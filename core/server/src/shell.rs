@@ -21,7 +21,7 @@
 //! [`ShellBus`] bound, the [`ShellHandlers`] slot struct, and the
 //! `[cluster]` timer-to-tick translation every consensus group boots with.
 //! Everything here is type- and config-level; construction (wiring the
-//! handlers against a live bus) stays in [`crate::bootstrap`].
+//! handlers against a live bus) stays in [`crate::boot`].
 
 use crate::session_manager::SessionManager;
 use configs::server::ServerConfig;
@@ -82,7 +82,7 @@ impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
 /// [`SessionManager`] the request-plane pair shares.
 ///
 /// Both production (`build_shard_for_thread`) and the simulator's shell
-/// mode construct these through [`crate::bootstrap::wire_shell_handlers`],
+/// mode construct these through [`crate::boot::wire_shell_handlers`],
 /// so the request plane is wired one way. The simulator's shell-off fast
 /// path uses [`ShellHandlers::noop`] instead.
 pub struct ShellHandlers {
@@ -197,6 +197,19 @@ pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
 pub(crate) fn repair_retry_ticks(config: &ServerConfig) -> u32 {
     u32::try_from(duration_to_ticks(
         config.cluster.repair_retry_interval.get_duration(),
+    ))
+    .unwrap_or(u32::MAX)
+}
+
+/// `[cluster] repair_gap_debounce_interval` in consensus ticks: how long a
+/// partition backup holds a hole before the sweep opens a repair session for
+/// it. Deliberately NOT the retry interval above: that one paces an open
+/// stream, and pairing them means quieting retry chatter also widens how long a
+/// replication hole stays open. The shard applies
+/// [`shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN`] as a floor on top.
+pub(crate) fn repair_gap_debounce_ticks(config: &ServerConfig) -> u32 {
+    u32::try_from(duration_to_ticks(
+        config.cluster.repair_gap_debounce_interval.get_duration(),
     ))
     .unwrap_or(u32::MAX)
 }

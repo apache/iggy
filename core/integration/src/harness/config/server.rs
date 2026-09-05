@@ -38,6 +38,11 @@ pub struct TestServerConfig {
     pub extra_envs: HashMap<String, String>,
     #[builder(into)]
     pub executable_path: Option<String>,
+    /// Bind every enabled transport to port 0 and discover the bound addresses
+    /// from `runtime/current_config.toml` instead of pre-reserving ports.
+    /// Single node only: a cluster roster names every port before boot.
+    #[builder(default)]
+    pub ephemeral_ports: bool,
 }
 
 impl Default for TestServerConfig {

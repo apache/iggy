@@ -21,9 +21,16 @@ mod a2a_jwt;
 mod cg;
 // Flush (FLUSH_UNSAVED_BUFFER) has no the server primitive; it must deny typed.
 mod flush_vsr;
+// Raw TCP framing (connect, hand-crafted frames, root register) for the
+// server suites that send what the SDK cannot.
+pub(crate) mod raw_tcp;
 // Legacy login codes (LOGIN_USER / LOGIN_WITH_PAT) have no the server handler;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
 mod legacy_login_vsr;
+// A non-replicated code no read serves (unknown, or table-listed without an
+// arm) must deny typed (InvalidCommand) at the read gate, not stall or reply
+// empty-ok.
+mod unknown_code_vsr;
 // A failed credential login must report the credential failure, not the
 // payload shape it fell through to.
 mod login_credentials_vsr;
@@ -48,11 +55,20 @@ mod http_rbac;
 // End-to-end HTTPS: the server serves the REST listener over TLS and negotiates
 // HTTP/2 via ALPN.
 mod http_tls;
+// The iggy-view response header: on authenticated success and redirect
+// responses only, never on errors or /ping, relayed from the primary.
+mod http_view_header;
+// An unqualified REST read must not answer below what the same caller was told
+// committed, on the node that accepted the write and has not applied it yet.
+mod http_read_your_writes;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
 mod cluster_metadata_vsr;
 // A declared node.advertised_address outranks the bind address a
 // cluster-disabled server would otherwise publish.
 mod cluster_metadata_advertised;
+// Listeners bound to :0 must publish the OS-chosen ports through the runtime
+// config dump and both cluster-metadata spines.
+mod port_discovery;
 // A metadata view change must persist the advanced view and recover it from disk
 // across a replica restart.
 mod cluster_view_durability_vsr;

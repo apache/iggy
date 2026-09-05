@@ -843,6 +843,7 @@ mod tests {
             checkpoint_op,
             checkpoint_checksum,
             offset_frontier: 0,
+            offset_reserved: 0,
         }
     }
 

@@ -148,26 +148,11 @@ internal static class TcpContracts
 
     internal static byte[] UpdatePermissions(Identifier userId, Permissions? permissions)
     {
-        var length = userId.Length + 2 +
-                     (permissions is not null ? 1 + 4 + CalculatePermissionsSize(permissions) : 0);
-        Span<byte> bytes = stackalloc byte[length];
-        bytes.WriteBytesFromIdentifier(userId);
-        var position = userId.Length + 2;
-        if (permissions is not null)
-        {
-            bytes[position++] = 1;
-            var permissionsBytes = GetBytesFromPermissions(permissions);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)],
-                permissionsBytes.Length);
-            position += 4;
-            permissionsBytes.CopyTo(bytes[position..(position + permissionsBytes.Length)]);
-        }
-        else
-        {
-            bytes[position++] = 0;
-        }
-
-        return bytes.ToArray();
+        var permissionsBytes = permissions is not null ? GetBytesFromPermissions(permissions) : [];
+        var bytes = new byte[userId.Length + 2 + 1 + (permissions is not null ? 4 + permissionsBytes.Length : 0)];
+        bytes.AsSpan().WriteBytesFromIdentifier(userId);
+        WritePermissionsBlock(bytes.AsSpan(userId.Length + 2), permissions, permissionsBytes);
+        return bytes;
     }
 
     internal static byte[] UpdateUser(Identifier userId, string? userName, UserStatus? status)
@@ -213,166 +198,98 @@ internal static class TcpContracts
     {
         var userNameLength = Encoding.UTF8.GetByteCount(userName);
         var passwordLength = Encoding.UTF8.GetByteCount(password);
-        var capacity = 3 + userNameLength + passwordLength
-                       + (permissions is not null ? 1 + 4 + CalculatePermissionsSize(permissions) : 1);
-
-        Span<byte> bytes = stackalloc byte[capacity];
+        var permissionsBytes = permissions is not null ? GetBytesFromPermissions(permissions) : [];
+        var bytes = new byte[3 + userNameLength + passwordLength + 1
+                             + (permissions is not null ? 4 + permissionsBytes.Length : 0)];
         var position = 0;
 
         bytes[position++] = (byte)userNameLength;
-        position += Encoding.UTF8.GetBytes(userName, bytes[position..(position + userNameLength)]);
+        position += Encoding.UTF8.GetBytes(userName, bytes.AsSpan(position, userNameLength));
 
         bytes[position++] = (byte)passwordLength;
-        position += Encoding.UTF8.GetBytes(password, bytes[position..(position + passwordLength)]);
+        position += Encoding.UTF8.GetBytes(password, bytes.AsSpan(position, passwordLength));
 
         bytes[position++] = (byte)status;
 
-        if (permissions is not null)
+        WritePermissionsBlock(bytes.AsSpan(position), permissions, permissionsBytes);
+        return bytes;
+    }
+
+    private static void WritePermissionsBlock(Span<byte> destination, Permissions? permissions,
+        byte[] permissionsBytes)
+    {
+        if (permissions is null)
         {
-            bytes[position++] = 1;
-            var permissionsBytes = GetBytesFromPermissions(permissions);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], permissionsBytes.Length);
-            position += 4;
-            permissionsBytes.CopyTo(bytes[position..(position + permissionsBytes.Length)]);
-        }
-        else
-        {
-            bytes[position++] = 0;
+            destination[0] = 0;
+            return;
         }
 
-        return bytes.ToArray();
+        destination[0] = 1;
+        BinaryPrimitives.WriteInt32LittleEndian(destination[1..5], permissionsBytes.Length);
+        permissionsBytes.CopyTo(destination[5..]);
     }
 
     private static byte[] GetBytesFromPermissions(Permissions data)
     {
-        var size = CalculatePermissionsSize(data);
-        Span<byte> bytes = stackalloc byte[size];
+        var writer = new ArrayBufferWriter<byte>();
 
-        bytes[0] = data.Global.ManageServers ? (byte)1 : (byte)0;
-        bytes[1] = data.Global.ReadServers ? (byte)1 : (byte)0;
-        bytes[2] = data.Global.ManageUsers ? (byte)1 : (byte)0;
-        bytes[3] = data.Global.ReadUsers ? (byte)1 : (byte)0;
-        bytes[4] = data.Global.ManageStreams ? (byte)1 : (byte)0;
-        bytes[5] = data.Global.ReadStreams ? (byte)1 : (byte)0;
-        bytes[6] = data.Global.ManageTopics ? (byte)1 : (byte)0;
-        bytes[7] = data.Global.ReadTopics ? (byte)1 : (byte)0;
-        bytes[8] = data.Global.PollMessages ? (byte)1 : (byte)0;
-        bytes[9] = data.Global.SendMessages ? (byte)1 : (byte)0;
+        WriteFlag(writer, data.Global.ManageServers);
+        WriteFlag(writer, data.Global.ReadServers);
+        WriteFlag(writer, data.Global.ManageUsers);
+        WriteFlag(writer, data.Global.ReadUsers);
+        WriteFlag(writer, data.Global.ManageStreams);
+        WriteFlag(writer, data.Global.ReadStreams);
+        WriteFlag(writer, data.Global.ManageTopics);
+        WriteFlag(writer, data.Global.ReadTopics);
+        WriteFlag(writer, data.Global.PollMessages);
+        WriteFlag(writer, data.Global.SendMessages);
 
-
-        if (data.Streams is not null)
+        var hasStreams = data.Streams is { Count: > 0 };
+        WriteFlag(writer, hasStreams);
+        if (!hasStreams)
         {
-            var streamsCount = data.Streams.Count;
-            var currentStream = 1;
-            bytes[10] = 1;
-            var position = 11;
-            foreach (var (streamId, stream) in data.Streams)
+            return writer.WrittenSpan.ToArray();
+        }
+
+        var remainingStreams = data.Streams!.Count;
+        foreach (var (streamId, stream) in data.Streams)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(writer.GetSpan(4), streamId);
+            writer.Advance(4);
+            WriteFlag(writer, stream.ManageStream);
+            WriteFlag(writer, stream.ReadStream);
+            WriteFlag(writer, stream.ManageTopics);
+            WriteFlag(writer, stream.ReadTopics);
+            WriteFlag(writer, stream.PollMessages);
+            WriteFlag(writer, stream.SendMessages);
+
+            var hasTopics = stream.Topics is { Count: > 0 };
+            WriteFlag(writer, hasTopics);
+            if (hasTopics)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], streamId);
-                position += 4;
-
-                bytes[position] = stream.ManageStream ? (byte)1 : (byte)0;
-                bytes[position + 1] = stream.ReadStream ? (byte)1 : (byte)0;
-                bytes[position + 2] = stream.ManageTopics ? (byte)1 : (byte)0;
-                bytes[position + 3] = stream.ReadTopics ? (byte)1 : (byte)0;
-                bytes[position + 4] = stream.PollMessages ? (byte)1 : (byte)0;
-                bytes[position + 5] = stream.SendMessages ? (byte)1 : (byte)0;
-                position += 6;
-
-                if (stream.Topics != null)
+                var remainingTopics = stream.Topics!.Count;
+                foreach (var (topicId, topic) in stream.Topics)
                 {
-                    var topicsCount = stream.Topics.Count;
-                    var currentTopic = 1;
-                    bytes[position] = 1;
-                    position += 1;
-
-                    foreach (var (topicId, topic) in stream.Topics)
-                    {
-                        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], topicId);
-                        position += 4;
-
-                        bytes[position] = topic.ManageTopic ? (byte)1 : (byte)0;
-                        bytes[position + 1] = topic.ReadTopic ? (byte)1 : (byte)0;
-                        bytes[position + 2] = topic.PollMessages ? (byte)1 : (byte)0;
-                        bytes[position + 3] = topic.SendMessages ? (byte)1 : (byte)0;
-                        position += 4;
-                        if (currentTopic < topicsCount)
-                        {
-                            currentTopic++;
-                            bytes[position++] = 1;
-                        }
-                        else
-                        {
-                            bytes[position++] = 0;
-                        }
-                    }
-                }
-                else
-                {
-                    bytes[position++] = 0;
-                }
-
-                if (currentStream < streamsCount)
-                {
-                    currentStream++;
-                    bytes[position++] = 1;
-                }
-                else
-                {
-                    bytes[position++] = 0;
+                    BinaryPrimitives.WriteUInt32LittleEndian(writer.GetSpan(4), topicId);
+                    writer.Advance(4);
+                    WriteFlag(writer, topic.ManageTopic);
+                    WriteFlag(writer, topic.ReadTopic);
+                    WriteFlag(writer, topic.PollMessages);
+                    WriteFlag(writer, topic.SendMessages);
+                    WriteFlag(writer, --remainingTopics > 0);
                 }
             }
-        }
-        else
-        {
-            bytes[0] = 0;
+
+            WriteFlag(writer, --remainingStreams > 0);
         }
 
-        return bytes.ToArray();
+        return writer.WrittenSpan.ToArray();
     }
 
-    private static int CalculatePermissionsSize(Permissions data)
+    private static void WriteFlag(ArrayBufferWriter<byte> writer, bool value)
     {
-        var size = 10;
-
-        if (data.Streams is not null)
-        {
-            size += 1;
-            foreach (var (_, stream) in data.Streams)
-            {
-                size += 4;
-                size += 6;
-                size += 1;
-
-                if (stream.Topics is not null)
-                {
-                    size += 1;
-                    size += stream.Topics.Count * 9;
-                }
-                else
-                {
-                    size += 1;
-                }
-            }
-        }
-        else
-        {
-            size += 1;
-        }
-
-        return size;
-    }
-
-    public static byte[] FlushUnsavedBuffer(Identifier streamId, Identifier topicId, uint partitionId, bool fsync)
-    {
-        var length = streamId.Length + 2 + topicId.Length + 2 + 4 + 1;
-        Span<byte> bytes = stackalloc byte[length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-        var position = streamId.Length + 2 + topicId.Length + 2;
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionId);
-        bytes[position + 4] = fsync ? (byte)1 : (byte)0;
-
-        return bytes.ToArray();
+        writer.GetSpan(1)[0] = value ? (byte)1 : (byte)0;
+        writer.Advance(1);
     }
 
     internal static void GetMessages(Span<byte> bytes, Consumer consumer, Identifier streamId, Identifier topicId,
