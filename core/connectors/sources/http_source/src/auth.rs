@@ -17,26 +17,7 @@
 
 use ring::hmac;
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
-
-/// HMAC algorithms accepted for signature validation. SHA-256 covers GitHub,
-/// Stripe, and most modern providers; SHA-1 exists only for legacy senders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HmacAlgorithm {
-    HmacSha256,
-    HmacSha1,
-}
-
-impl HmacAlgorithm {
-    fn ring_algorithm(self) -> hmac::Algorithm {
-        match self {
-            Self::HmacSha256 => hmac::HMAC_SHA256,
-            Self::HmacSha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-        }
-    }
-}
+use subtle::ConstantTimeEq;
 
 /// Validates `Authorization: Bearer <token>` in constant time.
 pub fn validate_bearer(authorization_header: Option<&str>, expected_token: &SecretString) -> bool {
@@ -54,13 +35,24 @@ pub fn validate_bearer(authorization_header: Option<&str>, expected_token: &Secr
 
 /// Splits `Bearer <token>`. RFC 7235 makes the scheme case-insensitive, so a
 /// sender using `bearer` is legitimate and must not be turned away.
-pub fn strip_bearer(header_value: &str) -> Option<&str> {
+fn strip_bearer(header_value: &str) -> Option<&str> {
     let (scheme, token) = header_value.split_once(' ')?;
     // RFC 9110's grammar is `auth-scheme [ 1*SP token68 ]`, so more than one
     // space is legal and the extra would otherwise fail the compare.
     scheme
         .eq_ignore_ascii_case("Bearer")
         .then(|| token.trim_start_matches(' '))
+}
+
+/// Whether a secret is present and non-empty.
+///
+/// An empty key is valid for HMAC, so accepting one would leave `auth_type`
+/// advertising a second factor that anyone holding the URL can compute. Shared
+/// so the config path and the management API cannot disagree about it.
+pub fn is_usable_secret(secret: &Option<SecretString>) -> bool {
+    secret
+        .as_ref()
+        .is_some_and(|secret| !secret.expose_secret().is_empty())
 }
 
 /// Compares two secrets without leaking their contents through timing.
@@ -71,22 +63,13 @@ pub fn secrets_match(left: &SecretString, right: &SecretString) -> bool {
     )
 }
 
-// ring deprecated its direct comparison helper; `hmac::verify` compares
-// tags in constant time, so equal inputs iff the tag over one verifies
-// against the other.
-/// Built once. The key material is empty and fixed, so rebuilding it per
-/// comparison only repeated the block-size padding work on the token path.
-static COMPARE_KEY: LazyLock<hmac::Key> = LazyLock::new(|| hmac::Key::new(hmac::HMAC_SHA256, &[]));
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    // Signing one side and verifying the other compares tags of a fixed
-    // length, so neither the result nor the timing depends on where the inputs
-    // first differ. Total time is still proportional to their length, since
-    // each HMAC runs one compression per block, so a presented token's length
-    // remains observable. That is the known caveat of this construction and is
-    // acceptable here: length alone does not narrow a secret's content.
-    let left_tag = hmac::sign(&COMPARE_KEY, left);
-    hmac::verify(&COMPARE_KEY, right, left_tag.as_ref()).is_ok()
+    // `subtle` is the purpose-built primitive; this used to sign one side and
+    // verify the other, which was a workaround for ring deprecating its own
+    // comparison helper. Either way a presented token's length is observable,
+    // here because unequal lengths answer immediately. That caveat is
+    // unchanged and acceptable: length alone does not narrow a secret.
+    left.ct_eq(right).into()
 }
 
 /// Longest tag any supported algorithm produces: SHA-256 at 32 bytes.
@@ -97,11 +80,8 @@ const MAX_TAG_LEN: usize = 32;
 /// Called from `RouteTable::build`, so the key is rebuilt whenever the table
 /// is, which is on every registry mutation. That is what keeps a rotated
 /// secret from being verified against the old key.
-pub fn hmac_key(algorithm: HmacAlgorithm, secret: &SecretString) -> hmac::Key {
-    hmac::Key::new(
-        algorithm.ring_algorithm(),
-        secret.expose_secret().as_bytes(),
-    )
+pub fn hmac_key(algorithm: hmac::Algorithm, secret: &SecretString) -> hmac::Key {
+    hmac::Key::new(algorithm, secret.expose_secret().as_bytes())
 }
 
 /// Validates an HMAC signature over the raw request body bytes, never a
@@ -144,8 +124,8 @@ mod tests {
         SecretString::from(SECRET)
     }
 
-    fn github_style_signature(body: &[u8], algorithm: HmacAlgorithm) -> String {
-        let key = hmac::Key::new(algorithm.ring_algorithm(), SECRET.as_bytes());
+    fn github_style_signature(body: &[u8], algorithm: hmac::Algorithm) -> String {
+        let key = hmac::Key::new(algorithm, SECRET.as_bytes());
         let tag = hmac::sign(&key, body);
         hex::encode(tag.as_ref())
     }
@@ -191,15 +171,12 @@ mod tests {
 
     #[test]
     fn given_valid_sha256_signature_when_hmac_validated_should_accept() {
-        let signature = format!(
-            "sha256={}",
-            github_style_signature(BODY, HmacAlgorithm::HmacSha256)
-        );
+        let signature = format!("sha256={}", github_style_signature(BODY, hmac::HMAC_SHA256));
         assert!(validate_hmac(
             BODY,
             Some(&signature),
             "sha256=",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 
@@ -207,27 +184,24 @@ mod tests {
     fn given_valid_sha1_signature_when_hmac_validated_should_accept() {
         let signature = format!(
             "sha1={}",
-            github_style_signature(BODY, HmacAlgorithm::HmacSha1)
+            github_style_signature(BODY, hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY)
         );
         assert!(validate_hmac(
             BODY,
             Some(&signature),
             "sha1=",
-            &hmac_key(HmacAlgorithm::HmacSha1, &secret()),
+            &hmac_key(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &secret()),
         ));
     }
 
     #[test]
     fn given_tampered_body_when_hmac_validated_should_reject() {
-        let signature = format!(
-            "sha256={}",
-            github_style_signature(BODY, HmacAlgorithm::HmacSha256)
-        );
+        let signature = format!("sha256={}", github_style_signature(BODY, hmac::HMAC_SHA256));
         assert!(!validate_hmac(
             br#"{"event": "push", "repository": "attacker/repo"}"#,
             Some(&signature),
             "sha256=",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 
@@ -237,21 +211,18 @@ mod tests {
             BODY,
             None,
             "sha256=",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 
     #[test]
     fn given_wrong_prefix_when_hmac_validated_should_reject() {
-        let signature = format!(
-            "sha1={}",
-            github_style_signature(BODY, HmacAlgorithm::HmacSha256)
-        );
+        let signature = format!("sha1={}", github_style_signature(BODY, hmac::HMAC_SHA256));
         assert!(!validate_hmac(
             BODY,
             Some(&signature),
             "sha256=",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 
@@ -264,7 +235,7 @@ mod tests {
             BODY,
             Some(&header),
             "sha256=",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 
@@ -275,7 +246,7 @@ mod tests {
             BODY,
             Some(&header),
             "sha256=",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 
@@ -285,18 +256,18 @@ mod tests {
             BODY,
             Some("sha256=not-hex-at-all"),
             "sha256=",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 
     #[test]
     fn given_empty_prefix_when_hmac_validated_should_accept_raw_hex() {
-        let signature = github_style_signature(BODY, HmacAlgorithm::HmacSha256);
+        let signature = github_style_signature(BODY, hmac::HMAC_SHA256);
         assert!(validate_hmac(
             BODY,
             Some(&signature),
             "",
-            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+            &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
     }
 }

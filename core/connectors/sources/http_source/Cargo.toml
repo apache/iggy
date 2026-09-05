@@ -49,6 +49,7 @@ rand = { workspace = true }
 ring = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+subtle = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

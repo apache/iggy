@@ -428,9 +428,9 @@ mod tests {
     #[tokio::test]
     async fn given_revoked_endpoint_when_looked_up_should_report_revoked() {
         let source = instance(1, None, &[ENDPOINT_ONE]);
-        source
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1))
-            .await;
+        source.mutate_registry(|registry| {
+            registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1)
+        });
 
         let table = RouteTable::build(&[source]).expect("must build");
 
@@ -443,15 +443,13 @@ mod tests {
     #[tokio::test]
     async fn given_expired_endpoint_when_looked_up_should_report_expired() {
         let source = instance(1, None, &[ENDPOINT_ONE]);
-        source
-            .mutate_registry(|registry| {
-                registry
-                    .endpoint_mut(ENDPOINT_ONE)
-                    .expect("static endpoint is registered")
-                    .expires_at = Some(NOW);
-                true
-            })
-            .await;
+        source.mutate_registry(|registry| {
+            registry
+                .endpoint_mut(ENDPOINT_ONE)
+                .expect("static endpoint is registered")
+                .expires_at = Some(NOW);
+            true
+        });
 
         let table = RouteTable::build(&[source]).expect("must build");
 
@@ -468,16 +466,14 @@ mod tests {
     #[tokio::test]
     async fn given_revoked_and_expired_endpoint_when_looked_up_should_prefer_revoked() {
         let source = instance(1, None, &[ENDPOINT_ONE]);
-        source
-            .mutate_registry(|registry| {
-                let endpoint = registry
-                    .endpoint_mut(ENDPOINT_ONE)
-                    .expect("static endpoint is registered");
-                endpoint.expires_at = Some(NOW);
-                endpoint.revoke("compromised".to_string(), NOW);
-                true
-            })
-            .await;
+        source.mutate_registry(|registry| {
+            let endpoint = registry
+                .endpoint_mut(ENDPOINT_ONE)
+                .expect("static endpoint is registered");
+            endpoint.expires_at = Some(NOW);
+            endpoint.revoke("compromised".to_string(), NOW);
+            true
+        });
 
         let table = RouteTable::build(&[source]).expect("must build");
 
