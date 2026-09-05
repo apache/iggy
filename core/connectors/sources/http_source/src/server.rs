@@ -774,10 +774,11 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
                 endpoints_revoked: registry.revoked_count(),
                 named_path: instance.config.topic_path.is_some(),
                 poll_is_live: instance.poll_is_live(now),
-                // Same derivation as the per-endpoint flag: submitted is set
-                // before the state leaves, so it only means durable if no
-                // flush is still owed.
-                state_submitted: registry.all_submitted() && !instance.has_pending_state(),
+                // The registry is handed over whole, so an owed flush is the
+                // whole answer. Still not `persisted`: the flag clears when the
+                // state leaves the plugin, and the runtime's write landing is
+                // something no poll return value reports back.
+                state_submitted: !instance.has_pending_state(),
                 headers_dropped: state.metrics.headers_dropped(&instance.instance_name),
                 headers_clamped: state.metrics.headers_clamped(&instance.instance_name),
             }

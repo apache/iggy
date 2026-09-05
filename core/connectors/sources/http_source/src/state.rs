@@ -113,7 +113,6 @@ impl EndpointRegistry {
         let mut tombstones = 0;
         let mut dropped_static = 0;
         for (endpoint_id, mut endpoint) in persisted.endpoints {
-            endpoint.submitted = true;
             // The id is both the map key and a field, and both are written out.
             // A hand-edited state file could disagree between them, which would
             // split `owner_of`, keyed off the map, from `lookup_secret_path`,
@@ -269,21 +268,6 @@ impl EndpointRegistry {
         true
     }
 
-    /// Flags the whole registry as handed to the runtime for persistence.
-    ///
-    /// Set when the registry is handed to the runtime, which is why the flag
-    /// is `submitted` rather than `persisted`. The runtime does acknowledge
-    /// the batch, and a failed save comes back as a NACK that re-arms the
-    /// flush without clearing this, so between a failed save and the retry
-    /// that succeeds the flag over-reports. Nothing here may assume the save
-    /// landed, and `HttpSource::on_nack`'s re-arm is what makes the retry
-    /// happen: it is load-bearing, not defensive.
-    pub fn mark_submitted(&mut self) {
-        for endpoint in self.endpoints.values_mut() {
-            endpoint.submitted = true;
-        }
-    }
-
     /// Endpoints that would accept a request right now: neither revoked nor
     /// past their expiry. An expired endpoint is still `Active` in lifecycle
     /// terms but answers 404, so counting it as serving would mislead.
@@ -322,20 +306,6 @@ impl EndpointRegistry {
         self.endpoints
             .values()
             .filter(|endpoint| !endpoint.is_active())
-            .count()
-    }
-
-    /// Whether every endpoint has been handed to the runtime, which is what
-    /// the admin listener reports as `state_submitted`.
-    pub fn all_submitted(&self) -> bool {
-        self.endpoints.values().all(|endpoint| endpoint.submitted)
-    }
-
-    /// Endpoints whose latest change has not been handed to the runtime.
-    pub fn unsubmitted_count(&self) -> usize {
-        self.endpoints
-            .values()
-            .filter(|endpoint| !endpoint.submitted)
             .count()
     }
 
@@ -381,7 +351,6 @@ mod tests {
             expires_at: None,
             origin: EndpointOrigin::Dynamic,
             state: EndpointState::Active,
-            submitted: false,
         }
     }
 
@@ -436,7 +405,6 @@ mod tests {
             Some("whsec_dynamic"),
             "a redacted secret would reject every request the sender signs"
         );
-        assert!(endpoint.submitted);
     }
 
     #[test]
@@ -785,26 +753,6 @@ mod tests {
             registry.endpoints.len(),
             MAX_ENDPOINTS,
             "a refusal must not leave the registry partially reclaimed, or it would arm a flush for a change the caller was told did not happen"
-        );
-    }
-
-    #[test]
-    fn given_mixed_registry_when_counting_unsubmitted_should_exclude_handed_over_entries() {
-        // close() reports this number, and it is the only record that a
-        // revocation made after the last poll did not survive the restart.
-        let mut registry = EndpointRegistry::default();
-        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
-        assert!(registry.insert(dynamic_endpoint(ENDPOINT_TWO)));
-        assert_eq!(registry.unsubmitted_count(), 2);
-
-        registry.mark_submitted();
-        assert_eq!(registry.unsubmitted_count(), 0);
-
-        assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
-        assert_eq!(
-            registry.unsubmitted_count(),
-            1,
-            "revoking marks the entry unsubmitted again, which is what close() must report"
         );
     }
 
