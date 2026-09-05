@@ -111,12 +111,6 @@ pub struct Endpoint {
     // short by one element would resurrect a revoked endpoint - turning a
     // loud decode failure into a silent, fail-open one.
     pub state: EndpointState,
-    /// Whether this endpoint has been handed to the runtime for persistence.
-    /// Reset on every mutation, never itself persisted: a restored endpoint is
-    /// durable by definition. Not named `persisted`, because the plugin gets
-    /// no acknowledgement that the runtime's write actually landed.
-    #[serde(skip)]
-    pub submitted: bool,
 }
 
 impl Endpoint {
@@ -136,7 +130,6 @@ impl Endpoint {
 
     pub fn revoke(&mut self, reason: String, revoked_at: u64) {
         self.state = EndpointState::Revoked { reason, revoked_at };
-        self.submitted = false;
         // The handler 404s on a revoked entry before `authorize()` runs, so
         // the secret is already dead weight. Keeping it would serialize a
         // leaked credential into the state file, and nothing compacts
@@ -157,8 +150,6 @@ impl From<&StaticEndpointConfig> for Endpoint {
             expires_at: config.expires_at,
             origin: EndpointOrigin::Static,
             state: EndpointState::Active,
-            // Declared in TOML, so it needs no state file to come back.
-            submitted: true,
         }
     }
 }

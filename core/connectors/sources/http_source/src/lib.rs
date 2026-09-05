@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -196,6 +196,16 @@ pub struct SharedState {
     pub(crate) forward_headers: Vec<(HeaderName, HeaderKey)>,
     registry: ArcSwap<EndpointRegistry>,
     registry_dirty: AtomicBool,
+    /// Mutations made since the last one the runtime acknowledged.
+    ///
+    /// The registry is handed over whole, so durability was never per-endpoint;
+    /// what an operator losing a shutdown needs is how many changes went with
+    /// it. Counting them on the instance costs two atomics instead of a flag on
+    /// every endpoint and a clone of the whole registry per flush.
+    pending_changes: AtomicUsize,
+    /// Mutations in the batch currently awaiting the runtime's verdict, so a
+    /// NACK can return them to `pending_changes` rather than lose the count.
+    handed_changes: AtomicUsize,
     /// True while a `poll()` is in flight, including the long block on an idle
     /// bridge. Cleared by a guard, so a cancelled poll clears it too, which is
     /// what makes a stopped poll task observable.
@@ -249,8 +259,14 @@ impl SharedState {
             if !mutation(&mut next) {
                 return false;
             }
-            self.registry.store(Arc::new(next));
+            // Before the publish, not after. A reader between the two sees a
+            // registry that has not changed yet and is told a flush is owed,
+            // which is the harmless direction. The other order let it see the
+            // change and be told nothing was outstanding, which is what the
+            // per-endpoint flag used to exist to paper over.
             self.registry_dirty.store(true, Ordering::Release);
+            self.pending_changes.fetch_add(1, Ordering::AcqRel);
+            self.registry.store(Arc::new(next));
         }
         // Notified after the gate is free, so the woken poll finds it open
         // rather than bouncing off `try_lock` and relying on the re-arm there.
@@ -316,12 +332,14 @@ impl SharedState {
 
     /// Re-arms a flush whose state was taken but never persisted.
     ///
-    /// `take_dirty_state` clears the flag and marks every endpoint submitted
-    /// before the state leaves the plugin, so a caller that later learns the
-    /// save did not land has to put the flag back. Without it the mutation is
+    /// `take_dirty_state` clears the flag and sets the pending change count
+    /// aside before the state leaves the plugin, so a caller that later learns
+    /// the save did not land has to put both back. Without it the mutation is
     /// never retried and nothing on the control API says so.
     pub fn rearm_state_flush(&self) {
         self.registry_dirty.store(true, Ordering::Release);
+        let handed = self.handed_changes.swap(0, Ordering::AcqRel);
+        self.pending_changes.fetch_add(handed, Ordering::AcqRel);
         let attempt = self.state_flush_nacks.fetch_add(1, Ordering::AcqRel);
         let delay = state_flush_retry_delay(attempt);
         if delay.is_zero() {
@@ -346,6 +364,13 @@ impl SharedState {
     /// Clears the refused-flush backoff once the runtime accepts a batch.
     pub fn clear_state_flush_backoff(&self) {
         self.state_flush_nacks.store(0, Ordering::Release);
+        self.handed_changes.store(0, Ordering::Release);
+    }
+
+    /// Mutations that have not been handed to the runtime, or were handed over
+    /// and came back NACKed. What `close()` reports as lost on a stop.
+    pub fn pending_change_count(&self) -> usize {
+        self.pending_changes.load(Ordering::Acquire)
     }
 
     /// Hands the registry to the runtime for persistence, once per mutation.
@@ -353,8 +378,7 @@ impl SharedState {
     /// Only ever called for an empty batch. The runtime saves state solely on
     /// the success branch of the Iggy send, so attaching state to a batch of
     /// messages would let a failed send skip the save while this side had
-    /// already cleared the flag and marked the registry submitted, losing a
-    /// revocation tombstone with no trace. An empty batch cannot fail *for
+    /// already cleared the flag, losing a revocation tombstone with no trace. An empty batch cannot fail *for
     /// want of a successful publish*, which is what makes it the safe carrier.
     /// It can still be NACKed: the runtime short-circuits the send stage when
     /// its own state storage is latched or a pending checkpoint will not
@@ -392,9 +416,12 @@ impl SharedState {
             self.registry_dirty.store(true, Ordering::Release);
             return None;
         };
-        let mut persisted = EndpointRegistry::clone(&snapshot);
-        persisted.mark_submitted();
-        self.registry.store(Arc::new(persisted));
+        // The batch is not acknowledged yet, so the count moves aside rather
+        // than being dropped: `rearm_state_flush` puts it back on a NACK.
+        self.handed_changes.store(
+            self.pending_changes.swap(0, Ordering::AcqRel),
+            Ordering::Release,
+        );
         Some(state)
     }
 }
@@ -677,6 +704,8 @@ impl HttpSource {
             forward_headers,
             registry: ArcSwap::from_pointee(registry),
             registry_dirty: AtomicBool::new(false),
+            pending_changes: AtomicUsize::new(0),
+            handed_changes: AtomicUsize::new(0),
             poll_active: AtomicBool::new(false),
             last_poll_at: AtomicU64::new(0),
             registry_writer: StdMutex::new(()),
@@ -749,11 +778,11 @@ impl HttpSource {
             // Nothing staged means the batch carried no messages, which is
             // usually a state flush the runtime could not persist or would not
             // attempt. It can also be an empty batch that carried no state at
-            // all, when the writer gate was contended or nothing was dirty, and
-            // re-arming then costs one redundant flush rather than a lost one. `take_dirty_state` already cleared
-            // the flag and marked every endpoint submitted, so re-arming here
-            // is the only thing that stops a revocation being lost while the
-            // API reports it durable. This is load-bearing, not defensive.
+            // all, when the writer gate was contended or nothing was dirty,
+            // and re-arming then costs one redundant flush rather than a lost
+            // one. `take_dirty_state` already cleared the flag, so re-arming
+            // here is the only thing that stops a revocation being lost while
+            // the API reports it durable. This is load-bearing, not defensive.
             self.shared.rearm_state_flush();
             warn!(
                 "Runtime NACKed the state flush for {CONNECTOR_NAME} connector ID: {}, re-arming it",
@@ -901,9 +930,9 @@ impl Source for HttpSource {
         // `poll()`.
         if self.shared.has_pending_state() {
             warn!(
-                "Closing {CONNECTOR_NAME} connector ID: {} with an unflushed registry: {} endpoint(s) not submitted, so a change made since the last poll will not survive the restart",
+                "Closing {CONNECTOR_NAME} connector ID: {} with an unflushed registry: {} change(s) not submitted, so a change made since the last poll will not survive the restart",
                 self.shared.id,
-                self.shared.registry().unsubmitted_count()
+                self.shared.pending_change_count()
             );
         }
         // The SDK stops the poll task before calling this, so anything still
@@ -1477,7 +1506,6 @@ mod tests {
             expires_at: None,
             origin: crate::routes::EndpointOrigin::Dynamic,
             state: crate::routes::EndpointState::Active,
-            submitted: false,
         }));
 
         let source = HttpSource::new(
@@ -1519,28 +1547,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_state_taken_when_registry_read_should_report_endpoints_submitted() {
+    async fn given_state_taken_when_counted_should_report_the_changes_handed_over() {
+        let source = HttpSource::new(
+            1,
+            test_support::config(None, &[ENDPOINT_ONE, ENDPOINT_TWO]),
+            None,
+        );
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_TWO, "rotated".to_string(), 43));
+        assert_eq!(source.shared.pending_change_count(), 2);
+
+        source.shared.take_dirty_state();
+        assert_eq!(
+            source.shared.pending_change_count(),
+            0,
+            "handing the registry over settles what was outstanding"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_nacked_flush_when_counted_should_still_owe_the_changes() {
+        // The per-endpoint flag this replaced was set for the whole registry
+        // when the state left and never cleared by the NACK, so close() logged
+        // "0 not submitted" for changes it was about to lose.
         let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
         source
             .shared
             .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
 
-        assert!(
-            !source
-                .shared
-                .registry()
-                .endpoint(ENDPOINT_ONE)
-                .expect("endpoint must exist")
-                .submitted
+        let flushed = source.poll().await.expect("poll must succeed");
+        assert!(flushed.state.is_some(), "the mutation must arm a flush");
+        assert_eq!(source.shared.pending_change_count(), 0);
+
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("nack must succeed");
+        assert_eq!(
+            source.shared.pending_change_count(),
+            1,
+            "a refused flush owes its change again, and close() reports that number"
         );
+
         source.shared.take_dirty_state();
-        assert!(
-            source
-                .shared
-                .registry()
-                .endpoint(ENDPOINT_ONE)
-                .expect("endpoint must exist")
-                .submitted
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ack must succeed");
+        assert_eq!(
+            source.shared.pending_change_count(),
+            0,
+            "and only the runtime accepting it settles the count"
         );
     }
 
@@ -1839,7 +1900,7 @@ mod tests {
 
         assert!(
             source.shared.has_pending_state(),
-            "a NACKed state flush is a revocation the runtime never persisted, and `take_dirty_state` already marked it submitted, so without the re-arm it is lost for good"
+            "a NACKed state flush is a revocation the runtime never persisted, and `take_dirty_state` already cleared the flag, so without the re-arm it is lost for good"
         );
 
         // Consume the permit the re-arm posted, so the poll below is reached

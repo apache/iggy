@@ -24,7 +24,8 @@
 //! Disabled unless `management_token` is set, and never reachable from the
 //! public listener. Mutations become durable on the next successful poll, so
 //! a response here means "accepted", not "written"; `GET /admin/endpoints`
-//! reports `submitted` per endpoint for callers that need the difference.
+//! reports `submitted` per endpoint for callers that need the difference,
+//! though the underlying flush covers the whole registry at once.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Request, State};
@@ -154,7 +155,6 @@ async fn register_endpoint(
         expires_at: request.expires_at,
         origin: EndpointOrigin::Dynamic,
         state: EndpointState::Active,
-        submitted: false,
     };
 
     let mut outcome = InsertOutcome::Collision;
@@ -280,7 +280,6 @@ async fn rotate_secret(
             return false;
         }
         endpoint.auth_secret = Some(request.auth_secret.clone());
-        endpoint.submitted = false;
         true
     });
     if !rotated {
@@ -350,9 +349,10 @@ async fn revoke_endpoint(
     );
     // 202, not 204. The tombstone is live in the route table before this
     // returns, so the endpoint stops serving immediately, but it reaches the
-    // runtime only on a later `poll()` and `submitted` flips before the state
-    // leaves the plugin, so waiting on that flag would not prove durability
-    // either. `GET /admin/endpoints/{id}` is where an operator watches for it.
+    // runtime only on a later `poll()`, and the flag it flips clears when the
+    // state leaves the plugin rather than when the runtime writes it, so
+    // waiting on it would not prove durability either.
+    // `GET /admin/endpoints/{id}` is where an operator watches for it.
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -555,12 +555,11 @@ impl EndpointSummary {
             hmac_header: endpoint.hmac_header.clone(),
             hmac_prefix: endpoint.hmac_prefix.clone(),
             expires_at: endpoint.expires_at,
-            // Derived, not read straight off the endpoint: `take_dirty_state`
-            // marks the whole registry submitted before the state leaves, and a
-            // NACK re-arms the flush without clearing that. Pairing it with the
-            // outstanding-flush bit turns the flag honest for free, and errs
-            // toward reporting not-yet-durable, which is the safe direction.
-            submitted: endpoint.submitted && !instance.has_pending_state(),
+            // Instance-wide, because the state file is: the registry is
+            // serialized and handed over whole, so no endpoint in it can be
+            // submitted while another is not. Reported per endpoint anyway,
+            // since that is the granularity a caller asks about one at a time.
+            submitted: !instance.has_pending_state(),
             revoked_at,
             revoked_reason,
         }
@@ -794,16 +793,16 @@ mod tests {
 
     #[tokio::test]
     async fn given_owed_flush_when_listed_should_not_claim_submitted() {
-        // `take_dirty_state` marks the whole registry submitted before the
-        // state leaves the plugin, and a NACK re-arms the flush without
-        // clearing that, so the stored flag alone would claim a revocation was
-        // durable when nothing had been written.
+        // `take_dirty_state` clears the owed-flush bit before the state leaves
+        // the plugin, so between the hand-over and the runtime's verdict the
+        // bit alone would claim a revocation was durable when nothing had been
+        // written. The NACK's re-arm is what puts it back.
         let fixture = Fixture::start(Some(TOKEN)).await;
         let http = client();
         let list = format!("{}/admin/endpoints", fixture.admin);
 
-        // Mutate so a flush is owed, hand it over so the registry is marked
-        // submitted, then re-arm as a NACK would.
+        // Mutate so a flush is owed, hand it over so the bit clears, then
+        // re-arm as a NACK would.
         assert!(
             fixture
                 .source

@@ -255,11 +255,11 @@ Durability follows the same path as registration below, with one asymmetry worth
 
 Dynamic endpoints ride the SDK's `ConnectorState`, which the runtime writes after the next successful send. A management response therefore means "accepted", not "durable": if Iggy is unreachable, the endpoint is live in memory but not yet on disk, and a crash in that window loses it.
 
-`GET /admin/endpoints` reports `submitted` per endpoint. It is named that, and not `persisted`, on purpose: the flag is set when the registry is handed to the runtime, so `submitted: true` means it reached the runtime, not that the write landed.
+`GET /admin/endpoints` reports `submitted` per endpoint. It is named that, and not `persisted`, on purpose: it says the registry was handed to the runtime, not that the write landed.
 
-Since #3855 the runtime does acknowledge the batch, and a failed save comes back as a NACK that re-arms the flush for the next poll. The stored flag is not cleared by that re-arm, so what the API reports pairs it with whether a flush is still owed: an endpoint reads `submitted: true` only once it has been handed over and nothing is outstanding.
+It is answered per endpoint but derived instance-wide, because that is what the mechanism is. The registry is serialized and handed over whole, so no endpoint in it can be submitted while another is not, and one outstanding flush makes every endpoint unsubmitted until it lands. Since #3855 the runtime acknowledges the batch, and a failed save comes back as a NACK that re-arms the flush for the next poll, which puts the endpoints back to `submitted: false` too.
 
-That errs toward reporting not-yet-durable, which is the safe direction. It also means a mutation arriving after a successful save shows every endpoint as unsubmitted until the next flush lands.
+That errs toward reporting not-yet-durable, which is the safe direction.
 
 ## Backpressure
 
