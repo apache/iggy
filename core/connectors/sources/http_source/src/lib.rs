@@ -1606,28 +1606,33 @@ mod tests {
 
     #[tokio::test]
     async fn given_pending_flush_and_traffic_when_polled_should_take_the_flush_first() {
-        // Both arms ready. Unbiased, which one ran was a coin flip, so a
-        // revocation left on the second poll on average and this assertion
-        // could only ever hold half the time.
-        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
-        source
-            .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
-        source
-            .shared
-            .sender
-            .try_send(queued("one"))
-            .expect("bridge must accept");
+        // Repeated deliberately. A single round asserts a branch choice, and
+        // an unordered `select!` picks the right one half the time, so one
+        // round would let the regression through on every other run. Ordered,
+        // every round holds; unordered, all sixteen holding is a 1-in-65536
+        // accident.
+        const ROUNDS: usize = 16;
+        for round in 0..ROUNDS {
+            let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+            source.shared.mutate_registry(|registry| {
+                registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42)
+            });
+            source
+                .shared
+                .sender
+                .try_send(queued("one"))
+                .expect("bridge must accept");
 
-        let produced = source.poll().await.expect("poll must succeed");
-        assert!(
-            produced.messages.is_empty(),
-            "the armed flush must win first refusal over waiting traffic"
-        );
-        assert!(
-            produced.state.is_some(),
-            "so the mutation rides the very next poll rather than waiting one out"
-        );
+            let produced = source.poll().await.expect("poll must succeed");
+            assert!(
+                produced.messages.is_empty(),
+                "round {round}: the armed flush must win first refusal over waiting traffic"
+            );
+            assert!(
+                produced.state.is_some(),
+                "round {round}: so the mutation rides the very next poll rather than waiting one out"
+            );
+        }
     }
 
     #[tokio::test]
