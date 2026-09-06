@@ -6783,6 +6783,7 @@ dependencies = [
  "libc",
  "secrecy",
  "serde",
+ "serde_json",
  "serial_test",
  "socket2",
  "tempfile",

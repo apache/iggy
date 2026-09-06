@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -36,12 +36,12 @@ use serial_test::serial;
 
 use iggy_gateway_kafka::bridge::{BridgeError, IggyBridge, IggyBridgeConfig, TopicMapping};
 
-/// First port of the local reservation band. Clear of both the default Linux/macOS ephemeral
-/// range (roughly 32768-60999 and 49152-65535 respectively) and `core/integration`'s own
-/// `port_reserver.rs` band (20000 up to that ephemeral floor), so a `bind(0)` call in an unrelated
-/// process - including that harness's own test servers - is never handed a port this band has
-/// claimed.
-const PORT_LOCK_BAND_START: u16 = 61000;
+/// First port of the local reservation band. `u16` has no room above the highest ephemeral
+/// ceiling in use (macOS: 49152-65535), so "clear of ephemeral" only leaves room below the
+/// lowest floor (Linux default: 32768) - picked here below `core/integration`'s own
+/// `port_reserver.rs` band too (20000 up to that floor), so a `bind(0)` call in an unrelated
+/// process, including that harness's own test servers, is never handed a port this band claims.
+const PORT_LOCK_BAND_START: u16 = 15000;
 const PORT_LOCK_BAND_SLOTS: u16 = 200;
 
 /// Exclusive claim on one port, released (and the port freed for reuse) when dropped - including
@@ -88,26 +88,44 @@ impl PortGuard {
 /// crate nor `core/integration` (same `Command::cargo_bin` pattern) declares that crate as a
 /// dependency just to make its binary buildable. Driving `cargo build` directly sidesteps that
 /// entirely - no Cargo.toml dependency edge needed on a crate this one otherwise never touches.
+///
+/// Reads the artifact path from `--message-format=json` rather than guessing
+/// `target/debug/iggy-server`: a guessed path breaks under `CARGO_TARGET_DIR` (this workspace's
+/// own coverage CI sets it), `--release`, or a `--target` triple subdirectory, none of which
+/// `cargo build`'s own JSON output leaves to guesswork.
 fn iggy_server_binary() -> &'static PathBuf {
     static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
     BINARY_PATH.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "--package", "server", "--bin", "iggy-server"])
-            .status()
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--package",
+                "server",
+                "--bin",
+                "iggy-server",
+                "--message-format=json",
+            ])
+            .output()
             .expect("run cargo build for iggy-server");
         assert!(
-            status.success(),
-            "cargo build --package server --bin iggy-server failed"
+            output.status.success(),
+            "cargo build --package server --bin iggy-server failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
 
-        // CARGO_MANIFEST_DIR is gateways/kafka; the workspace root (and its target/ dir) is two
-        // levels up.
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = manifest_dir
-            .parent()
-            .and_then(Path::parent)
-            .expect("gateways/kafka is two levels under the workspace root");
-        workspace_root.join("target/debug/iggy-server")
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|message| {
+                if message.get("reason")? == "compiler-artifact"
+                    && message.get("target")?.get("name")? == "iggy-server"
+                {
+                    message.get("executable")?.as_str().map(PathBuf::from)
+                } else {
+                    None
+                }
+            })
+            .expect("cargo build --message-format=json reported no iggy-server executable")
     })
 }
 
@@ -146,12 +164,20 @@ impl TestServer {
         server
     }
 
-    /// Retries a full bridge connect (not just a TCP connect) so the wait covers the server
-    /// actually being ready to authenticate, not just its listener socket being open.
+    /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries
+    /// `RECONNECTION_RETRIES` (3 dials at ~1s apart) on every failed attempt, so a poll loop built
+    /// on it pays several real seconds per iteration instead of running at its own 100ms cadence,
+    /// and a *successful* poll iteration would authenticate a client and then drop it without
+    /// `close()`, leaking a session server-side. A TCP accept slightly ahead of the app being
+    /// ready to authenticate is fine - every caller's own subsequent `IggyBridge::connect` already
+    /// retries a few times, which covers the last few hundred ms of that gap.
     async fn wait_ready(&self) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if IggyBridge::connect(self.test_config()).await.is_ok() {
+            if tokio::net::TcpStream::connect(self.address.as_str())
+                .await
+                .is_ok()
+            {
                 return;
             }
             assert!(
@@ -184,9 +210,9 @@ impl Drop for TestServer {
 }
 
 /// Builds and connects a raw `IggyClient` against `server` - for producing test data directly,
-/// independent of the `IggyBridge` under test. Mirrors `IggyBridge::connect`'s fluent-builder
-/// approach (not a hand-built connection string) purely so this test helper doesn't reintroduce
-/// the credential-escaping bug finding #4 fixes.
+/// independent of the `IggyBridge` under test. Uses the fluent builder, not a hand-built
+/// `iggy://user:pass@host` string: `ConnectionString` splits on `@` then `:`, which breaks for
+/// any password containing either character.
 async fn raw_client(server: &TestServer) -> IggyClient {
     let client = IggyClientBuilder::new()
         .with_tcp()

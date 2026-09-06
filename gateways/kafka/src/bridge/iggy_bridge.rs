@@ -287,8 +287,11 @@ impl IggyBridge {
             .partitions
             .iter()
             .find(|p| p.id == partition)
-            .ok_or(BridgeError::PartitionOutOfRange {
-                topic: topic_name.clone(),
+            .ok_or_else(|| BridgeError::PartitionOutOfRange {
+                // The Kafka-side name a caller (a future ListOffsets handler) actually asked
+                // about, not `topic_name` - a mapping override would otherwise quote the wrong
+                // (Iggy-side) name back at a Kafka client that never heard of it.
+                topic: kafka_topic.to_string(),
                 partition,
                 partitions_count: details.partitions_count,
             })?;

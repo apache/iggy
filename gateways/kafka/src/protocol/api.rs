@@ -45,10 +45,18 @@ pub const API_KEY_CREATE_TOPICS: i16 = 19;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
+/// Generic catch-all. Not sent by any stub response today; the `bridge` module's error mapping
+/// uses it for an `IggyError` with no closer Kafka analogue.
+pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 pub const ERROR_NONE: i16 = 0;
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 /// Retriable; Produce stub uses this until the Iggy bridge persists records.
 pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
+/// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
+///
+/// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
+/// misstate the failure point. Not sent by any stub response today.
+pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;

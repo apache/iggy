@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Iggy SDK integration layer (`#3533`).
+//! Iggy SDK integration layer.
 //!
 //! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning and
 //! high-watermark lookups, and translates Iggy errors to Kafka wire error codes. Not yet wired

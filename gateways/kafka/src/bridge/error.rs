@@ -19,17 +19,9 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_PARTITIONS, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
-
-/// Kafka's generic `UNKNOWN_SERVER_ERROR` (`-1`). Not in `protocol::api`'s `ERROR_*` set - that
-/// table only lists codes the foundation's stub responses actually send; this is the bridge's own
-/// catch-all for an `IggyError` variant with no closer Kafka analogue.
-const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
-/// Kafka's `TOPIC_AUTHORIZATION_FAILED`. Closest fit for an Iggy permission/credential rejection -
-/// there is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
-/// misstate the failure point.
-const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
 #[derive(Debug, Error)]

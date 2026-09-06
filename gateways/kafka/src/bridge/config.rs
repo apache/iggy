@@ -148,25 +148,6 @@ mod tests {
         );
     }
 
-    /// Every var `from_env` actually reads must be declared, or a future rename here silently
-    /// desyncs from the allowlist (as opposed to `KNOWN_ENV_VARS` listing a var this module
-    /// never reads, which the compiler can't catch either but is far less consequential).
-    #[test]
-    fn known_env_vars_covers_every_var_from_env_reads() {
-        for var in [
-            "IGGY_KAFKA_IGGY_ADDR",
-            "IGGY_KAFKA_IGGY_USERNAME",
-            "IGGY_KAFKA_IGGY_PASSWORD",
-            "IGGY_KAFKA_IGGY_STREAM",
-            "IGGY_KAFKA_TOPIC_MAP_PATH",
-        ] {
-            assert!(
-                IggyBridgeConfig::KNOWN_ENV_VARS.contains(&var),
-                "{var} read by from_env() but missing from KNOWN_ENV_VARS"
-            );
-        }
-    }
-
     #[test]
     #[serial]
     fn from_env_rejects_missing_topic_map_file() {
