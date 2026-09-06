@@ -113,7 +113,7 @@ async fn load_offsets<T>(
             error!(?kind, name, "invalid consumer offset path");
             continue;
         };
-        let offset = match read_offset_file(&path, "consumer offset").await {
+        let offset = match read_offset_file(&path, offset_kind_label(kind)).await {
             OffsetFileLoad::Loaded(offset) => offset,
             OffsetFileLoad::Removed => continue,
             OffsetFileLoad::Stranded => {
@@ -141,6 +141,13 @@ async fn remove_stale_replacement(path: &std::path::Path, name: &str) {
             "{COMPONENT} (error: {e}) - could not remove stale offset replacement \
              file: '{name}', skipping."
         ),
+    }
+}
+
+const fn offset_kind_label(kind: ConsumerKind) -> &'static str {
+    match kind {
+        ConsumerKind::Consumer => "consumer offset",
+        ConsumerKind::ConsumerGroup => "consumer group offset",
     }
 }
 

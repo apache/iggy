@@ -1729,6 +1729,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                consumer_offset_enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,

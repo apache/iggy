@@ -415,28 +415,24 @@ impl ConsumerOffsetCapacity {
         self.last_reclaim.replace(Some(epoch)) != Some(epoch)
     }
 
+    /// Keys this kind holds: the durable set plus every pending, active
+    /// provisional or stranded key the durable set does not already count.
     pub(crate) fn occupied(&self, durable: &DurableConsumerOffsets) -> usize {
         let pending = self.pending.borrow();
         let provisional = self.provisional.borrow();
         let stranded = self.stranded.borrow();
+        let mut local: HashSet<u32> = pending.keys().copied().collect();
+        local.extend(
+            provisional
+                .iter()
+                .filter(|(_, token)| token.active.load(Ordering::Relaxed) > 0)
+                .map(|(id, _)| *id),
+        );
+        local.extend(stranded.iter().copied());
         durable.count(self.kind)
-            + pending
-                .keys()
-                .chain(
-                    provisional
-                        .iter()
-                        .filter(|(id, token)| {
-                            !pending.contains_key(id) && token.active.load(Ordering::Relaxed) > 0
-                        })
-                        .map(|(id, _)| id),
-                )
-                .chain(stranded.iter().filter(|id| {
-                    !pending.contains_key(id)
-                        && provisional
-                            .get(id)
-                            .is_none_or(|token| token.active.load(Ordering::Relaxed) == 0)
-                }))
-                .filter(|id| !durable.contains(self.kind, **id))
+            + local
+                .into_iter()
+                .filter(|id| !durable.contains(self.kind, *id))
                 .count()
     }
 }

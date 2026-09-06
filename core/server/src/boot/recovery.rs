@@ -122,6 +122,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                 iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
             ),
             enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
+            consumer_offset_enforce_fsync: config.partition.consumer_offset_enforce_fsync,
             validate_checksum: config.system.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,

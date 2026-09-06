@@ -266,19 +266,15 @@ pub async fn configure_consumer_offsets(
         }
     }
 
-    // Offset files follow the topic's own `enforce_fsync`: they are part of the
-    // same partition's durability story, and the global knob they used to read
-    // is gone.
-    let enforce_fsync = partition
-        .runtime_options()
-        .enforce_fsync
-        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
+    // Offset files have their own knob, not the topic's `enforce_fsync`: that
+    // one gates message and index writes, and syncing a 16-byte cursor on every
+    // commit costs milliseconds per commit for a file whose loss is a redelivery.
     partition.configure_consumer_offset_storage(
         consumer_offsets_path.clone(),
         consumer_group_offsets_path.clone(),
         consumer_offsets,
         consumer_group_offsets,
-        enforce_fsync,
+        config.partition.consumer_offset_enforce_fsync,
     );
     for consumer_id in recovered_consumers.stranded_ids {
         if partition.seed_stranded_consumer_offset(ConsumerKind::Consumer, consumer_id) {
@@ -1560,6 +1556,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                consumer_offset_enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,

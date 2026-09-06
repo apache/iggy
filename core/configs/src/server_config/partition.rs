@@ -183,6 +183,14 @@ pub struct PartitionConfig {
     #[serde(default = "default_consumer_offsets_max")]
     pub consumer_offsets_max: usize,
 
+    /// Whether consumer-offset files are written crash-safe: data-synced, then
+    /// renamed over the prior cursor, with the directory synced once per commit
+    /// walk. Independent of the topic's `enforce_fsync`, which governs message
+    /// and index files. Off, an offset file is rewritten in place with no sync
+    /// and a crash costs at most a redelivery from the last flushed cursor.
+    #[serde(default)]
+    pub consumer_offset_enforce_fsync: bool,
+
     /// Offsets claimed in the superblock ahead of the mint counter before an
     /// append, so a crash-restarted replica resumes above what it confirmed.
     /// One superblock write per block: lowering it raises the fsync rate,

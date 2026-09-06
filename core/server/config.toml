@@ -1040,6 +1040,17 @@ dedup_clients_max = 4096
 # Must be > 0 and <= 262144.
 consumer_offsets_max = 4096
 
+# Whether consumer-offset files are written crash-safe. On, every committed
+# offset store writes a sibling file, fdatasyncs it and renames it over the
+# prior cursor, and the offsets directory is fsynced once per commit walk before
+# any reply in that walk is sent. Independent of the topic's enforce_fsync,
+# which governs message and index files: a replicated partition
+# already gets its durability from the quorum, and a lost offset file costs at
+# most a redelivery from the last flushed cursor. Off, the file is rewritten in
+# place with no sync.
+# The environment override is IGGY_PARTITION_CONSUMER_OFFSET_ENFORCE_FSYNC.
+consumer_offset_enforce_fsync = false
+
 # How many offsets a partition claims in its superblock ahead of the mint
 # counter before it will append, so a crash-restarted replica resumes above
 # every offset it confirmed to a client instead of re-minting it for a different

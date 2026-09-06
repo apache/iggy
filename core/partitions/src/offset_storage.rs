@@ -40,7 +40,7 @@ pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
 pub const PURGE_GENERATION_FILE: &str = "purge.gen";
 
 /// Sibling name an atomic offset replacement writes before its rename lands.
-pub const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
+const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
 
 /// `[generation][created_revision]`, both LE u64.
 const PURGE_GENERATION_RECORD_SIZE: usize = 2 * OFFSET_SIZE;
@@ -109,15 +109,50 @@ pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
 
 /// Overwrite a consumer-offset file with `offset` and a checksum over it.
 ///
-/// Atomic replacement allocates a sibling inode and renames it over the prior
-/// file. The caller syncs the parent directory when durability is required.
-/// This costs more than an in-place write but preserves the prior cursor when
-/// writing the replacement fails.
+/// Without `enforce_fsync` the file is rewritten in place. With it, the record
+/// goes to a sibling inode, is data-synced and renamed over the prior file, so a
+/// failed write leaves the prior cursor intact. The replacement is tied to the
+/// same knob as the sync: without the sync neither the write nor the rename is
+/// ordered against a crash, so the extra inode and rename buy nothing. The
+/// caller syncs the parent directory afterwards.
 ///
 /// # Errors
 /// [`IggyError`] when the directory, file, or write cannot be created or completed.
 pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
-    replace_file(path, encode_offset_record(offset), enforce_fsync, false).await
+    let record = encode_offset_record(offset);
+    if enforce_fsync {
+        replace_file(path, record, true, false).await
+    } else {
+        write_in_place(path, record).await
+    }
+}
+
+async fn write_in_place<const N: usize>(path: &str, record: [u8; N]) -> Result<(), IggyError> {
+    create_parent_dir(path).await?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
+    file.write_all_at(record, 0)
+        .await
+        .0
+        .map_err(|_| IggyError::CannotWriteToFile)
+}
+
+async fn create_parent_dir(path: &str) -> Result<(), IggyError> {
+    // No `exists()` probe first: that is a BLOCKING `std::path` stat on the pump
+    // in front of every write, which serialises a batched fan-out on stats
+    // before it can submit any I/O. `create_dir_all` is already a no-op on an
+    // existing directory.
+    if let Some(parent) = Path::new(path).parent() {
+        create_dir_all(parent).await.map_err(|_| {
+            IggyError::CannotCreateConsumerOffsetsDirectory(parent.display().to_string())
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn stage_offset_replacement(path: &str, offset: u64) -> Result<(), IggyError> {
@@ -167,15 +202,7 @@ async fn write_replacement<const N: usize>(
     record: [u8; N],
     enforce_fsync: bool,
 ) -> Result<String, IggyError> {
-    // No `exists()` probe first: that is a BLOCKING `std::path` stat on the pump
-    // in front of every write, which serialises a batched fan-out on stats
-    // before it can submit any I/O. `create_dir_all` is already a no-op on an
-    // existing directory.
-    if let Some(parent) = Path::new(path).parent() {
-        create_dir_all(parent).await.map_err(|_| {
-            IggyError::CannotCreateConsumerOffsetsDirectory(parent.display().to_string())
-        })?;
-    }
+    create_parent_dir(path).await?;
 
     // Keep the previous cursor intact until the complete replacement exists.
     // A failed truncate-and-write otherwise turns a valid cursor into a torn
@@ -402,66 +429,6 @@ pub async fn delete_persisted_offset(path: &str) -> Result<bool, IggyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[compio::test]
-    #[ignore = "manual filesystem-dependent offset persistence measurement"]
-    async fn measure_offset_replacement_against_in_place_updates() {
-        const UPDATES: u64 = 1_000;
-        let dir = tempfile::tempdir().unwrap();
-        for enforce_fsync in [false, true] {
-            for replacement in [false, true] {
-                let path = dir
-                    .path()
-                    .join(format!("offset-{enforce_fsync}-{replacement}"));
-                let path = path.to_str().unwrap();
-                persist_offset(path, 0, enforce_fsync).await.unwrap();
-                let mut latencies = Vec::with_capacity(usize::try_from(UPDATES).unwrap());
-                let started = std::time::Instant::now();
-                for offset in 1..=UPDATES {
-                    let before = std::time::Instant::now();
-                    if replacement {
-                        persist_offset(path, offset, enforce_fsync).await.unwrap();
-                        if enforce_fsync {
-                            crate::state_transfer::fsync_dir(dir.path().to_str().unwrap())
-                                .await
-                                .unwrap();
-                        }
-                    } else {
-                        create_dir_all(dir.path()).await.unwrap();
-                        let mut file = OpenOptions::new()
-                            .write(true)
-                            .truncate(true)
-                            .open(path)
-                            .await
-                            .unwrap();
-                        file.write_all_at(encode_offset_record(offset), 0)
-                            .await
-                            .0
-                            .unwrap();
-                        if enforce_fsync {
-                            file.sync_data().await.unwrap();
-                        }
-                    }
-                    latencies.push(before.elapsed().as_nanos());
-                }
-                let elapsed = started.elapsed();
-                latencies.sort_unstable();
-                eprintln!(
-                    "replacement={replacement} fsync={enforce_fsync} updates={UPDATES} elapsed_us={} p50_ns={} p95_ns={}",
-                    elapsed.as_micros(),
-                    latencies[latencies.len() / 2],
-                    latencies[latencies.len() * 95 / 100]
-                );
-                assert!(matches!(
-                    read_offset_record(path).await.unwrap(),
-                    Some(OffsetRecord::Value {
-                        offset: UPDATES,
-                        ..
-                    })
-                ));
-            }
-        }
-    }
 
     fn unique_temp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

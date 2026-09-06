@@ -1643,6 +1643,8 @@ fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
 /// superblock pre-pass.
 const OFFSET_PERSIST_CONCURRENCY: usize = 16;
 const OFFSET_IO_ATTEMPTS: usize = 3;
+/// First retry delay of [`retry_offset_mutation`]; each further retry doubles it.
+const OFFSET_IO_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(10);
 
 async fn retry_offset_mutation<T, E: fmt::Debug, F: Future<Output = Result<T, E>>>(
     mut operation: impl FnMut() -> F,
@@ -1656,7 +1658,7 @@ async fn retry_offset_mutation<T, E: fmt::Debug, F: Future<Output = Result<T, E>
                     ?error,
                     "offset mutation failed, retrying after backoff"
                 );
-                compio::time::sleep(std::time::Duration::from_millis(10 << (attempt - 1))).await;
+                compio::time::sleep(OFFSET_IO_BACKOFF_BASE * (1 << (attempt - 1))).await;
             }
         }
     }
@@ -2907,7 +2909,7 @@ where
             // incoming entry, so a map-only sweep leaves the old table for boot
             // to resurrect.
             paths.extend(
-                strayed_offset_files(self.consumer_offsets_path.as_deref(), &[])
+                strayed_offset_files(self.consumer_offsets_path.as_deref())
                     .into_iter()
                     .filter_map(|path| {
                         numeric_offset_id(&path).map(|id| (ConsumerKind::Consumer, id, path))
@@ -2934,7 +2936,7 @@ where
                 .collect();
             guard.clear();
             paths.extend(
-                strayed_offset_files(self.consumer_group_offsets_path.as_deref(), &[])
+                strayed_offset_files(self.consumer_group_offsets_path.as_deref())
                     .into_iter()
                     .filter_map(|path| {
                         numeric_offset_id(&path).map(|id| (ConsumerKind::ConsumerGroup, id, path))
@@ -2957,14 +2959,32 @@ where
             .map(|(kind, id, path)| ((kind, id), path))
             .collect();
         for ((kind, consumer_id), path) in old_paths {
-            let removed = delete_persisted_offset(&path)
-                .await
-                .map_err(|source| PartitionInstallError::OffsetPersistence { path, source })?;
-            if removed {
-                offset_dirs_changed[consumer_kind_index(kind)] = true;
+            // Strand rather than fail: failing here fences the partition and
+            // re-pulls the same transfer against the same unlinkable file. A
+            // stranded key stays counted and admits a later delete, which is
+            // what the purge path does with the same fault.
+            match delete_persisted_offset(&path).await {
+                Ok(removed) => {
+                    if removed {
+                        offset_dirs_changed[consumer_kind_index(kind)] = true;
+                    }
+                    self.consumer_offset_capacity_for(kind)
+                        .clear_stranded(consumer_id);
+                }
+                Err(error) => {
+                    self.consumer_offset_capacity_for(kind)
+                        .record_stranded(consumer_id);
+                    tracing::warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = self.consensus().group(),
+                        path,
+                        consumer_id,
+                        %error,
+                        "install could not remove a superseded consumer offset file"
+                    );
+                }
             }
-            self.consumer_offset_capacity_for(kind)
-                .clear_stranded(consumer_id);
         }
         self.durable_consumer_offsets.clear();
         self.pending_consumer_offset_commits.clear();
@@ -3193,20 +3213,33 @@ where
             ),
         ] {
             let Some(dir) = dir else { continue };
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().is_ok_and(|kind| kind.is_file())
-                        && offset_replacement_id(&entry.file_name().to_string_lossy()).is_some()
-                        && let Err(error) = compio::fs::remove_file(entry.path()).await
-                    {
-                        tracing::warn!(path = %entry.path().display(), %error, "could not remove ignored offset replacement");
+            for entry in offset_dir_entries(dir) {
+                match entry {
+                    OffsetDirEntry::Replacement(path) => {
+                        if let Err(error) = compio::fs::remove_file(&path).await {
+                            tracing::warn!(
+                                path,
+                                %error,
+                                "could not remove an abandoned offset replacement"
+                            );
+                        }
                     }
-                }
-            }
-            for path in strayed_offset_files(Some(dir), &[]) {
-                retry_offset_mutation(|| delete_persisted_offset(&path)).await?;
-                if let Some(id) = numeric_offset_id(&path) {
-                    self.consumer_offset_capacity_for(kind).clear_stranded(id);
+                    OffsetDirEntry::Offset { id, path } => {
+                        // Same policy as install: an unlinkable file strands its
+                        // key instead of failing the converge and looping.
+                        match retry_offset_mutation(|| delete_persisted_offset(&path)).await {
+                            Ok(_) => self.consumer_offset_capacity_for(kind).clear_stranded(id),
+                            Err(error) => {
+                                self.consumer_offset_capacity_for(kind).record_stranded(id);
+                                tracing::warn!(
+                                    path,
+                                    consumer_id = id,
+                                    %error,
+                                    "converge could not remove a consumer offset file"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             if std::path::Path::new(dir).exists() {
@@ -3551,23 +3584,23 @@ pub fn offered_purge_generation(offsets_bytes: &[u8]) -> u64 {
         .unwrap_or_default()
 }
 
-/// Offset files under `dir` whose id is absent from `incoming`.
+/// One regular file of a consumer-offset directory, classified by name.
+enum OffsetDirEntry {
+    /// A sibling an atomic replacement left behind.
+    Replacement(String),
+    /// A bare-u32 offset file and its id.
+    Offset { id: u32, path: String },
+}
+
+/// The offset files and abandoned replacements under `dir`, in one pass.
 ///
-/// The install's own map cannot name these: a pre-purge offset op replayed by
-/// journal repair persists a file this incarnation never held, and a purged
-/// origin offers `next_offset = 0`, which drops every incoming entry. Left
-/// behind, boot hydrates them back.
-///
-/// A file whose name is not a bare u32 is left alone rather than guessed at:
-/// every offset file is named by its id, so anything else is not ours.
-pub(crate) fn strayed_offset_files(dir: Option<&str>, incoming: &[(u32, u64)]) -> Vec<String> {
-    let Some(dir) = dir else {
-        return Vec::new();
-    };
+/// A file whose name is neither a bare u32 nor a replacement sibling is left
+/// alone rather than guessed at: every offset file is named by its id, so
+/// anything else is not ours.
+fn offset_dir_entries(dir: &str) -> Vec<OffsetDirEntry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let incoming_ids: HashSet<u32> = incoming.iter().map(|(id, _)| *id).collect();
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -3575,8 +3608,28 @@ pub(crate) fn strayed_offset_files(dir: Option<&str>, incoming: &[(u32, u64)]) -
                 return None;
             }
             let name = entry.file_name().into_string().ok()?;
+            let path = format!("{dir}/{name}");
+            if offset_replacement_id(&name).is_some() {
+                return Some(OffsetDirEntry::Replacement(path));
+            }
             let id: u32 = name.parse().ok()?;
-            (!incoming_ids.contains(&id)).then(|| format!("{dir}/{name}"))
+            Some(OffsetDirEntry::Offset { id, path })
+        })
+        .collect()
+}
+
+/// Every offset file under `dir`.
+///
+/// The live map cannot name these: a pre-purge offset op replayed by journal
+/// repair persists a file this incarnation never held. Left behind, boot
+/// hydrates them back.
+pub(crate) fn strayed_offset_files(dir: Option<&str>) -> Vec<String> {
+    dir.map(offset_dir_entries)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            OffsetDirEntry::Offset { path, .. } => Some(path),
+            OffsetDirEntry::Replacement(_) => None,
         })
         .collect()
 }

@@ -4080,7 +4080,7 @@ where
             stats,
             consensus,
             partitions.config().segment_size,
-            partitions.config().enforce_fsync,
+            partitions.config().consumer_offset_enforce_fsync,
         );
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
