@@ -1347,6 +1347,28 @@ mod tests {
         );
     }
 
+    /// The integration test rebuilds this key by hand, because a sink cannot be
+    /// a cargo dependency of the test binary without colliding on the
+    /// `iggy_sink_*` FFI symbols. Pinning the literal here makes a format
+    /// change fail in this crate first.
+    #[test]
+    fn given_a_message_when_keyed_should_use_the_documented_format() {
+        let topic_metadata = TopicMetadata {
+            stream: "a:b".to_owned(),
+            topic: "topic".to_owned(),
+        };
+        let messages_metadata = MessagesMetadata {
+            partition_id: 3,
+            current_offset: 42,
+            schema: Schema::Json,
+        };
+
+        assert_eq!(
+            build_message_key(&topic_metadata, &messages_metadata, 42),
+            "3:a:b:5:topic:3:42"
+        );
+    }
+
     #[test]
     fn given_same_message_when_built_twice_should_produce_the_same_key() {
         let sink = DynamoDbSink::new(1, given_default_config());

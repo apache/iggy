@@ -69,7 +69,9 @@ async fn given_json_messages_when_sink_consumes_should_write_items(
         .map(|item| string_attribute(item, "iggy_id"))
         .collect::<HashSet<_>>();
     assert_eq!(keys.len(), payloads.len());
-    assert!(!keys.iter().any(|key| key.is_empty()));
+    for item in &items {
+        assert_eq!(string_attribute(item, "iggy_id"), expected_key(item));
+    }
     assert!(
         items
             .iter()
@@ -231,6 +233,24 @@ async fn send_messages(harness: &TestHarness, payloads: &[serde_json::Value]) {
         )
         .await
         .expect("send messages");
+}
+
+/// Rebuilds the key from the item's own metadata. The connector cannot be a
+/// cargo dependency here, because every sink exports the same `iggy_sink_*`
+/// FFI symbols and the test binary already links one. The format is pinned by
+/// `given_a_message_when_keyed_should_use_the_documented_format` in the sink,
+/// which fails first if it ever changes.
+fn expected_key(item: &HashMap<String, AttributeValue>) -> String {
+    let stream = seeds::names::STREAM;
+    let topic = seeds::names::TOPIC;
+    let partition_id = number_attribute(item, "iggy_partition_id");
+    let offset = number_attribute(item, "iggy_offset");
+
+    format!(
+        "{}:{stream}:{}:{topic}:{partition_id}:{offset}",
+        stream.len(),
+        topic.len()
+    )
 }
 
 fn string_attribute<'a>(item: &'a HashMap<String, AttributeValue>, field: &str) -> &'a str {
