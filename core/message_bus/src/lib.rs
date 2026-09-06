@@ -53,8 +53,9 @@
 //!   `Ready` on first poll. Consensus code relies on this for
 //!   reentrancy reasoning; any `.await` in the body breaks it.
 //! - The TCP transport's writer task coalesces up to
-//!   `MessageBusConfig::max_batch` (default 256) `Frozen<MESSAGE_ALIGN>`
-//!   into one `write_vectored_all`. Don't introduce per-message
+//!   `MessageBusConfig::max_batch` (default 256) [`BusMessage`] frames
+//!   (their `Frozen<MESSAGE_ALIGN>` fragments flattened, chunked at
+//!   `IOV_MAX`) into `write_vectored_all`. Don't introduce per-message
 //!   syscalls or per-message encryption on the plaintext TCP plane.
 //! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
 //!   connections have no dupable plaintext fd, so shard 0 terminates
@@ -279,7 +280,7 @@ pub type ReplicaForwardFn = Box<dyn Fn(u8, u16, Frozen<MESSAGE_ALIGN>) -> Result
 /// shift. `client_id` is carried so the receiver can rebuild the
 /// `ShardFrame::Lifecycle`'s `ForwardClientSend { client_id, msg }`
 /// payload.
-pub type ClientForwardFn = Box<dyn Fn(u128, u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
+pub type ClientForwardFn = Box<dyn Fn(u128, u16, BusMessage) -> Result<(), SendError>>;
 
 /// Callback invoked when a client connection metadata entry is removed.
 pub type ClientConnectionLostFn = std::rc::Rc<dyn Fn(u128)>;
@@ -496,10 +497,13 @@ pub type ConnectionLostFn = std::rc::Rc<dyn Fn(u8)>;
 ///
 /// A bus impl must preserve this divergence - see each method.
 pub trait MessageBus {
+    /// Queue one frame for `client_id`. Takes anything that converts into a
+    /// [`BusMessage`]: a single `Frozen<MESSAGE_ALIGN>` buffer or an
+    /// already fragmented frame.
     fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> impl Future<Output = Result<(), SendError>>;
 
     fn send_to_replica(
@@ -1261,7 +1265,7 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> impl Future<Output = Result<(), SendError>> {
         (**self).send_to_client(client_id, data)
     }
@@ -1313,11 +1317,12 @@ impl MessageBus for IggyMessageBus {
     async fn send_to_client(
         &self,
         client_id: u128,
-        message: Frozen<MESSAGE_ALIGN>,
+        message: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         if self.is_shutting_down() {
             return Err(SendError::BusShuttingDown);
         }
+        let message = message.into();
         // Owning shard is encoded in the top 16 bits of client_id.
         let owning_shard = client_id_owning_shard(client_id);
         if owning_shard == self.shard_id {
@@ -1357,9 +1362,9 @@ impl MessageBus for IggyMessageBus {
         // Fast path: this shard owns a connection to the replica. On no-slot
         // the registry returns the message unchanged so the slow path can
         // forward it via the inter-shard channel without a wasted clone.
-        let message = match self.replicas.try_send_or_return(replica, message) {
+        let message = match self.replicas.try_send_or_return(replica, message.into()) {
             Ok(send_result) => return send_result.map_err(map_try_send_err),
-            Err(message) => message,
+            Err(message) => message.into_contiguous(),
         };
         // Slow path: route via the inter-shard channel to the owning shard.
         // The shard-shared `owner_table` is the authoritative routing
@@ -1438,7 +1443,7 @@ pub const fn is_auto_commit_client(client_id: u128) -> bool {
 /// Shape-matches `Result::map_err` (takes the error by value) so it can be
 /// used directly as a function reference rather than a closure.
 #[allow(clippy::needless_pass_by_value)] // signature required by map_err
-fn map_try_send_err(e: async_channel::TrySendError<Frozen<MESSAGE_ALIGN>>) -> SendError {
+fn map_try_send_err(e: async_channel::TrySendError<BusMessage>) -> SendError {
     match e {
         async_channel::TrySendError::Full(_) => SendError::Backpressure,
         async_channel::TrySendError::Closed(_) => SendError::ConnectionClosed,
@@ -1448,9 +1453,10 @@ fn map_try_send_err(e: async_channel::TrySendError<Frozen<MESSAGE_ALIGN>>) -> Se
 /// Peek `ReplyHeader.request` (the originating request id) from a reply
 /// buffer at its fixed header offset. Only the in-process reply path calls
 /// this; the socket path never decodes.
-fn reply_request_id(reply: &Frozen<MESSAGE_ALIGN>) -> u64 {
+fn reply_request_id(reply: &BusMessage) -> u64 {
     const OFFSET: usize = std::mem::offset_of!(ReplyHeader, request);
     reply
+        .first()
         .as_slice()
         .get(OFFSET..OFFSET + std::mem::size_of::<u64>())
         .and_then(|bytes| bytes.try_into().ok())

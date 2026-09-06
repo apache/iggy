@@ -226,7 +226,11 @@ mod tests {
             ("name".to_string(), AvroValue::String("Alice".to_string())),
             ("age".to_string(), AvroValue::Int(30)),
         ]);
-        apache_avro::to_avro_datum(&schema, record).unwrap()
+        apache_avro::writer::datum::GenericDatumWriter::builder(&schema)
+            .build()
+            .unwrap()
+            .write_value_to_vec(record)
+            .unwrap()
     }
 
     #[test]

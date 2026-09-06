@@ -23,9 +23,32 @@ const WEB_ASSETS_PATH: &str = "web/build/static";
 const WEB_INDEX_FILE: &str = "web/build/static/index.html";
 
 fn main() -> Result<(), Box<dyn error::Error>> {
+    stub_libm_for_musl();
     verify_web_assets_if_enabled();
     emit_vergen_instructions()?;
     Ok(())
+}
+
+// Vendored `hwloc` references `cbrt`, which makes the linker pull in a
+// `libm`. musl folds the math functions into its `libc`, so the Rust
+// musl sysroot ships no `libm.a`. Without one, `-lm` falls through to
+// the host glibc's `libm.a`, whose `cbrt` needs glibc-internal
+// `__frexp`/`__ldexp` symbols that do not exist on musl, and the static
+// link fails. Drop an empty `libm.a` stub on the search path so `-lm`
+// resolves to nothing and `cbrt` is satisfied later by musl's own
+// `libc`. No effect on non-musl targets.
+fn stub_libm_for_musl() {
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {
+        return;
+    }
+
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR is set by cargo for build scripts");
+    let stub = PathBuf::from(&out_dir).join("libm.a");
+
+    // `!<arch>\n` is the canonical header of an empty `ar` archive.
+    std::fs::write(&stub, b"!<arch>\n").expect("write empty libm.a stub");
+
+    println!("cargo:rustc-link-search=native={out_dir}");
 }
 
 /// Returns the workspace root (iggy/), two levels up from core/server.

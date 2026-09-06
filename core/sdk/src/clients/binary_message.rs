@@ -37,6 +37,28 @@ impl MessageClient for IggyClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_strategy_for(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            &|_: u32| *strategy,
+            count,
+            auto_commit,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_strategy_for(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+    ) -> Result<PolledMessages, IggyError> {
         if count == 0 {
             return Err(IggyError::InvalidMessagesCount);
         }
@@ -45,12 +67,12 @@ impl MessageClient for IggyClient {
             .client
             .read()
             .await
-            .poll_messages(
+            .poll_messages_with_strategy_for(
                 stream_id,
                 topic_id,
                 partition_id,
                 consumer,
-                strategy,
+                strategy_for,
                 count,
                 auto_commit,
             )

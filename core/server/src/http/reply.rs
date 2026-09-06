@@ -33,12 +33,12 @@ use iggy_common::{
     ConsumerGroupDetails, IggyError, StreamDetails, TopicDetails, UserInfoDetails,
     eviction_reason_to_error,
 };
-use message_bus::BusMessage;
-use server_common::Message;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
+use crate::dispatch::login_error::LoginRegisterError;
 use crate::http::error::{PartitionWriteError, WriteError};
-use crate::login_register::LoginRegisterError;
+use crate::responses::reply_body;
 
 /// Discriminate a partition write reply. Partition replies carry no result
 /// section - a denial is empty-bodied and a committed body, where there is one,
@@ -60,7 +60,7 @@ use crate::login_register::LoginRegisterError;
 /// keeps that a single parse whose failure mode is already decided here, rather
 /// than a second one whose fallback would have to invent a body.
 pub(in crate::http) fn classify_partition_reply(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
 ) -> Result<ReplyHeader, PartitionWriteError> {
     let header = reply
         .as_slice()
@@ -93,7 +93,7 @@ pub(in crate::http) fn classify_partition_reply(
 /// `header` is the one [`classify_partition_reply`] graded, so this reads the
 /// body without re-deriving its extent.
 pub(in crate::http) fn send_confirmations(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
     header: &ReplyHeader,
 ) -> Option<SendMessagesResponse> {
     let body = partition_reply_body(reply, header);
@@ -115,7 +115,7 @@ pub(in crate::http) fn send_confirmations(
 /// A partition reply's body past the header, bounded by the header's `size`
 /// rather than by the buffer length: `size` is the frame's authoritative
 /// extent, and the typed decoders reject trailing bytes.
-fn partition_reply_body<'a>(reply: &'a BusMessage, header: &ReplyHeader) -> &'a [u8] {
+fn partition_reply_body<'a>(reply: &'a Frozen<MESSAGE_ALIGN>, header: &ReplyHeader) -> &'a [u8] {
     reply
         .as_slice()
         .get(HEADER_SIZE..header.size as usize)
@@ -145,33 +145,6 @@ pub(in crate::http) fn committed_payload(
         Some(code) => Err(WriteError::Rejected(IggyError::from_code(code))),
         None => Err(WriteError::Rejected(IggyError::InvalidCommand)),
     }
-}
-
-/// The transient variant of a reply-shaped pre-consensus rejection frame
-/// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
-/// for a committed outcome. Either transient means the op did not commit, so
-/// the write path must replay the same request id rather than grade it as a
-/// committed result or advance the session gate. The two codes are kept
-/// distinct because they exhaust differently: `TransientNotAccepted` never
-/// entered the pipeline and is safe to re-issue anywhere, while
-/// `TransientNotCommitted` may still commit and only a same-session same-id
-/// replay is safe.
-pub(in crate::http) fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
-    match result_code(reply_body(reply)) {
-        Some(code) if code == IggyError::TransientNotCommitted.as_code() => {
-            Some(IggyError::TransientNotCommitted)
-        }
-        Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
-            Some(IggyError::TransientNotAccepted)
-        }
-        _ => None,
-    }
-}
-
-/// The reply body past the generic header, bounded by the header's `size`.
-fn reply_body(reply: &Message<GenericHeader>) -> &[u8] {
-    let size = reply.header().size as usize;
-    reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default()
 }
 
 /// Decode the `GetStreamResponse` payload of a committed create-stream reply into
@@ -272,7 +245,7 @@ mod tests {
 
     use crate::responses::{
         NonReplicatedResponse, build_deny_reply, build_empty_reply, build_reply_from_bytes,
-        build_reply_with_body,
+        build_reply_with_body, transient_code,
     };
 
     use crate::http::wire::build_request_message;
@@ -362,7 +335,7 @@ mod tests {
         );
     }
 
-    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> BusMessage {
+    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> Frozen<MESSAGE_ALIGN> {
         reply.into_generic().into_frozen()
     }
 
@@ -486,7 +459,7 @@ mod tests {
         ));
     }
 
-    fn send_reply(body: &Bytes) -> BusMessage {
+    fn send_reply(body: &Bytes) -> Frozen<MESSAGE_ALIGN> {
         let prepare = PrepareHeader {
             command: Command::Prepare,
             operation: Operation::SendMessages,

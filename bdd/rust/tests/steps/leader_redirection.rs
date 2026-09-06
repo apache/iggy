@@ -17,6 +17,7 @@
 
 use crate::common::leader_context::LeaderContext;
 use crate::helpers::cluster;
+use crate::helpers::env::{root_password, root_username};
 use cucumber::{given, then, when};
 use iggy::prelude::*;
 use std::time::Duration;
@@ -160,7 +161,7 @@ async fn when_authenticate_root(world: &mut LeaderContext) {
             .unwrap_or_else(|| panic!("Client {} should be created", client_name));
 
         client
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .login_user(&root_username(), &root_password())
             .await
             .expect("Failed to login as root");
 

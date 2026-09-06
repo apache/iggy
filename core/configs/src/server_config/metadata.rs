@@ -100,7 +100,9 @@ pub struct MetadataConfig {
     /// Size of the metadata WAL's in-memory index, in slots (one
     /// committed-but-unsnapshotted op per slot). Headroom between forced
     /// checkpoints; more slots = rarer checkpoints, more memory, larger
-    /// per-checkpoint WAL rewrites.
+    /// per-checkpoint WAL rewrites. Reducing this for an existing data directory
+    /// is refused at boot when the live WAL suffix cannot fit without collisions;
+    /// restore the previous value to recover.
     pub journal_slots: usize,
 
     /// Slot count of the VSR client table: how many distinct clients

@@ -21,8 +21,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	"github.com/apache/iggy/foreign/go/client"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -52,10 +52,7 @@ type basicMessagingSteps struct{}
 
 func (s basicMessagingSteps) givenRunningServer(ctx context.Context) error {
 	c := getBasicMessagingCtx(ctx)
-	addr := os.Getenv("IGGY_TCP_ADDRESS")
-	if addr == "" {
-		addr = "127.0.0.1:8090"
-	}
+	addr := env.ServerAddress()
 	c.serverAddr = &addr
 	return nil
 }
@@ -80,7 +77,8 @@ func (s basicMessagingSteps) givenAuthenticationAsRoot(ctx context.Context) erro
 		return fmt.Errorf("error pinging client: %w", err)
 	}
 
-	if _, err = cli.LoginUser(ctx, "iggy", "iggy"); err != nil {
+	username, password := env.RootCredentials()
+	if _, err = cli.LoginUser(ctx, username, password); err != nil {
 		return fmt.Errorf("error logging in: %v", err)
 	}
 

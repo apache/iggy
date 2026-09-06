@@ -38,6 +38,7 @@ pub use certificates::generate_self_signed_certificate;
 pub use consensus_message::{
     ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
+    ResponseFragments,
 };
 pub use executor::create_shard_executor;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};

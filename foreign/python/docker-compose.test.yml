@@ -36,6 +36,7 @@ services:
     environment:
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_NODE_ADVERTISED_ADDRESS=iggy-server
       - IGGY_QUIC_ADDRESS=0.0.0.0:8080
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
       - IGGY_ROOT_USERNAME=iggy

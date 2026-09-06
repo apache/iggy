@@ -94,12 +94,9 @@ public sealed class VsrOperationTests
         Assert.True(VsrOperation.CreateTopicWithAssignments.IsInternal());
         Assert.True(VsrOperation.CreateTopicWithAssignments.IsMetadata());
         Assert.True(VsrOperation.CreateStream.IsMetadata());
-        Assert.False(VsrOperation.CreateStream.IsPartition());
-        Assert.True(VsrOperation.SendMessages.IsPartition());
         Assert.False(VsrOperation.SendMessages.IsMetadata());
 
-        // Resolved server-side to an internal truncate, so it is neither plane despite carrying a namespace.
-        Assert.False(VsrOperation.DeleteSegments.IsPartition());
+        // Resolved server-side to an internal truncate, so it is not metadata despite carrying a namespace.
         Assert.False(VsrOperation.DeleteSegments.IsMetadata());
     }
 

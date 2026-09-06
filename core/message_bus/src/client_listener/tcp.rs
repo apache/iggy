@@ -40,13 +40,13 @@ use tracing::{debug, error, info};
 ///
 /// # Errors
 ///
-/// Returns [`IggyError::CannotBindToSocket`] if the bind fails.
-#[allow(clippy::future_not_send)]
-pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
+/// Returns [`IggyError::CannotBindToSocket`] if the bind fails, or
+/// [`IggyError::IoError`] if listener configuration fails.
+pub fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
     // `SO_REUSEPORT` intentionally not set: only shard 0 binds the client
     // listener. The shard-0 coordinator round-robins accepts to owning
     // shards via `shard::LifecycleFrame::ClientConnectionSetup`.
-    bind_nodelay_listener(addr).await
+    bind_nodelay_listener(addr)
 }
 
 /// Run the client listener accept loop until the shutdown token fires. The

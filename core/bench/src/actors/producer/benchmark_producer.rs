@@ -256,7 +256,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
     ) {
         let mut summary_table = Table::new();
         summary_table
-            .load_preset(UTF8_FULL)
+            .load_style(UTF8_FULL)
             .set_content_arrangement(ContentArrangement::Dynamic);
 
         summary_table.add_row(vec![
@@ -279,7 +279,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
 
         let mut latency_table = Table::new();
         latency_table
-            .load_preset(UTF8_FULL)
+            .load_style(UTF8_FULL)
             .set_content_arrangement(ContentArrangement::Dynamic);
 
         latency_table.add_row(vec![
@@ -313,7 +313,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
     ) {
         let mut table = Table::new();
         table
-            .load_preset(UTF8_FULL)
+            .load_style(UTF8_FULL)
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_width(60);
 

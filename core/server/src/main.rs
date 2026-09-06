@@ -22,9 +22,7 @@ mod args;
 use args::Args;
 use clap::Parser;
 use configs::server::ServerConfig;
-use server::bootstrap::{
-    apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs,
-};
+use server::boot::{apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs};
 use server::server_error::ServerError;
 use server_common::log::Logging;
 use system_stats::capture_allowed_cpus;
@@ -98,7 +96,7 @@ fn main() -> Result<(), ServerError> {
     let joined = shards.join_all();
     #[cfg(feature = "systemd")]
     if let Err(error) = &joined {
-        server::systemd::notify_shutdown_failure(error);
+        server::boot::systemd::notify_shutdown_failure(error);
     }
     joined?;
     info!("server shutdown complete");

@@ -56,6 +56,9 @@ x-cluster-topology: &cluster-topology
   IGGY_ROOT_PASSWORD: iggy
   IGGY_CLUSTER_ENABLED: "true"
   IGGY_CLUSTER_NAME: test-cluster
+  # Keep role-specific scenarios on view 0 when a loaded CI runner delays
+  # one replica during startup.
+  IGGY_CLUSTER_HEARTBEAT_TIMEOUT: "30s"
   IGGY_CLUSTER_NODES_0_NAME: leader-node
   IGGY_CLUSTER_NODES_0_IP: 172.28.0.101
   IGGY_CLUSTER_NODES_0_REPLICA_ID: "0"
@@ -115,6 +118,9 @@ services:
 
   iggy-follower:
     <<: *cluster-node
+    depends_on:
+      iggy-leader:
+        condition: service_healthy
     command: [ "--replica-id", "1" ]
     healthcheck:
       test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "172.28.0.102:8092", "ping" ]

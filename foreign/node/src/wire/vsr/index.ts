@@ -20,11 +20,7 @@ import type { CommandResponse } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
 import { HEADER_SIZE, encodeRequestHeader } from './header.js';
-import {
-  Operation,
-  isPartition,
-  operationForCode,
-} from './operation.js';
+import { Operation, operationForCode } from './operation.js';
 import {
   deserializeLoginRegister,
   serializeLoginRegister,
@@ -80,9 +76,10 @@ export class VsrSession {
     } else {
       if (this.state.session === null)
         throw responseError(command, UNAUTHENTICATED);
-      request = isPartition(operation)
-        ? this.state.currentRequestId()
-        : this.state.nextRequestId();
+      // Partition ops consume an id too, even though no partition-plane dedup
+      // exists yet: dedup needs each send to carry a distinct number, and the
+      // metadata watermark tolerates the gaps.
+      request = this.state.nextRequestId();
       session = this.state.session;
     }
 

@@ -275,10 +275,11 @@ pub trait IcebergOps: Sync {
         &self,
         namespace: &str,
         table: &str,
+        partition_spec: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
         async move {
             let url = format!("{}/v1/namespaces/{namespace}/tables", self.catalog_url());
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "name": table,
                 "schema": {
                     "type": "struct",
@@ -292,6 +293,9 @@ pub trait IcebergOps: Sync {
                     ]
                 }
             });
+            if let Some(partition_spec) = partition_spec {
+                body["partition-spec"] = partition_spec;
+            }
 
             let response = self
                 .http_client()
@@ -431,6 +435,8 @@ pub struct SnapshotSummary {
     pub added_data_files: Option<String>,
     #[serde(rename = "added-records")]
     pub added_records: Option<String>,
+    #[serde(rename = "changed-partition-count")]
+    pub changed_partition_count: Option<String>,
 }
 
 impl IcebergOps for IcebergFixture {
@@ -502,6 +508,8 @@ fn create_http_client() -> HttpClient {
 
 pub const DEFAULT_NAMESPACE: &str = "test";
 pub const DEFAULT_TABLE: &str = "messages";
+/// Field id of the `active` column in the schema created by `IcebergOps::create_table`.
+const ACTIVE_FIELD_ID: i32 = 5;
 
 pub struct IcebergPreCreatedFixture {
     inner: IcebergFixture,
@@ -524,13 +532,61 @@ impl IcebergOps for IcebergPreCreatedFixture {
     }
 }
 
-#[async_trait]
-impl TestFixture for IcebergPreCreatedFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
+impl IcebergPreCreatedFixture {
+    async fn setup_with_partition_spec(
+        partition_spec: Option<serde_json::Value>,
+    ) -> Result<Self, TestBinaryError> {
         let inner = IcebergFixture::setup().await?;
 
         inner.create_namespace(DEFAULT_NAMESPACE).await?;
-        inner.create_table(DEFAULT_NAMESPACE, DEFAULT_TABLE).await?;
+        inner
+            .create_table(DEFAULT_NAMESPACE, DEFAULT_TABLE, partition_spec)
+            .await?;
+
+        Ok(Self { inner })
+    }
+}
+
+#[async_trait]
+impl TestFixture for IcebergPreCreatedFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Self::setup_with_partition_spec(None).await
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.inner.connectors_runtime_envs()
+    }
+}
+
+/// Same table as `IcebergPreCreatedFixture`, partitioned by identity(`active`).
+pub struct IcebergPartitionedTableFixture {
+    inner: IcebergPreCreatedFixture,
+}
+
+impl IcebergOps for IcebergPartitionedTableFixture {
+    fn catalog_url(&self) -> &str {
+        self.inner.catalog_url()
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        self.inner.http_client()
+    }
+}
+
+#[async_trait]
+impl TestFixture for IcebergPartitionedTableFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let partition_spec = serde_json::json!({
+            "spec-id": 0,
+            "fields": [{
+                "source-id": ACTIVE_FIELD_ID,
+                "field-id": 1000,
+                "name": "active",
+                "transform": "identity"
+            }]
+        });
+        let inner =
+            IcebergPreCreatedFixture::setup_with_partition_spec(Some(partition_spec)).await?;
 
         Ok(Self { inner })
     }

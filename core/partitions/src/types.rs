@@ -15,10 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::Operation;
 use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// A local commit that failed for an op the cluster had already committed.
+///
+/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// the op, its `commit_min` never advanced, and the next
+/// `advance_commit_min` would assert on the gap. Continuing would either
+/// serve a prefix the cluster has moved past or panic somewhere less
+/// legible, so the partition fences itself on this and the shard brings the
+/// server down through the ordinary shutdown path. Recorded rather than
+/// panicked because a panic on the pump task is swallowed by the runtime,
+/// which wedges every partition on the shard while the process reports
+/// healthy.
+#[derive(Debug, Clone)]
+pub struct FatalCommit {
+    pub namespace_raw: u64,
+    pub op: u64,
+    pub operation: Operation,
+}
 
 #[derive(Debug, Clone)]
 pub struct Fragment<const ALIGN: usize = 4096> {
@@ -55,6 +74,28 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
         } else {
             self.source.slice(self.start..self.end)
         }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.source[self.start..self.end]
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Whether this fragment refcounts `source`'s allocation (and thus keeps
+    /// all of it alive, not just the sliced window).
+    #[must_use]
+    pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
+        self.source.shares_allocation(source)
     }
 }
 
@@ -209,6 +250,34 @@ impl Default for PartitionOffsets {
 /// forever on a single dropped frame. The remaining window is re-requested
 /// from the serving peer.
 pub const REPAIR_RETRY_TICKS: u32 = 100;
+
+/// Consecutive stalled re-requests tolerated before a repair session is
+/// abandoned and re-armed against a different peer.
+///
+/// A session pins its peer, and `repair.is_some()` fences the sweep's detector
+/// and every edge-triggered arming site while it stands, so a peer that went
+/// away (or never was reachable, which the gap-stopped-primary rotation can
+/// pick) would wedge the group harder than having no session at all. Three
+/// rounds is ~3s at the default retry interval: long enough that an ordinary
+/// dropped frame is re-requested rather than re-targeted, short enough that a
+/// dead peer costs one debounce interval, not a view change.
+pub const REPAIR_MAX_STALL_RETRIES: u32 = 3;
+
+/// Committed ops one journal-driven commit walk applies before returning to the
+/// pump.
+///
+/// `commit_journal`'s journal half returns the whole resident
+/// `(commit_min, commit_max]` run, and applying it reaches a segment flush per
+/// batch with no await the pump can interleave: after a rejoin that is the
+/// entire backlog in one call, with the consensus tick stopped behind it. Every
+/// caller is re-driven (the shard sweep's walk backstop is level-triggered and
+/// stays true until the group drains), so a truncated walk resumes on the next
+/// tick instead of losing anything.
+///
+/// Sized as a batch big enough that an ordinary group drains in one pass and
+/// small enough that a full one cannot hold the pump for the view-change
+/// escalation window.
+pub const COMMIT_WALK_OPS_MAX: usize = 64;
 
 /// One in-flight journal-repair stream for a partition group.
 #[derive(Debug, Clone, Copy)]

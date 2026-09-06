@@ -33,6 +33,7 @@ on:
 
 permissions:
   contents: read
+  issues: read # listLabelsOnIssue, for the breaking:storage escape hatch
   security-events: write
   pull-requests: write
 
@@ -55,15 +56,62 @@ jobs:
         run: echo "No changes detected, skipping tests"
 
       # Rust
+      # `breaking:storage` is the documented escape hatch for a deliberate
+      # on-disk format change, which the compat check cannot pass by
+      # construction. The label has to be read live: pre-merge.yml does not
+      # subscribe to `labeled` (pr-triage-apply.yml writes S-* labels, so every
+      # triage write would re-run the whole gate), and a re-run replays the
+      # webhook-frozen `pull_request.labels` from the last push. The operator
+      # flow is "check fails, apply label, re-run", which the frozen payload
+      # cannot see. Paginated so a PR with more than 100 labels still resolves.
+      - name: Resolve breaking:storage escape hatch
+        id: storage_hatch
+        if: >-
+          startsWith(inputs.component, 'rust') &&
+          inputs.task == 'test-storage-compat' &&
+          github.event.pull_request.number
+        uses: actions/github-script@v9
+        with:
+          script: |
+            let skip = false;
+            try {
+              const labels = await github.paginate(
+                github.rest.issues.listLabelsOnIssue,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  per_page: 100,
+                },
+              );
+              skip = labels.some(l => l.name === 'breaking:storage');
+            } catch (e) {
+              // Fail toward running. A rate limit or a narrowed token must not
+              // wave an on-disk format break through as a green check.
+              core.warning(`listLabelsOnIssue failed (${e.status ?? e.code ?? 'network'}), running the check`);
+            }
+            core.info(`breaking:storage escape hatch: skip=${skip}`);
+            core.setOutput('skip', String(skip));
+
       - name: Run Rust task
-        if: startsWith(inputs.component, 'rust')
+        # Skipping the step (not the job) keeps the leg green so the pre-merge
+        # status roll-up stays reportable instead of pending.
+        if: >-
+          startsWith(inputs.component, 'rust') &&
+          steps.storage_hatch.outputs.skip != 'true'
         uses: ./.github/actions/rust/pre-merge
         with:
           task: ${{ inputs.task }}
           component: ${{ inputs.component }}
 
       - name: Upload coverage to Codecov
-        if: startsWith(inputs.component, 'rust') && startsWith(inputs.task, 'test-')
+        # test-storage-compat runs its own nextest invocation without llvm-cov,
+        # so it emits no codecov.json. Uploading an empty report under the
+        # `rust` flag would read as a coverage drop on the PR.
+        if: >-
+          startsWith(inputs.component, 'rust') &&
+          startsWith(inputs.task, 'test-') &&
+          inputs.task != 'test-storage-compat'
         uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

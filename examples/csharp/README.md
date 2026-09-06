@@ -16,7 +16,7 @@ You can also customize the server using environment variables:
 
 ```bash
 ## Example: Enable HTTP transport and set custom address
-IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
+IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server
 ```
 
 ## Basic Examples

@@ -162,16 +162,18 @@ public sealed class VsrHeaderTests
     }
 
     [Fact]
-    public void Encode_PartitionOpDoesNotAdvanceTheCounter()
+    public void Encode_PartitionOpConsumesADistinctId()
     {
         var session = BoundSession();
         var payload = VsrTestPayloads.SendMessagesToPartition(2, 3, 4);
 
-        var header = Encode(session, CommandCodes.SEND_MESSAGES_CODE, payload, out _);
+        var first = Encode(session, CommandCodes.SEND_MESSAGES_CODE, payload, out _);
+        Assert.Equal((byte)VsrOperation.SendMessages, first[VsrHeader.REQUEST_OPERATION_OFFSET]);
+        Assert.Equal(1UL, ReadUInt64(first, VsrHeader.REQUEST_ID_OFFSET));
 
-        Assert.Equal((byte)VsrOperation.SendMessages, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
-        Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
-        Assert.Equal(1UL, session.RequestCounter);
+        var second = Encode(session, CommandCodes.SEND_MESSAGES_CODE, payload, out _);
+        Assert.Equal(2UL, ReadUInt64(second, VsrHeader.REQUEST_ID_OFFSET));
+        Assert.Equal(3UL, session.RequestCounter);
     }
 
     [Fact]

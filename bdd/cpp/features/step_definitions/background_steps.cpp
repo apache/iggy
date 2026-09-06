@@ -27,15 +27,20 @@
 #include <cucumber-cpp/autodetect.hpp>
 
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "world.hpp"
 
 namespace {
-std::string env_or(const char *name, const std::string &fallback) {
+std::string required_env(const char *name) {
     const char *value = std::getenv(name);
-    return value != nullptr ? std::string(value) : fallback;
+    if (value == nullptr || *value == '\0') {
+        throw std::runtime_error(std::string(name) +
+                                 " must be set; run the suite via scripts/run-bdd-tests.sh");
+    }
+    return std::string(value);
 }
 }  // namespace
 
@@ -44,7 +49,7 @@ GIVEN("^I have a running Iggy server$") {
 
     // Empty address makes the SDK fall back to its default TCP endpoint; in CI the address
     // is supplied via IGGY_TCP_ADDRESS (e.g. iggy-server:8090).
-    const std::string address = env_or("IGGY_TCP_ADDRESS", "");
+    const std::string address = required_env("IGGY_TCP_ADDRESS");
     iggy::ffi::IggyClientConfig config{};
     config.server_address     = address;
     iggy::ffi::Client *client = iggy::ffi::new_connection(std::move(config));
@@ -57,7 +62,7 @@ GIVEN("^I am authenticated as the root user$") {
     cucumber::ScenarioScope<bdd::GlobalContext> context;
     ASSERT_NE(context->client, nullptr);
 
-    const std::string username = env_or("IGGY_ROOT_USERNAME", "iggy");
-    const std::string password = env_or("IGGY_ROOT_PASSWORD", "iggy");
+    const std::string username = required_env("IGGY_ROOT_USERNAME");
+    const std::string password = required_env("IGGY_ROOT_PASSWORD");
     context->client->login_user(username, password);
 }

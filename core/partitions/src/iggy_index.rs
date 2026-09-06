@@ -17,6 +17,12 @@
 
 pub const IGGY_INDEX_SIZE: usize = std::mem::size_of::<u64>() * 3;
 
+/// One sparse index entry.
+///
+/// On disk it is the three fields as little-endian u64s in declaration
+/// order, `IGGY_INDEX_SIZE` bytes per entry. The server's segment recovery
+/// and the cluster crash tests decode that layout by hand (the `integration`
+/// crate does not depend on this one), so a change here must change them too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IggyIndex {
     pub offset: u64,

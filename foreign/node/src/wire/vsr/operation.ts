@@ -63,7 +63,6 @@ export const Operation = {
 
 const INTERNAL_START = 64;
 const METADATA_START = 128;
-const PARTITION_START = 160;
 
 /**
  * Replicated command code to `Operation` mapping, the client half of the
@@ -125,10 +124,6 @@ export const isMetadata = (operation: number): boolean => {
   return operation >= METADATA_START &&
     operation <= Operation.LeaveConsumerGroup;
 };
-
-/** Partition band is a bare range, mirroring `Operation::is_partition`. */
-export const isPartition = (operation: number): boolean =>
-  operation >= PARTITION_START;
 
 /** Whether a reply body leads with a committed result section. */
 export const isResultFramed = (operation: number): boolean =>

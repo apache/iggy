@@ -128,14 +128,9 @@ func (s *Session) NextRequestID() (uint64, error) {
 }
 
 // CurrentRequestID returns the watermark without advancing it. Non-replicated
-// and partition-plane requests use it because neither consults the client
-// table: non-replicated requests route by transport identity, and the
-// partition plane replicates in per-partition groups with no dedup table at
-// all. The table accepts any id above the watermark with no contiguity
-// requirement, so consuming one here would not gap anything; the invariant
-// that matters is that every partition request on a session carries the id
-// the next metadata operation will claim, and that a partition-plane replay
-// is therefore at-least-once.
+// requests use it because they never consult the client table: they route by
+// transport identity, and the table accepts any id above the watermark with
+// no contiguity requirement, so reading here gaps nothing.
 func (s *Session) CurrentRequestID() uint64 {
 	return s.requestCounter
 }

@@ -21,8 +21,10 @@ namespace Apache.Iggy.Vsr;
 
 /// <summary>
 ///     The 256-byte consensus header, read and written by wire offset. Offsets mirror
-///     <c>core/binary_protocol/src/consensus/header.rs</c>. Checksums stay zero: the server does not verify
-///     them for client frames.
+///     <c>core/binary_protocol/src/consensus/header.rs</c>. Checksums stay zero: the frame and body checksums
+///     are not read on the client request path, and <c>request_checksum</c> treats zero as unstamped, which
+///     opts out of the server's payload comparison. Stamping it is optional -- the Rust SDK does so for
+///     deduped operations, this SDK does not yet.
 /// </summary>
 internal static class VsrHeader
 {

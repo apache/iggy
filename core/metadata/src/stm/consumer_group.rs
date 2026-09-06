@@ -969,6 +969,7 @@ mod tests {
             IggyTimestamp::now(),
         );
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,

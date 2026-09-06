@@ -176,8 +176,11 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 		// The roster read runs while register holds the sign-in lock, so it must
 		// not enter the reconnect path: the reconnect's automatic sign-in would
 		// deadlock on that lock. The connect scope fails it fast instead.
-		redirect, err := c.HandleLeaderRedirection(
-			context.WithValue(ctx, connectScoped{}, struct{}{}))
+		c.mtx.Lock()
+		generation := c.connGeneration
+		c.mtx.Unlock()
+		redirect, err := c.redirectToLeader(
+			context.WithValue(ctx, connectScoped{}, struct{}{}), generation)
 		if err != nil || !redirect {
 			return settled, err
 		}
@@ -253,7 +256,24 @@ func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
 	return nil
 }
 
+// HandleLeaderRedirection moves the client to the leader the cluster roster
+// names, tearing down whichever connection it is on.
 func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, error) {
+	c.mtx.Lock()
+	generation := c.connGeneration
+	c.mtx.Unlock()
+	return c.redirectToLeader(ctx, generation)
+}
+
+// redirectToLeader moves the client to the leader, tearing down the
+// connection generation the redirect was decided on.
+//
+// A caller whose connection was replaced while the roster was being read has
+// nothing left to redirect: closing the replacement would strand the requests
+// running on it, and reporting a redirect would have the caller replay on a
+// node it never chose. It is told no redirect happened, and its re-attempt
+// reads the roster over the connection it now has.
+func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64) (bool, error) {
 	// Clone current address
 	c.mtx.Lock()
 	currentAddress := c.currentServerAddress
@@ -292,8 +312,13 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 	}
 	c.mtx.Unlock()
 
-	if err = c.disconnect(); err != nil {
+	torn, err := c.disconnectGeneration(generation)
+	if err != nil {
 		return false, err
+	}
+	if !torn {
+		c.logger.Debug("Dropping a redirect decided on a replaced connection.")
+		return false, nil
 	}
 
 	c.mtx.Lock()

@@ -37,7 +37,7 @@ bytes = { workspace = true }
 # Broker-role only: decodes requests and encodes responses. Default features also pull in
 # client-role codec paths and compression codecs (gzip/lz4/snappy/zstd) this gateway never
 # uses, since RecordBatch payloads stay opaque `Bytes` here.
-kafka-protocol = { version = "0.17", default-features = false, features = ["broker"] }
+kafka-protocol = { workspace = true }
 libc = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }

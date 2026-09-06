@@ -15,23 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::helpers::env::{follower_address, leader_address, server_address};
 use iggy::prelude::*;
-use std::env;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-/// Resolves server address based on role and port, checking environment variables first
+/// Resolves the server address for a role and port from the environment
 pub fn resolve_server_address(role: &str, port: u16) -> String {
     match (role.to_lowercase().as_str(), port) {
-        ("leader", 8091) => {
-            env::var("IGGY_TCP_ADDRESS_LEADER").unwrap_or_else(|_| "iggy-leader:8091".to_string())
-        }
-        ("follower", 8092) => env::var("IGGY_TCP_ADDRESS_FOLLOWER")
-            .unwrap_or_else(|_| "iggy-follower:8092".to_string()),
-        ("single", 8090) | (_, 8090) => {
-            env::var("IGGY_TCP_ADDRESS").unwrap_or_else(|_| "iggy-server:8090".to_string())
-        }
-        _ => format!("iggy-server:{}", port),
+        ("leader", 8091) => leader_address(),
+        ("follower", 8092) => follower_address(),
+        (_, 8090) => server_address(),
+        _ => panic!("no address mapping for role '{role}' on port {port}"),
     }
 }
 

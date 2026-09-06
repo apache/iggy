@@ -287,7 +287,9 @@ pub struct RequestHeader {
     /// catch a `request` number reused for a different operation: a retry that
     /// disagrees with the stamp of the cached reply is refused rather than
     /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison; the wire currently sends zero.
+    /// comparison. The Rust SDK stamps the ops the table dedups; partition and
+    /// non-replicated ops, and the other SDKs, leave it zero. The server
+    /// verifies any nonzero stamp before routing.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,

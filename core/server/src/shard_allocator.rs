@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `shard_allocator`: decide which CPU cores each shard lives on.
+//! Decide which CPU cores each shard lives on.
 //!
 //! The server makes many shards and wants each one to run on its own
-//! core so they do not fight over CPU time. This crate reads the
+//! core so they do not fight over CPU time. This module reads the
 //! operator's choice ([`CpuAllocation`] from the config), looks at the
 //! real machine with `hwloc`, and hands back one [`ShardInfo`] per
 //! shard. On Linux it also pins each shard's thread to its core and
@@ -97,7 +97,7 @@ pub struct NumaTopology {
 impl NumaTopology {
     /// Ask `hwloc` to read this machine's NUMA layout right now.
     /// Errors if hwloc fails or the machine reports no NUMA nodes.
-    pub fn detect() -> Result<NumaTopology, ShardingError> {
+    pub fn detect() -> Result<Self, ShardingError> {
         let topology =
             Topology::new().map_err(|e| ShardingError::TopologyDetection { msg: e.to_string() })?;
 
@@ -113,20 +113,19 @@ impl NumaTopology {
         let mut logical_cores_per_node = Vec::new();
 
         for node in numa_nodes {
-            let cpuset = node.cpuset().ok_or(ShardingError::TopologyDetection {
-                msg: "NUMA node has no CPU set".to_string(),
-            })?;
+            let cpuset = node
+                .cpuset()
+                .ok_or_else(|| ShardingError::TopologyDetection {
+                    msg: "NUMA node has no CPU set".to_string(),
+                })?;
 
             let logical_cores = cpuset.weight().unwrap_or(0);
 
             let physical_cores = topology
                 .objects_with_type(ObjectType::Core)
                 .filter(|core| {
-                    if let Some(core_cpuset) = core.cpuset() {
-                        !(cpuset & core_cpuset).is_empty()
-                    } else {
-                        false
-                    }
+                    core.cpuset()
+                        .is_some_and(|core_cpuset| !(cpuset & core_cpuset).is_empty())
                 })
                 .count();
 
@@ -153,15 +152,15 @@ impl NumaTopology {
         self.logical_cores_per_node.get(node).copied().unwrap_or(0)
     }
 
-    fn filter_physical_cores(&self, node_cpuset: CpuSet) -> CpuSet {
+    fn filter_physical_cores(&self, node_cpuset: &CpuSet) -> CpuSet {
         let mut physical_cpuset = CpuSet::new();
         for core in self.topology.objects_with_type(ObjectType::Core) {
             if let Some(core_cpuset) = core.cpuset() {
-                let intersection = node_cpuset.clone() & core_cpuset;
+                let intersection = node_cpuset & core_cpuset;
                 if !intersection.is_empty()
                     && let Some(first_cpu) = intersection.iter_set().min()
                 {
-                    physical_cpuset.set(first_cpu)
+                    physical_cpuset.set(first_cpu);
                 }
             }
         }
@@ -182,14 +181,16 @@ impl NumaTopology {
                 available: self.node_count,
             })?;
 
-        let cpuset_ref = node.cpuset().ok_or(ShardingError::TopologyDetection {
-            msg: format!("Node {} has no CPU set", node_id),
-        })?;
+        let cpuset_ref = node
+            .cpuset()
+            .ok_or_else(|| ShardingError::TopologyDetection {
+                msg: format!("Node {node_id} has no CPU set"),
+            })?;
 
         let cpuset = SpecializedBitmapRef::to_owned(&cpuset_ref);
 
         if avoid_hyperthread {
-            Ok(self.filter_physical_cores(cpuset))
+            Ok(self.filter_physical_cores(&cpuset))
         } else {
             Ok(cpuset)
         }
@@ -199,6 +200,8 @@ impl NumaTopology {
 /// One shard's home: which CPU cores it may run on, and which NUMA
 /// node its memory should sit near (`None` means do not pin memory).
 #[derive(Debug, Clone)]
+// The only readers are the Linux-gated bind paths below.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct ShardInfo {
     pub cpu_set: HashSet<usize>,
     pub numa_node: Option<usize>,
@@ -249,7 +252,7 @@ impl ShardInfo {
                 let node = topology
                     .objects_with_type(ObjectType::NUMANode)
                     .nth(node_id)
-                    .ok_or(ShardingError::InvalidNode {
+                    .ok_or_else(|| ShardingError::InvalidNode {
                         requested: node_id,
                         available: topology.objects_with_type(ObjectType::NUMANode).count(),
                     })?;
@@ -324,10 +327,7 @@ pub struct ShardAllocator {
 impl ShardAllocator {
     /// Build an allocator for the given choice. Only `NumaAware` reads
     /// the machine topology up front; the simpler modes do not.
-    pub fn new(
-        allocation: &CpuAllocation,
-        pin_cores: bool,
-    ) -> Result<ShardAllocator, ShardingError> {
+    pub fn new(allocation: &CpuAllocation, pin_cores: bool) -> Result<Self, ShardingError> {
         let topology = if matches!(allocation, CpuAllocation::NumaAware(_)) {
             let numa_topology = NumaTopology::detect()?;
 
@@ -353,7 +353,7 @@ impl ShardAllocator {
                 // quota-restricted process gets proportionally fewer shards.
                 let available_cpus = available_parallelism()
                     .map_err(|err| ShardingError::Other {
-                        msg: format!("Failed to get available_parallelism: {:?}", err),
+                        msg: format!("Failed to get available_parallelism: {err:?}"),
                     })?
                     .get();
 
@@ -431,7 +431,7 @@ impl ShardAllocator {
             }
             CpuAllocation::NumaAware(numa_config) => {
                 let topology = self.topology.as_ref().ok_or(ShardingError::NoTopology)?;
-                let assignments = self.compute_numa_assignments(topology, numa_config)?;
+                let assignments = Self::compute_numa_assignments(topology, numa_config)?;
 
                 if !self.pin_cores {
                     tracing::warn!(
@@ -446,7 +446,6 @@ impl ShardAllocator {
     }
 
     fn compute_numa_assignments(
-        &self,
         topology: &NumaTopology,
         numa: &NumaConfig,
     ) -> Result<Vec<ShardInfo>, ShardingError> {

@@ -31,6 +31,8 @@ concurrency:
 
 permissions:
   contents: read
+  # listLabelsOnIssue in _test.yml, for the breaking:storage escape hatch
+  issues: read
   security-events: write
   pull-requests: write
 

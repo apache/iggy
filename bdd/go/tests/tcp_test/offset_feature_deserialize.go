@@ -21,6 +21,7 @@ import (
 	"context"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
@@ -175,7 +176,10 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			consumer := iggcon.NewGroupConsumer(randomU32Identifier())
 			partitionId := uint32(1)
 
-			offset, err := client.GetConsumerOffset(
+			// An unresolved stream is an addressing error, not a fresh
+			// consumer: a nil offset would let a typo'd or deleted target read
+			// back as "no offset stored" and silently reprocess.
+			_, err := client.GetConsumerOffset(
 				context.Background(),
 				consumer,
 				randomU32Identifier(),
@@ -183,8 +187,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 				&partitionId,
 			)
 
-			itShouldNotReturnError(err)
-			itShouldReturnNilOffsetForNewConsumerGroup(offset)
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 	})
 

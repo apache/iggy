@@ -8,7 +8,8 @@ To run any example, first start the server with
 
 ```bash
 # Using latest release
-docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 apache/iggy:latest
+docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
 
 # Or build from source (recommended for development)
 cd ../../ && cargo run --bin iggy-server
@@ -24,7 +25,7 @@ You can also customize the server using environment variables:
 
 ```bash
 ## Example: Enable HTTP transport and set custom address
-IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
+IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server
 ```
 
 and then install Python dependencies:

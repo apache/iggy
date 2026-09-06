@@ -84,7 +84,7 @@ impl CliCommand for GetConsumerGroupCmd {
 
         if consumer_group.members_count > 0 {
             let mut members_table = Table::new();
-            members_table.load_preset(ASCII_NO_BORDERS);
+            members_table.load_style(ASCII_NO_BORDERS);
             members_table.set_header(vec!["Member id", "Partitions count", "Partitions"]);
             for member in consumer_group.members {
                 members_table.add_row(vec![

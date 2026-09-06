@@ -18,8 +18,43 @@
 use crate::server_error::ServerError;
 use compio::fs::OpenOptions;
 use compio::io::AsyncWriteAtExt;
+use configs::cluster::TransportPorts;
 use configs::server::ServerConfig;
 use std::net::SocketAddr;
+
+/// Every listener the server bound, as the OS reports it (`None` = not bound
+/// on this node).
+#[derive(Default)]
+pub struct BoundAddresses {
+    pub tcp: Option<SocketAddr>,
+    pub tcp_tls: Option<SocketAddr>,
+    pub quic: Option<SocketAddr>,
+    pub websocket: Option<SocketAddr>,
+    pub http: Option<SocketAddr>,
+    pub replica: Option<SocketAddr>,
+}
+
+impl BoundAddresses {
+    /// The listener a client's `tcp.address` reaches: the TLS one occupies the
+    /// configured tcp slot, as the WSS one occupies the websocket slot.
+    pub fn client_tcp(&self) -> Option<SocketAddr> {
+        self.tcp_tls.or(self.tcp)
+    }
+}
+
+/// The bound listeners as the roster ports the cluster metadata and
+/// `current_config.toml` publish.
+impl From<&BoundAddresses> for TransportPorts {
+    fn from(bound: &BoundAddresses) -> Self {
+        Self {
+            tcp: bound.client_tcp().map(|addr| addr.port()),
+            quic: bound.quic.map(|addr| addr.port()),
+            http: bound.http.map(|addr| addr.port()),
+            websocket: bound.websocket.map(|addr| addr.port()),
+            tcp_replica: bound.replica.map(|addr| addr.port()),
+        }
+    }
+}
 
 /// Write the runtime `current_config.toml` file with the effective bound ports.
 ///
@@ -30,25 +65,24 @@ use std::net::SocketAddr;
 pub async fn write_current_config(
     config: &ServerConfig,
     current_replica_id: Option<u8>,
-    bound_tcp: Option<SocketAddr>,
-    bound_replica: Option<SocketAddr>,
-    bound_tcp_tls: Option<SocketAddr>,
-    bound_quic: Option<SocketAddr>,
-    bound_websocket: Option<SocketAddr>,
+    bound: &BoundAddresses,
 ) -> Result<(), ServerError> {
     let mut current_config = config.clone();
 
-    if let Some(bound_client_tcp) = bound_tcp_tls.or(bound_tcp) {
-        // Keep parity with the current server binary: integration harnesses
-        // read `tcp.address` from `runtime/current_config.toml` to discover
-        // the actual port chosen by the OS when binding to port 0.
+    if let Some(bound_client_tcp) = bound.client_tcp() {
+        // Integration harnesses read the `*.address` fields from
+        // `runtime/current_config.toml` to discover the actual port chosen by
+        // the OS when binding to port 0.
         current_config.tcp.address = bound_client_tcp.to_string();
     }
-    if let Some(bound_quic) = bound_quic {
+    if let Some(bound_quic) = bound.quic {
         current_config.quic.address = bound_quic.to_string();
     }
-    if let Some(bound_websocket) = bound_websocket {
+    if let Some(bound_websocket) = bound.websocket {
         current_config.websocket.address = bound_websocket.to_string();
+    }
+    if let Some(bound_http) = bound.http {
+        current_config.http.address = bound_http.to_string();
     }
 
     if current_config.cluster.enabled
@@ -60,18 +94,13 @@ pub async fn write_current_config(
             .iter_mut()
             .find(|node| node.replica_id == replica_id)
             .ok_or(ServerError::ClusterNodeNotFound { replica_id })?;
-        if let Some(bound_client_tcp) = bound_tcp_tls.or(bound_tcp) {
-            node.ports.tcp = Some(bound_client_tcp.port());
-        }
-        if let Some(bound_replica) = bound_replica {
-            node.ports.tcp_replica = Some(bound_replica.port());
-        }
-        if let Some(bound_quic) = bound_quic {
-            node.ports.quic = Some(bound_quic.port());
-        }
-        if let Some(bound_websocket) = bound_websocket {
-            node.ports.websocket = Some(bound_websocket.port());
-        }
+        // A transport this node did not bind keeps its configured port.
+        let bound_ports = TransportPorts::from(bound);
+        node.ports.tcp = bound_ports.tcp.or(node.ports.tcp);
+        node.ports.tcp_replica = bound_ports.tcp_replica.or(node.ports.tcp_replica);
+        node.ports.quic = bound_ports.quic.or(node.ports.quic);
+        node.ports.websocket = bound_ports.websocket.or(node.ports.websocket);
+        node.ports.http = bound_ports.http.or(node.ports.http);
     }
 
     let runtime_path = current_config.system.get_runtime_path();

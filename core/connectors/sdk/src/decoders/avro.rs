@@ -17,6 +17,7 @@
 
 use crate::{Error, Payload, Schema, StreamDecoder};
 use apache_avro::Schema as AvroSchema;
+use apache_avro::reader::datum::GenericDatumReader;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -134,10 +135,13 @@ impl AvroStreamDecoder {
         })?;
 
         let mut reader = payload;
-        let avro_value = apache_avro::from_avro_datum(schema, &mut reader, None).map_err(|e| {
-            error!("Failed to decode Avro datum: {}", e);
-            Error::CannotDecode(Schema::Avro)
-        })?;
+        let avro_value = GenericDatumReader::builder(schema)
+            .build()
+            .and_then(|datum_reader| datum_reader.read_value(&mut reader))
+            .map_err(|e| {
+                error!("Failed to decode Avro datum: {}", e);
+                Error::CannotDecode(Schema::Avro)
+            })?;
 
         if !reader.is_empty() {
             error!(
@@ -250,7 +254,11 @@ mod tests {
             ("name".to_string(), AvroValue::String("Alice".to_string())),
             ("age".to_string(), AvroValue::Int(30)),
         ]);
-        apache_avro::to_avro_datum(&schema, record).unwrap()
+        apache_avro::writer::datum::GenericDatumWriter::builder(&schema)
+            .build()
+            .unwrap()
+            .write_value_to_vec(record)
+            .unwrap()
     }
 
     #[test]

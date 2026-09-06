@@ -46,7 +46,7 @@
 use crate::harness::config::{IpAddrKind, TestServerConfig};
 use crate::harness::error::TestBinaryError;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -262,11 +262,7 @@ impl SlotGuard {
         let port = self.base_port + self.next_offset;
         self.next_offset += 1;
 
-        let ip: IpAddr = match ip_kind {
-            IpAddrKind::V4 => Ipv4Addr::LOCALHOST.into(),
-            IpAddrKind::V6 => Ipv6Addr::LOCALHOST.into(),
-        };
-        Ok(SocketAddr::new(ip, port))
+        Ok(SocketAddr::new(ip_kind.loopback(), port))
     }
 }
 

@@ -402,6 +402,11 @@ pub struct PartitionDiagEvent<'a> {
     pub message: &'static str,
     pub operation: Option<Operation>,
     pub op: Option<u64>,
+    /// This replica's sequencer position when the event fired. Set where `op`
+    /// alone cannot say which side of the frontier the frame landed on: a
+    /// prepare above it is a forward gap, one at or below it is a replay of an
+    /// op already sequenced.
+    pub sequence: Option<u64>,
     pub prepare_checksum: Option<u128>,
     pub reason: Option<&'a str>,
     pub error: Option<Cow<'a, str>>,
@@ -415,6 +420,7 @@ impl<'a> PartitionDiagEvent<'a> {
             message,
             operation: None,
             op: None,
+            sequence: None,
             prepare_checksum: None,
             reason: None,
             error: None,
@@ -430,6 +436,12 @@ impl<'a> PartitionDiagEvent<'a> {
     #[must_use]
     pub const fn with_op(mut self, op: u64) -> Self {
         self.op = Some(op);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_sequence(mut self, sequence: u64) -> Self {
+        self.sequence = Some(sequence);
         self
     }
 
@@ -469,6 +481,7 @@ fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
     let op = event.op.unwrap_or_default();
+    let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
     let reason = event.reason.unwrap_or("");
     let error = event.error.as_deref().unwrap_or("");
@@ -490,6 +503,7 @@ fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
         role = ctx.role.as_str(),
         operation,
         op,
+        sequence,
         prepare_checksum,
         reason,
         error,
@@ -501,6 +515,7 @@ fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
     let op = event.op.unwrap_or_default();
+    let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
     let reason = event.reason.unwrap_or("");
     let error = event.error.as_deref().unwrap_or("");
@@ -522,6 +537,7 @@ fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
         role = ctx.role.as_str(),
         operation,
         op,
+        sequence,
         prepare_checksum,
         reason,
         error,
@@ -533,6 +549,7 @@ fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
     let op = event.op.unwrap_or_default();
+    let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
     let reason = event.reason.unwrap_or("");
     let error = event.error.as_deref().unwrap_or("");
@@ -554,6 +571,7 @@ fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
         role = ctx.role.as_str(),
         operation,
         op,
+        sequence,
         prepare_checksum,
         reason,
         error,
@@ -565,6 +583,7 @@ fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
     let op = event.op.unwrap_or_default();
+    let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
     let reason = event.reason.unwrap_or("");
     let error = event.error.as_deref().unwrap_or("");
@@ -586,6 +605,7 @@ fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
         role = ctx.role.as_str(),
         operation,
         op,
+        sequence,
         prepare_checksum,
         reason,
         error,
@@ -597,6 +617,7 @@ fn emit_partition_diag_trace(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
     let op = event.op.unwrap_or_default();
+    let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
     let reason = event.reason.unwrap_or("");
     let error = event.error.as_deref().unwrap_or("");
@@ -618,6 +639,7 @@ fn emit_partition_diag_trace(event: &PartitionDiagEvent<'_>) {
         role = ctx.role.as_str(),
         operation,
         op,
+        sequence,
         prepare_checksum,
         reason,
         error,

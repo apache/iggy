@@ -339,7 +339,7 @@ public class HttpMessageStream : IIggyClient
 
             if (MessageEncryptor is not null)
             {
-                DecryptMessages(pollMessages.Messages, (uint)pollMessages.PartitionId);
+                DecryptMessages(pollMessages.Messages, pollMessages.PartitionId);
             }
 
             return pollMessages;
@@ -1003,7 +1003,7 @@ public class HttpMessageStream : IIggyClient
             _ => throw new FeatureUnavailableException()
         };
 
-        return Partitioning.PartitionId((int)partition);
+        return Partitioning.PartitionId(partition);
     }
 
     private void DecryptMessages(IReadOnlyList<MessageResponse> messages, uint partitionId)

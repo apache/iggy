@@ -25,15 +25,15 @@ public sealed class ConsumerGroupInfo
     /// <summary>
     ///     Stream identifier.
     /// </summary>
-    public required int StreamId { get; init; }
+    public required uint StreamId { get; init; }
 
     /// <summary>
     ///     Topic identifier.
     /// </summary>
-    public required int TopicId { get; init; }
+    public required uint TopicId { get; init; }
 
     /// <summary>
     ///     Consumer group identifier.
     /// </summary>
-    public required int GroupId { get; init; }
+    public required uint GroupId { get; init; }
 }

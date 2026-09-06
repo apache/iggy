@@ -61,13 +61,10 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		sessionID = session.SessionID()
 	default:
 		sessionID = session.SessionID()
-		if IsPartition(operation) {
-			// Partition operations replicate in per-partition groups that
-			// keep no client table, so there is nothing to deduplicate
-			// against: the watermark is read without being consumed and a
-			// partition-plane replay is at-least-once.
-			request = session.CurrentRequestID()
-		} else if request, err = session.NextRequestID(); err != nil {
+		// Partition operations consume an id too, even though no
+		// partition-plane dedup exists yet: dedup needs each send to carry a
+		// distinct number, and the metadata watermark tolerates the gaps.
+		if request, err = session.NextRequestID(); err != nil {
 			return err
 		}
 	}

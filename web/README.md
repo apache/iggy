@@ -25,7 +25,8 @@ The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, an
    ```
 
    ```sh
-   docker run -p 3000:3000 -p 8090:8090 apache/iggy:latest
+   docker run -p 3000:3000 -p 8090:8090 \
+     -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
    ```
 
 2. **Clone the repository:**

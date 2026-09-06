@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
+use iggy_common::{BinaryTransport, ConsumerGroupClientState};
 use integration::iggy_harness;
 use tokio::time::timeout;
 
@@ -156,6 +160,161 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
     }
 }
 
+// A member holding zero partitions gets an empty poll reply whose partition id
+// is the `NO_ASSIGNED_PARTITION` sentinel, so a caller can tell it from an
+// empty partition, which echoes its real id.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
+async fn given_member_holds_no_partitions_when_polled_should_report_no_assigned_partition(
+    harness: &TestHarness,
+) {
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    let mut clients = harness
+        .root_clients(2)
+        .await
+        .expect("Failed to create root clients");
+    let first_member = clients.remove(0);
+    let second_member = clients.remove(0);
+
+    first_member.create_stream(STREAM_NAME).await.unwrap();
+    first_member
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    first_member
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+
+    // The first member to join keeps the topic's only partition.
+    first_member
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    second_member
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+
+    let consumer = Consumer::group(group_id.clone());
+    let owner_poll = first_member
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            None,
+            &consumer,
+            &PollingStrategy::next(),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(owner_poll.messages.is_empty());
+    assert_eq!(
+        owner_poll.partition_id, 0,
+        "an empty poll of an owned partition must echo its id"
+    );
+
+    let surplus_poll = second_member
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            None,
+            &consumer,
+            &PollingStrategy::next(),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(surplus_poll.messages.is_empty());
+    assert_eq!(
+        surplus_poll.partition_id, NO_ASSIGNED_PARTITION,
+        "a member without partitions must report the sentinel"
+    );
+}
+
+// A member built with `do_not_auto_join_consumer_group()` relies on the caller for the join, so
+// polling must not wait for a join the consumer itself never performs.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
+async fn given_member_that_does_not_auto_join_when_joined_by_the_caller_should_receive_messages(
+    harness: &TestHarness,
+) {
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    let client = harness.new_client().await.expect("Failed to create client");
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+    let mut messages = vec![IggyMessage::from_str("message").unwrap()];
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    // Membership is per connection, so the join goes through the client the consumer uses.
+    client
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+
+    let mut consumer = client
+        .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
+        .unwrap()
+        .batch_length(1)
+        .do_not_auto_join_consumer_group()
+        .build();
+    consumer.init().await.unwrap();
+
+    let received = timeout(RESOLVE_TIMEOUT, consumer.next())
+        .await
+        .expect("a member joined by the caller must poll instead of waiting for a join")
+        .expect("consumer stream should remain open")
+        .expect("the member must receive the message from its assigned partition");
+    assert_eq!(received.message.payload, "message");
+}
+
 // End-to-end wire pin for the consumer-group join/leave error ladder. The
 // metadata STM unit tests pin the committed result codes; this pins that
 // the server actually emits them over the wire, so a client observes the same
@@ -251,4 +410,121 @@ fn assert_rejected(result: Result<(), IggyError>, expected_code: u32, context: &
         "{context}: expected wire error code {expected_code}, got {} ({error})",
         error.as_code(),
     );
+}
+
+// Membership is per connection: a reconnect registers a new client identity
+// that the coordinator knows as a member of nothing, so the transport must not
+// carry the old session's membership and assignment into the new one. Carried
+// over, the first poll would run against a stale assignment instead of
+// reporting the missing membership straight away.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
+async fn given_group_member_when_session_reset_should_forget_membership(harness: &TestHarness) {
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    let client = harness.new_client().await.expect("Failed to create client");
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+    client
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+
+    let consumer = Consumer::group(group_id.clone());
+    // The first group poll syncs the assignment, which is what registers the
+    // membership in the transport cache.
+    client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            None,
+            &consumer,
+            &PollingStrategy::next(),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let state = consumer_group_state(&client).await;
+    // The key the join and the group poll build from the same identifiers.
+    let key = format!("{stream_id}|{topic_id}|{group_id}");
+    assert!(
+        state.is_registered(&key),
+        "the sync must register the membership"
+    );
+    assert!(
+        state.has_assignment(&key),
+        "the sole member must hold the topic's only partition"
+    );
+
+    client.disconnect().await.unwrap();
+    // Reconnects through the transport rather than `IggyClient::connect`: the
+    // heartbeat the latter spawns re-syncs every registered group on its own,
+    // and this asserts on the reset alone.
+    client.client().read().await.connect().await.unwrap();
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+
+    assert!(
+        state.registered_groups().is_empty(),
+        "a reconnected client must not carry the old session's membership"
+    );
+    assert!(!state.is_registered(&key));
+    assert!(!state.has_assignment(&key));
+
+    // The new identity never joined, and the poll must say so instead of
+    // running against the old assignment.
+    let poll = client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            None,
+            &consumer,
+            &PollingStrategy::next(),
+            1,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(poll, Err(IggyError::ConsumerGroupMemberNotFound(..))),
+        "expected ConsumerGroupMemberNotFound for a poll without a rejoin, got {poll:?}"
+    );
+}
+
+/// The consumer-group cache lives on the transport `IggyClient` wraps.
+async fn consumer_group_state(client: &IggyClient) -> Arc<ConsumerGroupClientState> {
+    match &*client.client().read().await {
+        ClientWrapper::Tcp(client) => client.consumer_group_state(),
+        ClientWrapper::Quic(client) => client.consumer_group_state(),
+        ClientWrapper::WebSocket(client) => client.consumer_group_state(),
+        ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => {
+            panic!("the consumer-group cache is a binary-transport concern")
+        }
+    }
 }

@@ -45,4 +45,29 @@ public sealed class IdentifiersByteSerializationTests
         var val = Enumerable.Range(0, 500).Select(x => (byte)x).ToArray();
         Assert.Throws<ArgumentException>(() => Partitioning.EntityIdBytes(val));
     }
+
+    [Fact]
+    public void NumericIdentifier_WithNegativeValue_ShouldThrow()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => Identifier.Numeric(-1));
+    }
+
+    [Fact]
+    public void NumericIdentifier_IntAndUintOverloads_ProduceSameBytes()
+    {
+        Assert.Equal(Identifier.Numeric(42u).Value, Identifier.Numeric(42).Value);
+    }
+
+    [Fact]
+    public void PartitionId_WithNegativeValue_ShouldThrow()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => Partitioning.PartitionId(-1));
+    }
+
+    [Fact]
+    public void Consumer_WithNegativeId_ShouldThrow()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => Consumer.New(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => Consumer.Group(-1));
+    }
 }

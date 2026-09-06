@@ -428,10 +428,8 @@ func TestProtocolParity_OperationClassification(t *testing.T) {
 
 	internalStart := rustValues["CreateTopicWithAssignments"]
 	metadataStart := rustValues["CreateStream"]
-	partitionStart := rustValues["SendMessages"]
 	require.NotZero(t, internalStart)
 	require.NotZero(t, metadataStart)
-	require.NotZero(t, partitionStart)
 
 	for name, value := range rustValues {
 		operation := Operation(value)
@@ -442,7 +440,6 @@ func TestProtocolParity_OperationClassification(t *testing.T) {
 
 		assert.Equal(t, internal, IsInternal(operation), "IsInternal(%s)", name)
 		assert.Equal(t, metadata, IsMetadata(operation), "IsMetadata(%s)", name)
-		assert.Equal(t, value >= partitionStart, IsPartition(operation), "IsPartition(%s)", name)
 		assert.Equal(t, metadata || inResultFramedList, IsResultFramed(operation),
 			"IsResultFramed(%s)", name)
 		assert.True(t, IsKnownOperation(operation), "IsKnownOperation(%s)", name)

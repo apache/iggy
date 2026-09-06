@@ -41,6 +41,17 @@ public readonly struct Consumer
     /// <returns>Consumer instance</returns>
     public static Consumer New(int id)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(id);
+        return New((uint)id);
+    }
+
+    /// <summary>
+    ///     Creates a new regular consumer identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>Consumer instance</returns>
+    public static Consumer New(uint id)
+    {
         return new Consumer
         {
             ConsumerId = Identifier.Numeric(id),
@@ -68,6 +79,17 @@ public readonly struct Consumer
     /// <param name="id">Identifier value</param>
     /// <returns>Consumer instance</returns>
     public static Consumer Group(int id)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(id);
+        return Group((uint)id);
+    }
+
+    /// <summary>
+    ///     Creates a new consumer group identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>Consumer instance</returns>
+    public static Consumer Group(uint id)
     {
         return new Consumer
         {

@@ -88,7 +88,19 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     <c>RESYNC_REQUIRED_PARTITION_SENTINEL</c> (<c>u32::MAX</c>). The reply header carries no status for an
     ///     empty poll, so the sentinel is the only channel the coordinator has to ask for a re-sync.
     /// </summary>
-    private const int VsrResyncRequiredPartitionSentinel = -1;
+    private const uint VsrResyncRequiredPartitionSentinel = uint.MaxValue;
+
+    /// <summary>
+    ///     Shared empty poll result for a group member that currently owns no partition, carrying
+    ///     <see cref="PolledMessages.NoAssignedPartition" /> so a consumer can back off instead of re-polling at
+    ///     once. Same ownership rules as <see cref="EmptyPolledMessages" />.
+    /// </summary>
+    private static readonly PolledMessagesRental NoAssignedPartitionPolledMessages = new(EmptyMemoryOwner.Instance)
+    {
+        PartitionId = PolledMessages.NoAssignedPartition,
+        CurrentOffset = 0,
+        Messages = []
+    };
 
     /// <summary>
     ///     Shared empty poll result. An idle consumer loop returns one on every iteration, and the instance owns
@@ -158,7 +170,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 response.ServerVersion, response.ServerProtocolVersion);
             SetConnectionState(ConnectionState.Authenticated);
 
-            var authResponse = new AuthResponse((int)response.UserId, null);
+            var authResponse = new AuthResponse(response.UserId, null);
             if (IsConnecting)
             {
                 return authResponse;
@@ -227,7 +239,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 $"Partitioning kind {partitioning.Kind} cannot be resolved to a partition id.")
         };
 
-        return Partitioning.PartitionId((int)partition);
+        return Partitioning.PartitionId(partition);
     }
 
     private async ValueTask<uint> TopicPartitionCountAsync(Identifier streamId, Identifier topicId,
@@ -274,7 +286,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                         $"Client is not a member of consumer group {consumer.ConsumerId} on topic {topicId}.");
                 }
 
-                return EmptyPolledMessages;
+                return NoAssignedPartitionPolledMessages;
             }
 
             PolledMessagesRental? rental = null;
@@ -307,7 +319,9 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
         }
 
-        return EmptyPolledMessages;
+        // Running out of attempts mid-rebalance is not a failure: report it like a member that owns nothing
+        // yet, so the consumer backs off and polls again.
+        return NoAssignedPartitionPolledMessages;
     }
 
     /// <summary>

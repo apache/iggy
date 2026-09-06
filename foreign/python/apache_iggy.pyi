@@ -872,6 +872,27 @@ class IggyClient:
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
         """
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
+        """
     def login_user(
         self, username: builtins.str, password: builtins.str
     ) -> collections.abc.Awaitable[None]:
@@ -1033,27 +1054,6 @@ class IggyClient:
         Gets stream by id.
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
-        """
-    def describe_options(
-        self, scope: builtins.str
-    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
-        r"""
-        Describe the option catalog for a resource scope.
-
-        This is the discovery surface for the `options` argument on
-        `create_topic`/`update_topic`: a key outside the catalog is refused at
-        create, and the binary transports carry only the error code back.
-
-        Args:
-            scope: One of `"topic"`, `"stream"`, `"user"`.
-
-        Returns:
-            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
-            with no keys yet.
-
-        Raises:
-            ValueError: If the scope name is not one of the three above.
-            RuntimeError: If the request fails.
         """
     def create_topic(
         self,
@@ -1377,6 +1377,8 @@ class IggyClient:
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
+        `partition_id` is ignored for a consumer group: the member reads the partitions
+        the server assigns to it.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
         `AutoCommit` interval is negative, or if any of those except `poll_interval`
@@ -2103,8 +2105,8 @@ class Topic:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as `options`. These would have resolved differently under
-        another server configuration.
+        Same shape as `options`. These would have resolved differently
+        under another server configuration.
         """
 
 @typing.final
@@ -2168,8 +2170,8 @@ class TopicDetails:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as `options`. These would have resolved differently under
-        another server configuration.
+        Same shape as `options`. These would have resolved differently
+        under another server configuration.
         """
     @property
     def partitions(self) -> builtins.list[Partition]:

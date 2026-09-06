@@ -28,14 +28,19 @@ import org.apache.iggy.exception.IggyTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class VsrResponseHandlerTest {
+
+    private static final int LOGIN_USER_CODE = 38;
+    private static final int SEND_MESSAGES_CODE = 101;
 
     private final ConsensusSession session = new ConsensusSession();
     private final AtomicInteger evictions = new AtomicInteger();
@@ -252,6 +257,47 @@ class VsrResponseHandlerTest {
     }
 
     @Test
+    void shouldCorrelateASendInFlightAcrossReLogin() throws Exception {
+        // A re-login re-arms the session while an earlier send is still
+        // pending. Replies correlate by (operation, request id), so the first
+        // send of the new session must not claim the in-flight one's key:
+        // registering it would be refused and a late reply for the older send
+        // would be handed to the newer one.
+        VsrRequestEncoder encoder = new VsrRequestEncoder(session);
+        session.beginRegister();
+        session.bind(42);
+
+        CompletableFuture<ByteBuf> inFlight = new CompletableFuture<>();
+        long beforeLoginId = registerEncodedSend(encoder, inFlight);
+
+        ByteBuf loginPayload = loginUserPayload();
+        encoder.encode(channel.alloc(), LOGIN_USER_CODE, loginPayload).release();
+        loginPayload.release();
+        session.bind(43);
+
+        CompletableFuture<ByteBuf> afterLogin = new CompletableFuture<>();
+        long afterLoginId = registerEncodedSend(encoder, afterLogin);
+
+        assertThat(afterLoginId).isNotEqualTo(beforeLoginId);
+        assertThat(channel.isActive()).isTrue();
+
+        channel.writeInbound(
+                replyFrame(VsrOperation.SEND_MESSAGES, afterLoginId, Unpooled.wrappedBuffer(new byte[] {2})));
+        channel.writeInbound(
+                replyFrame(VsrOperation.SEND_MESSAGES, beforeLoginId, Unpooled.wrappedBuffer(new byte[] {1})));
+
+        ByteBuf inFlightResponse = inFlight.get();
+        ByteBuf afterLoginResponse = afterLogin.get();
+        try {
+            assertThat(inFlightResponse.readByte()).isEqualTo((byte) 1);
+            assertThat(afterLoginResponse.readByte()).isEqualTo((byte) 2);
+        } finally {
+            inFlightResponse.release();
+            afterLoginResponse.release();
+        }
+    }
+
+    @Test
     void shouldCorrelateRepliesForServerRewrittenOperations() throws Exception {
         int[][] rewrittenOperations = {
             {VsrOperation.CREATE_TOPIC, VsrOperation.CREATE_TOPIC_WITH_ASSIGNMENTS},
@@ -294,6 +340,32 @@ class VsrResponseHandlerTest {
         CompletableFuture<ByteBuf> future = new CompletableFuture<>();
         handler.registerRequest(future, operation, requestId);
         return future;
+    }
+
+    /**
+     * Encodes a partition send off the live session and registers it the way
+     * the connection does, returning the request id the encoder minted.
+     */
+    private long registerEncodedSend(VsrRequestEncoder encoder, CompletableFuture<ByteBuf> future) {
+        ByteBuf frame = encoder.encode(channel.alloc(), SEND_MESSAGES_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            handler.registerRequest(
+                    channel, frame, future, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), SEND_MESSAGES_CODE);
+            return VsrHeaders.readRequestId(frame);
+        } finally {
+            frame.release();
+        }
+    }
+
+    private static ByteBuf loginUserPayload() {
+        ByteBuf payload = Unpooled.buffer();
+        payload.writeByte(4);
+        payload.writeBytes("iggy".getBytes(StandardCharsets.UTF_8));
+        payload.writeByte(4);
+        payload.writeBytes("iggy".getBytes(StandardCharsets.UTF_8));
+        payload.writeIntLE(0);
+        payload.writeIntLE(0);
+        return payload;
     }
 
     private static ByteBuf emptyFrame() {

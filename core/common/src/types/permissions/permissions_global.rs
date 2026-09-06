@@ -219,7 +219,7 @@ impl From<GlobalPermissions> for Table {
     fn from(value: GlobalPermissions) -> Self {
         let mut table = Self::new();
 
-        table.load_preset(ASCII_NO_BORDERS);
+        table.load_style(ASCII_NO_BORDERS);
         table.set_header(vec!["Permission", "Value"]);
         table.add_row(vec![
             "Manage Servers",
@@ -264,7 +264,7 @@ impl From<&TopicPermissions> for Table {
     fn from(value: &TopicPermissions) -> Self {
         let mut table = Self::new();
 
-        table.load_preset(ASCII_NO_BORDERS);
+        table.load_style(ASCII_NO_BORDERS);
         table.set_header(vec!["Permission", "Value"]);
         table.add_row(vec![
             "Manage Topic",
@@ -288,7 +288,7 @@ impl From<&StreamPermissions> for Table {
     fn from(value: &StreamPermissions) -> Self {
         let mut table = Self::new();
 
-        table.load_preset(ASCII_NO_BORDERS);
+        table.load_style(ASCII_NO_BORDERS);
         table.set_header(vec!["Permission", "Value"]);
         table.add_row(vec![
             "Manage Stream",

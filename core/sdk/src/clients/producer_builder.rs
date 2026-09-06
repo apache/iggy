@@ -91,7 +91,7 @@ impl IggyProducerBuilder {
         Self { stream, ..self }
     }
 
-    /// Sets the stream name.
+    /// Sets the topic identifier.
     pub fn topic(self, topic: Identifier) -> Self {
         Self { topic, ..self }
     }
