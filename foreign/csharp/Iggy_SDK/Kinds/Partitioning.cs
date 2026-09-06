@@ -61,8 +61,19 @@ public readonly struct Partitioning
     /// <returns>Partitioning instance</returns>
     public static Partitioning PartitionId(int value)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(value);
+        return PartitionId((uint)value);
+    }
+
+    /// <summary>
+    ///     Creates a partitioning strategy that use a specific partition id.
+    /// </summary>
+    /// <param name="value">Partition id</param>
+    /// <returns>Partitioning instance</returns>
+    public static Partitioning PartitionId(uint value)
+    {
         var bytes = new byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
 
         return new Partitioning
         {

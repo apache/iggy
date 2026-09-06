@@ -37,6 +37,14 @@ publish = false
 # requests it. No production caller.
 simulator = []
 
+# Fault injection for the harness (`IggyPartition::inject_commit_failure`):
+# makes a local commit fail the way a full disk does, so the shard sweep's
+# fence path can be driven over an in-memory partition. Requested ONLY by
+# `core/simulator`'s dev-dependencies, which the v3 resolver keeps out of any
+# non-test build, so the branch it gates cannot reach a shipped binary the way
+# a `[dependencies]` feature would through unification.
+fault-injection = []
+
 [dependencies]
 ahash = { workspace = true }
 bytemuck = { workspace = true }

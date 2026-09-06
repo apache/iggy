@@ -141,7 +141,7 @@ public sealed class MessageBatchGoldenVectorTests
         using var rental =
             Mappers.BinaryMapper.MapRentedMessages(pollBody, EmptyMemoryOwner.Instance);
 
-        Assert.Equal(3, rental.PartitionId);
+        Assert.Equal(3u, rental.PartitionId);
         Assert.Equal(101ul, rental.CurrentOffset);
         Assert.Equal(2, rental.Messages.Count);
 

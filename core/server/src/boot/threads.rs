@@ -25,9 +25,11 @@ use crate::shard_allocator::{ShardAllocator, ShardInfo};
 use compio::runtime::ResumeUnwind;
 use configs::server::ServerConfig;
 use configs::sharding::{
-    INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
+    INBOX_CAPACITY_MAX, RECONCILE_PERIODIC_INTERVAL_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX,
+    SHUTDOWN_JOIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
+use metadata::AppliedFrontier;
 use partitions::FatalCommit;
 use server_common::executor::create_shard_executor;
 use shard::metrics::ShardMetrics;
@@ -35,7 +37,7 @@ use shard::{Receiver as ShardReceiver, Sender, ShardFrame, TaggedSender};
 use std::backtrace::Backtrace;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use std::{panic, thread};
 use tracing::{error, info, warn};
@@ -45,12 +47,12 @@ use tracing::{error, info, warn};
 /// Carries the cross-thread shutdown flag, one OS-thread `JoinHandle`
 /// per shard, and the first panic `install_panic_hook` recorded. The
 /// caller flips the flag via [`Self::install_ctrlc_handler`] and then
-/// drains every shard via [`Self::join_all`], bounded by `join_timeout`
-/// (`system.sharding.shutdown_join_timeout`).
+/// drains every shard via [`Self::join_all`], bounded by the shared
+/// `ShutdownDeadline` (`system.sharding.shutdown_join_timeout`).
 pub struct ShardHandles {
     pub(in crate::boot) shutdown_flag: Arc<AtomicBool>,
     pub(in crate::boot) shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)>,
-    pub(in crate::boot) join_timeout: Duration,
+    pub(in crate::boot) deadline: Arc<ShutdownDeadline>,
     pub(in crate::boot) first_panic: Arc<OnceLock<String>>,
 }
 
@@ -93,7 +95,9 @@ impl ShardHandles {
     /// deadline passes is abandoned (its `JoinHandle` dropped, the OS
     /// thread left to die with the process) and reported as
     /// [`ShardJoinFailureKind::Wedged`]: a wedged pump or listener must
-    /// not block process exit forever.
+    /// not block process exit forever. Shard 0 gets the peer-wait floor
+    /// as grace on top, because its `PeerExitWait` is allowed to hold the
+    /// metadata writer that long past a spent budget.
     ///
     /// # Errors
     ///
@@ -106,31 +110,32 @@ impl ShardHandles {
     /// compio's `spawn` caught, which no thread result can carry.
     pub fn join_all(self) -> Result<(), ServerError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
-        // Armed on the first poll that observes the shutdown flag, shared
-        // across all shards: one budget covers the whole drain, not one
-        // budget per shard.
-        let mut deadline: Option<Instant> = None;
         // Shards run thread-per-core with compio's blocking fallback pool
         // disabled, so an io_uring opcode the kernel lacks aborts every shard
         // with the same panic. Surface the actionable diagnostic once.
         let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
-            let Some(joined) = join_until_shutdown_deadline(
-                handle,
-                &self.shutdown_flag,
-                self.join_timeout,
-                &mut deadline,
-            ) else {
+            // Shard 0's `PeerExitWait` is allowed to overrun the budget by
+            // its floor, so its join has to tolerate the same overrun or a
+            // shutdown that correctly held the writer for a slow peer reports
+            // the shard that honoured the fence as wedged.
+            let grace = if shard_id == 0 {
+                self.deadline.peer_wait_floor
+            } else {
+                Duration::ZERO
+            };
+            let waited = self.deadline.budget.saturating_add(grace);
+            let Some(joined) =
+                join_until_shutdown_deadline(handle, &self.shutdown_flag, &self.deadline, grace)
+            else {
                 error!(
                     shard_id,
-                    waited = ?self.join_timeout,
+                    ?waited,
                     "shard thread still running at the shutdown join deadline; abandoning it"
                 );
                 failures.push(ShardJoinFailure {
                     shard_id,
-                    kind: ShardJoinFailureKind::Wedged {
-                        waited: self.join_timeout,
-                    },
+                    kind: ShardJoinFailureKind::Wedged { waited },
                 });
                 continue;
             };
@@ -217,28 +222,24 @@ pub(in crate::boot) fn install_panic_hook(shutdown_flag: Arc<AtomicBool>) -> Arc
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Join `handle`, waiting indefinitely while the server runs. The
-/// `join_timeout` clock starts only when `shutdown_flag` is observed set
-/// (arming the caller-shared `deadline` once, so all shards drain under
-/// ONE budget); a running server parked here for hours must never be
-/// mistaken for a wedged shard. `None` means the thread was still
-/// running at the post-shutdown deadline and the handle was dropped
-/// (the OS thread keeps running detached; process exit reaps it).
-/// `JoinHandle` has no timed join, so this polls `is_finished` at
-/// [`JOIN_POLL_INTERVAL`]; the closing `join()` on a finished thread
-/// returns immediately.
+/// budget clock starts only when `shutdown_flag` is observed set (arming
+/// the shared [`ShutdownDeadline`], so every shard join and shard 0's
+/// peer wait drain under ONE budget); a running server parked here for
+/// hours must never be mistaken for a wedged shard. `grace` extends this
+/// caller's share of the budget by an overrun the joined thread is allowed
+/// (shard 0's peer-wait floor). `None` means the thread was still running
+/// at the post-shutdown deadline and the handle was dropped (the OS thread
+/// keeps running detached; process exit reaps it). `JoinHandle` has no
+/// timed join, so this polls `is_finished` at [`JOIN_POLL_INTERVAL`]; the
+/// closing `join()` on a finished thread returns immediately.
 fn join_until_shutdown_deadline(
     handle: thread::JoinHandle<Result<(), ServerError>>,
     shutdown_flag: &AtomicBool,
-    join_timeout: Duration,
-    deadline: &mut Option<Instant>,
+    deadline: &ShutdownDeadline,
+    grace: Duration,
 ) -> Option<thread::Result<Result<(), ServerError>>> {
     while !handle.is_finished() {
-        if deadline.is_none() && shutdown_flag.load(Ordering::Relaxed) {
-            *deadline = Some(Instant::now() + join_timeout);
-        }
-        if let Some(deadline) = deadline
-            && Instant::now() >= *deadline
-        {
+        if shutdown_flag.load(Ordering::Relaxed) && deadline.remaining_with_grace(grace).is_zero() {
             return None;
         }
         thread::sleep(JOIN_POLL_INTERVAL);
@@ -273,9 +274,8 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
 /// spawn error instead of hanging on a wedged shard.
 pub(in crate::boot) fn join_partial_shard_survivors(
     shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)>,
-    join_timeout: Duration,
+    deadline: &ShutdownDeadline,
 ) {
-    let deadline = Instant::now() + join_timeout;
     let mut remaining = shard_threads;
     loop {
         let mut still_running = Vec::with_capacity(remaining.len());
@@ -288,7 +288,7 @@ pub(in crate::boot) fn join_partial_shard_survivors(
             }
         }
         remaining = still_running;
-        if remaining.is_empty() || Instant::now() >= deadline {
+        if remaining.is_empty() || deadline.remaining().is_zero() {
             break;
         }
         thread::sleep(JOIN_POLL_INTERVAL);
@@ -296,7 +296,7 @@ pub(in crate::boot) fn join_partial_shard_survivors(
     for (shard_id, _survivor) in remaining {
         error!(
             shard_id,
-            waited = ?join_timeout,
+            waited = ?deadline.budget,
             "survivor shard thread still running at the shutdown join deadline; abandoning it"
         );
     }
@@ -333,6 +333,199 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
+/// The single post-shutdown budget, shared by the main thread's shard
+/// joins and shard 0's peer wait.
+///
+/// Both waits are bounded by `system.sharding.shutdown_join_timeout` and
+/// they NEST: shard 0 cannot start waiting for its peers until its own
+/// drain returned, which is already inside the join budget. Arming one
+/// instant on first use, whichever wait gets there first, keeps the two
+/// inside one deadline instead of stacking two full budgets, so a
+/// correct shutdown cannot report shard 0 as wedged.
+///
+/// The two waits enforce different things, so the budget is shared but not
+/// fungible: the join bounds LIVENESS (process exit must not hang on a
+/// wedged shard) while the peer wait enforces SAFETY (the metadata writer
+/// must outlive every reader). `peer_wait_floor` is what keeps an exhausted
+/// join budget from cancelling the safety fence, and the joins in turn
+/// tolerate that floor as grace (see [`ShardHandles::join_all`]).
+pub(in crate::boot) struct ShutdownDeadline {
+    armed: OnceLock<Instant>,
+    budget: Duration,
+    peer_wait_floor: Duration,
+}
+
+impl ShutdownDeadline {
+    pub(in crate::boot) const fn new(budget: Duration, peer_wait_floor: Duration) -> Self {
+        Self {
+            armed: OnceLock::new(),
+            budget,
+            peer_wait_floor,
+        }
+    }
+
+    /// Time left in the shared budget plus `grace`, arming it on the first
+    /// call. Callers must only reach this once the shutdown flag is set: a
+    /// running server would otherwise start the clock.
+    fn remaining_with_grace(&self, grace: Duration) -> Duration {
+        self.armed
+            .get_or_init(|| Instant::now() + self.budget)
+            .checked_add(grace)
+            .map_or(Duration::MAX, |limit| {
+                limit.saturating_duration_since(Instant::now())
+            })
+    }
+
+    fn remaining(&self) -> Duration {
+        self.remaining_with_grace(Duration::ZERO)
+    }
+
+    /// How long shard 0 may block on its peers: what is left of the shared
+    /// budget, floored at a peer's whole exit (one poll interval to observe the
+    /// shutdown flag plus one drain budget) so a join that already spent the
+    /// budget cannot release the metadata writer while a peer still reads
+    /// through it. Only [`PeerExitWait::drop`]'s panic arm skips the fence.
+    fn remaining_for_peer_wait(&self) -> Duration {
+        self.remaining().max(self.peer_wait_floor)
+    }
+}
+
+/// Peer shards still running: each [`PeerExitGuard`] counts one out,
+/// [`PeerExitWait`] blocks shard 0 until the count is zero.
+///
+/// Shard 0 owns the metadata state machine's only write handle and every
+/// peer reads through handles that stop working the moment it drops, so
+/// the shard that owns the writer must outlive every reader on every exit
+/// but one: [`PeerExitWait::drop`] skips the wait while shard 0 is
+/// panicking, because parking an unwinding thread on a `Condvar` inside
+/// `runtime.block_on` would stall the `io_uring` driver, and a panic in
+/// shard 0's own pump can be exactly what the peers are blocked on. A
+/// peer mid-read then panics too; the first panic is already recorded and
+/// the process is going down either way.
+pub(in crate::boot) struct PeerExitCountdown {
+    running: Mutex<usize>,
+    all_exited: Condvar,
+}
+
+impl PeerExitCountdown {
+    pub(in crate::boot) const fn new(peers: usize) -> Self {
+        Self {
+            running: Mutex::new(peers),
+            all_exited: Condvar::new(),
+        }
+    }
+
+    /// Block until every peer has counted itself out or `timeout` elapses.
+    /// `Err` carries the number of peers still running at the deadline.
+    fn wait(&self, timeout: Duration) -> Result<(), usize> {
+        let (guard, _) = self
+            .all_exited
+            .wait_timeout_while(
+                self.running.lock().unwrap_or_else(PoisonError::into_inner),
+                timeout,
+                |running| *running > 0,
+            )
+            .unwrap_or_else(PoisonError::into_inner);
+        let running = *guard;
+        drop(guard);
+        if running == 0 { Ok(()) } else { Err(running) }
+    }
+
+    fn peer_exited(&self) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        *running = running.saturating_sub(1);
+        if *running == 0 {
+            self.all_exited.notify_all();
+        }
+    }
+
+    /// Count out peers that never spawned. The countdown is sized before the
+    /// spawn loop, so a failed `thread::Builder::spawn` leaves peers whose
+    /// [`PeerExitGuard`] will never exist: without this shard 0 waits out its
+    /// whole join budget for threads that were never there.
+    pub(in crate::boot) fn peers_never_spawned(&self, count: usize) {
+        for _ in 0..count {
+            self.peer_exited();
+        }
+    }
+}
+
+/// Counts one peer shard out of the [`PeerExitCountdown`] on drop.
+///
+/// Held by `run_shard_thread` from before the runtime exists, so it drops
+/// after the runtime and its tasks are gone: past that point nothing on
+/// the peer's thread can still read shard 0's metadata. Drop runs on every
+/// exit path, the error `?` returns and panic unwinds included.
+struct PeerExitGuard {
+    countdown: Arc<PeerExitCountdown>,
+}
+
+impl PeerExitGuard {
+    const fn new(countdown: Arc<PeerExitCountdown>) -> Self {
+        Self { countdown }
+    }
+}
+
+impl Drop for PeerExitGuard {
+    fn drop(&mut self) {
+        self.countdown.peer_exited();
+    }
+}
+
+/// Shard 0's side of the [`PeerExitCountdown`]: blocks on drop until every
+/// peer has exited, so whatever is declared before it outlives every
+/// peer's reads.
+///
+/// Flips the shutdown flag before waiting: a peer parked on its bus token
+/// only starts its drain once the flag is set, and the thread-level
+/// `ShutdownOnDrop` flips it only after `block_on` returns, which is after
+/// this wait. Bounded by [`ShutdownDeadline::remaining_for_peer_wait`] --
+/// what is left of the budget [`ShardHandles::join_all`] shares, but never
+/// less than one drain -- with the same abandon-and-log policy, so a wedged
+/// peer cannot hold shard 0 indefinitely while a spent join budget still
+/// cannot cut the wait to nothing.
+pub(in crate::boot) struct PeerExitWait {
+    countdown: Arc<PeerExitCountdown>,
+    shutdown_flag: Arc<AtomicBool>,
+    deadline: Arc<ShutdownDeadline>,
+}
+
+impl PeerExitWait {
+    pub(in crate::boot) const fn new(
+        countdown: Arc<PeerExitCountdown>,
+        shutdown_flag: Arc<AtomicBool>,
+        deadline: Arc<ShutdownDeadline>,
+    ) -> Self {
+        Self {
+            countdown,
+            shutdown_flag,
+            deadline,
+        }
+    }
+}
+
+impl Drop for PeerExitWait {
+    fn drop(&mut self) {
+        // The panic is the fault to report and `ShutdownOnDrop` still
+        // flips the flag for the peers; blocking an unwinding thread here
+        // would only delay it.
+        if thread::panicking() {
+            return;
+        }
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        let remaining = self.deadline.remaining_for_peer_wait();
+        if let Err(peers_running) = self.countdown.wait(remaining) {
+            warn!(
+                peers_running,
+                waited = ?remaining,
+                budget = ?self.deadline.budget,
+                "peer shards still running at the shutdown join deadline; \
+                 releasing shard 0 anyway"
+            );
+        }
+    }
+}
+
 /// Resolve the operator's `cpu_allocation` into concrete shard
 /// assignments plus the checked `u16` shard count.
 ///
@@ -363,10 +556,13 @@ pub(in crate::boot) fn resolve_shard_assignments(
 }
 
 /// Re-validate the runtime sharding knobs that the per-shard runtime
-/// consumes directly. Mirrors `ShardingConfig::validate` so a caller
-/// that built the config without running it (e.g. tests, embedded
-/// usage) cannot OOM at boot or wedge process exit with an out-of-range
-/// value.
+/// consumes directly: the two inbox capacities, the three shutdown
+/// durations and their ordering, and the reconcile tick. Mirrors
+/// `ShardingConfig::validate` for exactly those, so a caller that built the
+/// config without running it (e.g. tests, embedded usage) cannot OOM at
+/// boot, starve a core, or wedge process exit with an out-of-range value.
+/// `cpu_allocation` is not re-checked here - [`resolve_shard_assignments`]
+/// resolves it through the allocator and rejects it there.
 pub(in crate::boot) fn validate_sharding_runtime_knobs(
     sharding: &configs::sharding::ShardingConfig,
 ) -> Result<(), ServerError> {
@@ -406,6 +602,32 @@ pub(in crate::boot) fn validate_sharding_runtime_knobs(
             drain: drain_timeout,
         });
     }
+    let join_timeout = sharding.shutdown_join_timeout.get_duration();
+    if join_timeout > SHUTDOWN_JOIN_TIMEOUT_MAX {
+        return Err(ServerError::InvalidShutdownJoinTimeout {
+            value: join_timeout,
+            max: SHUTDOWN_JOIN_TIMEOUT_MAX,
+        });
+    }
+    // A join budget under the drain budget abandons shards mid-drain,
+    // interrupting the WAL fsync / replica drain, and now also cuts shard
+    // 0's peer wait short of the writer's last reader.
+    if join_timeout < drain_timeout {
+        return Err(ServerError::ShutdownJoinBelowDrain {
+            join: join_timeout,
+            drain: drain_timeout,
+        });
+    }
+    // Zero feeds `run_reconciler`'s sleep inside an unconditional loop, so the
+    // tick arm is ready every iteration and `reconcile_once` runs back to back,
+    // starving the pump on that core.
+    let reconcile_interval = sharding.reconcile_periodic_interval.get_duration();
+    if reconcile_interval.is_zero() || reconcile_interval > RECONCILE_PERIODIC_INTERVAL_MAX {
+        return Err(ServerError::InvalidReconcilePeriodicInterval {
+            value: reconcile_interval,
+            max: RECONCILE_PERIODIC_INTERVAL_MAX,
+        });
+    }
     Ok(())
 }
 
@@ -426,12 +648,19 @@ pub(in crate::boot) fn run_shard_thread(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
+    metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
+    peer_exit: Arc<PeerExitCountdown>,
+    shutdown_deadline: Arc<ShutdownDeadline>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
     // their bus shutdown instead of parking forever on `bus.token().wait()`.
     let mut shutdown_guard = ShutdownOnDrop::new(Arc::clone(&shutdown_flag));
+    // Declared before the runtime so it drops after it: a peer counts
+    // itself out only once no task of its runtime can read shard 0's
+    // metadata any more.
+    let _peer_exit_guard = (shard_id != 0).then(|| PeerExitGuard::new(Arc::clone(&peer_exit)));
 
     assignment
         .bind_cpu()
@@ -469,7 +698,10 @@ pub(in crate::boot) fn run_shard_thread(
             barrier,
             owner_table,
             roster_cells,
+            metadata_applied_frontier,
             shard_metrics_all,
+            peer_exit,
+            shutdown_deadline,
         ))
         .await
     });
@@ -649,6 +881,248 @@ mod tests {
         );
     }
 
+    #[test]
+    fn peer_exit_countdown_releases_the_waiter_once_every_peer_is_out() {
+        let countdown = Arc::new(PeerExitCountdown::new(2));
+        let guards: [PeerExitGuard; 2] =
+            std::array::from_fn(|_| PeerExitGuard::new(Arc::clone(&countdown)));
+        assert_eq!(
+            countdown.wait(Duration::from_millis(10)),
+            Err(2),
+            "two live peers must hold the waiter past a short deadline"
+        );
+        let peers: Vec<_> = guards
+            .into_iter()
+            .map(|guard| {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(20));
+                    drop(guard);
+                })
+            })
+            .collect();
+        assert_eq!(
+            countdown.wait(Duration::from_secs(30)),
+            Ok(()),
+            "the last guard drop must release the waiter"
+        );
+        for peer in peers {
+            peer.join()
+                .expect("peer thread dropped its guard without panicking");
+        }
+    }
+
+    #[test]
+    fn peer_exit_guard_counts_out_during_unwind() {
+        let countdown = Arc::new(PeerExitCountdown::new(1));
+        let guard = PeerExitGuard::new(Arc::clone(&countdown));
+        // `resume_unwind` skips the panic hook, so the unwind is silent.
+        let unwound = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _guard = guard;
+            panic::resume_unwind(Box::new("peer shard body panicked"));
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            countdown.wait(Duration::ZERO),
+            Ok(()),
+            "a guard dropped by a panic unwind must still count its peer out"
+        );
+    }
+
+    /// Stops a parked stand-in thread once the test's binding goes out of
+    /// scope. The joiner under test drops the `JoinHandle`, so the thread
+    /// cannot be joined back; flagging it keeps it from parking for the life
+    /// of the test binary.
+    struct ThreadStopper(Arc<AtomicBool>);
+
+    impl Drop for ThreadStopper {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A shard thread that never returns on its own: the stand-in for a
+    /// wedged pump that the deadline tests need.
+    fn spawn_wedged_shard() -> (thread::JoinHandle<Result<(), ServerError>>, ThreadStopper) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || -> Result<(), ServerError> {
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(JOIN_POLL_INTERVAL);
+                }
+                Ok(())
+            }
+        });
+        (handle, ThreadStopper(stop))
+    }
+
+    #[test]
+    fn peer_exit_wait_flips_the_flag_before_waiting() {
+        // Stands in for a peer parked on its bus token: it exits only once
+        // the shutdown flag is set, so a waiter that set the flag after
+        // waiting would sit out the whole budget.
+        let countdown = Arc::new(PeerExitCountdown::new(1));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let peer = thread::spawn({
+            let guard = PeerExitGuard::new(Arc::clone(&countdown));
+            let shutdown_flag = Arc::clone(&shutdown_flag);
+            move || {
+                while !shutdown_flag.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                drop(guard);
+            }
+        });
+        let started = Instant::now();
+        drop(PeerExitWait::new(
+            countdown,
+            Arc::clone(&shutdown_flag),
+            Arc::new(ShutdownDeadline::new(
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+            )),
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the waiter must not sit out its budget on a peer that waits for the flag"
+        );
+        assert!(shutdown_flag.load(Ordering::Relaxed));
+        peer.join()
+            .expect("peer thread dropped its guard without panicking");
+    }
+
+    #[test]
+    fn peer_exit_wait_gives_up_at_the_deadline() {
+        let countdown = Arc::new(PeerExitCountdown::new(1));
+        let _wedged_peer = PeerExitGuard::new(Arc::clone(&countdown));
+        // Degenerate budget == floor: the floor cannot extend the wait, so
+        // the abandon is bounded by the budget alone.
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+        drop(PeerExitWait::new(
+            countdown,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(ShutdownDeadline::new(timeout, timeout)),
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited >= timeout && waited < Duration::from_secs(5),
+            "a wedged peer must be abandoned at the deadline, waited {waited:?}"
+        );
+    }
+
+    /// Regression: the two waits nest (shard 0 cannot start waiting for its
+    /// peers until its own drain returned, already inside the join budget).
+    /// With a budget each, a clean shutdown reported shard 0 as wedged and
+    /// exited non-zero. What is left of the shared budget is what the peer
+    /// wait gets, whenever that clears the floor.
+    #[test]
+    fn peer_wait_inherits_the_shared_budget_above_its_floor() {
+        const BUDGET: Duration = Duration::from_secs(30);
+        const FLOOR: Duration = Duration::from_secs(10);
+        let deadline = ShutdownDeadline::new(BUDGET, FLOOR);
+        let inherited = deadline.remaining_for_peer_wait();
+        assert!(
+            inherited > FLOOR && inherited <= BUDGET,
+            "an unspent budget must be inherited, not replaced by the floor: {inherited:?}"
+        );
+    }
+
+    /// The other half of the same nesting: the join budget bounds LIVENESS
+    /// (process exit must not hang on a wedged shard) while this wait enforces
+    /// SAFETY (shard 0 owns the metadata write handle every peer reads
+    /// through). Funding the fence out of the join budget let an exit-latency
+    /// timeout cancel it: the drain spent the budget, `wait(ZERO)` returned
+    /// without blocking, and shard 0 dropped the writer under a live reader.
+    #[test]
+    fn peer_wait_honours_a_live_peer_past_a_spent_join_budget() {
+        const BUDGET: Duration = Duration::from_millis(20);
+        const FLOOR: Duration = Duration::from_millis(200);
+        let deadline = Arc::new(ShutdownDeadline::new(BUDGET, FLOOR));
+        let shutdown_flag = AtomicBool::new(true);
+        // Stands in for the slow drain that arms and then spends the shared
+        // budget before shard 0 can reach its peer wait.
+        let (wedged_shard, _stopper) = spawn_wedged_shard();
+        assert!(
+            join_until_shutdown_deadline(wedged_shard, &shutdown_flag, &deadline, Duration::ZERO)
+                .is_none(),
+            "the join must spend the budget it armed"
+        );
+        assert!(deadline.remaining().is_zero(), "the budget must be spent");
+
+        let countdown = Arc::new(PeerExitCountdown::new(1));
+        let _live_peer = PeerExitGuard::new(Arc::clone(&countdown));
+        let started = Instant::now();
+        drop(PeerExitWait::new(
+            countdown,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&deadline),
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited >= FLOOR,
+            "a spent join budget must not release the metadata writer while a peer still reads \
+             through it, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn peer_exit_wait_ignores_peers_that_never_spawned() {
+        // A failed spawn leaves peers with no guard to count them out; the
+        // one that did spawn must still be the only thing the waiter waits on.
+        let countdown = Arc::new(PeerExitCountdown::new(3));
+        countdown.peers_never_spawned(2);
+        let spawned = PeerExitGuard::new(Arc::clone(&countdown));
+        assert_eq!(
+            countdown.wait(Duration::from_millis(10)),
+            Err(1),
+            "the peer that did spawn must still hold the waiter"
+        );
+        drop(spawned);
+        assert_eq!(countdown.wait(Duration::ZERO), Ok(()));
+    }
+
+    #[test]
+    fn peer_exit_wait_with_no_peers_returns_at_once() {
+        let started = Instant::now();
+        drop(PeerExitWait::new(
+            Arc::new(PeerExitCountdown::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(ShutdownDeadline::new(
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+            )),
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a single-shard server has nobody to wait for"
+        );
+    }
+
+    #[test]
+    fn peer_exit_wait_never_blocks_an_unwinding_thread() {
+        let countdown = Arc::new(PeerExitCountdown::new(1));
+        let _still_running = PeerExitGuard::new(Arc::clone(&countdown));
+        let wait = PeerExitWait::new(
+            countdown,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(ShutdownDeadline::new(
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+            )),
+        );
+        let started = Instant::now();
+        let unwound = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _wait = wait;
+            panic::resume_unwind(Box::new("shard 0 body panicked"));
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a waiter dropped during unwind must return without waiting"
+        );
+    }
+
     #[compio::test]
     async fn pump_drain_timeout_is_not_reported_as_clean() {
         let mut config = ServerConfig::default();
@@ -711,19 +1185,15 @@ mod tests {
             thread::sleep(Duration::from_millis(300));
             Ok(())
         });
-        let mut deadline = None;
-        let joined = join_until_shutdown_deadline(
-            handle,
-            &shutdown_flag,
-            Duration::from_millis(20),
-            &mut deadline,
-        );
+        let deadline = ShutdownDeadline::new(Duration::from_millis(20), Duration::from_millis(20));
+        let joined =
+            join_until_shutdown_deadline(handle, &shutdown_flag, &deadline, Duration::ZERO);
         assert!(
             matches!(joined, Some(Ok(Ok(())))),
             "a running server must be awaited indefinitely, not abandoned as wedged"
         );
         assert!(
-            deadline.is_none(),
+            deadline.armed.get().is_none(),
             "the join deadline must not arm before the shutdown flag flips"
         );
     }
@@ -741,7 +1211,10 @@ mod tests {
         let handles = ShardHandles {
             shutdown_flag: Arc::new(AtomicBool::new(true)),
             shard_threads: vec![(0, handle)],
-            join_timeout: Duration::from_secs(1),
+            deadline: Arc::new(ShutdownDeadline::new(
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+            )),
             first_panic,
         };
         let error = handles
@@ -778,24 +1251,17 @@ mod tests {
     #[test]
     fn join_abandons_a_wedged_shard_after_the_shutdown_deadline() {
         let shutdown_flag = AtomicBool::new(true);
-        // Never finishes: stands in for a wedged pump. The thread leaks
-        // into the test process, which exits right after.
-        let handle = thread::spawn(|| -> Result<(), ServerError> {
-            loop {
-                thread::sleep(Duration::from_secs(1));
-            }
-        });
-        let mut deadline = None;
-        let joined = join_until_shutdown_deadline(
-            handle,
-            &shutdown_flag,
-            Duration::from_millis(100),
-            &mut deadline,
-        );
+        let (handle, _stopper) = spawn_wedged_shard();
+        let deadline = ShutdownDeadline::new(Duration::from_millis(100), Duration::from_millis(50));
+        let joined =
+            join_until_shutdown_deadline(handle, &shutdown_flag, &deadline, Duration::ZERO);
         assert!(
             joined.is_none(),
             "a shard still running past the post-shutdown budget must be abandoned"
         );
-        assert!(deadline.is_some(), "the deadline arms once the flag is set");
+        assert!(
+            deadline.armed.get().is_some(),
+            "the deadline arms once the flag is set"
+        );
     }
 }

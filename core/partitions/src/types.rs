@@ -251,6 +251,34 @@ impl Default for PartitionOffsets {
 /// from the serving peer.
 pub const REPAIR_RETRY_TICKS: u32 = 100;
 
+/// Consecutive stalled re-requests tolerated before a repair session is
+/// abandoned and re-armed against a different peer.
+///
+/// A session pins its peer, and `repair.is_some()` fences the sweep's detector
+/// and every edge-triggered arming site while it stands, so a peer that went
+/// away (or never was reachable, which the gap-stopped-primary rotation can
+/// pick) would wedge the group harder than having no session at all. Three
+/// rounds is ~3s at the default retry interval: long enough that an ordinary
+/// dropped frame is re-requested rather than re-targeted, short enough that a
+/// dead peer costs one debounce interval, not a view change.
+pub const REPAIR_MAX_STALL_RETRIES: u32 = 3;
+
+/// Committed ops one journal-driven commit walk applies before returning to the
+/// pump.
+///
+/// `commit_journal`'s journal half returns the whole resident
+/// `(commit_min, commit_max]` run, and applying it reaches a segment flush per
+/// batch with no await the pump can interleave: after a rejoin that is the
+/// entire backlog in one call, with the consensus tick stopped behind it. Every
+/// caller is re-driven (the shard sweep's walk backstop is level-triggered and
+/// stays true until the group drains), so a truncated walk resumes on the next
+/// tick instead of losing anything.
+///
+/// Sized as a batch big enough that an ordinary group drains in one pass and
+/// small enough that a full one cannot hold the pump for the view-change
+/// escalation window.
+pub const COMMIT_WALK_OPS_MAX: usize = 64;
+
 /// One in-flight journal-repair stream for a partition group.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairSession {

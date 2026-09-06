@@ -41,10 +41,10 @@ internal static class PermissionsFactory
                     PollMessages = Random.Shared.Next() % 2 == 0,
                     SendMessages = Random.Shared.Next() % 2 == 0
                 },
-            Streams = new Dictionary<int, StreamPermissions>
+            Streams = new Dictionary<uint, StreamPermissions>
             {
                 {
-                    Random.Shared.Next(1, 30), new StreamPermissions
+                    (uint)Random.Shared.Next(1, 30), new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,
                         ReadStream = Random.Shared.Next() % 2 == 0,
@@ -52,10 +52,10 @@ internal static class PermissionsFactory
                         ReadTopics = Random.Shared.Next() % 2 == 0,
                         PollMessages = Random.Shared.Next() % 2 == 0,
                         SendMessages = Random.Shared.Next() % 2 == 0,
-                        Topics = new Dictionary<int, TopicPermissions>
+                        Topics = new Dictionary<uint, TopicPermissions>
                         {
                             {
-                                Random.Shared.Next(1, 30),
+                                (uint)Random.Shared.Next(1, 30),
                                 new TopicPermissions
                                 {
                                     ManageTopic = Random.Shared.Next() % 2 == 0,
@@ -65,7 +65,7 @@ internal static class PermissionsFactory
                                 }
                             },
                             {
-                                Random.Shared.Next(31, 69),
+                                (uint)Random.Shared.Next(31, 69),
                                 new TopicPermissions
                                 {
                                     ManageTopic = Random.Shared.Next() % 2 == 0,
@@ -78,7 +78,7 @@ internal static class PermissionsFactory
                     }
                 },
                 {
-                    Random.Shared.Next(31, 69), new StreamPermissions
+                    (uint)Random.Shared.Next(31, 69), new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,
                         ReadStream = Random.Shared.Next() % 2 == 0,
@@ -95,7 +95,7 @@ internal static class PermissionsFactory
 
     internal static Permissions PermissionsFromBytes(byte[] bytes)
     {
-        var streamMap = new Dictionary<int, StreamPermissions>();
+        var streamMap = new Dictionary<uint, StreamPermissions>();
         var index = 0;
 
         var globalPermissions = new GlobalPermissions
@@ -116,8 +116,8 @@ internal static class PermissionsFactory
         {
             while (true)
             {
-                var streamId = BinaryPrimitives.ReadInt32LittleEndian(bytes[index..(index + 4)]);
-                index += sizeof(int);
+                var streamId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
+                index += sizeof(uint);
 
                 var manageStream = bytes[index++] == 1;
                 var readStream = bytes[index++] == 1;
@@ -125,14 +125,14 @@ internal static class PermissionsFactory
                 var readTopics = bytes[index++] == 1;
                 var pollMessagesStream = bytes[index++] == 1;
                 var sendMessagesStream = bytes[index++] == 1;
-                var topicsMap = new Dictionary<int, TopicPermissions>();
+                var topicsMap = new Dictionary<uint, TopicPermissions>();
 
                 if (bytes[index++] == 1)
                 {
                     while (true)
                     {
-                        var topicId = BinaryPrimitives.ReadInt32LittleEndian(bytes[index..(index + 4)]);
-                        index += sizeof(int);
+                        var topicId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
+                        index += sizeof(uint);
 
                         var manageTopic = bytes[index++] == 1;
                         var readTopic = bytes[index++] == 1;

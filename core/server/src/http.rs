@@ -232,6 +232,7 @@ pub fn start(
         in_flight_writes: Cell::new(0),
         forward,
         metrics: metrics::HttpMetrics::init(shard_metrics_all),
+        metadata_watermarks: Rc::default(),
     }));
     let app = router(
         state,

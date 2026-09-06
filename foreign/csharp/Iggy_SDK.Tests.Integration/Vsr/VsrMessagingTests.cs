@@ -49,7 +49,7 @@ public class VsrMessagingTests
 
         var polled = await PollAsync(client, streamName, 2);
         polled.Messages.Count.ShouldBe(5);
-        polled.PartitionId.ShouldBe(2);
+        polled.PartitionId.ShouldBe(2u);
 
         (await PollAsync(client, streamName, 1)).Messages.ShouldBeEmpty();
     }

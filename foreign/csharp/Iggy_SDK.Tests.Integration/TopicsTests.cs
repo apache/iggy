@@ -46,7 +46,6 @@ public class TopicsTests
             TimeSpan.FromMinutes(10), 2_000_000_000);
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.Name.ShouldBe("Test Topic");
         response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
@@ -86,7 +85,6 @@ public class TopicsTests
         var response = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.Numeric(0));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.Name.ShouldBe("Get Topic");
         response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
@@ -113,7 +111,6 @@ public class TopicsTests
             Identifier.String("Name Topic"));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Name.ShouldBe("Name Topic");
         response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
         response.Partitions!.Count().ShouldBe(2);
@@ -169,7 +166,6 @@ public class TopicsTests
             Identifier.String("Parts Topic"));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Name.ShouldBe("Parts Topic");
         response.Partitions!.Count().ShouldBe(3);
         response.Size.ShouldBeGreaterThan(0u);

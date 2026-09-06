@@ -762,6 +762,30 @@ where
         headers.iter().find(|header| header.op == op).copied()
     }
 
+    /// Whether `op` is resident, in O(log n) instead of `header_by_op`'s scan.
+    /// Callers that only need presence must use this: a miss is the common case
+    /// on the residency checks, and a miss is exactly when the scan walks the
+    /// whole vec.
+    ///
+    /// It answers off `op_to_storage_offset`, so it is `header_by_op(op).is_some()`
+    /// everywhere except INSIDE [`Self::append_with_meta`], which pushes the
+    /// header before the storage write and inserts the offset after it: a task
+    /// that interleaves at that await sees the header without the offset and is
+    /// answered `false`. Both are cleared together at every clear site
+    /// ([`Self::commit`], [`Self::evict_prefix`], the restore path), so that
+    /// window is the only divergence.
+    ///
+    /// The window is unreachable for this journal: `PartitionJournalMemStorage`
+    /// writes to memory and its `write_at` never yields, so no task can observe
+    /// the half-inserted state. That is what lets `apply_repaired_prepare` lean
+    /// on this for idempotence, where a false negative would re-journal an op
+    /// the log already holds. A future yielding `Storage` has to insert the
+    /// offset before the write, or move that check back to the header vec.
+    pub fn holds_op(&self, op: u64) -> bool {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        op_to_storage_offset.contains_key(&op)
+    }
+
     /// Presence and message-carrying shape of the repair window `(floor, to_op]`
     /// in ONE pass over the header vec.
     ///
@@ -842,27 +866,64 @@ where
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
-    /// stopping at the first missing op. A replication gap must not be skipped:
-    /// the caller advances `commit_min` strictly by one, so a hole would break
-    /// that contract. Headers are append-ordered, which is op-ascending on a
-    /// backup, so this is a single linear scan: drop ops below `from_op`, take
-    /// while contiguous, stop at the first gap or past `commit_max`.
-    pub fn committed_headers_from(&self, from_op: u64, commit_max: u64) -> Vec<PrepareHeader> {
+    /// stopping at the first missing op and at `limit` headers. A replication
+    /// gap must not be skipped: the caller advances `commit_min` strictly by
+    /// one, so a hole would break that contract.
+    ///
+    /// `limit` bounds what one caller commits in a single pass. The run is
+    /// re-derived from the caller's own `commit_min` every time, so a truncated
+    /// answer is resumed, not lost.
+    pub fn committed_headers_from(
+        &self,
+        from_op: u64,
+        commit_max: u64,
+        limit: usize,
+    ) -> Vec<PrepareHeader> {
         // Walk by OP, not by append position: after a rejoin the journal
         // interleaves live tail ops (which arrive while repair is still
         // streaming) with repaired window ops, so append order is no longer
         // op-ascending and a positional sequential scan would break at the
         // first interleave boundary forever.
-        let mut result = Vec::new();
-        let mut op = from_op;
-        while op <= commit_max {
-            let Some(header) = self.header_by_op(op) else {
-                break;
-            };
-            result.push(header);
-            op += 1;
+        //
+        // ONE pass over the headers, like `repaired_window_shape`, not a
+        // `header_by_op` probe per op: that probe is itself a linear scan, so
+        // probing walked the window against the whole vec, and the walk this
+        // feeds runs per group per tick over a rejoin's entire backlog.
+        if from_op > commit_max {
+            return Vec::new();
         }
-        result
+        let headers = unsafe { &*self.headers.get() };
+        // Sized off the RUN the caller asked for, capped by the headers that
+        // could possibly cover it. Sizing off `headers.len()` alone would make
+        // a one-op run allocate a slot per resident header, and `commit_max` is
+        // a cluster frontier this replica may be arbitrarily far below, so
+        // neither bound can be dropped. `saturating_add` because `commit_max`
+        // is `u64::MAX` on a saturated frontier, where `+ 1` would panic in
+        // debug and wrap to an empty span (a walk that never resumes) in
+        // release.
+        let span = (commit_max - from_op)
+            .saturating_add(1)
+            .min(limit as u64)
+            .min(headers.len() as u64);
+        // `span` is a `min` of two `usize`-derived values on a 64-bit target,
+        // so the narrowing is lossless; `slot` is then compared against it as
+        // a `u64` BEFORE any cast, so nothing depends on the cast to bound it.
+        #[allow(clippy::cast_possible_truncation)]
+        let span = span as usize;
+        let mut slots: Vec<Option<PrepareHeader>> = vec![None; span];
+        for header in headers {
+            if header.op < from_op || header.op - from_op >= span as u64 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = (header.op - from_op) as usize;
+            // First writer wins, matching the `header_by_op` probe this
+            // replaces (`find` returns the earliest match).
+            slots[slot].get_or_insert(*header);
+        }
+        // Stops at the first hole: a replication gap must not be skipped, or
+        // `advance_commit_min`'s sequential contract breaks.
+        slots.into_iter().map_while(|header| header).collect()
     }
 
     /// Oldest message offset still resident in the in-memory journal, if
@@ -1555,7 +1616,7 @@ mod tests {
 
         // Contiguous run from op 1 stops before the missing op 3 even though
         // op 4 is resident and within commit_max.
-        let run = journal.committed_headers_from(1, 4);
+        let run = journal.committed_headers_from(1, 4, usize::MAX);
         let ops: Vec<u64> = run.iter().map(|header| header.op).collect();
         assert_eq!(
             ops,
@@ -1564,8 +1625,18 @@ mod tests {
         );
 
         assert!(
-            journal.committed_headers_from(5, 4).is_empty(),
+            journal.committed_headers_from(5, 4, usize::MAX).is_empty(),
             "from_op past commit_max yields nothing"
+        );
+
+        // The limit truncates the run rather than skipping ahead in it, so the
+        // caller resumes at the op it stopped on.
+        let bounded = journal.committed_headers_from(1, 4, 1);
+        let ops: Vec<u64> = bounded.iter().map(|header| header.op).collect();
+        assert_eq!(ops, vec![1], "the limit must cut the run at its front");
+        assert!(
+            journal.committed_headers_from(1, 4, 0).is_empty(),
+            "a zero limit commits nothing"
         );
     }
 
