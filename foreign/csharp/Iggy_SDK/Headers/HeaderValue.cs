@@ -19,6 +19,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Headers;
 
@@ -42,8 +43,11 @@ public readonly struct HeaderValue
     /// </summary>
     /// <param name="value">Raw bytes</param>
     /// <returns></returns>
+    /// <exception cref="ArgumentException">Thrown when the value is empty or longer than 255 bytes.</exception>
     public static HeaderValue FromBytes(byte[] value)
     {
+        WireName.Validate(value.Length, nameof(value));
+
         return new HeaderValue
         {
             Kind = HeaderKind.Raw,
@@ -59,15 +63,13 @@ public readonly struct HeaderValue
     /// <exception cref="ArgumentException"></exception>
     public static HeaderValue FromString(string value)
     {
-        if (value.Length is 0 or > 255)
-        {
-            throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(value));
-        }
+        var bytes = Encoding.UTF8.GetBytes(value);
+        WireName.Validate(bytes.Length, nameof(value));
 
         return new HeaderValue
         {
             Kind = HeaderKind.String,
-            Value = Encoding.UTF8.GetBytes(value)
+            Value = bytes
         };
     }
 
