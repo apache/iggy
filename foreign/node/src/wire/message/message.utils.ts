@@ -131,7 +131,7 @@ let idPoolCursor = idPool.length; // past the end -> refill on first use
  *
  * @returns 16-byte buffer of random bytes owned by the caller
  */
-const mintMessageId = (): Buffer => {
+export const mintMessageId = (): Buffer => {
   if (idPoolCursor + MESSAGE_ID_SIZE > idPool.length) {
     randomFillSync(idPool);
     idPoolCursor = 0;
@@ -149,7 +149,7 @@ const mintMessageId = (): Buffer => {
  * @param id - Optional message ID
  * @returns 16-byte little-endian buffer containing a non-zero ID
  */
-const resolveMessageId = (id?: MessageIdKind): Buffer => {
+export const resolveMessageId = (id?: MessageIdKind): Buffer => {
   // An absent or zero id mints a random one.
   if (id === undefined || id === 0 || id === 0n)
     return mintMessageId();
