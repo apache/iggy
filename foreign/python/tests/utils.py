@@ -82,16 +82,6 @@ def get_quic_server_config() -> tuple[str, int]:
     return get_transport_config("IGGY_SERVER_QUIC_PORT", 8080)
 
 
-def get_http_server_config() -> tuple[str, int]:
-    """
-    Get HTTP server configuration from environment variables or defaults.
-
-    Returns:
-        tuple: (host, port) for the Iggy server
-    """
-    return get_transport_config("IGGY_SERVER_HTTP_PORT", 3000)
-
-
 def wait_for_server(host: str, port: int, timeout: int = 60, interval: int = 2) -> None:
     """
     Wait for the server to become available.

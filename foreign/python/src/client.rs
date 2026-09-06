@@ -108,12 +108,8 @@ impl IggyClient {
     ///
     /// Raises:
     ///     RuntimeError: If the address passed as a string is not a valid
-    ///         `host:port` pair, if a `QuicConfig` client cannot bind its local
-    ///         UDP socket (for example the port is already in use), or if an
-    ///         `HttpConfig` client cannot be constructed. `api_url` is already
-    ///         validated when `HttpConfig` is built, so the last case does not
-    ///         currently fail; the exception is documented for interface
-    ///         consistency with the other transports.
+    ///         `host:port` pair, or if a `QuicConfig` client cannot bind its
+    ///         local UDP socket (for example the port is already in use).
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
@@ -1154,6 +1150,12 @@ impl IggyClient {
     /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
     /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
     /// is zero.
+    ///
+    /// Consumer groups are not available over HTTP: this call awaits the join
+    /// before returning, and HTTP answers it with `Feature is unavailable`.
+    /// Disabling `auto_join_consumer_group` only moves that failure to the
+    /// first poll, so it is not a way around this. Use `Consumer.Single(...)`
+    /// with `poll_messages(...)` instead.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         name,

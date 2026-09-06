@@ -23,6 +23,7 @@ from datetime import timedelta
 
 from apache_iggy import (
     AutoLogin,
+    HttpConfig,
     IggyClient,
     StreamDetails,
     TcpConfig,
@@ -100,8 +101,8 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(args))
 
 
-def build_config(args: ArgNamespace) -> TcpConfig:
-    """Build the TCP client configuration with auto-login and reconnection."""
+def build_config(args: ArgNamespace) -> TcpConfig | HttpConfig:
+    """Build the client configuration, TCP with auto-login and reconnection."""
 
     # IggyClient(...) also accepts a QuicConfig for the QUIC transport. To use
     # it, import QuicConfig and QuicReconnectionConfig above, change the return
@@ -118,6 +119,12 @@ def build_config(args: ArgNamespace) -> TcpConfig:
     #
     # main() logs args.tcp_server_address, so change that line too.
 
+    # IggyClient(...) also accepts an HttpConfig for the HTTP transport. HTTP
+    # has no AutoLogin or reconnection policy, so main() below would also need
+    # an explicit `await client.login_user(args.username, args.password)`
+    # after connecting:
+    # return HttpConfig(api_url="http://127.0.0.1:3000")
+
     return TcpConfig(
         server_address=args.tcp_server_address,
         auto_login=AutoLogin.username_password(args.username, args.password),
@@ -128,13 +135,6 @@ def build_config(args: ArgNamespace) -> TcpConfig:
         tls_enabled=args.tls,
         tls_ca_file=args.tls_ca_file or None,
     )
-    # IggyClient(...) also accepts an HttpConfig for the HTTP transport. HTTP
-    # has no AutoLogin or reconnection policy, so main() below would also need
-    # an explicit `await client.login_user(args.username, args.password)`
-    # after connecting:
-    # from apache_iggy import HttpConfig
-    #
-    # return HttpConfig(api_url="http://127.0.0.1:3000")
 
 
 async def main():
@@ -144,7 +144,7 @@ async def main():
     except ValueError as error:
         logger.error(f"Invalid client configuration: {error}")
         return
-    logger.info(f"Connecting to {args.tcp_server_address} (TLS: {args.tls})")
+    logger.info(f"Connecting with {config}")
 
     client = IggyClient(config)
     logger.info("Connecting to IggyClient")

@@ -134,7 +134,8 @@ running prek / committing / pushing. This list is not exhaustive and other hook 
 
 ## Client Configuration
 
-`IggyClient` takes a server address, a `TcpConfig`, or a `QuicConfig`:
+`IggyClient` takes a server address, a `TcpConfig`, a `QuicConfig`, or an
+`HttpConfig`:
 
 ```python
 import asyncio
@@ -171,10 +172,32 @@ asyncio.run(main())
 `IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport; see
 `examples/python/getting-started/producer.py` for a config swap example.
 
-`IggyClient(...)` also accepts an `HttpConfig` for the HTTP transport. HTTP is a
-stateless per-request transport, so there is no reconnection policy to configure.
-There is also no `AutoLogin`: call `login_user(...)` explicitly after connecting.
-See `examples/python/getting-started/producer.py` for a config swap example.
+`IggyClient(...)` also accepts an `HttpConfig` for the HTTP transport, which
+differs from TCP in two ways. There is no reconnection policy and no
+`AutoLogin`: `connect()` does not dial over HTTP, but it does start the
+heartbeat that `heartbeat_interval` configures, so call it and then
+`login_user(...)`. And HTTP is single-consumer only: `consumer_group(...)`
+raises `Feature is unavailable`, and a `Consumer.Group(...)` poll does not fail
+either - the consumer kind is not carried on the HTTP wire, so it is served as
+an ordinary consumer named after the group, with no membership or partition
+assignment behind it. Use `Consumer.Single(...)` with `poll_messages(...)`.
+
+```python
+import asyncio
+
+from apache_iggy import HttpConfig, IggyClient
+
+
+async def main():
+    client = IggyClient(HttpConfig(api_url="http://127.0.0.1:3000"))
+    await client.connect()
+    await client.login_user("iggy", "iggy")
+
+
+asyncio.run(main())
+```
+
+`examples/python/getting-started/producer.py` shows the same swap in context.
 
 ## Examples
 

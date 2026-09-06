@@ -158,14 +158,7 @@ impl TcpReconnectionConfig {
         let defaults = RustTcpClientReconnectionConfig::default();
         let enabled = enabled.unwrap_or(defaults.enabled);
         let max_retries = max_retries
-            .map(|max_retries| {
-                u32::try_from(max_retries).map_err(|_| {
-                    PyValueError::new_err(format!(
-                        "'max_retries' must be between 0 and {}",
-                        u32::MAX
-                    ))
-                })
-            })
+            .map(|max_retries| u32_arg(max_retries, "max_retries"))
             .transpose()?;
         let interval = interval
             .as_ref()
@@ -830,6 +823,12 @@ impl QuicConfig {
 /// Configuration for the HTTP transport, accepted by `IggyClient(...)`.
 ///
 /// Every field is keyword-only and optional.
+///
+/// HTTP is single-consumer only. The consumer kind is not carried on the HTTP
+/// wire, so a `Consumer.Group(...)` poll does not fail - it is served as an
+/// ordinary consumer named after the group, with no membership, no partition
+/// assignment, and no rebalancing behind it. Pass `Consumer.Single(...)`
+/// explicitly.
 #[gen_stub_pyclass]
 #[pyclass(from_py_object)]
 #[derive(Clone)]
@@ -850,15 +849,33 @@ impl HttpConfig {
     /// Constructs an HTTP configuration.
     ///
     /// Args:
-    ///     api_url: Base URL of the Iggy HTTP API. Defaults to `http://127.0.0.1:3000`.
-    ///     retries: Number of retries to perform on transient errors. Defaults to 3.
-    ///     jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to `None`.
-    ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+    ///     api_url: Base URL of the Iggy HTTP API, as `scheme://host[:port]`
+    ///         only - no path, query, fragment, or credentials. Defaults to
+    ///         `http://127.0.0.1:3000`.
+    ///     retries: Number of retries to perform on transient errors, each one
+    ///         replaying the full request (including its body) via automatic
+    ///         middleware. Defaults to 3. Delivery is therefore at-least-once:
+    ///         if the original request actually committed but its response
+    ///         was lost (e.g. to a timeout), a retried call applies the same
+    ///         operation again. Set to 0 to disable automatic replay and match
+    ///         the other transports, which surface the failure instead of
+    ///         silently resending.
+    ///     jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to
+    ///         `None`. Rejected if empty or whitespace-only: accepting it
+    ///         would make `has_jwt` report `True` while every call still
+    ///         fails `Unauthenticated`.
+    ///     heartbeat_interval: Interval between the client's liveness probes
+    ///         (a bare `GET /ping`). Defaults to 5 seconds. Unlike TCP/QUIC,
+    ///         HTTP has no persistent connection or session for this to keep
+    ///         alive; it only proves the server is reachable.
     ///
     /// Raises:
-    ///     ValueError: If `api_url` is not a valid URL, if `retries` is outside the
-    ///         range of an unsigned 32-bit integer, if a duration is negative, or
-    ///         if `heartbeat_interval` is zero.
+    ///     ValueError: If `api_url` is not a valid URL, if `retries` is outside
+    ///         the range of an unsigned 32-bit integer, if `jwt` is empty or
+    ///         whitespace-only, if a duration is negative, or if
+    ///         `heartbeat_interval` is zero.
+    ///     OverflowError: If `retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
     #[new]
     #[pyo3(signature = (*, api_url=None, retries=None, jwt=None, heartbeat_interval=None))]
     fn new(
@@ -875,23 +892,26 @@ impl HttpConfig {
             builder = builder.with_api_url(api_url);
         }
         if let Some(retries) = retries {
-            let retries = u32::try_from(retries).map_err(|_| {
-                PyValueError::new_err(format!("'retries' must be between 0 and {}", u32::MAX))
-            })?;
-            builder = builder.with_retries(retries);
+            builder = builder.with_retries(u32_arg(retries, "retries")?);
         }
         if let Some(jwt) = jwt {
+            if jwt.trim().is_empty() {
+                return Err(PyValueError::new_err(
+                    "'jwt' must not be empty or whitespace-only",
+                ));
+            }
             builder = builder.with_jwt(jwt);
         }
-        let mut inner = builder
-            .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         if let Some(heartbeat_interval) = heartbeat_interval {
-            inner.heartbeat_interval = reject_zero(
+            let heartbeat_interval = reject_zero(
                 py_delta_to_iggy_duration(&heartbeat_interval)?,
                 "heartbeat_interval",
             )?;
+            builder = builder.with_heartbeat_interval(heartbeat_interval);
         }
+        let inner = builder
+            .build()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -937,6 +957,16 @@ impl HttpConfig {
 
 fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
+}
+
+/// Converts a Python int to the unsigned 32-bit integer `max_retries`/`retries`
+/// expect, naming the parameter in the error so a caller can tell which
+/// argument was out of range. A value too large even for `i64` still raises
+/// pyo3's own unnamed `OverflowError` before this ever runs.
+fn u32_arg(value: i64, parameter: &str) -> PyResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", u32::MAX))
+    })
 }
 
 /// Converts a Python int to the unsigned 64-bit integer a QUIC transport
