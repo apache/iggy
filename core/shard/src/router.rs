@@ -532,7 +532,7 @@ where
         })
     }
 
-    /// [`Self::first_partition_commit_fault`] for the simulator's lost-wakeup
+    /// `first_partition_commit_fault` for the simulator's lost-wakeup
     /// tripwire: a fenced pump and a missed wake both leave frames undrained, and
     /// only the second is a channel bug. Test/simulator only, like `inbox_len`.
     #[cfg(any(test, feature = "simulator"))]
