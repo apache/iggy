@@ -32,24 +32,34 @@ public readonly struct Partitioning
     public required Enums.Partitioning Kind { get; init; }
 
     /// <summary>
-    ///     Length of the partitioning value.
+    ///     Length of the partitioning value in bytes, always derived from <see cref="Value" />.
+    ///     The initializer is kept for compatibility and its value is ignored.
     /// </summary>
-    public int Length => Value.Length;
+    public int Length
+    {
+        get => _value.Length;
+        init { }
+    }
 
     /// <summary>
-    ///     Partitioning value as bytes, at most 255 of them.
+    ///     Copy of the partitioning value as bytes, at most 255 of them.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when the value is longer than 255 bytes.</exception>
     public required byte[] Value
     {
-        get => _value;
+        get => _value.ToArray();
         init
         {
             ArgumentNullException.ThrowIfNull(value);
             ArgumentOutOfRangeException.ThrowIfGreaterThan(value.Length, WireName.MAX_LENGTH, nameof(Value));
-            _value = value;
+            _value = value.ToArray();
         }
     }
+
+    /// <summary>
+    ///     Read-only view of the value bytes for serialization, without the defensive copy of <see cref="Value" />.
+    /// </summary>
+    internal ReadOnlySpan<byte> Bytes => _value;
 
     private readonly byte[] _value;
 

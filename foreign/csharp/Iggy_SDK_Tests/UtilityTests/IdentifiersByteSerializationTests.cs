@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Headers;
+using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
+using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.Tests.UtilityTests;
 
@@ -130,5 +132,73 @@ public sealed class IdentifiersByteSerializationTests
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => Consumer.New(-1));
         Assert.Throws<ArgumentOutOfRangeException>(() => Consumer.Group(-1));
+    }
+
+    [Fact]
+    public void Identifier_BuiltWithALegacyLengthInitializer_DerivesLengthFromValue()
+    {
+        var identifier = new Identifier { Kind = IdKind.String, Length = 1, Value = "café"u8.ToArray() };
+
+        Assert.Equal(5, identifier.Length);
+        Assert.Equal(Identifier.String("café"), identifier);
+    }
+
+    [Fact]
+    public void Partitioning_BuiltWithALegacyLengthInitializer_DerivesLengthFromValue()
+    {
+        var partitioning = new Partitioning
+        {
+            Kind = Enums.Partitioning.MessageKey,
+            Length = 1,
+            Value = "café"u8.ToArray()
+        };
+
+        Assert.Equal(5, partitioning.Length);
+    }
+
+    [Fact]
+    public void Identifier_WhenTheInitializerArrayIsMutated_KeepsTheOriginalValue()
+    {
+        var bytes = "abc"u8.ToArray();
+        var identifier = new Identifier { Kind = IdKind.String, Value = bytes };
+        var lookup = new HashSet<Identifier> { identifier };
+
+        bytes[0] = (byte)'z';
+
+        Assert.Equal("abc", identifier.GetString());
+        Assert.Contains(Identifier.String("abc"), lookup);
+    }
+
+    [Fact]
+    public void Identifier_WhenTheValueCopyIsMutated_KeepsTheOriginalValue()
+    {
+        var identifier = Identifier.String("abc");
+        var lookup = new HashSet<Identifier> { identifier };
+
+        identifier.Value[0] = (byte)'z';
+
+        Assert.Equal("abc", identifier.GetString());
+        Assert.Contains(Identifier.String("abc"), lookup);
+    }
+
+    [Fact]
+    public void Partitioning_WhenTheInitializerArrayIsMutated_KeepsTheOriginalValue()
+    {
+        var bytes = "abc"u8.ToArray();
+        var partitioning = Partitioning.EntityIdBytes(bytes);
+
+        bytes[0] = (byte)'z';
+
+        Assert.Equal("abc"u8.ToArray(), partitioning.Value);
+    }
+
+    [Fact]
+    public void Partitioning_WhenTheValueCopyIsMutated_KeepsTheOriginalValue()
+    {
+        var partitioning = Partitioning.EntityIdString("abc");
+
+        partitioning.Value[0] = (byte)'z';
+
+        Assert.Equal("abc"u8.ToArray(), partitioning.Value);
     }
 }

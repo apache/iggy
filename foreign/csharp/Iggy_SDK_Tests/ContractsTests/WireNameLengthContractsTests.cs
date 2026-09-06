@@ -171,6 +171,27 @@ public sealed class WireNameLengthContractsTests
     }
 
     [Fact]
+    public void GetUser_WithANonAsciiStringIdentifier_SerializesTheUtf8Bytes()
+    {
+        var bytes = TcpContracts.GetUser(Identifier.String("café"));
+
+        Assert.Equal(new byte[] { 2, 5, (byte)'c', (byte)'a', (byte)'f', 0xC3, 0xA9 }, bytes);
+    }
+
+    [Fact]
+    public void UpdateStream_WithANonAsciiStringIdentifier_PlacesTheNameAfterTheUtf8Bytes()
+    {
+        var bytes = TcpContracts.UpdateStream(Identifier.String("café"), "topic");
+
+        Assert.Equal(
+            new byte[]
+            {
+                2, 5, (byte)'c', (byte)'a', (byte)'f', 0xC3, 0xA9,
+                5, (byte)'t', (byte)'o', (byte)'p', (byte)'i', (byte)'c'
+            }, bytes);
+    }
+
+    [Fact]
     public void Identifier_BuiltWithAnObjectInitializerOver255Bytes_Throws()
     {
         var exception = Assert.Throws<ArgumentOutOfRangeException>(() =>
