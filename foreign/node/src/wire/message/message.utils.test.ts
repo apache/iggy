@@ -74,7 +74,7 @@ describe("serializeMessageId", () => {
     assert.throws(() => serializeMessageId(-1n), />= 0/);
   });
 
-  it("rejects an unparseable string", () => {
+  it("rejects an unparsable string", () => {
     assert.throws(() => serializeMessageId("not-a-uuid"), /invalid message id/);
   });
 
