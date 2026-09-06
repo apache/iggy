@@ -112,6 +112,10 @@ runs:
         # plugins (cdylib) are loaded at runtime via dlopen by iggy-connectors.
         # Both must always be compiled alongside affected crates.
         echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] | (. == "bin" or . == "cdylib")) | .name' 2>/dev/null > /tmp/bin-packages.txt || true
+        # Connector plugins on their own. The same dlopen edge that keeps them
+        # out of the DAG also hides the integration suites that exercise them,
+        # which the filter below puts back.
+        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] | . == "cdylib") | .name' 2>/dev/null > /tmp/plugin-packages.txt || true
 
         PLAN_JSON=$(cargo rail plan --since origin/master -f json 2>/tmp/affected-stderr.txt || echo "")
 
@@ -119,9 +123,34 @@ runs:
           MODE=$(echo "$PLAN_JSON" | jq -r '.scope.mode')
           if [[ "$MODE" == "crates" ]]; then
             CRATES=$(echo "$PLAN_JSON" | jq -r '.scope.crates[]')
+            # `iggy_connector_<name>_{sink,source}` is exercised by
+            # `integration::connectors::<name>`, but the plugin reaches the
+            # runtime through dlopen, so cargo records no edge and the DAG drops
+            # those tests. Name the suite of every affected plugin that has one.
+            PLUGIN_TESTS=""
+            PLUGIN_SUITES=0
+            while read -r plugin; do
+              if [[ ! -d "core/integration/tests/connectors/$plugin" ]]; then
+                echo "::warning::No integration suite at core/integration/tests/connectors/${plugin}, leaving it out of the test scope"
+                continue
+              fi
+              PLUGIN_TESTS+=" | (package(integration) & test(/^connectors::${plugin}::/))"
+              PLUGIN_SUITES=$(( PLUGIN_SUITES + 1 ))
+            done < <(comm -12 <(sort -u /tmp/plugin-packages.txt) <(echo "$CRATES" | sort -u) \
+              | sed -nE 's/^iggy_connector_(.*)_(sink|source)$/\1/p' | sort -u)
+            echo "$PLUGIN_SUITES" > /tmp/plugin-suites.txt
+            # Those suites live in the integration test binary, so it has to be
+            # built even when the DAG left it out of scope. Only the build set
+            # grows: the `cargo test` fallback below has no filter, and adding
+            # the package there would run the whole integration suite.
+            BUILD_CRATES="$CRATES"
+            if (( PLUGIN_SUITES > 0 )); then
+              BUILD_CRATES=$(printf '%s\nintegration\n' "$CRATES" | sort -u)
+            fi
             CRATE_COUNT=$(echo "$CRATES" | wc -l)
             # Build nextest filter expression for cargo nextest run (affected crates only)
-            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd '|' | sed 's/|/ | /g' > /tmp/nextest-filter.txt
+            FILTER=$(echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd '|' - | sed 's/|/ | /g')
+            echo "${FILTER}${PLUGIN_TESTS}" > /tmp/nextest-filter.txt
             # Save affected-only -p flags for cargo test fallback (no nextest filter)
             echo "$CRATES" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/test-packages.txt
             # Build -p flags: affected crates + packages with bin/cdylib targets.
@@ -129,17 +158,17 @@ runs:
             # artifacts; cdylib packages: connector plugins loaded via dlopen.
             # Both must be in the build even if not directly in the DAG scope.
             BIN_PKGS=$(cat /tmp/bin-packages.txt 2>/dev/null || echo "")
-            ALL_BUILD_PKGS=$(printf '%s\n%s\n' "$CRATES" "$BIN_PKGS" | sort -u | grep -v '^$')
+            ALL_BUILD_PKGS=$(printf '%s\n%s\n' "$BUILD_CRATES" "$BIN_PKGS" | sort -u | grep -v '^$')
             echo "$ALL_BUILD_PKGS" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/packages.txt
             BUILD_COUNT=$(echo "$ALL_BUILD_PKGS" | wc -l)
-            echo "::notice::DAG analysis: testing ${CRATE_COUNT} crates, building ${BUILD_COUNT} (of ${TOTAL_CRATES} total, +$(( BUILD_COUNT - CRATE_COUNT )) binary pkgs)"
+            echo "::notice::DAG analysis: testing ${CRATE_COUNT} crates + ${PLUGIN_SUITES} connector suites, building ${BUILD_COUNT} (of ${TOTAL_CRATES} total, +$(( BUILD_COUNT - CRATE_COUNT )) extra pkgs)"
           else
             echo "::notice::Full workspace affected (${TOTAL_CRATES} crates)"
           fi
         else
           STDERR=$(cat /tmp/affected-stderr.txt 2>/dev/null || echo "")
           echo "::warning::Could not compute affected crates, running full test suite. ${STDERR}"
-          rm -f /tmp/nextest-filter.txt /tmp/packages.txt
+          rm -f /tmp/nextest-filter.txt /tmp/packages.txt /tmp/plugin-suites.txt
         fi
       shell: bash
 
@@ -241,6 +270,7 @@ runs:
         PACKAGE_FLAGS=""
         TEST_PACKAGE_FLAGS=""
         TOTAL_CRATES="?"
+        PLUGIN_SUITES=0
         if [[ -f /tmp/nextest-filter.txt ]]; then
           NEXTEST_FILTER=$(cat /tmp/nextest-filter.txt)
         fi
@@ -253,11 +283,16 @@ runs:
         if [[ -f /tmp/total-crates.txt ]]; then
           TOTAL_CRATES=$(cat /tmp/total-crates.txt)
         fi
+        if [[ -f /tmp/plugin-suites.txt ]]; then
+          PLUGIN_SUITES=$(cat /tmp/plugin-suites.txt)
+        fi
 
         if [[ -n "$PACKAGE_FLAGS" ]]; then
-          TEST_CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
+          # Each connector suite contributes its own `package(integration)`, so
+          # subtract them to keep the crate count a crate count.
+          TEST_CRATE_COUNT=$(( $(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l) - PLUGIN_SUITES ))
           BUILD_CRATE_COUNT=$(echo "$PACKAGE_FLAGS" | grep -o '\-p ' | wc -l)
-          echo "::notice::DAG-scoped: testing ${TEST_CRATE_COUNT} crates, building ${BUILD_CRATE_COUNT} (cargo check/clippy cover full workspace separately)"
+          echo "::notice::DAG-scoped: testing ${TEST_CRATE_COUNT} crates + ${PLUGIN_SUITES} connector suites, building ${BUILD_CRATE_COUNT} (cargo check/clippy cover full workspace separately)"
         else
           echo "::notice::Full workspace build (no DAG filter available)"
         fi
@@ -389,9 +424,9 @@ runs:
         echo ""
         echo "========================================="
         if [[ -n "$PACKAGE_FLAGS" ]]; then
-          TEST_CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
+          TEST_CRATE_COUNT=$(( $(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l) - PLUGIN_SUITES ))
           BUILD_CRATE_COUNT=$(echo "$PACKAGE_FLAGS" | grep -o '\-p ' | wc -l)
-          echo "DAG scope (test):              ${TEST_CRATE_COUNT}/${TOTAL_CRATES} crates"
+          echo "DAG scope (test):              ${TEST_CRATE_COUNT}/${TOTAL_CRATES} crates + ${PLUGIN_SUITES} connector suites"
           echo "DAG scope (build):             ${BUILD_CRATE_COUNT}/${TOTAL_CRATES} crates"
         else
           echo "DAG scope:                     full workspace (${TOTAL_CRATES} crates)"
