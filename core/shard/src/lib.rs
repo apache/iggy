@@ -8355,15 +8355,15 @@ where
             return false;
         }
         let missing_suffix = partition_missing_suffix_through(partition);
-        if !commit_lag && missing_suffix.is_none() {
+        // Fetch the adopted suffix even while committed operations lag. Later
+        // live prepares can advance the head while an adopted body is missing.
+        let Some(fetch_to_op) =
+            partition_repair_fetch_to_op(consensus.commit_min(), commit_to_op, missing_suffix)
+        else {
             return false;
-        }
+        };
         let nonce = iggy_common::random_id::get_uuid();
         let from_op = consensus.commit_min() + 1;
-        // Include the adopted suffix in the same repair as the committed
-        // prefix. Otherwise a newer live prepare can advance the sequencer
-        // while an older adopted body is still missing.
-        let fetch_to_op = missing_suffix.unwrap_or(commit_to_op);
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
         let namespace = consensus.group();
@@ -9748,7 +9748,7 @@ struct GapProbe {
     /// bodies never arrived. Its own recovery shape, disjoint from the lag
     /// below the frontier: the group cannot gather quorum for that suffix until
     /// the bodies land, and the only other site that notices is the single
-    /// `on_start_view` edge that adopted them. See [`partition_missing_suffix`].
+    /// `on_start_view` edge that adopted them. See [`partition_missing_suffix_through`].
     missing_suffix: bool,
 }
 
@@ -9870,6 +9870,15 @@ fn rotate_sweep_to_cursor(namespaces: &mut [IggyNamespace], cursor: Option<IggyN
     // `partition_point` answers in `0..=len`, and `rotate_left(len)` is the
     // no-op that wraps a cursor past the last namespace back to the front.
     namespaces.rotate_left(namespaces.partition_point(|namespace| *namespace < cursor));
+}
+
+fn partition_repair_fetch_to_op(
+    commit_min: u64,
+    commit_max: u64,
+    missing_suffix: Option<u64>,
+) -> Option<u64> {
+    (commit_min < commit_max || missing_suffix.is_some())
+        .then(|| missing_suffix.unwrap_or(commit_max))
 }
 
 /// Highest adopted suffix op whose bodies are not all present above `commit_max`.
@@ -10834,6 +10843,17 @@ mod repair_scope_tests {
         assert_eq!(adopted_suffix_head(&pending, 98, 101), Some(100));
         assert_eq!(adopted_suffix_head(&pending, 99, 101), Some(100));
         assert_eq!(adopted_suffix_head(&pending, 100, 101), None);
+        let suffix = adopted_suffix_head(&pending, 98, 101);
+        assert_eq!(
+            super::partition_repair_fetch_to_op(0, 98, suffix),
+            Some(100)
+        );
+        assert_eq!(
+            super::partition_repair_fetch_to_op(98, 98, suffix),
+            Some(100)
+        );
+        assert_eq!(super::partition_repair_fetch_to_op(0, 98, None), Some(98));
+        assert_eq!(super::partition_repair_fetch_to_op(98, 98, None), None);
         let mut missing = pending;
         missing.headers.retain(|header| header.op != 99);
         assert_eq!(adopted_suffix_head(&missing, 98, 101), None);

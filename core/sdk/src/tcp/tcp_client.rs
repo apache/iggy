@@ -1281,7 +1281,11 @@ impl TcpClient {
                     }
 
                     if routing_guard.is_none() {
-                        routing_guard = Some(self.routing_lock.lock().await);
+                        routing_guard = Some(
+                            tokio::time::timeout_at(overall_deadline, self.routing_lock.lock())
+                                .await
+                                .map_err(|_| IggyError::TransientNotAccepted)?,
+                        );
                         // A concurrent refused request may have moved the
                         // shared client while this request waited.
                         continue;
@@ -1323,14 +1327,17 @@ impl TcpClient {
                         // hops would bounce the request between two nodes and
                         // never reach the rest of the roster.
                         (next, true)
+                    } else if roster_walk
+                        .as_ref()
+                        .is_some_and(RosterWalk::is_single_endpoint)
+                    {
+                        // Partition materialisation can outlast the short retry
+                        // window on a single node. No routing change is needed,
+                        // so let other requests and reconnects acquire the lock.
+                        drop(routing_guard.take());
+                        continue;
                     } else {
-                        // A one-node roster has nowhere else to walk while a
-                        // freshly committed partition is still materialising.
-                        // The server explicitly did not admit this request, so
-                        // keep retrying the current endpoint within the existing
-                        // overall deadline rather than surfacing a transient
-                        // solely because the roster contains no alternative.
-                        (current, false)
+                        return Err(IggyError::TransientNotAccepted);
                     };
 
                     loop {

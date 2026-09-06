@@ -30,7 +30,8 @@
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
     PURGE_GENERATION_FILE, commit_offset_replacement, delete_persisted_offset,
-    discard_offset_replacement, persist_purge_generation, stage_offset_replacement,
+    discard_offset_replacement, offset_replacement_id, persist_purge_generation,
+    stage_offset_replacement,
 };
 use crate::segment::Segment;
 use crate::segment_anchor::ANCHOR_SUFFIX;
@@ -47,7 +48,7 @@ use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::send_messages::decode_batch_slice;
 use server_common::{SegmentStorage, yield_to_reactor};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::mem::size_of;
@@ -1361,6 +1362,9 @@ pub struct PartitionInstallOutcome {
 #[derive(Debug)]
 pub enum PartitionInstallError {
     NoPartitionDir,
+    NoOffsetDir {
+        kind: ConsumerKind,
+    },
     /// `commit_op` fell below this replica's commit frontier; installing
     /// would rewind `commit_min` (the anti-rewind assert, as a refusal).
     StaleTransfer {
@@ -1434,6 +1438,9 @@ impl fmt::Display for PartitionInstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoPartitionDir => write!(f, "partition has no on-disk directory"),
+            Self::NoOffsetDir { kind } => {
+                write!(f, "partition has no {kind:?} offset directory configured")
+            }
             Self::StaleTransfer {
                 commit_op,
                 commit_min,
@@ -1637,14 +1644,19 @@ fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
 const OFFSET_PERSIST_CONCURRENCY: usize = 16;
 const OFFSET_IO_ATTEMPTS: usize = 3;
 
-async fn retry_offset_mutation<T, E, F: Future<Output = Result<T, E>>>(
+async fn retry_offset_mutation<T, E: fmt::Debug, F: Future<Output = Result<T, E>>>(
     mut operation: impl FnMut() -> F,
 ) -> Result<T, E> {
-    for _ in 1..OFFSET_IO_ATTEMPTS {
+    for attempt in 1..OFFSET_IO_ATTEMPTS {
         match operation().await {
             Ok(value) => return Ok(value),
-            Err(_) => {
-                yield_to_reactor().await;
+            Err(error) => {
+                tracing::debug!(
+                    attempt,
+                    ?error,
+                    "offset mutation failed, retrying after backoff"
+                );
+                compio::time::sleep(std::time::Duration::from_millis(10 << (attempt - 1))).await;
             }
         }
     }
@@ -1661,7 +1673,7 @@ struct PlannedOffsetWrite {
     value: u64,
 }
 
-const fn consumer_kind_index(kind: ConsumerKind) -> usize {
+pub(crate) const fn consumer_kind_index(kind: ConsumerKind) -> usize {
     match kind {
         ConsumerKind::Consumer => 0,
         ConsumerKind::ConsumerGroup => 1,
@@ -1715,37 +1727,37 @@ where
         offsets_wire: &ConsumerOffsetsWire,
         next_offset: u64,
     ) -> Result<Vec<PlannedOffsetWrite>, PartitionInstallError> {
-        let consumer_dir = self.consumer_offsets_path.as_deref().ok_or_else(|| {
-            PartitionInstallError::OffsetPersistence {
-                path: "consumer offset directory".to_owned(),
-                source: iggy_common::IggyError::InvalidConfiguration,
-            }
-        })?;
-        let group_dir = self.consumer_group_offsets_path.as_deref().ok_or_else(|| {
-            PartitionInstallError::OffsetPersistence {
-                path: "consumer group offset directory".to_owned(),
-                source: iggy_common::IggyError::InvalidConfiguration,
-            }
-        })?;
+        let consumer_dir =
+            self.consumer_offsets_path
+                .as_deref()
+                .ok_or(PartitionInstallError::NoOffsetDir {
+                    kind: ConsumerKind::Consumer,
+                })?;
+        let group_dir = self.consumer_group_offsets_path.as_deref().ok_or(
+            PartitionInstallError::NoOffsetDir {
+                kind: ConsumerKind::ConsumerGroup,
+            },
+        )?;
         let clamp = |offset: u64| next_offset.checked_sub(1).map(|last| offset.min(last));
         let mut planned =
             Vec::with_capacity(offsets_wire.consumers.len() + offsets_wire.groups.len());
-        planned.extend(offsets_wire.consumers.iter().filter_map(|(id, offset)| {
-            clamp(*offset).map(|value| PlannedOffsetWrite {
-                kind: ConsumerKind::Consumer,
-                id: *id,
-                path: format!("{consumer_dir}/{id}"),
-                value,
-            })
-        }));
-        planned.extend(offsets_wire.groups.iter().filter_map(|(id, offset)| {
-            clamp(*offset).map(|value| PlannedOffsetWrite {
-                kind: ConsumerKind::ConsumerGroup,
-                id: *id,
-                path: format!("{group_dir}/{id}"),
-                value,
-            })
-        }));
+        for (kind, dir, offsets) in [
+            (
+                ConsumerKind::Consumer,
+                consumer_dir,
+                &offsets_wire.consumers,
+            ),
+            (ConsumerKind::ConsumerGroup, group_dir, &offsets_wire.groups),
+        ] {
+            planned.extend(offsets.iter().filter_map(|(id, offset)| {
+                clamp(*offset).map(|value| PlannedOffsetWrite {
+                    kind,
+                    id: *id,
+                    path: format!("{dir}/{id}"),
+                    value,
+                })
+            }));
+        }
         Ok(planned)
     }
 
@@ -2147,21 +2159,22 @@ where
         kind: ConsumerKind,
         map_contains: impl Fn(u32) -> bool,
     ) -> Result<Vec<(u32, u64)>, PartitionTransferUnavailable> {
-        let entries = self.durable_consumer_offsets.snapshot_entries(kind);
-        let mut snapshot = Vec::with_capacity(entries.len());
-        for (&consumer_id, state) in entries.iter() {
-            if !map_contains(consumer_id) {
-                return Err(
-                    PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
-                        kind,
-                        consumer_id,
-                    },
-                );
+        self.durable_consumer_offsets.with_entries(kind, |entries| {
+            let mut snapshot = Vec::with_capacity(entries.len());
+            for (&consumer_id, state) in entries {
+                if !map_contains(consumer_id) {
+                    return Err(
+                        PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
+                            kind,
+                            consumer_id,
+                        },
+                    );
+                }
+                snapshot.push((consumer_id, state.committed_offset));
             }
-            snapshot.push((consumer_id, state.committed_offset));
-        }
-        snapshot.sort_unstable_by_key(|(id, _)| *id);
-        Ok(snapshot)
+            snapshot.sort_unstable_by_key(|(id, _)| *id);
+            Ok(snapshot)
+        })
     }
 
     #[cfg(test)]
@@ -2552,6 +2565,7 @@ where
                 &offsets_wire,
                 &planned_offsets,
                 &partition_dir,
+                next_offset,
             )
             .await;
         if outcome.is_err() {
@@ -2604,7 +2618,7 @@ where
     /// caller converges from. Split out so the convergence handling cannot
     /// be forgotten on a new error path. Runs under the caller's write-lock
     /// guard.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn apply_checked_install(
         &mut self,
         config: &PartitionsConfig,
@@ -2613,6 +2627,7 @@ where
         offsets_wire: &ConsumerOffsetsWire,
         planned_offsets: &[PlannedOffsetWrite],
         partition_dir: &str,
+        next_offset: u64,
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
         // Sweep staging strays a dead earlier attempt left behind, keeping
         // only what THIS install is about to rename. Bounded disk hygiene;
@@ -2869,9 +2884,6 @@ where
         // must not rewind every transferred offset to 0 -- a durable,
         // client-visible rewind the replicas would then disagree on.
         let installed_end = staged.last().map(|meta| meta.end_offset);
-        let next_offset = offsets_wire
-            .next_offset
-            .max(installed_end.map_or(0, |end| end + 1));
         // A key that fails the u32 narrowing would strand its old offset
         // file's delete, which boot can then resurrect: unreachable while
         // keys are minted from u32 wire ids, so assert it.
@@ -2895,14 +2907,11 @@ where
             // incoming entry, so a map-only sweep leaves the old table for boot
             // to resurrect.
             paths.extend(
-                strayed_offset_files(
-                    self.consumer_offsets_path.as_deref(),
-                    &offsets_wire.consumers,
-                )
-                .into_iter()
-                .filter_map(|path| {
-                    numeric_offset_id(&path).map(|id| (ConsumerKind::Consumer, id, path))
-                }),
+                strayed_offset_files(self.consumer_offsets_path.as_deref(), &[])
+                    .into_iter()
+                    .filter_map(|path| {
+                        numeric_offset_id(&path).map(|id| (ConsumerKind::Consumer, id, path))
+                    }),
             );
             paths
         };
@@ -2925,19 +2934,29 @@ where
                 .collect();
             guard.clear();
             paths.extend(
-                strayed_offset_files(
-                    self.consumer_group_offsets_path.as_deref(),
-                    &offsets_wire.groups,
-                )
-                .into_iter()
-                .filter_map(|path| {
-                    numeric_offset_id(&path).map(|id| (ConsumerKind::ConsumerGroup, id, path))
-                }),
+                strayed_offset_files(self.consumer_group_offsets_path.as_deref(), &[])
+                    .into_iter()
+                    .filter_map(|path| {
+                        numeric_offset_id(&path).map(|id| (ConsumerKind::ConsumerGroup, id, path))
+                    }),
             );
             paths
         };
         let mut offset_dirs_changed = [false; 2];
-        for (kind, consumer_id, path) in old_consumer_paths.into_iter().chain(old_group_paths) {
+        let planned_ids: HashSet<_> = planned_offsets
+            .iter()
+            .map(|write| (write.kind, write.id))
+            .collect();
+        // Replacements atomically overwrite their old files. Only keys absent
+        // from the clamped plan require unlinking, including every key when
+        // the incoming message frontier is empty.
+        let old_paths: HashMap<_, _> = old_consumer_paths
+            .into_iter()
+            .chain(old_group_paths)
+            .filter(|(kind, id, _)| !planned_ids.contains(&(*kind, *id)))
+            .map(|(kind, id, path)| ((kind, id), path))
+            .collect();
+        for ((kind, consumer_id), path) in old_paths {
             let removed = delete_persisted_offset(&path)
                 .await
                 .map_err(|source| PartitionInstallError::OffsetPersistence { path, source })?;
@@ -2962,6 +2981,9 @@ where
         self.dedup_mut()
             .install_watermarks(offsets_wire.dedup.iter().copied());
         for write in planned_offsets {
+            // A rename failure after the segment swap leaves an incomplete
+            // install. Propagate it to convergence rather than acknowledge
+            // mixed state or retry a standalone directory barrier.
             commit_offset_replacement(&write.path)
                 .await
                 .map_err(|source| PartitionInstallError::OffsetPersistence {
@@ -2989,10 +3011,6 @@ where
             self.consumer_offset_capacity_for(write.kind)
                 .clear_stranded(write.id);
         }
-        self.consumer_offset_capacity
-            .rearm_map_if_below_limit(self.consumer_offsets.len());
-        self.consumer_group_offset_capacity
-            .rearm_map_if_below_limit(self.consumer_group_offsets.len());
         // One observation per changed directory. Retrying with a newly opened
         // handle can mask the writeback error that the first fsync consumed.
         for (changed, dir) in offset_dirs_changed.into_iter().zip([
@@ -3141,6 +3159,7 @@ where
     /// [`iggy_common::IggyError`] when the sweep or the empty plant fails;
     /// the partition then has no serviceable chain and the caller must
     /// fence it (see [`PartitionInstallError::ConvergeFailed`]).
+    #[allow(clippy::too_many_lines)]
     async fn converge_to_empty_after_failed_install(
         &mut self,
         config: &PartitionsConfig,
@@ -3174,6 +3193,16 @@ where
             ),
         ] {
             let Some(dir) = dir else { continue };
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_file())
+                        && offset_replacement_id(&entry.file_name().to_string_lossy()).is_some()
+                        && let Err(error) = compio::fs::remove_file(entry.path()).await
+                    {
+                        tracing::warn!(path = %entry.path().display(), %error, "could not remove ignored offset replacement");
+                    }
+                }
+            }
             for path in strayed_offset_files(Some(dir), &[]) {
                 retry_offset_mutation(|| delete_persisted_offset(&path)).await?;
                 if let Some(id) = numeric_offset_id(&path) {
@@ -3542,6 +3571,9 @@ pub(crate) fn strayed_offset_files(dir: Option<&str>, incoming: &[(u32, u64)]) -
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
             let name = entry.file_name().into_string().ok()?;
             let id: u32 = name.parse().ok()?;
             (!incoming_ids.contains(&id)).then(|| format!("{dir}/{name}"))

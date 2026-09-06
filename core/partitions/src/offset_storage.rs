@@ -109,6 +109,11 @@ pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
 
 /// Overwrite a consumer-offset file with `offset` and a checksum over it.
 ///
+/// Atomic replacement allocates a sibling inode and renames it over the prior
+/// file. The caller syncs the parent directory when durability is required.
+/// This costs more than an in-place write but preserves the prior cursor when
+/// writing the replacement fails.
+///
 /// # Errors
 /// [`IggyError`] when the directory, file, or write cannot be created or completed.
 pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
@@ -116,6 +121,8 @@ pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Res
 }
 
 pub(crate) async fn stage_offset_replacement(path: &str, offset: u64) -> Result<(), IggyError> {
+    // Install can remove old files before publishing replacements. Staging
+    // must survive a crash regardless of the normal consumer-offset fsync knob.
     write_replacement(path, encode_offset_record(offset), true)
         .await
         .map(|_| ())
@@ -199,6 +206,17 @@ fn replacement_path(path: &str) -> String {
     format!("{path}{OFFSET_REPLACEMENT_SUFFIX}")
 }
 
+#[must_use]
+pub fn offset_replacement_id(name: &str) -> Option<u32> {
+    name.strip_suffix(OFFSET_REPLACEMENT_SUFFIX)?.parse().ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedOffset {
+    pub offset: u64,
+    pub written: bool,
+}
+
 /// Monotone counterpart of [`persist_offset`] for a server auto-commit op.
 ///
 /// Folds `max(current_on_disk, offset)` and returns the value now on disk, skipping
@@ -224,7 +242,7 @@ pub async fn persist_offset_max(
     path: &str,
     offset: u64,
     enforce_fsync: bool,
-) -> Result<u64, IggyError> {
+) -> Result<PersistedOffset, IggyError> {
     let on_disk = match read_offset_record(path).await? {
         Some(OffsetRecord::Value { offset, .. }) => Some(offset),
         Some(OffsetRecord::Corrupt {
@@ -246,10 +264,14 @@ pub async fn persist_offset_max(
         Some(OffsetRecord::Torn) | None => None,
     };
     let effective = on_disk.map_or(offset, |current| current.max(offset));
-    if on_disk != Some(effective) {
+    let written = on_disk != Some(effective);
+    if written {
         persist_offset(path, effective, enforce_fsync).await?;
     }
-    Ok(effective)
+    Ok(PersistedOffset {
+        offset: effective,
+        written,
+    })
 }
 
 /// Durably record the purge generation a partition has locally applied, keyed
@@ -362,9 +384,9 @@ async fn read_offset_record(path: &str) -> Result<Option<OffsetRecord>, IggyErro
 }
 
 /// Unlink a persisted consumer-offset file. A no-op if the file is absent.
+/// Returns whether a file was removed. An absent file is `Ok(false)`.
 ///
 /// # Errors
-/// Returns whether a file was removed. An absent file is `Ok(false)`.
 /// Returns [`IggyError::CannotDeleteConsumerOffsetFile`] if the unlink fails.
 pub async fn delete_persisted_offset(path: &str) -> Result<bool, IggyError> {
     // NotFound is tolerated on the result instead of probed for: the probe was
@@ -380,6 +402,66 @@ pub async fn delete_persisted_offset(path: &str) -> Result<bool, IggyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[compio::test]
+    #[ignore = "manual filesystem-dependent offset persistence measurement"]
+    async fn measure_offset_replacement_against_in_place_updates() {
+        const UPDATES: u64 = 1_000;
+        let dir = tempfile::tempdir().unwrap();
+        for enforce_fsync in [false, true] {
+            for replacement in [false, true] {
+                let path = dir
+                    .path()
+                    .join(format!("offset-{enforce_fsync}-{replacement}"));
+                let path = path.to_str().unwrap();
+                persist_offset(path, 0, enforce_fsync).await.unwrap();
+                let mut latencies = Vec::with_capacity(usize::try_from(UPDATES).unwrap());
+                let started = std::time::Instant::now();
+                for offset in 1..=UPDATES {
+                    let before = std::time::Instant::now();
+                    if replacement {
+                        persist_offset(path, offset, enforce_fsync).await.unwrap();
+                        if enforce_fsync {
+                            crate::state_transfer::fsync_dir(dir.path().to_str().unwrap())
+                                .await
+                                .unwrap();
+                        }
+                    } else {
+                        create_dir_all(dir.path()).await.unwrap();
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(path)
+                            .await
+                            .unwrap();
+                        file.write_all_at(encode_offset_record(offset), 0)
+                            .await
+                            .0
+                            .unwrap();
+                        if enforce_fsync {
+                            file.sync_data().await.unwrap();
+                        }
+                    }
+                    latencies.push(before.elapsed().as_nanos());
+                }
+                let elapsed = started.elapsed();
+                latencies.sort_unstable();
+                eprintln!(
+                    "replacement={replacement} fsync={enforce_fsync} updates={UPDATES} elapsed_us={} p50_ns={} p95_ns={}",
+                    elapsed.as_micros(),
+                    latencies[latencies.len() / 2],
+                    latencies[latencies.len() * 95 / 100]
+                );
+                assert!(matches!(
+                    read_offset_record(path).await.unwrap(),
+                    Some(OffsetRecord::Value {
+                        offset: UPDATES,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
 
     fn unique_temp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -698,7 +780,7 @@ mod tests {
             .await
             .expect("a corrupt file must not fail the commit");
         assert_eq!(
-            folded, 7,
+            folded.offset, 7,
             "the untrusted stored value must not win the fold"
         );
 

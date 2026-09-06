@@ -406,6 +406,10 @@ impl RosterWalk {
         self.attempted.push(endpoint.clone());
         Some(endpoint)
     }
+
+    pub(crate) fn is_single_endpoint(&self) -> bool {
+        self.remaining.is_empty() && self.attempted.len() == 1
+    }
 }
 
 /// Coordinates callers of one client's complete connect and authentication
@@ -777,11 +781,25 @@ mod tests {
         assert_eq!(walk.next().as_deref(), Some("10.0.0.2:8090"));
         assert_eq!(walk.next().as_deref(), Some("10.0.0.3:8090"));
         assert_eq!(walk.next(), None);
+        assert!(
+            !walk.is_single_endpoint(),
+            "exhausting a cluster does not make it a single node"
+        );
 
         let mut from_last = RosterWalk::new("10.0.0.3:8090", &roster);
         assert_eq!(from_last.next().as_deref(), Some("10.0.0.1:8090"));
         assert_eq!(from_last.next().as_deref(), Some("10.0.0.2:8090"));
         assert_eq!(from_last.next(), None);
+    }
+
+    #[test]
+    fn given_single_endpoint_roster_when_exhausted_should_allow_local_retry() {
+        let mut walk = RosterWalk::new("127.0.0.1:8090", &["localhost:8090".to_owned()]);
+        assert!(walk.is_single_endpoint());
+        assert_eq!(walk.next(), None);
+        assert!(walk.is_single_endpoint());
+        walk.record_attempt("127.0.0.2:8090");
+        assert!(!walk.is_single_endpoint());
     }
 
     #[test]

@@ -974,7 +974,7 @@ impl AutoCommitApplied {
     /// Undo this poll's eager update after synchronous admission fails. The
     /// caller must not yield between execution and this rollback.
     pub fn rollback_created(&self) {
-        let map_len = match &self.target {
+        match &self.target {
             AutoCommitTarget::Consumer {
                 offsets,
                 consumer_id,
@@ -987,8 +987,7 @@ impl AutoCommitApplied {
                 ConsumerGroupId(*group_id as usize),
                 self.previous_offset,
             ),
-        };
-        self.capacity.rearm_map_if_below_limit(map_len);
+        }
         if self.previous_offset.is_none() {
             self.capacity.note_local_key_change();
             self.capacity.forget_inactive_provisional(self.consumer_id);
@@ -1000,7 +999,7 @@ fn rollback_local_offset<K: Hash + Eq + Send + Sync + Copy>(
     map: &papaya::HashMap<K, ConsumerOffset>,
     key: K,
     previous: Option<u64>,
-) -> usize {
+) {
     let guard = map.pin();
     if let Some(previous) = previous {
         if let Some(entry) = guard.get(&key) {
@@ -1009,7 +1008,6 @@ fn rollback_local_offset<K: Hash + Eq + Send + Sync + Copy>(
     } else {
         guard.remove(&key);
     }
-    guard.len()
 }
 
 fn apply_local_offset<K: Hash + Eq + Clone + Send + Sync>(

@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy_common::ConsumerKind;
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -127,11 +127,12 @@ impl DurableConsumerOffsets {
             .collect()
     }
 
-    pub(crate) fn snapshot_entries(
+    pub(crate) fn with_entries<T>(
         &self,
         kind: ConsumerKind,
-    ) -> Ref<'_, HashMap<u32, DurableOffsetState>> {
-        self.entries(kind).borrow()
+        read: impl FnOnce(&HashMap<u32, DurableOffsetState>) -> T,
+    ) -> T {
+        read(&self.entries(kind).borrow())
     }
 
     const fn entries(&self, kind: ConsumerKind) -> &RefCell<HashMap<u32, DurableOffsetState>> {
@@ -224,6 +225,14 @@ impl ConsumerOffsetCapacity {
         }
         let limit = self.limit.get();
         let durable_count = durable.count(self.kind);
+        let upper_bound = durable_count
+            .saturating_add(self.pending.borrow().len())
+            .saturating_add(self.provisional.borrow().len())
+            .saturating_add(self.stranded.borrow().len());
+        if !self.uncertain.get() && upper_bound < limit {
+            self.durable_warned.set(false);
+            return Ok(());
+        }
         // A full durable table cannot gain room by pruning provisional keys.
         let occupied = if durable_count >= limit {
             durable_count
@@ -362,13 +371,14 @@ impl ConsumerOffsetCapacity {
         }
     }
 
-    pub(crate) const fn admit_local_map_key(
+    pub(crate) fn admit_local_map_key(
         &self,
         map_len: usize,
         durable_full: bool,
     ) -> Result<(), ConsumerOffsetCapacityError> {
         let limit = self.limit.get();
         if map_len < limit {
+            self.map_warned.set(false);
             return Ok(());
         }
         Err(ConsumerOffsetCapacityError {
@@ -378,12 +388,6 @@ impl ConsumerOffsetCapacity {
             first_in_episode: !self.map_warned.replace(true),
             uncertain: !durable_full,
         })
-    }
-
-    pub(crate) fn rearm_map_if_below_limit(&self, map_len: usize) {
-        if map_len < self.limit.get() {
-            self.map_warned.set(false);
-        }
     }
 
     pub(crate) fn note_local_key_change(&self) {
@@ -462,6 +466,27 @@ impl Drop for AutoCommitReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_low_occupancy_when_accounting_is_uncertain_should_reject_new_keys() {
+        let durable = DurableConsumerOffsets::default();
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 100);
+        capacity.try_reserve(1, &durable).unwrap();
+        capacity.mark_uncertain();
+        assert!(capacity.check(2, &durable).unwrap_err().uncertain);
+        capacity.rebuild(&durable, [1]);
+        capacity.check(2, &durable).unwrap();
+    }
+
+    #[test]
+    fn given_overlapping_accounting_sets_when_sum_exceeds_limit_should_use_exact_occupancy() {
+        let durable = DurableConsumerOffsets::default();
+        durable.record_explicit(ConsumerKind::Consumer, 1, 0, 0);
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2);
+        capacity.try_reserve(1, &durable).unwrap();
+        capacity.record_stranded(1);
+        capacity.check(2, &durable).unwrap();
+    }
 
     #[test]
     fn given_unchanged_protection_when_reclaim_repeats_should_skip_until_guard_drops() {

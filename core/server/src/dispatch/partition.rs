@@ -1396,6 +1396,7 @@ mod tests {
     };
     use iggy_binary_protocol::ReplyHeader;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{
@@ -1415,6 +1416,59 @@ mod tests {
         LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology, ShardFrame,
         ShardIdentity, shard_channel,
     };
+
+    #[compio::test]
+    async fn given_invalid_partition_writes_when_resolving_should_preserve_offset_error_codes() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let mut cases = Vec::new();
+        for operation in [
+            Operation::StoreConsumerOffset,
+            Operation::DeleteConsumerOffset,
+        ] {
+            cases.push((operation, vec![1], IggyError::InvalidCommand));
+            let consumer = WireConsumer::consumer(WireIdentifier::Numeric(1));
+            let body = if operation == Operation::StoreConsumerOffset {
+                StoreConsumerOffsetRequest {
+                    consumer,
+                    stream_id: WireIdentifier::Numeric(404),
+                    topic_id: WireIdentifier::Numeric(1),
+                    partition_id: Some(0),
+                    offset: 0,
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes()
+            } else {
+                DeleteConsumerOffsetRequest {
+                    consumer,
+                    stream_id: WireIdentifier::Numeric(404),
+                    topic_id: WireIdentifier::Numeric(1),
+                    partition_id: Some(0),
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes()
+            };
+            cases.push((
+                operation,
+                body.to_vec(),
+                IggyError::StreamIdNotFound(Identifier::numeric(404).unwrap()),
+            ));
+        }
+        cases.push((
+            Operation::SendMessages,
+            vec![1],
+            IggyError::ResourceNotFound(String::new()),
+        ));
+        for (index, (operation, body, expected)) in cases.into_iter().enumerate() {
+            let request = request_message(operation, 1, 1, index as u64 + 1, &body);
+            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID)).await;
+            let replies = bus.client_replies.borrow();
+            let (_, frame) = replies.last().unwrap();
+            let start = std::mem::offset_of!(ReplyHeader, status);
+            let status = u32::from_le_bytes(frame[start..start + 4].try_into().unwrap());
+            assert_eq!(status, expected.as_code(), "{operation:?}");
+        }
+    }
 
     /// An undecodable request body is a PERMANENT client error, so every read
     /// on this path must answer a nonzero status. The fail-fast shapes these

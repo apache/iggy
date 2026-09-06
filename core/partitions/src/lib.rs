@@ -109,17 +109,6 @@ pub trait Partition {
         message: Message<PrepareHeader>,
     ) -> impl Future<Output = Result<AppendResult, IggyError>>;
 
-    /// # Errors
-    /// Returns `IggyError::FeatureUnavailable` by default.
-    fn store_consumer_offset(
-        &self,
-        consumer: PollingConsumer,
-        offset: u64,
-    ) -> Result<(), IggyError> {
-        let _ = (consumer, offset);
-        Err(IggyError::FeatureUnavailable)
-    }
-
     fn get_consumer_offset(&self, consumer: PollingConsumer) -> Option<u64> {
         let _ = consumer;
         None

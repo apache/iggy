@@ -158,7 +158,7 @@ pub async fn create_partition_file_hierarchy(
 /// exist but fail to decode. A stored offset past the offset space is clamped
 /// to `current_offset` (with a warning), not an error.
 #[allow(clippy::too_many_lines)]
-pub fn configure_consumer_offsets(
+pub async fn configure_consumer_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
     namespace: IggyNamespace,
@@ -193,7 +193,8 @@ pub fn configure_consumer_offsets(
         stream_id,
         topic_id,
         partition_id,
-    )?;
+    )
+    .await?;
     let consumer_offsets = ConsumerOffsets::with_capacity(recovered_consumers.entries.len());
     {
         let guard = consumer_offsets.pin();
@@ -233,7 +234,8 @@ pub fn configure_consumer_offsets(
         stream_id,
         topic_id,
         partition_id,
-    )?;
+    )
+    .await?;
     let consumer_group_offsets =
         ConsumerGroupOffsets::with_capacity(recovered_groups.entries.len());
     {
@@ -307,7 +309,7 @@ pub fn configure_consumer_offsets(
     Ok(())
 }
 
-fn load_partition_consumer_offsets(
+async fn load_partition_consumer_offsets(
     path: &str,
     consumer_kind: &'static str,
     stream_id: usize,
@@ -315,19 +317,13 @@ fn load_partition_consumer_offsets(
     partition_id: usize,
 ) -> Result<RecoveredOffsets<iggy_common::ConsumerOffset>, ServerError> {
     if !Path::new(path).exists() {
-        return Ok(RecoveredOffsets {
-            entries: Vec::new(),
-            stranded_ids: Vec::new(),
-        });
+        return Ok(RecoveredOffsets::default());
     }
 
-    load_consumer_offsets(path).or_else(|source| {
+    load_consumer_offsets(path).await.or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok(RecoveredOffsets {
-                entries: Vec::new(),
-                stranded_ids: Vec::new(),
-            });
+            return Ok(RecoveredOffsets::default());
         }
 
         Err(ServerError::ConsumerOffsetsLoad {
@@ -341,7 +337,7 @@ fn load_partition_consumer_offsets(
     })
 }
 
-fn load_partition_consumer_group_offsets(
+async fn load_partition_consumer_group_offsets(
     path: &str,
     stream_id: usize,
     topic_id: usize,
@@ -351,19 +347,13 @@ fn load_partition_consumer_group_offsets(
     ServerError,
 > {
     if !Path::new(path).exists() {
-        return Ok(RecoveredOffsets {
-            entries: Vec::new(),
-            stranded_ids: Vec::new(),
-        });
+        return Ok(RecoveredOffsets::default());
     }
 
-    load_consumer_group_offsets(path).or_else(|source| {
+    load_consumer_group_offsets(path).await.or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok(RecoveredOffsets {
-                entries: Vec::new(),
-                stranded_ids: Vec::new(),
-            });
+            return Ok(RecoveredOffsets::default());
         }
 
         Err(ServerError::ConsumerOffsetsLoad {
@@ -897,7 +887,7 @@ async fn load_partition(
     restore_partition_offsets(&mut partition, partitions_config, recovered_state.as_ref()).await?;
     let current_offset = partition.offset.load(Ordering::Acquire);
 
-    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset).await?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
 
     Ok(partition)
@@ -1363,7 +1353,7 @@ pub async fn build_partition_fresh(
 
     let current_offset = partition.offset.load(Ordering::Acquire);
 
-    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset).await?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
 
     // Claim the first offset-reservation block HERE so no send ever pays the

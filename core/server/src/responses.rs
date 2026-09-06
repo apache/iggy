@@ -260,6 +260,7 @@ where
 /// touch the offset of a partition it currently owns. `Ok` for individual
 /// consumers (no fence) and for owned group partitions; `Err` otherwise so a
 /// stale client re-syncs instead of corrupting the shared group offset.
+#[allow(clippy::cast_possible_truncation)]
 fn fence_group_offset<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,
@@ -280,8 +281,7 @@ where
     }
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
     let streams = shard.plane.metadata().mux_stm.streams();
-    #[allow(clippy::cast_possible_truncation)]
-    streams
+    let Some(_) = streams
         // Commit fence: allow a pending-revoked partition (the source commits it
         // to drain the cooperative handoff), so `require_pollable = false`.
         .consumer_group_fence(
@@ -292,15 +292,14 @@ where
             partition_id,
             false,
         )
-        .map(|_| ())
-        .ok_or_else(|| {
-            resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)
-                .err()
-                .unwrap_or(IggyError::ConsumerGroupPartitionNotOwned(
-                    client_id as u32,
-                    partition_id,
-                ))
-        })
+    else {
+        resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
+        return Err(IggyError::ConsumerGroupPartitionNotOwned(
+            client_id as u32,
+            partition_id,
+        ));
+    };
+    Ok(())
 }
 
 pub fn resolve_offset_group_id(
