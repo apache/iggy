@@ -119,26 +119,15 @@ export const serializeMessageId = (id?: unknown) => {
 
 }
 
-/** Number of ids drawn per CSPRNG refill. One randomFillSync fills the whole
- *  pool; ids are handed out from it until drained, amortizing the per-call
- *  crypto overhead (~2us) across this many mints. */
+/** Number of ids drawn from the pool per CSPRNG refill */
 const ID_POOL_COUNT = 4096;
 
-/** Pooled random bytes and a cursor into them. Filled lazily on first mint. */
+/** Pooled random bytes and a cursor into them, filled lazily on first mint */
 const idPool = Buffer.allocUnsafe(ID_POOL_COUNT * MESSAGE_ID_SIZE);
 let idPoolCursor = idPool.length; // past the end -> refill on first use
 
 /**
- * Mints a random 16-byte message ID from a pooled CSPRNG buffer.
- *
- * One randomFillSync fills the whole pool; each mint copies the next 16 bytes
- * into a freshly owned buffer and advances the cursor, refilling when drained.
- * Amortizing the per-call crypto cost across ID_POOL_COUNT ids makes this both
- * faster than a per-id draw and stronger than a non-cryptographic PRNG. The id
- * is opaque and not keyed on, so its only requirements are uniqueness and a
- * non-zero value; 128 bits keeps collisions far below the birthday bound, and
- * the all-zero result has probability 2^-128, so "non-zero" holds without a
- * retry. The bytes are copied out, so the id stays valid across a later refill.
+ * Mints a random 16-byte message ID from the pool, refilling when drained.
  *
  * @returns 16-byte buffer of random bytes owned by the caller
  */
@@ -161,12 +150,11 @@ const mintMessageId = (): Buffer => {
  * @returns 16-byte little-endian buffer containing a non-zero ID
  */
 const resolveMessageId = (id?: MessageIdKind): Buffer => {
-  // Hot path: an absent or explicit-zero id mints straight from the CSPRNG,
-  // skipping serialization and the all-zero byte scan entirely.
+  // An absent or zero id mints a random one.
   if (id === undefined || id === 0 || id === 0n)
     return mintMessageId();
   const bId = serializeMessageId(id);
-  // A caller can still pass the all-zero nil UUID string; keep "zero id -> mint".
+  // A string id can still be the all-zero nil UUID; mint in that case too.
   return 'string' === typeof id && bId.every((byte) => byte === 0)
     ? mintMessageId()
     : bId;
