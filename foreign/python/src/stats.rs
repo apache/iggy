@@ -116,25 +116,11 @@ impl CacheMetrics {
 #[pyclass]
 pub struct Stats {
     pub(crate) inner: RustStats,
-    /// Converted once here so that every `cache_metrics` access returns the
-    /// same dict instead of re-collecting the whole map.
-    cache_metrics: Py<PyDict>,
 }
 
 impl From<RustStats> for Stats {
     fn from(stats: RustStats) -> Self {
-        let cache_metrics = Python::attach(|py| {
-            let dict = PyDict::new(py);
-            for (key, metrics) in &stats.cache_metrics {
-                dict.set_item(CacheMetricsKey::from(key), CacheMetrics::from(metrics))
-                    .expect("insert cache metrics entry");
-            }
-            dict.unbind()
-        });
-        Self {
-            inner: stats,
-            cache_metrics,
-        }
+        Self { inner: stats }
     }
 }
 
@@ -147,7 +133,9 @@ impl Stats {
         self.inner.process_id
     }
 
-    /// The CPU usage of the server process, in percent.
+    /// The CPU usage of the server process, in percent summed over the cores
+    /// it ran on, so it exceeds 100 whenever the process uses more than one
+    /// core.
     ///
     /// Measured as a delta since the previous `get_stats` served by the same
     /// server shard, so the first sample a shard serves is 0.
@@ -156,8 +144,9 @@ impl Stats {
         self.inner.cpu_usage
     }
 
-    /// The total CPU usage of the system, in percent, scoped to the cores the
-    /// server may run on when confined by an affinity/cpuset mask.
+    /// The total CPU usage of the system, in percent averaged over the cores
+    /// the server may run on when confined by an affinity/cpuset mask (over
+    /// every host core otherwise), so it stays within 0-100.
     ///
     /// Same per-shard delta sampling as `cpu_usage`: the first sample a shard
     /// serves is 0.
@@ -301,13 +290,17 @@ impl Stats {
 
     /// Cache metrics per partition.
     ///
-    /// The server does not populate this yet and always replies with an empty
-    /// map. Built once when the stats are received; every access returns the
-    /// same dict.
+    /// Current servers do not populate this and reply with an empty map. Each
+    /// access builds a fresh dict, so mutating the returned dict does not
+    /// change the stats.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.dict[CacheMetricsKey, CacheMetrics]"))]
-    pub fn cache_metrics(&self, py: Python<'_>) -> Py<PyDict> {
-        self.cache_metrics.clone_ref(py)
+    pub fn cache_metrics<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new(py);
+        for (key, metrics) in &self.inner.cache_metrics {
+            dict.set_item(CacheMetricsKey::from(key), CacheMetrics::from(metrics))?;
+        }
+        Ok(dict)
     }
 
     /// The number of threads in the server process.
@@ -355,6 +348,37 @@ mod tests {
     use iggy::prelude::{IggyByteSize, IggyDuration, IggyTimestamp};
     use std::collections::HashMap;
 
+    /// Two entries sharing a stream and topic, so a key collision in the
+    /// `HashMap` -> `PyDict` conversion drops one of them.
+    fn cache_metrics_entries() -> HashMap<RustCacheMetricsKey, RustCacheMetrics> {
+        HashMap::from([
+            (
+                RustCacheMetricsKey {
+                    stream_id: 1,
+                    topic_id: 2,
+                    partition_id: 3,
+                },
+                RustCacheMetrics {
+                    hits: 7,
+                    misses: 3,
+                    hit_ratio: 0.7,
+                },
+            ),
+            (
+                RustCacheMetricsKey {
+                    stream_id: 1,
+                    topic_id: 2,
+                    partition_id: 4,
+                },
+                RustCacheMetrics {
+                    hits: 0,
+                    misses: 5,
+                    hit_ratio: 0.0,
+                },
+            ),
+        ])
+    }
+
     fn rust_stats(iggy_server_semver: Option<u32>) -> RustStats {
         RustStats {
             process_id: 1,
@@ -381,7 +405,7 @@ mod tests {
             kernel_version: String::new(),
             iggy_server_version: String::new(),
             iggy_server_semver,
-            cache_metrics: HashMap::new(),
+            cache_metrics: cache_metrics_entries(),
             threads_count: 0,
             free_disk_space: IggyByteSize::default(),
             total_disk_space: IggyByteSize::default(),
@@ -389,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn iggy_server_semver_none_survives_conversion() {
+    fn given_stats_when_converting_should_preserve_semver_option() {
         Python::initialize();
 
         assert_eq!(Stats::from(rust_stats(None)).iggy_server_semver(), None);
@@ -397,5 +421,29 @@ mod tests {
             Stats::from(rust_stats(Some(1_002_003))).iggy_server_semver(),
             Some(1_002_003)
         );
+    }
+
+    #[test]
+    fn given_populated_cache_metrics_when_reading_should_key_every_entry() {
+        Python::initialize();
+
+        let stats = Stats::from(rust_stats(None));
+
+        Python::attach(|py| {
+            let dict = stats.cache_metrics(py).expect("build cache metrics dict");
+            assert_eq!(dict.len(), cache_metrics_entries().len());
+
+            let entry = dict
+                .get_item(CacheMetricsKey::new(1, 2, 4))
+                .expect("look up cache metrics entry")
+                .expect("entry for an independently built key");
+            assert_eq!(
+                entry
+                    .getattr("misses")
+                    .and_then(|misses| misses.extract::<u64>())
+                    .expect("read misses"),
+                5
+            );
+        });
     }
 }

@@ -124,7 +124,8 @@ class TestStats:
                     stream_name, topic_name, unique_name()
                 )
                 topics.append((stream_name, topic_name))
-        second_client = await login_fresh_client("iggy", "iggy")
+        # Bound only to keep a second connection open until the test ends.
+        _second_client = await login_fresh_client("iggy", "iggy")
 
         topics_created = len(topics)
         partitions_created = topics_created * partitions_per_topic
@@ -142,39 +143,46 @@ class TestStats:
             stats.consumer_groups_count
             >= stats_before.consumer_groups_count + topics_created
         )
-        assert stats.clients_count >= stats_before.clients_count + 1
+        # Both `iggy_client` and `_second_client` are connected at this point, so
+        # the cross-shard total covers them regardless of what else the server
+        # reaped in between.
+        assert stats.clients_count >= 2
 
         # The SDK has no delete_stream, so the streams stay behind and only the
-        # topic-level counters are expected to drop.
+        # topic-level counters are expected to drop. The baseline is re-read
+        # right before the deletes to keep the window in which a concurrent
+        # test can bump the server-global counters as small as possible.
+        stats_before_delete = await iggy_client.get_stats()
         for stream_name, topic_name in topics:
             await iggy_client.delete_topic(stream_name, topic_name)
-        del second_client
 
         stats_after = await iggy_client.get_stats()
 
-        assert stats_after.topics_count <= stats.topics_count - topics_created
         assert (
-            stats_after.partitions_count <= stats.partitions_count - partitions_created
+            stats_after.topics_count
+            <= stats_before_delete.topics_count - topics_created
         )
-        assert stats_after.segments_count <= stats.segments_count - partitions_created
+        assert (
+            stats_after.partitions_count
+            <= stats_before_delete.partitions_count - partitions_created
+        )
+        assert (
+            stats_after.segments_count
+            <= stats_before_delete.segments_count - partitions_created
+        )
         assert (
             stats_after.consumer_groups_count
-            <= stats.consumer_groups_count - topics_created
+            <= stats_before_delete.consumer_groups_count - topics_created
         )
-        # The server reaps a dropped connection asynchronously, so the count
-        # may not have decreased yet.
-        assert stats_after.clients_count <= stats.clients_count
 
     @pytest.mark.asyncio
     async def test_get_stats_cache_metrics_dict(self, iggy_client: IggyClient):
-        """cache_metrics is a dict the server currently leaves empty, and
-        repeated accesses return the same dict rather than rebuilding it."""
+        """cache_metrics is a dict the server currently leaves empty."""
         stats = await iggy_client.get_stats()
 
         assert stats.cache_metrics == {}
-        # The getter must not re-collect the map on every access.
-        assert stats.cache_metrics is stats.cache_metrics
 
+    @pytest.mark.unit
     def test_cache_metrics_key_is_constructible_and_hashable(self):
         """A key built in Python can address a cache_metrics dict entry."""
         key = CacheMetricsKey(stream_id=1, topic_id=2, partition_id=3)
@@ -202,18 +210,18 @@ class TestStats:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Not connected"):
             await client.get_stats()
 
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Unauthenticated"):
             await client.get_stats()
 
         await client.login_user("iggy", "iggy")
         await client.get_stats()
 
         await client.logout_user()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Unauthenticated"):
             await client.get_stats()
 
     @pytest.mark.asyncio
@@ -225,17 +233,18 @@ class TestStats:
         username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
-        denied_client = await login_fresh_client(username, password)
-        with pytest.raises(RuntimeError):
-            await denied_client.get_stats()
+        try:
+            denied_client = await login_fresh_client(username, password)
+            with pytest.raises(RuntimeError, match="Unauthorized"):
+                await denied_client.get_stats()
 
-        await iggy_client.update_permissions(
-            created.id,
-            Permissions(global_permissions=GlobalPermissions(**{flag: True})),
-        )
+            await iggy_client.update_permissions(
+                created.id,
+                Permissions(global_permissions=GlobalPermissions(**{flag: True})),
+            )
 
-        granted_client = await login_fresh_client(username, password)
-        stats = await granted_client.get_stats()
-        assert stats.process_id > 0
-
-        await iggy_client.delete_user(created.id)
+            granted_client = await login_fresh_client(username, password)
+            stats = await granted_client.get_stats()
+            assert stats.process_id > 0
+        finally:
+            await iggy_client.delete_user(created.id)

@@ -1922,7 +1922,9 @@ class Stats:
     @property
     def cpu_usage(self) -> builtins.float:
         r"""
-        The CPU usage of the server process, in percent.
+        The CPU usage of the server process, in percent summed over the cores
+        it ran on, so it exceeds 100 whenever the process uses more than one
+        core.
 
         Measured as a delta since the previous `get_stats` served by the same
         server shard, so the first sample a shard serves is 0.
@@ -1930,8 +1932,9 @@ class Stats:
     @property
     def total_cpu_usage(self) -> builtins.float:
         r"""
-        The total CPU usage of the system, in percent, scoped to the cores the
-        server may run on when confined by an affinity/cpuset mask.
+        The total CPU usage of the system, in percent averaged over the cores
+        the server may run on when confined by an affinity/cpuset mask (over
+        every host core otherwise), so it stays within 0-100.
 
         Same per-shard delta sampling as `cpu_usage`: the first sample a shard
         serves is 0.
@@ -2051,9 +2054,9 @@ class Stats:
         r"""
         Cache metrics per partition.
 
-        The server does not populate this yet and always replies with an empty
-        map. Built once when the stats are received; every access returns the
-        same dict.
+        Current servers do not populate this and reply with an empty map. Each
+        access builds a fresh dict, so mutating the returned dict does not
+        change the stats.
         """
     @property
     def threads_count(self) -> builtins.int:
