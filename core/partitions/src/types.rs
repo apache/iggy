@@ -366,6 +366,7 @@ impl Default for PartitionPathLayout {
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
 /// `SegmentConfig` (`core/server/src/configs/system.rs`).
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PartitionsConfig {
     /// Flush journal to disk when it accumulates this many messages.
     pub messages_required_to_save: u32,
@@ -373,6 +374,10 @@ pub struct PartitionsConfig {
     pub size_of_messages_required_to_save: IggyByteSize,
     /// Whether to enforce fsync after writes.
     pub enforce_fsync: bool,
+    /// Whether consumer-offset files are written crash-safe (data-synced,
+    /// renamed, directory synced). Independent of `enforce_fsync`, which
+    /// governs message and index files.
+    pub consumer_offset_enforce_fsync: bool,
     /// Whether a disk poll verifies each batch's `batch_checksum` against the bytes
     /// it just read.
     ///

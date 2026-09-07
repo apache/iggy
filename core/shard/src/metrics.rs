@@ -39,8 +39,11 @@
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::sync::{Arc, OnceLock};
+
+use iggy_common::ConsumerKind;
 
 /// Label for `frame_drops_total`.
 ///
@@ -60,6 +63,11 @@ use std::sync::{Arc, OnceLock};
 pub struct FrameDropLabel {
     pub variant: &'static str,
     pub reason: &'static str,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct ConsumerOffsetKindLabel {
+    pub kind: &'static str,
 }
 
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
@@ -99,6 +107,12 @@ pub mod frame_drop_variant {
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
     pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
+    /// A poll's auto-commit submit refused by the owning shard's own inbox.
+    ///
+    /// Its own series, not `PARTITION`: the poll is answered with a retriable
+    /// status and no frame of the client's was dropped, so counting it with
+    /// shed frames would read as a routing loss.
+    pub const PARTITION_AUTO_COMMIT: &str = "partition_auto_commit";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -147,7 +161,7 @@ pub mod frame_drop_reason {
 // pair enters the `Family` (and therefore the scrape) the first time a drop
 // site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 7;
+const VARIANT_COUNT: usize = 8;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -158,6 +172,7 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::FORWARD_REPLICA_SEND,
     frame_drop_variant::METADATA_COMMIT_TICK,
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
+    frame_drop_variant::PARTITION_AUTO_COMMIT,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
@@ -180,6 +195,13 @@ fn variant_index(s: &str) -> Option<usize> {
 
 fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
+}
+
+const fn consumer_kind_index(kind: ConsumerKind) -> usize {
+    match kind {
+        ConsumerKind::Consumer => 0,
+        ConsumerKind::ConsumerGroup => 1,
+    }
 }
 
 /// Per-shard metric handles.
@@ -215,6 +237,10 @@ pub struct ShardMetrics {
     metadata_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
+    partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
+    consumer_offset_denied_counters: [Counter; 2],
+    partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
+    consumer_offset_stranded_gauges: [Gauge; 2],
 }
 
 impl ShardMetrics {
@@ -227,6 +253,34 @@ impl ShardMetrics {
         let cached_counters = Arc::new(std::array::from_fn(|_| {
             std::array::from_fn(|_| OnceLock::new())
         }));
+        let partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter> =
+            Family::default();
+        let consumer_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
+                .clone()
+        };
+        let consumer_group_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel {
+                    kind: "consumer_group",
+                })
+                .clone()
+        };
+        let consumer_offset_denied_counters = [consumer_denied, consumer_group_denied];
+        let partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge> =
+            Family::default();
+        // End each Family read guard before creating the next series, which
+        // needs the same family's write lock on a miss.
+        let consumer_stranded = partition_consumer_offsets_stranded
+            .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
+            .clone();
+        let group_stranded = partition_consumer_offsets_stranded
+            .get_or_create(&ConsumerOffsetKindLabel {
+                kind: "consumer_group",
+            })
+            .clone();
+        let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
             frame_drops_total,
             cached_counters,
@@ -243,7 +297,34 @@ impl ShardMetrics {
             metadata_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
+            partition_consumer_offsets_denied_total,
+            consumer_offset_denied_counters,
+            partition_consumer_offsets_stranded,
+            consumer_offset_stranded_gauges,
         }
+    }
+
+    /// Best effort: counts explicit client denials read off the reply status
+    /// and the poll-side reservation refusals. A denial the pump answers to an
+    /// auto-commit submit has no client reply to read and is not counted.
+    pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].inc();
+    }
+
+    /// Republished by every partition sweep: the sum over this shard's
+    /// partitions of offset keys whose file could not be loaded or unlinked.
+    /// Such a key stays counted against `consumer_offsets_max` until a later
+    /// store or delete of it succeeds, so a non-zero value that never falls is
+    /// an offsets directory an operator has to repair.
+    pub fn set_consumer_offsets_stranded(&self, kind: ConsumerKind, count: usize) {
+        self.consumer_offset_stranded_gauges[consumer_kind_index(kind)]
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn consumer_offset_denied_value(&self, kind: ConsumerKind) -> u64 {
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].get()
     }
 
     /// Bumped every time a client request is answered with a retryable denial
@@ -625,6 +706,18 @@ impl ShardMetrics {
             "client requests denied retryable because that client's request queue was full",
             self.client_requests_denied_queue_full_total.clone(),
         );
+        registry.register(
+            "partition_consumer_offsets_denied",
+            "consumer offset creations denied at the per-partition admission limit (best effort: \
+             explicit client denials and poll-side reservation refusals)",
+            self.partition_consumer_offsets_denied_total.clone(),
+        );
+        registry.register(
+            "partition_consumer_offsets_stranded",
+            "consumer offset keys whose file could not be loaded or unlinked, still counted \
+             against the limit",
+            self.partition_consumer_offsets_stranded.clone(),
+        );
     }
 }
 
@@ -704,6 +797,35 @@ mod tests {
             })
             .get();
         assert_eq!(from_family, 5);
+    }
+
+    #[test]
+    fn consumer_offset_denials_use_two_cached_kind_series() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::ConsumerGroup);
+
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::Consumer),
+            2
+        );
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::ConsumerGroup),
+            1
+        );
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        assert_eq!(
+            buffer
+                .lines()
+                .filter(|line| line.starts_with("partition_consumer_offsets_denied_total"))
+                .count(),
+            2
+        );
     }
 
     #[test]

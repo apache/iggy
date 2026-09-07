@@ -122,6 +122,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                 iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
             ),
             enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
+            consumer_offset_enforce_fsync: config.partition.consumer_offset_enforce_fsync,
             validate_checksum: config.system.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
@@ -330,6 +331,16 @@ const _: () = assert!(
 );
 const _: () = assert!(
     configs::partition::PARTITION_DEDUP_CLIENTS_DEFAULT == consensus::PARTITION_DEDUP_CLIENTS_MAX
+);
+const _: () = assert!(
+    configs::partition::PARTITION_CONSUMER_OFFSETS_DEFAULT
+        == partitions::DEFAULT_CONSUMER_OFFSETS_MAX
+);
+const _: () = assert!(
+    4 * configs::partition::PARTITION_CONSUMER_OFFSETS_CEILING
+        <= partitions::CONSUMER_OFFSETS_ENTRIES_MAX as usize,
+    "four ceilings fill the transfer decoder's entry budget exactly, with no headroom left; raise \
+     CONSUMER_OFFSETS_ENTRIES_MAX before raising PARTITION_CONSUMER_OFFSETS_CEILING"
 );
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);

@@ -21,6 +21,7 @@
 //! can ride a bound session.
 
 use std::mem::offset_of;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use iggy::prelude::*;
@@ -55,6 +56,10 @@ pub(crate) async fn connect(harness: &TestHarness) -> TcpStream {
         .server()
         .tcp_addr()
         .expect("server must expose a TCP address");
+    connect_to(addr).await
+}
+
+pub(crate) async fn connect_to(addr: SocketAddr) -> TcpStream {
     TcpStream::connect(addr).await.unwrap()
 }
 

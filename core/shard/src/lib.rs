@@ -49,7 +49,7 @@ use iggy_binary_protocol::{
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
+use iggy_common::{ConsumerKind, IggyError, IggyExpiry, IggyTimestamp};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::RequestHandler;
@@ -114,6 +114,7 @@ where
 pub struct PartitionMaterialisation {
     epoch: u64,
     created_view: u32,
+    consumer_offsets_max: usize,
 }
 
 #[cfg(feature = "simulator")]
@@ -123,7 +124,14 @@ impl PartitionMaterialisation {
         Self {
             epoch,
             created_view,
+            consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
         }
+    }
+
+    #[must_use]
+    pub const fn with_consumer_offsets_max(mut self, consumer_offsets_max: usize) -> Self {
+        self.consumer_offsets_max = consumer_offsets_max;
+        self
     }
 }
 
@@ -358,6 +366,15 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
+    /// The read was refused and returns no messages, even where fragments were
+    /// already gathered. For a poll with `auto_commit`, `TooManyConsumerOffsets`
+    /// when the poll needed a new offset key past `[partition]
+    /// consumer_offsets_max`, and `TransientNotAccepted` when the auto-commit
+    /// could not be submitted: the owning shard's inbox was full, or the
+    /// partition changed primary or incarnation during the read. Transient
+    /// refusal permits re-polling. A capacity refusal needs a slot reclaimed
+    /// or a higher configured limit before a new key can succeed.
+    Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
     /// committed offsets on this partition (each `None` if absent).
     GroupOffsetState {
@@ -734,6 +751,12 @@ pub enum LifecycleFrame {
     PartitionSubmit {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
+    },
+    /// Local auto-commit submission. The guard travels with the frame so an
+    /// inbox drop or admission refusal releases its provisional key directly.
+    AutoCommitSubmit {
+        request: Message<RoutedRequestHeader>,
+        reservation: partitions::AutoCommitReservation,
     },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
@@ -2035,6 +2058,32 @@ where
         Ok(PartitionSubmitTicket {
             receiver: reply_rx,
             target,
+        })
+    }
+
+    /// Submit an auto-commit back to the partition-owning shard's pump.
+    ///
+    /// # Errors
+    /// Returns a refusal if the local inbox cannot accept the frame.
+    pub fn submit_auto_commit_offset(
+        &self,
+        request: Message<RoutedRequestHeader>,
+        reservation: partitions::AutoCommitReservation,
+    ) -> Result<(), PartitionSubmitRefused> {
+        let frame = ShardFrame::lifecycle(LifecycleFrame::AutoCommitSubmit {
+            request,
+            reservation,
+        });
+        let sender = self
+            .senders
+            .get(usize::from(self.id))
+            .ok_or(PartitionSubmitRefused)?;
+        sender.try_send(frame).map_err(|error| {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION_AUTO_COMMIT,
+                crate::coordinator::classify_try_send_err(&error),
+            );
+            PartitionSubmitRefused
         })
     }
 
@@ -4012,6 +4061,7 @@ where
         let PartitionMaterialisation {
             epoch,
             created_view,
+            consumer_offsets_max,
         } = materialisation;
         let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {
@@ -4070,8 +4120,9 @@ where
             stats,
             consensus,
             partitions.config().segment_size,
-            partitions.config().enforce_fsync,
+            partitions.config().consumer_offset_enforce_fsync,
         );
+        partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state.as_ref());
         }
@@ -7204,6 +7255,15 @@ where
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
                 };
+                partition.retry_consumer_offset_reservations();
+                if partition.queued_requests_ready() {
+                    if walks < PARTITION_WALKS_PER_TICK_MAX {
+                        walks += 1;
+                        partition.resume_queued_requests().await;
+                    } else {
+                        walk_cursor.get_or_insert(namespace);
+                    }
+                }
                 let consensus_normal = partition.consensus().is_normal();
                 let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
@@ -7550,6 +7610,21 @@ where
         // retires whatever completed.
         self.partition_repairs_inflight
             .set(repairs_live + repair_arms);
+        // Republished per sweep like the repair count: a stranded key is
+        // permanent until its own store or delete succeeds, so a gauge that
+        // never falls is the operator's only signal.
+        let mut stranded = [0usize; 2];
+        for namespace in partitions.namespaces() {
+            if let Some(partition) = partitions.get_by_ns(namespace) {
+                stranded[0] += partition.stranded_consumer_offset_count(ConsumerKind::Consumer);
+                stranded[1] +=
+                    partition.stranded_consumer_offset_count(ConsumerKind::ConsumerGroup);
+            }
+        }
+        self.metrics
+            .set_consumer_offsets_stranded(ConsumerKind::Consumer, stranded[0]);
+        self.metrics
+            .set_consumer_offsets_stranded(ConsumerKind::ConsumerGroup, stranded[1]);
 
         fatal
     }
@@ -8445,24 +8520,16 @@ where
         if !commit_lag && head <= commit_to_op {
             return false;
         }
-        let missing_suffix = partition_missing_suffix(partition);
-        if !commit_lag && !missing_suffix {
+        let missing_suffix = partition_missing_suffix_through(partition);
+        // Fetch the adopted suffix even while committed operations lag. Later
+        // live prepares can advance the head while an adopted body is missing.
+        let Some(fetch_to_op) =
+            partition_repair_fetch_to_op(consensus.commit_min(), commit_to_op, missing_suffix)
+        else {
             return false;
-        }
+        };
         let nonce = iggy_common::random_id::get_uuid();
         let from_op = consensus.commit_min() + 1;
-        // Capping at `commit_to_op` while a commit lag stands avoids
-        // re-asking for `(commit_min, commit_to_op]`, the committed prefix
-        // this replica already holds. But a restarted node has a commit lag
-        // by construction, and if it also adopted a StartView suffix, the
-        // missing bodies sit above `commit_to_op`, not within it -- so the
-        // cap only holds when no suffix is missing; otherwise it must widen
-        // to `head` to ever reach those bodies.
-        let fetch_to_op = if commit_lag && !missing_suffix {
-            commit_to_op
-        } else {
-            head
-        };
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
         let namespace = consensus.group();
@@ -9002,7 +9069,7 @@ where
                 partition.note_transfer_progress();
                 partition.note_transfer_installed();
                 partition.transfer_rearm = None;
-                if outcome.offsets_written {
+                if outcome.purge_generation_recorded {
                     tracing::info!(
                         shard = self.id,
                         namespace_raw = namespace,
@@ -9017,8 +9084,8 @@ where
                         shard = self.id,
                         namespace_raw = namespace,
                         applied_commit_op = outcome.applied_commit_op,
-                        "partition state transfer landed WITHOUT fully written consumer \
-                         offsets; the next offset commit rewrites the files"
+                        "partition state transfer landed without a durable purge generation. \
+                         A restart may repeat the purge and transfer"
                     );
                 }
                 partition.commit_journal(&config).await;
@@ -10067,7 +10134,7 @@ struct GapProbe {
     /// bodies never arrived. Its own recovery shape, disjoint from the lag
     /// below the frontier: the group cannot gather quorum for that suffix until
     /// the bodies land, and the only other site that notices is the single
-    /// `on_start_view` edge that adopted them. See [`partition_missing_suffix`].
+    /// `on_start_view` edge that adopted them. See [`partition_missing_suffix_through`].
     ///
     /// Always `false` on a metadata probe: the shape it names is read off the
     /// partition's own journal window, and the metadata plane's equivalent is
@@ -10259,8 +10326,16 @@ fn rotate_sweep_to_cursor(namespaces: &mut [IggyNamespace], cursor: Option<IggyN
     namespaces.rotate_left(namespaces.partition_point(|namespace| *namespace < cursor));
 }
 
-/// Whether this replica holds adopted suffix HEADERS above `commit_max` whose
-/// bodies never arrived.
+fn partition_repair_fetch_to_op(
+    commit_min: u64,
+    commit_max: u64,
+    missing_suffix: Option<u64>,
+) -> Option<u64> {
+    (commit_min < commit_max || missing_suffix.is_some())
+        .then(|| missing_suffix.unwrap_or(commit_max))
+}
+
+/// Highest adopted suffix op whose bodies are not all present above `commit_max`.
 ///
 /// The shape `maybe_request_partition_repair` widens its window for, read here
 /// so the sweep's detector and the arm agree by construction. A backup that
@@ -10271,8 +10346,9 @@ fn rotate_sweep_to_cursor(namespaces: &mut [IggyNamespace], cursor: Option<IggyN
 ///
 /// Ordered cheapest-first, because it runs per group per tick: no suffix at all
 /// is one comparison, and a suffix nobody adopted is one `Option` check. Only a
-/// group that has both pays the header-vec walk.
-fn partition_missing_suffix<B, SB>(partition: &IggyPartition<B, SB>) -> bool
+/// group that has both pays the header-vec walk. Later live prepares can raise
+/// the sequencer without extending the adopted canonical header list.
+fn partition_missing_suffix_through<B, SB>(partition: &IggyPartition<B, SB>) -> Option<u64>
 where
     B: MessageBus,
     SB: SuperblockStore,
@@ -10281,18 +10357,24 @@ where
     let commit_max = consensus.commit_max();
     let head = consensus.sequencer().current_sequence();
     if head <= commit_max {
-        return false;
+        return None;
     }
-    let canonical_suffix = consensus
-        .with_pending_view_log(|pending| pending_covers_suffix(pending, commit_max, head))
-        .unwrap_or(false);
-    canonical_suffix
-        && !partition
-            .log
-            .journal()
-            .inner
-            .repaired_window_shape(commit_max, head)
-            .complete
+    let adopted_head = consensus
+        .with_pending_view_log(|pending| adopted_suffix_head(pending, commit_max, head))
+        .flatten()?;
+    (!partition
+        .log
+        .journal()
+        .inner
+        .repaired_window_shape(commit_max, adopted_head)
+        .complete)
+        .then_some(adopted_head)
+}
+
+fn adopted_suffix_head(pending: &MergedLog, commit_max: u64, current_head: u64) -> Option<u64> {
+    let adopted_head = pending.op_head.min(current_head);
+    (adopted_head > commit_max && pending_covers_suffix(pending, commit_max, adopted_head))
+        .then_some(adopted_head)
 }
 
 /// Read the gap probe off a live partition.
@@ -10324,8 +10406,10 @@ where
     // Same discipline, one guard deeper: the suffix test walks the header vec,
     // so it runs only for a group that HAS an unfinished suffix and already
     // owes nothing else.
-    let missing_suffix =
-        normal && !transferring && !recovery_owned && partition_missing_suffix(partition);
+    let missing_suffix = normal
+        && !transferring
+        && !recovery_owned
+        && partition_missing_suffix_through(partition).is_some();
     GapProbe {
         normal,
         transferring,
@@ -10341,9 +10425,11 @@ where
 /// suffix `(commit_max, head]`, in descending order. Only this canonical list
 /// makes fetching bodies above the commit point safe.
 fn pending_covers_suffix(pending: &MergedLog, commit_max: u64, head: u64) -> bool {
-    if head <= commit_max || pending.commit_max != commit_max || pending.op_head != head {
+    if head <= commit_max || pending.commit_max > commit_max || pending.op_head != head {
         return false;
     }
+    // Live commits can advance inside an adopted suffix. Its remaining
+    // canonical headers still authorize repair above the new commit point.
     let mut expected = head;
     for header in pending
         .headers
@@ -11129,7 +11215,10 @@ mod repair_scope_tests {
 
     use iggy_binary_protocol::{Command, PrepareHeader};
 
-    use super::{MergedLog, pending_covers_suffix, repair_op_in_scope, repair_serve_ceiling};
+    use super::{
+        MergedLog, adopted_suffix_head, pending_covers_suffix, repair_op_in_scope,
+        repair_serve_ceiling,
+    };
 
     fn header(op: u64) -> PrepareHeader {
         PrepareHeader {
@@ -11202,6 +11291,29 @@ mod repair_scope_tests {
     }
 
     #[test]
+    fn given_an_adopted_suffix_when_live_head_advances_should_preserve_its_repair_boundary() {
+        let pending = parked();
+        assert_eq!(adopted_suffix_head(&pending, 98, 100), Some(100));
+        assert_eq!(adopted_suffix_head(&pending, 98, 101), Some(100));
+        assert_eq!(adopted_suffix_head(&pending, 99, 101), Some(100));
+        assert_eq!(adopted_suffix_head(&pending, 100, 101), None);
+        let suffix = adopted_suffix_head(&pending, 98, 101);
+        assert_eq!(
+            super::partition_repair_fetch_to_op(0, 98, suffix),
+            Some(100)
+        );
+        assert_eq!(
+            super::partition_repair_fetch_to_op(98, 98, suffix),
+            Some(100)
+        );
+        assert_eq!(super::partition_repair_fetch_to_op(0, 98, None), Some(98));
+        assert_eq!(super::partition_repair_fetch_to_op(98, 98, None), None);
+        let mut missing = pending;
+        missing.headers.retain(|header| header.op != 99);
+        assert_eq!(adopted_suffix_head(&missing, 98, 101), None);
+    }
+
+    #[test]
     fn given_a_parked_view_when_fetching_above_commit_should_require_dense_canonical_suffix() {
         let pending = parked();
         assert!(pending_covers_suffix(&pending, 98, 100));
@@ -11211,7 +11323,7 @@ mod repair_scope_tests {
         assert!(!pending_covers_suffix(&missing, 98, 100));
 
         let mut wrong_frontier = pending;
-        wrong_frontier.commit_max = 97;
+        wrong_frontier.commit_max = 99;
         assert!(!pending_covers_suffix(&wrong_frontier, 98, 100));
     }
 }
