@@ -379,6 +379,8 @@ where
                                 self.process_frame(frame).await;
                                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
+                                // Anything it stages is served by the arm above
+                                // on the next pass, before this arm can run again.
                                 self.apply_reconcile_ops();
                             }
                             // Guaranteed reply-lane service: `select_biased!`
@@ -725,6 +727,15 @@ where
                 // awaiting shard never waits out its budget on a decision
                 // already made.
                 self.on_partition_submit(request, reply).await;
+            }
+            LifecycleFrame::AutoCommitSubmit {
+                request,
+                reservation,
+            } => {
+                self.plane
+                    .partitions()
+                    .on_auto_commit_request(request, reservation)
+                    .await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or

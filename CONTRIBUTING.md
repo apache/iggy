@@ -28,6 +28,23 @@ These require design discussion in the issue before coding:
 
 Authors of PRs must run the code locally. "Relying on CI" is not acceptable.
 
+### AI Assistance
+
+You are responsible for the code you submit, even if a tool wrote it.
+
+Using an AI assistant to help you code is fine. Submitting code you don't understand is
+not. Before you open a PR you must be able to explain what every part of the change does
+and why, answer review questions about it yourself, and defend the design without going
+back to the tool for an answer. If you can't, the PR isn't ready.
+
+While you're new to the project, please keep to **one open PR at a time**. Review takes
+longer than writing, so a queue of changes from one contributor holds up everyone else's.
+
+Maintainers may close a PR at first review if it reads as a relay between the reviewer and
+a model, rather than a change the author understands and takes responsibility for. That is
+a judgment about the submission, not about you, and it does not bar you from contributing
+again if you come back with a change you can take responsibility for.
+
 ### Green CI
 
 Maintainers will not start reviewing a PR while its CI is failing. Get the
@@ -146,6 +163,8 @@ line in a regular PR comment (not an inline review reply):
 | `/ready`                            | author or maintainer                | mark `S-waiting-on-review`                                   |
 | `/author`                           | maintainer or returning contributor | mark `S-waiting-on-author`                                   |
 | `/request-review @user-or-team ...` | author or maintainer                | request review from the listed `@user` / `@org/team` handles |
+| `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
+| `/unpin`                            | author or maintainer                | remove `pinned`                                              |
 
 Some labels move on their own: opening or marking a non-draft PR ready sets
 `S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
@@ -164,7 +183,19 @@ PRs may be closed if:
 - Code not ran and tested locally
 - Mixed purposes or purposes not clear
 - Can't answer questions about the change
-- Inactivity for longer than 7 days
+- Inactivity, see [Stale PRs](#stale-prs) below
+
+Whoever closes leaves a comment saying why. If the thread holds a finding
+that outlives the change, open an issue for it and link it from that
+comment. The closed thread is the first place someone looks to find out
+whether anything fell through.
+
+### Stale PRs
+
+A bot labels a PR `S-stale` after 7 days without activity and closes it 7
+days after that. A push, comment, review, reopen, or ready-for-review
+clears the label. Drafts and PRs labeled `pinned` are exempt. Issues are
+never labeled or closed by it. A closed PR can be reopened.
 
 ## Questions?
 

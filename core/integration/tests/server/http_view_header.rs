@@ -20,17 +20,13 @@
 //! withheld wherever it could reach a caller that proved no credential. Raw
 //! `reqwest`, because the header itself is the contract.
 
-use std::future::Future;
-use std::time::Instant;
-
-use iggy::prelude::*;
-use integration::harness::TestHarness;
 use integration::iggy_harness;
 use reqwest::{Response, StatusCode};
 use serde_json::json;
-use tokio::time::sleep;
 
-use crate::server::http_client::{HttpClient, LOGIN_RETRY_INTERVAL, LOGIN_TIMEOUT};
+use crate::server::http_client::{
+    HttpClient, leader_and_follower, node_url, until_primary_resolved,
+};
 
 const VIEW_HEADER: &str = "iggy-view";
 
@@ -89,67 +85,6 @@ async fn given_the_ping_route_when_it_succeeds_should_omit_the_iggy_view_header(
         view_number(&response).is_none(),
         "the pre-auth probe must not carry {VIEW_HEADER}"
     );
-}
-
-/// `http://host:port` of a harness node's HTTP listener.
-fn node_url(harness: &TestHarness, node: usize) -> String {
-    let addr = harness.node(node).http_addr().expect("node http address");
-    format!("http://{addr}")
-}
-
-/// Harness indexes of the node the roster marks `Leader` and of one it marks
-/// `Follower`. The harness emits the roster in node order, so a roster
-/// position is a harness index. Every node reads `Follower` until shard 0
-/// publishes its first view, so the roster is polled within the shared
-/// warmup budget until it marks a leader.
-async fn leader_and_follower(harness: &TestHarness) -> (usize, usize) {
-    let client = harness
-        .root_client_for_node(0)
-        .await
-        .expect("connect to node 0");
-    let deadline = Instant::now() + LOGIN_TIMEOUT;
-    loop {
-        let metadata = client
-            .get_cluster_metadata()
-            .await
-            .expect("get cluster metadata");
-        let position =
-            |role: ClusterNodeRole| metadata.nodes.iter().position(|node| node.role == role);
-        if let (Some(leader), Some(follower)) = (
-            position(ClusterNodeRole::Leader),
-            position(ClusterNodeRole::Follower),
-        ) {
-            return (leader, follower);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the roster did not mark a leader within {LOGIN_TIMEOUT:?}, got {metadata}"
-        );
-        sleep(LOGIN_RETRY_INTERVAL).await;
-    }
-}
-
-/// Repeat `request` while the follower answers 503, which it does until it
-/// can resolve the primary from its own view; bounded by the shared warmup
-/// budget, as cluster_metadata_vsr does. A 503 is the retry-safe class: the
-/// request provably never entered a pipeline.
-async fn until_primary_resolved<F, Fut>(request: F) -> Response
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Response>,
-{
-    let deadline = Instant::now() + LOGIN_TIMEOUT;
-    loop {
-        let response = request().await;
-        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
-            return response;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "follower did not resolve the primary within {LOGIN_TIMEOUT:?}"
-        );
-        sleep(LOGIN_RETRY_INTERVAL).await;
-    }
 }
 
 /// The view the primary stamps on its own successful response: the value a

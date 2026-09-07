@@ -23,8 +23,9 @@
 //! that parked. This test pins the park path positively, and on the replica
 //! where getting it wrong creates a replica gap: a client request that never
 //! reaches the plane is answered with a retriable status and the SDK replays it,
-//! while a replicated PREPARE has no client behind it and must wait for a later
-//! commit heartbeat to arm repair if this path drops it.
+//! while a replicated PREPARE has no client behind it: nothing re-sends it once
+//! its op has quorum, so the backup gap-stops and waits out `tick_partitions`'
+//! repair debounce before anything refetches it.
 //!
 //! What makes the window wide on a backup is the commit broadcast. A backup
 //! learns a metadata commit from the `commit` field of the next prepare on that
@@ -50,7 +51,7 @@
 //! - Every acked message is readable in dense offset order, each producer's own
 //!   sends stay in the order it made them, and all three replicas hold
 //!   byte-identical segments. A prepare lost to the gap check leaves a backup
-//!   permanently short, since the gap never closes on its own.
+//!   short until the repair driver's next pass closes the gap.
 //!
 //! The harness removes an ambient `RUST_LOG` when this test supplies its explicit
 //! logging level, and the log oracle falls back from captured stdout to the
@@ -98,8 +99,13 @@ const DEGRADED_MARKERS: [&str; 3] = [
 ];
 
 /// `IggyPartition::on_replicate`'s backup gap check. A re-dispatch that appends
-/// behind an op already queued on the inbox surfaces here, and the dropped op
-/// forces repair that correct redispatch ordering should never need.
+/// behind an op already queued on the inbox surfaces here. The dropped op is
+/// refetched by `tick_partitions`' level-triggered repair driver, but only after
+/// its debounce interval, so a re-dispatch that trips this has already stalled
+/// the replica for ~1s and the marker still means the ordering broke.
+///
+/// The metadata plane logs the same string, so the counting below pairs it with
+/// `PARTITION_PLANE_FIELD`.
 const GAP_MARKER: &str = "dropping out-of-order prepare (gap)";
 const PARTITION_PLANE_FIELD: &str = "plane=\"partitions\"";
 
@@ -347,7 +353,8 @@ fn assert_no_degraded_park_paths(harness: &TestHarness) {
         assert_eq!(
             partition_gaps, 0,
             "node {node} logged {GAP_MARKER:?}: a re-dispatched prepare lost its arrival \
-             position and forced avoidable partition repair"
+             position, and the op it displaced is recoverable only by waiting out the \
+             repair driver's debounce"
         );
     }
 }

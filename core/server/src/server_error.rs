@@ -122,6 +122,27 @@ pub enum ServerError {
         poll: std::time::Duration,
         drain: std::time::Duration,
     },
+    #[error("system.sharding.shutdown_join_timeout must be <= {max:?}; got {value:?}")]
+    InvalidShutdownJoinTimeout {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
+    #[error(
+        "system.sharding.shutdown_join_timeout ({join:?}) must be >= \
+         shutdown_drain_timeout ({drain:?})"
+    )]
+    ShutdownJoinBelowDrain {
+        join: std::time::Duration,
+        drain: std::time::Duration,
+    },
+    #[error(
+        "system.sharding.reconcile_periodic_interval must be in (0, {max:?}]; got {value:?}. \
+         Note that \"0\", \"none\", \"unlimited\", and \"disabled\" all parse to zero"
+    )]
+    InvalidReconcilePeriodicInterval {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
     #[error("failed to serialize current server config")]
     CurrentConfigSerialize(#[source] toml::ser::Error),
     #[error("failed to write current server config at {path}")]
@@ -200,6 +221,21 @@ pub enum ServerError {
         topic_id: usize,
         partition_id: usize,
         reason: PartitionRecoveryRefusal,
+    },
+    /// Fails the create rather than letting the partition go live without its
+    /// first reservation: the failed write arms the group's superblock retry
+    /// backoff, and a send arriving inside that window is refused with a
+    /// transient the HTTP plane does not replay. `namespace_raw` joins this to
+    /// the write's own `iggy.partitions.diag` line, which carries the cause.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} (namespace {namespace_raw}) could not \
+         claim its first offset reservation"
+    )]
+    PartitionOffsetReservationClaim {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        namespace_raw: u64,
     },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \

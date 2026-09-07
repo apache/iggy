@@ -999,7 +999,7 @@ public class HttpMessageStream : IIggyClient
         var partition = partitioning.Kind switch
         {
             Enums.Partitioning.Balanced => _groupState.NextBalancedPartition(key, partitionCount.Value),
-            Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Value) % partitionCount.Value,
+            Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Bytes) % partitionCount.Value,
             _ => throw new FeatureUnavailableException()
         };
 

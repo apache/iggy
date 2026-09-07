@@ -259,17 +259,7 @@ mod tests {
     /// construction plus the live cancellation smoke, not faked here.
     #[compio::test]
     async fn detached_task_advances_gate_and_ignores_dead_receiver() {
-        let session = Rc::new(HttpSession {
-            key: "jwt:test".to_owned(),
-            client_id: 7,
-            session: 1,
-            user_id: DEFAULT_ROOT_USER_ID,
-            expiry: u64::MAX,
-            gate: Mutex::new(FIRST_REQUEST_ID),
-            data_gate: Mutex::new(FIRST_REQUEST_ID),
-            registry_token: Cell::new(None),
-            in_flight_writes: Cell::new(0),
-        });
+        let session = fake_session("jwt:test", 7, u64::MAX);
         let (result_slot, committed) = oneshot::channel::<u64>();
         // The handler future dies (client disconnect) before the task runs.
         drop(committed);

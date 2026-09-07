@@ -28,6 +28,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use crate::options::OptionSpec as PyOptionSpec;
 use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
+use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
@@ -57,6 +59,11 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
+/// Keeps the SDK's own message on the `RuntimeError` the Python surface raises.
+fn to_runtime_error<E: Display>(error: E) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+}
+
 /// Resolves the shared `create_topic`/`update_topic` parameters, applying
 /// server defaults where the caller left them unset.
 fn resolve_topic_params(
@@ -65,8 +72,7 @@ fn resolve_topic_params(
     max_topic_size: Option<&MaxTopicSize>,
 ) -> PyResult<(CompressionAlgorithm, RustIggyExpiry, RustMaxTopicSize)> {
     let compression_algorithm = match compression_algorithm {
-        Some(algo) => CompressionAlgorithm::from_str(&algo)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+        Some(algo) => CompressionAlgorithm::from_str(&algo).map_err(to_runtime_error)?,
         None => CompressionAlgorithm::default(),
     };
 
@@ -86,44 +92,59 @@ fn resolve_topic_params(
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
-    /// This initializes a new runtime for asynchronous operations.
+    /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
+    /// `QuicConfig`. This initializes a new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
     ///
     /// Args:
-    ///     conn: Either a `host:port` address, or a `TcpConfig` carrying the full
-    ///         transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-    ///         disabled. A malformed address is reported differently by the two
-    ///         forms: the string form raises `RuntimeError` here, while `TcpConfig`
-    ///         raises `ValueError` when it is constructed, before it ever reaches
-    ///         this call. Neither exception is a subclass of the other.
+    ///     conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
+    ///         to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
+    ///         address is reported differently depending on the form: the string
+    ///         form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
+    ///         raise `ValueError` when they are constructed, before either ever
+    ///         reaches this call. Neither exception is a subclass of the other.
     ///
     /// Raises:
     ///     RuntimeError: If the address passed as a string is not a valid
-    ///         `host:port` pair.
+    ///         `host:port` pair, or if a `QuicConfig` client cannot bind its
+    ///         local UDP socket (for example the port is already in use).
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
-        #[gen_stub(override_type(type_repr = "TcpConfig | builtins.str | None"))] conn: Option<
-            PyClientConfig,
-        >,
+        #[gen_stub(override_type(type_repr = "TcpConfig | QuicConfig | builtins.str | None"))]
+        conn: Option<PyClientConfig>,
     ) -> PyResult<Self> {
-        let config = match conn {
-            Some(PyClientConfig::Config(config)) => config.client_config(),
-            Some(PyClientConfig::ServerAddress(server_address)) => Arc::new(
-                TcpClientConfigBuilder::new()
-                    .with_server_address(server_address)
-                    .build()
-                    .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                    })?,
+        let wrapper = match conn {
+            Some(PyClientConfig::Tcp(config)) => ClientWrapper::Tcp(
+                TcpClient::create(config.client_config()).map_err(to_runtime_error)?,
             ),
-            None => Arc::new(TcpClientConfig::default()),
+            Some(PyClientConfig::ServerAddress(server_address)) => {
+                let config = Arc::new(
+                    TcpClientConfigBuilder::new()
+                        .with_server_address(server_address)
+                        .build()
+                        .map_err(to_runtime_error)?,
+                );
+                ClientWrapper::Tcp(TcpClient::create(config).map_err(to_runtime_error)?)
+            }
+            Some(PyClientConfig::Quic(config)) => {
+                // `quinn::Endpoint::client` (invoked eagerly by `QuicClient::create`) looks
+                // up the current Tokio runtime via `Handle::try_current()` and fails with
+                // `CannotCreateEndpoint` if none is active. This method runs synchronously
+                // from Python without one, so enter the runtime pyo3-async-runtimes uses
+                // for our own async methods before building the endpoint.
+                let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+                ClientWrapper::Quic(
+                    QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
+                )
+            }
+            None => ClientWrapper::Tcp(
+                TcpClient::create(Arc::new(TcpClientConfig::default()))
+                    .map_err(to_runtime_error)?,
+            ),
         };
-        let tcp_client = TcpClient::create(config)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(IggyClient {
-            inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
+        Ok(Self {
+            inner: Arc::new(RustIggyClient::new(wrapper)),
         })
     }
 
@@ -137,6 +158,11 @@ impl IggyClient {
         _cls: &Bound<'_, PyType>,
         connection_string: String,
     ) -> PyResult<Self> {
+        // The QUIC transport builds its endpoint eagerly and needs a Tokio runtime context
+        // to do so (see the `QuicConfig` arm of `new()` above for details); entering it here
+        // is a no-op for the other transports since the protocol isn't known until the
+        // connection string is parsed.
+        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
         let client = RustIggyClient::from_connection_string(&connection_string)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {
@@ -154,6 +180,30 @@ impl IggyClient {
                 .ping()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        })
+    }
+
+    /// Get the statistics and details of the server and its running process.
+    ///
+    /// Requires an authenticated session whose user holds the `read_servers`
+    /// or `manage_servers` global permission.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `Stats`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client is not connected, the session is not
+    ///         authenticated, the user lacks the permission, or the request
+    ///         fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[Stats]", imports=("collections.abc")))]
+    fn get_stats<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let stats = inner
+                .get_stats()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(PyStats::from(stats))
         })
     }
 

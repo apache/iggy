@@ -44,7 +44,11 @@ pub async fn create_consumer(
                 "Consumer #{} → joining consumer group #{}",
                 consumer_id, consumer_group_id
             );
-            let cg_identifier = Identifier::try_from(*consumer_group_id).unwrap();
+            // By name: the group was created by name and the server assigns its
+            // own numeric id, which need not equal the bench's counter.
+            let cg_identifier =
+                Identifier::named(&format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}"))
+                    .unwrap();
             client
                 .join_consumer_group(stream_id, topic_id, &cg_identifier)
                 .await
@@ -209,8 +213,10 @@ pub fn build_consumer_futures(
                 consumer_id
             };
             let stream_id = format!("bench-stream-{stream_idx}");
+            // Groups are created as `BASE + 1..=cg_count`, one per stream, so the
+            // consumer must land on the group of the stream it polls.
             let consumer_group_id = if cg_count > 0 {
-                Some(CONSUMER_GROUP_BASE_ID + (consumer_id % cg_count))
+                Some(CONSUMER_GROUP_BASE_ID + stream_idx)
             } else {
                 None
             };

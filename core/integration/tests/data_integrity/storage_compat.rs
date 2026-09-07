@@ -57,17 +57,30 @@
 //! unseals the last segment, so a chain that ends on a rotation boundary
 //! would only ever hand that path an empty file.
 //!
-//! # Structural false positive to avoid
+//! # The configuration is held constant across the swap
 //!
-//! The harness forwards every parent `IGGY_*` variable to the server child,
-//! and the server treats an unknown `IGGY_*` name as a `debug_assert`. A pull
-//! request that adds a config leaf AND a test that sets it therefore makes
-//! the BASELINE binary die on startup, which looks like a compatibility
-//! break. Nothing here detects that: `resolve_config_paths` validates the
-//! name against the catalog of the build under test, which is the wrong side
-//! of the swap, so it only proves the name exists on HEAD. Keeping every
-//! override to a name that already exists on the merge base stays a rule the
-//! author has to follow by hand.
+//! Both boots read the BASELINE's `core/server/config.toml`, extracted next
+//! to the baseline binary by `scripts/ci/storage-compat.sh`. Neither side may
+//! fall back to the server's relative default path: figment resolves that by
+//! walking up from the test process's directory, so the BASELINE parses THIS
+//! branch's file, and a key added under a `deny_unknown_fields` table (every
+//! `[cluster]` and `[node]` one) fails its extraction with
+//! `Config(CannotLoadConfiguration)`. That reads as a compatibility break and
+//! is not one.
+//!
+//! One file across the swap leaves the binary as the only variable, and it
+//! pins the two rules the config plane already carries: a field this branch
+//! adds needs its `#[serde(default)]`, because the build under test boots on
+//! a file written before the field existed, and a key this branch takes away
+//! needs its `RelocatedKey` entry. Deleting a key from a
+//! `deny_unknown_fields` table, or relocating one, makes the SECOND boot
+//! refuse the file; strip that key from the extracted copy when it happens.
+//!
+//! The overrides below reach both binaries as `IGGY_*` variables, and
+//! `resolve_config_paths` checks them against the catalog of the build under
+//! test only. [`assert_overrides_known_to_the_baseline`] covers the other
+//! side, where an unknown `IGGY_*` name trips a `debug_assert` and takes the
+//! debug binary down at boot.
 //!
 //! `IGGY_TEST_VERBOSE` makes the harness inherit the server's stdout instead
 //! of capturing it, which would make the tombstone check vacuous. The
@@ -88,12 +101,20 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 /// Absolute path to the baseline `iggy-server` binary. See
-/// [`baseline_server_binary`] for why a relative value is refused.
+/// [`baseline_path_from_env`] for why a relative value is refused.
 ///
 /// NOT `IGGY_`-prefixed on purpose: the harness forwards every parent
 /// `IGGY_*` variable to the server child, where an unknown name trips a
 /// `debug_assert` and kills the debug build this test runs against.
 const BASELINE_SERVER_ENV: &str = "COMPAT_BASELINE_SERVER";
+
+/// Absolute path to the baseline's `core/server/config.toml`, which both
+/// boots read. Same naming rule as [`BASELINE_SERVER_ENV`].
+const BASELINE_CONFIG_ENV: &str = "COMPAT_BASELINE_CONFIG";
+
+/// Selects the server's config file, ahead of the relative default path the
+/// module documentation warns about.
+const CONFIG_PATH_ENV: &str = "IGGY_CONFIG_PATH";
 
 /// `metadata.journal_slots` floor for `prepare_queue_depth = 32`
 /// (`4 * max(64, 32)`). With the 64-op checkpoint margin a checkpoint fires
@@ -263,11 +284,17 @@ const GRACEFUL_SHUTDOWN_MARKER: &str = "server shutdown complete";
 #[ignore = "needs a baseline iggy-server built from master; run via scripts/ci/storage-compat.sh"]
 async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     let baseline = baseline_server_binary();
-    let envs = resolve_config_paths(&HashMap::from([(
+    let baseline_config = baseline_server_config();
+    let overrides = HashMap::from([(
         "metadata.journal_slots".to_string(),
         JOURNAL_SLOTS.to_string(),
-    )]))
-    .expect("metadata.journal_slots resolves against the live config catalog");
+    )]);
+    assert_overrides_known_to_the_baseline(&overrides, &baseline_config);
+    let mut envs = resolve_config_paths(&overrides)
+        .expect("metadata.journal_slots resolves against the live config catalog");
+    // `extra_envs` is re-applied on every `start()`, so the swapped-in binary
+    // reads this same file.
+    envs.insert(CONFIG_PATH_ENV.to_string(), baseline_config.clone());
 
     let mut harness = TestHarness::builder()
         .cluster_nodes(1)
@@ -279,7 +306,13 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         )
         .build()
         .unwrap();
-    harness.start().await.unwrap();
+    harness.start().await.unwrap_or_else(|error| {
+        panic!(
+            "the baseline server did not start. It boots on the merge base's own config file, \
+             so a Config(...) error below means the harness fed it something the merge base \
+             does not carry: {error}"
+        )
+    });
 
     let data_path = harness.server().data_path();
     let client = harness.tcp_root_client().await.unwrap();
@@ -677,7 +710,14 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
 
     // The swap: `None` selects the cargo-built binary of the crate under test.
     harness.server_mut().set_executable_path(None);
-    harness.restart_server().await.unwrap();
+    harness.restart_server().await.unwrap_or_else(|error| {
+        panic!(
+            "the server under test did not restart on the data directory the baseline wrote. \
+             A Config(...) error below is a configuration break rather than a storage one: \
+             this branch dropped or renamed a key the merge base's config file still sets, or \
+             added a field without a `#[serde(default)]`: {error}"
+        )
+    });
 
     // `tcp_root_client` hands out a client the harness does not own, so the
     // reconnect loop inside `restart_server` never touched it. Take a fresh one.
@@ -877,44 +917,86 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     );
 }
 
-/// Resolve the baseline binary to an absolute, existing path.
+/// Resolve one of the baseline artefacts to an absolute, existing path.
 ///
-/// The absolute requirement is not cosmetic. `ServerHandle::start` only spawns
-/// the configured path directly when it has more than one component or already
-/// exists; a bare name that does not exist falls through to
+/// The absolute requirement is not cosmetic for the binary. `ServerHandle::start`
+/// only spawns the configured path directly when it has more than one component
+/// or already exists; a bare name that does not exist falls through to
 /// `Command::cargo_bin`, which resolves the binary of the crate under test. So
 /// a single-component value would boot the HEAD build while the test reported
 /// it as the baseline, comparing master against master and passing forever.
 /// The same silent-green family as running a stale binary.
-fn baseline_server_binary() -> String {
-    let raw = std::env::var(BASELINE_SERVER_ENV).unwrap_or_else(|_| {
+fn baseline_path_from_env(variable: &str, artefact: &str) -> String {
+    let raw = std::env::var(variable).unwrap_or_else(|_| {
         panic!(
-            "{BASELINE_SERVER_ENV} is unset. It must be an ABSOLUTE path to the iggy-server \
-             binary built from master. Without it this test would boot the build under test \
-             twice and prove nothing, so it refuses to run. Use scripts/ci/storage-compat.sh, \
-             which builds the baseline and exports the variable."
+            "{variable} is unset. It must be an ABSOLUTE path to the baseline {artefact}. \
+             Without it this test would run entirely on the build under test and prove nothing, \
+             so it refuses to run. Use scripts/ci/storage-compat.sh, which builds the baseline \
+             and exports both variables."
         )
     });
 
     let path = PathBuf::from(&raw);
     assert!(
         path.is_absolute(),
-        "{BASELINE_SERVER_ENV}={raw:?} is relative. It must be an ABSOLUTE path: a bare binary \
-         name that does not exist on disk is silently resolved as the build under test, which \
-         would compare master against master and report green forever."
+        "{variable}={raw:?} is relative. It must be an ABSOLUTE path: a bare name that does not \
+         exist on disk is silently resolved as the build under test, which would compare master \
+         against master and report green forever."
     );
     let resolved = fs::canonicalize(&path).unwrap_or_else(|error| {
         panic!(
-            "{BASELINE_SERVER_ENV}={raw:?} does not resolve: {error}. It must point at an \
-             iggy-server binary built from master."
+            "{variable}={raw:?} does not resolve: {error}. It must point at the baseline \
+             {artefact}."
         )
     });
     assert!(
         resolved.is_file(),
-        "{BASELINE_SERVER_ENV}={raw:?} resolves to {}, which is not a file.",
+        "{variable}={raw:?} resolves to {}, which is not a file.",
         resolved.display()
     );
     resolved.display().to_string()
+}
+
+fn baseline_server_binary() -> String {
+    baseline_path_from_env(BASELINE_SERVER_ENV, "iggy-server binary")
+}
+
+fn baseline_server_config() -> String {
+    baseline_path_from_env(BASELINE_CONFIG_ENV, "core/server/config.toml")
+}
+
+/// Refuse an override the baseline binary cannot read.
+///
+/// Every override travels to both binaries as an `IGGY_*` variable, and an
+/// unknown name trips a `debug_assert` in the server's env provider, which
+/// takes the debug baseline down at boot with no mention of the variable.
+/// `resolve_config_paths` cannot catch that: it validates against the catalog
+/// of the build under test, which is the wrong side of the swap. The baseline
+/// config file spells out every knob that build has, so it stands in for the
+/// catalog here.
+fn assert_overrides_known_to_the_baseline(overrides: &HashMap<String, String>, config: &str) {
+    let raw = fs::read_to_string(config)
+        .unwrap_or_else(|error| panic!("reading the baseline config {config}: {error}"));
+    let doc: toml::Value = toml::from_str(&raw)
+        .unwrap_or_else(|error| panic!("parsing the baseline config {config}: {error}"));
+
+    for path in overrides.keys() {
+        // The `system.` fallback mirrors `resolve_config_paths`.
+        let prefixed = format!("system.{path}");
+        let known = [path.as_str(), prefixed.as_str()]
+            .into_iter()
+            .any(|candidate| config_key(&doc, candidate).is_some());
+        assert!(
+            known,
+            "the override '{path}' names no key in the baseline config {config}, so the \
+             baseline server has no such config leaf and dies on the variable at boot. Drive \
+             the behaviour through a key that already exists on the merge base."
+        );
+    }
+}
+
+fn config_key<'a>(doc: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
+    path.split('.').try_fold(doc, |node, key| node.get(key))
 }
 
 /// Options of the topic that carries the segment chain. Every key but

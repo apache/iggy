@@ -39,8 +39,11 @@
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::sync::{Arc, OnceLock};
+
+use iggy_common::ConsumerKind;
 
 /// Label for `frame_drops_total`.
 ///
@@ -62,6 +65,11 @@ pub struct FrameDropLabel {
     pub reason: &'static str,
 }
 
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct ConsumerOffsetKindLabel {
+    pub kind: &'static str,
+}
+
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
 /// catch typos at compile time and to keep the cardinality bounded.
 ///
@@ -80,11 +88,14 @@ pub struct FrameDropLabel {
 /// (`reason=park_overflow`), a parked frame retired with no client to answer
 /// (`reason=park_dropped`), an incarnation rejection, or a routing send the
 /// target inbox refused. A shed client request is answered with a retriable
-/// status. A shed prepare may no longer be covered by retransmit once its op
-/// reached quorum, but a later `CommitMessage` that advances the backup's
-/// frontier arms same-view journal repair. If the primary evicted the range,
-/// repair escalates to partition state transfer. The counter therefore signals
-/// a data-plane gap or recovery burden, not a requirement for a view change.
+/// status, so the client recovers. A shed *prepare* has nobody to answer and is
+/// not covered by retransmit once its op has reached quorum
+/// (`consensus::retransmit_targets` skips `ok_quorum_received`), so the backup
+/// gap-stops; `tick_partitions`' sweep is what repairs it, escalating to
+/// partition state transfer when the primary has evicted the range, and
+/// `partition_prepare_gap_drops_total` is what counts the prepares that reached
+/// the gap check. The counter therefore signals a data-plane gap or recovery
+/// burden, not a requirement for a view change.
 pub mod frame_drop_variant {
     pub const CONSENSUS: &str = "consensus";
     pub const FD_TRANSFER: &str = "fd_transfer";
@@ -96,6 +107,12 @@ pub mod frame_drop_variant {
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
     pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
+    /// A poll's auto-commit submit refused by the owning shard's own inbox.
+    ///
+    /// Its own series, not `PARTITION`: the poll is answered with a retriable
+    /// status and no frame of the client's was dropped, so counting it with
+    /// shed frames would read as a routing loss.
+    pub const PARTITION_AUTO_COMMIT: &str = "partition_auto_commit";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -144,7 +161,7 @@ pub mod frame_drop_reason {
 // pair enters the `Family` (and therefore the scrape) the first time a drop
 // site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 7;
+const VARIANT_COUNT: usize = 8;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -155,6 +172,7 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::FORWARD_REPLICA_SEND,
     frame_drop_variant::METADATA_COMMIT_TICK,
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
+    frame_drop_variant::PARTITION_AUTO_COMMIT,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
@@ -177,6 +195,13 @@ fn variant_index(s: &str) -> Option<usize> {
 
 fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
+}
+
+const fn consumer_kind_index(kind: ConsumerKind) -> usize {
+    match kind {
+        ConsumerKind::Consumer => 0,
+        ConsumerKind::ConsumerGroup => 1,
+    }
 }
 
 /// Per-shard metric handles.
@@ -208,6 +233,14 @@ pub struct ShardMetrics {
     partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
+    partition_prepare_gap_drops_total: Counter,
+    metadata_prepare_gap_drops_total: Counter,
+    metadata_read_frontier_refusals_total: Counter,
+    client_requests_denied_queue_full_total: Counter,
+    partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
+    consumer_offset_denied_counters: [Counter; 2],
+    partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
+    consumer_offset_stranded_gauges: [Gauge; 2],
 }
 
 impl ShardMetrics {
@@ -220,6 +253,34 @@ impl ShardMetrics {
         let cached_counters = Arc::new(std::array::from_fn(|_| {
             std::array::from_fn(|_| OnceLock::new())
         }));
+        let partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter> =
+            Family::default();
+        let consumer_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
+                .clone()
+        };
+        let consumer_group_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel {
+                    kind: "consumer_group",
+                })
+                .clone()
+        };
+        let consumer_offset_denied_counters = [consumer_denied, consumer_group_denied];
+        let partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge> =
+            Family::default();
+        // End each Family read guard before creating the next series, which
+        // needs the same family's write lock on a miss.
+        let consumer_stranded = partition_consumer_offsets_stranded
+            .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
+            .clone();
+        let group_stranded = partition_consumer_offsets_stranded
+            .get_or_create(&ConsumerOffsetKindLabel {
+                kind: "consumer_group",
+            })
+            .clone();
+        let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
             frame_drops_total,
             cached_counters,
@@ -232,7 +293,76 @@ impl ShardMetrics {
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
+            partition_prepare_gap_drops_total: Counter::default(),
+            metadata_prepare_gap_drops_total: Counter::default(),
+            metadata_read_frontier_refusals_total: Counter::default(),
+            client_requests_denied_queue_full_total: Counter::default(),
+            partition_consumer_offsets_denied_total,
+            consumer_offset_denied_counters,
+            partition_consumer_offsets_stranded,
+            consumer_offset_stranded_gauges,
         }
+    }
+
+    /// Best effort: counts explicit client denials read off the reply status
+    /// and the poll-side reservation refusals. A denial the pump answers to an
+    /// auto-commit submit has no client reply to read and is not counted.
+    pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].inc();
+    }
+
+    /// Republished by every partition sweep: the sum over this shard's
+    /// partitions of offset keys whose file could not be loaded or unlinked.
+    /// Such a key stays counted against `consumer_offsets_max` until a later
+    /// store or delete of it succeeds, so a non-zero value that never falls is
+    /// an offsets directory an operator has to repair.
+    pub fn set_consumer_offsets_stranded(&self, kind: ConsumerKind, count: usize) {
+        self.consumer_offset_stranded_gauges[consumer_kind_index(kind)]
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn consumer_offset_denied_value(&self, kind: ConsumerKind) -> u64 {
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].get()
+    }
+
+    /// Bumped every time a client request is answered with a retryable denial
+    /// because that client already has the maximum number of requests queued
+    /// behind one the shard has not answered yet.
+    ///
+    /// The queue only grows while a client pipelines faster than its own
+    /// frames are served, so a sustained rate means one connection is stalled
+    /// on something - a held metadata read, a slow commit - while it keeps
+    /// sending.
+    pub fn record_client_request_denied_queue_full(&self) {
+        self.client_requests_denied_queue_full_total.inc();
+    }
+
+    /// Current value of [`Self::record_client_request_denied_queue_full`], for
+    /// tests that assert the denial was counted.
+    #[must_use]
+    pub fn client_requests_denied_queue_full_value(&self) -> u64 {
+        self.client_requests_denied_queue_full_total.get()
+    }
+
+    /// Bumped every time a metadata read is refused because this node's
+    /// applied frontier never reached what the caller was told committed.
+    ///
+    /// The counter is the signal, not a log line: a node that lags durably
+    /// refuses every held read of every client for as long as it lags, so the
+    /// refusal itself logs at `debug!` and this is what a dashboard alerts on.
+    /// Any sustained rate means reads on this node are failing retryable while
+    /// its commit walk stays behind.
+    pub fn record_metadata_read_frontier_refusal(&self) {
+        self.metadata_read_frontier_refusals_total.inc();
+    }
+
+    /// Current value of [`Self::record_metadata_read_frontier_refusal`], for
+    /// tests that assert a refusal was counted rather than scraping it.
+    #[must_use]
+    pub fn metadata_read_frontier_refusals_value(&self) -> u64 {
+        self.metadata_read_frontier_refusals_total.get()
     }
 
     /// Increment `frame_drops_total{variant, reason}` by 1.
@@ -405,6 +535,66 @@ impl ShardMetrics {
         self.partition_repair_serves_deferred_purge_total.get()
     }
 
+    /// Add the prepares a partition's backup gap check destroyed since the last
+    /// sweep. Drained per tick from `IggyPartition::take_prepare_gap_drops`,
+    /// and once more when `ConfirmRemove` drops the partition: a tombstoned
+    /// namespace is invisible to the sweep, so the tail it left would otherwise
+    /// go to the floor with the value.
+    ///
+    /// Counts the prepares that ARRIVED after a hole, not the holes: a gap
+    /// opened by the last prepare of a burst leaves this at zero. A nonzero
+    /// value proves the repair driver has work; a zero one proves nothing.
+    ///
+    /// Deliberately NOT a `frame_drops_total{variant=partition}` reason: that
+    /// family means the bus or the router shed a frame, and the simulator
+    /// asserts it stays at zero on runs with no injected loss. A gap drop is a
+    /// protocol-ordering drop that any real loss produces, and the sweep repairs
+    /// it, so folding the two would turn a routing-fault alert into noise.
+    ///
+    /// Shard-scoped, with no namespace label: a server runs hundreds of groups
+    /// per shard, so labelling by namespace is unbounded cardinality, and every
+    /// other partition counter in this file is shard-scoped for the same
+    /// reason. The per-group detail is in the arm's log line.
+    ///
+    /// The metadata plane's own gap drop is NOT counted here: it has its own
+    /// counter, and its own level-triggered driver in `tick_metadata`. See
+    /// [`Self::record_metadata_prepare_gap_drops`].
+    pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
+        self.partition_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `partition_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_prepare_gap_drops_value(&self) -> u64 {
+        self.partition_prepare_gap_drops_total.get()
+    }
+
+    /// Add the prepares the metadata backup gap check destroyed since the last
+    /// tick, drained from `IggyMetadata::take_prepare_gap_drops`.
+    ///
+    /// The sibling of [`Self::record_partition_prepare_gap_drops`], and it
+    /// carries every caveat that one does: it counts the prepares that ARRIVED
+    /// after a hole rather than the holes, so a nonzero value proves the
+    /// metadata repair driver has work and a zero one proves nothing. There is
+    /// one metadata group per node, so unlike the partition counter it needs no
+    /// argument about namespace cardinality.
+    ///
+    /// Deliberately NOT a `frame_drops_total` reason, for the same reason: that
+    /// family means the bus or the router shed a frame and the simulator
+    /// asserts it stays at zero on runs with no injected loss, while a gap drop
+    /// is a protocol-ordering drop the tick repairs.
+    pub fn record_metadata_prepare_gap_drops(&self, drops: u64) {
+        self.metadata_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `metadata_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_prepare_gap_drops_value(&self) -> u64 {
+        self.metadata_prepare_gap_drops_total.get()
+    }
+
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
     /// accessor, readable from any crate under those cfgs so the crates that
     /// drive the reconciler can assert a reject did not happen.
@@ -496,6 +686,38 @@ impl ShardMetrics {
             "partition repair serves or completions deferred until a committed purge applies",
             self.partition_repair_serves_deferred_purge_total.clone(),
         );
+        registry.register(
+            "partition_prepare_gap_drops",
+            "replicated prepares dropped out of order by a backup's gap check",
+            self.partition_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "metadata_prepare_gap_drops",
+            "replicated metadata prepares dropped out of order by a backup's gap check",
+            self.metadata_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "metadata_read_frontier_refusals",
+            "metadata reads refused because this node never applied the caller's committed op",
+            self.metadata_read_frontier_refusals_total.clone(),
+        );
+        registry.register(
+            "client_requests_denied_queue_full",
+            "client requests denied retryable because that client's request queue was full",
+            self.client_requests_denied_queue_full_total.clone(),
+        );
+        registry.register(
+            "partition_consumer_offsets_denied",
+            "consumer offset creations denied at the per-partition admission limit (best effort: \
+             explicit client denials and poll-side reservation refusals)",
+            self.partition_consumer_offsets_denied_total.clone(),
+        );
+        registry.register(
+            "partition_consumer_offsets_stranded",
+            "consumer offset keys whose file could not be loaded or unlinked, still counted \
+             against the limit",
+            self.partition_consumer_offsets_stranded.clone(),
+        );
     }
 }
 
@@ -575,6 +797,35 @@ mod tests {
             })
             .get();
         assert_eq!(from_family, 5);
+    }
+
+    #[test]
+    fn consumer_offset_denials_use_two_cached_kind_series() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::ConsumerGroup);
+
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::Consumer),
+            2
+        );
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::ConsumerGroup),
+            1
+        );
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        assert_eq!(
+            buffer
+                .lines()
+                .filter(|line| line.starts_with("partition_consumer_offsets_denied_total"))
+                .count(),
+            2
+        );
     }
 
     #[test]

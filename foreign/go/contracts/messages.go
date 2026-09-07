@@ -30,8 +30,8 @@ const (
 	//
 	//  Constraints
 	//  - Minimum payload size: 1 byte (empty payloads are not allowed)
-	//  - Maximum payload size: 10 MB
-	MaxPayloadSize = 10 * 1000 * 1000
+	//  - Maximum payload size: 64 MB
+	MaxPayloadSize = 64 * 1000 * 1000
 
 	// MaxUserHeadersSize is maximum allowed size in bytes for user-defined headers.
 	//

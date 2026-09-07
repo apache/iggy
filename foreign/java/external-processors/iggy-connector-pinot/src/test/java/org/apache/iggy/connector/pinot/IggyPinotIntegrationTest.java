@@ -38,7 +38,6 @@ import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.images.PullPolicy;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
@@ -63,7 +62,7 @@ import static org.assertj.core.api.Assertions.fail;
 
 class IggyPinotIntegrationTest {
 
-    // The Java SDK speaks VSR, so use the same VSR-capable image as its integration tests.
+    // Mirrors the container in the SDK's BaseIntegrationTest so both suites exercise the same server.
     private static final DockerImageName IGGY_IMAGE = DockerImageName.parse("apache/iggy:edge");
     private static final DockerImageName PINOT_IMAGE = DockerImageName.parse(
             Objects.requireNonNull(System.getProperty("iggy.pinot.image"), "Missing iggy.pinot.image system property"));
@@ -74,6 +73,7 @@ class IggyPinotIntegrationTest {
     private static final int PINOT_CONTROLLER_PORT = 9000;
     private static final int PINOT_BROKER_PORT = 8099;
     private static final int PINOT_SERVER_ADMIN_PORT = 8097;
+    private static final String IGGY_NETWORK_ALIAS = "iggy";
     private static final String EXTERNAL_SERVER_HOST = "127.0.0.1";
     private static final String TESTCONTAINERS_HOST = "host.testcontainers.internal";
     private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
@@ -220,25 +220,20 @@ class IggyPinotIntegrationTest {
 
     private static void startIggy() {
         iggy = new GenericContainer<>(IGGY_IMAGE)
-                .withImagePullPolicy(PullPolicy.alwaysPull())
                 .withNetwork(network)
-                .withNetworkAliases("iggy")
+                .withNetworkAliases(IGGY_NETWORK_ALIAS)
                 .withExposedPorts(IGGY_HTTP_PORT, IGGY_TCP_PORT)
-                .withEnv("IGGY_SYSTEM_LOGGING_LEVEL", "info")
-                .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
-                .withEnv("IGGY_HTTP_ENABLED", "true")
-                .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
                 .withEnv("IGGY_ROOT_USERNAME", "iggy")
                 .withEnv("IGGY_ROOT_PASSWORD", "iggy")
-                .withEnv("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION", "1")
+                .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:" + IGGY_TCP_PORT)
+                .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:" + IGGY_HTTP_PORT)
+                .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", IGGY_NETWORK_ALIAS)
+                .withEnv("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION", "all")
                 .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                         .withCapAdd(Capability.SYS_NICE)
                         .withSecurityOpts(List.of("seccomp:unconfined"))
                         .withUlimits(List.of(new Ulimit("memlock", -1L, -1L))))
-                .waitingFor(Wait.forHttp("/")
-                        .forPort(IGGY_HTTP_PORT)
-                        .forStatusCodeMatching(status -> status >= 200 && status < 500)
-                        .withStartupTimeout(STARTUP_TIMEOUT));
+                .waitingFor(Wait.forHttp("/ping").forPort(IGGY_HTTP_PORT).withStartupTimeout(STARTUP_TIMEOUT));
         iggy.start();
     }
 

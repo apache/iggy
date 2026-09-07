@@ -102,7 +102,22 @@ def parse_args() -> ArgNamespace:
 
 
 def build_config(args: ArgNamespace) -> TcpConfig:
-    """Build a TCP client configuration with auto-login and reconnection."""
+    """Build the TCP client configuration with auto-login and reconnection."""
+
+    # IggyClient(...) also accepts a QuicConfig for the QUIC transport. To use
+    # it, import QuicConfig and QuicReconnectionConfig above, change the return
+    # annotation to QuicConfig, and replace the return statement with:
+    #
+    # return QuicConfig(
+    #     server_address="127.0.0.1:8080",
+    #     server_name="localhost",
+    #     auto_login=AutoLogin.username_password(args.username, args.password),
+    #     reconnection=QuicReconnectionConfig(
+    #         enabled=True, interval=timedelta(seconds=1)
+    #     ),
+    # )
+    #
+    # main() logs args.tcp_server_address, so change that line too.
 
     return TcpConfig(
         server_address=args.tcp_server_address,

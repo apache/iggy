@@ -54,12 +54,16 @@ pub type RecordedReplies = Rc<RefCell<Vec<(u128, Vec<u8>)>>>;
 pub type RecordedReplicaSends = Rc<RefCell<Vec<(u8, Vec<u8>)>>>;
 
 /// Records every client-bound reply and replica-bound frame (target +
-/// bytes) instead of writing to a socket; everything else is a no-op. The
-/// two `ShellBus` halves are stubbed.
+/// bytes) instead of writing to a socket, and counts connection-lost hook
+/// installs; everything else is a no-op. The two `ShellBus` halves are
+/// stubbed.
 #[derive(Debug, Clone, Default)]
 pub struct SpyBus {
     pub client_replies: RecordedReplies,
     pub replica_sends: RecordedReplicaSends,
+    /// Installs of the client connection-lost hook, one per handler built
+    /// on this bus.
+    pub connection_lost_hooks: Rc<Cell<usize>>,
     /// Resolve [`MessageBus::sleep`] immediately instead of arming a real
     /// timer. The register forward is the only path here that races a
     /// timer, and its budget is five seconds -- too long to wait for in a
@@ -143,7 +147,10 @@ impl ConnectionInstaller for SpyBus {
     fn client_meta(&self, _client_id: u128) -> Option<Rc<ClientConnMeta>> {
         None
     }
-    fn set_client_connection_lost_fn(&self, _f: ClientConnectionLostFn) {}
+    fn set_client_connection_lost_fn(&self, _f: ClientConnectionLostFn) {
+        self.connection_lost_hooks
+            .set(self.connection_lost_hooks.get() + 1);
+    }
 }
 
 /// Consensus incarnations standing for two successive boots of one node, as
@@ -177,6 +184,7 @@ pub fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u12
             messages_required_to_save: 1,
             size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
             enforce_fsync: false,
+            consumer_offset_enforce_fsync: false,
             validate_checksum: true,
             segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
             preallocate_segments: false,
