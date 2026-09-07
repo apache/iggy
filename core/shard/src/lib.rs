@@ -8451,12 +8451,18 @@ where
         }
         let nonce = iggy_common::random_id::get_uuid();
         let from_op = consensus.commit_min() + 1;
-        // The widening is for the replica that is LEVEL with the commit
-        // frontier and short of bodies above it. Widening while a commit lag
-        // stands would ask for `(commit_min, head]` -- the whole committed
-        // prefix this replica already holds, refetched -- and the suffix is
-        // reached anyway once the lag closes, on the arm after it.
-        let fetch_to_op = if commit_lag { commit_to_op } else { head };
+        // Capping at `commit_to_op` while a commit lag stands avoids
+        // re-asking for `(commit_min, commit_to_op]`, the committed prefix
+        // this replica already holds. But a restarted node has a commit lag
+        // by construction, and if it also adopted a StartView suffix, the
+        // missing bodies sit above `commit_to_op`, not within it -- so the
+        // cap only holds when no suffix is missing; otherwise it must widen
+        // to `head` to ever reach those bodies.
+        let fetch_to_op = if commit_lag && !missing_suffix {
+            commit_to_op
+        } else {
+            head
+        };
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
         let namespace = consensus.group();
