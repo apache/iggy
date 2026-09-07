@@ -728,6 +728,15 @@ where
                 // already made.
                 self.on_partition_submit(request, reply).await;
             }
+            LifecycleFrame::AutoCommitSubmit {
+                request,
+                reservation,
+            } => {
+                self.plane
+                    .partitions()
+                    .on_auto_commit_request(request, reservation)
+                    .await;
+            }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
                 // single-shard tests that never enable the reconciler loop).
