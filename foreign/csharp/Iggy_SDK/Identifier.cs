@@ -18,6 +18,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy;
 
@@ -32,14 +33,36 @@ public readonly struct Identifier : IEquatable<Identifier>
     public required IdKind Kind { get; init; }
 
     /// <summary>
-    ///     Identifier length in bytes.
+    ///     Identifier length in bytes, always derived from <see cref="Value" />.
+    ///     The initializer is kept for compatibility and its value is ignored.
     /// </summary>
-    public required int Length { get; init; }
+    public int Length
+    {
+        get => _value.Length;
+        init { }
+    }
 
     /// <summary>
-    ///     Identifier value as bytes.
+    ///     Copy of the identifier value as bytes, at most 255 of them.
     /// </summary>
-    public required byte[] Value { get; init; }
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when the value is longer than 255 bytes.</exception>
+    public required byte[] Value
+    {
+        get => _value.ToArray();
+        init
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(value.Length, WireName.MAX_LENGTH, nameof(Value));
+            _value = value.ToArray();
+        }
+    }
+
+    /// <summary>
+    ///     Read-only view of the value bytes for serialization, without the defensive copy of <see cref="Value" />.
+    /// </summary>
+    internal ReadOnlySpan<byte> Bytes => _value;
+
+    private readonly byte[] _value;
 
     /// <summary>
     ///     Creates a numeric identifier from a value.
@@ -65,7 +88,6 @@ public readonly struct Identifier : IEquatable<Identifier>
         return new Identifier
         {
             Kind = IdKind.Numeric,
-            Length = 4,
             Value = bytes
         };
     }
@@ -78,16 +100,13 @@ public readonly struct Identifier : IEquatable<Identifier>
     /// <exception cref="ArgumentException">Thrown when the value is too long or too short.</exception>
     public static Identifier String(string value)
     {
-        if (value.Length is 0 or > 255)
-        {
-            throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(value));
-        }
+        var bytes = Encoding.UTF8.GetBytes(value);
+        WireName.Validate(bytes.Length, nameof(value));
 
         return new Identifier
         {
             Kind = IdKind.String,
-            Length = value.Length,
-            Value = Encoding.UTF8.GetBytes(value)
+            Value = bytes
         };
     }
 
@@ -96,8 +115,8 @@ public readonly struct Identifier : IEquatable<Identifier>
     {
         return Kind switch
         {
-            IdKind.Numeric => BitConverter.ToInt32(Value).ToString(),
-            IdKind.String => Encoding.UTF8.GetString(Value),
+            IdKind.Numeric => BitConverter.ToInt32(_value).ToString(),
+            IdKind.String => Encoding.UTF8.GetString(_value),
             _ => throw new ArgumentOutOfRangeException()
         };
     }
@@ -114,7 +133,7 @@ public readonly struct Identifier : IEquatable<Identifier>
             throw new InvalidOperationException("Identifier is not numeric");
         }
 
-        return BinaryPrimitives.ReadUInt32LittleEndian(Value);
+        return BinaryPrimitives.ReadUInt32LittleEndian(_value);
     }
 
     /// <summary>
@@ -129,7 +148,7 @@ public readonly struct Identifier : IEquatable<Identifier>
             throw new InvalidOperationException("Identifier is not string");
         }
 
-        return Encoding.UTF8.GetString(Value);
+        return Encoding.UTF8.GetString(_value);
     }
 
     /// <summary>
@@ -139,7 +158,7 @@ public readonly struct Identifier : IEquatable<Identifier>
     /// <returns>True if the current identifier is equal to the other identifier; otherwise, false.</returns>
     public bool Equals(Identifier other)
     {
-        return Kind == other.Kind && Value.Equals(other.Value);
+        return Kind == other.Kind && Bytes.SequenceEqual(other.Bytes);
     }
 
     /// <inheritdoc />
@@ -151,6 +170,9 @@ public readonly struct Identifier : IEquatable<Identifier>
     /// <inheritdoc />
     public override int GetHashCode()
     {
-        return HashCode.Combine((int)Kind, Value);
+        var hash = new HashCode();
+        hash.Add(Kind);
+        hash.AddBytes(_value);
+        return hash.ToHashCode();
     }
 }
