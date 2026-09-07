@@ -117,7 +117,7 @@ class TestHttpConfig:
         Only `scheme://host[:port]` is accepted: a path, query, fragment, or
         embedded credentials are all rejected, not just a missing/zero port.
         """
-        with pytest.raises(ValueError, match="Cannot parse URL|Invalid API URL"):
+        with pytest.raises(ValueError, match="api_url"):
             HttpConfig(api_url=invalid_url)
 
     @pytest.mark.parametrize("bad_jwt", ["", "   ", "\t"])

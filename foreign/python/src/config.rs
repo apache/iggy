@@ -29,6 +29,7 @@ use pyo3::types::PyDelta;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use pyo3_stub_gen::impl_stub_type;
 use secrecy::SecretString;
+use std::fmt::Display;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -145,6 +146,8 @@ impl TcpReconnectionConfig {
     /// Raises:
     ///     ValueError: If a duration is negative, if `max_retries` is outside the
     ///         range of an unsigned 32-bit integer, or if `interval` is zero.
+    ///     OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
@@ -302,7 +305,7 @@ impl TcpConfig {
         }
         let mut inner = builder
             .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| invalid_address("server_address", e))?;
         if let Some(auto_login) = auto_login {
             inner.auto_login = auto_login.inner;
         }
@@ -439,6 +442,8 @@ impl QuicReconnectionConfig {
     /// Raises:
     ///     ValueError: If a duration is negative, if `max_retries` is outside the
     ///         range of an unsigned 32-bit integer, or if `interval` is zero.
+    ///     OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
@@ -582,6 +587,8 @@ impl QuicConfig {
     ///         `max_idle_timeout` is not a whole number of milliseconds, if
     ///         `initial_mtu` is below quinn's minimum of 1200, or if a numeric
     ///         field is outside the range of its underlying wire type.
+    ///     OverflowError: If a numeric field does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
     #[new]
     #[pyo3(signature = (
         *,
@@ -641,15 +648,18 @@ impl QuicConfig {
         }
         let mut inner = builder
             .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| invalid_address("server_address", e))?;
         if let Some(client_address) = client_address {
-            // Kept verbatim rather than normalized: `QuicClient::create` compares
-            // this against the literal default to decide whether to bind an IPv6
-            // socket for an IPv6 server, and a rewritten string would not match.
-            client_address.parse::<SocketAddr>().map_err(|e| {
-                PyValueError::new_err(format!("'client_address' is not a valid 'host:port': {e}"))
-            })?;
-            inner.client_address = client_address;
+            // Trimmed like the server address, but otherwise kept verbatim rather
+            // than re-serialized from the parsed `SocketAddr`: `QuicClient::create`
+            // compares this against the literal default to decide whether to bind
+            // an IPv6 socket for an IPv6 server, and a rewritten string would not
+            // match.
+            let client_address = client_address.trim();
+            client_address
+                .parse::<SocketAddr>()
+                .map_err(|e| invalid_address("client_address", e))?;
+            inner.client_address = client_address.to_owned();
         }
         if let Some(server_name) = server_name {
             inner.server_name = server_name;
@@ -899,7 +909,7 @@ impl HttpConfig {
         }
         let mut inner = builder
             .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| PyValueError::new_err(format!("'api_url' is not a valid URL: {e}")))?;
         if let Some(retries) = retries {
             inner.retries = u32_param(retries, "retries")?;
         }
@@ -963,6 +973,12 @@ impl HttpConfig {
 
 fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
+}
+
+/// Rejects an address that is not a valid `host:port`, naming the argument it
+/// came from: neither the builder's error nor `SocketAddr`'s mentions which one.
+fn invalid_address(parameter: &str, error: impl Display) -> PyErr {
+    PyValueError::new_err(format!("'{parameter}' is not a valid 'host:port': {error}"))
 }
 
 /// Converts a Python int to the unsigned 32-bit integer `max_retries`/`retries`

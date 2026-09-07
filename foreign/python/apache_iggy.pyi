@@ -1961,6 +1961,8 @@ class QuicConfig:
                 `max_idle_timeout` is not a whole number of milliseconds, if
                 `initial_mtu` is below quinn's minimum of 1200, or if a numeric
                 field is outside the range of its underlying wire type.
+            OverflowError: If a numeric field does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2008,6 +2010,8 @@ class QuicReconnectionConfig:
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2522,6 +2526,8 @@ class TcpReconnectionConfig:
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 

@@ -25,6 +25,7 @@ from apache_iggy import (
     AutoLogin,
     HttpConfig,
     IggyClient,
+    QuicConfig,
     StreamDetails,
     TcpConfig,
     TcpReconnectionConfig,
@@ -101,12 +102,12 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(args))
 
 
-def build_config(args: ArgNamespace) -> TcpConfig | HttpConfig:
+def build_config(args: ArgNamespace) -> TcpConfig | QuicConfig | HttpConfig:
     """Build the client configuration, TCP with auto-login and reconnection."""
 
     # IggyClient(...) also accepts a QuicConfig for the QUIC transport. To use
-    # it, import QuicConfig and QuicReconnectionConfig above, change the return
-    # annotation to QuicConfig, and replace the return statement with:
+    # it, uncomment the return below and import QuicReconnectionConfig, which is
+    # left out above because only the commented block names it:
     #
     # return QuicConfig(
     #     server_address="127.0.0.1:8080",
