@@ -160,11 +160,16 @@ impl IggyClient {
 
     /// Get the statistics and details of the server and its running process.
     ///
+    /// Requires an authenticated session whose user holds the `read_servers`
+    /// or `manage_servers` global permission.
+    ///
     /// Returns:
     ///     An awaitable that resolves to `Stats`.
     ///
     /// Raises:
-    ///     RuntimeError: If the request fails.
+    ///     RuntimeError: If the client is not connected, the session is not
+    ///         authenticated, the user lacks the permission, or the request
+    ///         fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[Stats]", imports=("collections.abc")))]
     fn get_stats<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();

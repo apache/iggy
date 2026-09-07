@@ -930,11 +930,16 @@ class IggyClient:
         r"""
         Get the statistics and details of the server and its running process.
 
+        Requires an authenticated session whose user holds the `read_servers`
+        or `manage_servers` global permission.
+
         Returns:
             An awaitable that resolves to `Stats`.
 
         Raises:
-            RuntimeError: If the request fails.
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, the user lacks the permission, or the request
+                fails.
         """
     def describe_options(
         self, scope: builtins.str
@@ -1904,6 +1909,10 @@ class SendMessagesResponse:
 class Stats:
     r"""
     The statistics and details of the server and its running process.
+
+    The fields are gathered from several sources while the request is served
+    (metadata counters, a process probe, a disk probe), so they are not an
+    atomic snapshot of one instant.
     """
     @property
     def process_id(self) -> builtins.int:
@@ -1914,11 +1923,18 @@ class Stats:
     def cpu_usage(self) -> builtins.float:
         r"""
         The CPU usage of the server process, in percent.
+
+        Measured as a delta since the previous `get_stats` served by the same
+        server shard, so the first sample a shard serves is 0.
         """
     @property
     def total_cpu_usage(self) -> builtins.float:
         r"""
-        The total CPU usage of the system, in percent.
+        The total CPU usage of the system, in percent, scoped to the cores the
+        server may run on when confined by an affinity/cpuset mask.
+
+        Same per-shard delta sampling as `cpu_usage`: the first sample a shard
+        serves is 0.
         """
     @property
     def memory_usage(self) -> builtins.int:
@@ -1928,22 +1944,26 @@ class Stats:
     @property
     def total_memory(self) -> builtins.int:
         r"""
-        The total memory of the system, in bytes.
+        The total memory of the system, in bytes, or the effective cgroup memory
+        limit when the server runs inside a memory-capped cgroup (container,
+        systemd slice).
         """
     @property
     def available_memory(self) -> builtins.int:
         r"""
-        The available memory of the system, in bytes.
+        The available memory of the system, in bytes, scoped to the cgroup
+        limit when one applies.
         """
     @property
     def run_time(self) -> datetime.timedelta:
         r"""
-        The run time of the server process.
+        The run time of the server process, with whole-second precision.
         """
     @property
     def start_time(self) -> builtins.int:
         r"""
-        The start time of the server process, in microseconds since the Unix epoch.
+        The start time of the server process, in microseconds since the Unix
+        epoch, with whole-second precision.
         """
     @property
     def read_bytes(self) -> builtins.int:
@@ -2031,7 +2051,8 @@ class Stats:
         r"""
         Cache metrics per partition.
 
-        Built once when the stats snapshot is created; every access returns the
+        The server does not populate this yet and always replies with an empty
+        map. Built once when the stats are received; every access returns the
         same dict.
         """
     @property
@@ -2043,11 +2064,17 @@ class Stats:
     def free_disk_space(self) -> builtins.int:
         r"""
         The available (free) disk space for the data directory, in bytes.
+
+        0 when the server does not know its data directory or the disk probe
+        fails.
         """
     @property
     def total_disk_space(self) -> builtins.int:
         r"""
         The total disk space for the data directory, in bytes.
+
+        0 when the server does not know its data directory or the disk probe
+        fails.
         """
     def __repr__(self) -> builtins.str: ...
 

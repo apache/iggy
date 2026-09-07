@@ -108,6 +108,10 @@ impl CacheMetrics {
 }
 
 /// The statistics and details of the server and its running process.
+///
+/// The fields are gathered from several sources while the request is served
+/// (metadata counters, a process probe, a disk probe), so they are not an
+/// atomic snapshot of one instant.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct Stats {
@@ -144,12 +148,19 @@ impl Stats {
     }
 
     /// The CPU usage of the server process, in percent.
+    ///
+    /// Measured as a delta since the previous `get_stats` served by the same
+    /// server shard, so the first sample a shard serves is 0.
     #[getter]
     pub fn cpu_usage(&self) -> f32 {
         self.inner.cpu_usage
     }
 
-    /// The total CPU usage of the system, in percent.
+    /// The total CPU usage of the system, in percent, scoped to the cores the
+    /// server may run on when confined by an affinity/cpuset mask.
+    ///
+    /// Same per-shard delta sampling as `cpu_usage`: the first sample a shard
+    /// serves is 0.
     #[getter]
     pub fn total_cpu_usage(&self) -> f32 {
         self.inner.total_cpu_usage
@@ -161,26 +172,30 @@ impl Stats {
         self.inner.memory_usage.as_bytes_u64()
     }
 
-    /// The total memory of the system, in bytes.
+    /// The total memory of the system, in bytes, or the effective cgroup memory
+    /// limit when the server runs inside a memory-capped cgroup (container,
+    /// systemd slice).
     #[getter]
     pub fn total_memory(&self) -> u64 {
         self.inner.total_memory.as_bytes_u64()
     }
 
-    /// The available memory of the system, in bytes.
+    /// The available memory of the system, in bytes, scoped to the cgroup
+    /// limit when one applies.
     #[getter]
     pub fn available_memory(&self) -> u64 {
         self.inner.available_memory.as_bytes_u64()
     }
 
-    /// The run time of the server process.
+    /// The run time of the server process, with whole-second precision.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
     pub fn run_time<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
         iggy_duration_to_py_delta(py, self.inner.run_time)
     }
 
-    /// The start time of the server process, in microseconds since the Unix epoch.
+    /// The start time of the server process, in microseconds since the Unix
+    /// epoch, with whole-second precision.
     #[getter]
     pub fn start_time(&self) -> u64 {
         self.inner.start_time.as_micros()
@@ -286,7 +301,8 @@ impl Stats {
 
     /// Cache metrics per partition.
     ///
-    /// Built once when the stats snapshot is created; every access returns the
+    /// The server does not populate this yet and always replies with an empty
+    /// map. Built once when the stats are received; every access returns the
     /// same dict.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.dict[CacheMetricsKey, CacheMetrics]"))]
@@ -301,12 +317,18 @@ impl Stats {
     }
 
     /// The available (free) disk space for the data directory, in bytes.
+    ///
+    /// 0 when the server does not know its data directory or the disk probe
+    /// fails.
     #[getter]
     pub fn free_disk_space(&self) -> u64 {
         self.inner.free_disk_space.as_bytes_u64()
     }
 
     /// The total disk space for the data directory, in bytes.
+    ///
+    /// 0 when the server does not know its data directory or the disk probe
+    /// fails.
     #[getter]
     pub fn total_disk_space(&self) -> u64 {
         self.inner.total_disk_space.as_bytes_u64()
@@ -324,5 +346,56 @@ impl Stats {
             self.inner.messages_count,
             self.inner.clients_count
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy::prelude::{IggyByteSize, IggyDuration, IggyTimestamp};
+    use std::collections::HashMap;
+
+    fn rust_stats(iggy_server_semver: Option<u32>) -> RustStats {
+        RustStats {
+            process_id: 1,
+            cpu_usage: 0.0,
+            total_cpu_usage: 0.0,
+            memory_usage: IggyByteSize::default(),
+            total_memory: IggyByteSize::default(),
+            available_memory: IggyByteSize::default(),
+            run_time: IggyDuration::default(),
+            start_time: IggyTimestamp::default(),
+            read_bytes: IggyByteSize::default(),
+            written_bytes: IggyByteSize::default(),
+            messages_size_bytes: IggyByteSize::default(),
+            streams_count: 0,
+            topics_count: 0,
+            partitions_count: 0,
+            segments_count: 0,
+            messages_count: 0,
+            clients_count: 0,
+            consumer_groups_count: 0,
+            hostname: String::new(),
+            os_name: String::new(),
+            os_version: String::new(),
+            kernel_version: String::new(),
+            iggy_server_version: String::new(),
+            iggy_server_semver,
+            cache_metrics: HashMap::new(),
+            threads_count: 0,
+            free_disk_space: IggyByteSize::default(),
+            total_disk_space: IggyByteSize::default(),
+        }
+    }
+
+    #[test]
+    fn iggy_server_semver_none_survives_conversion() {
+        Python::initialize();
+
+        assert_eq!(Stats::from(rust_stats(None)).iggy_server_semver(), None);
+        assert_eq!(
+            Stats::from(rust_stats(Some(1_002_003))).iggy_server_semver(),
+            Some(1_002_003)
+        );
     }
 }
