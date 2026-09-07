@@ -26,9 +26,10 @@ use tokio::time::sleep;
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::{
-    QuestDbSinkFixture, QuestDbSinkHeadersFixture, QuestDbSinkPayloadTimestampFixture,
-    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
-    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
+    QuestDbOps, QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
+    QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
+    QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
+    QuestDbSinkTypedFixture,
 };
 
 fn message(id: u128, payload: serde_json::Value) -> IggyMessage {
@@ -530,4 +531,109 @@ async fn given_headers_enabled_when_consumed_should_write_prefixed_columns(
         .await
         .expect("no values");
     assert_eq!(values[0].as_str(), Some("gateway"));
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_raw_schema_when_consumed_should_store_bytes_in_payload_column(
+    harness: &TestHarness,
+    fixture: QuestDbSinkRawFixture,
+) {
+    // A raw payload has no field structure, so it lands whole in `payload`
+    // rather than being rejected for not being a JSON object.
+    let fixture = &fixture.0;
+    let body = "raw binary-ish body";
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            IggyMessage::builder()
+                .id(1)
+                .payload(Bytes::from(body.as_bytes().to_vec()))
+                .build()
+                .expect("Failed to build message"),
+        ],
+    )
+    .await;
+
+    fixture.wait_for_rows(1).await.expect("no rows");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert_eq!(columns.get("payload").map(String::as_str), Some("VARCHAR"));
+    let values = fixture.column_values("payload").await.expect("no values");
+    assert_eq!(values[0].as_str(), Some(body));
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_dedup_table_when_duplicates_delivered_should_collapse_to_one_row(
+    harness: &TestHarness,
+    fixture: QuestDbSinkDedupFixture,
+) {
+    // Delivery is at-least-once, and the README tells operators to declare
+    // DEDUP UPSERT KEYS. This proves that recipe actually collapses a replay:
+    // the same logical rows are delivered twice as distinct Apache Iggy
+    // messages, and the table must still hold one row per key.
+    let fixture = &fixture.0;
+    let client = harness.root_client().await.unwrap();
+    let rows: Vec<serde_json::Value> = (0..10u32)
+        .map(|i| json!({"event_time": 1_788_523_200_000_000i64 + i as i64, "seq": i}))
+        .collect();
+
+    send(
+        &client,
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| message((i + 1) as u128, row.clone()))
+            .collect(),
+    )
+    .await;
+    fixture.wait_for_rows(10).await.expect("first delivery");
+
+    // Same payloads, fresh message IDs: a replay from the sink's perspective.
+    send(
+        &client,
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| message((i + 100) as u128, row.clone()))
+            .collect(),
+    )
+    .await;
+
+    // Give the second delivery time to land before asserting it did not grow
+    // the table, otherwise the assertion could pass simply by running early.
+    sleep(Duration::from_secs(3)).await;
+    let count = fixture
+        .count_rows(&fixture.table())
+        .await
+        .expect("count failed")
+        .expect("table missing");
+    assert_eq!(count, 10, "DEDUP did not collapse the replayed rows");
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_large_payloads_when_consumed_should_write_every_row(
+    harness: &TestHarness,
+    fixture: QuestDbSinkFixture,
+) {
+    // Roughly 8 MiB across the batch, well past the client's per-frame target,
+    // so the publication path has to span several frames without losing rows.
+    let blob = "x".repeat(64 * 1024);
+    let count = 128usize;
+    send(
+        &harness.root_client().await.unwrap(),
+        (0..count)
+            .map(|i| message((i + 1) as u128, json!({"seq": i, "blob": blob})))
+            .collect(),
+    )
+    .await;
+
+    let written = fixture.wait_for_rows(count).await.expect("no rows");
+    assert_eq!(written, count, "large payloads lost rows");
 }

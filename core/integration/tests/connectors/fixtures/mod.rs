@@ -102,9 +102,10 @@ pub use postgres::{
     PostgresSourceOps, PostgresSourceTextKeyFixture,
 };
 pub use questdb::{
-    QuestDbSinkFixture, QuestDbSinkHeadersFixture, QuestDbSinkPayloadTimestampFixture,
-    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
-    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
+    QuestDbOps, QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
+    QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
+    QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
+    QuestDbSinkTypedFixture,
 };
 pub use quickwit::{
     QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,
