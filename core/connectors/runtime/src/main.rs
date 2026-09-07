@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
+use crate::configs::connectors::{
+    ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, create_connectors_config_provider,
+};
 use ::configs::ConfigProvider;
 use clap::Parser;
 use configs::connectors::ConfigFormat;
@@ -40,7 +42,7 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod api;
 mod benchmark;
@@ -155,6 +157,7 @@ async fn main() -> Result<(), RuntimeError> {
         connectors_config.sources().len(),
         connectors_config.sinks().len()
     );
+    warn_on_unaddressable_keys(&connectors_config);
     let sources_config = connectors_config.sources();
     let (sources, failed_sources) = source::init(
         sources_config.clone(),
@@ -304,6 +307,29 @@ async fn main() -> Result<(), RuntimeError> {
     iggy_clients.consumer.shutdown().await?;
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
+}
+
+/// Keys loaded from a provider are not held to `ConnectorKey`, so existing
+/// deployments keep starting, but the control API only routes keys that pass
+/// it. Say so at startup instead of letting the operator discover a 400.
+fn warn_on_unaddressable_keys(connectors_config: &ConnectorsConfig) {
+    let keys = connectors_config
+        .sinks()
+        .keys()
+        .map(|key| ("sink", key))
+        .chain(
+            connectors_config
+                .sources()
+                .keys()
+                .map(|key| ("source", key)),
+        );
+    for (connector_type, key) in keys {
+        if let Err(error) = key.parse::<ConnectorKey>() {
+            warn!(
+                "Loaded {connector_type} connector with key {key:?} that the control API cannot address: {error}"
+            );
+        }
+    }
 }
 
 /// Resolves a plugin shared library path from the connector config `path` field.
