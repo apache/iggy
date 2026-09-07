@@ -159,7 +159,7 @@ where
     /// plus one is missing). Debounces the sweep's level-triggered repair arm,
     /// and is spent by whichever site opens the repair session.
     ///
-    /// `Cell` for the same reason as [`Self::prepare_gap_drops`]: the sweep
+    /// `Cell` for the same reason as `prepare_gap_drops`: the sweep
     /// drives it from the shared borrow it probes the partition through, so the
     /// in-flight scan the arm budget needs can run without a `&mut` outstanding.
     pub gap_ticks: Cell<u32>,
@@ -1749,7 +1749,7 @@ where
         self.write_superblock_advancing(superblock, 0, claim).await
     }
 
-    /// Take and clear the gap-drop count ([`Self::prepare_gap_drops`]).
+    /// Take and clear the gap-drop count (`prepare_gap_drops`).
     #[must_use = "dropping the count loses the only record those prepares existed"]
     pub const fn take_prepare_gap_drops(&self) -> u64 {
         self.prepare_gap_drops.replace(0)
