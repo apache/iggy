@@ -92,9 +92,9 @@ apache-avro = "0.22.0"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 argon2 = "0.6.0"
 # arrow 58: iceberg 0.10.1 and deltalake 0.32.4 still require it.
-arrow = "58.4.0"
-arrow-array = "58.4.0"
-arrow-json = "58.4.0"
+arrow = "59.2.0"
+arrow-array = "59.2.0"
+arrow-json = "59.2.0"
 assert_cmd = "2.2.2"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
@@ -252,7 +252,7 @@ opentelemetry_sdk = { version = "0.32.1", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 papaya = "0.2.5"
-parquet = "58.4.0"
+parquet = "59.2.0"
 partitions = { path = "core/partitions" }
 passterm = "2.0.6"
 paste = "1.0"
