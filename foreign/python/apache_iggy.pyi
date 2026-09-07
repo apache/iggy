@@ -977,21 +977,27 @@ class IggyClient:
     It provides asynchronous functionality through the contained runtime.
     """
     def __new__(
-        cls, conn: TcpConfig | QuicConfig | HttpConfig | builtins.str | None = None
+        cls,
+        conn: TcpConfig
+        | QuicConfig
+        | HttpConfig
+        | WebSocketConfig
+        | builtins.str
+        | None = None,
     ) -> IggyClient:
         r"""
         Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
-        `QuicConfig`, or an `HttpConfig`. This initializes a new runtime for
-        asynchronous operations.
+        `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
+        new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
 
         Args:
-            conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, or an
-                `HttpConfig`. Defaults to `127.0.0.1:8090` over TCP with auto-login
-                disabled. A malformed address is reported differently depending on
-                the form: the string form raises `RuntimeError` here, while
-                `TcpConfig`/`QuicConfig`/`HttpConfig` raise `ValueError` when they
-                are constructed, before any of them ever reaches this call. Neither
+            conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
+                `HttpConfig`, or a `WebSocketConfig`. Defaults to `127.0.0.1:8090`
+                over TCP with auto-login disabled. A malformed address is reported
+                differently depending on the form: the string form raises
+                `RuntimeError` here, while every config type raises `ValueError`
+                when it is constructed, before any of them reaches this call. Neither
                 exception is a subclass of the other.
 
         Raises:
@@ -1004,21 +1010,6 @@ class IggyClient:
         r"""
         Constructs a new IggyClient from a connection string.
         Returns an error if the connection string provided is invalid.
-        """
-    @classmethod
-    def websocket(cls, config: WebSocketConfig | None = None) -> IggyClient:
-        r"""
-        Constructs a new IggyClient configured for the WebSocket transport.
-
-        `server_address` is already validated when `config` is built, so this
-        does not currently fail; the exception is documented for interface
-        consistency with the other transport constructors.
-
-        Args:
-            config: WebSocket transport configuration. Defaults to `WebSocketConfig()`.
-
-        Raises:
-            RuntimeError: If the client cannot be constructed.
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
@@ -2967,24 +2958,9 @@ class UserInfoDetails:
         """
 
 @typing.final
-class UserStatus(enum.Enum):
-    r"""
-    The status of a user account.
-    """
-
-    Active = ...
-    r"""
-    The user account is active and can be used.
-    """
-    Inactive = ...
-    r"""
-    The user account is inactive and cannot be used.
-    """
-
-@typing.final
 class WebSocketConfig:
     r"""
-    Configuration for the WebSocket transport, accepted by `IggyClient.websocket(...)`.
+    Configuration for the WebSocket transport, accepted by `IggyClient(...)`.
 
     Every field is keyword-only and optional.
     """
@@ -3073,8 +3049,8 @@ class WebSocketFramingConfig:
         read_buffer_size: builtins.int | None = None,
         write_buffer_size: builtins.int | None = None,
         max_write_buffer_size: builtins.int | None = None,
-        max_message_size: builtins.int | None = None,
-        max_frame_size: builtins.int | None = None,
+        max_message_size: builtins.int | None = 64 << 20,
+        max_frame_size: builtins.int | None = 16 << 20,
         accept_unmasked_frames: builtins.bool | None = None,
     ) -> WebSocketFramingConfig:
         r"""
@@ -3084,14 +3060,26 @@ class WebSocketFramingConfig:
             read_buffer_size: Read buffer size in bytes.
             write_buffer_size: Write buffer size in bytes.
             max_write_buffer_size: Maximum write buffer size in bytes.
-            max_message_size: Maximum message size in bytes, or `None` for no limit.
-            max_frame_size: Maximum frame size in bytes, or `None` for no limit.
+            max_message_size: Maximum message size in bytes, or an explicit `None`
+                to lift the limit entirely. Omitting the argument is not the same
+                as passing `None`: it keeps the underlying default of 64 MiB.
+                Lifting the limit lets a peer queue an arbitrarily large message
+                in memory, so prefer a finite value.
+            max_frame_size: Maximum frame size in bytes, or an explicit `None` to
+                lift the limit entirely. Omitting the argument keeps the
+                underlying default of 16 MiB, with the same caveat as
+                `max_message_size`.
             accept_unmasked_frames: Whether to accept unmasked frames. Defaults to
                 `False`; clients should typically keep this off for RFC compliance.
 
         Raises:
             ValueError: If a numeric field is outside the range of a pointer-sized
-                unsigned integer.
+                unsigned integer, or if `max_write_buffer_size` does not come out
+                greater than `write_buffer_size`. tungstenite enforces the same
+                invariant with an `assert!` at connect time, which would otherwise
+                surface as an unrecoverable Rust panic instead of a `ValueError`.
+            OverflowError: If a numeric field does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -3121,24 +3109,41 @@ class WebSocketReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Passes over the known endpoints after the first, or
-                `None` for unlimited; `0` still makes that first pass. One pass
-                tries the endpoint the client is on, the address it was
-                configured with, and every node the roster named, so this counts
-                passes rather than dials. Defaults
-                to unlimited, which means a call awaited while the server is
-                down never returns: `connect()`, `send_messages()` and
-                `poll_messages()` all wait inside the retry loop. Set a finite
+            max_retries: Redials of the configured server address after the first
+                attempt, or `None` for unlimited; `0` still makes that first
+                attempt. Unlike the TCP transport, WebSocket redials the one
+                address it was configured with rather than walking a cluster
+                roster, so this counts dials. Defaults to unlimited, which means
+                a call awaited while the server is down never returns:
+                `connect()` waits inside the retry loop, as do `send_messages()`
+                and `poll_messages()` once auto-login is configured. Set a finite
                 number for request/reply style usage, so a call fails instead.
-            interval: Delay between passes. Defaults to 1 second. The first pass
-                runs at once when more than one endpoint is known.
-            reestablish_after: Cooldown before redialing the endpoint of the last
+            interval: Delay before each redial. Defaults to 1 second.
+            reestablish_after: Cooldown before redialing after a previously
                 successful connection, measured from when it was established, so
-                a session that outlived the interval is redialed at once. Owed to
-                that endpoint alone. Defaults to 5 seconds.
+                a session that outlived the interval is redialed at once. Applied
+                from the first redial onward, not to the initial connect.
+                Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class UserStatus(enum.Enum):
+    r"""
+    The status of a user account.
+    """
+
+    Active = ...
+    r"""
+    The user account is active and can be used.
+    """
+    Inactive = ...
+    r"""
+    The user account is inactive and cannot be used.
+    """

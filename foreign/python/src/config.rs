@@ -1001,6 +1001,8 @@ impl WebSocketReconnectionConfig {
     /// Raises:
     ///     ValueError: If a duration is negative, if `max_retries` is outside the
     ///         range of an unsigned 32-bit integer, or if `interval` is zero.
+    ///     OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
@@ -1014,14 +1016,7 @@ impl WebSocketReconnectionConfig {
         let defaults = RustWebSocketClientReconnectionConfig::default();
         let enabled = enabled.unwrap_or(defaults.enabled);
         let max_retries = max_retries
-            .map(|max_retries| {
-                u32::try_from(max_retries).map_err(|_| {
-                    PyValueError::new_err(format!(
-                        "'max_retries' must be between 0 and {}",
-                        u32::MAX
-                    ))
-                })
-            })
+            .map(|max_retries| u32_param(max_retries, "max_retries"))
             .transpose()?;
         let interval = interval
             .as_ref()
@@ -1120,6 +1115,8 @@ impl WebSocketFramingConfig {
     ///         greater than `write_buffer_size`. tungstenite enforces the same
     ///         invariant with an `assert!` at connect time, which would otherwise
     ///         surface as an unrecoverable Rust panic instead of a `ValueError`.
+    ///     OverflowError: If a numeric field does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
     #[new]
     #[pyo3(signature = (
         *,
@@ -1316,7 +1313,7 @@ impl WebSocketConfig {
         }
         let mut inner = builder
             .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| invalid_address("server_address", e))?;
         if let Some(auto_login) = auto_login {
             inner.auto_login = auto_login.inner;
         }
@@ -1506,19 +1503,17 @@ pub enum PyClientConfig {
     #[pyo3(transparent, annotation = "str")]
     ServerAddress(String),
 }
-impl_stub_type!(
-    PyClientConfig = TcpConfig | QuicConfig | HttpConfig | WebSocketConfig | String
-);
+impl_stub_type!(PyClientConfig = TcpConfig | QuicConfig | HttpConfig | WebSocketConfig | String);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Mirrors the literal in `WebSocketFramingConfig::new`'s signature.
-    const DEFAULT_MAX_MESSAGE_SIZE: i64 = 64 << 20;
+    const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 
     /// Mirrors the literal in `WebSocketFramingConfig::new`'s signature.
-    const DEFAULT_MAX_FRAME_SIZE: i64 = 16 << 20;
+    const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 
     /// The signature defaults have to be literals for the generated stub to stay
     /// valid Python, so nothing but this test stops them drifting from the SDK
@@ -1529,13 +1524,15 @@ mod tests {
 
         assert_eq!(
             defaults.max_message_size,
-            Some(DEFAULT_MAX_MESSAGE_SIZE as usize),
-            "'max_message_size' drifted from the SDK; update the literal in              WebSocketFramingConfig::new's signature too"
+            Some(DEFAULT_MAX_MESSAGE_SIZE),
+            "'max_message_size' drifted from the SDK, update the literal in \
+             WebSocketFramingConfig::new's signature too"
         );
         assert_eq!(
             defaults.max_frame_size,
-            Some(DEFAULT_MAX_FRAME_SIZE as usize),
-            "'max_frame_size' drifted from the SDK; update the literal in              WebSocketFramingConfig::new's signature too"
+            Some(DEFAULT_MAX_FRAME_SIZE),
+            "'max_frame_size' drifted from the SDK, update the literal in \
+             WebSocketFramingConfig::new's signature too"
         );
     }
 }

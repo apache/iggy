@@ -29,6 +29,8 @@ transport-agnostic and already covered by `test_client_config.py`.
 """
 
 import ast
+import socket
+import threading
 from collections.abc import Callable
 from datetime import timedelta
 
@@ -43,6 +45,15 @@ from apache_iggy import (
 )
 
 from .utils import get_websocket_server_config, wait_for_ping, wait_for_server
+
+
+def _accept_and_close(listener: socket.socket) -> None:
+    """Accept one connection and drop it, failing any WebSocket handshake."""
+    try:
+        connection, _ = listener.accept()
+    except OSError:
+        return
+    connection.close()
 
 
 @pytest.mark.unit
@@ -347,8 +358,8 @@ class TestWebSocketConfig:
         ["", "127.0.0.1", "127.0.0.1:not-a-port", "127.0.0.1:70000", "::1:8092"],
     )
     def test_invalid_server_address_is_rejected(self, invalid_address: str):
-        """Test that a malformed address fails at construction, not at connect."""
-        with pytest.raises(ValueError):
+        """Test that a malformed address fails at construction, naming itself."""
+        with pytest.raises(ValueError, match="server_address"):
             WebSocketConfig(server_address=invalid_address)
 
     def test_negative_heartbeat_interval_is_rejected(self):
@@ -370,9 +381,40 @@ class TestWebSocketConfig:
 class TestWebSocketClientConstruction:
     """Test that `IggyClient(...)` accepts a `WebSocketConfig`."""
 
-    def test_accepts_a_config(self):
-        """Test that a client can be built from a config object."""
-        assert IggyClient(WebSocketConfig(server_address="127.0.0.1:8092")) is not None
+    @pytest.mark.asyncio
+    async def test_accepts_a_config(self):
+        """Test that the resulting client is actually WebSocket, not silently TCP.
+
+        `IggyClient(...)` is not None for either union arm, so that alone never
+        pinned the transport, and neither does the error text: both arms report
+        a failed dial as `Cannot establish connection`. What separates them is
+        the outcome against a plain TCP listener. WebSocket has to complete an
+        HTTP upgrade handshake, which the listener below refuses by closing at
+        once, while a client that regressed to the TCP arm needs nothing beyond
+        the accepted socket and would connect. So the raise itself is the proof.
+
+        The listener is a real socket on an ephemeral loopback port, so nothing
+        here depends on a sysctl, a privileged port, or a running server.
+        `max_retries=0` keeps the failure immediate instead of retrying
+        forever, which is the default.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            threading.Thread(
+                target=lambda: _accept_and_close(listener), daemon=True
+            ).start()
+
+            client = IggyClient(
+                WebSocketConfig(
+                    server_address=f"127.0.0.1:{port}",
+                    reconnection=WebSocketReconnectionConfig(max_retries=0),
+                )
+            )
+
+            with pytest.raises(RuntimeError, match="Cannot establish connection"):
+                await client.connect()
 
     def test_accepts_the_default_config(self):
         """Test that an explicit default `WebSocketConfig` is accepted."""
