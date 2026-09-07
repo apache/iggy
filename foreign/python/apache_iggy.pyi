@@ -30,6 +30,8 @@ __all__ = [
     "AutoCommitAfter",
     "AutoCommitWhen",
     "AutoLogin",
+    "CacheMetrics",
+    "CacheMetricsKey",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
@@ -45,10 +47,14 @@ __all__ = [
     "Partition",
     "Permissions",
     "PollingStrategy",
+    "QuicConfig",
+    "QuicReconnectionConfig",
     "ReceiveMessage",
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "Stats",
+    "Stream",
     "StreamDetails",
     "StreamPermissions",
     "TcpConfig",
@@ -288,6 +294,57 @@ class AutoLogin:
         r"""
         Log in with the given personal access token on every connect.
         """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class CacheMetrics:
+    r"""
+    Cache metrics for a specific partition.
+    """
+    @property
+    def hits(self) -> builtins.int:
+        r"""
+        Number of cache hits.
+        """
+    @property
+    def misses(self) -> builtins.int:
+        r"""
+        Number of cache misses.
+        """
+    @property
+    def hit_ratio(self) -> builtins.float:
+        r"""
+        Hit ratio (hits / (hits + misses)).
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class CacheMetricsKey:
+    r"""
+    Key identifying the partition a `CacheMetrics` entry belongs to.
+
+    Hashable and comparable, so it can key the `Stats.cache_metrics` dict.
+    """
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the stream.
+        """
+    @property
+    def topic_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the topic within the stream.
+        """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the partition within the topic.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __hash__(self) -> builtins.int: ...
+    def __new__(
+        cls, stream_id: builtins.int, topic_id: builtins.int, partition_id: builtins.int
+    ) -> CacheMetricsKey: ...
     def __repr__(self) -> builtins.str: ...
 
 class Consumer:
@@ -843,23 +900,26 @@ class IggyClient:
     A Python class representing the Iggy client.
     It provides asynchronous functionality through the contained runtime.
     """
-    def __new__(cls, conn: TcpConfig | builtins.str | None = None) -> IggyClient:
+    def __new__(
+        cls, conn: TcpConfig | QuicConfig | builtins.str | None = None
+    ) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
-        This initializes a new runtime for asynchronous operations.
+        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
+        `QuicConfig`. This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
 
         Args:
-            conn: Either a `host:port` address, or a `TcpConfig` carrying the full
-                transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-                disabled. A malformed address is reported differently by the two
-                forms: the string form raises `RuntimeError` here, while `TcpConfig`
-                raises `ValueError` when it is constructed, before it ever reaches
-                this call. Neither exception is a subclass of the other.
+            conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
+                to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
+                address is reported differently depending on the form: the string
+                form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
+                raise `ValueError` when they are constructed, before either ever
+                reaches this call. Neither exception is a subclass of the other.
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
-                `host:port` pair.
+                `host:port` pair, or if a `QuicConfig` client cannot bind its
+                local UDP socket (for example the port is already in use).
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
@@ -871,6 +931,21 @@ class IggyClient:
         r"""
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
+        """
+    def get_stats(self) -> collections.abc.Awaitable[Stats]:
+        r"""
+        Get the statistics and details of the server and its running process.
+
+        Requires an authenticated session whose user holds the `read_servers`
+        or `manage_servers` global permission.
+
+        Returns:
+            An awaitable that resolves to `Stats`.
+
+        Raises:
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, the user lacks the permission, or the request
+                fails.
         """
     def describe_options(
         self, scope: builtins.str
@@ -1054,6 +1129,93 @@ class IggyClient:
         Gets stream by id.
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
+        """
+    def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
+        r"""
+        Return all streams.
+
+        Returns:
+            A list of `Stream` summaries.
+
+        Raises:
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `read_streams` or `manage_streams` permission, or the request fails.
+        """
+    def update_stream(
+        self,
+        stream_id: builtins.str | builtins.int,
+        name: builtins.str,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Rename a stream selected by name or numeric ID.
+
+        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+        decimal-only string is interpreted as a numeric ID. `name` must be unique
+        and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
+        name succeeds without changing it.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            name: New stream name as `str`.
+            options: Additional option keys as `dict[str, str] | None`, forwarded
+                to the server. Current server versions reject all stream update
+                option keys.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`, or `name` is not `str`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, the new name is invalid or already used, or
+                the request fails.
+        """
+    def delete_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete a stream selected by name or numeric ID.
+
+        Deletion removes the stream and all of its topics, partitions, and messages.
+        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+        decimal-only string is interpreted as a numeric ID.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, or the request fails.
+        """
+    def purge_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete all messages from every topic in a stream.
+
+        The stream, topics, and partitions remain available. Repeated purges of an
+        existing empty stream succeed. `stream_id` accepts a stream name as `str`
+        or numeric ID as `int`. A decimal-only string is interpreted as a numeric
+        ID.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, or the request fails.
         """
     def create_topic(
         self,
@@ -1707,6 +1869,151 @@ class PollingStrategy:
     ...
 
 @typing.final
+class QuicConfig:
+    r"""
+    Configuration for the QUIC transport, accepted by `IggyClient(...)`.
+
+    Every field is keyword-only and optional.
+    """
+    @property
+    def server_address(self) -> builtins.str: ...
+    @property
+    def client_address(self) -> builtins.str: ...
+    @property
+    def server_name(self) -> builtins.str: ...
+    @property
+    def auto_login(self) -> AutoLogin: ...
+    @property
+    def reconnection(self) -> QuicReconnectionConfig: ...
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    @property
+    def response_buffer_size(self) -> builtins.int: ...
+    @property
+    def max_concurrent_bidi_streams(self) -> builtins.int: ...
+    @property
+    def datagram_send_buffer_size(self) -> builtins.int: ...
+    @property
+    def initial_mtu(self) -> builtins.int: ...
+    @property
+    def send_window(self) -> builtins.int: ...
+    @property
+    def receive_window(self) -> builtins.int: ...
+    @property
+    def keep_alive_interval(self) -> datetime.timedelta: ...
+    @property
+    def max_idle_timeout(self) -> datetime.timedelta: ...
+    @property
+    def validate_certificate(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        server_address: builtins.str | None = None,
+        client_address: builtins.str | None = None,
+        server_name: builtins.str | None = None,
+        auto_login: AutoLogin | None = None,
+        reconnection: QuicReconnectionConfig | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+        response_buffer_size: builtins.int | None = None,
+        max_concurrent_bidi_streams: builtins.int | None = None,
+        datagram_send_buffer_size: builtins.int | None = None,
+        initial_mtu: builtins.int | None = None,
+        send_window: builtins.int | None = None,
+        receive_window: builtins.int | None = None,
+        keep_alive_interval: datetime.timedelta | None = None,
+        max_idle_timeout: datetime.timedelta | None = None,
+        validate_certificate: builtins.bool | None = None,
+    ) -> QuicConfig:
+        r"""
+        Constructs a QUIC configuration.
+
+        Args:
+            server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8080`.
+            client_address: `host:port` to bind the local UDP socket to. Defaults to
+                `127.0.0.1:0`, which binds to any available port. That exact value,
+                passed or defaulted, binds `[::1]:0` instead when `server_address`
+                resolves to IPv6, so the socket in use may not be the address read
+                back here. Any other value binds as given.
+            server_name: Server name used for the QUIC/TLS handshake. Defaults to
+                `localhost`.
+            auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+            response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
+            max_concurrent_bidi_streams: Maximum number of concurrent bidirectional
+                streams. Defaults to 10,000.
+            datagram_send_buffer_size: Size of the datagram send buffer in bytes.
+                Defaults to 100,000.
+            initial_mtu: Initial MTU in bytes. Defaults to 1200.
+            send_window: Send window size in bytes. Defaults to 100,000.
+            receive_window: Receive window size in bytes. Defaults to 100,000.
+            keep_alive_interval: Interval between QUIC keep-alive pings, or a zero
+                duration to disable them. Defaults to 5 seconds.
+            max_idle_timeout: How long the connection tolerates silence before it is
+                considered dead, or a zero duration to use quinn's own default (30
+                seconds) instead, since `configure()` skips the setter entirely when
+                zero. Defaults to 10 seconds.
+            validate_certificate: Whether to validate the server certificate. Defaults
+                to disabled, unlike the TCP and WebSocket transports.
+
+        Raises:
+            ValueError: If `server_address` or `client_address` is not a valid
+                `host:port` pair, if a duration is negative, if
+                `heartbeat_interval` is zero, if `keep_alive_interval` or
+                `max_idle_timeout` is not a whole number of milliseconds, if
+                `initial_mtu` is below quinn's minimum of 1200, or if a numeric
+                field is outside the range of its underlying wire type.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class QuicReconnectionConfig:
+    r"""
+    How the QUIC client reconnects after the connection to the server is lost.
+    """
+    @property
+    def enabled(self) -> builtins.bool: ...
+    @property
+    def max_retries(self) -> builtins.int | None: ...
+    @property
+    def interval(self) -> datetime.timedelta: ...
+    @property
+    def reestablish_after(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        enabled: builtins.bool | None = None,
+        max_retries: builtins.int | None = None,
+        interval: datetime.timedelta | None = None,
+        reestablish_after: datetime.timedelta | None = None,
+    ) -> QuicReconnectionConfig:
+        r"""
+        Constructs a reconnection policy.
+
+        Args:
+            enabled: Whether to reconnect at all. Defaults to enabled.
+            max_retries: Redials of the configured server address after the first
+                attempt, or `None` for unlimited; `0` still makes that first
+                attempt. Unlike the TCP transport, QUIC redials the one address
+                it was configured with rather than walking a cluster roster, so
+                this counts dials. Defaults to unlimited, which means a call
+                awaited while the server is down never returns: `connect()`
+                waits inside the retry loop, as do `send_messages()` and
+                `poll_messages()` once auto-login is configured. Set a finite
+                number for request/reply style usage, so a call fails instead.
+            interval: Delay before each redial. Defaults to 1 second.
+            reestablish_after: Cooldown before redialing after a previously
+                successful connection, measured from when it was established, so
+                a session that outlived the interval is redialed at once.
+                Defaults to 5 seconds.
+
+        Raises:
+            ValueError: If a duration is negative, if `max_retries` is outside the
+                range of an unsigned 32-bit integer, or if `interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class ReceiveMessage:
     r"""
     A Python class representing a received message.
@@ -1837,15 +2144,245 @@ class SendMessagesResponse:
         """
 
 @typing.final
+class Stats:
+    r"""
+    The statistics and details of the server and its running process.
+
+    The fields are gathered from several sources while the request is served
+    (metadata counters, a process probe, a disk probe), so they are not an
+    atomic snapshot of one instant.
+    """
+    @property
+    def process_id(self) -> builtins.int:
+        r"""
+        The unique identifier of the server process.
+        """
+    @property
+    def cpu_usage(self) -> builtins.float:
+        r"""
+        The CPU usage of the server process, in percent summed over the cores
+        it ran on, so it exceeds 100 whenever the process uses more than one
+        core.
+
+        Measured as a delta since the previous `get_stats` served by the same
+        server shard, so the first sample a shard serves is 0.
+        """
+    @property
+    def total_cpu_usage(self) -> builtins.float:
+        r"""
+        The total CPU usage of the system, in percent averaged over the cores
+        the server may run on when confined by an affinity/cpuset mask (over
+        every host core otherwise), so it stays within 0-100.
+
+        Same per-shard delta sampling as `cpu_usage`: the first sample a shard
+        serves is 0.
+        """
+    @property
+    def memory_usage(self) -> builtins.int:
+        r"""
+        The memory usage of the server process, in bytes.
+        """
+    @property
+    def total_memory(self) -> builtins.int:
+        r"""
+        The total memory of the system, in bytes, or the effective cgroup memory
+        limit when the server runs inside a memory-capped cgroup (container,
+        systemd slice).
+        """
+    @property
+    def available_memory(self) -> builtins.int:
+        r"""
+        The available memory of the system, in bytes, scoped to the cgroup
+        limit when one applies.
+        """
+    @property
+    def run_time(self) -> datetime.timedelta:
+        r"""
+        The run time of the server process, with whole-second precision.
+        """
+    @property
+    def start_time(self) -> builtins.int:
+        r"""
+        The start time of the server process, in microseconds since the Unix
+        epoch, with whole-second precision.
+        """
+    @property
+    def read_bytes(self) -> builtins.int:
+        r"""
+        The total number of bytes read.
+        """
+    @property
+    def written_bytes(self) -> builtins.int:
+        r"""
+        The total number of bytes written.
+        """
+    @property
+    def messages_size_bytes(self) -> builtins.int:
+        r"""
+        The total size of the messages, in bytes.
+        """
+    @property
+    def streams_count(self) -> builtins.int:
+        r"""
+        The total number of streams.
+        """
+    @property
+    def topics_count(self) -> builtins.int:
+        r"""
+        The total number of topics.
+        """
+    @property
+    def partitions_count(self) -> builtins.int:
+        r"""
+        The total number of partitions.
+        """
+    @property
+    def segments_count(self) -> builtins.int:
+        r"""
+        The total number of segments.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        The total number of messages.
+        """
+    @property
+    def clients_count(self) -> builtins.int:
+        r"""
+        The total number of connected clients.
+        """
+    @property
+    def consumer_groups_count(self) -> builtins.int:
+        r"""
+        The total number of consumer groups.
+        """
+    @property
+    def hostname(self) -> builtins.str:
+        r"""
+        The name of the host the server runs on.
+        """
+    @property
+    def os_name(self) -> builtins.str:
+        r"""
+        The name of the operating system.
+        """
+    @property
+    def os_version(self) -> builtins.str:
+        r"""
+        The version of the operating system.
+        """
+    @property
+    def kernel_version(self) -> builtins.str:
+        r"""
+        The version of the kernel.
+        """
+    @property
+    def iggy_server_version(self) -> builtins.str:
+        r"""
+        The version of the Iggy server.
+        """
+    @property
+    def iggy_server_semver(self) -> builtins.int | None:
+        r"""
+        The numeric semantic version of the Iggy server, or `None` when unknown.
+        E.g. 1.2.3 -> 1002003 (major * 1000000 + minor * 1000 + patch).
+        """
+    @property
+    def cache_metrics(self) -> builtins.dict[CacheMetricsKey, CacheMetrics]:
+        r"""
+        Cache metrics per partition.
+
+        Current servers do not populate this and reply with an empty map. Each
+        access builds a fresh dict, so mutating the returned dict does not
+        change the stats.
+        """
+    @property
+    def threads_count(self) -> builtins.int:
+        r"""
+        The number of threads in the server process.
+        """
+    @property
+    def free_disk_space(self) -> builtins.int:
+        r"""
+        The available (free) disk space for the data directory, in bytes.
+
+        0 when the server does not know its data directory or the disk probe
+        fails.
+        """
+    @property
+    def total_disk_space(self) -> builtins.int:
+        r"""
+        The total disk space for the data directory, in bytes.
+
+        0 when the server does not know its data directory or the disk probe
+        fails.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class Stream:
+    r"""
+    Summary information returned by `IggyClient.get_streams()`.
+
+    `created_at` is Unix time in microseconds. `size` is the stream's current
+    stored size in bytes.
+    """
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        Numeric stream identifier.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        Stream creation time as Unix time in microseconds.
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        Unique stream name.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        Current stored stream size in bytes.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        Total messages across all topics in the stream.
+        """
+    @property
+    def topics_count(self) -> builtins.int:
+        r"""
+        Number of topics in the stream.
+        """
+
+@typing.final
 class StreamDetails:
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        Stream creation time as Unix time in microseconds.
+        """
     @property
     def id(self) -> builtins.int: ...
     @property
     def name(self) -> builtins.str: ...
     @property
+    def size(self) -> builtins.int:
+        r"""
+        Current stored stream size in bytes.
+        """
+    @property
     def messages_count(self) -> builtins.int: ...
     @property
     def topics_count(self) -> builtins.int: ...
+    @property
+    def topics(self) -> builtins.list[Topic]:
+        r"""
+        Returns the topics in the stream.
+        """
 
 @typing.final
 class StreamPermissions:
