@@ -507,8 +507,10 @@ impl IggyClient {
         })
     }
 
-    /// Connects the IggyClient to its service.
-    /// Raises `RuntimeError` if the connection fails.
+    /// Connects the IggyClient to its service and starts the heartbeat task.
+    /// Raises `RuntimeError` if the connection fails. Over HTTP there is no
+    /// connection to establish, so only the heartbeat starts and this call
+    /// succeeds even against an unreachable server.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -1151,11 +1153,14 @@ impl IggyClient {
     /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
     /// is zero.
     ///
-    /// Consumer groups are not available over HTTP: this call awaits the join
-    /// before returning, and HTTP answers it with `Feature is unavailable`.
-    /// Disabling `auto_join_consumer_group` only moves that failure to the
-    /// first poll, so it is not a way around this. Use `Consumer.Single(...)`
-    /// with `poll_messages(...)` instead.
+    /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
+    /// left on, this call fails at the join with `Feature is unavailable`.
+    /// Turning it off is not a workaround: the join is skipped, but a group
+    /// member always polls without a partition, so the first poll fails with
+    /// the same error. Use `Consumer.Single(...)` with `poll_messages(...)`
+    /// instead - a `Consumer.Group(...)` poll with an explicit `partition_id`
+    /// does reach the server, but is served as an ordinary consumer named
+    /// after the group.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         name,

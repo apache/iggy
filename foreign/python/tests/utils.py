@@ -32,6 +32,9 @@ MAX_USERNAME_BYTES = 50
 MIN_PASSWORD_BYTES = 3
 MAX_PASSWORD_BYTES = 100
 
+DEFAULT_TCP_PORT = 8090
+DEFAULT_HTTP_PORT = 3000
+
 
 def get_transport_config(port_env_var: str, default_port: int) -> tuple[str, int]:
     """
@@ -69,7 +72,17 @@ def get_server_config() -> tuple[str, int]:
     Returns:
         tuple: (host, port) for the Iggy server
     """
-    return get_transport_config("IGGY_SERVER_TCP_PORT", 8090)
+    return get_transport_config("IGGY_SERVER_TCP_PORT", DEFAULT_TCP_PORT)
+
+
+def get_http_server_config() -> tuple[str, int]:
+    """
+    Get HTTP server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy HTTP API
+    """
+    return get_transport_config("IGGY_SERVER_HTTP_PORT", DEFAULT_HTTP_PORT)
 
 
 def get_quic_server_config() -> tuple[str, int]:

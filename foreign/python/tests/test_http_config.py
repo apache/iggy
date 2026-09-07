@@ -35,7 +35,7 @@ import pytest
 from apache_iggy import Consumer, HttpConfig, IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
 
-from .utils import get_transport_config, wait_for_ping
+from .utils import get_http_server_config, wait_for_ping
 
 
 @pytest.mark.unit
@@ -164,13 +164,16 @@ class TestHttpClientConstruction:
         """Test that the resulting client is actually HTTP, not silently TCP.
 
         `IggyClient(...)` is not None for either union arm, so that alone
-        never pinned the transport. An unreachable HTTP address plus a
-        raised ping proves this one is HTTP. `retries=0` keeps the failure
-        immediate instead of working through the default retry/backoff first.
+        never pinned the transport, and a bare `RuntimeError` does not either:
+        a client that regressed to the TCP arm raises too, just after hanging
+        until the pytest timeout. `Invalid HTTP request` is the HTTP
+        transport's own send failure, so matching it pins the transport.
+        `retries=0` keeps the failure immediate instead of working through
+        the default retry/backoff first.
         """
         client = IggyClient(HttpConfig(api_url="http://127.0.0.1:1", retries=0))
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Invalid HTTP request"):
             await client.ping()
 
 
@@ -181,7 +184,7 @@ class TestHttpConfigAgainstServer:
     @pytest.mark.asyncio
     async def test_client_connects_and_pings(self):
         """Test that a client built with a custom config reaches the server."""
-        host, port = get_transport_config("IGGY_SERVER_HTTP_PORT", 3000)
+        host, port = get_http_server_config()
 
         client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
         await client.connect()
@@ -195,7 +198,7 @@ class TestHttpConfigAgainstServer:
         cover: that a client built from `HttpConfig` can carry a real
         workload, not just answer a ping.
         """
-        host, port = get_transport_config("IGGY_SERVER_HTTP_PORT", 3000)
+        host, port = get_http_server_config()
         stream_name = unique_name()
         topic_name = unique_name()
         payload = f"payload-{unique_name()}"
@@ -237,7 +240,7 @@ class TestHttpConfigAgainstServer:
         stdlib `urllib` (bypassing `HttpConfig` and `login_user()` entirely)
         proves the client actually authenticates with the token it was given.
         """
-        host, port = get_transport_config("IGGY_SERVER_HTTP_PORT", 3000)
+        host, port = get_http_server_config()
         api_url = f"http://{host}:{port}"
 
         request = urllib.request.Request(  # noqa: S310
@@ -265,9 +268,12 @@ class TestHttpConfigAgainstServer:
         `join_consumer_group` answers `Feature is unavailable` over HTTP, and
         `consumer_group(...)` awaits that join before returning, so the
         failure surfaces at construction. `auto_join_consumer_group=False`
-        only moves it to the first poll, so it is not a way around this.
+        is not a way around it: the join is skipped, but the first poll
+        raises the same error, because a group member is pinned to no
+        partition and a consumer-group poll without one is rejected
+        client-side.
         """
-        host, port = get_transport_config("IGGY_SERVER_HTTP_PORT", 3000)
+        host, port = get_http_server_config()
         stream_name = unique_name()
         topic_name = unique_name()
 

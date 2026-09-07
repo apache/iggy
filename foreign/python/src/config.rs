@@ -824,11 +824,12 @@ impl QuicConfig {
 ///
 /// Every field is keyword-only and optional.
 ///
-/// HTTP is single-consumer only. The consumer kind is not carried on the HTTP
-/// wire, so a `Consumer.Group(...)` poll does not fail - it is served as an
-/// ordinary consumer named after the group, with no membership, no partition
-/// assignment, and no rebalancing behind it. Pass `Consumer.Single(...)`
-/// explicitly.
+/// HTTP is single-consumer only. `consumer_group(...)` fails with
+/// `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
+/// names an explicit `partition_id`. With one, the consumer kind is not carried
+/// on the HTTP wire, so the poll is served as an ordinary consumer named after
+/// the group, with no membership, no partition assignment, and no rebalancing
+/// behind it. Pass `Consumer.Single(...)` explicitly.
 #[gen_stub_pyclass]
 #[pyclass(from_py_object)]
 #[derive(Clone)]
@@ -861,9 +862,11 @@ impl HttpConfig {
     ///         the other transports, which surface the failure instead of
     ///         silently resending.
     ///     jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to
-    ///         `None`. Rejected if empty or whitespace-only: accepting it
-    ///         would make `has_jwt` report `True` while every call still
-    ///         fails `Unauthenticated`.
+    ///         `None`. Stored trimmed, since a token read from a file carries a
+    ///         trailing newline that the `Authorization` header value rejects.
+    ///         Rejected if empty or whitespace-only: accepting it would make
+    ///         `has_jwt` report `True` while every call still fails
+    ///         `Unauthenticated`.
     ///     heartbeat_interval: Interval between the client's liveness probes
     ///         (a bare `GET /ping`). Defaults to 5 seconds. Unlike TCP/QUIC,
     ///         HTTP has no persistent connection or session for this to keep
@@ -895,12 +898,13 @@ impl HttpConfig {
             builder = builder.with_retries(u32_arg(retries, "retries")?);
         }
         if let Some(jwt) = jwt {
-            if jwt.trim().is_empty() {
+            let jwt = jwt.trim();
+            if jwt.is_empty() {
                 return Err(PyValueError::new_err(
                     "'jwt' must not be empty or whitespace-only",
                 ));
             }
-            builder = builder.with_jwt(jwt);
+            builder = builder.with_jwt(jwt.to_owned());
         }
         if let Some(heartbeat_interval) = heartbeat_interval {
             let heartbeat_interval = reject_zero(

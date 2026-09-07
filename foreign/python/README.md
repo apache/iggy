@@ -176,11 +176,15 @@ asyncio.run(main())
 differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the
 heartbeat that `heartbeat_interval` configures, so call it and then
-`login_user(...)`. And HTTP is single-consumer only: `consumer_group(...)`
-raises `Feature is unavailable`, and a `Consumer.Group(...)` poll does not fail
-either - the consumer kind is not carried on the HTTP wire, so it is served as
-an ordinary consumer named after the group, with no membership or partition
-assignment behind it. Use `Consumer.Single(...)` with `poll_messages(...)`.
+`login_user(...)`. And HTTP is single-consumer only: the `consumer_group(...)`
+path always fails with `Feature is unavailable`, at the join by default and at
+the returned consumer's first poll if you disable `auto_join_consumer_group`,
+so disabling it is not a workaround. A direct
+`poll_messages(consumer=Consumer.Group(...))` fails the same way unless you
+pass an explicit `partition_id`, and with one it degrades silently instead: the
+consumer kind is not carried on the HTTP wire, so the group is served as an
+ordinary consumer named after it, with no membership or partition assignment
+behind it. Use `Consumer.Single(...)` with `poll_messages(...)`.
 
 ```python
 import asyncio
