@@ -115,7 +115,7 @@ impl IggyBridge {
     ) -> Result<(), BridgeError> {
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = self.ensure_stream(&stream_name).await?;
-        self.ensure_topic(&stream_id, &topic_name, partition_count)
+        self.ensure_topic(&stream_id, &topic_name, kafka_topic, partition_count)
             .await?;
         Ok(())
     }
@@ -168,6 +168,7 @@ impl IggyBridge {
         &self,
         stream_id: &Identifier,
         topic_name: &str,
+        kafka_topic: &str,
         partition_count: u32,
     ) -> Result<(), BridgeError> {
         let identifier = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
@@ -186,7 +187,9 @@ impl IggyBridge {
             // make silently. Erring is the only response that keeps the postcondition honest.
             if existing.partitions_count != partition_count {
                 return Err(BridgeError::PartitionCountMismatch {
-                    topic: topic_name.to_string(),
+                    // The Kafka-side name a caller actually asked about, not `topic_name` - see
+                    // the identical note on `PartitionOutOfRange` in `high_watermark`.
+                    topic: kafka_topic.to_string(),
                     existing: existing.partitions_count,
                     requested: partition_count,
                 });
@@ -224,7 +227,7 @@ impl IggyBridge {
                     })?;
                 if existing.partitions_count != partition_count {
                     return Err(BridgeError::PartitionCountMismatch {
-                        topic: topic_name.to_string(),
+                        topic: kafka_topic.to_string(),
                         existing: existing.partitions_count,
                         requested: partition_count,
                     });

@@ -148,6 +148,10 @@ impl TestServer {
             .env("IGGY_TCP_ADDRESS", &address)
             .env("IGGY_HTTP_ENABLED", "false")
             .env("IGGY_QUIC_ENABLED", "false")
+            // WebSocket defaults to enabled on a fixed 127.0.0.1:8092 (config.toml), unlike TCP
+            // which reads a per-test port from PortGuard - every spawned server here would fight
+            // over that one port otherwise, and a bind failure aborts boot.
+            .env("IGGY_WEBSOCKET_ENABLED", "false")
             // `--with-default-root-credentials` is off by default (args.rs) - without these,
             // a fresh server provisions no loginable root user at all, and every bridge connect
             // attempt fails with "invalid credentials" no matter what this test passes.
@@ -376,6 +380,7 @@ async fn connect_succeeds_with_password_containing_special_characters() {
         .env("IGGY_TCP_ADDRESS", &address)
         .env("IGGY_HTTP_ENABLED", "false")
         .env("IGGY_QUIC_ENABLED", "false")
+        .env("IGGY_WEBSOCKET_ENABLED", "false")
         .env("IGGY_ROOT_USERNAME", "iggy")
         .env("IGGY_ROOT_PASSWORD", password);
     let mut child = command.spawn().expect("spawn iggy-server");
