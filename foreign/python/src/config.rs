@@ -17,6 +17,9 @@
 
 use iggy::prelude::{
     AutoLogin as RustAutoLogin, Credentials as RustCredentials,
+    HttpClientConfig as RustHttpClientConfig, HttpClientConfigBuilder,
+    QuicClientConfig as RustQuicClientConfig, QuicClientConfigBuilder,
+    QuicClientReconnectionConfig as RustQuicClientReconnectionConfig,
     TcpClientConfig as RustTcpClientConfig, TcpClientConfigBuilder,
     TcpClientReconnectionConfig as RustTcpClientReconnectionConfig,
 };
@@ -26,10 +29,13 @@ use pyo3::types::PyDelta;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use pyo3_stub_gen::impl_stub_type;
 use secrecy::SecretString;
+use std::fmt::Display;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::duration::{
-    duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration, reject_zero,
+    duration_repr, iggy_duration_to_py_delta, millis_repr, millis_to_py_delta,
+    py_delta_to_iggy_duration, py_delta_to_millis, reject_zero,
 };
 
 /// The credentials replayed by the client every time it (re)connects.
@@ -140,6 +146,8 @@ impl TcpReconnectionConfig {
     /// Raises:
     ///     ValueError: If a duration is negative, if `max_retries` is outside the
     ///         range of an unsigned 32-bit integer, or if `interval` is zero.
+    ///     OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
@@ -153,14 +161,7 @@ impl TcpReconnectionConfig {
         let defaults = RustTcpClientReconnectionConfig::default();
         let enabled = enabled.unwrap_or(defaults.enabled);
         let max_retries = max_retries
-            .map(|max_retries| {
-                u32::try_from(max_retries).map_err(|_| {
-                    PyValueError::new_err(format!(
-                        "'max_retries' must be between 0 and {}",
-                        u32::MAX
-                    ))
-                })
-            })
+            .map(|max_retries| u32_param(max_retries, "max_retries"))
             .transpose()?;
         let interval = interval
             .as_ref()
@@ -304,7 +305,7 @@ impl TcpConfig {
         }
         let mut inner = builder
             .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| invalid_address("server_address", e))?;
         if let Some(auto_login) = auto_login {
             inner.auto_login = auto_login.inner;
         }
@@ -408,16 +409,628 @@ impl TcpConfig {
     }
 }
 
+/// How the QUIC client reconnects after the connection to the server is lost.
+#[gen_stub_pyclass]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct QuicReconnectionConfig {
+    pub(crate) inner: RustQuicClientReconnectionConfig,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl QuicReconnectionConfig {
+    /// Constructs a reconnection policy.
+    ///
+    /// Args:
+    ///     enabled: Whether to reconnect at all. Defaults to enabled.
+    ///     max_retries: Redials of the configured server address after the first
+    ///         attempt, or `None` for unlimited; `0` still makes that first
+    ///         attempt. Unlike the TCP transport, QUIC redials the one address
+    ///         it was configured with rather than walking a cluster roster, so
+    ///         this counts dials. Defaults to unlimited, which means a call
+    ///         awaited while the server is down never returns: `connect()`
+    ///         waits inside the retry loop, as do `send_messages()` and
+    ///         `poll_messages()` once auto-login is configured. Set a finite
+    ///         number for request/reply style usage, so a call fails instead.
+    ///     interval: Delay before each redial. Defaults to 1 second.
+    ///     reestablish_after: Cooldown before redialing after a previously
+    ///         successful connection, measured from when it was established, so
+    ///         a session that outlived the interval is redialed at once.
+    ///         Defaults to 5 seconds.
+    ///
+    /// Raises:
+    ///     ValueError: If a duration is negative, if `max_retries` is outside the
+    ///         range of an unsigned 32-bit integer, or if `interval` is zero.
+    ///     OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
+    #[new]
+    #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enabled: Option<bool>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_retries: Option<i64>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        reestablish_after: Option<Py<PyDelta>>,
+    ) -> PyResult<Self> {
+        let defaults = RustQuicClientReconnectionConfig::default();
+        let enabled = enabled.unwrap_or(defaults.enabled);
+        let max_retries = max_retries
+            .map(|max_retries| u32_param(max_retries, "max_retries"))
+            .transpose()?;
+        let interval = interval
+            .as_ref()
+            .map(py_delta_to_iggy_duration)
+            .transpose()?
+            .map(|interval| reject_zero(interval, "interval"))
+            .transpose()?
+            .unwrap_or(defaults.interval);
+        Ok(Self {
+            inner: RustQuicClientReconnectionConfig {
+                enabled,
+                max_retries,
+                interval,
+                reestablish_after: reestablish_after
+                    .as_ref()
+                    .map(py_delta_to_iggy_duration)
+                    .transpose()?
+                    .unwrap_or(defaults.reestablish_after),
+            },
+        })
+    }
+
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.inner.enabled
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
+    #[getter]
+    fn max_retries(&self) -> Option<u32> {
+        self.inner.max_retries
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.interval.get())
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn reestablish_after<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.reestablish_after)
+    }
+
+    fn __repr__(&self) -> String {
+        let max_retries = match self.inner.max_retries {
+            Some(max_retries) => max_retries.to_string(),
+            None => "None".to_owned(),
+        };
+        format!(
+            "QuicReconnectionConfig(enabled={}, max_retries={max_retries}, interval={}, reestablish_after={})",
+            python_bool(self.inner.enabled),
+            duration_repr(self.inner.interval.get()),
+            duration_repr(self.inner.reestablish_after),
+        )
+    }
+}
+
+/// quinn clamps `TransportConfig::initial_mtu` up to this floor rather than
+/// rejecting a smaller value, so `QuicConfig` rejects it instead: otherwise the
+/// getter would read back a value that is not the one actually in effect.
+const QUINN_MIN_INITIAL_MTU: u16 = 1200;
+
+/// Configuration for the QUIC transport, accepted by `IggyClient(...)`.
+///
+/// Every field is keyword-only and optional.
+#[gen_stub_pyclass]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct QuicConfig {
+    inner: Arc<RustQuicClientConfig>,
+}
+
+impl QuicConfig {
+    /// The configuration in the shape `QuicClient::create` expects.
+    pub(crate) fn client_config(&self) -> Arc<RustQuicClientConfig> {
+        self.inner.clone()
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl QuicConfig {
+    /// Constructs a QUIC configuration.
+    ///
+    /// Args:
+    ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8080`.
+    ///     client_address: `host:port` to bind the local UDP socket to. Defaults to
+    ///         `127.0.0.1:0`, which binds to any available port. That exact value,
+    ///         passed or defaulted, binds `[::1]:0` instead when `server_address`
+    ///         resolves to IPv6, so the socket in use may not be the address read
+    ///         back here. Any other value binds as given.
+    ///     server_name: Server name used for the QUIC/TLS handshake. Defaults to
+    ///         `localhost`.
+    ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+    ///     reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
+    ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+    ///     response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
+    ///     max_concurrent_bidi_streams: Maximum number of concurrent bidirectional
+    ///         streams. Defaults to 10,000.
+    ///     datagram_send_buffer_size: Size of the datagram send buffer in bytes.
+    ///         Defaults to 100,000.
+    ///     initial_mtu: Initial MTU in bytes. Defaults to 1200.
+    ///     send_window: Send window size in bytes. Defaults to 100,000.
+    ///     receive_window: Receive window size in bytes. Defaults to 100,000.
+    ///     keep_alive_interval: Interval between QUIC keep-alive pings, or a zero
+    ///         duration to disable them. Defaults to 5 seconds.
+    ///     max_idle_timeout: How long the connection tolerates silence before it is
+    ///         considered dead, or a zero duration to use quinn's own default (30
+    ///         seconds) instead, since `configure()` skips the setter entirely when
+    ///         zero. Defaults to 10 seconds.
+    ///     validate_certificate: Whether to validate the server certificate. Defaults
+    ///         to disabled, unlike the TCP and WebSocket transports.
+    ///
+    /// Raises:
+    ///     ValueError: If `server_address` or `client_address` is not a valid
+    ///         `host:port` pair, if a duration is negative, if
+    ///         `heartbeat_interval` is zero, if `keep_alive_interval` or
+    ///         `max_idle_timeout` is not a whole number of milliseconds, if
+    ///         `initial_mtu` is below quinn's minimum of 1200, or if a numeric
+    ///         field is outside the range of its underlying wire type.
+    ///     OverflowError: If a numeric field does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
+    #[new]
+    #[pyo3(signature = (
+        *,
+        server_address=None,
+        client_address=None,
+        server_name=None,
+        auto_login=None,
+        reconnection=None,
+        heartbeat_interval=None,
+        response_buffer_size=None,
+        max_concurrent_bidi_streams=None,
+        datagram_send_buffer_size=None,
+        initial_mtu=None,
+        send_window=None,
+        receive_window=None,
+        keep_alive_interval=None,
+        max_idle_timeout=None,
+        validate_certificate=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_address: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] client_address: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_name: Option<String>,
+        #[gen_stub(override_type(type_repr = "AutoLogin | None"))] auto_login: Option<AutoLogin>,
+        #[gen_stub(override_type(type_repr = "QuicReconnectionConfig | None"))]
+        reconnection: Option<QuicReconnectionConfig>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        heartbeat_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] response_buffer_size: Option<
+            i64,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        max_concurrent_bidi_streams: Option<i64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        datagram_send_buffer_size: Option<i64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] initial_mtu: Option<i64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] send_window: Option<i64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] receive_window: Option<i64>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        keep_alive_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        max_idle_timeout: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] validate_certificate: Option<
+            bool,
+        >,
+    ) -> PyResult<Self> {
+        // The builder starts from `QuicClientConfig::default()`, and its `build()`
+        // trims and validates the server address whether or not one was set here.
+        let mut builder = QuicClientConfigBuilder::new();
+        if let Some(server_address) = server_address {
+            builder = builder.with_server_address(server_address);
+        }
+        let mut inner = builder
+            .build()
+            .map_err(|e| invalid_address("server_address", e))?;
+        if let Some(client_address) = client_address {
+            // Trimmed like the server address, but otherwise kept verbatim rather
+            // than re-serialized from the parsed `SocketAddr`: `QuicClient::create`
+            // compares this against the literal default to decide whether to bind
+            // an IPv6 socket for an IPv6 server, and a rewritten string would not
+            // match.
+            let client_address = client_address.trim();
+            client_address
+                .parse::<SocketAddr>()
+                .map_err(|e| invalid_address("client_address", e))?;
+            inner.client_address = client_address.to_owned();
+        }
+        if let Some(server_name) = server_name {
+            inner.server_name = server_name;
+        }
+        if let Some(auto_login) = auto_login {
+            inner.auto_login = auto_login.inner;
+        }
+        if let Some(reconnection) = reconnection {
+            inner.reconnection = reconnection.inner;
+        }
+        if let Some(heartbeat_interval) = heartbeat_interval {
+            inner.heartbeat_interval = reject_zero(
+                py_delta_to_iggy_duration(&heartbeat_interval)?,
+                "heartbeat_interval",
+            )?;
+        }
+        if let Some(response_buffer_size) = response_buffer_size {
+            inner.response_buffer_size = u64_param(response_buffer_size, "response_buffer_size")?;
+        }
+        if let Some(max_concurrent_bidi_streams) = max_concurrent_bidi_streams {
+            inner.max_concurrent_bidi_streams =
+                varint_param(max_concurrent_bidi_streams, "max_concurrent_bidi_streams")?;
+        }
+        if let Some(datagram_send_buffer_size) = datagram_send_buffer_size {
+            inner.datagram_send_buffer_size =
+                u64_param(datagram_send_buffer_size, "datagram_send_buffer_size")?;
+        }
+        if let Some(initial_mtu) = initial_mtu {
+            let initial_mtu = u16_param(initial_mtu, "initial_mtu")?;
+            if initial_mtu < QUINN_MIN_INITIAL_MTU {
+                return Err(PyValueError::new_err(format!(
+                    "'initial_mtu' must be at least {QUINN_MIN_INITIAL_MTU}; quinn silently \
+                     raises anything smaller to that floor, so the getter would no longer \
+                     match the value actually in effect"
+                )));
+            }
+            inner.initial_mtu = initial_mtu;
+        }
+        if let Some(send_window) = send_window {
+            inner.send_window = u64_param(send_window, "send_window")?;
+        }
+        if let Some(receive_window) = receive_window {
+            inner.receive_window = varint_param(receive_window, "receive_window")?;
+        }
+        if let Some(keep_alive_interval) = keep_alive_interval {
+            inner.keep_alive_interval =
+                py_delta_to_millis(&keep_alive_interval, "keep_alive_interval")?;
+        }
+        if let Some(max_idle_timeout) = max_idle_timeout {
+            inner.max_idle_timeout = py_delta_to_millis(&max_idle_timeout, "max_idle_timeout")?;
+        }
+        if let Some(validate_certificate) = validate_certificate {
+            inner.validate_certificate = validate_certificate;
+        }
+
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    #[getter]
+    fn server_address(&self) -> String {
+        self.inner.server_address.clone()
+    }
+
+    #[getter]
+    fn client_address(&self) -> String {
+        self.inner.client_address.clone()
+    }
+
+    #[getter]
+    fn server_name(&self) -> String {
+        self.inner.server_name.clone()
+    }
+
+    #[getter]
+    fn auto_login(&self) -> AutoLogin {
+        AutoLogin {
+            inner: self.inner.auto_login.clone(),
+        }
+    }
+
+    #[getter]
+    fn reconnection(&self) -> QuicReconnectionConfig {
+        QuicReconnectionConfig {
+            inner: self.inner.reconnection.clone(),
+        }
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn heartbeat_interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.heartbeat_interval.get())
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int"))]
+    #[getter]
+    fn response_buffer_size(&self) -> u64 {
+        self.inner.response_buffer_size
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int"))]
+    #[getter]
+    fn max_concurrent_bidi_streams(&self) -> u64 {
+        self.inner.max_concurrent_bidi_streams
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int"))]
+    #[getter]
+    fn datagram_send_buffer_size(&self) -> u64 {
+        self.inner.datagram_send_buffer_size
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int"))]
+    #[getter]
+    fn initial_mtu(&self) -> u16 {
+        self.inner.initial_mtu
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int"))]
+    #[getter]
+    fn send_window(&self) -> u64 {
+        self.inner.send_window
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int"))]
+    #[getter]
+    fn receive_window(&self) -> u64 {
+        self.inner.receive_window
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn keep_alive_interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        millis_to_py_delta(py, self.inner.keep_alive_interval)
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn max_idle_timeout<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        millis_to_py_delta(py, self.inner.max_idle_timeout)
+    }
+
+    #[getter]
+    fn validate_certificate(&self) -> bool {
+        self.inner.validate_certificate
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QuicConfig(server_address={:?}, client_address={:?}, server_name={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, response_buffer_size={}, max_concurrent_bidi_streams={}, datagram_send_buffer_size={}, initial_mtu={}, send_window={}, receive_window={}, keep_alive_interval={}, max_idle_timeout={}, validate_certificate={})",
+            self.inner.server_address,
+            self.inner.client_address,
+            self.inner.server_name,
+            self.auto_login().__repr__(),
+            self.reconnection().__repr__(),
+            duration_repr(self.inner.heartbeat_interval.get()),
+            self.inner.response_buffer_size,
+            self.inner.max_concurrent_bidi_streams,
+            self.inner.datagram_send_buffer_size,
+            self.inner.initial_mtu,
+            self.inner.send_window,
+            self.inner.receive_window,
+            millis_repr(self.inner.keep_alive_interval),
+            millis_repr(self.inner.max_idle_timeout),
+            python_bool(self.inner.validate_certificate),
+        )
+    }
+}
+
+/// Configuration for the HTTP transport, accepted by `IggyClient(...)`.
+///
+/// Every field is keyword-only and optional.
+///
+/// There is no `AutoLogin` and no reconnection policy, and `connect()` does not
+/// dial: it only starts the heartbeat, so `login_user(...)` has to follow it.
+///
+/// HTTP is single-consumer only. `consumer_group(...)` fails with
+/// `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
+/// names an explicit `partition_id`. With one, the consumer kind is not carried
+/// on the HTTP wire, so the poll is served as an ordinary consumer named after
+/// the group, with no membership, no partition assignment, and no rebalancing
+/// behind it. Pass `Consumer.Single(...)` explicitly.
+#[gen_stub_pyclass]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct HttpConfig {
+    inner: Arc<RustHttpClientConfig>,
+}
+
+impl HttpConfig {
+    /// The configuration in the shape `HttpClient::create` expects.
+    pub(crate) fn client_config(&self) -> Arc<RustHttpClientConfig> {
+        self.inner.clone()
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl HttpConfig {
+    /// Constructs an HTTP configuration.
+    ///
+    /// Args:
+    ///     api_url: Base URL of the Iggy HTTP API, as `scheme://host[:port]`
+    ///         only - no path, query, fragment, or credentials. Defaults to
+    ///         `http://127.0.0.1:3000`.
+    ///     retries: Number of retries to perform on transient errors, each one
+    ///         replaying the full request (including its body) via automatic
+    ///         middleware. Defaults to 3. Delivery is therefore at-least-once:
+    ///         if the original request actually committed but its response
+    ///         was lost (e.g. to a timeout), a retried call applies the same
+    ///         operation again. Set to 0 to disable automatic replay and match
+    ///         the other transports, which surface the failure instead of
+    ///         silently resending.
+    ///     jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to
+    ///         `None`. Stored trimmed, since a token read from a file carries a
+    ///         trailing newline that the `Authorization` header value rejects.
+    ///         Rejected if empty or whitespace-only: accepting it would make
+    ///         `has_jwt` report `True` while every call still fails
+    ///         `Unauthenticated`.
+    ///     heartbeat_interval: Interval between the client's liveness probes
+    ///         (a bare `GET /ping`). Defaults to 5 seconds. Unlike TCP/QUIC,
+    ///         HTTP has no persistent connection or session for this to keep
+    ///         alive; it only proves the server is reachable.
+    ///
+    /// Raises:
+    ///     ValueError: If `api_url` is not a valid URL, if `retries` is outside
+    ///         the range of an unsigned 32-bit integer, if `jwt` is empty or
+    ///         whitespace-only, if a duration is negative, or if
+    ///         `heartbeat_interval` is zero.
+    ///     OverflowError: If `retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
+    #[new]
+    #[pyo3(signature = (*, api_url=None, retries=None, jwt=None, heartbeat_interval=None))]
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] api_url: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] retries: Option<i64>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] jwt: Option<String>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        heartbeat_interval: Option<Py<PyDelta>>,
+    ) -> PyResult<Self> {
+        // The builder starts from `HttpClientConfig::default()`, and its `build()`
+        // trims and validates the API URL whether or not one was set here.
+        let mut builder = HttpClientConfigBuilder::new();
+        if let Some(api_url) = api_url {
+            builder = builder.with_api_url(api_url);
+        }
+        let mut inner = builder
+            .build()
+            .map_err(|e| PyValueError::new_err(format!("'api_url' is not a valid URL: {e}")))?;
+        if let Some(retries) = retries {
+            inner.retries = u32_param(retries, "retries")?;
+        }
+        if let Some(jwt) = jwt {
+            let jwt = jwt.trim();
+            if jwt.is_empty() {
+                return Err(PyValueError::new_err(
+                    "'jwt' must not be empty or whitespace-only",
+                ));
+            }
+            inner.jwt = Some(jwt.to_owned());
+        }
+        if let Some(heartbeat_interval) = heartbeat_interval {
+            inner.heartbeat_interval = reject_zero(
+                py_delta_to_iggy_duration(&heartbeat_interval)?,
+                "heartbeat_interval",
+            )?;
+        }
+
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    #[getter]
+    fn api_url(&self) -> String {
+        self.inner.api_url.clone()
+    }
+
+    #[getter]
+    fn retries(&self) -> u32 {
+        self.inner.retries
+    }
+
+    /// Whether a JWT is configured, without exposing the token itself.
+    #[getter]
+    fn has_jwt(&self) -> bool {
+        self.inner.jwt.is_some()
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn heartbeat_interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.heartbeat_interval.get())
+    }
+
+    fn __repr__(&self) -> String {
+        let jwt = if self.inner.jwt.is_some() {
+            "..."
+        } else {
+            "None"
+        };
+        format!(
+            "HttpConfig(api_url={:?}, retries={}, jwt={jwt}, heartbeat_interval={})",
+            self.inner.api_url,
+            self.inner.retries,
+            duration_repr(self.inner.heartbeat_interval.get()),
+        )
+    }
+}
+
 fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
 
-/// What `IggyClient(...)` accepts: a bare `host:port` or a full `TcpConfig`.
+/// Rejects an address that is not a valid `host:port`, naming the argument it
+/// came from: neither the builder's error nor `SocketAddr`'s mentions which one.
+fn invalid_address(parameter: &str, error: impl Display) -> PyErr {
+    PyValueError::new_err(format!("'{parameter}' is not a valid 'host:port': {error}"))
+}
+
+/// Converts a Python int to the unsigned 32-bit integer `max_retries`/`retries`
+/// expect, naming the parameter in the error so a caller can tell which
+/// argument was out of range. A value too large even for `i64` still raises
+/// pyo3's own unnamed `OverflowError` before this ever runs.
+fn u32_param(value: i64, parameter: &str) -> PyResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", u32::MAX))
+    })
+}
+
+/// Converts a Python int to the unsigned 64-bit integer a QUIC transport
+/// field expects, naming the parameter in the error so a caller can tell
+/// which argument was out of range. The bound in the message is `i64::MAX`
+/// rather than `u64::MAX` because pyo3 extracts the argument as an `i64`
+/// first: anything above that never reaches here, raising `OverflowError`
+/// on the way in. Every one of these fields is a buffer or window size, so
+/// the unreachable half of the range has no practical use.
+fn u64_param(value: i64, parameter: &str) -> PyResult<u64> {
+    u64::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", i64::MAX))
+    })
+}
+
+/// Converts a Python int to the unsigned 16-bit integer `initial_mtu` expects.
+fn u16_param(value: i64, parameter: &str) -> PyResult<u16> {
+    u16::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", u16::MAX))
+    })
+}
+
+/// Converts a Python int to a `u64` that also fits `quinn::VarInt` (max
+/// `2^62 - 1`), which `max_concurrent_bidi_streams` and `receive_window` are
+/// narrowed into when the connection is configured. A `u64` in range for
+/// `u64::MAX` but not `VarInt::MAX` would otherwise only fail there, as an
+/// opaque `RuntimeError` instead of a `ValueError` naming the argument.
+fn varint_param(value: i64, parameter: &str) -> PyResult<u64> {
+    const VARINT_MAX: u64 = (1u64 << 62) - 1;
+    let value = u64_param(value, parameter)?;
+    if value > VARINT_MAX {
+        return Err(PyValueError::new_err(format!(
+            "'{parameter}' must be between 0 and {VARINT_MAX}"
+        )));
+    }
+    Ok(value)
+}
+
+/// What `IggyClient(...)` accepts: a bare `host:port`, a full `TcpConfig`, a
+/// `QuicConfig` for the QUIC transport, or an `HttpConfig` for the HTTP transport.
 #[derive(FromPyObject)]
 pub enum PyClientConfig {
     #[pyo3(transparent)]
-    Config(TcpConfig),
+    Tcp(TcpConfig),
+    #[pyo3(transparent)]
+    Quic(QuicConfig),
+    #[pyo3(transparent)]
+    Http(HttpConfig),
     #[pyo3(transparent, annotation = "str")]
     ServerAddress(String),
 }
-impl_stub_type!(PyClientConfig = TcpConfig | String);
+impl_stub_type!(PyClientConfig = TcpConfig | QuicConfig | HttpConfig | String);

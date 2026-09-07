@@ -21,26 +21,32 @@ mod consumer;
 mod duration;
 mod identifier;
 mod options;
+mod partitioning;
 mod permissions;
 mod receive_message;
 mod send_message;
+mod stats;
 mod stream;
 mod topic;
 mod user;
 mod user_headers;
 
 use client::IggyClient;
-use config::{AutoLogin, TcpConfig, TcpReconnectionConfig};
+use config::{
+    AutoLogin, HttpConfig, QuicConfig, QuicReconnectionConfig, TcpConfig, TcpReconnectionConfig,
+};
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
 };
 use options::OptionSpec;
+use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
-use stream::StreamDetails;
+use stats::{CacheMetrics, CacheMetricsKey, Stats};
+use stream::{Stream, StreamDetails};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
 use user::{UserInfo, UserInfoDetails, UserStatus};
 use user_headers::{HeaderKey, HeaderValue, UserHeaders};
@@ -56,12 +62,20 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AutoLogin>()?;
     m.add_class::<TcpConfig>()?;
     m.add_class::<TcpReconnectionConfig>()?;
+    m.add_class::<QuicConfig>()?;
+    m.add_class::<QuicReconnectionConfig>()?;
+    m.add_class::<HttpConfig>()?;
     m.add_class::<StreamDetails>()?;
+    m.add_class::<Stream>()?;
+    m.add_class::<Stats>()?;
+    m.add_class::<CacheMetrics>()?;
+    m.add_class::<CacheMetricsKey>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;
     m.add_class::<IggyExpiry>()?;
     m.add_class::<MaxTopicSize>()?;
     m.add_class::<OptionSpec>()?;
+    m.add_class::<Partitioning>()?;
     m.add_class::<Partition>()?;
     m.add_class::<Consumer>()?;
     m.add_class::<ConsumerGroup>()?;

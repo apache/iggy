@@ -326,6 +326,21 @@ Currently, it does expose the following endpoints:
 - `POST /sources/{key}/restart`: stop the source and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.
 
+`{key}` is the connector key: at most 128 bytes of ASCII letters, digits, `-`,
+`_` and `.`, starting with a letter or digit. A decoded segment outside that
+rule, such as `..%2F..%2Fpwned`, is answered with `400 Bad Request` and the
+error code `invalid_connector_key` before the request reaches the configuration
+provider, because on the local provider the key becomes part of a filename under
+`config_dir`, and on the HTTP provider part of a URL. An unencoded `/` splits
+the path and matches no route, so it is a `404`.
+
+Keys loaded from configuration files or the HTTP provider are not rejected, so
+existing deployments keep starting, but a key outside the rule is logged at
+startup and cannot be addressed through the API. Keys are case-sensitive to the
+runtime while the local provider maps them to filenames, so on a
+case-insensitive filesystem two keys that differ only by case share one file;
+prefer lowercase.
+
 ## Telemetry
 
 The connector runtime supports OpenTelemetry for logs and traces. To enable telemetry, add the following configuration:
