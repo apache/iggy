@@ -18,6 +18,7 @@
 #![allow(clippy::future_not_send)]
 
 mod args;
+mod banner;
 
 use args::Args;
 use clap::Parser;
@@ -37,6 +38,7 @@ fn main() -> Result<(), ServerError> {
     // visible. `create_shard_executor` also reads its capacity knob from the
     // environment, which is why the `.env` load has to precede it.
     let args = Args::parse();
+    banner::print(server::VERSION);
     // `logging` owns the tracing appender worker guards; it must outlive the
     // shard threads or every log line after bootstrap is silently dropped.
     let mut logging = Logging::new(server::VERSION);
