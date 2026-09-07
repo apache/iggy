@@ -281,6 +281,12 @@ class TestHttpConfigAgainstServer:
         `/users/login` is unauthenticated, so a token minted out-of-band via
         stdlib `urllib` (bypassing `HttpConfig` and `login_user()` entirely)
         proves the client actually authenticates with the token it was given.
+
+        The trailing newline is deliberate, and is the only coverage of the
+        trim in `HttpConfig::new`: it reproduces a token read from a file, and
+        untrimmed it builds a `Bearer <token>\\n` header value that
+        `HeaderValue` rejects, failing every call with `Invalid HTTP request`.
+        Do not remove it.
         """
         host, port = get_http_server_config()
         api_url = f"http://{host}:{port}"
@@ -295,7 +301,7 @@ class TestHttpConfigAgainstServer:
             identity = json.loads(response.read())
         token = identity["access_token"]["token"]
 
-        client = IggyClient(HttpConfig(api_url=api_url, jwt=token))
+        client = IggyClient(HttpConfig(api_url=api_url, jwt=f"{token}\n"))
         await client.connect()
         await wait_for_ping(client)
 

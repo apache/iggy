@@ -457,14 +457,7 @@ impl QuicReconnectionConfig {
         let defaults = RustQuicClientReconnectionConfig::default();
         let enabled = enabled.unwrap_or(defaults.enabled);
         let max_retries = max_retries
-            .map(|max_retries| {
-                u32::try_from(max_retries).map_err(|_| {
-                    PyValueError::new_err(format!(
-                        "'max_retries' must be between 0 and {}",
-                        u32::MAX
-                    ))
-                })
-            })
+            .map(|max_retries| u32_param(max_retries, "max_retries"))
             .transpose()?;
         let interval = interval
             .as_ref()

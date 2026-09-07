@@ -184,7 +184,9 @@ so disabling it is not a workaround. A direct
 pass an explicit `partition_id`, and with one it degrades silently instead: the
 consumer kind is not carried on the HTTP wire, so the group is served as an
 ordinary consumer named after it, with no membership or partition assignment
-behind it. Use `Consumer.Single(...)` with `poll_messages(...)`.
+behind it. Use `Consumer.Single(...)` with `poll_messages(...)`. Delivery is
+also at-least-once: the default `retries=3` replays the full request body, so a
+send whose response was lost is applied twice, and only `retries=0` opts out.
 
 ```python
 import asyncio

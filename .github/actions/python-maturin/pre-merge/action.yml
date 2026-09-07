@@ -173,9 +173,10 @@ runs:
       run: |
         cd foreign/python
 
-        # Ports come from server-start's own outputs rather than duplicated
-        # literals, so a future default change here can't silently desync
-        # from what the server actually started with.
+        # TCP and HTTP ports come from server-start's own outputs rather than
+        # duplicated literals, so a future default change here can't silently
+        # desync from what the server actually started with. QUIC stays a
+        # literal below because server-start exposes no output for it.
         tcp_port="${{ steps.iggy.outputs.tcp_address }}"
         http_port="${{ steps.iggy.outputs.http_address }}"
         tcp_port="${tcp_port##*:}"
