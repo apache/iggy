@@ -153,9 +153,9 @@ class TestWebSocketFramingConfig:
     def test_defaults_match_tungstenite(self):
         """Test that unconfigured sizes fall back to the tungstenite defaults.
 
-        Every size defaults to `Some(...)`; passing `None` explicitly leaves the
-        default untouched rather than clearing the limit, since the constructor
-        only assigns a field when its argument is `Some(...)`.
+        Every size defaults to a concrete value; an omitted argument keeps that
+        default, while an explicit `None` clears the limit. See
+        `test_explicit_none_clears_the_limit`.
         """
         framing = WebSocketFramingConfig()
 
@@ -183,6 +183,32 @@ class TestWebSocketFramingConfig:
         assert framing.max_message_size == 16384
         assert framing.max_frame_size == 16384
         assert framing.accept_unmasked_frames is True
+
+    @pytest.mark.parametrize("field", ["max_message_size", "max_frame_size"])
+    def test_explicit_none_clears_the_limit(self, field: str):
+        """Test that an explicit `None` lifts the size limit.
+
+        An omitted argument and an explicit `None` both reach Rust as
+        `Option::None`, so without a sentinel the constructor cannot tell them
+        apart and a caller asking for no limit would silently keep the default.
+        """
+        framing = WebSocketFramingConfig(**{field: None})
+
+        assert getattr(framing, field) is None
+
+    @pytest.mark.parametrize("field", ["max_message_size", "max_frame_size"])
+    def test_omitting_the_argument_keeps_the_default_limit(self, field: str):
+        """Test that omitting the argument is not the same as passing `None`."""
+        framing = WebSocketFramingConfig()
+
+        assert getattr(framing, field) is not None
+
+    def test_clearing_one_limit_leaves_the_other_alone(self):
+        """Test that the two sentinels are independent."""
+        framing = WebSocketFramingConfig(max_message_size=None)
+
+        assert framing.max_message_size is None
+        assert framing.max_frame_size is not None
 
     def test_arguments_are_keyword_only(self):
         """Test that the first field cannot be passed positionally."""
@@ -341,19 +367,16 @@ class TestWebSocketConfig:
 
 
 @pytest.mark.unit
-class TestClientConstruction:
-    """Test what `IggyClient.websocket(...)` accepts."""
+class TestWebSocketClientConstruction:
+    """Test that `IggyClient(...)` accepts a `WebSocketConfig`."""
 
     def test_accepts_a_config(self):
         """Test that a client can be built from a config object."""
-        assert (
-            IggyClient.websocket(WebSocketConfig(server_address="127.0.0.1:8092"))
-            is not None
-        )
+        assert IggyClient(WebSocketConfig(server_address="127.0.0.1:8092")) is not None
 
-    def test_accepts_nothing(self):
-        """Test that the default configuration is used when no argument is given."""
-        assert IggyClient.websocket() is not None
+    def test_accepts_the_default_config(self):
+        """Test that an explicit default `WebSocketConfig` is accepted."""
+        assert IggyClient(WebSocketConfig()) is not None
 
 
 @pytest.mark.integration
@@ -366,7 +389,7 @@ class TestAutoLoginAgainstServer:
         host, port = get_websocket_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient.websocket(
+        client = IggyClient(
             WebSocketConfig(
                 server_address=f"{host}:{port}",
                 auto_login=AutoLogin.username_password("iggy", "iggy"),
@@ -391,7 +414,7 @@ class TestAutoLoginAgainstServer:
         host, port = get_websocket_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient.websocket(
+        client = IggyClient(
             WebSocketConfig(
                 server_address=f"{host}:{port}",
                 # The default reconnection policy retries forever: a missing
@@ -412,7 +435,7 @@ class TestAutoLoginAgainstServer:
         host, port = get_websocket_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient.websocket(
+        client = IggyClient(
             WebSocketConfig(
                 server_address=f"{host}:{port}",
                 auto_login=AutoLogin.username_password("iggy", "invalid-password"),

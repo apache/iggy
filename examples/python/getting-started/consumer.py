@@ -31,6 +31,7 @@ from apache_iggy import (
     ReceiveMessage,
     TcpConfig,
     TcpReconnectionConfig,
+    WebSocketConfig,
 )
 from loguru import logger
 
@@ -103,7 +104,9 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(args))
 
 
-def build_config(args: ArgNamespace) -> TcpConfig | QuicConfig | HttpConfig:
+def build_config(
+    args: ArgNamespace,
+) -> TcpConfig | QuicConfig | HttpConfig | WebSocketConfig:
     """Build the client configuration, TCP with auto-login and reconnection."""
 
     # IggyClient(...) also accepts a QuicConfig for the QUIC transport. To use
@@ -124,6 +127,18 @@ def build_config(args: ArgNamespace) -> TcpConfig | QuicConfig | HttpConfig:
     # an explicit `await client.login_user(args.username, args.password)`
     # after connecting:
     # return HttpConfig(api_url="http://127.0.0.1:3000")
+
+    # IggyClient(...) also accepts a WebSocketConfig for the WebSocket transport.
+    # To use it, uncomment the return below and import WebSocketReconnectionConfig,
+    # which is left out above because only the commented block names it:
+    #
+    # return WebSocketConfig(
+    #     server_address="127.0.0.1:8092",
+    #     auto_login=AutoLogin.username_password(args.username, args.password),
+    #     reconnection=WebSocketReconnectionConfig(
+    #         enabled=True, interval=timedelta(seconds=1)
+    #     ),
+    # )
 
     return TcpConfig(
         server_address=args.tcp_server_address,

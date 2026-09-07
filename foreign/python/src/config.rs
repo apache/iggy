@@ -982,21 +982,21 @@ impl WebSocketReconnectionConfig {
     ///
     /// Args:
     ///     enabled: Whether to reconnect at all. Defaults to enabled.
-    ///     max_retries: Passes over the known endpoints after the first, or
-    ///         `None` for unlimited; `0` still makes that first pass. One pass
-    ///         tries the endpoint the client is on, the address it was
-    ///         configured with, and every node the roster named, so this counts
-    ///         passes rather than dials. Defaults
-    ///         to unlimited, which means a call awaited while the server is
-    ///         down never returns: `connect()`, `send_messages()` and
-    ///         `poll_messages()` all wait inside the retry loop. Set a finite
+    ///     max_retries: Redials of the configured server address after the first
+    ///         attempt, or `None` for unlimited; `0` still makes that first
+    ///         attempt. Unlike the TCP transport, WebSocket redials the one
+    ///         address it was configured with rather than walking a cluster
+    ///         roster, so this counts dials. Defaults to unlimited, which means
+    ///         a call awaited while the server is down never returns:
+    ///         `connect()` waits inside the retry loop, as do `send_messages()`
+    ///         and `poll_messages()` once auto-login is configured. Set a finite
     ///         number for request/reply style usage, so a call fails instead.
-    ///     interval: Delay between passes. Defaults to 1 second. The first pass
-    ///         runs at once when more than one endpoint is known.
-    ///     reestablish_after: Cooldown before redialing the endpoint of the last
+    ///     interval: Delay before each redial. Defaults to 1 second.
+    ///     reestablish_after: Cooldown before redialing after a previously
     ///         successful connection, measured from when it was established, so
-    ///         a session that outlived the interval is redialed at once. Owed to
-    ///         that endpoint alone. Defaults to 5 seconds.
+    ///         a session that outlived the interval is redialed at once. Applied
+    ///         from the first redial onward, not to the initial connect.
+    ///         Defaults to 5 seconds.
     ///
     /// Raises:
     ///     ValueError: If a duration is negative, if `max_retries` is outside the
@@ -1102,8 +1102,15 @@ impl WebSocketFramingConfig {
     ///     read_buffer_size: Read buffer size in bytes.
     ///     write_buffer_size: Write buffer size in bytes.
     ///     max_write_buffer_size: Maximum write buffer size in bytes.
-    ///     max_message_size: Maximum message size in bytes, or `None` for no limit.
-    ///     max_frame_size: Maximum frame size in bytes, or `None` for no limit.
+    ///     max_message_size: Maximum message size in bytes, or an explicit `None`
+    ///         to lift the limit entirely. Omitting the argument is not the same
+    ///         as passing `None`: it keeps the underlying default of 64 MiB.
+    ///         Lifting the limit lets a peer queue an arbitrarily large message
+    ///         in memory, so prefer a finite value.
+    ///     max_frame_size: Maximum frame size in bytes, or an explicit `None` to
+    ///         lift the limit entirely. Omitting the argument keeps the
+    ///         underlying default of 16 MiB, with the same caveat as
+    ///         `max_message_size`.
     ///     accept_unmasked_frames: Whether to accept unmasked frames. Defaults to
     ///         `False`; clients should typically keep this off for RFC compliance.
     ///
@@ -1119,8 +1126,8 @@ impl WebSocketFramingConfig {
         read_buffer_size=None,
         write_buffer_size=None,
         max_write_buffer_size=None,
-        max_message_size=None,
-        max_frame_size=None,
+        max_message_size=64 << 20,
+        max_frame_size=16 << 20,
         accept_unmasked_frames=None,
     ))]
     fn new(
@@ -1147,12 +1154,17 @@ impl WebSocketFramingConfig {
             inner.max_write_buffer_size =
                 Some(usize_param(max_write_buffer_size, "max_write_buffer_size")?);
         }
-        if let Some(max_message_size) = max_message_size {
-            inner.max_message_size = Some(usize_param(max_message_size, "max_message_size")?);
-        }
-        if let Some(max_frame_size) = max_frame_size {
-            inner.max_frame_size = Some(usize_param(max_frame_size, "max_frame_size")?);
-        }
+        // Assigned unconditionally, unlike the buffer sizes above: `None` here
+        // means "no limit", and pyo3 cannot tell an omitted argument from an
+        // explicit `None` on its own. The signature defaults carry the
+        // underlying limits instead, so omission lands on `Some(default)` and
+        // only an explicit `None` reaches this as `None`.
+        inner.max_message_size = max_message_size
+            .map(|max_message_size| usize_param(max_message_size, "max_message_size"))
+            .transpose()?;
+        inner.max_frame_size = max_frame_size
+            .map(|max_frame_size| usize_param(max_frame_size, "max_frame_size"))
+            .transpose()?;
         if let Some(accept_unmasked_frames) = accept_unmasked_frames {
             inner.accept_unmasked_frames = accept_unmasked_frames;
         }
@@ -1221,7 +1233,7 @@ impl WebSocketFramingConfig {
     }
 }
 
-/// Configuration for the WebSocket transport, accepted by `IggyClient.websocket(...)`.
+/// Configuration for the WebSocket transport, accepted by `IggyClient(...)`.
 ///
 /// Every field is keyword-only and optional.
 #[gen_stub_pyclass]
@@ -1468,18 +1480,19 @@ fn varint_param(value: i64, parameter: &str) -> PyResult<u64> {
 
 /// Converts a Python int to the unsigned pointer-sized integer a WebSocket
 /// framing field expects, naming the parameter in the error so a caller can
-/// tell which argument was out of range.
+/// tell which argument was out of range. The bound in the message is
+/// `i64::MAX` rather than `usize::MAX` because pyo3 extracts the argument as
+/// an `i64` first: anything above that never reaches here, raising
+/// `OverflowError` on the way in.
 fn usize_param(value: i64, parameter: &str) -> PyResult<usize> {
     usize::try_from(value).map_err(|_| {
-        PyValueError::new_err(format!(
-            "'{parameter}' must be between 0 and {}",
-            usize::MAX
-        ))
+        PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", i64::MAX))
     })
 }
 
 /// What `IggyClient(...)` accepts: a bare `host:port`, a full `TcpConfig`, a
-/// `QuicConfig` for the QUIC transport, or an `HttpConfig` for the HTTP transport.
+/// `QuicConfig` for the QUIC transport, an `HttpConfig` for the HTTP transport,
+/// or a `WebSocketConfig` for the WebSocket transport.
 #[derive(FromPyObject)]
 pub enum PyClientConfig {
     #[pyo3(transparent)]
@@ -1488,7 +1501,41 @@ pub enum PyClientConfig {
     Quic(QuicConfig),
     #[pyo3(transparent)]
     Http(HttpConfig),
+    #[pyo3(transparent)]
+    WebSocket(WebSocketConfig),
     #[pyo3(transparent, annotation = "str")]
     ServerAddress(String),
 }
-impl_stub_type!(PyClientConfig = TcpConfig | QuicConfig | HttpConfig | String);
+impl_stub_type!(
+    PyClientConfig = TcpConfig | QuicConfig | HttpConfig | WebSocketConfig | String
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors the literal in `WebSocketFramingConfig::new`'s signature.
+    const DEFAULT_MAX_MESSAGE_SIZE: i64 = 64 << 20;
+
+    /// Mirrors the literal in `WebSocketFramingConfig::new`'s signature.
+    const DEFAULT_MAX_FRAME_SIZE: i64 = 16 << 20;
+
+    /// The signature defaults have to be literals for the generated stub to stay
+    /// valid Python, so nothing but this test stops them drifting from the SDK
+    /// (and so from tungstenite) on a dependency bump.
+    #[test]
+    fn defaults_should_match_the_sdk() {
+        let defaults = RustWebSocketFramingConfig::default();
+
+        assert_eq!(
+            defaults.max_message_size,
+            Some(DEFAULT_MAX_MESSAGE_SIZE as usize),
+            "'max_message_size' drifted from the SDK; update the literal in              WebSocketFramingConfig::new's signature too"
+        );
+        assert_eq!(
+            defaults.max_frame_size,
+            Some(DEFAULT_MAX_FRAME_SIZE as usize),
+            "'max_frame_size' drifted from the SDK; update the literal in              WebSocketFramingConfig::new's signature too"
+        );
+    }
+}

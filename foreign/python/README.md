@@ -134,8 +134,8 @@ running prek / committing / pushing. This list is not exhaustive and other hook 
 
 ## Client Configuration
 
-`IggyClient` takes a server address, a `TcpConfig`, a `QuicConfig`, or an
-`HttpConfig`:
+`IggyClient` takes a server address, a `TcpConfig`, a `QuicConfig`, an
+`HttpConfig`, or a `WebSocketConfig`:
 
 ```python
 import asyncio
@@ -169,9 +169,10 @@ async def main():
 asyncio.run(main())
 ```
 
-`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport and an
-`HttpConfig` for the HTTP transport;
-`examples/python/getting-started/producer.py` shows either swap in context.
+`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport, an
+`HttpConfig` for the HTTP transport, and a `WebSocketConfig` for the WebSocket
+transport. `examples/python/getting-started/producer.py` shows each swap in
+context.
 
 `HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the
@@ -198,49 +199,6 @@ async def main():
     client = IggyClient(HttpConfig(api_url="http://127.0.0.1:3000"))
     await client.connect()
     await client.login_user("iggy", "iggy")
-
-
-asyncio.run(main())
-```
-
-`WebSocketConfig` is the fourth arm of the same constructor:
-
-```python
-import asyncio
-from datetime import timedelta
-
-from apache_iggy import (
-    AutoLogin,
-    IggyClient,
-    WebSocketConfig,
-    WebSocketFramingConfig,
-    WebSocketReconnectionConfig,
-)
-
-
-async def main():
-    client = IggyClient(
-        WebSocketConfig(
-            server_address="127.0.0.1:8092",
-            auto_login=AutoLogin.username_password("iggy", "iggy"),
-            reconnection=WebSocketReconnectionConfig(
-                enabled=True,
-                max_retries=10,
-                interval=timedelta(seconds=2),
-                reestablish_after=timedelta(seconds=30),
-            ),
-            heartbeat_interval=timedelta(seconds=5),
-            framing=WebSocketFramingConfig(
-                max_message_size=64 * 1024 * 1024,
-                max_frame_size=16 * 1024 * 1024,
-            ),
-            # tls_enabled=True,
-            # tls_domain="localhost",
-            # tls_ca_file="../../core/certs/iggy_ca_cert.pem",
-            # tls_validate_certificate=True,
-        )
-    )
-    await client.connect()
 
 
 asyncio.run(main())
