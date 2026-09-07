@@ -122,6 +122,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                 iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
             ),
             enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
+            consumer_offset_enforce_fsync: config.partition.consumer_offset_enforce_fsync,
             validate_checksum: config.system.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
@@ -285,7 +286,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
-    shard.set_partition_gap_debounce_ticks(repair_gap_debounce_ticks(config));
+    shard.set_repair_gap_debounce_ticks(repair_gap_debounce_ticks(config));
     shard.set_superblock_wedged_fatal_failures(superblock_wedged_fatal_failures(config));
     shard.set_served_segment_cache_bytes_max(
         config
@@ -330,6 +331,16 @@ const _: () = assert!(
 );
 const _: () = assert!(
     configs::partition::PARTITION_DEDUP_CLIENTS_DEFAULT == consensus::PARTITION_DEDUP_CLIENTS_MAX
+);
+const _: () = assert!(
+    configs::partition::PARTITION_CONSUMER_OFFSETS_DEFAULT
+        == partitions::DEFAULT_CONSUMER_OFFSETS_MAX
+);
+const _: () = assert!(
+    4 * configs::partition::PARTITION_CONSUMER_OFFSETS_CEILING
+        <= partitions::CONSUMER_OFFSETS_ENTRIES_MAX as usize,
+    "four ceilings fill the transfer decoder's entry budget exactly, with no headroom left; raise \
+     CONSUMER_OFFSETS_ENTRIES_MAX before raising PARTITION_CONSUMER_OFFSETS_CEILING"
 );
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);
@@ -947,13 +958,13 @@ mod tests {
     #[test]
     fn documented_gap_debounce_floor_matches_the_shard_constant() {
         assert_eq!(
-            shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN,
+            shard::REPAIR_GAP_DEBOUNCE_TICKS_MIN,
             50,
             "the gap debounce floor moved; core/server/config.toml states it in \
              ticks and milliseconds under [cluster] repair_gap_debounce_interval"
         );
         assert_eq!(
-            u128::from(shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN)
+            u128::from(shard::REPAIR_GAP_DEBOUNCE_TICKS_MIN)
                 * shard::CONSENSUS_TICK_INTERVAL.as_millis(),
             500,
             "the floor is no longer 500ms; core/server/config.toml states that \

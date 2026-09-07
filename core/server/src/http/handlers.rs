@@ -1296,6 +1296,7 @@ pub(in crate::http) async fn poll_messages(
             ))
         }
         Some(PartitionReadReply::NotFound) => Err(ReadError::NotFound),
+        Some(PartitionReadReply::Rejected(error)) => Err(ReadError::Rejected(error)),
         Some(_) => Err(ReadError::Rejected(IggyError::InvalidCommand)),
         None => Err(ReadError::Timeout),
     }
@@ -1466,13 +1467,26 @@ pub(in crate::http) async fn store_consumer_offset(
     let request = store_offset_wire_request(&stream_id, &topic_id, &command)
         .map_err(PartitionWriteError::Rejected)?;
     let body = request.to_bytes();
-    SendWrapper::new(partition_write_replicated(
+    let consumer_kind = command.consumer.kind;
+    let result = SendWrapper::new(partition_write_replicated(
         &state,
         &identity.session,
         Operation::StoreConsumerOffset,
         &body,
     ))
-    .await?;
+    .await;
+    if matches!(
+        &result,
+        Err(PartitionWriteError::Rejected(
+            IggyError::TooManyConsumerOffsets
+        ))
+    ) {
+        state
+            .shard
+            .metrics()
+            .record_consumer_offset_denied(consumer_kind);
+    }
+    result?;
     Ok(StatusCode::NO_CONTENT)
 }
 

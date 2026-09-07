@@ -55,7 +55,7 @@ public interface IIggyTopic
     ///     Additional parameters control message expiry, compression, replication, and maximum size.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream where the topic will be created (numeric ID or name).</param>
-    /// <param name="name">The unique name of the topic (max 255 characters).</param>
+    /// <param name="name">The unique name of the topic (max 255 UTF-8 bytes).</param>
     /// <param name="partitionsCount">The number of partitions for the topic (max 1000).</param>
     /// <param name="compressionAlgorithm">The compression algorithm to use for messages (default: None).</param>
     /// <param name="messageExpiry">The message expiry period (0 for server default, MaxValue for never expire).</param>
@@ -86,7 +86,7 @@ public interface IIggyTopic
     /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic to update (numeric ID or name).</param>
-    /// <param name="name">The new name for the topic (max 255 characters).</param>
+    /// <param name="name">The new name for the topic (max 255 UTF-8 bytes).</param>
     /// <param name="compressionAlgorithm">The new compression algorithm to use (default: None).</param>
     /// <param name="maxTopicSize">The new maximum size of the topic in bytes (0 = unlimited).</param>
     /// <param name="messageExpiry">The new message expiry period (0 for server default, MaxValue for never expire).</param>
