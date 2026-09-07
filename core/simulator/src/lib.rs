@@ -53,7 +53,7 @@ use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -133,6 +133,31 @@ pub(crate) struct PartitionConsensusState {
     /// Ops committed in the group. Not `PartitionOffsets::commit_offset`, the
     /// highest durably PERSISTED offset, which counts an uncommitted suffix.
     pub commit_min: u64,
+}
+
+/// A pipeline head the commit walk is holding on: covered by the commit frontier,
+/// but not the op the state machine is next owed.
+///
+/// What `drain_committable_prefix` / `peek_committable_head` refuse to drain. Legit
+/// and transient right after a partition promotion, whose `RebuildPipeline` seeds
+/// above an apply backlog the bounded journal walk clears over the following
+/// sweeps; permanent means the ops between are gone and nothing is repairing them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommitPrefixHole {
+    pub head_op: u64,
+    pub commit_min: u64,
+    pub commit_max: u64,
+}
+
+impl CommitPrefixHole {
+    fn read(head: Option<PrepareHeader>, commit_min: u64, commit_max: u64) -> Option<Self> {
+        let head = head?;
+        (head.op <= commit_max && head.op != commit_min + 1).then_some(Self {
+            head_op: head.op,
+            commit_min,
+            commit_max,
+        })
+    }
 }
 
 pub struct Simulator {
@@ -1377,22 +1402,28 @@ impl Simulator {
         Some(partition.offsets())
     }
 
-    /// A replica's journaled partition-plane prepare header at `op`, or `None` when
-    /// it does not host the namespace or no longer holds the entry.
+    /// A replica's journaled partition-plane prepare headers over `ops`, or `None`
+    /// when it does not host the namespace.
     ///
-    /// Absence is ordinary, unlike on the metadata plane: the partition journal
-    /// evicts its committed prefix as it flushes to segments. The quiesce oracle
-    /// compares only the ops two replicas both still hold.
+    /// Repair headers, not resident ones. `evict_prefix` clears the resident vec as
+    /// the committed prefix flushes to segments and moves those entries to the
+    /// repair ring, so a resident-only read compares nothing at all once a run has
+    /// flushed. The ring is capacity-bounded, which makes this the recently
+    /// committed tail rather than the whole prefix -- and that tail is where a bad
+    /// repair or a mis-decided view change lands.
+    ///
+    /// One pass per replica per namespace, not one per op: both lookups behind
+    /// `repair_headers_in` are linear.
     #[must_use]
-    pub(crate) fn partition_journaled_header(
+    pub(crate) fn partition_journaled_headers(
         &self,
         replica_idx: usize,
         namespace: IggyNamespace,
-        op: u64,
-    ) -> Option<PrepareHeader> {
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> Option<BTreeMap<u64, PrepareHeader>> {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
         let partition = shard.plane.partitions().get_by_ns(&namespace)?;
-        partition.log.journal().inner.header_by_op(op)
+        Some(partition.log.journal().inner.repair_headers_in(ops))
     }
 
     /// Consensus view for a replica's partition-plane group, or `None` if that
@@ -1427,6 +1458,42 @@ impl Simulator {
             is_primary: consensus.is_primary(),
             commit_min: consensus.commit_min(),
         })
+    }
+
+    /// The metadata pipeline head the commit walk is holding on, if any. See
+    /// [`CommitPrefixHole`].
+    #[must_use]
+    pub(crate) fn metadata_commit_prefix_hole(
+        &self,
+        replica_idx: usize,
+    ) -> Option<CommitPrefixHole> {
+        let consensus = self.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()?;
+        CommitPrefixHole::read(
+            consensus.pipeline_head_header(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        )
+    }
+
+    /// Partition-plane twin of [`Self::metadata_commit_prefix_hole`].
+    #[must_use]
+    pub(crate) fn partition_commit_prefix_hole(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+    ) -> Option<CommitPrefixHole> {
+        let shard = self.replicas[replica_idx].partition_shard(namespace);
+        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let consensus = partition.consensus();
+        CommitPrefixHole::read(
+            consensus.pipeline_head_header(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        )
     }
 
     /// Index of the current primary for `namespace`, as seen by the first live

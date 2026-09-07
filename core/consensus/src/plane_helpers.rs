@@ -440,9 +440,13 @@ where
 ///
 /// Callers `advance_commit_min` per entry, so a run starting above
 /// `commit_min + 1` or breaking partway hits that counter's sequential-advance
-/// assert. Pipeline-side twin of `commit_journal`'s gap-stop, and a backstop
-/// only: reaching it means committing over a hole coverage should have caught.
-/// Loud in debug and the simulator, hold-and-repair in release.
+/// assert. Pipeline-side twin of `commit_journal`'s gap-stop.
+///
+/// Reported, not asserted: a promoted partition primary reaches it legitimately,
+/// `RebuildPipeline` seeding above `commit_min` while the walk that catches it up
+/// runs `COMMIT_WALK_OPS_MAX` ops per call. `commit_journal`'s journal fallback
+/// closes that backlog; a hold that never clears is caught by the simulator's
+/// contiguity invariant.
 ///
 /// # Panics
 /// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
@@ -463,11 +467,7 @@ where
                 break;
             }
             if head_op != next {
-                debug_assert_eq!(
-                    head_op, next,
-                    "pipeline head must be the next op owed to the state machine"
-                );
-                tracing::error!(
+                tracing::warn!(
                     replica,
                     head_op,
                     expected_op = next,
@@ -511,9 +511,10 @@ where
 /// applying it. A driver dropped at an await strands nothing; a sibling driver
 /// that committed the op first fails the caller's revalidation and re-peeks.
 ///
-/// Bounded below for the reason [`drain_committable_prefix`] is, and stalls rather
-/// than panicking for the same one: a shard pump's panic is swallowed by
-/// `compio::runtime::spawn`, while `tick_metadata` re-arms repair on the level.
+/// Bounded below for the reason [`drain_committable_prefix`] is, and reported
+/// rather than asserted for the same one. Holding is safe: a shard pump's panic is
+/// swallowed by `compio::runtime::spawn`, while `tick_metadata` re-arms repair on
+/// the level.
 pub fn peek_committable_head<B, P>(consensus: &VsrConsensus<B, P>) -> Option<PrepareHeader>
 where
     B: MessageBus,
@@ -525,12 +526,7 @@ where
         .pipeline_head_header()
         .filter(|header| header.op <= commit)?;
     if head.op != next {
-        // Unreachable in debug and the simulator; release reports and waits.
-        debug_assert_eq!(
-            head.op, next,
-            "pipeline head must be the next op owed to the state machine"
-        );
-        tracing::error!(
+        tracing::warn!(
             replica = consensus.replica(),
             head_op = head.op,
             commit_min = consensus.commit_min(),

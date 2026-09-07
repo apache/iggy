@@ -302,8 +302,10 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
 /// its committed prefix as it flushes to segments:
 ///
 /// * A missing header is ordinary, not a hole, so this compares only the ops two
-///   replicas both still hold: the recently committed tail, where a bad repair or a
-///   mis-decided view change lands.
+///   replicas both still hold. `evict_prefix` moves a flushed entry to the repair
+///   ring rather than dropping it, so that set is the ring plus whatever is still
+///   resident: the recently committed tail, where a bad repair or a mis-decided
+///   view change lands.
 /// * Identity, not the sealed checksum. `restamp_prepare_view` rewrites the view on
 ///   retransmit, so `identity_checksum` compares the entry, not the delivery.
 ///
@@ -329,10 +331,12 @@ pub fn assert_partition_prefixes_agree(
             let Some(state) = sim.partition_consensus_state(idx, namespace) else {
                 continue;
             };
-            for op in 1..=state.commit_min {
-                let Some(header) = sim.partition_journaled_header(idx, namespace, op) else {
-                    continue;
-                };
+            let Some(headers) =
+                sim.partition_journaled_headers(idx, namespace, 1..=state.commit_min)
+            else {
+                continue;
+            };
+            for (op, header) in headers {
                 let identity = header.identity_checksum();
                 if let Some(&(expected, owner)) = canonical.get(&op) {
                     assert_eq!(
@@ -382,6 +386,7 @@ mod tests {
     use super::*;
     use crate::client::SimClient;
     use crate::packet::PacketSimulatorOptions;
+    use consensus::PartitionsHandle;
 
     const SEED: u64 = 0x5C11;
 
@@ -466,6 +471,97 @@ mod tests {
             "op 2 must be journaled for this test to damage anything"
         );
         checker.check(&sim, SEED);
+    }
+
+    /// A three-replica cluster with committed partition ops flushed to segments.
+    ///
+    /// The state the partition comparison has to work in: `evict_prefix` clears the
+    /// resident header vec on flush, so a resident-only read sees nothing.
+    fn cluster_with_flushed_partition_ops() -> (Simulator, IggyNamespace) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let client_id: u128 = 1;
+        let mut sim = Simulator::new(
+            3,
+            std::iter::once(client_id),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: SEED,
+                ..PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(client_id);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        for sequence in 0..6u32 {
+            let msg = client.send_messages(
+                namespace,
+                &[bytes::Bytes::from(format!("wl-part-{sequence}"))],
+            );
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..60 {
+                sim.step();
+            }
+        }
+
+        for replica_idx in 0..3usize {
+            let shard = sim.replicas[replica_idx].partition_shard(namespace);
+            let partitions = shard.plane.partitions();
+            let config = partitions.config();
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            futures::executor::block_on(partition.flush_committed_messages(config))
+                .expect("the in-memory flush must succeed");
+        }
+        (sim, namespace)
+    }
+
+    /// The partition comparison must survive a flush.
+    ///
+    /// `header_by_op` reads the resident header vec, which `evict_prefix` clears as
+    /// the committed prefix flushes, so a resident-only read compares zero ops at
+    /// quiescence and the check passes over nothing.
+    #[test]
+    fn a_flushed_partition_prefix_is_still_compared() {
+        let (sim, namespace) = cluster_with_flushed_partition_ops();
+
+        let committed = sim
+            .partition_consensus_state(1, namespace)
+            .expect("replica 1 hosts the namespace")
+            .commit_min;
+        assert!(
+            committed > 1,
+            "the cluster committed {committed} partition op(s), so there is nothing \
+             for two replicas to agree on"
+        );
+
+        let resident = sim.replicas[1]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("replica 1 hosts the namespace")
+            .log
+            .journal()
+            .inner
+            .header_by_op(1);
+        assert!(
+            resident.is_none(),
+            "op 1 is still resident, so this test does not exercise the flushed path"
+        );
+
+        let compared = assert_partition_prefixes_agree(&sim, &[namespace], SEED);
+        assert!(
+            compared > 0,
+            "no committed partition op was witnessed by more than one replica after \
+             the flush, so the check passed over an empty set"
+        );
     }
 
     /// An undamaged prefix passes the recheck: the reset must turn a restart into a

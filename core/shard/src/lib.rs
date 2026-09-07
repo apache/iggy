@@ -1585,10 +1585,13 @@ where
     /// [`Self::metadata_transfer_decode_failures`].
     metadata_transfer_attempts: Cell<u32>,
 
-    /// Consecutive stalled re-requests on the live metadata repair session,
-    /// against [`partitions::REPAIR_MAX_STALL_RETRIES`]. Survives the session,
-    /// so rotating the peer cannot reset it; cleared by an accepted repaired
-    /// prepare.
+    /// Consecutive stall rounds burned by the metadata repair session, against
+    /// [`partitions::REPAIR_MAX_STALL_RETRIES`], bounding how long one quiet peer
+    /// pins the commit walk.
+    ///
+    /// On the shard like [`Self::metadata_transfer_attempts`]: rotation re-arms a
+    /// FRESH session, so a per-session counter would reset itself. An in-window
+    /// frame clears it, so it bounds silent peers, not slow ones.
     metadata_repair_attempts: Cell<u32>,
 
     /// Decode failures charged against one snapshot generation, as
@@ -5023,6 +5026,9 @@ where
             if !in_scope {
                 return;
             }
+            // The serving peer is answering. Clears the stall clock and the budget
+            // so a window served in chunks cannot rotate off a healthy stream.
+            self.note_metadata_repair_progress();
             // Applies to both planes, and is why a backup parks a log at all. The
             // view already decided which prepare belongs at this op; a different
             // one forks the log. An op the parked log omits is unconstrained.
@@ -5058,15 +5064,6 @@ where
             let Some(journal) = planes.0.journal.as_ref() else {
                 return;
             };
-            // Above the two returns below, not after them: only SILENCE should
-            // age the stream, and an in-scope frame proves the peer is serving
-            // whether or not this replica still needs the op it carries. The
-            // ops a re-request re-serves are exactly the ones already held, so
-            // counting accepted frames alone rotates away from a live peer.
-            if let Some(session) = self.metadata_repair.borrow_mut().as_mut() {
-                session.idle_ticks = 0;
-            }
-            self.note_metadata_repair_progress();
             let journal = journal.handle();
             #[allow(clippy::cast_possible_truncation)]
             if journal.header(header.op as usize).is_some() {
@@ -5214,6 +5211,51 @@ where
                     // `RangeEvicted` again if the primary checkpointed mid
                     // transfer -- that reraises through the same path, and each
                     // round lifts the local floor, so it converges.
+                    //
+                    // Never as primary-elect. A transfer replaces snapshot-shaped
+                    // state wholesale, and this replica has a merged log parked
+                    // against that state naming ops it has just been told it
+                    // cannot serve; installing under it would start the view over
+                    // a log the new state no longer matches. The honest answer is
+                    // that another replica holds the committed prefix, so leave
+                    // the session for the stall rotation to re-target and let the
+                    // view-change timeout escalate if nobody can serve it.
+                    if consensus.view_log_is_pending()
+                        && consensus.is_primary_for_view(consensus.view())
+                    {
+                        tracing::warn!(
+                            shard = self.id,
+                            peer = header.replica,
+                            retained_from = header.op,
+                            local_commit = consensus.commit_min(),
+                            "merged-log repair peer evicted the requested range; \
+                             waiting for another sender rather than transferring \
+                             state mid view change"
+                        );
+                        return;
+                    }
+
+                    // The floor must also be ABOVE the op this replica needs. A
+                    // peer behind the requested window walks its serve range off
+                    // the end and answers `RangeEvicted` at the requested floor
+                    // itself, having retained nothing and evicted nothing;
+                    // converting on that arms a transfer against a replica with
+                    // less state than this one and fences repair for a full
+                    // transfer backoff. Drop the session and let the level trigger
+                    // re-request from the primary instead.
+                    if header.op <= consensus.commit_min() + 1 {
+                        tracing::warn!(
+                            shard = self.id,
+                            peer = header.replica,
+                            retained_from = header.op,
+                            local_commit = consensus.commit_min(),
+                            "metadata repair peer retains the requested floor but served \
+                             nothing; re-requesting rather than converting to state transfer"
+                        );
+                        *self.metadata_repair.borrow_mut() = None;
+                        self.metadata_repair_attempts.set(0);
+                        return;
+                    }
                     if consensus.state_transfer_stage() == consensus::StateTransferStage::Idle {
                         *self.metadata_repair.borrow_mut() = None;
                         consensus.begin_state_transfer_await();
@@ -5598,6 +5640,11 @@ where
     ///
     /// Repair frames are fire-and-forget, so a lost one leaves the session armed
     /// forever with the commit walk pinned below the frontier.
+    ///
+    /// Re-requests from the SAME peer while its stall budget holds. A peer that
+    /// never answers is a different problem, and
+    /// [`Self::rotate_stalled_metadata_repair`] owns it: the target lives on the
+    /// session, so it must be replaced there rather than shadowed for one send.
     #[allow(clippy::future_not_send)]
     async fn retry_stalled_metadata_repair<P>(&self, consensus: &VsrConsensus<B, P>)
     where
@@ -5650,39 +5697,6 @@ where
             })
         };
         if let Some((peer, nonce, to_op)) = stalled {
-            // A session pins its peer and fences every arming site while it
-            // stands, so a peer that cannot answer wedges the plane harder than
-            // having no session at all -- and the gap-stopped-primary rotation
-            // can pick a peer that is simply down. Past the budget the session
-            // is dropped and re-armed one step around the ring; an ordinary lost
-            // frame is re-requested long before that.
-            if self.burn_metadata_repair_attempt() {
-                let next_peer = next_transfer_peer(
-                    consensus.replica(),
-                    peer,
-                    consensus.replica_count(),
-                    consensus.primary_index(consensus.view()),
-                );
-                tracing::warn!(
-                    shard = self.id,
-                    peer,
-                    next_peer,
-                    to_op,
-                    "metadata repair stalled past its retry budget; re-arming from another \
-                     replica"
-                );
-                *self.metadata_repair.borrow_mut() = None;
-                self.note_metadata_repair_progress();
-                if next_peer != peer {
-                    self.maybe_request_metadata_repair(consensus, next_peer)
-                        .await;
-                }
-                // Nobody else to name (a solo group, or a two-replica group
-                // whose only peer went quiet): dropping the session is still
-                // right, since it unfences the detector, which re-arms after its
-                // debounce and logs the state each interval.
-                return;
-            }
             // Primary-elect only, and floored at `merged_log_scan_floor` so a
             // retry re-requests the window the initial arm did. The merged log's
             // commit point can sit below local `commit_min` (the headers
@@ -5701,7 +5715,26 @@ where
                 })
                 .flatten()
                 .unwrap_or_else(|| consensus.commit_min() + 1);
-            if from_op <= to_op {
+            if from_op > to_op {
+                // `from_op` past `to_op` without `commit_min` reaching it: the
+                // primary-elect window above starts at the merged log's commit
+                // point, which can sit above what this replica has walked. The
+                // top-of-tick check closes the ordinary case; this closes the
+                // one it cannot see. Leaving it armed wedges the replica: no
+                // `RepairDone` clears a window the walk is already past, and the
+                // `is_none` gate then blocks the session the ops above it need.
+                tracing::info!(
+                    shard = self.id,
+                    to_op,
+                    peer,
+                    "metadata repair window fully requested; closing the stalled session"
+                );
+                *self.metadata_repair.borrow_mut() = None;
+                self.note_metadata_repair_progress();
+            } else if self.burn_metadata_repair_attempt() {
+                self.rotate_stalled_metadata_repair(consensus, peer, from_op, to_op)
+                    .await;
+            } else {
                 tracing::info!(
                     shard = self.id,
                     from_op,
@@ -5719,22 +5752,108 @@ where
                     consensus.group(),
                 )
                 .await;
-            } else {
-                // `from_op` past `to_op` without `commit_min` reaching it: the
-                // primary-elect window above starts at the merged log's commit
-                // point, which can sit above what this replica has walked. The
-                // top-of-tick check closes the ordinary case; this closes the
-                // one it cannot see.
-                tracing::info!(
-                    shard = self.id,
-                    to_op,
-                    peer,
-                    "metadata repair window fully requested; closing the stalled session"
-                );
-                *self.metadata_repair.borrow_mut() = None;
-                self.note_metadata_repair_progress();
             }
         }
+    }
+
+    /// Re-arm a repair session that spent its stall budget against another replica.
+    ///
+    /// A session pins its peer and fences every arming site while it stands, so a
+    /// peer that cannot answer wedges the walk harder than having no session at
+    /// all. Past the budget the session is dropped and re-armed one step on; an
+    /// ordinary lost frame is re-requested long before that. Mirrors the partition
+    /// rotation in [`Self::tick_partitions`].
+    ///
+    /// Two rings, because two things decide who can serve. A `Normal` backup is
+    /// repairing its committed tail and any replica ahead of it will do, so it
+    /// walks the cluster preferring the primary. A primary-elect is repairing
+    /// toward a merged log, and only the `DoViewChange` senders that named the op
+    /// can serve it: walking the whole ring lands on a replica that answers
+    /// `RangeEvicted` for a range it never held.
+    #[allow(clippy::future_not_send)]
+    async fn rotate_stalled_metadata_repair<P>(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        peer: u8,
+        from_op: u64,
+        to_op: u64,
+    ) where
+        B: MessageBus,
+        P: Pipeline<Entry = consensus::PipelineEntry>,
+    {
+        *self.metadata_repair.borrow_mut() = None;
+        self.metadata_repair_attempts.set(0);
+
+        if consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view()) {
+            let sources = metadata_view_repair_sources(consensus, from_op);
+            let Some(next_peer) = sources.into_iter().find(|candidate| *candidate != peer) else {
+                // Only the quiet peer named this op. The session is dropped either
+                // way: `advance_pending_metadata_view` re-scans on the next tick and
+                // re-requests it, and a peer that never comes back leaves the
+                // view-change timeout to escalate.
+                tracing::warn!(
+                    shard = self.id,
+                    peer,
+                    from_op,
+                    "no other replica offers op {from_op} for the merged log; \
+                     view change is stalled"
+                );
+                return;
+            };
+            let nonce = iggy_common::random_id::get_uuid();
+            *self.metadata_repair.borrow_mut() = Some(MetadataRepairSession {
+                nonce,
+                to_op,
+                view: consensus.view(),
+                peer: next_peer,
+                idle_ticks: 0,
+            });
+            tracing::warn!(
+                shard = self.id,
+                peer,
+                next_peer,
+                from_op,
+                to_op,
+                "merged-log repair stalled past its retry budget; re-arming from \
+                 another do_view_change sender"
+            );
+            self.send_request_prepares(
+                consensus.cluster(),
+                consensus.replica(),
+                next_peer,
+                nonce,
+                from_op,
+                to_op,
+                consensus.group(),
+            )
+            .await;
+            return;
+        }
+
+        let primary = consensus.primary_index(consensus.view());
+        let next_peer = next_transfer_peer(
+            consensus.replica(),
+            peer,
+            consensus.replica_count(),
+            primary,
+        );
+        if next_peer == peer {
+            // The ring had nobody else to offer (a solo group, or a two-replica
+            // cluster whose only peer went quiet). Dropping the session is still
+            // right: it unfences the level trigger below, which re-requests the
+            // window on the next tick.
+            return;
+        }
+        tracing::warn!(
+            shard = self.id,
+            peer,
+            next_peer,
+            from_op,
+            to_op,
+            "metadata repair stalled past its retry budget; re-arming from another replica"
+        );
+        self.maybe_request_metadata_repair(consensus, next_peer)
+            .await;
     }
 
     /// Compare this replica's log against the headers the view decided, and drop or
@@ -5966,7 +6085,7 @@ where
             // Stream already running; the stall retry covers it drying up.
             return;
         }
-        let sources = consensus.pending_view_body_sources(missing_op);
+        let sources = metadata_view_repair_sources(consensus, missing_op);
         let Some(peer) = sources.first().copied() else {
             // The merge only returns a startable log when some replica offered each
             // body, so an empty source list means that offer was withdrawn (peer
@@ -6606,16 +6725,6 @@ where
         attempts > partitions::REPAIR_MAX_STALL_RETRIES
     }
 
-    /// The serving peer answered: reset the budget, so it bounds CONSECUTIVE
-    /// silence rather than the stalls a long healthy stream accumulates.
-    ///
-    /// Any in-scope repair frame, not only an accepted one. A re-request
-    /// re-serves ops this replica already holds, so charging those as silence
-    /// rotates away from a peer that is answering.
-    fn note_metadata_repair_progress(&self) {
-        self.metadata_repair_attempts.set(0);
-    }
-
     /// Burn one retry round; `true` once the budget is exhausted.
     fn burn_metadata_transfer_attempt(&self) -> bool {
         let attempts = self.metadata_transfer_attempts.get() + 1;
@@ -6630,6 +6739,20 @@ where
     /// nearly done, throwing away every byte already pulled.
     fn note_metadata_transfer_progress(&self) {
         self.metadata_transfer_attempts.set(0);
+    }
+
+    /// Real repair progress: any frame from the serving peer that landed inside
+    /// the requested window.
+    ///
+    /// Clears the stall clock as well as the budget. A window is served in
+    /// `REPAIR_CHUNK_MAX` slices and nothing else resets `idle_ticks`, so a
+    /// healthy multi-chunk stream would otherwise cross the retry interval on
+    /// its own and rotate off a peer that is answering.
+    fn note_metadata_repair_progress(&self) {
+        self.metadata_repair_attempts.set(0);
+        if let Some(session) = self.metadata_repair.borrow_mut().as_mut() {
+            session.idle_ticks = 0;
+        }
     }
 
     /// Charge one decode failure against `snapshot_seq`'s generation; `true`
@@ -10011,6 +10134,27 @@ where
 /// the same question about that hole.
 fn merged_log_scan_floor(pending: &MergedLog, commit_min: u64) -> u64 {
     pending.commit_max.min(commit_min + 1).max(1)
+}
+
+/// Replicas a primary-elect can ask for `op` while its merged log is parked.
+///
+/// Offered bodies first: those senders proved they hold the entry. A gap below
+/// every sender's commit point has none -- a DVC suffix spans `commit..=op` and
+/// says nothing underneath -- and the merged commit point alone is what
+/// [`merged_log_scan_floor`] stopped trusting, so fall back to the senders that
+/// committed the op. They hold it or have compacted it, and `RangeEvicted` is
+/// the answer that says so.
+fn metadata_view_repair_sources<B, P>(consensus: &VsrConsensus<B, P>, op: u64) -> Vec<u8>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    let offered = consensus.pending_view_body_sources(op);
+    if offered.is_empty() {
+        consensus.pending_view_commit_sources(op)
+    } else {
+        offered
+    }
 }
 
 /// Whether a repaired prepare at `op` falls inside the range this replica is

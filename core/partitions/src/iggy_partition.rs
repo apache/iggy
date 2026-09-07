@@ -7845,6 +7845,65 @@ mod tests {
         );
     }
 
+    /// `AckLevel::NoAck` stores apply on the primary only and never replicate, so
+    /// which replicas hold an offset is not agreed and a committed delete can
+    /// legitimately find nothing. Erroring here fails the committed apply, fences
+    /// the partition, and then crash-loops on every replay of the same op.
+    #[compio::test]
+    async fn given_an_absent_offset_when_committing_a_delete_should_apply_without_fencing() {
+        let mut partition = test_partition();
+        assert!(
+            !partition.consensus().is_follower(),
+            "the role the old existence check errored on is the primary"
+        );
+
+        partition.stage_consumer_offset_delete(1, ConsumerKind::Consumer, 7);
+        partition
+            .apply_staged_consumer_offset_commit(1)
+            .await
+            .expect("a committed delete of an absent consumer offset must apply");
+
+        partition.stage_consumer_offset_delete(2, ConsumerKind::ConsumerGroup, 9);
+        partition
+            .apply_staged_consumer_offset_commit(2)
+            .await
+            .expect("a committed delete of an absent group offset must apply");
+
+        assert!(
+            partition.fatal().is_none(),
+            "a committed delete over an absent offset must not fence the partition"
+        );
+        assert!(partition.consumer_offsets.pin().is_empty());
+        assert!(partition.consumer_group_offsets.pin().is_empty());
+        assert!(
+            partition.pending_consumer_offset_commits.is_empty(),
+            "an applied delete must clear its staged entry"
+        );
+    }
+
+    /// The other half: a delete that DOES find its offset still removes it.
+    #[compio::test]
+    async fn given_a_stored_offset_when_committing_a_delete_should_remove_it() {
+        let mut partition = test_partition();
+
+        partition.stage_consumer_offset_upsert(1, ConsumerKind::Consumer, 7, 42, false);
+        partition
+            .apply_staged_consumer_offset_commit(1)
+            .await
+            .expect("the store must apply");
+        assert_eq!(partition.consumer_offsets.pin().len(), 1);
+
+        partition.stage_consumer_offset_delete(2, ConsumerKind::Consumer, 7);
+        partition
+            .apply_staged_consumer_offset_commit(2)
+            .await
+            .expect("the delete must apply");
+        assert!(
+            partition.consumer_offsets.pin().is_empty(),
+            "a delete over a present offset must still remove it"
+        );
+    }
+
     /// Fail-closed: offsets the record does not cover would be confirmed to a
     /// client with nothing durable saying they were handed out.
     /// The fence ahead of the pipeline must bound a mint the ordinary send path

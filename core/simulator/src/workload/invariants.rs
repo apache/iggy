@@ -23,9 +23,9 @@
 //! trace and the determinism baseline (`workload_replay_is_deterministic`)
 //! unchanged.
 
-use crate::Simulator;
 use crate::workload::state_checker::StateChecker;
 use crate::workload::{CLIENT_REQUEST_QUEUE_MAX, Workload};
+use crate::{CommitPrefixHole, Simulator};
 use consensus::{Consensus, MetadataHandle};
 use server_common::sharding::IggyNamespace;
 use std::collections::HashMap;
@@ -38,6 +38,14 @@ use std::collections::HashMap;
 /// of slack: only a barrier nothing will ever lower trips it.
 const RECOVERY_BARRIER_WEDGE_TICKS: u32 = 2_000;
 
+/// Ticks a replica may hold its commit walk below a committable pipeline head
+/// before the run is called wedged.
+///
+/// A promotion holds here legitimately while the journal walk clears its apply
+/// backlog 64 ops per sweep. Sized past any backlog a run generates, so only a
+/// hole nothing refills trips it.
+const COMMIT_PREFIX_HOLE_WEDGE_TICKS: u32 = 2_000;
+
 /// Per-(replica, namespace) high-water marks carried across ticks so each new
 /// reading can be compared against the last.
 #[derive(Debug, Default)]
@@ -47,6 +55,9 @@ pub struct Invariants {
     /// Consecutive ticks a replica has been a `Normal` metadata primary still
     /// gated by its recovery barrier. Reset as soon as any of that stops holding.
     barrier_gated_ticks: HashMap<u8, u32>,
+    /// Consecutive ticks a plane's commit walk has held below a committable
+    /// pipeline head, keyed by replica and namespace (`None` = metadata).
+    commit_hole_ticks: HashMap<(u8, Option<IggyNamespace>), u32>,
     /// Cross-replica committed-log agreement. Runs every tick like the rest, so a
     /// divergence is reported where it appears rather than at the next quiesce.
     state_checker: StateChecker,
@@ -84,10 +95,24 @@ impl Invariants {
         for replica_idx in 0..sim.replica_count {
             if sim.is_crashed(replica_idx) {
                 self.barrier_gated_ticks.remove(&replica_idx);
+                self.commit_hole_ticks
+                    .retain(|(replica, _), _| *replica != replica_idx);
                 continue;
             }
             self.check_recovery_barrier(sim, seed, replica_idx);
+            self.check_commit_prefix_contiguity(
+                seed,
+                replica_idx,
+                None,
+                sim.metadata_commit_prefix_hole(usize::from(replica_idx)),
+            );
             for &ns in &workload.options.namespaces {
+                self.check_commit_prefix_contiguity(
+                    seed,
+                    replica_idx,
+                    Some(ns),
+                    sim.partition_commit_prefix_hole(usize::from(replica_idx), ns),
+                );
                 if let Some(offsets) = sim.offsets(usize::from(replica_idx), ns) {
                     let cur = offsets.commit_offset;
                     if let Some(&prev) = self.commit_offset.get(&(replica_idx, ns)) {
@@ -156,6 +181,48 @@ impl Invariants {
             consensus.commit_min(),
             consensus.commit_max(),
             consensus.view(),
+        );
+    }
+
+    /// Catch a commit walk permanently held below a committable pipeline head.
+    ///
+    /// The state `drain_committable_prefix` and `peek_committable_head` refuse to
+    /// drain: the frontier covers the head, but the ops between it and `commit_min`
+    /// never arrived. Holding is correct, and on the partition plane a promotion
+    /// reaches it legitimately for as long as the bounded journal walk needs to
+    /// clear the apply backlog. What is never correct is holding forever: those
+    /// replies are owed to clients and nothing above the hole will ever apply.
+    ///
+    /// # Panics
+    /// When one plane holds for [`COMMIT_PREFIX_HOLE_WEDGE_TICKS`] consecutive
+    /// ticks.
+    fn check_commit_prefix_contiguity(
+        &mut self,
+        seed: u64,
+        replica_idx: u8,
+        namespace: Option<IggyNamespace>,
+        hole: Option<CommitPrefixHole>,
+    ) {
+        let key = (replica_idx, namespace);
+        let Some(hole) = hole else {
+            self.commit_hole_ticks.remove(&key);
+            return;
+        };
+        let ticks = self
+            .commit_hole_ticks
+            .entry(key)
+            .and_modify(|ticks| *ticks += 1)
+            .or_insert(1);
+        assert!(
+            *ticks < COMMIT_PREFIX_HOLE_WEDGE_TICKS,
+            "replica {replica_idx} has held its commit walk below a committable \
+             pipeline head for {ticks} ticks on {}: head_op={} commit={}..{}. The ops \
+             between are missing and nothing is refilling them, so every reply above \
+             the hole is owed forever (seed={seed:#x})",
+            namespace.map_or_else(|| "the metadata plane".to_owned(), |ns| format!("{ns:?}")),
+            hole.head_op,
+            hole.commit_min,
+            hole.commit_max,
         );
     }
 

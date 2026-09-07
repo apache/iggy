@@ -1742,18 +1742,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Call this wherever the head is authoritatively re-decided: a merged log at
     /// view start, an adopted `StartView`. `head` lowers the barrier when the view
     /// truncated the suffix, keeps it when the suffix survived.
+    ///
+    /// Lowered, never cleared. `is_caught_up_primary` reads it against `commit_max`
+    /// and a met barrier costs it nothing, but `await_recovery_barrier` reads it
+    /// against `commit_min`, and adoption raises `commit_max` before walking the
+    /// suffix into the state machine. Zeroing a met barrier would open that read
+    /// gate over the unapplied window it exists to hold.
     pub fn redecide_recovery_barrier(&self, head: u64) {
         let barrier = self.recovery_barrier.get();
         if barrier == 0 {
             return;
         }
-        let barrier = barrier.min(head);
-        self.recovery_barrier
-            .set(if barrier <= self.commit_max.get() {
-                0
-            } else {
-                barrier
-            });
+        self.recovery_barrier.set(barrier.min(head));
     }
 
     /// Deadline paired with [`Self::recovery_barrier`]; only meaningful while the
@@ -3698,6 +3698,30 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         sources.into_iter().map(|(_, replica)| replica).collect()
     }
 
+    /// Replicas that committed `op`, most-recent-`log_view` first.
+    ///
+    /// The fallback for an op below the DVC suffixes. A suffix spans `commit..=op`,
+    /// so [`Self::pending_view_body_sources`] answers nothing about the committed
+    /// prefix and a merged log whose coverage gap sits there would have no source
+    /// at all. A sender that committed the op either still journals it or has
+    /// compacted it under a checkpoint, and both answers move the requester
+    /// forward: the prepare, or the `RangeEvicted` that says repair cannot close
+    /// this gap.
+    ///
+    /// Presence is not proven the way an offered body is, so prefer
+    /// [`Self::pending_view_body_sources`] wherever it returns anything.
+    #[must_use]
+    pub fn pending_view_commit_sources(&self, op: u64) -> Vec<u8> {
+        let quorum = self.do_view_change_from_all_replicas.borrow();
+        let mut sources: Vec<(u32, u8)> = dvc_iter(&quorum)
+            .filter(|dvc| dvc.replica != self.replica)
+            .filter(|dvc| dvc.commit >= op)
+            .map(|dvc| (dvc.log_view, dvc.replica))
+            .collect();
+        sources.sort_unstable_by_key(|(log_view, _)| std::cmp::Reverse(*log_view));
+        sources.into_iter().map(|(_, replica)| replica).collect()
+    }
+
     /// Finish the parked view change: this replica's journal now covers the merged
     /// log, so it can serve any op it is about to announce.
     ///
@@ -4808,13 +4832,18 @@ mod timestamp_clamp_tests {
         );
         assert_eq!(
             consensus.recovery_barrier(),
-            0,
-            "the adopted head settled the suffix's fate and commit_max covers it, \
-             so the barrier must clear rather than latch"
+            105,
+            "the adopted head settled the suffix's fate, so the barrier must fall to \
+             it rather than latch at a head the view discarded"
         );
         assert!(
             is_caught_up_primary_barrier_open(&consensus),
-            "a cleared barrier must stop gating admission"
+            "a barrier the adopted commit point covers must stop gating admission"
+        );
+        assert!(
+            consensus.commit_min() < consensus.recovery_barrier(),
+            "adoption raises commit_max before applying, so the local read gate \
+             (which reads commit_min) must still hold"
         );
     }
 
@@ -5550,4 +5579,131 @@ mod quorum_tests {
             REPLICAS_MAX as u8
         }
     };
+}
+
+#[cfg(test)]
+mod view_source_tests {
+    //! Who a primary-elect may ask for an op its merged log names. A `DoViewChange`
+    //! suffix spans `commit..=op`, so the two selectors cover disjoint halves of
+    //! the merged log and the split is what keeps a coverage gap under the merged
+    //! commit point askable at all.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::view_change_quorum::{DvcSuffix, StoredDvc, dvc_record};
+    use message_bus::BusMessage;
+    use server_common::MESSAGE_ALIGN;
+    use server_common::iobuf::Frozen;
+
+    struct NoopBus;
+
+    impl MessageBus for NoopBus {
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: impl Into<BusMessage>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+    }
+
+    fn consensus() -> VsrConsensus<NoopBus, LocalPipeline> {
+        VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new())
+    }
+
+    /// A sender whose suffix runs `commit..=op` with every body offered, which is
+    /// the widest window a real `DoViewChange` can carry.
+    fn sender(replica: u8, log_view: u32, op: u64, commit: u64) -> StoredDvc {
+        let headers: Vec<PrepareHeader> = (commit..=op)
+            .rev()
+            .map(|op| PrepareHeader {
+                command: Command::Prepare,
+                op,
+                view: log_view,
+                ..Default::default()
+            })
+            .collect();
+        let present = (1u128 << headers.len()) - 1;
+        StoredDvc {
+            replica,
+            log_view,
+            op,
+            commit,
+            suffix: DvcSuffix::new(headers, 0, present),
+        }
+    }
+
+    fn record(consensus: &VsrConsensus<NoopBus, LocalPipeline>, senders: [StoredDvc; 2]) {
+        let mut quorum = consensus.do_view_change_from_all_replicas.borrow_mut();
+        for dvc in senders {
+            assert!(dvc_record(&mut quorum, dvc));
+        }
+    }
+
+    #[test]
+    fn given_an_op_inside_the_suffixes_when_selecting_should_return_the_body_offers() {
+        let consensus = consensus();
+        record(&consensus, [sender(1, 5, 12, 10), sender(2, 4, 12, 10)]);
+
+        assert_eq!(
+            consensus.pending_view_body_sources(11),
+            vec![1, 2],
+            "both senders offer op 11, freshest log_view first"
+        );
+    }
+
+    #[test]
+    fn given_an_op_below_every_commit_point_when_selecting_should_need_the_committers() {
+        let consensus = consensus();
+        record(&consensus, [sender(1, 5, 12, 10), sender(2, 4, 12, 10)]);
+
+        assert!(
+            consensus.pending_view_body_sources(7).is_empty(),
+            "a suffix spans commit..=op, so it says nothing about op 7"
+        );
+        assert_eq!(
+            consensus.pending_view_commit_sources(7),
+            vec![1, 2],
+            "a sender that committed op 7 holds it or compacted it, and either \
+             answer moves the requester forward"
+        );
+    }
+
+    #[test]
+    fn given_a_sender_behind_the_op_when_selecting_committers_should_skip_it() {
+        let consensus = consensus();
+        record(&consensus, [sender(1, 5, 12, 10), sender(2, 6, 6, 5)]);
+
+        assert_eq!(
+            consensus.pending_view_commit_sources(7),
+            vec![1],
+            "replica 2 never committed op 7, so asking it wastes a retry interval \
+             on a RangeEvicted it has no standing to send"
+        );
+    }
+
+    #[test]
+    fn given_this_replica_in_the_quorum_when_selecting_should_never_return_self() {
+        let consensus = consensus();
+        record(&consensus, [sender(0, 5, 12, 10), sender(2, 4, 12, 10)]);
+
+        assert_eq!(
+            consensus.pending_view_commit_sources(7),
+            vec![2],
+            "a replica cannot repair from itself"
+        );
+    }
 }
