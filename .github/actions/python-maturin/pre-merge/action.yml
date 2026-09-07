@@ -90,6 +90,15 @@ runs:
         echo "pyrefly version: $(uv run pyrefly --version)"
       shell: bash
 
+    # The crate is outside the root workspace, so the Rust test jobs never
+    # reach it; without this its unit tests would only ever be compiled.
+    - name: Rust unit tests for Python extension
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/python
+        cargo test --manifest-path Cargo.toml
+      shell: bash
+
     - name: Build Python wheel
       if: inputs.task == 'test'
       run: |
