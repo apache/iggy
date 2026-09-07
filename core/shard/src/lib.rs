@@ -884,6 +884,10 @@ pub const REPAIR_CHUNK_MAX: u64 = 128;
 struct MetadataRepairSession {
     nonce: u128,
     to_op: u64,
+    /// Consensus view this session was armed in. A later view decides the log
+    /// again, so the window this names may no longer be the one to fetch;
+    /// `partitions::RepairSession::view` fences the partition twin the same way.
+    view: u32,
     /// Re-request target on stall.
     peer: u8,
     /// Ticks since the stream last made progress; at
@@ -5003,6 +5007,15 @@ where
             let Some(journal) = planes.0.journal.as_ref() else {
                 return;
             };
+            // Above the two returns below, not after them: only SILENCE should
+            // age the stream, and an in-scope frame proves the peer is serving
+            // whether or not this replica still needs the op it carries. The
+            // ops a re-request re-serves are exactly the ones already held, so
+            // counting accepted frames alone rotates away from a live peer.
+            if let Some(session) = self.metadata_repair.borrow_mut().as_mut() {
+                session.idle_ticks = 0;
+            }
+            self.note_metadata_repair_progress();
             let journal = journal.handle();
             #[allow(clippy::cast_possible_truncation)]
             if journal.header(header.op as usize).is_some() {
@@ -5017,15 +5030,6 @@ where
                 );
                 return;
             }
-            // The stream is alive, so only SILENCE should age it. The tick's own
-            // walk can land between a chunk's last prepare and its `RepairDone`,
-            // and `on_repair_range_reply` pulls the next chunk only when its own
-            // walk moved `commit_min`, so without this the session idles a full
-            // retry interval on every such landing.
-            if let Some(session) = self.metadata_repair.borrow_mut().as_mut() {
-                session.idle_ticks = 0;
-            }
-            self.note_metadata_repair_progress();
             // Contiguous-frontier advance, mirroring
             // `apply_repaired_prepare`: DVC advertises the sequencer, so a
             // hole below a repaired op must stall the advance rather than
@@ -5111,10 +5115,10 @@ where
                     // peer's served-through claim: repair frames ride a
                     // lossy best-effort bus, so a fully-served stream can
                     // still arrive with holes. Anything short keeps the
-                    // session armed; while the walk is making progress the
-                    // next chunk is pulled immediately (the window is served
-                    // in `REPAIR_CHUNK_MAX` slices), and a stalled one is
-                    // left to the retry timer.
+                    // session armed; the next chunk is pulled as soon as this
+                    // one is walked (the window is served in
+                    // `REPAIR_CHUNK_MAX` slices), and a window still holed
+                    // below `served_through` is left to the retry timer.
                     let commit_min = consensus.commit_min();
                     let done = commit_min >= session.to_op;
                     tracing::info!(
@@ -5126,7 +5130,7 @@ where
                     );
                     if done {
                         *self.metadata_repair.borrow_mut() = None;
-                    } else if commit_min > before {
+                    } else if repair_chunk_walked(before, commit_min, header.op) {
                         self.send_request_prepares(
                             consensus.cluster(),
                             consensus.replica(),
@@ -5546,20 +5550,32 @@ where
         B: MessageBus,
         P: Pipeline<Entry = consensus::PipelineEntry>,
     {
-        // Closed at the TOP of the tick, not after an idle window: a session
-        // that outlives its window fences every arming site and holds the gap
-        // debounce at zero (`recovery_owned`), so waiting a full retry interval
-        // to notice costs that interval on every arm behind it. The partition
-        // sweep's `repair_finished` check is the same idea.
-        let finished = self
-            .metadata_repair
-            .borrow()
-            .is_some_and(|session| consensus.commit_min() >= session.to_op);
-        if finished {
+        // `ViewChange` too: a parked view change repairs toward its merged log
+        // and cannot start until the window fills. Gating on `Normal` alone
+        // defers a dropped frame to the 500-tick escalation, and closes the one
+        // session that legitimately runs outside `Normal`.
+        let repairing_view =
+            consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view());
+
+        // Closed at the TOP of the tick, not after an idle window: a standing
+        // session fences every arming site and holds the gap debounce at zero
+        // (`recovery_owned`), so waiting a full retry interval to notice costs
+        // that interval on every arm behind it.
+        let superseded = self.metadata_repair.borrow().is_some_and(|session| {
+            metadata_repair_superseded(
+                &session,
+                consensus.commit_min(),
+                consensus.view(),
+                consensus.is_normal(),
+                repairing_view,
+            )
+        });
+        if superseded {
             tracing::debug!(
                 shard = self.id,
                 commit_min = consensus.commit_min(),
-                "metadata repair window walked; closing the session"
+                view = consensus.view(),
+                "metadata repair session walked or superseded; closing it"
             );
             *self.metadata_repair.borrow_mut() = None;
             self.note_metadata_repair_progress();
@@ -5569,16 +5585,8 @@ where
         // Stall retry (mirrors `tick_partitions`): a lost frame must not wedge it.
         let repair_retry_ticks = self.repair_retry_ticks.get();
         let stalled = {
-            // `ViewChange` too: a parked view change repairs toward its merged log
-            // and cannot start until the window fills. Gating on `Normal` alone
-            // defers a dropped frame to the 500-tick escalation.
-            let repairing_view =
-                consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view());
             let mut session = self.metadata_repair.borrow_mut();
             session.as_mut().and_then(|session| {
-                if !consensus.is_normal() && !repairing_view {
-                    return None;
-                }
                 session.idle_ticks += 1;
                 if session.idle_ticks < repair_retry_ticks {
                     return None;
@@ -5914,6 +5922,7 @@ where
         *self.metadata_repair.borrow_mut() = Some(MetadataRepairSession {
             nonce,
             to_op: pending.op_head,
+            view: consensus.view(),
             peer,
             idle_ticks: 0,
         });
@@ -5978,6 +5987,7 @@ where
             *self.metadata_repair.borrow_mut() = Some(MetadataRepairSession {
                 nonce,
                 to_op,
+                view: consensus.view(),
                 peer,
                 idle_ticks: 0,
             });
@@ -6535,9 +6545,12 @@ where
         attempts > partitions::REPAIR_MAX_STALL_RETRIES
     }
 
-    /// Real repair progress (any accepted prepare from the serving peer): reset
-    /// the budget, so it bounds CONSECUTIVE stalls rather than the ones a long
-    /// healthy stream accumulates.
+    /// The serving peer answered: reset the budget, so it bounds CONSECUTIVE
+    /// silence rather than the stalls a long healthy stream accumulates.
+    ///
+    /// Any in-scope repair frame, not only an accepted one. A re-request
+    /// re-serves ops this replica already holds, so charging those as silence
+    /// rotates away from a peer that is answering.
     fn note_metadata_repair_progress(&self) {
         self.metadata_repair_attempts.set(0);
     }
@@ -9334,6 +9347,57 @@ where
         }
     }
 
+    /// Drop the WAL entry at `stuck_op` and the suffix above it, so repair can
+    /// refill a header whose body the commit walk cannot read.
+    ///
+    /// Nothing else clears it: `on_repair_prepare` returns early for an op
+    /// whose header is resident, and the append under it is refused anyway.
+    /// `stuck_op` is at `commit_min + 1` under `commit_max`, so a quorum holds
+    /// it and repair can serve it back.
+    ///
+    /// SERIALIZATION: same argument as `reconcile_metadata_view_divergence`,
+    /// which is the other shard-side `truncate_from` caller. This runs on the
+    /// pump between frames, so no append is in flight for these ops.
+    #[allow(clippy::future_not_send)]
+    async fn drop_unwalkable_metadata_entry<P>(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        journal: &MJ,
+        stuck_op: u64,
+    ) where
+        B: MessageBus,
+        P: Pipeline<Entry = consensus::PipelineEntry>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        match journal.handle().truncate_from(stuck_op).await {
+            Ok(removed) => {
+                // The snapshot's `(op, commit)` tag does not move when entries
+                // are removed under it, so the next `DoViewChange` would
+                // otherwise advertise headers this replica can no longer serve.
+                consensus.invalidate_local_dvc_suffix();
+                tracing::warn!(
+                    shard = self.id,
+                    stuck_op,
+                    removed,
+                    "metadata commit walk found a resident header with no body at op {stuck_op}; \
+                     dropped {removed} entries from it so repair can refill the range"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    shard = self.id,
+                    stuck_op,
+                    %error,
+                    "could not drop the unwalkable entry at op {stuck_op}; journal repair skips \
+                     ops it already holds a header for, so this replica will not walk past \
+                     it until it is restarted"
+                );
+            }
+        }
+    }
+
     /// Read the gap probe off the metadata plane; [`partition_gap_probe`]'s
     /// twin. A shard method because the recovery slots live here, on the shard,
     /// not on the plane.
@@ -9512,19 +9576,19 @@ where
             // nothing needs spreading across ticks. How FAR one walk goes is
             // still capped, inside `commit_journal` itself.
             //
-            // It cannot spin: the predicate says the header is there, and a
-            // walk that finds no body behind it records the op and stops
-            // claiming to be walk-stalled (see `metadata_gap_probe`), which
-            // hands the op to repair.
+            // Both roles, like the partition arm. `resume_stranded_commits`
+            // above re-drives a primary's PIPELINE, and `(commit_min,
+            // commit_max]` is journal-only once it has run, so an inherited
+            // prefix or the tail of a capped walk has no other re-driver here
+            // and pins `commit_min` until the next op to commit trips
+            // `advance_commit_min`'s sequential assert.
             //
-            // Follower only. A backup's `commit_journal` ships no wire replies,
-            // while a stranded primary owes its clients answers, which is
-            // `resume_stranded_commits` above. Not gated on `recovery_owned`
-            // (repaired prepares are journaled without being walked, so gating
-            // parks the walk for the whole session); `group_is_walk_stalled`
-            // itself refuses mid-transfer, where a walk past the incoming
-            // `snapshot_seq` would break the install.
-            if group_is_walk_stalled(&probe) && consensus.is_follower() {
+            // Not gated on `recovery_owned` (repaired prepares are journaled
+            // without being walked, so gating parks the walk for the whole
+            // session); `group_is_walk_stalled` itself refuses mid-transfer,
+            // where a walk past the incoming `snapshot_seq` would break the
+            // install.
+            if group_is_walk_stalled(&probe) {
                 // Debug, not info: a repair stream journals its prepares without
                 // walking them, so this is the steady state for the whole
                 // duration of a rejoin and would be one line per tick.
@@ -9535,17 +9599,23 @@ where
                     "metadata commit walk parked over resident committed ops; resuming"
                 );
                 metadata.commit_journal().await;
-                // A walk that moved nothing found the header and not the body;
-                // see `metadata_gap_probe`. Recorded rather than retried, so the
-                // detector stops calling this a parked walk and arms repair for
-                // the body instead.
+                // A walk that moved nothing found the header and not the body.
+                // Recording the op stops the detector calling this a parked
+                // walk, but arming repair alone cannot refill it: the ingest
+                // skips an op whose header is resident and `append` refuses the
+                // slot under it, so the header has to go first.
                 let walked = consensus.commit_min();
-                self.metadata_walk_stuck_op
-                    .set(if walked == probe.commit_min {
-                        walked.saturating_add(1)
-                    } else {
-                        0
-                    });
+                if walked == probe.commit_min {
+                    let stuck_op = walked.saturating_add(1);
+                    // Once per op: a failed truncation leaves the header where
+                    // it is, and retrying every tick only repeats the error.
+                    if self.metadata_walk_stuck_op.replace(stuck_op) != stuck_op {
+                        self.drop_unwalkable_metadata_entry(consensus, journal, stuck_op)
+                            .await;
+                    }
+                } else {
+                    self.metadata_walk_stuck_op.set(0);
+                }
             }
         }
 
@@ -10129,6 +10199,34 @@ const fn gap_repair_peer(self_id: u8, replica_count: u8, primary: u8) -> Option<
     // A solo group (or a ring with nobody else live to name) rotates back to
     // self, which no session can be opened against.
     if peer == self_id { None } else { Some(peer) }
+}
+
+/// Whether a standing metadata repair session should be closed at the top of
+/// the tick: its window is walked, the view that decided that window has
+/// moved, or this replica has left the status the session belongs to.
+///
+/// `repairing_view` is the primary-elect repairing toward its merged log, the
+/// one session that runs outside `Normal`. Pinned by
+/// `metadata_repair_session_tests`.
+const fn metadata_repair_superseded(
+    session: &MetadataRepairSession,
+    commit_min: u64,
+    view: u32,
+    normal: bool,
+    repairing_view: bool,
+) -> bool {
+    commit_min >= session.to_op || session.view != view || !(normal || repairing_view)
+}
+
+/// Whether a walked `RepairDone` should pull the next chunk of the window.
+///
+/// `served_through` is the terminator's own op. Chunk progress, not this
+/// walk's: `tick_metadata` walks the same journal, so it can consume a chunk
+/// between the chunk's last prepare and its terminator, and requiring
+/// `commit_min` to move HERE idles the session a full retry interval on every
+/// such landing.
+const fn repair_chunk_walked(before: u64, commit_min: u64, served_through: u64) -> bool {
+    commit_min > before || commit_min >= served_through
 }
 
 /// Rotate a sweep's namespace snapshot so it resumes at `cursor`.
@@ -12039,5 +12137,162 @@ mod gap_detector_tests {
             drive_group_gap_debounce(&probe, &mut gap_ticks, 1, true),
             GapArm::Arm
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_repair_session_tests {
+    //! The three rules a standing metadata repair session lives by: who it is
+    //! opened against, when it is closed, and when a walked terminator pulls
+    //! the next chunk of its window.
+    //!
+    //! All three wedge the plane rather than failing loudly. A session fences
+    //! every other arming site and holds the gap debounce at zero while it
+    //! stands, so one opened against nobody, or kept past the view that decided
+    //! its window, or that stops pulling chunks, pins the commit frontier with
+    //! nothing else able to arm.
+
+    use super::{
+        MetadataRepairSession, gap_repair_peer, metadata_repair_superseded, next_transfer_peer,
+        repair_chunk_walked,
+    };
+
+    /// Armed at view 3, against a window ending at op 20.
+    const fn session() -> MetadataRepairSession {
+        MetadataRepairSession {
+            nonce: 7,
+            to_op: 20,
+            view: 3,
+            peer: 0,
+            idle_ticks: 0,
+        }
+    }
+
+    #[test]
+    fn given_a_gap_stopped_backup_when_picking_a_peer_should_ask_the_primary() {
+        assert_eq!(gap_repair_peer(2, 3, 0), Some(0));
+        assert_eq!(gap_repair_peer(1, 5, 3), Some(3));
+    }
+
+    #[test]
+    fn given_a_gap_stopped_primary_when_picking_a_peer_should_never_ask_itself() {
+        // The case `maybe_request_metadata_repair`'s self-guard exists for: no
+        // other site re-drives a settled primary's own hole, and a
+        // self-addressed request fails to send AFTER the session is recorded.
+        for replica_count in 2..=7u8 {
+            for primary in 0..replica_count {
+                let peer = gap_repair_peer(primary, replica_count, primary);
+                assert_ne!(peer, Some(primary), "count {replica_count}");
+                assert!(peer.is_some(), "count {replica_count}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_solo_group_when_picking_a_peer_should_answer_nobody() {
+        assert_eq!(gap_repair_peer(0, 1, 0), None);
+    }
+
+    #[test]
+    fn given_a_silent_peer_when_the_stall_budget_is_spent_should_rotate_off_it() {
+        // Re-arming against the peer that just went quiet spends another whole
+        // budget on it, and the ring is the only thing that names anyone else.
+        for replica_count in 3..=7u8 {
+            for primary in 0..replica_count {
+                let self_id = (primary + 1) % replica_count;
+                let failed = gap_repair_peer(self_id, replica_count, primary).expect("a peer");
+                let next = next_transfer_peer(self_id, failed, replica_count, primary);
+                assert_ne!(next, failed, "count {replica_count}, primary {primary}");
+                assert_ne!(next, self_id, "count {replica_count}, primary {primary}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_two_replicas_when_the_stall_budget_is_spent_should_name_the_same_peer_back() {
+        // Which is how the caller reads "nobody else to ask" and drops the
+        // session instead of re-arming it.
+        assert_eq!(next_transfer_peer(1, 0, 2, 0), 0);
+    }
+
+    #[test]
+    fn given_a_session_whose_window_is_walked_when_checked_should_be_superseded() {
+        let session = session();
+        assert!(metadata_repair_superseded(
+            &session,
+            session.to_op,
+            session.view,
+            true,
+            false
+        ));
+        assert!(!metadata_repair_superseded(
+            &session,
+            session.to_op - 1,
+            session.view,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn given_a_session_armed_in_an_earlier_view_when_checked_should_be_superseded() {
+        let session = session();
+        assert!(metadata_repair_superseded(
+            &session,
+            0,
+            session.view + 1,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn given_a_replica_that_left_normal_when_checked_should_be_superseded() {
+        let session = session();
+        assert!(metadata_repair_superseded(
+            &session,
+            0,
+            session.view,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn given_a_primary_elect_repairing_its_merged_log_when_checked_should_stand() {
+        // The one session that runs outside `Normal`;
+        // `advance_pending_metadata_view` cannot start the view until its
+        // window fills.
+        let session = session();
+        assert!(!metadata_repair_superseded(
+            &session,
+            0,
+            session.view,
+            false,
+            true
+        ));
+        assert!(
+            metadata_repair_superseded(&session, 0, session.view + 1, false, true),
+            "not even the primary-elect's session survives the next view"
+        );
+    }
+
+    #[test]
+    fn given_a_chunk_this_walk_moved_when_checked_should_pull_the_next_chunk() {
+        assert!(repair_chunk_walked(5, 8, 12));
+    }
+
+    #[test]
+    fn given_a_chunk_the_tick_already_walked_when_checked_should_pull_the_next_chunk() {
+        // `tick_metadata` walks the same journal, so the terminator can arrive
+        // with nothing left for its own walk to move.
+        assert!(repair_chunk_walked(12, 12, 12));
+    }
+
+    #[test]
+    fn given_a_window_still_holed_below_the_terminator_when_checked_should_wait_for_the_retry() {
+        // A frame was lost inside the served chunk: re-requesting now would
+        // race the retry timer for the same window.
+        assert!(!repair_chunk_walked(5, 5, 12));
     }
 }

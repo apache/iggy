@@ -5093,6 +5093,93 @@ mod tests {
         );
     }
 
+    /// The walk cap bounds ONE `commit_journal` call, not the backlog.
+    ///
+    /// The resident `(commit_min, commit_max]` run after a repair window or a
+    /// rejoin is the whole backlog, and the walk applies each op with no await
+    /// the pump can interleave, so an uncapped call holds the shard for all of
+    /// it. Every caller is re-driven every tick, so stopping short loses
+    /// nothing; a cap that did NOT resume would pin `commit_min` until the next
+    /// op to commit trips `advance_commit_min`'s sequential assert.
+    #[compio::test]
+    async fn commit_journal_stops_at_the_walk_cap_and_resumes_on_the_next_call() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// The cap, as an op count.
+        const CAP: u64 = COMMIT_WALK_OPS_MAX as u64;
+        /// One op past the cap, so the first call must stop short and the
+        /// second must have something left to finish.
+        const OPS: u64 = CAP + 1;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0: a backup, so `on_replicate` journals each
+        // prepare without the primary's pipeline commit path running under it.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        for request in 1..=OPS {
+            let prepare = md
+                .prepare_request(create_stream_request(
+                    CLIENT,
+                    request,
+                    &format!("s{request}"),
+                ))
+                .expect("CreateStream is client-allowed");
+            md.on_replicate(prepare).await;
+        }
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(journal.last_op(), Some(OPS), "every op must be resident");
+        assert_eq!(consensus.commit_min(), 0, "no commit heartbeat has landed");
+
+        // What a repair window or a rejoin leaves behind: the whole run
+        // committed by the group and resident here, none of it walked.
+        consensus.advance_commit_max(OPS);
+
+        md.commit_journal().await;
+        assert_eq!(
+            consensus.commit_min(),
+            CAP,
+            "one call walked the whole backlog; the pump is blocked for as long \
+             as the resident run is, however long that is"
+        );
+
+        md.commit_journal().await;
+        assert_eq!(
+            consensus.commit_min(),
+            OPS,
+            "the walk did not resume where it stopped, so `commit_min` is pinned \
+             below `commit_max` with no other re-driver"
+        );
+    }
+
     /// A state-transfer receiver admits the first live prepare above the floor it
     /// installed, instead of waiting for an op the snapshot already contains.
     ///

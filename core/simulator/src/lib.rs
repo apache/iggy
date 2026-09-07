@@ -6029,6 +6029,17 @@ mod metadata_repair_driver_tests {
     /// then the drain, still under `NORMAL_HEARTBEAT_TICKS`.
     const STRAND_QUIET_STEPS: usize = 300;
 
+    /// Stall interval for the rotation run, shortened from
+    /// `partitions::REPAIR_RETRY_TICKS` so a whole spent budget plus the gap
+    /// debounce (floored at `shard::REPAIR_GAP_DEBOUNCE_TICKS_MIN`) fits under
+    /// `NORMAL_HEARTBEAT_TICKS`. At the production interval the run would only
+    /// prove that an election heals the gap.
+    const ROTATE_RETRY_TICKS: u32 = 10;
+
+    /// Quiet budget for the rotation run: debounce, the spent budget, then the
+    /// repair stream from the replica it rotates onto.
+    const ROTATE_QUIET_STEPS: usize = 250;
+
     /// Ticks of healthy load in the no-false-positive test, several debounce
     /// intervals' worth so the driver gets many chances to arm.
     const LOAD_TICKS: usize = 4 * partitions::REPAIR_RETRY_TICKS as usize;
@@ -6351,6 +6362,196 @@ mod metadata_repair_driver_tests {
             commit_min, commit_max,
             "the walk never resumed over resident committed ops: walkable to \
              {commit_min}, committed through {commit_max}, every op between resident"
+        );
+    }
+
+    #[test]
+    fn given_a_resident_header_with_no_body_when_the_walk_stops_on_it_should_drop_it_for_repair() {
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+        starve_commit_edge!(WITHHELD_OP);
+
+        let (mut sim, client) = cluster(0x5EED_0245);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        sim.replicas[LAGGING as usize].shards[0].set_repair_retry_ticks(ROTATE_RETRY_TICKS);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+        assert_ne!(
+            WITHHELD_OP.load(Ordering::Relaxed),
+            0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+
+        // Corrupt the op the walk is about to read, once repair has put a
+        // window back but before the walk has consumed it. Injected here
+        // rather than by dropping packets: the header and the body land in the
+        // same append, so no link fault produces this state.
+        let mut doomed = 0;
+        for _ in 0..ROTATE_QUIET_STEPS {
+            sim.step();
+            let (_, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+            if view != 0 {
+                break;
+            }
+            let next_op = commit_min + 1;
+            if commit_min < commit_max && journal_holds(&sim, LAGGING, next_op) {
+                assert!(
+                    sim.replicas[LAGGING as usize]
+                        .metadata_journal
+                        .forget_body(next_op),
+                    "op {next_op} had no body to forget"
+                );
+                doomed = next_op;
+                break;
+            }
+        }
+        assert_ne!(
+            doomed, 0,
+            "the repair window never landed resident above the commit point, so \
+             there was no walkable op to corrupt"
+        );
+        assert!(
+            journal_holds(&sim, LAGGING, doomed),
+            "op {doomed}'s header must stay resident, or the walk would read this \
+             as an ordinary hole and repair would refill it unaided"
+        );
+
+        for _ in 0..ROTATE_QUIET_STEPS {
+            sim.step();
+            let (_, view, commit_min, _) = metadata_state(&sim, LAGGING);
+            if view != 0 || commit_min >= doomed {
+                break;
+            }
+        }
+
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            view, 0,
+            "a view change healed the log instead of the walk; the test proves \
+             nothing about the unwalkable entry"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert!(
+            commit_min >= doomed,
+            "the walk never crossed op {doomed}: the repair ingest skips an op \
+             whose header is resident and `append` refuses the slot under it, so \
+             the header has to be dropped first. Stopped at {commit_min} of \
+             {commit_max}"
+        );
+    }
+
+    #[test]
+    fn given_a_repair_peer_that_never_answers_when_the_budget_is_spent_should_re_arm_from_another_replica()
+     {
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        static ASKED_PRIMARY: AtomicU64 = AtomicU64::new(0);
+        static ASKED_SUCCESSOR: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+
+        /// The peer `gap_repair_peer` names for a gap-stopped backup is the
+        /// primary, so the session can only heal by rotating off it.
+        fn blackhole(_packet: &Packet) -> bool {
+            true
+        }
+
+        /// Observers, not faults: every packet passes.
+        fn count_requests_to_primary(packet: &Packet) -> bool {
+            if is_request_prepares_for(packet, METADATA_GROUP) {
+                ASKED_PRIMARY.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+        fn count_requests_to_successor(packet: &Packet) -> bool {
+            if is_request_prepares_for(packet, METADATA_GROUP) {
+                ASKED_SUCCESSOR.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0244);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        ASKED_PRIMARY.store(0, Ordering::Relaxed);
+        ASKED_SUCCESSOR.store(0, Ordering::Relaxed);
+        sim.replicas[LAGGING as usize].shards[0].set_repair_retry_ticks(ROTATE_RETRY_TICKS);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+        let (_, _, warm_commit_min, _) = metadata_state(&sim, LAGGING);
+        assert!(
+            warm_commit_min > 0,
+            "the lagging replica committed nothing before the fault, so the gap \
+             below would open at the group's first op"
+        );
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        // Everything, not just this group's commit edge: the primary must be
+        // unable to answer the repair it is about to be asked for, while the
+        // chain (0 -> 1 -> 2) keeps carrying the prepares that advance
+        // `commit_max` past the hole.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(blackhole);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(LAGGING), ProcessId::Replica(0)) =
+            Some(count_requests_to_primary);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(LAGGING), ProcessId::Replica(1)) =
+            Some(count_requests_to_successor);
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+
+        for _ in 0..ROTATE_QUIET_STEPS {
+            sim.step();
+            let (_, view, commit_min, _) = metadata_state(&sim, LAGGING);
+            if view != 0 || commit_min >= withheld {
+                break;
+            }
+        }
+
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            view, 0,
+            "a view change healed the gap instead of the rotation; the test proves \
+             nothing about the stall budget"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert!(
+            ASKED_PRIMARY.load(Ordering::Relaxed) > 1,
+            "the session was never re-requested from the silent primary, so the \
+             stall budget (`partitions::REPAIR_MAX_STALL_RETRIES`) was not spent \
+             and any rotation below came from somewhere else"
+        );
+        assert!(
+            ASKED_SUCCESSOR.load(Ordering::Relaxed) > 0,
+            "the budget ran out against a peer that cannot answer and the session \
+             was never re-armed anywhere else; nothing re-drives it, so the plane \
+             stays gap-stopped at {commit_min} of {commit_max}"
+        );
+        assert!(
+            journal_holds(&sim, LAGGING, withheld),
+            "op {withheld} was never repaired back into the lagging replica's WAL"
+        );
+        assert!(
+            commit_min >= withheld,
+            "the commit walk never crossed the repaired hole: stopped at \
+             {commit_min}, the withheld op is {withheld}"
         );
     }
 
