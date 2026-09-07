@@ -64,6 +64,7 @@ impl OptionSpec {
     /// options ride that codec.
     #[gen_stub(override_return_type(type_repr = "HeaderValue | None"))]
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "HeaderValue | None"))]
     pub fn default_value<'a>(&self, py: Python<'a>) -> PyResult<Option<Bound<'a, HeaderValue>>> {
         if self.inner.default_value.is_empty() {
             return Ok(None);
