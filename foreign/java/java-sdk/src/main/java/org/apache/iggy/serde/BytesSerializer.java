@@ -44,7 +44,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Unified serializer for both blocking and async clients.
@@ -339,9 +338,7 @@ public final class BytesSerializer {
      */
     private static byte[] encodedMessageId(MessageId id) {
         if (id.toBigInteger().signum() == 0) {
-            byte[] minted = new byte[16];
-            ThreadLocalRandom.current().nextBytes(minted);
-            return minted;
+            return MessageIdGenerator.mint();
         }
         return readAllBytes(id.toBytes());
     }
