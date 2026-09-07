@@ -214,6 +214,7 @@ impl SinkManager {
             callback,
             config.verbose,
             config.benchmark,
+            config.offset_commit,
             metrics,
             context.clone(),
         );

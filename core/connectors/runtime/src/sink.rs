@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::benchmark;
-use crate::configs::connectors::SinkConfig;
+use crate::configs::connectors::{OffsetCommitMode, SinkConfig};
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
 use crate::metrics::{Metrics, SinkLabels};
@@ -147,6 +147,7 @@ pub async fn init(
             error: init_error.clone(),
             verbose: config.verbose,
             benchmark: config.benchmark,
+            offset_commit: config.offset_commit,
         });
 
         if let Some(error) = init_error {
@@ -229,6 +230,7 @@ pub fn consume(
                 sink.callback,
                 plugin.verbose,
                 plugin.benchmark,
+                plugin.offset_commit,
                 &context.metrics,
                 context.clone(),
             );
@@ -251,6 +253,7 @@ pub(crate) fn spawn_consume_tasks(
     callback: ConsumeCallback,
     verbose: bool,
     benchmark: bool,
+    offset_commit: OffsetCommitMode,
     metrics: &Arc<Metrics>,
     context: Arc<RuntimeContext>,
 ) -> (watch::Sender<()>, Vec<JoinHandle<()>>) {
@@ -267,6 +270,7 @@ pub(crate) fn spawn_consume_tasks(
         let plugin_key = plugin_key.to_string();
         let metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let shutdown_tx = shutdown_tx.clone();
         let context = context.clone();
         let labels = labels.clone();
         let handle = tokio::spawn(async move {
@@ -279,6 +283,7 @@ pub(crate) fn spawn_consume_tasks(
                 consumer,
                 verbose,
                 benchmark,
+                offset_commit,
                 &plugin_key,
                 &metrics,
                 &labels,
@@ -294,6 +299,11 @@ pub(crate) fn spawn_consume_tasks(
                     .sinks
                     .set_error(&plugin_key, &error.to_string())
                     .await;
+                // The instance owns the target connection, so one topic's
+                // failure condemns the rest. Stopping them here keeps the
+                // failure domain the same as the recovery domain: the whole
+                // connector goes down, and `restart_connector` brings it back.
+                let _ = shutdown_tx.send(());
             }
         });
         task_handles.push(handle);
@@ -311,6 +321,7 @@ pub(crate) async fn consume_messages(
     mut consumer: IggyConsumer,
     verbose: bool,
     benchmark: bool,
+    offset_commit: OffsetCommitMode,
     plugin_key: &str,
     metrics: &Arc<Metrics>,
     labels: &SinkLabels,
@@ -389,6 +400,11 @@ pub(crate) async fn consume_messages(
         // Total always records; sub-stages only on success (no 0-sample skew).
         metrics.observe_stage_with_labels(&labels.stage_total, elapsed);
 
+        let consume_result = match &result {
+            Ok(timing) => timing.consume_result,
+            Err(_) => 0,
+        };
+
         let (processed_count, decode_us, prepare_us, ffi_us) = match &result {
             Ok(timing) => {
                 let prepare_elapsed = elapsed
@@ -428,6 +444,33 @@ pub(crate) async fn consume_messages(
                 "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
             );
             return Err(error);
+        }
+
+        if consume_result != 0 {
+            error!(
+                "Sink connector with ID: {plugin_id} rejected {messages_count} messages from \
+                 stream: {}, topic: {}, partition ID: {partition_id} with code: {consume_result}",
+                topic_metadata.stream, topic_metadata.topic,
+            );
+            metrics.inc_errors_with_labels(&labels.counter);
+            // A rejection means the target is unusable, not that this batch is
+            // bad - a sink drops bad records itself and returns success. Both
+            // modes stop: continuing would hand every later batch to the same
+            // failing target, and under `AfterPolling` each of those is already
+            // committed at poll time, so the topic would drain into nothing.
+            return Err(RuntimeError::SinkRejectedBatch(plugin_id, consume_result));
+        }
+
+        if offset_commit == OffsetCommitMode::AfterConsuming
+            && let Err(error) = consumer
+                .store_offset(message_offset, Some(partition_id))
+                .await
+        {
+            error!(
+                "Failed to store offset: {message_offset} for partition ID: {partition_id}, \
+                 sink connector with ID: {plugin_id}. {error}",
+            );
+            return Err(error.into());
         }
 
         metrics.inc_messages_processed_with_labels(&labels.counter, processed_count as u64);
@@ -502,6 +545,11 @@ pub(crate) async fn setup_sink_consumers(
         vec![]
     };
 
+    let auto_commit = match config.offset_commit {
+        OffsetCommitMode::AfterPolling => AutoCommit::When(AutoCommitWhen::PollingMessages),
+        OffsetCommitMode::AfterConsuming => AutoCommit::Disabled,
+    };
+
     let mut consumers = Vec::new();
     for stream in config.streams.iter() {
         let poll_interval = IggyDuration::from_str(
@@ -519,7 +567,7 @@ pub(crate) async fn setup_sink_consumers(
         for topic in stream.topics.iter() {
             let mut consumer = iggy_client
                 .consumer_group(consumer_group, &stream.stream, topic)?
-                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+                .auto_commit(auto_commit)
                 .create_consumer_group_if_not_exists()
                 .auto_join_consumer_group()
                 .polling_strategy(PollingStrategy::next())
@@ -737,7 +785,7 @@ async fn process_messages(
     })?;
 
     let ffi_start = Instant::now();
-    (consume)(
+    let consume_result = (consume)(
         plugin_id,
         topic_meta.as_ptr(),
         topic_meta.len(),
@@ -752,6 +800,7 @@ async fn process_messages(
         processed_count,
         decode_elapsed,
         ffi_elapsed,
+        consume_result,
     })
 }
 
@@ -759,4 +808,7 @@ struct SinkBatchTiming {
     processed_count: usize,
     decode_elapsed: Duration,
     ffi_elapsed: Duration,
+    /// Plugin's `iggy_sink_consume` return code: 0 on success, non-zero when
+    /// the sink rejected the batch.
+    consume_result: i32,
 }

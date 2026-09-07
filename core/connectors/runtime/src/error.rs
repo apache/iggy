@@ -27,6 +27,8 @@ pub enum RuntimeError {
     FailedToSerializeMessagesMetadata,
     #[error("Failed to serialize raw messages")]
     FailedToSerializeRawMessages,
+    #[error("Sink connector with ID: {0} rejected the batch with code: {1}")]
+    SinkRejectedBatch(u32, i32),
     #[error("Connector SDK error")]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
     /// A classified state-store failure while loading an enabled source's

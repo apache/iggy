@@ -71,6 +71,14 @@ impl ConnectorConfig {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OffsetCommitMode {
+    #[default]
+    AfterPolling,
+    AfterConsuming,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CreateSinkConfig {
     pub enabled: bool,
@@ -84,6 +92,8 @@ pub struct CreateSinkConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    #[serde(default)]
+    pub offset_commit: OffsetCommitMode,
 }
 
 impl CreateSinkConfig {
@@ -100,6 +110,7 @@ impl CreateSinkConfig {
             plugin_config: self.plugin_config.clone(),
             verbose: self.verbose,
             benchmark: self.benchmark,
+            offset_commit: self.offset_commit,
         }
     }
 }
@@ -122,6 +133,9 @@ pub struct SinkConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub offset_commit: OffsetCommitMode,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -409,5 +423,57 @@ impl ConnectorsConfig {
 
     pub fn sources(&self) -> &HashMap<String, SourceConfig> {
         &self.sources
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use configs::ConfigEnvMappings;
+
+    const MINIMAL_SINK_TOML: &str = r#"
+        key = "test"
+        enabled = true
+        version = 1
+        name = "test sink"
+        path = "libtest_sink"
+        streams = []
+    "#;
+
+    #[test]
+    fn given_sink_config_without_offset_commit_when_deserialized_should_default_to_after_polling() {
+        let config: SinkConfig = toml::from_str(MINIMAL_SINK_TOML).expect("failed to parse config");
+        assert_eq!(config.offset_commit, OffsetCommitMode::AfterPolling);
+    }
+
+    #[test]
+    fn given_sink_config_with_after_consuming_when_deserialized_should_parse_mode() {
+        let toml = format!("{MINIMAL_SINK_TOML}\noffset_commit = \"after_consuming\"\n");
+        let config: SinkConfig = toml::from_str(&toml).expect("failed to parse config");
+        assert_eq!(config.offset_commit, OffsetCommitMode::AfterConsuming);
+    }
+
+    #[test]
+    fn given_unknown_offset_commit_mode_when_deserialized_should_fail() {
+        let toml = format!("{MINIMAL_SINK_TOML}\noffset_commit = \"after_flushing\"\n");
+        let result: Result<SinkConfig, _> = toml::from_str(&toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_create_sink_config_when_converted_should_carry_offset_commit() {
+        let create = CreateSinkConfig {
+            offset_commit: OffsetCommitMode::AfterConsuming,
+            ..CreateSinkConfig::default()
+        };
+        let config = create.to_sink_config("test", 1);
+        assert_eq!(config.offset_commit, OffsetCommitMode::AfterConsuming);
+    }
+
+    #[test]
+    fn given_sink_config_env_mappings_should_expose_offset_commit_as_leaf() {
+        let mapping = <SinkConfig as ConfigEnvMappings>::find_by_config_path("offset_commit")
+            .expect("offset_commit is not exposed as an env var mapping");
+        assert!(mapping.env_name.ends_with("OFFSET_COMMIT"));
     }
 }

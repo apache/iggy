@@ -7268,6 +7268,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_test_sink"
+version = "0.5.0-edge.4"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "iggy_connector_sdk",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_examples"
 version = "0.0.6"
 dependencies = [
