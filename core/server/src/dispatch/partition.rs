@@ -216,7 +216,7 @@ where
     match result {
         Ok((fragments, current_offset, auto_commit)) => {
             if let Some(applied) = auto_commit
-                && let Err(error) = submit_auto_commit(shard, namespace, &applied)
+                && let Err(error) = submit_auto_commit(shard, namespace, applied)
             {
                 PartitionReadReply::Rejected(error)
             } else {
@@ -246,7 +246,17 @@ where
 /// poll is served on whichever node owns the namespace locally, which may be a
 /// backup. So gate on primary status here. Auto-commit
 /// is server-managed best-effort (at-least-once delivery), so a follower-served
-/// poll simply does not advance the durable offset.
+/// poll simply does not advance the durable offset. The same contract covers a
+/// local cursor that never became durable: when the per-kind live map is over
+/// its limit the partition evicts such a cursor, and that consumer's next
+/// `Next` poll restarts from offset 0.
+///
+/// A poll whose auto-commit cannot be submitted is answered
+/// `TransientNotAccepted` and returns no messages, even though the fragments
+/// were already read: the owning shard's inbox refused the frame, or the
+/// partition changed primary or incarnation during the read. Like the
+/// `TooManyConsumerOffsets` refusal at the key limit, it returns no batch.
+/// Transient refusals permit retry. Capacity refusals need available capacity.
 ///
 /// Coalescing: an offset the partition's committed high-water already covers is
 /// dropped without a consensus op (the steady state for a re-poll of committed
@@ -256,7 +266,7 @@ where
 fn submit_auto_commit<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
-    applied: &AutoCommitApplied,
+    applied: AutoCommitApplied,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -265,66 +275,55 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let primary = shard
-        .plane
-        .partitions()
-        .with_partition(&namespace, |partition| {
-            let consensus = partition.consensus();
-            if !partition.auto_commit_admission_ready(applied) {
-                return Err(IggyError::TransientNotAccepted);
-            }
-            Ok(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring())
-        });
-    if matches!(primary, None | Some(Err(_))) {
-        applied.rollback_created();
-        return Err(IggyError::TransientNotAccepted);
-    }
-    if primary == Some(Ok(false)) {
-        applied.mark_served();
-        debug!(
-            namespace_raw = namespace.inner(),
-            "auto-commit offset not replicated: partition not primary on this node (best-effort)"
-        );
-        return Ok(());
-    }
-    let reservation = match applied.reserve_durable() {
-        Ok(Some(reservation)) => reservation,
-        Ok(None) => {
-            applied.mark_served();
+    // Everything inside is synchronous: `admit` rolls the eager cursor update
+    // back on `Err` in the same call, and no await may sit between the update
+    // and that rollback.
+    applied.admit(|applied| {
+        let primary = shard
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                let consensus = partition.consensus();
+                if !partition.auto_commit_admission_ready(applied) {
+                    return Err(IggyError::TransientNotAccepted);
+                }
+                Ok(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring())
+            });
+        if matches!(primary, None | Some(Err(_))) {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        if primary == Some(Ok(false)) {
+            debug!(
+                namespace_raw = namespace.inner(),
+                "auto-commit offset not replicated: partition not primary on this node (best-effort)"
+            );
             return Ok(());
         }
-        Err(error) => {
-            if !error.uncertain {
-                shard.metrics().record_consumer_offset_denied(applied.kind);
+        let reservation = match applied.reserve_durable() {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                if !error.uncertain {
+                    shard.metrics().record_consumer_offset_denied(applied.kind);
+                }
+                warn_auto_commit_capacity(namespace, error);
+                return Err(error.into());
             }
-            warn_auto_commit_capacity(namespace, error);
-            applied.rollback_created();
-            return Err(error.into());
-        }
-    };
-    let message = match build_auto_commit_request(namespace, applied) {
-        Ok(message) => message,
-        Err(error) => {
-            applied.rollback_created();
+        };
+        let message = build_auto_commit_request(namespace, applied).inspect_err(|error| {
             warn!(
                 namespace_raw = namespace.inner(),
                 error = %error,
                 "failed to build auto-commit store-offset request"
             );
-            return Err(error);
-        }
-    };
-    // Routes by namespace to this same owning primary shard's inbox. The pump
-    // admits it next turn exactly like a client store. `dispatch` never blocks.
-    if shard
-        .submit_auto_commit_offset(message, reservation)
-        .is_err()
-    {
-        applied.rollback_created();
-        return Err(IggyError::TransientNotAccepted);
-    }
-    applied.mark_served();
-    Ok(())
+        })?;
+        // Routes by namespace to this same owning primary shard's inbox. The
+        // pump admits it next turn exactly like a client store. `dispatch`
+        // never blocks.
+        shard
+            .submit_auto_commit_offset(message, reservation)
+            .map_err(|_| IggyError::TransientNotAccepted)
+    })
 }
 
 fn warn_auto_commit_capacity(

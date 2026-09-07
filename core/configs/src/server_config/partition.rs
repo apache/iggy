@@ -186,8 +186,8 @@ pub struct PartitionConfig {
     /// Whether consumer-offset files are written crash-safe: data-synced, then
     /// renamed over the prior cursor, with the directory synced once per commit
     /// walk. Independent of the topic's `enforce_fsync`, which governs message
-    /// and index files. Off, an offset file is rewritten in place with no sync
-    /// and a crash costs at most a redelivery from the last flushed cursor.
+    /// and index files. Off, an offset file is rewritten in place with no sync.
+    /// A lost or torn cursor can cause replay from the earliest retained data.
     #[serde(default)]
     pub consumer_offset_enforce_fsync: bool,
 

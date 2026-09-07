@@ -222,9 +222,11 @@ where
     offset_reservations_scan_state: Option<(u64, u64, u64, Option<u64>)>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
     consumer_offset_dirs_dirty: [Cell<bool>; 2],
-    /// Set once the offsets mount refused a directory fsync, so the warning
-    /// fires once per partition rather than per commit walk.
-    consumer_offset_dir_sync_unsupported: Cell<bool>,
+    /// Latest operation of each kind in the current commit walk. Even a covered
+    /// store depends on an earlier unsynced directory entry of its kind.
+    consumer_offset_dirs_touched: [Cell<Option<(u64, Operation)>>; 2],
+    #[cfg(test)]
+    consumer_offset_dir_sync_fault: Cell<Option<usize>>,
     #[cfg(test)]
     offset_dir_sync_count: Cell<usize>,
     /// Highest `PurgeTopic` generation this replica has locally applied (reset
@@ -579,7 +581,9 @@ where
             offset_reservations_scan_state: None,
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             consumer_offset_dirs_dirty: [Cell::new(false), Cell::new(false)],
-            consumer_offset_dir_sync_unsupported: Cell::new(false),
+            consumer_offset_dirs_touched: [Cell::new(None), Cell::new(None)],
+            #[cfg(test)]
+            consumer_offset_dir_sync_fault: Cell::new(None),
             #[cfg(test)]
             offset_dir_sync_count: Cell::new(0),
             applied_purge_generation: 0,
@@ -2122,6 +2126,13 @@ where
         // durably stored; the in-memory update is idempotent on replay
         // because we look up by (kind, id).
         self.persist_consumer_offset_commit(pending).await?;
+        let operation = match pending.mutation {
+            PendingConsumerOffsetMutation::Upsert(_) => Operation::StoreConsumerOffset,
+            PendingConsumerOffsetMutation::Delete => Operation::DeleteConsumerOffset,
+        };
+        // A covered store also depends on an earlier dirty directory entry.
+        self.consumer_offset_dirs_touched[crate::state_transfer::consumer_kind_index(pending.kind)]
+            .set(Some((op, operation)));
         self.apply_consumer_offset_commit(pending);
         self.pending_consumer_offset_commits.remove(&op);
         self.refresh_consumer_offset_reservation(pending.kind, pending.consumer_id);
@@ -2206,10 +2217,9 @@ where
             }
             PendingConsumerOffsetMutation::Delete => {
                 if let Some(path) = path.as_deref() {
-                    // A committed delete applies on every replica, so an
-                    // unlinkable file cannot refuse it. The key stays stranded:
-                    // the file may resurrect at boot, and a stranded key admits
-                    // the delete that settles it.
+                    // Keep the logical state until the file is removed. The
+                    // partition journal is memory-only, so acknowledging an
+                    // unsuccessful unlink would let boot resurrect the key.
                     match delete_persisted_offset(path).await {
                         Ok(removed) => {
                             if removed && self.consumer_offset_enforce_fsync {
@@ -2230,6 +2240,7 @@ where
                                 %error,
                                 "committed consumer offset delete could not remove its file"
                             );
+                            return Err(error);
                         }
                     }
                 }
@@ -2355,21 +2366,27 @@ where
         if !self.consensus.is_primary() || !self.consensus.is_normal() {
             return Vec::new();
         }
-        let mut dead = Vec::new();
-        for key in self.consumer_group_offsets.pin().keys() {
-            let Ok(id) = u32::try_from(key.0) else {
-                continue;
-            };
-            if !is_live(u64::from(id)) {
-                dead.push(id);
-            }
-        }
         // A stranded file already failed normal loading or unlink. Reissuing
         // replicated deletes every reconciliation pass cannot make its
         // filesystem writable and would create a permanent commit loop.
         // A single-replica explicit deletion can retry after repair. On a
         // replicated partition the file must be repaired or removed locally,
         // because older peers do not recognize a delete for a map-missing key.
+        let capacity = self.consumer_offset_capacity_for(ConsumerKind::ConsumerGroup);
+        let mut dead = Vec::new();
+        for key in self.consumer_group_offsets.pin().keys() {
+            let Ok(id) = u32::try_from(key.0) else {
+                continue;
+            };
+            if !is_live(u64::from(id))
+                && !capacity.is_stranded(id)
+                && self
+                    .durable_consumer_offsets
+                    .contains(ConsumerKind::ConsumerGroup, id)
+            {
+                dead.push(id);
+            }
+        }
         dead.sort_unstable();
         dead.dedup();
         dead
@@ -2449,26 +2466,35 @@ where
             return;
         }
         self.apply_consumer_offset_commit(pending);
-        if let Err(error) = self.flush_consumer_offset_directories().await {
+        // Only this request's kind: dirt on the other directory belongs to
+        // whichever path left it, and its failure is not this client's answer.
+        // Visibility does not prove crash durability. A failed required barrier
+        // must remain an error even after the mutation becomes visible.
+        let mut kinds = [false; 2];
+        kinds[crate::state_transfer::consumer_kind_index(kind)] = true;
+        let failed = self.flush_consumer_offset_directories_for(kinds).await;
+        if failed.iter().any(|failed| *failed) {
             if offset.is_some() {
                 self.release_consumer_offset_reservation(kind, consumer_id);
             } else {
-                // The delete already took effect in the maps. Stranding keeps
-                // the key admissible, so the client's retry passes the
-                // existence check and re-flushes instead of reading 3021.
+                // Retain retry admission after the visible deletion so a new
+                // delete can retry its directory barrier instead of returning
+                // ConsumerOffsetNotFound.
                 self.consumer_offset_capacity_for(kind)
                     .record_stranded(consumer_id);
             }
             emit_partition_diag(
                 tracing::Level::WARN,
-                &PartitionDiagEvent::new(self.diag_ctx(), "no_ack offset directory sync failed")
-                    .with_operation(request_header.operation)
-                    .with_error(error.to_string()),
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "no_ack offset directory sync failed after a visible local mutation",
+                )
+                .with_operation(request_header.operation),
             );
             Self::send_partition_deny_or_log(
                 &self.consensus,
                 &request_header,
-                error.as_code(),
+                IggyError::CannotSyncFile.as_code(),
                 "no_ack offset directory sync failure reply send failed",
                 waiter,
             )
@@ -2614,6 +2640,14 @@ where
         kind: ConsumerKind,
         consumer_id: u32,
     ) -> Result<(), IggyError> {
+        if self.durable_consumer_offsets.contains(kind, consumer_id) {
+            return Ok(());
+        }
+        // A local-only cursor is not a replicated key. Older replicas reject
+        // missing-key deletes when replaying as primary during a rolling upgrade.
+        if self.consensus.replica_count() > 1 {
+            return Err(IggyError::ConsumerOffsetNotFound(consumer_id as usize));
+        }
         let found = match kind {
             ConsumerKind::Consumer => {
                 let key = usize::try_from(consumer_id).expect("u32 consumer id must fit usize");
@@ -2627,15 +2661,10 @@ where
             }
         };
 
-        // The live maps are what `get_consumer_offset` answers from, so a key
-        // visible there must also be deletable. The durable table covers keys
-        // a replicated store committed but a NoAck-only apply never mapped.
-        let durable = self.consensus.replica_count() > 1
-            && self.durable_consumer_offsets.contains(kind, consumer_id);
         let local_stranded = self
             .consumer_offset_capacity_for(kind)
             .is_stranded(consumer_id);
-        if found || durable || local_stranded {
+        if found || local_stranded {
             Ok(())
         } else {
             Err(IggyError::ConsumerOffsetNotFound(
@@ -2715,7 +2744,9 @@ where
         let mut rebuilt: HashMap<_, _> = self
             .pending_consumer_offset_commits
             .iter()
-            .filter(|(op, _)| **op >= from_op && (**op <= commit_max || same_view))
+            .filter(|(op, _)| {
+                **op >= from_op && (**op <= commit_max || (same_view && **op <= to_op))
+            })
             .map(|(op, pending)| (*op, *pending))
             .collect();
         let headers = self.log.journal().inner.repair_headers_in(from_op..=to_op);
@@ -2824,11 +2855,17 @@ where
                 && map.remove(key).is_some()
             {
                 capacity.forget_inactive_provisional(id);
-                debug!(
+                // This cursor was never durable, so the consumer's next `Next`
+                // poll restarts from offset 0 and redelivers. At-least-once
+                // permits it; an operator should still see it happen.
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
                     namespace_raw = self.namespace().inner(),
                     ?kind,
                     consumer_id = id,
-                    "reclaimed local consumer offset cursor"
+                    "reclaimed a local consumer offset cursor with no durable backing; its next \
+                     poll restarts from offset 0"
                 );
                 remaining -= 1;
                 if remaining == 0 {
@@ -3672,10 +3709,15 @@ where
     /// # Panics
     /// On mid-iteration status flip. Reachable only if `clear_request_queue`
     /// is bypassed at view-change reset.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn drain_request_queue_into_prepares(&mut self, slots_freed: usize) {
         self.resynchronize_consumer_offset_reservations();
         let mut promoted = 0;
+        // Denials do not consume a slot, so without a budget one drain could
+        // answer the whole queue, each with an awaited reply send, inside one
+        // commit turn. Consecutive denials end the drain. The shard tick
+        // resumes parked work even if no further operation commits.
+        let mut consecutive_denials = 0usize;
         while promoted < slots_freed {
             let req = self.consensus().pop_queued_request();
             let Some(mut req) = req else { break };
@@ -3722,6 +3764,10 @@ where
                         reply_sender.take(),
                     )
                     .await;
+                    consecutive_denials += 1;
+                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                        break;
+                    }
                     continue;
                 };
                 if let Some(error) = self.store_offset_range_error(offset) {
@@ -3733,6 +3779,10 @@ where
                         reply_sender.take(),
                     )
                     .await;
+                    consecutive_denials += 1;
+                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                        break;
+                    }
                     continue;
                 }
                 if !self
@@ -3744,9 +3794,14 @@ where
                     )
                     .await
                 {
+                    consecutive_denials += 1;
+                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                        break;
+                    }
                     continue;
                 }
             }
+            consecutive_denials = 0;
 
             let prepare = {
                 let consensus = self.consensus();
@@ -3778,6 +3833,23 @@ where
             };
             promoted += 1;
             self.on_replicate(prepare).await;
+        }
+    }
+
+    #[must_use]
+    pub fn queued_requests_ready(&self) -> bool {
+        self.fatal.is_none()
+            && self.consensus.is_primary()
+            && self.consensus.is_normal()
+            && !self.consensus.is_transferring()
+            && !self.consensus.pipeline_is_full()
+            && self.consensus.request_queue_len() > 0
+    }
+
+    /// Resume a bounded promotion turn without waiting for another commit.
+    pub async fn resume_queued_requests(&mut self) {
+        if self.queued_requests_ready() {
+            self.drain_request_queue_into_prepares(1).await;
         }
     }
 
@@ -4547,6 +4619,9 @@ where
             }
         }
         self.consensus.invalidate_local_dvc_suffix();
+        let commit_max = self.consensus.commit_max();
+        self.pending_consumer_offset_commits
+            .retain(|op, _| *op < from_op || *op <= commit_max);
         self.offset_reservations_need_resync.set(true);
         Ok(removed)
     }
@@ -4932,6 +5007,9 @@ where
         // commit_min and their replies and dedup folds stay owned by `drained`.
         // A failure at entry K fences the replica. Recovery replays the whole
         // unadvanced prefix idempotently, including entries applied before K.
+        for cell in &self.consumer_offset_dirs_touched {
+            cell.set(None);
+        }
         for (entry, batch_stats) in drained.iter().zip(&committed_batch_stats) {
             let prepare_header = entry.header;
             if !self
@@ -4982,19 +5060,42 @@ where
         }
 
         // Commit replies and the applied frontier must follow directory
-        // durability. One sync per touched kind covers the whole walk. A sync
-        // failure is attributed to the batch boundary because one directory
-        // sync covers every delete in that kind, not one uniquely failing op.
-        if let Err(error) = self.flush_consumer_offset_directories().await {
-            if let Some(entry) = drained.last() {
-                error!(namespace_raw, %error, "consumer offset directory sync failed after committed operations");
+        // durability. One sync per dirty kind covers the whole walk. A sync
+        // failure is attributed to an operation of that kind in this walk.
+        // Covered stores depend on previously dirty directory entries too.
+        // Only a kind THIS walk uses can fence it: dirt left by a NoAck
+        // request belongs to that request's kind, and fencing a walk that wrote
+        // consumer offsets over the groups directory would take the node down
+        // for a failure none of its ops caused.
+        let touched = [
+            self.consumer_offset_dirs_touched[0].replace(None),
+            self.consumer_offset_dirs_touched[1].replace(None),
+        ];
+        let failed = self
+            .flush_consumer_offset_directories_for(touched.map(|entry| entry.is_some()))
+            .await;
+        if failed.iter().any(|failed| *failed) {
+            let failed_entry = failed
+                .iter()
+                .zip(touched)
+                .find_map(|(failed, entry)| if *failed { entry } else { None });
+            error!(
+                namespace_raw,
+                failed_consumer = failed[0],
+                failed_consumer_group = failed[1],
+                touched_consumer = touched[0].is_some(),
+                touched_consumer_group = touched[1].is_some(),
+                fences = failed_entry.is_some(),
+                "consumer offset directory sync failed after committed operations"
+            );
+            if let Some((op, operation)) = failed_entry {
                 self.fatal = Some(FatalCommit {
                     namespace_raw,
-                    op: entry.header.op,
-                    operation: entry.header.operation,
+                    op,
+                    operation,
                 });
+                return;
             }
-            return;
         }
 
         for (mut entry, batch_stats) in drained.into_iter().zip(committed_batch_stats) {
@@ -5108,8 +5209,11 @@ where
         self.drain_request_queue_into_prepares(drained_count).await;
     }
 
-    async fn flush_consumer_offset_directories(&self) -> Result<(), IggyError> {
-        let mut failed = false;
+    /// Sync the dirty offset directories selected by `kinds`, indexed by
+    /// `consumer_kind_index`. Returns which of them failed. A failed directory
+    /// stays dirty for the next attempt.
+    async fn flush_consumer_offset_directories_for(&self, kinds: [bool; 2]) -> [bool; 2] {
+        let mut failed = [false; 2];
         for (index, dir) in [
             self.consumer_offsets_path.as_deref(),
             self.consumer_group_offsets_path.as_deref(),
@@ -5117,7 +5221,12 @@ where
         .into_iter()
         .enumerate()
         {
-            if !self.consumer_offset_dirs_dirty[index].get() {
+            if !kinds[index] || !self.consumer_offset_dirs_dirty[index].get() {
+                continue;
+            }
+            #[cfg(test)]
+            if self.consumer_offset_dir_sync_fault.get() == Some(index) {
+                failed[index] = true;
                 continue;
             }
             if let Some(dir) = dir {
@@ -5127,29 +5236,6 @@ where
                         // The directory disappeared after the final unlink.
                         // There is no remaining dirent whose durability needs
                         // proving.
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
-                        ) =>
-                    {
-                        // The filesystem refuses directory fsync outright. Nothing
-                        // this replica does will make it succeed, so failing the
-                        // commit walk over it would fence every partition on such
-                        // a mount.
-                        if !self.consumer_offset_dir_sync_unsupported.replace(true) {
-                            warn!(
-                                target: "iggy.partitions.diag",
-                                plane = "partitions",
-                                replica_id = self.consensus.replica(),
-                                namespace_raw = self.namespace().inner(),
-                                path = dir,
-                                error_kind = ?error.kind(),
-                                "filesystem does not support directory fsync; consumer offset \
-                                 unlinks are not crash-durable here"
-                            );
-                        }
                     }
                     Err(error) => {
                         warn!(
@@ -5162,7 +5248,7 @@ where
                             %error,
                             "consumer offset directory sync failed"
                         );
-                        failed = true;
+                        failed[index] = true;
                         continue;
                     }
                 }
@@ -5172,16 +5258,18 @@ where
             }
             self.consumer_offset_dirs_dirty[index].set(false);
         }
-        if failed {
-            Err(IggyError::CannotSyncFile)
-        } else {
-            Ok(())
-        }
+        failed
     }
 
     fn mark_consumer_offset_dir_dirty(&self, kind: ConsumerKind) {
         let index = crate::state_transfer::consumer_kind_index(kind);
         self.consumer_offset_dirs_dirty[index].set(true);
+    }
+
+    /// Keys of `kind` whose offset file could not be loaded or unlinked.
+    #[must_use]
+    pub fn stranded_consumer_offset_count(&self, kind: ConsumerKind) -> usize {
+        self.consumer_offset_capacity_for(kind).stranded_count()
     }
 
     /// Batch stats for each drained entry, positionally parallel to `drained`.
@@ -7155,6 +7243,11 @@ fn accumulate_committed_info(
 /// it -- only a backlog does, and that one drains over several passes.
 const SEGMENT_REMOVAL_BUDGET_PER_PASS: usize = 16;
 
+/// Consecutive denials that end one promotion drain. Denials free no slot, so
+/// without this bound a single commit turn could answer every queued request,
+/// each with an awaited reply send.
+const PROMOTION_DENIALS_MAX: usize = 4;
+
 /// What one call to [`IggyPartition::remove_sealed_segments_up_to`] reclaimed.
 ///
 /// `budget_spent` reports that the pass stopped on
@@ -8683,7 +8776,12 @@ mod tests {
         partition.consumer_group_offsets_path = Some(dir.path().to_string_lossy().into_owned());
         partition.mark_consumer_offset_dir_dirty(ConsumerKind::Consumer);
         partition.mark_consumer_offset_dir_dirty(ConsumerKind::ConsumerGroup);
-        assert!(partition.flush_consumer_offset_directories().await.is_err());
+        assert_eq!(
+            partition
+                .flush_consumer_offset_directories_for([true, true])
+                .await,
+            [true, false]
+        );
         assert!(partition.consumer_offset_dirs_dirty[0].get());
         assert!(!partition.consumer_offset_dirs_dirty[1].get());
         assert_eq!(partition.offset_dir_sync_count.get(), 1);
@@ -8835,6 +8933,100 @@ mod tests {
             7
         );
         assert!(partition.consensus.pop_queued_request().is_none());
+    }
+
+    #[compio::test]
+    async fn given_same_view_truncation_when_resynchronizing_should_release_discarded_reservations()
+    {
+        let mut partition = test_partition();
+        journal_prepare(&partition, 1, Operation::StoreConsumerOffset).await;
+        journal_prepare(&partition, 2, Operation::StoreConsumerOffset).await;
+        partition.consensus.sequencer().set_sequence(2);
+        partition.stage_consumer_offset_upsert(1, ConsumerKind::Consumer, 7, 0, false);
+        partition.stage_consumer_offset_upsert(2, ConsumerKind::Consumer, 8, 0, false);
+        partition.truncate_uncommitted_from(2).await.unwrap();
+        partition.resynchronize_consumer_offset_reservations();
+        assert!(partition.pending_consumer_offset_commits.contains_key(&1));
+        assert!(!partition.pending_consumer_offset_commits.contains_key(&2));
+        assert_eq!(
+            partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
+            1
+        );
+        assert!(!partition.consumer_offset_capacity.is_uncertain());
+    }
+
+    #[compio::test]
+    async fn given_promotion_denial_budget_when_no_more_commits_arrive_should_resume_queued_work() {
+        let (mut partition, sent) = recording_partition_at(0, 3);
+        partition.set_consumer_offsets_max(1);
+        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
+        partition.consumer_offsets.pin().insert(
+            7,
+            ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new()),
+        );
+        partition.stats.increment_messages_count(1);
+        for (request, id) in [8, 9, 10, 11, 12, 7].into_iter().enumerate() {
+            partition
+                .consensus
+                .push_queued_request(consensus::RequestEntry::with_sender(
+                    store_offset_request(
+                        42,
+                        request as u64 + 1,
+                        ConsumerKind::Consumer,
+                        id,
+                        0,
+                        AckLevel::Quorum,
+                    ),
+                    None,
+                ))
+                .unwrap();
+        }
+        partition.drain_request_queue_into_prepares(1).await;
+        assert_eq!(sent.borrow().len(), PROMOTION_DENIALS_MAX);
+        assert_eq!(partition.consensus.request_queue_len(), 2);
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+        assert!(partition.queued_requests_ready());
+        partition.resume_queued_requests().await;
+        assert_eq!(partition.consensus.request_queue_len(), 0);
+        assert_eq!(partition.consensus.pipeline_len(), 1);
+        assert!(!partition.queued_requests_ready());
+    }
+
+    #[compio::test]
+    async fn given_covered_store_with_dirty_directory_when_sync_fails_should_fence_its_own_operation()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut partition, sent) = recording_partition_at(0, 3);
+        partition.consumer_offsets_path = Some(dir.path().to_string_lossy().into_owned());
+        partition.consumer_offset_enforce_fsync = true;
+        let pending =
+            PendingConsumerOffsetCommit::upsert_auto_commit(ConsumerKind::Consumer, 7, 10);
+        partition
+            .persist_consumer_offset_commit(pending)
+            .await
+            .unwrap();
+        partition.apply_consumer_offset_commit(pending);
+        partition.consumer_offset_dir_sync_fault.set(Some(0));
+        partition.stage_consumer_offset_upsert(1, ConsumerKind::Consumer, 7, 5, true);
+        partition.consensus.restore_commit_state(0, 1);
+        let header = PrepareHeader {
+            op: 1,
+            operation: Operation::StoreConsumerOffset,
+            client: 42,
+            request: 1,
+            ..Default::default()
+        };
+        partition
+            .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
+            .await;
+        assert_eq!(partition.fatal.as_ref().unwrap().op, 1);
+        assert_eq!(
+            partition.fatal.as_ref().unwrap().operation,
+            Operation::StoreConsumerOffset
+        );
+        assert_eq!(partition.consensus.commit_min(), 0);
+        assert!(sent.borrow().is_empty());
+        assert!(partition.consumer_offset_dirs_dirty[0].get());
     }
 
     #[compio::test]
@@ -9623,13 +9815,30 @@ mod tests {
         std::fs::create_dir_all(group_dir.join("7")).unwrap();
         let (mut partition, _) = recording_partition();
         partition.consumer_group_offsets_path = Some(group_dir.to_string_lossy().into_owned());
-        partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, 7);
+        // In the live map, so the reclaim walk actually meets the key and the
+        // stranded filter is what keeps it out of the delete log.
+        partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 7, 11, 11);
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(7),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
+        );
+        partition.consumer_group_offset_capacity.record_stranded(7);
         assert!(partition.consumer_group_offset_capacity.is_stranded(7));
+        assert_eq!(
+            partition.dead_consumer_group_offset_ids(|_| true),
+            Vec::<u32>::new()
+        );
         assert!(
             partition
                 .dead_consumer_group_offset_ids(|_| false)
                 .is_empty(),
             "automatic cleanup must not resubmit a known failed unlink"
+        );
+        partition.consumer_group_offset_capacity.clear_stranded(7);
+        assert_eq!(
+            partition.dead_consumer_group_offset_ids(|_| false),
+            vec![7],
+            "the same dead key is reclaimed once it is no longer stranded"
         );
         assert!(
             partition
@@ -9640,17 +9849,14 @@ mod tests {
     }
 
     #[test]
-    fn given_visible_or_stranded_key_when_replicated_should_admit_the_delete() {
-        // Whatever `get_consumer_offset` can answer from, or whatever a file on
-        // disk may resurrect at boot, must be deletable. A replicated delete of a
-        // key some replica never held applies there as a no-op.
+    fn given_local_only_key_when_replicated_should_require_durable_membership_to_delete() {
         let (partition, _) = recording_partition_at(0, 3);
         partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, 7);
         assert!(
             partition
                 .ensure_consumer_offset_exists(ConsumerKind::ConsumerGroup, 7)
-                .is_ok(),
-            "a stranded key is exactly what a delete settles"
+                .is_err(),
+            "a stranded file is not a replicated key"
         );
         partition.consumer_group_offsets.pin().insert(
             ConsumerGroupId(8),
@@ -9659,8 +9865,8 @@ mod tests {
         assert!(
             partition
                 .ensure_consumer_offset_exists(ConsumerKind::ConsumerGroup, 8)
-                .is_ok(),
-            "a key a read can see must be deletable"
+                .is_err(),
+            "a local poll cursor must not produce a missing-key delete on an older peer"
         );
         partition
             .durable_consumer_offsets
@@ -9687,7 +9893,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_committed_delete_when_unlink_fails_should_apply_and_strand_the_key() {
+    async fn given_committed_delete_when_unlink_fails_should_preserve_state_and_report_failure() {
         let dir = tempfile::tempdir().unwrap();
         let group_dir = dir.path().join("groups");
         std::fs::create_dir_all(group_dir.join("7")).unwrap();
@@ -9700,21 +9906,19 @@ mod tests {
         partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 7, 11, 11);
         partition.stage_consumer_offset_delete(1, ConsumerKind::ConsumerGroup, 7);
 
-        // The committed delete applies on every replica regardless of the
-        // unlink. The key stays stranded so the directory entry that may
-        // resurrect at boot is still counted and still deletable.
+        // A failed file mutation cannot become a successful logical delete.
         assert!(
             partition
                 .apply_staged_consumer_offset_commit(1)
                 .await
-                .is_ok()
+                .is_err()
         );
-        assert!(partition.consumer_group_offset_ids().is_empty());
+        assert_eq!(partition.consumer_group_offset_ids(), vec![7]);
         assert_eq!(
             partition.durable_consumer_offset_count(ConsumerKind::ConsumerGroup),
-            0
+            1
         );
-        assert!(!partition.pending_consumer_offset_commits.contains_key(&1));
+        assert!(partition.pending_consumer_offset_commits.contains_key(&1));
         assert!(partition.consumer_group_offset_capacity.is_stranded(7));
         assert!(partition.fatal.is_none());
     }
@@ -9761,18 +9965,17 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_no_ack_store_when_genuine_directory_sync_fails_should_keep_maps_consistent() {
+    async fn given_no_ack_store_when_its_directory_sync_fails_should_report_failure_and_stay_dirty()
+    {
         let dir = tempfile::tempdir().unwrap();
         let (mut partition, sent) = recording_partition();
         partition.consumer_offsets_path =
             Some(dir.path().join("consumers").to_string_lossy().into_owned());
-        // A path under a regular file: opening it fails with ENOTDIR, which is
-        // neither the tolerated "gone" nor the tolerated "unsupported".
-        let not_a_dir = dir.path().join("file");
-        std::fs::write(&not_a_dir, b"not a directory").unwrap();
         partition.consumer_group_offsets_path =
-            Some(not_a_dir.join("groups").to_string_lossy().into_owned());
-        partition.consumer_offset_dirs_dirty[1].set(true);
+            Some(dir.path().join("groups").to_string_lossy().into_owned());
+        partition.consumer_offset_enforce_fsync = true;
+        // Visibility alone cannot satisfy the explicitly requested barrier.
+        partition.consumer_offset_dir_sync_fault.set(Some(0));
         partition.stats.increment_messages_count(1);
 
         partition
@@ -9797,8 +10000,133 @@ mod tests {
                 )
                 .ok()
             })
-            .expect("sync failure reply");
+            .expect("failure reply");
         assert_eq!(header.status, IggyError::CannotSyncFile.as_code());
+        assert!(
+            partition.consumer_offset_dirs_dirty[0].get(),
+            "the failed directory keeps its dirt for the next walk"
+        );
+    }
+
+    #[compio::test]
+    async fn given_stale_dirt_on_the_other_kind_when_its_sync_fails_should_not_fence_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut partition, sent) = recording_partition_at(0, 3);
+        partition.consumer_offsets_path =
+            Some(dir.path().join("consumers").to_string_lossy().into_owned());
+        partition.consumer_group_offsets_path =
+            Some(dir.path().join("groups").to_string_lossy().into_owned());
+        partition.consumer_offset_enforce_fsync = true;
+        // Dirt a NoAck request left on the groups directory, whose sync now
+        // fails. This walk writes consumer offsets only.
+        partition.consumer_offset_dirs_dirty[1].set(true);
+        partition.consumer_offset_dir_sync_fault.set(Some(1));
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert(
+                ConsumerKind::Consumer,
+                1,
+                0,
+            ))
+            .await
+            .unwrap();
+        partition.stage_consumer_offset_delete(1, ConsumerKind::Consumer, 1);
+        let header = PrepareHeader {
+            op: 1,
+            operation: Operation::DeleteConsumerOffset,
+            client: 42,
+            request: 1,
+            ..Default::default()
+        };
+        partition.consensus.restore_commit_state(0, 1);
+        partition
+            .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
+            .await;
+        assert!(
+            partition.fatal.is_none(),
+            "a failure on a kind this walk did not write must not fence it"
+        );
+        assert_eq!(partition.consensus.commit_min(), 1);
+        assert_eq!(sent.borrow().len(), 1);
+        assert!(!partition.consumer_offset_dirs_dirty[0].get());
+        assert!(partition.consumer_offset_dirs_dirty[1].get());
+
+        // The same failure on the kind the walk wrote fences it.
+        partition.consumer_offset_dir_sync_fault.set(Some(0));
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert(
+                ConsumerKind::Consumer,
+                2,
+                0,
+            ))
+            .await
+            .unwrap();
+        partition.stage_consumer_offset_delete(2, ConsumerKind::Consumer, 2);
+        let header = PrepareHeader {
+            op: 2,
+            operation: Operation::DeleteConsumerOffset,
+            client: 42,
+            request: 2,
+            ..Default::default()
+        };
+        partition.consensus.advance_commit_max(2);
+        partition
+            .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
+            .await;
+        assert!(
+            partition.fatal.is_some(),
+            "a sync failure on a written kind fences the walk"
+        );
+        assert_eq!(partition.consensus.commit_min(), 1);
+    }
+
+    #[compio::test]
+    async fn given_no_ack_delete_sync_failure_when_retried_should_retry_barrier_and_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut partition, sent) = recording_partition();
+        partition.consumer_offsets_path = Some(dir.path().to_string_lossy().into_owned());
+        partition.consumer_offset_enforce_fsync = true;
+        let stored = PendingConsumerOffsetCommit::upsert(ConsumerKind::Consumer, 7, 0);
+        partition
+            .persist_consumer_offset_commit(stored)
+            .await
+            .unwrap();
+        partition.apply_consumer_offset_commit(stored);
+        partition.consumer_offset_dir_sync_fault.set(Some(0));
+        partition
+            .apply_consumer_offset_no_ack(
+                Box::new(*delete_offset_request(42, 1, 7).header()),
+                ConsumerKind::Consumer,
+                7,
+                None,
+                None,
+            )
+            .await;
+        let status = |index: usize| {
+            let frames = sent.borrow();
+            let bytes = frames[index].1.as_slice();
+            let start = std::mem::offset_of!(ReplyHeader, status);
+            u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
+        };
+        assert_eq!(status(0), IggyError::CannotSyncFile.as_code());
+        assert!(!dir.path().join("7").exists());
+        assert!(
+            partition
+                .ensure_consumer_offset_exists(ConsumerKind::Consumer, 7)
+                .is_ok()
+        );
+        partition.consumer_offset_dir_sync_fault.set(None);
+        partition
+            .apply_consumer_offset_no_ack(
+                Box::new(*delete_offset_request(42, 2, 7).header()),
+                ConsumerKind::Consumer,
+                7,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status(1), 0);
+        assert!(!partition.consumer_offset_dirs_dirty[0].get());
+        assert!(!partition.consumer_offset_capacity.is_stranded(7));
     }
 
     #[test]

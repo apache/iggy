@@ -49,7 +49,7 @@ use iggy_binary_protocol::{
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
+use iggy_common::{ConsumerKind, IggyError, IggyExpiry, IggyTimestamp};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::RequestHandler;
@@ -366,6 +366,14 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
+    /// The read was refused and returns no messages, even where fragments were
+    /// already gathered. For a poll with `auto_commit`, `TooManyConsumerOffsets`
+    /// when the poll needed a new offset key past `[partition]
+    /// consumer_offsets_max`, and `TransientNotAccepted` when the auto-commit
+    /// could not be submitted: the owning shard's inbox was full, or the
+    /// partition changed primary or incarnation during the read. Transient
+    /// refusal permits re-polling. A capacity refusal needs a slot reclaimed
+    /// or a higher configured limit before a new key can succeed.
     Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
     /// committed offsets on this partition (each `None` if absent).
@@ -2043,7 +2051,7 @@ where
             .ok_or(PartitionSubmitRefused)?;
         sender.try_send(frame).map_err(|error| {
             self.metrics.record_frame_drop(
-                crate::metrics::frame_drop_variant::PARTITION,
+                crate::metrics::frame_drop_variant::PARTITION_AUTO_COMMIT,
                 crate::coordinator::classify_try_send_err(&error),
             );
             PartitionSubmitRefused
@@ -7088,6 +7096,14 @@ where
                     continue;
                 };
                 partition.retry_consumer_offset_reservations();
+                if partition.queued_requests_ready() {
+                    if walks < PARTITION_WALKS_PER_TICK_MAX {
+                        walks += 1;
+                        partition.resume_queued_requests().await;
+                    } else {
+                        walk_cursor.get_or_insert(namespace);
+                    }
+                }
                 let consensus_normal = partition.consensus().is_normal();
                 let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
@@ -7459,6 +7475,21 @@ where
         // retires whatever completed.
         self.partition_repairs_inflight
             .set(repairs_live + repair_arms);
+        // Republished per sweep like the repair count: a stranded key is
+        // permanent until its own store or delete succeeds, so a gauge that
+        // never falls is the operator's only signal.
+        let mut stranded = [0usize; 2];
+        for namespace in partitions.namespaces() {
+            if let Some(partition) = partitions.get_by_ns(namespace) {
+                stranded[0] += partition.stranded_consumer_offset_count(ConsumerKind::Consumer);
+                stranded[1] +=
+                    partition.stranded_consumer_offset_count(ConsumerKind::ConsumerGroup);
+            }
+        }
+        self.metrics
+            .set_consumer_offsets_stranded(ConsumerKind::Consumer, stranded[0]);
+        self.metrics
+            .set_consumer_offsets_stranded(ConsumerKind::ConsumerGroup, stranded[1]);
 
         fatal
     }

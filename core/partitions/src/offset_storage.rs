@@ -51,7 +51,9 @@ pub enum OffsetRecord {
     /// A usable offset. `checksummed` is false for a bare offset predating the
     /// checksum, read as-is and upgraded by the next write.
     Value { offset: u64, checksummed: bool },
-    /// Shorter than the value, such as a legacy interrupted in-place write.
+    /// Shorter than the value: a crash between the truncate and the write of an
+    /// in-place update, the default path while `consumer_offset_enforce_fsync`
+    /// is off.
     Torn,
     /// The checksum does not describe the value stored beside it.
     Corrupt {
@@ -109,12 +111,13 @@ pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
 
 /// Overwrite a consumer-offset file with `offset` and a checksum over it.
 ///
-/// Without `enforce_fsync` the file is rewritten in place. With it, the record
-/// goes to a sibling inode, is data-synced and renamed over the prior file, so a
-/// failed write leaves the prior cursor intact. The replacement is tied to the
-/// same knob as the sync: without the sync neither the write nor the rename is
-/// ordered against a crash, so the extra inode and rename buy nothing. The
-/// caller syncs the parent directory afterwards.
+/// Without `enforce_fsync` the file is rewritten in place and no directory is
+/// synced. With it, the record goes to a sibling inode, is data-synced and
+/// renamed over the prior file, so a failed write leaves the prior cursor
+/// intact, and the caller marks the parent directory for a sync on the next
+/// commit walk. The replacement is tied to the same knob as the sync: without
+/// the sync neither the write nor the rename is ordered against a crash, so
+/// the extra inode and rename buy nothing.
 ///
 /// # Errors
 /// [`IggyError`] when the directory, file, or write cannot be created or completed.

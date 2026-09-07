@@ -347,18 +347,42 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .text()
         .await
         .expect("metrics text");
-    let denied: u64 = metrics
-        .lines()
-        .filter(|line| line.starts_with("partition_consumer_offsets_denied_total{"))
-        .map(|line| {
-            line.split_whitespace()
-                .last()
-                .expect("counter value")
-                .parse::<u64>()
-                .expect("numeric counter")
-        })
-        .sum();
-    assert_eq!(denied, 3, "one explicit TCP, one poll, and one HTTP denial");
+    let denied_for = |kind: &str| -> u64 {
+        let kind_label = format!("kind=\"{kind}\"");
+        let mut samples = 0;
+        let total = metrics
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("partition_consumer_offsets_denied_total{")?
+                    .split_once('}')
+            })
+            .filter(|(labels, _)| labels.split(',').any(|label| label == kind_label))
+            .map(|(_, value)| {
+                samples += 1;
+                value
+                    .split_whitespace()
+                    .last()
+                    .expect("counter value")
+                    .parse::<u64>()
+                    .expect("numeric counter")
+            })
+            .sum();
+        assert!(
+            samples > 0,
+            "missing {kind} denial metric in response: {metrics}"
+        );
+        total
+    };
+    assert_eq!(
+        denied_for("consumer"),
+        3,
+        "one explicit TCP, one poll, and one HTTP denial, all on the consumer kind"
+    );
+    assert_eq!(
+        denied_for("consumer_group"),
+        0,
+        "no consumer group offset was denied in this test"
+    );
 }
 
 #[iggy_harness(

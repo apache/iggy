@@ -173,6 +173,7 @@ pub struct ConsumerOffsetCapacity {
     limit: Cell<usize>,
     pending: RefCell<HashMap<u32, usize>>,
     provisional: RefCell<HashMap<u32, Arc<ProvisionalToken>>>,
+    active_provisional_keys: Arc<AtomicUsize>,
     stranded: RefCell<HashSet<u32>>,
     uncertain: Cell<bool>,
     durable_warned: Cell<bool>,
@@ -188,6 +189,7 @@ impl ConsumerOffsetCapacity {
             limit: Cell::new(limit),
             pending: RefCell::new(HashMap::new()),
             provisional: RefCell::new(HashMap::new()),
+            active_provisional_keys: Arc::new(AtomicUsize::new(0)),
             stranded: RefCell::new(HashSet::new()),
             uncertain: Cell::new(false),
             durable_warned: Cell::new(false),
@@ -225,10 +227,11 @@ impl ConsumerOffsetCapacity {
         }
         let limit = self.limit.get();
         let durable_count = durable.count(self.kind);
-        let upper_bound = durable_count
+        let fixed = durable_count
             .saturating_add(self.pending.borrow().len())
-            .saturating_add(self.provisional.borrow().len())
             .saturating_add(self.stranded.borrow().len());
+        let provisional_len = self.active_provisional_keys.load(Ordering::Relaxed);
+        let upper_bound = fixed.saturating_add(provisional_len);
         if !self.uncertain.get() && upper_bound < limit {
             self.durable_warned.set(false);
             return Ok(());
@@ -237,12 +240,6 @@ impl ConsumerOffsetCapacity {
         let occupied = if durable_count >= limit {
             durable_count
         } else {
-            let mut provisional = self.provisional.borrow_mut();
-            if provisional.len() >= limit {
-                provisional
-                    .retain(|key, token| *key == id || token.active.load(Ordering::Relaxed) > 0);
-            }
-            drop(provisional);
             self.occupied(durable)
         };
         if self.uncertain.get() || occupied >= limit {
@@ -265,13 +262,19 @@ impl ConsumerOffsetCapacity {
     ) -> Result<AutoCommitReservation, ConsumerOffsetCapacityError> {
         self.check(id, durable)?;
         let mut provisional = self.provisional.borrow_mut();
+        if provisional.len() >= self.limit.get() && !provisional.contains_key(&id) {
+            provisional.retain(|_, token| token.active.load(Ordering::Relaxed) > 0);
+        }
         let token = Arc::clone(provisional.entry(id).or_insert_with(|| {
             Arc::new(ProvisionalToken {
                 reclaim_epoch: Arc::clone(&self.reclaim_epoch),
+                active_keys: Arc::clone(&self.active_provisional_keys),
                 active: AtomicUsize::new(0),
             })
         }));
-        token.active.fetch_add(1, Ordering::Relaxed);
+        if token.active.fetch_add(1, Ordering::Relaxed) == 0 {
+            token.active_keys.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(AutoCommitReservation {
             token,
             kind: self.kind,
@@ -298,6 +301,10 @@ impl ConsumerOffsetCapacity {
                 .is_some_and(|token| token.active.load(Ordering::Relaxed) > 0)
     }
 
+    /// Assigns the pending count outright while [`Self::release_reservation`]
+    /// decrements it. Both take `&self` and neither locks: they are serialized
+    /// by their call sites, which all run under the partition's `&mut self` on
+    /// its own shard thread.
     pub(crate) fn set_pending_count(&self, id: u32, count: usize) {
         if count == 0 {
             if self.pending.borrow_mut().remove(&id).is_some() {
@@ -308,6 +315,7 @@ impl ConsumerOffsetCapacity {
         }
     }
 
+    /// See [`Self::set_pending_count`] for the serialization contract.
     pub(crate) fn release_reservation(&self, id: u32) {
         let mut pending = self.pending.borrow_mut();
         let Some(count) = pending.get_mut(&id) else {
@@ -357,6 +365,14 @@ impl ConsumerOffsetCapacity {
 
     pub(crate) fn is_stranded(&self, id: u32) -> bool {
         self.stranded.borrow().contains(&id)
+    }
+
+    /// Keys whose file could not be loaded or unlinked. Cleared only by a
+    /// later store or delete of the same key, never by `rebuild` or
+    /// `mark_uncertain`, so a permanently unwritable file keeps this above
+    /// zero. Exported as a gauge so that refusal has a signal.
+    pub(crate) fn stranded_count(&self) -> usize {
+        self.stranded.borrow().len()
     }
 
     pub(crate) fn rearm_if_below_limit(&self, durable: &DurableConsumerOffsets) {
@@ -448,12 +464,14 @@ pub struct AutoCommitReservation {
 #[derive(Debug)]
 struct ProvisionalToken {
     reclaim_epoch: Arc<AtomicU64>,
+    active_keys: Arc<AtomicUsize>,
     active: AtomicUsize,
 }
 
 impl Drop for AutoCommitReservation {
     fn drop(&mut self) {
         if self.token.active.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.token.active_keys.fetch_sub(1, Ordering::Relaxed);
             self.token.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -462,6 +480,26 @@ impl Drop for AutoCommitReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_cached_inactive_tokens_when_admitting_should_count_only_active_keys() {
+        let durable = Rc::new(DurableConsumerOffsets::default());
+        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let first = capacity.reserve_provisional(1, &durable).unwrap();
+        let repeated = capacity.reserve_provisional(1, &durable).unwrap();
+        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 1);
+        drop(first);
+        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 1);
+        drop(repeated);
+        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 0);
+        assert_eq!(capacity.provisional.borrow().len(), 1);
+        capacity.check(2, &durable).unwrap();
+        let second = capacity.reserve_provisional(2, &durable).unwrap();
+        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 1);
+        drop(second);
+        capacity.check(3, &durable).unwrap();
+        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn given_low_occupancy_when_accounting_is_uncertain_should_reject_new_keys() {

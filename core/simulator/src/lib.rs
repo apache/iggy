@@ -1347,7 +1347,7 @@ impl Simulator {
         // replicated (the serving shard's job in the real server). Offset discarded.
         let (fragments, _commit_offset, auto_commit) = futures::executor::block_on(plan.execute())?;
         if let Some(applied) = auto_commit {
-            applied.mark_served();
+            applied.admit(|_| Ok::<(), IggyError>(()))?;
         }
         Ok(fragments)
     }

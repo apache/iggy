@@ -355,6 +355,8 @@ fn normalize_address(addr: &str) -> String {
 /// failed dial cannot cycle the request back through nodes it already tried.
 #[derive(Debug)]
 pub(crate) struct RosterWalk {
+    /// Whether the roster named at least one node when the walk was built.
+    roster_known: bool,
     remaining: VecDeque<String>,
     attempted: Vec<String>,
 }
@@ -382,6 +384,7 @@ impl RosterWalk {
         Self {
             remaining: ordered,
             attempted: vec![current.to_owned()],
+            roster_known: !roster.is_empty(),
         }
     }
 
@@ -407,8 +410,11 @@ impl RosterWalk {
         Some(endpoint)
     }
 
+    /// True only when the roster itself names one node. An empty roster (its
+    /// discovery failed) also leaves nothing to walk, but replaying that one
+    /// address would be a guess, not a decision.
     pub(crate) fn is_single_endpoint(&self) -> bool {
-        self.remaining.is_empty() && self.attempted.len() == 1
+        self.roster_known && self.remaining.is_empty() && self.attempted.len() == 1
     }
 }
 
@@ -794,6 +800,7 @@ mod tests {
 
     #[test]
     fn given_single_endpoint_roster_when_exhausted_should_allow_local_retry() {
+        assert!(!RosterWalk::new("127.0.0.1:8090", &[]).is_single_endpoint());
         let mut walk = RosterWalk::new("127.0.0.1:8090", &["localhost:8090".to_owned()]);
         assert!(walk.is_single_endpoint());
         assert_eq!(walk.next(), None);

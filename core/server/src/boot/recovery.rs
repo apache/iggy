@@ -338,7 +338,9 @@ const _: () = assert!(
 );
 const _: () = assert!(
     4 * configs::partition::PARTITION_CONSUMER_OFFSETS_CEILING
-        <= partitions::CONSUMER_OFFSETS_ENTRIES_MAX as usize
+        <= partitions::CONSUMER_OFFSETS_ENTRIES_MAX as usize,
+    "four ceilings fill the transfer decoder's entry budget exactly, with no headroom left; raise \
+     CONSUMER_OFFSETS_ENTRIES_MAX before raising PARTITION_CONSUMER_OFFSETS_CEILING"
 );
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);

@@ -1662,7 +1662,13 @@ async fn retry_offset_mutation<T, E: fmt::Debug, F: Future<Output = Result<T, E>
             }
         }
     }
-    operation().await
+    operation().await.inspect_err(|error| {
+        tracing::debug!(
+            attempt = OFFSET_IO_ATTEMPTS,
+            ?error,
+            "offset mutation failed on the last attempt"
+        );
+    })
 }
 
 /// One consumer-offset file the install is about to write. Collected before any
@@ -1792,7 +1798,6 @@ where
         if self.repair.is_some() {
             return Err(PartitionTransferUnavailable::RepairInProgress);
         }
-        self.validate_consumer_offset_transfer_counts()?;
         // Primary-by-index at view 0 over an empty log passes every gate above
         // yet knows nothing: a group whose directory is absent boots through
         // `consensus.init()`, comes up Normal at view 0, and an empty group is
@@ -2403,7 +2408,8 @@ where
         offsets_bytes: &[u8],
         committed_purge_generation: u64,
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
-        // ---- check phase: nothing below may mutate ----
+        // ---- check phase: nothing below may mutate live state. Staging
+        // writes only sibling files the install can abandon. ----
         let Some(partition_dir) = self.partition_dir.clone() else {
             return Err(PartitionInstallError::NoPartitionDir);
         };
@@ -2959,10 +2965,8 @@ where
             .map(|(kind, id, path)| ((kind, id), path))
             .collect();
         for ((kind, consumer_id), path) in old_paths {
-            // Strand rather than fail: failing here fences the partition and
-            // re-pulls the same transfer against the same unlinkable file. A
-            // stranded key stays counted and admits a later delete, which is
-            // what the purge path does with the same fault.
+            // An obsolete authoritative file must not survive a successful
+            // install because boot would reload it outside the incoming table.
             match delete_persisted_offset(&path).await {
                 Ok(removed) => {
                     if removed {
@@ -2983,6 +2987,10 @@ where
                         %error,
                         "install could not remove a superseded consumer offset file"
                     );
+                    return Err(PartitionInstallError::OffsetPersistence {
+                        path,
+                        source: error,
+                    });
                 }
             }
         }
@@ -3225,8 +3233,7 @@ where
                         }
                     }
                     OffsetDirEntry::Offset { id, path } => {
-                        // Same policy as install: an unlinkable file strands its
-                        // key instead of failing the converge and looping.
+                        // A remaining authoritative file prevents convergence.
                         match retry_offset_mutation(|| delete_persisted_offset(&path)).await {
                             Ok(_) => self.consumer_offset_capacity_for(kind).clear_stranded(id),
                             Err(error) => {
@@ -3237,15 +3244,19 @@ where
                                     %error,
                                     "converge could not remove a consumer offset file"
                                 );
+                                return Err(error);
                             }
                         }
                     }
                 }
             }
-            if std::path::Path::new(dir).exists() {
-                fsync_dir(dir)
-                    .await
-                    .map_err(|_| iggy_common::IggyError::CannotSyncFile)?;
+            // No `exists()` probe: that is a blocking stat on the pump. A
+            // directory the unlinks emptied and removed has nothing left to
+            // make durable.
+            match fsync_dir(dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(iggy_common::IggyError::CannotSyncFile),
             }
         }
         // Every segment and staging file this partition had is about to be

@@ -942,7 +942,7 @@ impl AutoCommitCtx {
 
 impl AutoCommitApplied {
     /// Record the group handoff frontier only after poll admission succeeds.
-    pub fn mark_served(&self) {
+    fn mark_served(&self) {
         if let Some(last_polled) = &self.last_polled {
             last_polled.record(self.offset);
         }
@@ -971,9 +971,30 @@ impl AutoCommitApplied {
         Rc::ptr_eq(&self.durable, durable)
     }
 
-    /// Undo this poll's eager update after synchronous admission fails. The
-    /// caller must not yield between execution and this rollback.
-    pub fn rollback_created(&self) {
+    /// Run the serving shard's synchronous admission and settle this apply in
+    /// the same call: `Ok` marks the cursor served, `Err` rolls the eager
+    /// local update back and returns the error. The rollback is a bare store of
+    /// the previous offset, so nothing may yield between the decision and it.
+    /// Keeping both inside one synchronous method is what makes that hold for
+    /// every caller.
+    ///
+    /// # Errors
+    /// Whatever `decide` returned, after the rollback.
+    pub fn admit<E>(self, decide: impl FnOnce(&Self) -> Result<(), E>) -> Result<(), E> {
+        match decide(&self) {
+            Ok(()) => {
+                self.mark_served();
+                Ok(())
+            }
+            Err(error) => {
+                self.rollback_created();
+                Err(error)
+            }
+        }
+    }
+
+    /// Undo this poll's eager update after synchronous admission fails.
+    fn rollback_created(&self) {
         match &self.target {
             AutoCommitTarget::Consumer {
                 offsets,
@@ -1022,6 +1043,9 @@ fn apply_local_offset<K: Hash + Eq + Clone + Send + Sync>(
     if let Some(existing) = guard.get(&key) {
         return Ok(Some(existing.offset.fetch_max(offset, Ordering::Relaxed)));
     }
+    // The `len()` read and the insert are not atomic on this lock-free map.
+    // The bound holds because every poll of one partition runs on that
+    // partition's own shard thread, so no second inserter exists.
     capacity.admit_local_map_key(guard.len(), durable_full)?;
     guard.insert(key, create());
     capacity.note_local_key_change();

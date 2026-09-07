@@ -28,10 +28,15 @@
 
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
 use partitions::offset_storage::{OffsetRecord, decode_offset_record, offset_replacement_id};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, trace, warn};
 
 const COMPONENT: &str = "STREAMING_PARTITIONS";
+const OFFSET_DIRECTORY_BUFFER: usize = 64;
+static OFFSET_DIRECTORY_READERS: Semaphore = Semaphore::const_new(4);
+type OffsetDirectoryEntries = mpsc::Receiver<std::io::Result<Option<PathBuf>>>;
 
 pub struct RecoveredOffsets<T> {
     pub entries: Vec<T>,
@@ -76,30 +81,25 @@ async fn load_offsets<T>(
     construct: impl Fn(ConsumerOffset) -> T,
 ) -> Result<RecoveredOffsets<T>, IggyError> {
     trace!(?kind, path, "loading consumer offsets");
-    let dir_entries = std::fs::read_dir(path)
-        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
+    let mut dir_entries = offset_directory_entries(path).await?;
     let mut recovered = RecoveredOffsets::default();
-    for dir_entry in dir_entries {
-        let dir_entry = match dir_entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                warn!(?kind, path, %error, "failed to read offset directory entry");
-                continue;
+    loop {
+        let entry_path = match dir_entries.recv().await {
+            Some(Ok(Some(path))) => path,
+            Some(Ok(None)) => break,
+            Some(Err(error)) => {
+                warn!(?kind, path, %error, "failed to enumerate offset directory");
+                return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
             }
+            None => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
         };
-        let file_type = match dir_entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                warn!(?kind, path, %error, "failed to read offset entry type");
-                continue;
-            }
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        let name = dir_entry.file_name().to_string_lossy().into_owned();
+        let name = entry_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         if offset_replacement_id(&name).is_some() {
-            remove_stale_replacement(&dir_entry.path(), &name).await;
+            remove_stale_replacement(&entry_path, &name).await;
             continue;
         }
         let Ok(consumer_id) = name.parse::<u32>() else {
@@ -109,7 +109,7 @@ async fn load_offsets<T>(
             );
             continue;
         };
-        let Some(path) = dir_entry.path().to_str().map(str::to_owned) else {
+        let Some(path) = entry_path.to_str().map(str::to_owned) else {
             error!(?kind, name, "invalid consumer offset path");
             continue;
         };
@@ -129,6 +129,57 @@ async fn load_offsets<T>(
         }));
     }
     Ok(recovered)
+}
+
+async fn offset_directory_entries(path: &str) -> Result<OffsetDirectoryEntries, IggyError> {
+    // Compio has no asynchronous directory iterator and the shard's blocking
+    // pool is disabled. Bound both OS threads and buffered paths. The worker
+    // owns the permit so cancellation cannot exceed the concurrency bound.
+    let permit = OFFSET_DIRECTORY_READERS
+        .acquire()
+        .await
+        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
+    let (sender, receiver) = mpsc::channel(OFFSET_DIRECTORY_BUFFER);
+    let directory = path.to_owned();
+    std::thread::Builder::new()
+        .name("iggy-offset-recovery".to_owned())
+        .spawn(move || {
+            let _permit = permit;
+            let result = (|| {
+                // Only the directory read itself is fatal. One unreadable
+                // entry is skipped with a warning, as the on-reactor loader
+                // did, so a single bad dirent cannot keep a partition from
+                // booting.
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            warn!(path = directory, %error, "failed to read offset directory entry");
+                            continue;
+                        }
+                    };
+                    let is_file = match entry.file_type() {
+                        Ok(file_type) => file_type.is_file(),
+                        Err(error) => {
+                            warn!(path = directory, %error, "failed to read offset entry type");
+                            continue;
+                        }
+                    };
+                    if is_file && sender.blocking_send(Ok(Some(entry.path()))).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            })();
+            // Explicit completion distinguishes an empty directory from an
+            // interrupted worker. Closed receivers simply abandon enumeration.
+            let _ = sender.blocking_send(result.map(|()| None));
+        })
+        .map_err(|error| {
+            error!(path, %error, "failed to start offset directory reader");
+            IggyError::CannotReadConsumerOffsets(path.to_owned())
+        })?;
+    Ok(receiver)
 }
 
 /// A crashed atomic replacement leaves its sibling behind. The rename never
@@ -223,6 +274,31 @@ async fn remove_invalid_offset_file(path: &str, offset_kind: &'static str) -> Of
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[compio::test]
+    async fn given_missing_directory_when_loading_should_report_error_instead_of_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(matches!(
+            load_consumer_offsets(missing.to_str().unwrap()).await,
+            Err(IggyError::CannotReadConsumerOffsets(_))
+        ));
+    }
+
+    #[compio::test]
+    async fn given_full_directory_buffer_when_loader_is_cancelled_should_release_worker_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in 0..OFFSET_DIRECTORY_BUFFER * 2 {
+            std::fs::write(dir.path().join(id.to_string()), 0_u64.to_le_bytes()).unwrap();
+        }
+        let path = dir.path().to_str().unwrap();
+        for _ in 0..8 {
+            let entries = offset_directory_entries(path).await.unwrap();
+            drop(entries);
+        }
+        let loaded = load_consumer_offsets(path).await.unwrap();
+        assert_eq!(loaded.entries.len(), OFFSET_DIRECTORY_BUFFER * 2);
+    }
 
     #[compio::test]
     async fn given_numeric_directory_and_torn_file_when_loading_should_remove_only_invalid_file() {

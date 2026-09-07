@@ -1280,6 +1280,17 @@ impl TcpClient {
                         return Err(IggyError::TransientNotAccepted);
                     }
 
+                    if roster_walk
+                        .as_ref()
+                        .is_some_and(RosterWalk::is_single_endpoint)
+                    {
+                        // Discovery already proved there is no routing choice.
+                        // Retry without reacquiring the lock so reconnects and
+                        // unrelated requests do not wait out this deadline.
+                        drop(routing_guard.take());
+                        continue;
+                    }
+
                     if routing_guard.is_none() {
                         routing_guard = Some(
                             tokio::time::timeout_at(overall_deadline, self.routing_lock.lock())
@@ -1332,8 +1343,9 @@ impl TcpClient {
                         .is_some_and(RosterWalk::is_single_endpoint)
                     {
                         // Partition materialisation can outlast the short retry
-                        // window on a single node. No routing change is needed,
-                        // so let other requests and reconnects acquire the lock.
+                        // window on a single node. No routing change is needed.
+                        // Subsequent refusals take the lock-free local retry
+                        // branch above rather than reacquiring this guard.
                         drop(routing_guard.take());
                         continue;
                     } else {
