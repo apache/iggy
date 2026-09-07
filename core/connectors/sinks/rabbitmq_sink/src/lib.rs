@@ -57,6 +57,7 @@ pub struct RabbitMQSink {
     timeout: Duration,
     state: Mutex<Option<RabbitMqState>>,
     reconnect_lock: Mutex<()>,
+    publish_lock: Mutex<()>,
     max_retries: u32,
     retry_delay: Duration,
     max_retry_delay: Duration,
@@ -168,6 +169,7 @@ impl RabbitMQSink {
             timeout: Duration::from_secs(timeout_secs),
             state: Mutex::new(None),
             reconnect_lock: Mutex::new(()),
+            publish_lock: Mutex::new(()),
             max_retries: config.max_retries.unwrap_or(3),
             retry_delay: Duration::from_secs(config.retry_delay_secs.unwrap_or(1)),
             max_retry_delay: Duration::from_secs(config.max_retry_delay_secs.unwrap_or(5)),
@@ -194,6 +196,12 @@ impl RabbitMQSink {
         messages_metadata: &MessagesMetadata,
         messages: &[ConsumedMessage],
     ) -> Result<u64, Error> {
+        // The connectors runtime runs one consume task per (stream, topic) pair against a
+        // single sink instance, so batches would otherwise interleave on the shared channel.
+        // Serialize them: a Basic.Return staples to whichever confirm resolves next, and with
+        // two publishers in flight it can land on the other task's confirm, letting this batch
+        // count a returned message as delivered.
+        let _publish_guard = self.publish_lock.lock().await;
         let mut attempts = 0u32;
         let mut confirmed: usize = 0;
 
@@ -240,7 +248,17 @@ impl RabbitMQSink {
             let mut in_flight: Vec<PublisherConfirm> =
                 Vec::with_capacity(messages.len() - confirmed);
             for message in &messages[confirmed..] {
-                let body = message.payload.try_to_bytes()?;
+                let body = match message.payload.try_to_bytes() {
+                    Ok(body) => body,
+                    Err(error) => {
+                        // Earlier publishes in this attempt are still in flight; drop the
+                        // channel so their orphaned confirms never leak onto a reused one.
+                        self.clear_state().await;
+                        self.publish_errors
+                            .fetch_add((messages.len() - confirmed) as u64, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
                 let mut props = BasicProperties::default().with_delivery_mode(self.delivery_mode);
                 let headers = self.build_headers(topic_metadata, messages_metadata, message);
                 if !headers.inner().is_empty() {
