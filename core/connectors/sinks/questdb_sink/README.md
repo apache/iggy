@@ -63,13 +63,24 @@ verbose_logging = false
 | `include_headers` | `false` | Write each message header as a `header_<key>` `VARCHAR`. |
 | `ack_level` | `ok` | `ok` waits for server acceptance; `durable` waits for the Enterprise durable-ACK barrier. |
 | `flush_timeout` | `30s` | How long to wait for the configured ack level. |
-| `batch_size` | `1000` | Rows per flush. |
+| `batch_size` | `1000` | Maximum rows per flush. |
+| `max_flush_bytes` | `1000000` | Flush once the encoded buffer reaches this many bytes, regardless of `batch_size`. See below. |
 | `log_rejected_payload` | `false` | Include a truncated payload in the log line for a rejected message. Off by default because a rejected payload is still user data. |
 | `verbose_logging` | `false` | Raise per-batch logs from `debug` to `info`. |
 
 Everything else, including credentials, TLS, store-and-forward, reconnect, and
 multi-host failover, is configured through the connect string. See the
 [connect string reference](https://questdb.com/docs/connect/clients/connect-string/).
+
+### Batch sizing
+
+`batch_size` bounds rows; `max_flush_bytes` bounds bytes. Both matter, because
+QWP caps a single frame at the smaller of `max_buf_size` and the
+store-and-forward segment payload capacity, roughly 2 MiB with the default
+4 MiB segments. The row API does not split an oversized buffer, so a batch of
+wide rows that exceeds the cap is rejected whole and every row in it is lost.
+The byte bound flushes early to keep that from happening. Raise it only
+alongside `sf_max_segment_bytes` in the connect string.
 
 ## Store-and-forward
 

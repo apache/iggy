@@ -64,6 +64,12 @@ ack_level = "ok"
 flush_timeout = "30s"
 batch_size = 1000
 
+# Flush once the encoded buffer reaches this many bytes, regardless of
+# batch_size. QWP caps a single frame at roughly 2 MiB by default and the row
+# API does not split an oversized buffer, so this keeps a batch of wide rows
+# from being rejected whole.
+max_flush_bytes = 1000000
+
 # A rejected record cannot be replayed or dead-lettered, so its log line is the
 # only trace. Enable this to include a truncated payload in that line, at the
 # cost of writing user data to the log.
