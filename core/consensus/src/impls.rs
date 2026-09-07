@@ -2139,8 +2139,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             checkpoint_op,
             checkpoint_checksum,
             // Consensus mints no message offsets: the PARTITION plane stamps
-            // this in before it writes (`IggyPartition::write_superblock`).
+            // both of these in before it writes
+            // (`IggyPartition::write_superblock`).
             offset_frontier: 0,
+            offset_reserved: 0,
         }
     }
 

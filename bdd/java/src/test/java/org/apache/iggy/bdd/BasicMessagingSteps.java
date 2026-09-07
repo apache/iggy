@@ -142,8 +142,16 @@ public class BasicMessagingSteps {
 
     @Then("getting the stream by its numeric ID should return no stream")
     public void getStreamReturnsNoStream() {
+        // The assertion is "not the stream we deleted", not "nothing at this id":
+        // the server hands out the lowest free stream id, so once these scenarios
+        // run concurrently against one server a fresh create can legitimately
+        // occupy the deleted stream's id. Named, so a missing pre-value fails
+        // here instead of making the comparison below vacuously true.
+        assertNotNull(context.lastStreamName, "Stream should have been created");
         Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
-        assertTrue(stream.isEmpty(), "Deleted stream should not be returned");
+        assertTrue(
+                stream.isEmpty() || !stream.get().name().equals(context.lastStreamName),
+                "Deleted stream should not be returned");
     }
 
     @When("I create a topic with name {string} in stream {int} with {int} partitions")

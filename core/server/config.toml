@@ -655,8 +655,26 @@ view_probe_attempts_max = 5
 # remaining window from the serving peer (duration). Repair frames are
 # fire-and-forget over the lossy bus, so a session with no retry wedges forever
 # on a single dropped frame. Paces both the metadata and partition repair loops;
-# must be nonzero.
+# must be nonzero. Paces streams that are already OPEN only: how long a hole
+# waits before one is opened for it is repair_gap_debounce_interval below.
 repair_retry_interval = "1s"
+
+# How long a partition backup must hold committed ops it cannot walk to before
+# the shard's tick sweep opens a repair session for it (duration). The
+# level-triggered floor under every edge-triggered arming site, which a produce
+# stream can starve; must be nonzero.
+#
+# Floored at 50 consensus ticks (500ms at the 10ms tick), so values under that
+# arm no sooner: one tick of lag is ordinary pipelining, and repair against it
+# would fire on healthy traffic.
+#
+# Recovery latency for one hole is max(this, 500ms) plus up to one tick of sweep
+# granularity. Under a correlated fault the sweep opens at most 3 sessions per
+# tick and holds at most 8 at once, so the Nth group waiting on this shard adds
+# ceil(N / 3) ticks on top, and more while sessions are already in flight. That
+# cap is what keeps a node-wide rejoin from putting every group's repair stream
+# on one serving peer at once.
+repair_gap_debounce_interval = "1s"
 
 # Prepares a peer serves per repair round before the requester walks to the next
 # chunk (integer). Each frame rides the per-peer message-bus queue, so this must
@@ -664,14 +682,24 @@ repair_retry_interval = "1s"
 # the queue and drops frames. Must be > 0 and <= 1024.
 repair_chunk_max = 128
 
-# How long the metadata superblock may stay unwritable before the replica
-# fail-stops (duration). A replica that cannot persist its view is already
-# fenced quorum-invisible and retries with capped backoff; past this window the
-# process exits with a distinct status so a supervisor restarts or replaces it
-# instead of an operator finding the wedge in logs. "0" disables the fail-stop
-# and leaves the replica fenced indefinitely. Nonzero values must be at least
-# 30s so a transient disk hiccup cannot kill the process.
+# How long a superblock may stay unwritable before the replica fail-stops
+# (duration). Applies to the metadata superblock and to each partition's own. A
+# group that cannot persist its view is already fenced quorum-invisible and
+# retries with capped backoff; past this window the process exits with a distinct
+# status so a supervisor restarts or replaces it instead of an operator finding
+# the wedge in logs. "0" disables the fail-stop and leaves the group fenced
+# indefinitely. Nonzero values must be at least 30s so a transient disk hiccup
+# cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
+
+# DOWNGRADE, every deployment: this release grew the superblock record from 66
+# to 74 bytes to carry partition.offset_reservation_lease's claim. The metadata
+# superblock is written by EVERY server, clustered or not, so upgrading rewrites
+# it at the new length on a plain single node too. A build that predates the
+# field refuses a record of that length and treats the refusal as a durability
+# violation, which fails the whole node's boot -- so rolling BACK to
+# server-0.9.0-edge.6 or earlier needs the data directory wiped on every node.
+# Upgrading needs nothing: the 66-byte record still decodes.
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
@@ -995,6 +1023,21 @@ prepare_queue_depth = 32
 # memory scales with partition count. Size it to the producers one partition
 # actually sees, not the node's client total.
 dedup_clients_max = 4096
+
+# How many offsets a partition claims in its superblock ahead of the mint
+# counter before it will append, so a crash-restarted replica resumes above
+# every offset it confirmed to a client instead of re-minting it for a different
+# message. One superblock write (two fsyncs) per block: lowering it raises the
+# fsync rate on the write path, raising it wastes at most one block of the u64
+# offset space per crash. Must be > 0 and <= 16777216.
+#
+# SINGLE-REPLICA groups only. A replicated group acks a send once a quorum has
+# journaled it, so re-minting there needs a full-cluster crash; it claims
+# nothing, pays no write, and ignores this value.
+#
+# DOWNGRADE: see the note on superblock_wedged_fatal_timeout in [cluster].
+# Upgrading needs nothing.
+offset_reservation_lease = 65536
 
 # Entries the evicted ring retains per multi-replica partition for journal
 # repair after a peer rejoins. Larger widens the window a restarting peer can be

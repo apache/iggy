@@ -28,23 +28,25 @@
 //! replies to committed writes itself, straight from the owning shard, while
 //! everything the host builds here -- read bodies, denies, empty-poll shapes
 //! -- goes out on the connection's home shard. The reply path is therefore
-//! split by plane, not unified, and the deny helpers in `authz` are the
+//! split by plane, not unified, and the deny helpers in `failure` are the
 //! third leg (typed status replies for requests that never reach a plane).
 
 use crate::consumer_group::maybe_rewrite_consumer_offset_request;
-use crate::dispatch::authz::{
-    authorize_partition_op, authorize_partition_read, send_deny_reply, send_non_replicated_deny,
+use crate::dispatch::authz::{authorize_partition_op, authorize_partition_read};
+use crate::dispatch::failure::{
+    FrameChannel, send_deny_reply, send_host_frame, send_non_replicated_bytes,
+    send_non_replicated_deny, send_result_rejection,
 };
 use crate::dispatch::submit::submit_client_request_on_owner;
-use crate::dispatch::{send_non_replicated_bytes, send_reply_frame, upgrade_shard_handle};
+use crate::dispatch::upgrade_shard_handle;
 use crate::responses::{
-    build_consumer_offset_body, build_empty_reply, build_polled_messages_reply,
-    current_metadata_commit, resolve_partition_namespace, resolve_partition_request_namespace,
+    build_consumer_offset_body, build_polled_messages_reply, current_metadata_commit,
+    resolve_partition_namespace, resolve_partition_request_namespace,
 };
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::wire::{request_body, usize_to_u32};
 use bytes::Bytes;
-use consensus::{Consensus, MetadataHandle, PartitionsHandle, build_result_rejection_reply};
+use consensus::{Consensus, MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -57,10 +59,10 @@ use iggy_binary_protocol::{
     AckLevel, Command, KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireDecode, WireEncode,
     WireIdentifier,
 };
-use iggy_common::{IggyError, PollingStrategy};
+use iggy_common::{IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::AUTO_COMMIT_CLIENT_ID;
+use message_bus::{AUTO_COMMIT_CLIENT_ID, BusMessage};
 use metadata::impls::metadata::{
     StreamsFrontend, build_truncate_partition_client_message,
     build_truncate_partition_client_message_with_identifiers,
@@ -469,14 +471,19 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     // metadata access to resolve it.
     let request = match maybe_rewrite_consumer_offset_request(shard, request) {
         Ok(rewritten) => rewritten,
+        // Not reachable through the wire path: the same body already decoded in
+        // `resolve_partition_request_namespace` above, and re-encoding it can
+        // only fail past `u32::MAX` bytes against a 64 MiB request cap. Denying
+        // typed keeps a future re-encode failure from acking work the partition
+        // plane never saw.
         Err(error) => {
             warn!(
                 transport_client_id,
                 error = %error,
                 operation = ?header.operation,
-                "failed to rewrite consumer-offset request; replying empty"
+                "failed to rewrite consumer-offset request; replying denied"
             );
-            send_empty_partition_reply(shard, transport_client_id, &header).await;
+            send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
             return;
         }
     };
@@ -581,8 +588,12 @@ async fn relay_partition_reply<B, MJ, S, SB>(
 /// the owning shard ([`shard::IggyShard::partition_read`]), and re-encode
 /// the stored batches into the legacy wire `PolledMessages` body.
 ///
-/// Failures reply with an empty body so the SDK fails fast on decode
-/// instead of hanging until its read timeout.
+/// A partition that cannot answer yet replies with the 16-byte empty poll,
+/// which the SDK reads as 0 messages and retries; a consumer-group poll the
+/// coordinator fenced replies with the same shape carrying the re-sync
+/// sentinel. Every permanent client error (undecodable body, authz, and every
+/// rejection the resolve raises) denies with a nonzero status instead, so none
+/// of them can be mistaken for an empty partition.
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -597,21 +608,23 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let Ok(wire) = PollMessagesRequest::decode_from(request_body(request)) else {
-        // Undecodable poll: keep the fail-fast empty-poll shape.
-        send_non_replicated_bytes(
+        // A permanent client error, so it must not borrow the empty-poll
+        // shape: that body decodes as a successful 0-message poll, and a
+        // consumer looping on it never learns why. The server already sends
+        // nonzero-status poll replies (authz, unresolved target).
+        send_non_replicated_deny(
             shard,
             request,
             transport_client_id,
-            empty_polled_messages_body(0),
-            "poll_messages",
+            IggyError::InvalidCommand.as_code(),
         )
         .await;
         return;
     };
     // Gate on (stream, topic) before touching the partition plane. A resolution
-    // miss falls through to the resolve path below (empty-poll / not-found); a
-    // denial replies status!=0 with an empty body, distinct from the empty-poll
-    // "0 messages" shape.
+    // miss denies typed on the resolve path below; a denial here replies
+    // status!=0 with an empty body, distinct from the empty-poll "0 messages"
+    // shape.
     if let Some(status) = authorize_partition_read(
         shard,
         &wire.stream_id,
@@ -624,89 +637,132 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
     }
-    let body = match resolve_poll_request(shard, &wire, request.header().client) {
-        Ok((namespace, partition_id, consumer, args)) => {
-            match shard
-                .partition_read(namespace, PartitionRead::Poll { consumer, args })
-                .await
-            {
-                Some(PartitionReadReply::Poll {
-                    fragments,
-                    current_offset,
-                }) => match build_polled_messages_reply(
-                    request.header(),
-                    current_metadata_commit(shard),
-                    partition_id,
-                    current_offset,
-                    fragments,
-                    shard.plane.partitions().config().encryptor.as_deref(),
-                ) {
-                    Ok(reply) => {
-                        send_reply_frame(shard, transport_client_id, reply, "poll_messages").await;
-                        return;
-                    }
-                    Err(error) => {
-                        warn!(
-                            transport_client_id,
-                            error = %error,
-                            "failed to re-encode polled batches; replying empty poll"
-                        );
-                        empty_polled_messages_body(partition_id)
-                    }
-                },
-                other => {
-                    warn!(
+    let (body, channel) = match resolve_poll_request(shard, &wire, request.header().client) {
+        Ok(resolved) => {
+            match read_polled_messages(shard, transport_client_id, request, resolved).await {
+                Ok(reply) => {
+                    send_host_frame(
+                        &shard.bus,
                         transport_client_id,
-                        namespace = namespace.inner(),
-                        reply_was_none = other.is_none(),
-                        "partition read failed; replying empty poll"
-                    );
-                    empty_polled_messages_body(partition_id)
+                        reply,
+                        FrameChannel::Reply,
+                        "poll_messages",
+                    )
+                    .await;
+                    return;
                 }
+                Err(fallback) => fallback,
             }
         }
-        Err(error) => {
-            // A stream, topic, or partition id that does not resolve is a
-            // client addressing error and must surface as a typed rejection,
-            // not an empty poll a consumer would read as end-of-partition.
-            if matches!(
-                error,
-                IggyError::PartitionNotFound(..)
-                    | IggyError::StreamIdNotFound(_)
-                    | IggyError::TopicIdNotFound(..)
-            ) {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    "poll_messages rejected: target not found"
-                );
-                send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
-                    .await;
-                return;
-            }
-            // A zero-byte body would panic the SDK's `PolledMessages`
-            // decoder; reply the 16-byte empty-poll shape instead. A generation
-            // fence (the client's cached assignment is stale after a rebalance)
-            // carries the re-sync sentinel so the SDK re-syncs and retries
-            // rather than treating the empty poll as end-of-partition.
+        // A generation fence: the client's cached assignment went stale after a
+        // rebalance. The empty poll carries the re-sync sentinel so the SDK
+        // re-syncs and retries instead of reading end-of-partition.
+        Err(error @ IggyError::ConsumerGroupPartitionNotOwned(..)) => {
             warn!(
                 transport_client_id,
                 error = %error,
-                "poll_messages request rejected; replying empty poll"
+                "poll_messages fenced; replying re-sync sentinel"
             );
-            let partition_id = if matches!(error, IggyError::ConsumerGroupPartitionNotOwned(..)) {
-                iggy_common::RESYNC_REQUIRED_PARTITION_SENTINEL
-            } else {
-                0
-            };
-            empty_polled_messages_body(partition_id)
+            empty_poll_fallback(RESYNC_REQUIRED_PARTITION_SENTINEL)
+        }
+        // Everything else the resolve rejects is a permanent client error: an
+        // unresolved stream, topic, or partition, a polling strategy or
+        // consumer kind outside the wire enum, or a group poll that omitted
+        // its partition id. All must surface typed -- the empty poll is a
+        // successful 0-message read, and a consumer looping on it never learns
+        // why.
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "poll_messages rejected; replying denied"
+            );
+            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            return;
         }
     };
-    send_non_replicated_bytes(shard, request, transport_client_id, body, "poll_messages").await;
+    send_non_replicated_bytes(
+        shard,
+        request,
+        transport_client_id,
+        body,
+        channel,
+        "poll_messages",
+    )
+    .await;
 }
 
-/// Serve `get_consumer_offset`. An empty body decodes as `None` on the SDK
-/// side (no offset stored / partition unknown).
+/// Run the resolved poll on the owning shard and re-encode the stored
+/// batches into the wire `PolledMessages` reply. A failed read or re-encode
+/// hands back the fail-fast empty poll for the partition instead.
+#[allow(clippy::future_not_send)]
+async fn read_polled_messages<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    transport_client_id: u128,
+    request: &Message<RoutedRequestHeader>,
+    (namespace, partition_id, consumer, args): DecodedPollRequest,
+) -> Result<BusMessage, (Bytes, FrameChannel)>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    match shard
+        .partition_read(namespace, PartitionRead::Poll { consumer, args })
+        .await
+    {
+        Some(PartitionReadReply::Poll {
+            fragments,
+            current_offset,
+        }) => build_polled_messages_reply(
+            request.header(),
+            current_metadata_commit(shard),
+            partition_id,
+            current_offset,
+            fragments,
+            shard.plane.partitions().config().encryptor.as_deref(),
+        )
+        .map_err(|error| {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "failed to re-encode polled batches; replying empty poll"
+            );
+            empty_poll_fallback(partition_id)
+        }),
+        other => {
+            warn!(
+                transport_client_id,
+                namespace = namespace.inner(),
+                reply_was_none = other.is_none(),
+                "partition read failed; replying empty poll"
+            );
+            Err(empty_poll_fallback(partition_id))
+        }
+    }
+}
+
+/// The fail-fast poll reply for a partition that could not answer: the
+/// 16-byte empty poll for `partition_id`, riding the re-sync sentinel
+/// channel when the id is the sentinel and the empty-frame channel
+/// otherwise.
+fn empty_poll_fallback(partition_id: u32) -> (Bytes, FrameChannel) {
+    let channel = if partition_id == RESYNC_REQUIRED_PARTITION_SENTINEL {
+        FrameChannel::ResyncSentinel
+    } else {
+        FrameChannel::EmptyFrame
+    };
+    (empty_polled_messages_body(partition_id), channel)
+}
+
+/// Serve `get_consumer_offset`. An empty status-0 body decodes as `None` on
+/// the SDK side, so it is reserved for "this consumer has no stored offset" --
+/// an unresolved consumer group included, since a deleted group has no offset
+/// to report. A malformed request or an unresolved stream, topic, or partition
+/// denies with a nonzero status instead, so an addressing typo cannot read
+/// back as a fresh consumer.
 // TODO(hubcio): plain local partition_read with no primary gate, so a
 // follower answers from its own (possibly lagging) offset state. Needs the
 // same is-caught-up-primary gate the auto-commit path has, or an explicit
@@ -725,13 +781,15 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let Ok(wire) = GetConsumerOffsetRequest::decode_from(request_body(request)) else {
-        // Undecodable: an empty body decodes as None (no offset) on the SDK.
-        send_non_replicated_bytes(
+        // Same rule as the poll above: an empty body is the legitimate
+        // "no offset stored" answer, so a malformed request must not send
+        // one. Byte-identical frames on the same channel with the same
+        // context would also be indistinguishable in the send-failure log.
+        send_non_replicated_deny(
             shard,
             request,
             transport_client_id,
-            Bytes::new(),
-            "get_consumer_offset",
+            IggyError::InvalidCommand.as_code(),
         )
         .await;
         return;
@@ -749,7 +807,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         return;
     }
     let body = match resolve_consumer_offset_request(shard, &wire) {
-        Ok((namespace, partition_id, consumer)) => {
+        Ok(Some((namespace, partition_id, consumer))) => {
             match shard
                 .partition_read(namespace, PartitionRead::ConsumerOffset { consumer })
                 .await
@@ -761,27 +819,24 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                 _ => Bytes::new(),
             }
         }
-        // A partition id that does not exist in a resolvable topic is a client
-        // addressing error, the same one the poll path denies typed. An empty
-        // body decodes as `None` -- indistinguishable from "this consumer has
-        // no stored offset yet" -- so the caller cannot tell a typo from a
-        // fresh consumer.
-        Err(error @ IggyError::PartitionNotFound(..)) => {
-            warn!(
-                transport_client_id,
-                error = %error,
-                "get_consumer_offset rejected: partition not found"
-            );
-            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
-            return;
-        }
+        // An unresolved group has no offset to report, the one thing the
+        // empty body may mean.
+        Ok(None) => Bytes::new(),
+        // Everything the resolve rejects is a client error: an unresolved
+        // stream, topic, or partition, or `resolve_partition_namespace`'s
+        // generic rejection. All must surface typed -- an empty body decodes as
+        // `None`, indistinguishable from "no stored offset yet", so a typo'd or
+        // deleted target would read back as a fresh consumer and resume from
+        // its configured default with no error anywhere. The same read over
+        // REST 404s.
         Err(error) => {
             warn!(
                 transport_client_id,
                 error = %error,
-                "get_consumer_offset request rejected; replying empty"
+                "get_consumer_offset rejected; replying denied"
             );
-            Bytes::new()
+            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            return;
         }
     };
     send_non_replicated_bytes(
@@ -789,41 +844,10 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         request,
         transport_client_id,
         body,
+        FrameChannel::Reply,
         "get_consumer_offset",
     )
     .await;
-}
-
-/// Ack a consumer-offset op whose body could not be rewritten for the
-/// partition plane with an empty Reply. The SDK connection processes replies
-/// in lockstep, so a silent drop wedges every subsequent request on that
-/// connection.
-#[allow(clippy::future_not_send)]
-async fn send_empty_partition_reply<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
-    request_header: &RoutedRequestHeader,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let commit = current_metadata_commit(shard);
-    let reply = build_empty_reply(request_header, transport_client_id, 0, commit);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            operation = ?request_header.operation,
-            "failed to surface empty partition reply"
-        );
-    }
 }
 
 /// Wait (bounded) until this shard holds a routing row for `namespace`. Fast
@@ -961,10 +985,15 @@ where
 /// namespace, partition, and polling consumer. Shared by the TCP dispatch and
 /// the HTTP route; needs no client id because offset reads are not fenced
 /// (any client may read a group's offset, member or not).
+///
+/// `Ok(None)` is the one outcome that means "no offset exists to report" (an
+/// unresolved group). It is a separate outcome rather than an error code
+/// because [`resolve_partition_namespace`] also rejects an addressing miss
+/// with `InvalidIdentifier`, and the caller must deny that one typed.
 pub fn resolve_consumer_offset_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &GetConsumerOffsetRequest,
-) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError>
+) -> Result<Option<(IggyNamespace, u32, PollingConsumer)>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -981,19 +1010,21 @@ where
     // it, member or not), the same key the write path is rewritten to. An
     // unresolved group (e.g. deleted) has no offset, so the read reports None.
     let consumer = if wire.consumer.kind == KIND_CONSUMER_GROUP {
-        let group_id = shard
+        let Some(group_id) = shard
             .plane
             .metadata()
             .mux_stm
             .streams()
             .resolve_consumer_group_id(&wire.stream_id, &wire.topic_id, &wire.consumer.id)
-            .ok_or(IggyError::InvalidIdentifier)?;
+        else {
+            return Ok(None);
+        };
         #[allow(clippy::cast_possible_truncation)]
         PollingConsumer::ConsumerGroup(group_id as usize, partition_id as usize)
     } else {
         polling_consumer_from_wire(&wire.consumer, partition_id)?
     };
-    Ok((namespace, partition_id, consumer))
+    Ok(Some((namespace, partition_id, consumer)))
 }
 
 fn polling_consumer_from_wire(
@@ -1045,8 +1076,9 @@ fn polling_strategy_from_wire(
 /// The consensus reply is forwarded verbatim: nothing-to-delete commits a
 /// no-op `TruncatePartition(0)` and acks, while a not-primary rejection
 /// reaches the client as `TransientNotCommitted` so the SDK replays instead
-/// of mistaking a dropped delete for success. Only a malformed / unresolvable
-/// request is acked empty without a commit.
+/// of mistaking a dropped delete for success. Nothing is acked empty: a
+/// malformed body denies typed, and an unresolvable namespace commits a typed
+/// rejection against the client's raw identifiers so its retry dedups.
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -1087,7 +1119,7 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
     )
     .await
     {
-        Ok(truncate) => Some(truncate),
+        Ok(truncate) => truncate,
         // The owning partition has not converged on the committed log yet, so
         // the delete cannot be resolved to a watermark. Reply with the
         // result-framed transient rejection (under the TruncatePartition
@@ -1104,67 +1136,50 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
                 0,
                 0,
             );
-            let reply = build_result_rejection_reply(
+            send_result_rejection(
+                shard,
+                transport_client_id,
                 template.header(),
-                current_metadata_commit(shard),
-                IggyError::TransientNotAccepted.as_code(),
-            );
-            if let Err(error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    "delete_segments: failed to send transient rejection"
-                );
-            }
+                &IggyError::TransientNotAccepted,
+                "delete_segments_transient_rejection",
+            )
+            .await;
             return;
         }
-        Err(_) => None,
+        // Undecodable body (never produced by the SDK): deny typed rather
+        // than ack empty. Both keep the lockstep stream framed, but a
+        // status-0 ack reads as a completed trim. Unresolvable-but-well-formed
+        // targets commit a typed rejection instead (see the resolve).
+        Err(error) => {
+            send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+            return;
+        }
     };
 
-    let reply = if let Some(truncate) = truncate {
-        // Forward the consensus reply verbatim, exactly like the generic
-        // metadata path: a committed success acks the delete, and a
-        // result-framed `TransientNotCommitted` rejection makes the SDK
-        // replay the request. Acking unconditionally here would swallow a
-        // not-primary rejection and drop the delete on the floor while the
-        // client believes it succeeded.
-        let Some(reply) = submit_client_request_on_owner(shard, truncate).await else {
-            // Transient submit failure (not primary / view change). Stay
-            // silent; the SDK read-timeout replays the same request id,
-            // which re-resolves and commits. Acking here would advance the
-            // client past an unrecorded request and gap the next metadata
-            // op.
-            warn!(
-                transport_client_id,
-                "delete_segments: transient submit; client will replay"
-            );
-            return;
-        };
-        reply
-    } else {
-        // Undecodable body (never produced by the SDK): ack empty so the
-        // lockstep stream stays framed; the typed decoder surfaces the
-        // failure client-side. Unresolvable-but-well-formed targets commit a
-        // typed rejection instead (see the resolve), so only a wire-corrupt
-        // request can gap the sequence here.
-        let commit = current_metadata_commit(shard);
-        build_empty_reply(&header, transport_client_id, session, commit).into_generic()
-    };
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_frozen())
-        .await
-    {
+    // Forward the consensus reply verbatim, exactly like the generic metadata
+    // path: a committed success acks the delete, and a result-framed
+    // `TransientNotCommitted` rejection makes the SDK replay the request.
+    // Acking unconditionally here would swallow a not-primary rejection and
+    // drop the delete on the floor while the client believes it succeeded.
+    let Some(reply) = submit_client_request_on_owner(shard, truncate).await else {
+        // Transient submit failure (not primary / view change). Stay silent;
+        // the SDK read-timeout replays the same request id, which re-resolves
+        // and commits. Acking here would advance the client past an
+        // unrecorded request and gap the next metadata op.
         warn!(
             transport_client_id,
-            error = %error,
-            "delete_segments: failed to send reply"
+            "delete_segments: transient submit; client will replay"
         );
-    }
+        return;
+    };
+    send_host_frame(
+        &shard.bus,
+        transport_client_id,
+        reply.into_frozen(),
+        FrameChannel::Reply,
+        "delete_segments_reply",
+    )
+    .await;
 }
 
 /// Resolve a client `DeleteSegments` to the `TruncatePartition` that commits the
@@ -1175,9 +1190,11 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
 /// `request` number; `client_id` / `session` are the bound VSR identity the
 /// truncate commits under. A resolvable namespace with nothing sealed to delete
 /// still yields a `TruncatePartition(up_to_offset = 0)` so the metadata request
-/// sequence stays contiguous. `Err` on a malformed body or an unresolved
-/// namespace: the TCP caller drops it to a silent replay, the HTTP caller renders
-/// the error.
+/// sequence stays contiguous, and an UNRESOLVABLE one yields the truncate
+/// against the client's raw identifiers (the apply rejects it as a committed
+/// result). `Err` is only `InvalidCommand` for a malformed body and
+/// `TransientNotAccepted` for a partition behind the commit frontier: the TCP
+/// caller denies typed, the HTTP caller renders the error.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::cast_possible_truncation)]
 pub async fn resolve_delete_segments_truncate<B, MJ, S, SB>(
@@ -1279,7 +1296,7 @@ where
 mod tests {
     use super::*;
     use crate::dispatch::test_support::{
-        SpyBus, TestMux, TestShard, prepare_message, request_message,
+        SpyBus, TestMux, TestShard, prepare_message, request_message, test_shard,
     };
     use iggy_binary_protocol::ReplyHeader;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -1289,6 +1306,7 @@ mod tests {
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
     use iggy_binary_protocol::{WireName, WireOptions, WirePartitioning};
+    use iggy_common::Identifier;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use metadata::IggyMetadata;
     use metadata::stm::StateMachine as _;
@@ -1301,6 +1319,145 @@ mod tests {
         LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology, ShardFrame,
         ShardIdentity, shard_channel,
     };
+
+    /// An undecodable request body is a PERMANENT client error, so every read
+    /// on this path must answer a nonzero status. The fail-fast shapes these
+    /// used to borrow all decode as success: the 16-byte empty poll reads as a
+    /// 0-message poll, an empty consumer-offset body as "no offset stored",
+    /// and a status-0 `delete_segments` ack as a completed trim. A client on a
+    /// skewed protocol would loop on those forever with no error to surface.
+    #[compio::test]
+    async fn undecodable_read_bodies_must_deny_typed_not_fabricate_success() {
+        const TRANSPORT: u128 = 91;
+        const VSR_CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+        // Shorter than any of the three request encodings, so each decoder
+        // fails on length before it can interpret a field.
+        const TRUNCATED_BODY: &[u8] = &[0x01];
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+
+        let poll = request_message(
+            Operation::NonReplicated,
+            VSR_CLIENT,
+            SESSION,
+            1,
+            TRUNCATED_BODY,
+        );
+        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID)).await;
+
+        let offset = request_message(
+            Operation::NonReplicated,
+            VSR_CLIENT,
+            SESSION,
+            2,
+            TRUNCATED_BODY,
+        );
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+
+        let delete = request_message(
+            Operation::DeleteSegments,
+            VSR_CLIENT,
+            SESSION,
+            3,
+            TRUNCATED_BODY,
+        );
+        handle_delete_segments_request(&shard, TRANSPORT, Some((VSR_CLIENT, SESSION)), &delete)
+            .await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            3,
+            "one deny frame per undecodable request, none of them silent"
+        );
+        for (label, (client, frame)) in ["poll_messages", "get_consumer_offset", "delete_segments"]
+            .into_iter()
+            .zip(replies.iter())
+        {
+            assert_eq!(*client, TRANSPORT, "{label} deny must target the transport");
+            let status =
+                u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+            assert_eq!(
+                status,
+                IggyError::InvalidCommand.as_code(),
+                "{label} with an undecodable body must carry a nonzero status"
+            );
+        }
+    }
+
+    /// A WELL-FORMED read against a stream that does not exist is a permanent
+    /// addressing error, and it reaches the server through a public SDK method
+    /// (a typo'd or deleted stream). Both fail-fast shapes decode as success:
+    /// the 16-byte empty poll as a 0-message read, and an empty
+    /// consumer-offset body as `None`, which is indistinguishable from a fresh
+    /// consumer -- so the caller resumes from its configured default and
+    /// silently reprocesses. The same lookup 404s over REST.
+    #[compio::test]
+    async fn unresolved_read_targets_must_deny_typed_not_read_as_empty() {
+        const TRANSPORT: u128 = 91;
+        const VSR_CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+        const MISSING_STREAM: u32 = 404;
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+
+        let poll_body = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(1)),
+            stream_id: WireIdentifier::Numeric(MISSING_STREAM),
+            topic_id: WireIdentifier::Numeric(1),
+            partition_id: Some(1),
+            strategy: WirePollingStrategy::offset(0),
+            count: 10,
+            auto_commit: false,
+        }
+        .to_bytes();
+        let poll = request_message(Operation::NonReplicated, VSR_CLIENT, SESSION, 1, &poll_body);
+        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID)).await;
+
+        let offset_body = GetConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(1)),
+            stream_id: WireIdentifier::Numeric(MISSING_STREAM),
+            topic_id: WireIdentifier::Numeric(1),
+            partition_id: Some(1),
+        }
+        .to_bytes();
+        let offset = request_message(
+            Operation::NonReplicated,
+            VSR_CLIENT,
+            SESSION,
+            2,
+            &offset_body,
+        );
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            2,
+            "one deny frame per unresolved read, none of them silent"
+        );
+        for (label, (client, frame)) in ["poll_messages", "get_consumer_offset"]
+            .into_iter()
+            .zip(replies.iter())
+        {
+            assert_eq!(*client, TRANSPORT, "{label} deny must target the transport");
+            let status =
+                u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+            assert_eq!(
+                status,
+                IggyError::StreamIdNotFound(
+                    Identifier::numeric(MISSING_STREAM).expect("a nonzero numeric identifier")
+                )
+                .as_code(),
+                "{label} against a missing stream must carry the not-found status"
+            );
+        }
+    }
 
     /// A partition write whose routable wait exhausts (namespace committed,
     /// but no reconciler ever seeds this shard's routing row -- the state a

@@ -31,6 +31,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 # The test boots the baseline, seeds a data directory, swaps the binary to HEAD
 # and restarts against that same directory.
 #
+# The baseline's own core/server/config.toml is extracted next to its binary and
+# both boots read it, so the swap changes the binary and nothing else.
+#
 # Both binaries MUST be built here. `core/integration` has no dependency on the
 # `server` package; the harness only LOCATES a binary, through
 # `assert_cmd::Command::cargo_bin`, which falls back to whatever file happens to
@@ -186,6 +189,19 @@ fi
 # every run.
 BASELINE_SERVER="${TARGET_DIR}/storage-compat/${BASELINE_SHA}/iggy-server"
 
+# The baseline's own config file, handed to BOTH boots. Neither binary may fall
+# back to the server's relative default path: figment resolves that by walking
+# up from the test process's directory, which hands the BASELINE this branch's
+# file, and a key added under a `deny_unknown_fields` table (every [cluster] and
+# [node] one) then fails its extraction. Written on every run, cached binary or
+# not, so the pair can never drift apart.
+BASELINE_CONFIG="${TARGET_DIR}/storage-compat/${BASELINE_SHA}/config.toml"
+mkdir -p "$(dirname "${BASELINE_CONFIG}")"
+if ! git show "${BASELINE_SHA}:core/server/config.toml" >"${BASELINE_CONFIG}"; then
+  echo "Baseline ${BASELINE_SHA} carries no core/server/config.toml"
+  exit 1
+fi
+
 if [ "${REBUILD_BASELINE}" -eq 1 ]; then
   rm -f "${BASELINE_SERVER}"
 fi
@@ -260,6 +276,7 @@ fi
 # Absolute path: ServerHandle only treats this value as a literal path when it
 # has more than one component, otherwise it falls back to a cargo_bin lookup.
 export COMPAT_BASELINE_SERVER="${BASELINE_SERVER}"
+export COMPAT_BASELINE_CONFIG="${BASELINE_CONFIG}"
 
 echo "Running storage compatibility test..."
 # --run-ignored only: the test is #[ignore]d, so the normal lanes skip it.

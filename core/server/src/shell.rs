@@ -200,3 +200,16 @@ pub(crate) fn repair_retry_ticks(config: &ServerConfig) -> u32 {
     ))
     .unwrap_or(u32::MAX)
 }
+
+/// `[cluster] repair_gap_debounce_interval` in consensus ticks: how long a
+/// partition backup holds a hole before the sweep opens a repair session for
+/// it. Deliberately NOT the retry interval above: that one paces an open
+/// stream, and pairing them means quieting retry chatter also widens how long a
+/// replication hole stays open. The shard applies
+/// [`shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN`] as a floor on top.
+pub(crate) fn repair_gap_debounce_ticks(config: &ServerConfig) -> u32 {
+    u32::try_from(duration_to_ticks(
+        config.cluster.repair_gap_debounce_interval.get_duration(),
+    ))
+    .unwrap_or(u32::MAX)
+}

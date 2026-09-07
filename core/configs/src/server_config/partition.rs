@@ -44,6 +44,7 @@ use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use configs::ConfigEnv;
 use iggy_common::{IggyByteSize, Validatable};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 
 /// Mirrors `consensus::PIPELINE_PREPARE_QUEUE_MAX`.
 pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
@@ -97,6 +98,22 @@ pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 =
 /// count.
 pub const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
+/// Upper bound on `offset_reservation_lease`: a typo guard, so a slipped digit
+/// cannot reach the arithmetic in the append fence.
+pub const MAX_OFFSET_RESERVATION_LEASE: u32 = 16 * 1024 * 1024;
+
+/// Mirrors `partitions::DEFAULT_OFFSET_RESERVATION_LEASE`; pinned against drift
+/// by `default_offset_reservation_lease_matches_partitions_constant` in the
+/// server crate, which can see both.
+pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
+
+/// Serde fallback for a `[partition]` table that omits
+/// `offset_reservation_lease`.
+fn default_offset_reservation_lease() -> NonZeroU32 {
+    NonZeroU32::new(DEFAULT_OFFSET_RESERVATION_LEASE)
+        .expect("DEFAULT_OFFSET_RESERVATION_LEASE is a nonzero literal")
+}
+
 /// Mirrors `partitions::EVICTED_RING_CAPACITY`.
 pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 4096;
 
@@ -143,6 +160,27 @@ pub struct PartitionConfig {
     /// worst case scales with partition count: size it to the producers a
     /// single partition actually sees, not the node's client total.
     pub dedup_clients_max: usize,
+
+    /// Offsets claimed in the superblock ahead of the mint counter before an
+    /// append, so a crash-restarted replica resumes above what it confirmed.
+    /// One superblock write per block: lowering it raises the fsync rate,
+    /// raising it wastes at most one block per crash. Must be <=
+    /// [`MAX_OFFSET_RESERVATION_LEASE`].
+    ///
+    /// SINGLE-REPLICA groups only: a replicated group acks once a quorum has
+    /// journaled the batch, claims nothing, and ignores this.
+    ///
+    /// `NonZeroU32` rather than a `u32` with a floor check: a zero lease claims
+    /// nothing and would write the superblock before every append, and the type
+    /// is what stops the partition-side setter from having to silently coerce it
+    /// to one, a coercion that hid wiring errors the validator could not see.
+    ///
+    /// The serde fallback is for the providers that do NOT merge the embedded
+    /// defaults: the file provider does, so a partial `[partition]` table only
+    /// fails through direct deserialization or an alternate provider.
+    #[serde(default = "default_offset_reservation_lease")]
+    #[config_env(leaf)]
+    pub offset_reservation_lease: NonZeroU32,
 
     /// Entries the evicted ring retains per multi-replica partition for
     /// journal repair after a peer rejoins. Larger widens the window a
@@ -203,6 +241,14 @@ impl Validatable<ConfigurationError> for PartitionConfig {
                 "{COMPONENT} partition.dedup_clients_max ({}) must be > 0 and <= \
                  {PARTITION_DEDUP_CLIENTS_CEILING}",
                 self.dedup_clients_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.offset_reservation_lease.get() > MAX_OFFSET_RESERVATION_LEASE {
+            eprintln!(
+                "{COMPONENT} partition.offset_reservation_lease ({}) exceeds the maximum \
+                 ({MAX_OFFSET_RESERVATION_LEASE})",
+                self.offset_reservation_lease
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -327,6 +373,69 @@ mod tests {
     fn accepts_prepare_queue_depth_at_ceiling() {
         let config = PartitionConfig {
             prepare_queue_depth: MAX_PARTITION_PREPARE_QUEUE_DEPTH,
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    fn lease(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).expect("a nonzero test lease")
+    }
+
+    /// A `[partition]` table as an alternate provider hands it over: every other
+    /// field present, the lease optional.
+    fn partial_table(lease: Option<u32>) -> String {
+        let entry = lease.map_or_else(String::new, |lease| {
+            format!(r#""offset_reservation_lease": {lease},"#)
+        });
+        format!(
+            r#"{{"prepare_queue_depth": 32, {entry}
+               "dedup_clients_max": 4096,
+               "evicted_ring_capacity": 4096,
+               "evicted_ring_bytes_max": "16 MiB",
+               "transfer_served_cache_bytes_max": "64 MiB",
+               "transfer_artifact_bytes_max": "64 MiB"}}"#
+        )
+    }
+
+    /// The floor is the type's, so a zero cannot be constructed to validate --
+    /// it is refused at deserialization instead.
+    #[test]
+    fn rejects_zero_offset_reservation_lease_at_deserialization() {
+        let error = serde_json::from_str::<PartitionConfig>(&partial_table(Some(0)))
+            .expect_err("a zero lease reserves nothing and must not deserialize");
+        assert!(
+            error.to_string().contains("nonzero"),
+            "the refusal must name the constraint, got {error}"
+        );
+    }
+
+    /// The providers that do not merge the embedded defaults hand over a partial
+    /// table, which must still deserialize.
+    #[test]
+    fn given_a_table_without_the_lease_when_deserialized_should_fall_back_to_the_default() {
+        let config = serde_json::from_str::<PartitionConfig>(&partial_table(None))
+            .expect("a table omitting the lease must deserialize");
+        assert_eq!(
+            config.offset_reservation_lease.get(),
+            DEFAULT_OFFSET_RESERVATION_LEASE
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_offset_reservation_lease_above_ceiling() {
+        let config = PartitionConfig {
+            offset_reservation_lease: lease(MAX_OFFSET_RESERVATION_LEASE + 1),
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_offset_reservation_lease_at_ceiling() {
+        let config = PartitionConfig {
+            offset_reservation_lease: lease(MAX_OFFSET_RESERVATION_LEASE),
             ..PartitionConfig::default()
         };
         assert!(config.validate().is_ok());
