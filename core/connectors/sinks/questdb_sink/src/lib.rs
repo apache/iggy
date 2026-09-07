@@ -51,6 +51,17 @@ const MAX_LOGGED_REJECTIONS_PER_BATCH: usize = 20;
 /// Upper bound on the payload text included when `log_rejected_payload` is on.
 const REJECTED_PAYLOAD_PREVIEW_BYTES: usize = 512;
 
+/// Flush once the encoded buffer reaches this many bytes, independently of
+/// `batch_size`.
+///
+/// QWP caps a single frame at the smaller of `max_buf_size` and the
+/// store-and-forward segment payload capacity, which is about 2 MiB with the
+/// default 4 MiB segments. The row API does not split an oversized buffer, so
+/// without a byte bound a batch of wide rows is rejected outright and every row
+/// in it is lost. The default leaves room for one more row on top of the
+/// threshold before the cap bites.
+const DEFAULT_MAX_FLUSH_BYTES: usize = 1_000_000;
+
 /// Deserialize only. Nothing re-serializes a plugin config, and leaving
 /// `Serialize` off is what keeps `connection_string` unserializable rather than
 /// merely un-serialized.
@@ -73,6 +84,9 @@ pub struct QuestDbSinkConfig {
     pub ack_level: Option<String>,
     pub flush_timeout: Option<String>,
     pub batch_size: Option<u32>,
+    /// Flush once the encoded buffer reaches this many bytes, regardless of
+    /// `batch_size`. Guards the QWP per-frame cap.
+    pub max_flush_bytes: Option<usize>,
     /// Include a truncated payload in the log line for a rejected message.
     /// Off by default: a rejected payload is still user data and may carry
     /// personal or otherwise sensitive fields.
@@ -88,6 +102,7 @@ pub struct QuestDbSink {
     ack_level: AckLevel,
     flush_timeout: Duration,
     batch_size: usize,
+    max_flush_bytes: usize,
     verbose: bool,
     log_rejected_payload: bool,
     /// The `sink_connector!` macro requires `new` to be infallible, so a bad
@@ -176,6 +191,10 @@ impl QuestDbSink {
             ack_level,
             flush_timeout,
             batch_size: config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE) as usize,
+            max_flush_bytes: config
+                .max_flush_bytes
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or(DEFAULT_MAX_FLUSH_BYTES),
             verbose: config.verbose_logging.unwrap_or(false),
             log_rejected_payload: config.log_rejected_payload.unwrap_or(false),
             init_error,
@@ -202,6 +221,7 @@ impl QuestDbSink {
         let flush_timeout = self.flush_timeout;
         let id = self.id;
         let log_payload = self.log_rejected_payload;
+        let max_flush_bytes = self.max_flush_bytes;
 
         // `questdb-rs` is synchronous: the QWP driver owns its own I/O thread
         // and `flush` / `wait` block. Row building is cheap but is done here
@@ -216,10 +236,27 @@ impl QuestDbSink {
             };
 
             let mut outcome = BatchOutcome::default();
+            // Rows pending in the buffer, reset on every flush. Tracked
+            // separately from `rows_written`, which spans the whole batch.
+            let mut pending = 0usize;
             for message in &messages {
+                // Flush before the buffer can outgrow the QWP per-frame cap.
+                // `batch_size` bounds rows, not bytes, so a batch of wide rows
+                // would otherwise be rejected whole and lose every row in it.
+                if pending > 0 && buffer.len() >= max_flush_bytes {
+                    sender
+                        .flush_buffer(&mut buffer)
+                        .map_err(FlushError::publishing)?;
+                    sender
+                        .wait(ack_level, flush_timeout)
+                        .map_err(FlushError::awaiting)?;
+                    pending = 0;
+                }
+
                 let reason = match mapping.append_row(&mut buffer, message, context) {
                     Ok(()) => {
                         outcome.rows_written += 1;
+                        pending += 1;
                         continue;
                     }
                     Err(RowError::Invalid(reason)) => reason,
@@ -257,7 +294,7 @@ impl QuestDbSink {
                 );
             }
 
-            if outcome.rows_written > 0 {
+            if pending > 0 {
                 sender
                     .flush_buffer(&mut buffer)
                     .map_err(FlushError::publishing)?;
@@ -573,6 +610,7 @@ mod tests {
             ack_level: None,
             flush_timeout: None,
             batch_size: None,
+            max_flush_bytes: None,
             log_rejected_payload: None,
             verbose_logging: None,
         }
@@ -600,6 +638,52 @@ mod tests {
             sink.open().await,
             Err(Error::InvalidConfigValue(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn given_malformed_connection_string_when_opened_should_fail() {
+        let mut config = config();
+        config.connection_string = SecretString::from("not-a-connect-string");
+        let mut sink = QuestDbSink::new(1, config);
+        assert!(matches!(sink.open().await, Err(Error::InitError(_))));
+    }
+
+    #[tokio::test]
+    async fn given_unsupported_transport_when_opened_should_fail() {
+        // The sink is QWP-only. An ILP connect string parses but must not be
+        // accepted, since the QWP-only column types would fail per row later.
+        let mut config = config();
+        config.connection_string = SecretString::from("http::addr=localhost:9000;");
+        let mut sink = QuestDbSink::new(1, config);
+        assert!(matches!(sink.open().await, Err(Error::InitError(_))));
+    }
+
+    #[tokio::test]
+    async fn given_unreachable_server_when_opened_should_fail_fast() {
+        // Port 1 has no listener. `open` doubles as the connectivity check, so
+        // a dead endpoint must surface at startup rather than at first flush.
+        let mut config = config();
+        config.connection_string = SecretString::from("ws::addr=127.0.0.1:1;");
+        let mut sink = QuestDbSink::new(1, config);
+        assert!(matches!(sink.open().await, Err(Error::InitError(_))));
+    }
+
+    #[tokio::test]
+    async fn given_never_opened_sink_when_consuming_should_report_missing_pool() {
+        let sink = QuestDbSink::new(1, config());
+        let topic_metadata = TopicMetadata {
+            stream: "s".to_owned(),
+            topic: "t".to_owned(),
+        };
+        let messages_metadata = MessagesMetadata {
+            partition_id: 1,
+            current_offset: 0,
+            schema: iggy_connector_sdk::Schema::Json,
+        };
+        let result = sink
+            .consume(&topic_metadata, messages_metadata, Vec::new())
+            .await;
+        assert!(matches!(result, Err(Error::InitError(_))));
     }
 
     #[test]
@@ -657,6 +741,30 @@ mod tests {
             sink.init_error,
             Some(Error::InvalidConfigValue(_))
         ));
+    }
+
+    #[test]
+    fn given_no_max_flush_bytes_when_constructed_should_use_the_frame_safe_default() {
+        let sink = QuestDbSink::new(1, config());
+        assert_eq!(sink.max_flush_bytes, DEFAULT_MAX_FLUSH_BYTES);
+    }
+
+    #[test]
+    fn given_zero_max_flush_bytes_when_constructed_should_fall_back_to_default() {
+        // Zero would flush after every row, or never, depending on how the
+        // comparison is read. Neither is useful, so it falls back.
+        let mut config = config();
+        config.max_flush_bytes = Some(0);
+        let sink = QuestDbSink::new(1, config);
+        assert_eq!(sink.max_flush_bytes, DEFAULT_MAX_FLUSH_BYTES);
+    }
+
+    #[test]
+    fn given_explicit_max_flush_bytes_when_constructed_should_honour_it() {
+        let mut config = config();
+        config.max_flush_bytes = Some(4096);
+        let sink = QuestDbSink::new(1, config);
+        assert_eq!(sink.max_flush_bytes, 4096);
     }
 
     #[test]

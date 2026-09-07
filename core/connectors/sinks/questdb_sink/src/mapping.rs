@@ -789,6 +789,72 @@ mod tests {
     }
 
     #[test]
+    fn given_every_structureless_payload_when_appending_should_store_it_verbatim() {
+        // Raw, Proto, FlatBuffer and Avro all reach QuestDB through the same
+        // `payload` column, so each variant must round-trip its bytes rather
+        // than being dropped for having no JSON fields.
+        let body = "structureless body";
+        let variants = [
+            Payload::Raw(body.as_bytes().to_vec()),
+            Payload::Proto(body.to_owned()),
+            Payload::FlatBuffer(body.as_bytes().to_vec()),
+            Payload::Avro(body.as_bytes().to_vec()),
+        ];
+
+        for payload in variants {
+            let label = format!("{payload:?}");
+            let mut buffer = buffer();
+            let mut message = json_message(r#"{"unused":1}"#);
+            message.payload = payload;
+
+            mapping()
+                .append_row(&mut buffer, &message, context())
+                .unwrap();
+
+            let line = rendered(&buffer);
+            assert!(line.contains(body), "{label} did not round-trip: {line}");
+        }
+    }
+
+    #[test]
+    fn given_non_utf8_binary_payload_when_appending_should_reject_row() {
+        // 0xFF is never valid UTF-8, and a VARCHAR column cannot hold it.
+        let mut buffer = buffer();
+        let mut message = json_message(r#"{"unused":1}"#);
+        message.payload = Payload::Raw(vec![0xFF, 0xFE, 0xFD]);
+
+        let error = mapping()
+            .append_row(&mut buffer, &message, context())
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)));
+        assert!(buffer.is_empty(), "rejected row must leave nothing behind");
+    }
+
+    #[test]
+    fn given_structureless_payload_when_metadata_enabled_should_still_add_columns() {
+        // A payload with no fields must not skip the stream/topic/offset
+        // columns, which are the only way to trace such a row back.
+        let mut mapping = mapping();
+        mapping.include_stream_column = true;
+        mapping.include_topic_column = true;
+        mapping.include_offset_column = true;
+        let mut buffer = buffer();
+        let mut message = json_message(r#"{"unused":1}"#);
+        message.payload = Payload::Text("body".to_owned());
+
+        mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+
+        let line = rendered(&buffer);
+        assert!(line.contains("stream=user_events"), "{line}");
+        assert!(line.contains("topic=trades"), "{line}");
+        assert!(line.contains("offset=42i"), "{line}");
+        assert!(line.contains("payload="), "{line}");
+    }
+
+    #[test]
     fn given_canonical_uuid_when_parsed_should_use_java_uuid_halves() {
         let (lo, hi) = parse_uuid("123e4567-e89b-12d3-a456-426614174000").unwrap();
         assert_eq!(hi, 0x123e_4567_e89b_12d3);

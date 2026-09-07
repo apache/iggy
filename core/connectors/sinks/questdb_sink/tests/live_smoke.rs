@@ -65,6 +65,7 @@ async fn given_live_questdb_when_consuming_should_write_typed_rows() {
         ack_level: Some("ok".to_owned()),
         flush_timeout: Some("15s".to_owned()),
         batch_size: Some(500),
+        max_flush_bytes: None,
         log_rejected_payload: Some(true),
         verbose_logging: Some(true),
     };
