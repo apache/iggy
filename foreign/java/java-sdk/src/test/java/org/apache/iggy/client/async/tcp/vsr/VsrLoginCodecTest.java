@@ -19,6 +19,12 @@
 
 package org.apache.iggy.client.async.tcp.vsr;
 
+import io.netty.buffer.AbstractByteBufAllocator;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
+import org.apache.iggy.serde.BytesSerializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EmptySource;
@@ -27,6 +33,7 @@ import org.junit.jupiter.params.provider.NullSource;
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class VsrLoginCodecTest {
 
@@ -72,5 +79,75 @@ class VsrLoginCodecTest {
 
         assertThat(field).hasSize(252);
         assertThat(new String(field, StandardCharsets.UTF_8)).isEqualTo("a".repeat(252));
+    }
+
+    @Test
+    void rewriteUserLoginPrefixesCredentialsWithUtf8ByteLength() {
+        String username = "użytkownik";
+        String password = "hasło";
+        ByteBuf loginPayload = BytesSerializer.toBytes(username, "username");
+        loginPayload.writeBytes(BytesSerializer.toBytes(password, "password"));
+
+        ByteBuf body = VsrLoginCodec.rewriteUserLogin(UnpooledByteBufAllocator.DEFAULT, loginPayload);
+
+        assertThat(body.readIntLE()).isEqualTo(VsrLoginCodec.PROTOCOL_VERSION);
+        assertThat(readShortField(body)).isEqualTo(VsrLoginCodec.SDK_NAME);
+        assertThat(readShortField(body)).isNotEmpty();
+        assertThat(readShortField(body)).isEqualTo(username);
+        assertThat(readShortField(body)).isEqualTo(password);
+        assertThat(body.readIntLE()).isZero();
+        assertThat(body.isReadable()).isFalse();
+    }
+
+    @Test
+    void rewriteUserLoginRejectsEmptyUsernameBeforeAllocating() {
+        ByteBuf loginPayload = Unpooled.buffer();
+        loginPayload.writeByte(0);
+        loginPayload.writeBytes(BytesSerializer.toBytes("secret", "password"));
+        CountingAllocator alloc = new CountingAllocator();
+
+        assertThatThrownBy(() -> VsrLoginCodec.rewriteUserLogin(alloc, loginPayload))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("username");
+        assertThat(alloc.allocations).isZero();
+    }
+
+    @Test
+    void rewritePatLoginRejectsEmptyTokenBeforeAllocating() {
+        ByteBuf loginPayload = Unpooled.buffer();
+        loginPayload.writeByte(0);
+        CountingAllocator alloc = new CountingAllocator();
+
+        assertThatThrownBy(() -> VsrLoginCodec.rewritePatLogin(alloc, loginPayload))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("token");
+        assertThat(alloc.allocations).isZero();
+    }
+
+    private static String readShortField(ByteBuf buffer) {
+        byte[] bytes = new byte[buffer.readUnsignedByte()];
+        buffer.readBytes(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private static final class CountingAllocator extends AbstractByteBufAllocator {
+        private int allocations;
+
+        @Override
+        protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+            allocations++;
+            return Unpooled.buffer(initialCapacity, maxCapacity);
+        }
+
+        @Override
+        protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
+            allocations++;
+            return Unpooled.directBuffer(initialCapacity, maxCapacity);
+        }
+
+        @Override
+        public boolean isDirectBufferPooled() {
+            return false;
+        }
     }
 }

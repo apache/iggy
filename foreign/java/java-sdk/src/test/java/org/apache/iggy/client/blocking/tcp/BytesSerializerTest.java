@@ -171,7 +171,7 @@ class BytesSerializerTest {
             String input = "test";
 
             // when
-            ByteBuf result = BytesSerializer.toBytes(input);
+            ByteBuf result = BytesSerializer.toBytes(input, "name");
 
             // then
             assertThat(result.readByte()).isEqualTo((byte) 4); // length
@@ -181,16 +181,15 @@ class BytesSerializerTest {
         }
 
         @Test
-        void shouldSerializeEmptyString() {
+        void shouldRejectEmptyString() {
             // given
             String input = "";
 
-            // when
-            ByteBuf result = BytesSerializer.toBytes(input);
-
-            // then
-            assertThat(result.readByte()).isEqualTo((byte) 0); // length = 0
-            assertThat(result.readableBytes()).isEqualTo(0);
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(input, "name"))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("name")
+                    .hasMessageContaining("0 bytes");
         }
 
         @Test
@@ -199,7 +198,7 @@ class BytesSerializerTest {
             String input = "Hello世界";
 
             // when
-            ByteBuf result = BytesSerializer.toBytes(input);
+            ByteBuf result = BytesSerializer.toBytes(input, "name");
 
             // then
             byte[] expectedBytes = input.getBytes(StandardCharsets.UTF_8);
@@ -215,7 +214,7 @@ class BytesSerializerTest {
             String input = "世".repeat(85);
 
             // when
-            ByteBuf result = BytesSerializer.toBytes(input);
+            ByteBuf result = BytesSerializer.toBytes(input, "name");
 
             // then
             assertThat(result.readUnsignedByte()).isEqualTo((short) 255);
@@ -229,9 +228,33 @@ class BytesSerializerTest {
             assertThat(input.length()).isLessThan(255);
 
             // when / then
-            assertThatThrownBy(() -> BytesSerializer.toBytes(input))
+            assertThatThrownBy(() -> BytesSerializer.toBytes(input, "name"))
                     .isInstanceOf(IggyInvalidArgumentException.class)
                     .hasMessageContaining("258");
+        }
+
+        @Test
+        void shouldNameTheRejectedField() {
+            assertThatThrownBy(() -> BytesSerializer.toBytes("", "username"))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("Invalid username length");
+        }
+
+        @Test
+        void shouldApplyCallerBoundsToEncodedLength() {
+            // given: three chars, six bytes
+            String input = "ééé";
+
+            // when / then
+            assertThat(BytesSerializer.toBytes(input, "password", 3, 6).readUnsignedByte())
+                    .isEqualTo((short) 6);
+            assertThatThrownBy(() -> BytesSerializer.toBytes(input, "password", 3, 5))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("password")
+                    .hasMessageContaining("between 3 and 5");
+            assertThatThrownBy(() -> BytesSerializer.toBytes("ab", "password", 3, 5))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("2 bytes");
         }
     }
 
@@ -265,7 +288,7 @@ class BytesSerializerTest {
             assertThat(result.readByte()).isEqualTo((byte) 11); // length = "test-stream".length()
             byte[] nameBytes = new byte[11];
             result.readBytes(nameBytes);
-            assertThat(new String(nameBytes)).isEqualTo("test-stream");
+            assertThat(new String(nameBytes, StandardCharsets.UTF_8)).isEqualTo("test-stream");
         }
 
         @Test
@@ -295,7 +318,7 @@ class BytesSerializerTest {
             "naïve-café, 02 0C 6E 61 C3 AF 76 65 2D 63 61 66 C3 A9",
             "日本語,     02 09 E6 97 A5 E6 9C AC E8 AA 9E",
         })
-        void shouldMatchServerWireFormatForNonAsciiNames(String name, String expectedHex) {
+        void shouldMatchExpectedWireLayoutForNonAsciiNames(String name, String expectedHex) {
             // given
             var identifier = StreamId.of(name);
 

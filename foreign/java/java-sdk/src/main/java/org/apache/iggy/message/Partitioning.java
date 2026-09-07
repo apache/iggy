@@ -27,13 +27,24 @@ import java.nio.charset.StandardCharsets;
 
 public record Partitioning(PartitioningKind kind, byte[] value) {
 
+    private static final int PARTITION_ID_LENGTH = 4;
+
     /** Server-side cap on a messages key, in encoded bytes, matching its u8 length prefix. */
-    public static final int MAX_MESSAGES_KEY_LENGTH = 255;
+    private static final int MAX_MESSAGES_KEY_LENGTH = 255;
 
     public Partitioning {
-        if (value.length > MAX_MESSAGES_KEY_LENGTH) {
+        if (kind == null || value == null) {
+            throw new IggyInvalidArgumentException("Partitioning kind and value cannot be null");
+        }
+        boolean valid =
+                switch (kind) {
+                    case Balanced -> value.length == 0;
+                    case PartitionId -> value.length == PARTITION_ID_LENGTH;
+                    case MessagesKey -> value.length >= 1 && value.length <= MAX_MESSAGES_KEY_LENGTH;
+                };
+        if (!valid) {
             throw new IggyInvalidArgumentException(
-                    "Partitioning value must be at most " + MAX_MESSAGES_KEY_LENGTH + " bytes, got " + value.length);
+                    kind + " partitioning value must be " + expectedLength(kind) + " bytes, got " + value.length);
         }
     }
 
@@ -42,7 +53,10 @@ public record Partitioning(PartitioningKind kind, byte[] value) {
     }
 
     public static Partitioning partitionId(Long id) {
-        ByteBuffer buffer = ByteBuffer.allocate(4);
+        if (id == null) {
+            throw new IggyInvalidArgumentException("Partition id cannot be null");
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(PARTITION_ID_LENGTH);
         buffer.putInt(id.intValue());
         byte[] partitionId = buffer.array();
         ArrayUtils.reverse(partitionId);
@@ -53,16 +67,19 @@ public record Partitioning(PartitioningKind kind, byte[] value) {
         if (key == null || key.isBlank()) {
             throw new IggyInvalidArgumentException("Key must be non-empty");
         }
-        byte[] encoded = key.getBytes(StandardCharsets.UTF_8);
-        if (encoded.length > MAX_MESSAGES_KEY_LENGTH) {
-            throw new IggyInvalidArgumentException(
-                    "Key must be at most " + MAX_MESSAGES_KEY_LENGTH + " bytes, got " + encoded.length);
-        }
-        return new Partitioning(PartitioningKind.MessagesKey, encoded);
+        return new Partitioning(PartitioningKind.MessagesKey, key.getBytes(StandardCharsets.UTF_8));
     }
 
     public int getSize() {
         // kind, 1 byte + length, 1 byte + value.length()
         return 2 + value.length;
+    }
+
+    private static String expectedLength(PartitioningKind kind) {
+        return switch (kind) {
+            case Balanced -> "0";
+            case PartitionId -> String.valueOf(PARTITION_ID_LENGTH);
+            case MessagesKey -> "1.." + MAX_MESSAGES_KEY_LENGTH;
+        };
     }
 }

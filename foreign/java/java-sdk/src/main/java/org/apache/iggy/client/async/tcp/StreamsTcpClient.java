@@ -58,7 +58,7 @@ public class StreamsTcpClient implements StreamsClient {
 
     @Override
     public CompletableFuture<StreamDetails> createStream(String name) {
-        var payload = BytesSerializer.toBytes(name);
+        var payload = BytesSerializer.toBytes(name, "name");
 
         return connection().send(CommandCode.Stream.CREATE.getValue(), payload).thenApply(response -> {
             StreamDetails details = readStreamDetails(response);
@@ -99,12 +99,8 @@ public class StreamsTcpClient implements StreamsClient {
 
     @Override
     public CompletableFuture<Void> updateStream(StreamId streamId, String name) {
-        var idBytes = toBytes(streamId);
-        var nameBytes = BytesSerializer.toBytes(name);
-        var payload = Unpooled.buffer(idBytes.readableBytes() + nameBytes.readableBytes());
-
-        payload.writeBytes(idBytes);
-        payload.writeBytes(nameBytes);
+        var payload = toBytes(streamId);
+        payload.writeBytes(BytesSerializer.toBytes(name, "name"));
         // Trailing options block. Streams have no catalog keys yet, so the
         // server rejects every key; the empty block is the extension point.
         payload.writeBytes(BytesSerializer.toBytes(Map.<HeaderKey, HeaderValue>of()));

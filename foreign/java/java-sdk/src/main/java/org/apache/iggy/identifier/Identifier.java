@@ -30,7 +30,7 @@ import java.nio.charset.StandardCharsets;
 public abstract class Identifier {
 
     /** Server-side cap on a wire name, in UTF-8 bytes, matching its u8 length prefix. */
-    public static final int MAX_NAME_LENGTH = 255;
+    private static final int MAX_NAME_LENGTH = 255;
 
     private final String name;
     private final byte[] encodedName;

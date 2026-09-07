@@ -19,9 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.message.HeaderKey;
@@ -36,7 +34,6 @@ import org.apache.iggy.user.UserStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -51,6 +48,16 @@ import static org.apache.iggy.serde.BytesSerializer.toBytes;
  */
 public class UsersTcpClient implements UsersClient {
     private static final Logger log = LoggerFactory.getLogger(UsersTcpClient.class);
+
+    /**
+     * Credential bounds the server enforces, in UTF-8 bytes. Checked here so a bad value fails
+     * before the round trip instead of as an opaque server error.
+     */
+    private static final int MIN_USERNAME_LENGTH = 3;
+
+    private static final int MAX_USERNAME_LENGTH = 50;
+    private static final int MIN_PASSWORD_LENGTH = 3;
+    private static final int MAX_PASSWORD_LENGTH = 100;
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
     private final LoginRoutingHook routingHook;
@@ -84,8 +91,8 @@ public class UsersTcpClient implements UsersClient {
     public CompletableFuture<UserInfoDetails> createUser(
             String username, String password, UserStatus status, Optional<Permissions> permissions) {
         var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(username));
-        payload.writeBytes(toBytes(password));
+        payload.writeBytes(toBytes(username, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH));
+        payload.writeBytes(toBytes(password, "password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
         payload.writeByte(status.asCode());
         permissions.ifPresentOrElse(
                 perms -> {
@@ -111,7 +118,7 @@ public class UsersTcpClient implements UsersClient {
         username.ifPresentOrElse(
                 un -> {
                     payload.writeByte(1);
-                    payload.writeBytes(toBytes(un));
+                    payload.writeBytes(toBytes(un, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH));
                 },
                 () -> payload.writeByte(0));
         status.ifPresentOrElse(
@@ -146,8 +153,8 @@ public class UsersTcpClient implements UsersClient {
     @Override
     public CompletableFuture<Void> changePassword(UserId userId, String currentPassword, String newPassword) {
         var payload = toBytes(userId);
-        payload.writeBytes(toBytes(currentPassword));
-        payload.writeBytes(toBytes(newPassword));
+        payload.writeBytes(toBytes(currentPassword, "current password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
+        payload.writeBytes(toBytes(newPassword, "new password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
 
         return connection().sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload);
     }
@@ -157,23 +164,12 @@ public class UsersTcpClient implements UsersClient {
         return routingHook.loginOnLeader(() -> loginWithoutRedirect(username, password));
     }
 
-    static ByteBuf loginPayload(String username, String password, String version, String context) {
-        byte[] versionBytes = version.getBytes(StandardCharsets.UTF_8);
-        byte[] contextBytes = context.getBytes(StandardCharsets.UTF_8);
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(username));
-        payload.writeBytes(toBytes(password));
-        payload.writeIntLE(versionBytes.length);
-        payload.writeBytes(versionBytes);
-        payload.writeIntLE(contextBytes.length);
-        payload.writeBytes(contextBytes);
-        return payload;
-    }
-
     private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password) {
-        String version = IggyVersion.getInstance().getUserAgent();
-        String context = IggyVersion.getInstance().toString();
-        var payload = loginPayload(username, password, version, context);
+        // The VSR codec re-frames this into a Register and carries the SDK
+        // version itself, so the payload is only the two credentials.
+        var payload = Unpooled.buffer();
+        payload.writeBytes(toBytes(username, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH));
+        payload.writeBytes(toBytes(password, "password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
 
         log.debug("Logging in user: {}", username);
 

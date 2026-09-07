@@ -198,11 +198,20 @@ public final class BytesSerializer {
         return buffer;
     }
 
-    public static ByteBuf toBytes(String value) {
+    /** A u8-length-prefixed wire string; {@code field} names it in the error when it does not fit. */
+    public static ByteBuf toBytes(String value, String field) {
+        return toBytes(value, field, 1, MAX_U8_STRING_LENGTH);
+    }
+
+    /**
+     * A u8-length-prefixed wire string bounded to {@code [minLength, maxLength]} UTF-8 bytes, for
+     * fields the server holds to a tighter range than the prefix allows.
+     */
+    public static ByteBuf toBytes(String value, String field, int minLength, int maxLength) {
         byte[] stringBytes = value.getBytes(StandardCharsets.UTF_8);
-        if (stringBytes.length > MAX_U8_STRING_LENGTH) {
-            throw new IggyInvalidArgumentException("String must be at most " + MAX_U8_STRING_LENGTH
-                    + " bytes when UTF-8 encoded, got " + stringBytes.length);
+        if (stringBytes.length < minLength || stringBytes.length > maxLength) {
+            throw new IggyInvalidArgumentException("Invalid " + field + " length: " + stringBytes.length
+                    + " bytes when UTF-8 encoded, must be between " + minLength + " and " + maxLength);
         }
         ByteBuf buffer = Unpooled.buffer(1 + stringBytes.length);
         buffer.writeByte(stringBytes.length);

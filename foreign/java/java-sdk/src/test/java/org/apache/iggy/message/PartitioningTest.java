@@ -78,6 +78,40 @@ class PartitioningTest {
     }
 
     @Test
+    void constructorThrowsIggyInvalidArgumentExceptionWhenMessagesKeyValueIsEmpty() {
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.MessagesKey, new byte[0]))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("1..255");
+    }
+
+    @Test
+    void constructorThrowsIggyInvalidArgumentExceptionWhenBalancedValueIsNotEmpty() {
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.Balanced, new byte[] {1}))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("Balanced");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 3, 5})
+    void constructorThrowsIggyInvalidArgumentExceptionWhenPartitionIdValueIsNotFourBytes(int length) {
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.PartitionId, new byte[length]))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("must be 4 bytes");
+    }
+
+    @Test
+    void constructorThrowsIggyInvalidArgumentExceptionWhenKindOrValueIsNull() {
+        assertThatThrownBy(() -> new Partitioning(null, new byte[0])).isInstanceOf(IggyInvalidArgumentException.class);
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.MessagesKey, null))
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void partitionIdThrowsIggyInvalidArgumentExceptionWhenIdIsNull() {
+        assertThatThrownBy(() -> Partitioning.partitionId(null)).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
     void messagesKeyEncodesValueAsUtf8() {
         var result = Partitioning.messagesKey("世界");
 
