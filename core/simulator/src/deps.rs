@@ -435,6 +435,20 @@ impl SimJournal<MemStorage> {
         headers.remove(&op).is_some()
     }
 
+    /// Forget one op's BODY, leaving its header resident: what a commit walk
+    /// reading `entry()` cannot get past on its own, since the header the
+    /// gap check and the repair ingest both read is still there.
+    ///
+    /// Tests only, and the sibling of [`Self::forget_op`]: no drop pattern on
+    /// a link produces this, because the header and the body land in the same
+    /// append.
+    pub fn forget_body(&self, op: u64) -> bool {
+        #[cfg(debug_assertions)]
+        let _guard = JournalAccessGuard::new(&self.accessing);
+        let offsets = unsafe { &mut *self.offsets.get() };
+        offsets.remove(&op).is_some()
+    }
+
     /// The committed watermark to restore after a restart, mirroring
     /// `metadata::recover`. On a solo cluster every appended op commits the instant
     /// it is durable, so the head IS the commit point; otherwise the highest
