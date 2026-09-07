@@ -198,13 +198,13 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
 iceberg-storage-opendal = "0.10.1"
-iggy = { path = "core/sdk", version = "0.11.0-edge.6" }
-iggy-cli = { path = "core/cli", version = "0.14.0-edge.6" }
+iggy = { path = "core/sdk", version = "0.11.0-edge.7" }
+iggy-cli = { path = "core/cli", version = "0.14.0-edge.7" }
 iggy-gateway-kafka = { path = "gateways/kafka" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.6" }
-iggy_common = { path = "core/common", version = "0.11.0-edge.6" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.7" }
+iggy_common = { path = "core/common", version = "0.11.0-edge.7" }
 iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.3" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.4" }
 indexmap = "2.14.1"
 integration = { path = "core/integration" }
 ipnet = "2.12.1"
