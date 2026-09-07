@@ -39,6 +39,7 @@ __all__ = [
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
+    "HttpConfig",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
@@ -895,26 +896,100 @@ class HeaderValue:
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
+class HttpConfig:
+    r"""
+    Configuration for the HTTP transport, accepted by `IggyClient(...)`.
+
+    Every field is keyword-only and optional.
+
+    There is no `AutoLogin` and no reconnection policy, and `connect()` does not
+    dial: it only starts the heartbeat, so `login_user(...)` has to follow it.
+
+    HTTP is single-consumer only. `consumer_group(...)` fails with
+    `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
+    names an explicit `partition_id`. With one, the consumer kind is not carried
+    on the HTTP wire, so the poll is served as an ordinary consumer named after
+    the group, with no membership, no partition assignment, and no rebalancing
+    behind it. Pass `Consumer.Single(...)` explicitly.
+    """
+    @property
+    def api_url(self) -> builtins.str: ...
+    @property
+    def retries(self) -> builtins.int: ...
+    @property
+    def has_jwt(self) -> builtins.bool:
+        r"""
+        Whether a JWT is configured, without exposing the token itself.
+        """
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        api_url: builtins.str | None = None,
+        retries: builtins.int | None = None,
+        jwt: builtins.str | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+    ) -> HttpConfig:
+        r"""
+        Constructs an HTTP configuration.
+
+        Args:
+            api_url: Base URL of the Iggy HTTP API, as `scheme://host[:port]`
+                only - no path, query, fragment, or credentials. Defaults to
+                `http://127.0.0.1:3000`.
+            retries: Number of retries to perform on transient errors, each one
+                replaying the full request (including its body) via automatic
+                middleware. Defaults to 3. Delivery is therefore at-least-once:
+                if the original request actually committed but its response
+                was lost (e.g. to a timeout), a retried call applies the same
+                operation again. Set to 0 to disable automatic replay and match
+                the other transports, which surface the failure instead of
+                silently resending.
+            jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to
+                `None`. Stored trimmed, since a token read from a file carries a
+                trailing newline that the `Authorization` header value rejects.
+                Rejected if empty or whitespace-only: accepting it would make
+                `has_jwt` report `True` while every call still fails
+                `Unauthenticated`.
+            heartbeat_interval: Interval between the client's liveness probes
+                (a bare `GET /ping`). Defaults to 5 seconds. Unlike TCP/QUIC,
+                HTTP has no persistent connection or session for this to keep
+                alive; it only proves the server is reachable.
+
+        Raises:
+            ValueError: If `api_url` is not a valid URL, if `retries` is outside
+                the range of an unsigned 32-bit integer, if `jwt` is empty or
+                whitespace-only, if a duration is negative, or if
+                `heartbeat_interval` is zero.
+            OverflowError: If `retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
     It provides asynchronous functionality through the contained runtime.
     """
     def __new__(
-        cls, conn: TcpConfig | QuicConfig | builtins.str | None = None
+        cls, conn: TcpConfig | QuicConfig | HttpConfig | builtins.str | None = None
     ) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
-        `QuicConfig`. This initializes a new runtime for asynchronous operations.
+        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
+        `QuicConfig`, or an `HttpConfig`. This initializes a new runtime for
+        asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
 
         Args:
-            conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
-                to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
-                address is reported differently depending on the form: the string
-                form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
-                raise `ValueError` when they are constructed, before either ever
-                reaches this call. Neither exception is a subclass of the other.
+            conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, or an
+                `HttpConfig`. Defaults to `127.0.0.1:8090` over TCP with auto-login
+                disabled. A malformed address is reported differently depending on
+                the form: the string form raises `RuntimeError` here, while
+                `TcpConfig`/`QuicConfig`/`HttpConfig` raise `ValueError` when they
+                are constructed, before any of them ever reaches this call. Neither
+                exception is a subclass of the other.
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
@@ -1114,8 +1189,10 @@ class IggyClient:
         """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
-        Connects the IggyClient to its service.
-        Raises `RuntimeError` if the connection fails.
+        Connects the IggyClient to its service and starts the heartbeat task.
+        Raises `RuntimeError` if the connection fails. Over HTTP there is no
+        connection to establish, so only the heartbeat starts and this call
+        succeeds even against an unreachable server.
         """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
@@ -1545,6 +1622,15 @@ class IggyClient:
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
         `AutoCommit` interval is negative, or if any of those except `poll_interval`
         is zero.
+
+        Consumer groups are not available over HTTP. With `auto_join_consumer_group`
+        left on, this call fails at the join with `Feature is unavailable`.
+        Turning it off is not a workaround: the join is skipped, but a group
+        member always polls without a partition, so the first poll fails with
+        the same error. Use `Consumer.Single(...)` with `poll_messages(...)`
+        instead - a `Consumer.Group(...)` poll with an explicit `partition_id`
+        does reach the server, but is served as an ordinary consumer named
+        after the group.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
@@ -1963,6 +2049,8 @@ class QuicConfig:
                 `max_idle_timeout` is not a whole number of milliseconds, if
                 `initial_mtu` is below quinn's minimum of 1200, or if a numeric
                 field is outside the range of its underlying wire type.
+            OverflowError: If a numeric field does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2010,6 +2098,8 @@ class QuicReconnectionConfig:
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2578,6 +2668,8 @@ class TcpReconnectionConfig:
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 

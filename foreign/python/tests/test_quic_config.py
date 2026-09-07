@@ -26,6 +26,7 @@ covered by `test_client_config.py`.
 """
 
 import ast
+import socket
 from collections.abc import Callable
 from datetime import timedelta
 
@@ -131,10 +132,21 @@ class TestQuicReconnectionConfig:
         assert reconnection.interval == timedelta(days=30_000)
 
     def test_maximum_interval_round_trips(self):
-        """Test that the largest timedelta survives the day conversion."""
-        reconnection = QuicReconnectionConfig(interval=timedelta(days=999_999_999))
+        """Test that the largest timedelta survives the day conversion.
 
-        assert reconnection.interval == timedelta(days=999_999_999)
+        The repr is asserted in seconds rather than days: it is rendered from
+        a microsecond count, so the maximum comes back as a whole-second
+        `timedelta` instead of the `days=` form it was constructed with.
+        """
+        maximum = timedelta(days=999_999_999)
+
+        reconnection = QuicReconnectionConfig(interval=maximum)
+
+        printed = repr(reconnection)
+
+        assert reconnection.interval == maximum
+        assert "interval=datetime.timedelta(seconds=86399999913600)" in printed
+        ast.parse(printed)
 
 
 @pytest.mark.unit
@@ -210,8 +222,15 @@ class TestQuicConfig:
         assert "secret" not in repr(config)
 
     def test_repr_shows_every_field_as_python(self):
-        """Test that repr covers the QUIC-specific fields and parses as Python."""
+        """Test that repr covers the configured fields and parses as Python.
+
+        The three string fields are asserted too: `ast.parse` alone still
+        passes on a repr that dropped one from the format string.
+        """
         config = QuicConfig(
+            server_address="127.0.0.1:8081",
+            client_address="127.0.0.1:9000",
+            server_name="example.com",
             heartbeat_interval=timedelta(seconds=15),
             keep_alive_interval=timedelta(seconds=2),
             max_idle_timeout=timedelta(seconds=20),
@@ -220,6 +239,9 @@ class TestQuicConfig:
 
         printed = repr(config)
 
+        assert 'server_address="127.0.0.1:8081"' in printed
+        assert 'client_address="127.0.0.1:9000"' in printed
+        assert 'server_name="example.com"' in printed
         assert "validate_certificate=True" in printed
         assert "heartbeat_interval=datetime.timedelta(seconds=15)" in printed
         assert "keep_alive_interval=datetime.timedelta(seconds=2)" in printed
@@ -231,8 +253,8 @@ class TestQuicConfig:
         ["", "127.0.0.1", "127.0.0.1:not-a-port", "127.0.0.1:70000", "::1:8080"],
     )
     def test_invalid_server_address_is_rejected(self, invalid_address: str):
-        """Test that a malformed address fails at construction, not at connect."""
-        with pytest.raises(ValueError):
+        """Test that a malformed address fails at construction, naming itself."""
+        with pytest.raises(ValueError, match="server_address"):
             QuicConfig(server_address=invalid_address)
 
     @pytest.mark.parametrize(
@@ -250,6 +272,20 @@ class TestQuicConfig:
         """
         with pytest.raises(ValueError, match="client_address"):
             QuicConfig(client_address=invalid_address)
+
+    def test_surrounding_whitespace_in_the_addresses_is_trimmed(self):
+        """Test that both addresses tolerate whitespace, like HTTP's `api_url`.
+
+        `client_address` is stored as the string `QuicClient::create` compares
+        against the literal default to pick an IPv6 bind address, so storing
+        the trimmed form is what keeps a padded default matching that sentinel.
+        """
+        config = QuicConfig(
+            server_address=" 127.0.0.1:8080 ", client_address=" 127.0.0.1:0 "
+        )
+
+        assert config.server_address == "127.0.0.1:8080"
+        assert config.client_address == "127.0.0.1:0"
 
     def test_negative_heartbeat_interval_is_rejected(self):
         """Test that a negative heartbeat interval fails at construction."""
@@ -359,8 +395,32 @@ class TestQuicClientConstruction:
     """Test that `IggyClient(...)` accepts a `QuicConfig`."""
 
     def test_accepts_a_config(self):
-        """Test that a client can be built from a config object."""
-        assert IggyClient(QuicConfig(server_address="127.0.0.1:8080")) is not None
+        """Test that the resulting client is actually QUIC, not silently TCP.
+
+        `IggyClient(...)` is not None for either union arm, so that alone never
+        pinned the transport. `client_address` is a QUIC-only field that
+        `QuicClient::create` binds eagerly here, so a port already held fails
+        the bind synchronously with `Cannot create endpoint`, with no server
+        and no privileged port involved. A client that regressed to the TCP arm
+        has no such field and would construct fine, and no other error maps to
+        that message.
+
+        The held port has to be a real one: an unroutable address would only
+        fail the bind while `net.ipv4.ip_nonlocal_bind` is 0, and a host
+        running keepalived or a container setting it alone would bind
+        successfully and assert nothing. Neither the socket below nor quinn
+        sets `SO_REUSEADDR`, so the second bind is EADDRINUSE regardless.
+        """
+        # A bindable client_address of its own, so the failure below is the
+        # collision and not the field being set at all.
+        assert IggyClient(QuicConfig(client_address="127.0.0.1:0")) is not None
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as held:
+            held.bind(("127.0.0.1", 0))
+            port = held.getsockname()[1]
+
+            with pytest.raises(RuntimeError, match="Cannot create endpoint"):
+                IggyClient(QuicConfig(client_address=f"127.0.0.1:{port}"))
 
     def test_accepts_the_default_config(self):
         """Test that an explicit default `QuicConfig` is accepted."""
