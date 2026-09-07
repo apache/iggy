@@ -117,7 +117,7 @@ class TestHttpConfig:
         Only `scheme://host[:port]` is accepted: a path, query, fragment, or
         embedded credentials are all rejected, not just a missing/zero port.
         """
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Cannot parse URL|Invalid API URL"):
             HttpConfig(api_url=invalid_url)
 
     @pytest.mark.parametrize("bad_jwt", ["", "   ", "\t"])
@@ -140,10 +140,14 @@ class TestHttpConfig:
         with pytest.raises(ValueError, match="retries"):
             HttpConfig(retries=out_of_range)
 
-    def test_negative_heartbeat_interval_is_rejected(self):
+    @pytest.mark.parametrize(
+        "negative",
+        [timedelta(microseconds=-1), timedelta(seconds=-1), timedelta(days=-1)],
+    )
+    def test_negative_heartbeat_interval_is_rejected(self, negative: timedelta):
         """Test that a negative heartbeat interval fails at construction."""
         with pytest.raises(ValueError, match="negative"):
-            HttpConfig(heartbeat_interval=timedelta(seconds=-3))
+            HttpConfig(heartbeat_interval=negative)
 
     def test_zero_heartbeat_interval_is_rejected(self):
         """Test that a zero heartbeat interval fails at construction.
@@ -151,8 +155,27 @@ class TestHttpConfig:
         Nothing downstream reads zero as "disabled"; it heartbeats in a
         continuous loop for as long as the client lives.
         """
-        with pytest.raises(ValueError, match="zero"):
+        with pytest.raises(ValueError, match=r"heartbeat_interval.*must not be zero"):
             HttpConfig(heartbeat_interval=timedelta(0))
+
+    def test_maximum_heartbeat_interval_round_trips(self):
+        """Test that the largest timedelta survives the duration conversion.
+
+        The repr is asserted in seconds rather than days: it is rendered from
+        a microsecond count, so the maximum comes back as a whole-second
+        `timedelta` instead of the `days=` form it was constructed with.
+        """
+        maximum = timedelta(days=999_999_999)
+
+        config = HttpConfig(heartbeat_interval=maximum)
+
+        printed = repr(config)
+
+        assert config.heartbeat_interval == maximum
+        assert (
+            "heartbeat_interval=datetime.timedelta(seconds=86399999913600)" in printed
+        )
+        ast.parse(printed)
 
 
 @pytest.mark.unit
@@ -175,6 +198,25 @@ class TestHttpClientConstruction:
 
         with pytest.raises(RuntimeError, match="Invalid HTTP request"):
             await client.ping()
+
+    def test_accepts_the_default_config(self):
+        """Test that an explicit default `HttpConfig` is accepted."""
+        assert IggyClient(HttpConfig()) is not None
+
+    @pytest.mark.asyncio
+    async def test_without_a_jwt_a_privileged_call_is_unauthenticated(self):
+        """Test that a privileged call fails when no token is configured.
+
+        `HttpClient` seeds its access token from `jwt`, so with none configured
+        and no `login_user()` it stays empty and the client rejects the call
+        itself. The dead port is what proves that: nothing is dialled, so the
+        failure cannot be the server's.
+        """
+        client = IggyClient(HttpConfig(api_url="http://127.0.0.1:1", retries=0))
+        await client.connect()
+
+        with pytest.raises(RuntimeError, match="Unauthenticated"):
+            await client.create_stream("never-created")
 
 
 @pytest.mark.integration
@@ -260,6 +302,28 @@ class TestHttpConfigAgainstServer:
         stream_name = unique_name()
         await client.create_stream(stream_name)
         assert await client.get_stream(stream_name) is not None
+
+    @pytest.mark.asyncio
+    async def test_wrong_jwt_is_rejected_by_the_server(self, unique_name):
+        """Test that a JWT the server cannot decode fails the call, not connect.
+
+        `connect()` does not dial over HTTP, so a bad token can only surface
+        later. `wait_for_ping` runs first because ping needs no credentials:
+        it proves the server is reachable, which pins the failure below on the
+        token rather than on a missing listener. The server answers an
+        undecodable token with 401, which the HTTP client maps back to
+        `Unauthenticated`.
+        """
+        host, port = get_http_server_config()
+
+        client = IggyClient(
+            HttpConfig(api_url=f"http://{host}:{port}", jwt="not-a-real-token")
+        )
+        await client.connect()
+        await wait_for_ping(client)
+
+        with pytest.raises(RuntimeError, match="Unauthenticated"):
+            await client.create_stream(unique_name())
 
     @pytest.mark.asyncio
     async def test_consumer_group_is_rejected(self, unique_name):

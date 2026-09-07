@@ -901,6 +901,9 @@ class HttpConfig:
 
     Every field is keyword-only and optional.
 
+    There is no `AutoLogin` and no reconnection policy, and `connect()` does not
+    dial: it only starts the heartbeat, so `login_user(...)` has to follow it.
+
     HTTP is single-consumer only. `consumer_group(...)` fails with
     `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
     names an explicit `partition_id`. With one, the consumer kind is not carried

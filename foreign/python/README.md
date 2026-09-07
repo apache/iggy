@@ -169,11 +169,11 @@ async def main():
 asyncio.run(main())
 ```
 
-`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport; see
-`examples/python/getting-started/producer.py` for a config swap example.
+`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport and an
+`HttpConfig` for the HTTP transport;
+`examples/python/getting-started/producer.py` shows either swap in context.
 
-`IggyClient(...)` also accepts an `HttpConfig` for the HTTP transport, which
-differs from TCP in two ways. There is no reconnection policy and no
+`HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the
 heartbeat that `heartbeat_interval` configures, so call it and then
 `login_user(...)`. And HTTP is single-consumer only: the `consumer_group(...)`
@@ -200,8 +200,6 @@ async def main():
 
 asyncio.run(main())
 ```
-
-`examples/python/getting-started/producer.py` shows the same swap in context.
 
 ## Examples
 

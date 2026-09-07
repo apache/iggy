@@ -117,8 +117,6 @@ def build_config(args: ArgNamespace) -> TcpConfig | HttpConfig:
     #         enabled=True, interval=timedelta(seconds=1)
     #     ),
     # )
-    #
-    # main() logs args.tcp_server_address, so change that line too.
 
     # IggyClient(...) also accepts an HttpConfig for the HTTP transport. HTTP
     # has no AutoLogin or reconnection policy, so main() below would also need

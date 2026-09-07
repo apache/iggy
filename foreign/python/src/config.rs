@@ -158,7 +158,7 @@ impl TcpReconnectionConfig {
         let defaults = RustTcpClientReconnectionConfig::default();
         let enabled = enabled.unwrap_or(defaults.enabled);
         let max_retries = max_retries
-            .map(|max_retries| u32_arg(max_retries, "max_retries"))
+            .map(|max_retries| u32_param(max_retries, "max_retries"))
             .transpose()?;
         let interval = interval
             .as_ref()
@@ -824,6 +824,9 @@ impl QuicConfig {
 ///
 /// Every field is keyword-only and optional.
 ///
+/// There is no `AutoLogin` and no reconnection policy, and `connect()` does not
+/// dial: it only starts the heartbeat, so `login_user(...)` has to follow it.
+///
 /// HTTP is single-consumer only. `consumer_group(...)` fails with
 /// `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
 /// names an explicit `partition_id`. With one, the consumer kind is not carried
@@ -894,8 +897,11 @@ impl HttpConfig {
         if let Some(api_url) = api_url {
             builder = builder.with_api_url(api_url);
         }
+        let mut inner = builder
+            .build()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         if let Some(retries) = retries {
-            builder = builder.with_retries(u32_arg(retries, "retries")?);
+            inner.retries = u32_param(retries, "retries")?;
         }
         if let Some(jwt) = jwt {
             let jwt = jwt.trim();
@@ -904,18 +910,14 @@ impl HttpConfig {
                     "'jwt' must not be empty or whitespace-only",
                 ));
             }
-            builder = builder.with_jwt(jwt.to_owned());
+            inner.jwt = Some(jwt.to_owned());
         }
         if let Some(heartbeat_interval) = heartbeat_interval {
-            let heartbeat_interval = reject_zero(
+            inner.heartbeat_interval = reject_zero(
                 py_delta_to_iggy_duration(&heartbeat_interval)?,
                 "heartbeat_interval",
             )?;
-            builder = builder.with_heartbeat_interval(heartbeat_interval);
         }
-        let inner = builder
-            .build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -967,7 +969,7 @@ fn python_bool(value: bool) -> &'static str {
 /// expect, naming the parameter in the error so a caller can tell which
 /// argument was out of range. A value too large even for `i64` still raises
 /// pyo3's own unnamed `OverflowError` before this ever runs.
-fn u32_arg(value: i64, parameter: &str) -> PyResult<u32> {
+fn u32_param(value: i64, parameter: &str) -> PyResult<u32> {
     u32::try_from(value).map_err(|_| {
         PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", u32::MAX))
     })
