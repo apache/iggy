@@ -659,21 +659,22 @@ view_probe_attempts_max = 5
 # waits before one is opened for it is repair_gap_debounce_interval below.
 repair_retry_interval = "1s"
 
-# How long a partition backup must hold committed ops it cannot walk to before
-# the shard's tick sweep opens a repair session for it (duration). The
-# level-triggered floor under every edge-triggered arming site, which a produce
-# stream can starve; must be nonzero.
+# How long a backup must hold committed ops it cannot walk to before the shard's
+# tick opens a repair session for it (duration). The level-triggered floor under
+# every edge-triggered arming site, which a produce stream can starve; must be
+# nonzero. Paces the partition sweep and the metadata detector alike.
 #
 # Floored at 50 consensus ticks (500ms at the 10ms tick), so values under that
 # arm no sooner: one tick of lag is ordinary pipelining, and repair against it
 # would fire on healthy traffic.
 #
 # Recovery latency for one hole is max(this, 500ms) plus up to one tick of sweep
-# granularity. Under a correlated fault the sweep opens at most 3 sessions per
-# tick and holds at most 8 at once, so the Nth group waiting on this shard adds
-# ceil(N / 3) ticks on top, and more while sessions are already in flight. That
-# cap is what keeps a node-wide rejoin from putting every group's repair stream
-# on one serving peer at once.
+# granularity. Under a correlated fault the partition sweep opens at most 3
+# sessions per tick and holds at most 8 at once, so the Nth group waiting on
+# this shard adds ceil(N / 3) ticks on top, and more while sessions are already
+# in flight. That cap is what keeps a node-wide rejoin from putting every
+# group's repair stream on one serving peer at once. There is one metadata group
+# per node, so its detector is not rate-capped.
 repair_gap_debounce_interval = "1s"
 
 # Prepares a peer serves per repair round before the requester walks to the next
