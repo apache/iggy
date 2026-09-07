@@ -48,6 +48,8 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADER_PRODUCER_KEY: &str = "producer";
 const HEADER_PRODUCER_VALUE: &str = "integration-test";
 const HEADER_SEQ_KEY: &str = "seq";
+const INCLUDE_USER_HEADERS_ENV: &str =
+    "IGGY_CONNECTORS_SOURCE_IGGY_PLUGIN_CONFIG_INCLUDE_USER_HEADERS";
 
 /// Boots a second `iggy-server` that acts as the upstream cluster the
 /// `iggy_source` connector replicates from. The connector config's
@@ -172,16 +174,38 @@ impl IggySourceUpstreamFixture {
                     .expect("Failed to build upstream message")
             })
             .collect::<Vec<_>>();
+        self.produce_iggy_messages(client, &mut messages).await;
+    }
+
+    async fn produce_iggy_messages(&self, client: &IggyClient, messages: &mut [IggyMessage]) {
         client
             .send_messages(
                 &Identifier::named(UPSTREAM_STREAM).expect("valid stream name"),
                 &Identifier::named(UPSTREAM_TOPIC).expect("valid topic name"),
                 &Partitioning::partition_id(0),
-                &mut messages,
+                messages,
             )
             .await
             .expect("Failed to send messages upstream");
     }
+}
+
+fn message_with_unknown_header_kind(payload: &str) -> IggyMessage {
+    let mut user_headers = vec![0xFF];
+    user_headers.extend_from_slice(&3u32.to_le_bytes());
+    user_headers.extend_from_slice(b"key");
+    user_headers.push(0xFF);
+    user_headers.extend_from_slice(&5u32.to_le_bytes());
+    user_headers.extend_from_slice(b"value");
+
+    let mut message = IggyMessage::builder()
+        .payload(Bytes::copy_from_slice(payload.as_bytes()))
+        .build()
+        .expect("test message should be valid");
+    message.header.user_headers_length =
+        u32::try_from(user_headers.len()).expect("test user headers should fit in u32");
+    message.user_headers = Some(user_headers.into());
+    message
 }
 
 /// Drains the downstream test topic with a fresh consumer, returning every
@@ -298,6 +322,23 @@ async fn wait_for_source_error_after(http: &Client, api_url: &str, previous_erro
     .expect("Iggy source did not report a downstream send failure");
 }
 
+async fn wait_for_connector_log(harness: &TestHarness, marker: &str) {
+    timeout(WAIT_TIMEOUT, async {
+        loop {
+            let (stdout, stderr) = harness
+                .connectors_runtime()
+                .expect("connectors runtime")
+                .collect_logs();
+            if stdout.contains(marker) || stderr.contains(marker) {
+                break;
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    })
+    .await
+    .expect("Iggy source did not log the expected message build failure");
+}
+
 #[iggy_harness(
     cluster_nodes = 1,
     server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
@@ -332,6 +373,68 @@ async fn iggy_source_replicates_messages_with_headers(
         );
         assert_headers(message, i as u64);
     }
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn malformed_user_headers_do_not_advance_source_offset(
+    harness: &mut TestHarness,
+    fixture: IggySourceUpstreamFixture,
+) {
+    let upstream_client = fixture.client().await.expect("upstream client");
+    fixture.ensure_upstream_topic(&upstream_client).await;
+
+    let first_payload = vec!["before-malformed-headers".to_string()];
+    fixture
+        .produce_messages(&upstream_client, &first_payload)
+        .await;
+    let first_received = drain_downstream_topic(harness, "iggy_source_before_malformed", 1).await;
+    assert_eq!(first_received.len(), 1, "Expected the first offset to sync");
+
+    let mut blocked_batch = vec![
+        message_with_unknown_header_kind("malformed-headers"),
+        IggyMessage::builder()
+            .payload(Bytes::from_static(b"after-malformed-headers"))
+            .build()
+            .expect("test message should be valid"),
+    ];
+    fixture
+        .produce_iggy_messages(&upstream_client, &mut blocked_batch)
+        .await;
+    wait_for_connector_log(harness, "Failed to convert upstream message at offset 1").await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .add_env(INCLUDE_USER_HEADERS_ENV, "false");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime without user headers");
+
+    let received = drain_downstream_topic(harness, "iggy_source_after_malformed", 3).await;
+    let payloads = received
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads,
+        [
+            "before-malformed-headers",
+            "malformed-headers",
+            "after-malformed-headers",
+        ],
+        "The malformed offset and its tail should be replayed after restart"
+    );
 }
 
 #[iggy_harness(
