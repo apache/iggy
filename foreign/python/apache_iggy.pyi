@@ -917,10 +917,8 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
-                `host:port` pair, or if a `QuicConfig` client cannot be
-                constructed, e.g. `client_address` is not a valid `host:port`
-                pair or the local UDP socket cannot be bound (for example the
-                port is already in use).
+                `host:port` pair, or if a `QuicConfig` client cannot bind its
+                local UDP socket (for example the port is already in use).
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
@@ -1844,10 +1842,10 @@ class QuicConfig:
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8080`.
             client_address: `host:port` to bind the local UDP socket to. Defaults to
-                `127.0.0.1:0`, which binds to any available port. Left at that
-                default, a `server_address` that resolves to IPv6 binds `[::1]:0`
-                instead, so the socket in use may not be the address read back
-                here; set it explicitly to pin the local address.
+                `127.0.0.1:0`, which binds to any available port. That exact value,
+                passed or defaulted, binds `[::1]:0` instead when `server_address`
+                resolves to IPv6, so the socket in use may not be the address read
+                back here. Any other value binds as given.
             server_name: Server name used for the QUIC/TLS handshake. Defaults to
                 `localhost`.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
@@ -1874,7 +1872,7 @@ class QuicConfig:
             ValueError: If `server_address` or `client_address` is not a valid
                 `host:port` pair, if a duration is negative, if
                 `heartbeat_interval` is zero, if `keep_alive_interval` or
-                `max_idle_timeout` is non-zero but rounds down to 0ms, if
+                `max_idle_timeout` is not a whole number of milliseconds, if
                 `initial_mtu` is below quinn's minimum of 1200, or if a numeric
                 field is outside the range of its underlying wire type.
         """

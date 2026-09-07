@@ -26,7 +26,6 @@ from apache_iggy import (
     Consumer,
     IggyClient,
     PollingStrategy,
-    QuicConfig,
     ReceiveMessage,
     TcpConfig,
     TcpReconnectionConfig,
@@ -102,12 +101,12 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(args))
 
 
-def build_config(args: ArgNamespace) -> TcpConfig | QuicConfig:
-    """Build a TCP client configuration with auto-login and reconnection."""
+def build_config(args: ArgNamespace) -> TcpConfig:
+    """Build the TCP client configuration with auto-login and reconnection."""
 
     # IggyClient(...) also accepts a QuicConfig for the QUIC transport. To use
-    # it, import QuicReconnectionConfig above and replace the return statement
-    # with:
+    # it, import QuicConfig and QuicReconnectionConfig above, change the return
+    # annotation to QuicConfig, and replace the return statement with:
     #
     # return QuicConfig(
     #     server_address="127.0.0.1:8080",
@@ -117,6 +116,8 @@ def build_config(args: ArgNamespace) -> TcpConfig | QuicConfig:
     #         enabled=True, interval=timedelta(seconds=1)
     #     ),
     # )
+    #
+    # main() logs args.tcp_server_address, so change that line too.
 
     return TcpConfig(
         server_address=args.tcp_server_address,

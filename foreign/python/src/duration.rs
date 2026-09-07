@@ -42,15 +42,22 @@ pub fn iggy_duration_to_py_delta(
 
 /// Converts a Python timedelta to milliseconds, for fields the Rust SDK
 /// stores as a raw millisecond count rather than an `IggyDuration` (e.g.
-/// QUIC's `keep_alive_interval`/`max_idle_timeout`). Zero is a magic value for
-/// both of those fields (disables the keep-alive, or falls back to quinn's own
-/// default), so a non-zero duration that rounds down to 0ms would silently
-/// mean something other than what was asked for.
+/// QUIC's `keep_alive_interval`/`max_idle_timeout`). Anything finer than a
+/// millisecond is rejected rather than truncated, so the getter always reads
+/// back the duration that is actually in effect. Zero is accepted for both of
+/// those fields as a magic value (disables the keep-alive, or falls back to
+/// quinn's own default), so a non-zero duration below 1ms is rejected with its
+/// own message rather than collapsing into it.
 pub fn py_delta_to_millis(delta: &Py<PyDelta>, parameter: &str) -> PyResult<u64> {
     let duration = py_delta_to_iggy_duration(delta)?.get_duration();
     if !duration.is_zero() && duration.as_millis() == 0 {
         return Err(PyValueError::new_err(format!(
             "'{parameter}' is non-zero but rounds down to 0ms; use a duration of at least 1ms, or exactly zero"
+        )));
+    }
+    if duration.subsec_nanos() % 1_000_000 != 0 {
+        return Err(PyValueError::new_err(format!(
+            "'{parameter}' must be a whole number of milliseconds; anything finer is dropped by the QUIC transport, which stores it as a millisecond count"
         )));
     }
     Ok(duration.as_millis() as u64)

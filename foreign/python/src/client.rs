@@ -28,6 +28,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -58,6 +59,11 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
+/// Keeps the SDK's own message on the `RuntimeError` the Python surface raises.
+fn to_runtime_error<E: Display>(error: E) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+}
+
 /// Resolves the shared `create_topic`/`update_topic` parameters, applying
 /// server defaults where the caller left them unset.
 fn resolve_topic_params(
@@ -66,8 +72,7 @@ fn resolve_topic_params(
     max_topic_size: Option<&MaxTopicSize>,
 ) -> PyResult<(CompressionAlgorithm, RustIggyExpiry, RustMaxTopicSize)> {
     let compression_algorithm = match compression_algorithm {
-        Some(algo) => CompressionAlgorithm::from_str(&algo)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+        Some(algo) => CompressionAlgorithm::from_str(&algo).map_err(to_runtime_error)?,
         None => CompressionAlgorithm::default(),
     };
 
@@ -101,40 +106,26 @@ impl IggyClient {
     ///
     /// Raises:
     ///     RuntimeError: If the address passed as a string is not a valid
-    ///         `host:port` pair, or if a `QuicConfig` client cannot be
-    ///         constructed, e.g. `client_address` is not a valid `host:port`
-    ///         pair or the local UDP socket cannot be bound (for example the
-    ///         port is already in use).
+    ///         `host:port` pair, or if a `QuicConfig` client cannot bind its
+    ///         local UDP socket (for example the port is already in use).
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
         #[gen_stub(override_type(type_repr = "TcpConfig | QuicConfig | builtins.str | None"))]
         conn: Option<PyClientConfig>,
     ) -> PyResult<Self> {
-        match conn {
-            Some(PyClientConfig::Tcp(config)) => {
-                let tcp_client = TcpClient::create(config.client_config()).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })?;
-                Ok(Self {
-                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
-                })
-            }
+        let wrapper = match conn {
+            Some(PyClientConfig::Tcp(config)) => ClientWrapper::Tcp(
+                TcpClient::create(config.client_config()).map_err(to_runtime_error)?,
+            ),
             Some(PyClientConfig::ServerAddress(server_address)) => {
                 let config = Arc::new(
                     TcpClientConfigBuilder::new()
                         .with_server_address(server_address)
                         .build()
-                        .map_err(|e| {
-                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                        })?,
+                        .map_err(to_runtime_error)?,
                 );
-                let tcp_client = TcpClient::create(config).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })?;
-                Ok(Self {
-                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
-                })
+                ClientWrapper::Tcp(TcpClient::create(config).map_err(to_runtime_error)?)
             }
             Some(PyClientConfig::Quic(config)) => {
                 // `quinn::Endpoint::client` (invoked eagerly by `QuicClient::create`) looks
@@ -143,23 +134,18 @@ impl IggyClient {
                 // from Python without one, so enter the runtime pyo3-async-runtimes uses
                 // for our own async methods before building the endpoint.
                 let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-                let quic_client = QuicClient::create(config.client_config()).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })?;
-                Ok(Self {
-                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Quic(quic_client))),
-                })
+                ClientWrapper::Quic(
+                    QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
+                )
             }
-            None => {
-                let tcp_client =
-                    TcpClient::create(Arc::new(TcpClientConfig::default())).map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                    })?;
-                Ok(Self {
-                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
-                })
-            }
-        }
+            None => ClientWrapper::Tcp(
+                TcpClient::create(Arc::new(TcpClientConfig::default()))
+                    .map_err(to_runtime_error)?,
+            ),
+        };
+        Ok(Self {
+            inner: Arc::new(RustIggyClient::new(wrapper)),
+        })
     }
 
     /// Constructs a new IggyClient from a connection string.

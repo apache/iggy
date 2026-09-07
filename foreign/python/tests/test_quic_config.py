@@ -121,7 +121,7 @@ class TestQuicReconnectionConfig:
         The interval is a delay between passes, so zero reconnects in a
         continuous loop.
         """
-        with pytest.raises(ValueError, match="zero"):
+        with pytest.raises(ValueError, match=r"interval.*must not be zero"):
             QuicReconnectionConfig(interval=timedelta(0), **kwargs)
 
     def test_very_long_interval_round_trips(self):
@@ -262,7 +262,7 @@ class TestQuicConfig:
         Nothing downstream reads zero as "disabled"; it heartbeats in a
         continuous loop for as long as the client lives.
         """
-        with pytest.raises(ValueError, match="zero"):
+        with pytest.raises(ValueError, match=r"heartbeat_interval.*must not be zero"):
             QuicConfig(heartbeat_interval=timedelta(0))
 
     @pytest.mark.parametrize(
@@ -301,9 +301,21 @@ class TestQuicConfig:
         default), so a duration that rounds down to zero would silently mean
         something other than what was asked for.
         """
-        with pytest.raises(ValueError, match=field):
+        with pytest.raises(ValueError, match=rf"{field}.*rounds down to 0ms"):
             # pyrefly: ignore  # bad-argument-type
             QuicConfig(**{field: timedelta(microseconds=500)})
+
+    @pytest.mark.parametrize("field", ["keep_alive_interval", "max_idle_timeout"])
+    def test_sub_millisecond_precision_is_rejected(self, field: str):
+        """Test that a duration with a sub-millisecond remainder is refused.
+
+        The Rust SDK stores both fields as a millisecond count, so the
+        remainder would be dropped and the getter would read back a different
+        duration than the one that was passed in.
+        """
+        with pytest.raises(ValueError, match=rf"{field}.*whole number of milliseconds"):
+            # pyrefly: ignore  # bad-argument-type
+            QuicConfig(**{field: timedelta(milliseconds=1, microseconds=500)})
 
     @pytest.mark.parametrize("field", ["keep_alive_interval", "max_idle_timeout"])
     def test_exact_zero_duration_is_allowed(self, field: str):
@@ -312,6 +324,18 @@ class TestQuicConfig:
         config = QuicConfig(**{field: timedelta(0)})
 
         assert getattr(config, field) == timedelta(0)
+
+    @pytest.mark.parametrize("field", ["keep_alive_interval", "max_idle_timeout"])
+    def test_whole_millisecond_duration_is_allowed(self, field: str):
+        """Test that a duration that is not a whole number of seconds round-trips.
+
+        Every other duration these fields accept here is second-aligned, so a
+        check tightened to whole seconds would otherwise pass the suite.
+        """
+        # pyrefly: ignore  # bad-argument-type
+        config = QuicConfig(**{field: timedelta(milliseconds=1500)})
+
+        assert getattr(config, field) == timedelta(milliseconds=1500)
 
     def test_initial_mtu_below_quinns_minimum_is_rejected(self):
         """Test that an initial_mtu below 1200 fails at construction.
@@ -357,8 +381,8 @@ class TestAutoLoginAgainstServer:
                 server_address=f"{host}:{port}",
                 auto_login=AutoLogin.username_password("iggy", "iggy"),
                 # The default reconnection policy retries forever: a missing
-                # listener would hang this test until the CI timeout instead
-                # of failing.
+                # listener would stall this test for the full 30s pytest
+                # timeout instead of failing fast.
                 reconnection=QuicReconnectionConfig(enabled=False),
             )
         )
@@ -380,8 +404,8 @@ class TestAutoLoginAgainstServer:
             QuicConfig(
                 server_address=f"{host}:{port}",
                 # The default reconnection policy retries forever: a missing
-                # listener would hang this test until the CI timeout instead
-                # of failing.
+                # listener would stall this test for the full 30s pytest
+                # timeout instead of failing fast.
                 reconnection=QuicReconnectionConfig(enabled=False),
             )
         )
@@ -404,5 +428,7 @@ class TestAutoLoginAgainstServer:
             )
         )
 
-        with pytest.raises(RuntimeError):
+        # A bare RuntimeError would also match "Cannot establish connection",
+        # which is what a missing listener raises on this reconnection policy.
+        with pytest.raises(RuntimeError, match="Invalid credentials"):
             await client.connect()
