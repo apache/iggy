@@ -2049,7 +2049,7 @@ class QuicConfig:
                 seconds) instead, since `configure()` skips the setter entirely when
                 zero. Defaults to 10 seconds.
             validate_certificate: Whether to validate the server certificate. Defaults
-                to disabled, unlike the TCP and WebSocket transports.
+                to disabled; only the TCP transport validates by default.
 
         Raises:
             ValueError: If `server_address` or `client_address` is not a valid
@@ -3005,16 +3005,18 @@ class WebSocketConfig:
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             framing: Frame- and buffer-level options. Defaults to `WebSocketFramingConfig()`.
             tls_enabled: Whether to connect over TLS. Defaults to disabled.
-            tls_domain: Domain to validate the certificate against. Defaults to `localhost`.
+            tls_domain: Domain to validate the certificate against. Defaults to
+                `localhost`. Empty means it is taken from the IP `server_address`
+                resolves to.
             tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
                 and `tls_validate_certificate` are both on; with either one off it
                 is kept but never consulted, so pairing it with
                 `tls_validate_certificate=False` pins nothing.
             tls_validate_certificate: Whether to validate the server certificate.
-                Defaults to `False`, unlike the TCP and QUIC transports. Disabling
-                this accepts any certificate the server presents, including
-                self-signed and mismatched ones, and takes precedence over
-                `tls_ca_file`.
+                Defaults to `False`; only the TCP transport validates by default.
+                Disabling this accepts any certificate the server presents,
+                including self-signed and mismatched ones, and takes precedence
+                over `tls_ca_file`.
 
         Raises:
             ValueError: If `server_address` is not a valid `host:port` pair, if a
@@ -3057,9 +3059,11 @@ class WebSocketFramingConfig:
         Constructs a WebSocket framing configuration.
 
         Args:
-            read_buffer_size: Read buffer size in bytes.
-            write_buffer_size: Write buffer size in bytes.
-            max_write_buffer_size: Maximum write buffer size in bytes.
+            read_buffer_size: Read buffer size in bytes. Defaults to 128 KiB.
+            write_buffer_size: Write buffer size in bytes. Defaults to 128 KiB.
+            max_write_buffer_size: Maximum write buffer size in bytes. Defaults to
+                unbounded, which reads back as the largest value a pointer-sized
+                unsigned integer holds rather than as `None`.
             max_message_size: Maximum message size in bytes, or an explicit `None`
                 to lift the limit entirely. Omitting the argument is not the same
                 as passing `None`: it keeps the underlying default of 64 MiB.
@@ -3078,7 +3082,7 @@ class WebSocketFramingConfig:
                 greater than `write_buffer_size`. tungstenite enforces the same
                 invariant with an `assert!` at connect time, which would otherwise
                 surface as an unrecoverable Rust panic instead of a `ValueError`.
-            OverflowError: If a numeric field does not fit a signed 64-bit integer,
+            OverflowError: If a numeric field does not fit a signed 128-bit integer,
                 raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...

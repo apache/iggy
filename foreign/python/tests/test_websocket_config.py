@@ -30,6 +30,7 @@ transport-agnostic and already covered by `test_client_config.py`.
 
 import ast
 import socket
+import sys
 import threading
 from collections.abc import Callable
 from datetime import timedelta
@@ -45,6 +46,20 @@ from apache_iggy import (
 )
 
 from .utils import get_websocket_server_config, wait_for_ping, wait_for_server
+
+# tungstenite's own `WebSocketConfig::default()` values, mirrored here so a
+# dependency bump that moves one fails loudly instead of silently redefining the
+# Python surface.
+TUNGSTENITE_READ_BUFFER_SIZE = 128 * 1024
+TUNGSTENITE_WRITE_BUFFER_SIZE = 128 * 1024
+# `usize::MAX`, tungstenite's "unbounded" write buffer.
+TUNGSTENITE_MAX_WRITE_BUFFER_SIZE = sys.maxsize * 2 + 1
+TUNGSTENITE_MAX_MESSAGE_SIZE = 64 << 20
+TUNGSTENITE_MAX_FRAME_SIZE = 16 << 20
+
+# The accept thread only has to come back from a connection the client already
+# dialed, so anything beyond this is a hang, not slowness.
+ACCEPT_JOIN_TIMEOUT_SECONDS = 5.0
 
 
 def _accept_and_close(listener: socket.socket) -> None:
@@ -170,11 +185,11 @@ class TestWebSocketFramingConfig:
         """
         framing = WebSocketFramingConfig()
 
-        assert framing.read_buffer_size is not None
-        assert framing.write_buffer_size is not None
-        assert framing.max_write_buffer_size is not None
-        assert framing.max_message_size is not None
-        assert framing.max_frame_size is not None
+        assert framing.read_buffer_size == TUNGSTENITE_READ_BUFFER_SIZE
+        assert framing.write_buffer_size == TUNGSTENITE_WRITE_BUFFER_SIZE
+        assert framing.max_write_buffer_size == TUNGSTENITE_MAX_WRITE_BUFFER_SIZE
+        assert framing.max_message_size == TUNGSTENITE_MAX_MESSAGE_SIZE
+        assert framing.max_frame_size == TUNGSTENITE_MAX_FRAME_SIZE
         assert framing.accept_unmasked_frames is False
 
     def test_every_field_round_trips(self):
@@ -239,6 +254,18 @@ class TestWebSocketFramingConfig:
         assert "read_buffer_size=4096" in printed
         assert "accept_unmasked_frames=True" in printed
         ast.parse(printed)
+
+    def test_default_repr_is_constructible(self):
+        """Test that the default repr survives being fed back to the constructor.
+
+        `max_write_buffer_size` defaults to `usize::MAX`, so this only holds
+        because the constructor takes the sizes as `i128`. An `i64` parameter
+        rejects its own default with an `OverflowError`, which `ast.parse`
+        alone would not catch.
+        """
+        printed = repr(WebSocketFramingConfig())
+
+        assert repr(eval(printed)) == printed  # noqa: S307
 
     @pytest.mark.parametrize(
         "field",
@@ -397,14 +424,18 @@ class TestWebSocketClientConstruction:
         here depends on a sysctl, a privileged port, or a running server.
         `max_retries=0` keeps the failure immediate instead of retrying
         forever, which is the default.
+
+        The accept thread is joined before the block ends so it is out of
+        `accept()` before the listener closes under it.
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
             port = listener.getsockname()[1]
-            threading.Thread(
+            accept_thread = threading.Thread(
                 target=lambda: _accept_and_close(listener), daemon=True
-            ).start()
+            )
+            accept_thread.start()
 
             client = IggyClient(
                 WebSocketConfig(
@@ -415,6 +446,8 @@ class TestWebSocketClientConstruction:
 
             with pytest.raises(RuntimeError, match="Cannot establish connection"):
                 await client.connect()
+
+            accept_thread.join(timeout=ACCEPT_JOIN_TIMEOUT_SECONDS)
 
     def test_accepts_the_default_config(self):
         """Test that an explicit default `WebSocketConfig` is accepted."""
