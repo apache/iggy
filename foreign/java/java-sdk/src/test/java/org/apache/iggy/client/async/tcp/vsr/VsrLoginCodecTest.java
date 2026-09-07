@@ -89,14 +89,18 @@ class VsrLoginCodecTest {
         loginPayload.writeBytes(BytesSerializer.toBytes(password, "password"));
 
         ByteBuf body = VsrLoginCodec.rewriteUserLogin(UnpooledByteBufAllocator.DEFAULT, loginPayload);
-
-        assertThat(body.readIntLE()).isEqualTo(VsrLoginCodec.PROTOCOL_VERSION);
-        assertThat(readShortField(body)).isEqualTo(VsrLoginCodec.SDK_NAME);
-        assertThat(readShortField(body)).isNotEmpty();
-        assertThat(readShortField(body)).isEqualTo(username);
-        assertThat(readShortField(body)).isEqualTo(password);
-        assertThat(body.readIntLE()).isZero();
-        assertThat(body.isReadable()).isFalse();
+        try {
+            assertThat(body.readIntLE()).isEqualTo(VsrLoginCodec.PROTOCOL_VERSION);
+            assertThat(readShortField(body)).isEqualTo(VsrLoginCodec.SDK_NAME);
+            assertThat(readShortField(body)).isNotEmpty();
+            assertThat(readShortField(body)).isEqualTo(username);
+            assertThat(readShortField(body)).isEqualTo(password);
+            assertThat(body.readIntLE()).isZero();
+            assertThat(body.isReadable()).isFalse();
+        } finally {
+            body.release();
+            loginPayload.release();
+        }
     }
 
     @Test
@@ -110,6 +114,7 @@ class VsrLoginCodecTest {
                 .isInstanceOf(IggyInvalidArgumentException.class)
                 .hasMessageContaining("username");
         assertThat(alloc.allocations).isZero();
+        loginPayload.release();
     }
 
     @Test
@@ -122,6 +127,7 @@ class VsrLoginCodecTest {
                 .isInstanceOf(IggyInvalidArgumentException.class)
                 .hasMessageContaining("token");
         assertThat(alloc.allocations).isZero();
+        loginPayload.release();
     }
 
     private static String readShortField(ByteBuf buffer) {

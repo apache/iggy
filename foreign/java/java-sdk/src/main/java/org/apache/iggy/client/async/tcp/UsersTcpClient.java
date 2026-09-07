@@ -22,8 +22,6 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.identifier.UserId;
-import org.apache.iggy.message.HeaderKey;
-import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
@@ -35,7 +33,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
@@ -127,9 +124,9 @@ public class UsersTcpClient implements UsersClient {
                     payload.writeByte(s.asCode());
                 },
                 () -> payload.writeByte(0));
-        // Trailing options block. Users have no catalog keys yet, so the
-        // server rejects every key; the empty block is the extension point.
-        payload.writeBytes(toBytes(Map.<HeaderKey, HeaderValue>of()));
+        // No trailing options block: users have no catalog keys yet and the
+        // server reads an absent block as empty. Settings will ride one here,
+        // as topics do.
 
         return connection().sendAndRelease(CommandCode.User.UPDATE, payload);
     }
