@@ -377,25 +377,18 @@ impl Source for IggySource {
                     if polled.messages.is_empty() {
                         continue;
                     }
+                    let partition_messages = build_produced_messages(
+                        &polled.messages,
+                        self.include_user_headers,
+                        partition_id,
+                        self.id,
+                    )?;
                     let last_offset = polled
                         .messages
                         .last()
                         .map(|message| message.header.offset)
                         .unwrap_or_default();
-                    for message in &polled.messages {
-                        match build_produced_message(message, self.include_user_headers) {
-                            Ok(produced) => messages.push(produced),
-                            Err(e) => {
-                                error!(
-                                    "Failed to convert upstream message at offset {} on \
-                                     partition {partition_id} for {CONNECTOR_NAME} connector \
-                                     ID: {}: {e}",
-                                    message.header.offset, self.id
-                                );
-                                errors_in_cycle += 1;
-                            }
-                        }
-                    }
+                    messages.extend(partition_messages);
                     candidate_state.offsets.insert(partition_id, last_offset);
                 }
                 Err(IggyError::InvalidOffset(offset)) => {
@@ -504,27 +497,43 @@ fn next_strategy(initial: InitialOffset, saved_offset: Option<u64>) -> PollingSt
     }
 }
 
-fn build_produced_message(
-    message: &IggyMessage,
+fn build_produced_messages(
+    messages: &[IggyMessage],
     include_user_headers: bool,
-) -> Result<ProducedMessage, Error> {
-    let headers = if include_user_headers {
-        message.user_headers_map().map_err(|e| {
-            Error::InvalidRecordValue(format!("Failed to parse upstream user headers: {e}"))
-        })?
-    } else {
-        None
-    };
-
-    Ok(ProducedMessage {
-        id: (message.header.id != 0).then_some(message.header.id),
-        headers,
-        checksum: None,
-        timestamp: None,
-        origin_timestamp: (message.header.origin_timestamp != 0)
-            .then_some(message.header.origin_timestamp),
-        payload: message.payload.to_vec(),
-    })
+    partition_id: u32,
+    connector_id: u32,
+) -> Result<Vec<ProducedMessage>, Error> {
+    let mut produced_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        let headers = if include_user_headers {
+            message
+                .user_headers_map()
+                .map_err(|error| {
+                    Error::InvalidRecordValue(format!(
+                        "Failed to parse upstream user headers: {error}"
+                    ))
+                })
+                .inspect_err(|error| {
+                    error!(
+                        "Failed to convert upstream message at offset {} on partition \
+                         {partition_id} for {CONNECTOR_NAME} connector ID: {connector_id}: {error}",
+                        message.header.offset
+                    );
+                })?
+        } else {
+            None
+        };
+        produced_messages.push(ProducedMessage {
+            id: (message.header.id != 0).then_some(message.header.id),
+            headers,
+            checksum: None,
+            timestamp: None,
+            origin_timestamp: (message.header.origin_timestamp != 0)
+                .then_some(message.header.origin_timestamp),
+            payload: message.payload.to_vec(),
+        });
+    }
+    Ok(produced_messages)
 }
 
 fn redact_connection_string(connection_string: &str) -> String {
@@ -567,6 +576,30 @@ mod tests {
             max_retry_interval: Some("5s".to_string()),
             verbose_logging: Some(false),
         }
+    }
+
+    fn test_message(offset: u64) -> IggyMessage {
+        let mut message = IggyMessage::builder()
+            .payload("test payload".into())
+            .build()
+            .expect("test message should be valid");
+        message.header.offset = offset;
+        message
+    }
+
+    fn test_message_with_unknown_header_kind(offset: u64) -> IggyMessage {
+        let mut user_headers = vec![0xFF];
+        user_headers.extend_from_slice(&3u32.to_le_bytes());
+        user_headers.extend_from_slice(b"key");
+        user_headers.push(0xFF);
+        user_headers.extend_from_slice(&5u32.to_le_bytes());
+        user_headers.extend_from_slice(b"value");
+
+        let mut message = test_message(offset);
+        message.header.user_headers_length =
+            u32::try_from(user_headers.len()).expect("test user headers should fit in u32");
+        message.user_headers = Some(user_headers.into());
+        message
     }
 
     #[test]
@@ -789,6 +822,19 @@ mod tests {
             next_strategy(InitialOffset::Offset(7), None),
             PollingStrategy::offset(7)
         );
+    }
+
+    #[test]
+    fn given_malformed_message_when_building_polled_batch_should_reject_entire_batch() {
+        let messages = [
+            test_message(10),
+            test_message_with_unknown_header_kind(11),
+            test_message(12),
+        ];
+
+        let result = build_produced_messages(&messages, true, 0, 1);
+
+        assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
     }
 
     #[test]
