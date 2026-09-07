@@ -134,7 +134,7 @@ running prek / committing / pushing. This list is not exhaustive and other hook 
 
 ## Client Configuration
 
-`IggyClient` takes either a server address or a `TcpConfig`:
+`IggyClient` takes a server address, a `TcpConfig`, or a `QuicConfig`:
 
 ```python
 import asyncio
@@ -167,6 +167,9 @@ async def main():
 
 asyncio.run(main())
 ```
+
+`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport; see
+`examples/python/getting-started/producer.py` for a config swap example.
 
 ## Examples
 

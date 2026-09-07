@@ -102,7 +102,6 @@ testing = [
     "pytest>=9.1.1,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<8.0",
-    "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
 ]
 
@@ -123,7 +122,6 @@ all = [
     "pytest>=9.1.1,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<8.0",
-    "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
     "ruff>=0.1.0,<1.0",
     "testcontainers>=4.15.0,<5.0",
