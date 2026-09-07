@@ -354,13 +354,14 @@ internal static class TcpContracts
 
         // The producer owns message ids: a zero id is minted before the frame checksum covers it.
         var originTimestamp = ulong.MaxValue;
+        Span<byte> idBytes = stackalloc byte[16];
         foreach (var message in messages)
         {
             if (message.Header.Id == 0)
             {
-                message.Header = message.Header with { Id = Guid.NewGuid().ToUInt128() };
+                Random.Shared.NextBytes(idBytes);
+                message.Header = message.Header with { Id = BinaryPrimitives.ReadUInt128LittleEndian(idBytes) };
             }
-
             originTimestamp = Math.Min(originTimestamp, message.Header.OriginTimestamp);
         }
 
