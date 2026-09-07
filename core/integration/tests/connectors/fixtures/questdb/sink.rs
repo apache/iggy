@@ -65,6 +65,10 @@ pub struct QuestDbSinkOptions {
     /// fixture. The sink runs in the connectors-runtime process on the host,
     /// so this is a plain host path rather than a container volume.
     pub store_and_forward: bool,
+    /// DDL executed once the container is healthy and before the connectors
+    /// runtime starts, for tests that need the table to exist with settings
+    /// QWP cannot infer, such as `DEDUP UPSERT KEYS`.
+    pub pre_create_ddl: Option<String>,
 }
 
 pub struct QuestDbSinkFixture {
@@ -243,6 +247,15 @@ impl QuestDbSinkFixture {
             match fixture.http_client.get(&url).send().await {
                 Ok(response) if response.status().as_u16() == 204 => {
                     info!("QuestDB /ping OK after {} attempts", attempt + 1);
+                    if let Some(ddl) = fixture.options.pre_create_ddl.clone() {
+                        let result = fixture.exec(&ddl).await?;
+                        if let Some(error) = result.get("error") {
+                            return Err(TestBinaryError::FixtureSetup {
+                                fixture_type: "QuestDbSink".to_string(),
+                                message: format!("Pre-create DDL failed: {error}"),
+                            });
+                        }
+                    }
                     return Ok(fixture);
                 }
                 Ok(response) => info!(
@@ -454,6 +467,54 @@ impl TestFixture for QuestDbSinkTextFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
             schema: Some("text".to_string()),
+            ..Default::default()
+        })
+        .await
+        .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+/// Raw-schema stream: the payload arrives as bytes with no field structure.
+pub struct QuestDbSinkRawFixture(pub QuestDbSinkFixture);
+
+#[async_trait]
+impl TestFixture for QuestDbSinkRawFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
+            schema: Some("raw".to_string()),
+            ..Default::default()
+        })
+        .await
+        .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+/// Table pre-created with `DEDUP UPSERT KEYS`, which is the recipe the README
+/// gives operators for the at-least-once delivery model.
+pub struct QuestDbSinkDedupFixture(pub QuestDbSinkFixture);
+
+#[async_trait]
+impl TestFixture for QuestDbSinkDedupFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
+            timestamp_source: Some("payload".to_string()),
+            timestamp_field: Some("event_time".to_string()),
+            timestamp_unit: Some("micros".to_string()),
+            include_stream_column: Some(false),
+            include_topic_column: Some(false),
+            pre_create_ddl: Some(format!(
+                "create table {SINK_TABLE} (seq LONG, timestamp TIMESTAMP_NS) \
+                 timestamp(timestamp) partition by DAY WAL \
+                 DEDUP UPSERT KEYS(timestamp, seq)"
+            )),
             ..Default::default()
         })
         .await
