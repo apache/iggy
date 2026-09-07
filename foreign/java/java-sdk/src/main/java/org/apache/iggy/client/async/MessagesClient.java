@@ -59,7 +59,7 @@ import java.util.concurrent.CompletableFuture;
  *         Consumer.of(1L), PollingStrategy.first(), 100L, true)
  *     .thenAccept(polled -> {
  *         for (var msg : polled.messages()) {
- *             System.out.println(new String(msg.payload()));
+ *             System.out.println(new String(msg.payload(), StandardCharsets.UTF_8));
  *         }
  *     });
  * }</pre>

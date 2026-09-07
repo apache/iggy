@@ -44,7 +44,7 @@ use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
-use stream::StreamDetails;
+use stream::{Stream, StreamDetails};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
 use user::{UserInfo, UserInfoDetails, UserStatus};
 use user_headers::{HeaderKey, HeaderValue, UserHeaders};
@@ -64,6 +64,7 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<QuicReconnectionConfig>()?;
     m.add_class::<HttpConfig>()?;
     m.add_class::<StreamDetails>()?;
+    m.add_class::<Stream>()?;
     m.add_class::<Stats>()?;
     m.add_class::<CacheMetrics>()?;
     m.add_class::<CacheMetricsKey>()?;
