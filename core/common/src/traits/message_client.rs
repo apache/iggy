@@ -30,6 +30,16 @@ pub trait MessageClient {
     ///
     /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
     /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
+    ///
+    /// With server-side auto-commit enabled, a new consumer offset key can be
+    /// rejected with `TooManyConsumerOffsets` at the partition's configured
+    /// limit. That poll returns no messages. Existing keys remain writable,
+    /// and polling without auto-commit does not allocate a stored offset.
+    /// A refused auto-commit submission returns `TransientNotAccepted` with no
+    /// messages and may be retried. A capacity error requires capacity to be freed.
+    /// Local cursors without a committed offset can be evicted at the limit.
+    /// Their next `Next` poll resumes from the earliest retained messages,
+    /// which can redeliver messages from earlier polls.
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages(
         &self,

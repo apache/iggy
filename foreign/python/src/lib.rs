@@ -24,6 +24,7 @@ mod options;
 mod permissions;
 mod receive_message;
 mod send_message;
+mod stats;
 mod stream;
 mod topic;
 mod user;
@@ -40,6 +41,7 @@ use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermis
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
+use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::StreamDetails;
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
 use user::{UserInfo, UserInfoDetails, UserStatus};
@@ -57,6 +59,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TcpConfig>()?;
     m.add_class::<TcpReconnectionConfig>()?;
     m.add_class::<StreamDetails>()?;
+    m.add_class::<Stats>()?;
+    m.add_class::<CacheMetrics>()?;
+    m.add_class::<CacheMetricsKey>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;
     m.add_class::<IggyExpiry>()?;
