@@ -27,13 +27,14 @@ using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Contracts.Tcp;
 
 internal static class TcpContracts
 {
-    private const int MaxWireNameLength = 255;
 
     /// <summary>Frames wider than this are built on the heap instead of the stack.</summary>
     private const int MaxStackAllocBytes = 1024;
@@ -43,7 +44,7 @@ internal static class TcpContracts
 
     internal static byte[] LoginWithPersonalAccessToken(string token)
     {
-        var tokenLength = Encoding.UTF8.GetByteCount(token);
+        var tokenLength = WireName.ByteCount(token, nameof(token));
         Span<byte> bytes = stackalloc byte[5 + tokenLength];
         bytes[0] = (byte)tokenLength;
         Encoding.UTF8.GetBytes(token, bytes[1..(1 + tokenLength)]);
@@ -52,7 +53,7 @@ internal static class TcpContracts
 
     internal static byte[] DeletePersonalRequestToken(string name)
     {
-        var nameLength = Encoding.UTF8.GetByteCount(name);
+        var nameLength = WireName.ByteCount(name, nameof(name));
         Span<byte> bytes = stackalloc byte[5 + nameLength];
         bytes[0] = (byte)nameLength;
         Encoding.UTF8.GetBytes(name, bytes[1..(1 + nameLength)]);
@@ -61,7 +62,7 @@ internal static class TcpContracts
 
     internal static byte[] CreatePersonalAccessToken(string name, ulong? expiry)
     {
-        var nameLength = Encoding.UTF8.GetByteCount(name);
+        var nameLength = WireName.ByteCount(name, nameof(name));
         Span<byte> bytes = stackalloc byte[1 + nameLength + 8];
         bytes[0] = (byte)nameLength;
         Encoding.UTF8.GetBytes(name, bytes[1..(1 + nameLength)]);
@@ -94,13 +95,11 @@ internal static class TcpContracts
     {
         var bytes = new List<byte>();
 
-        var usernameBytes = Encoding.UTF8.GetBytes(userName);
-        bytes.Add((byte)usernameBytes.Length);
-        bytes.AddRange(usernameBytes);
+        bytes.Add((byte)WireName.ByteCount(userName, nameof(userName)));
+        bytes.AddRange(Encoding.UTF8.GetBytes(userName));
 
-        var passwordBytes = Encoding.UTF8.GetBytes(password);
-        bytes.Add((byte)passwordBytes.Length);
-        bytes.AddRange(passwordBytes);
+        bytes.Add((byte)WireName.ByteCount(password, nameof(password)));
+        bytes.AddRange(Encoding.UTF8.GetBytes(password));
 
         if (!string.IsNullOrEmpty(version))
         {
@@ -129,6 +128,8 @@ internal static class TcpContracts
 
     internal static byte[] ChangePassword(Identifier userId, string currentPassword, string newPassword)
     {
+        CredentialBounds.ValidatePassword(currentPassword);
+        CredentialBounds.ValidatePassword(newPassword);
         var currentPasswordLength = Encoding.UTF8.GetByteCount(currentPassword);
         var newPasswordLength = Encoding.UTF8.GetByteCount(newPassword);
         var length = userId.Length + 2 + currentPasswordLength + newPasswordLength + 2;
@@ -157,9 +158,15 @@ internal static class TcpContracts
 
     internal static byte[] UpdateUser(Identifier userId, string? userName, UserStatus? status)
     {
+        if (userName is not null)
+        {
+            CredentialBounds.ValidateUsername(userName);
+        }
+
         var userNameLength = userName is null ? 0 : Encoding.UTF8.GetByteCount(userName);
-        var length = userId.Length + 2 + userNameLength
-                     + (status is not null ? 2 : 1) + 1 + 1;
+        var length = userId.Length + 2
+                     + (userName is null ? 1 : 2 + userNameLength)
+                     + (status is not null ? 2 : 1);
         Span<byte> bytes = stackalloc byte[length];
 
         bytes.WriteBytesFromIdentifier(userId);
@@ -196,6 +203,8 @@ internal static class TcpContracts
     internal static byte[] CreateUser(string userName, string password, UserStatus status,
         Permissions? permissions = null)
     {
+        CredentialBounds.ValidateUsername(userName);
+        CredentialBounds.ValidatePassword(password);
         var userNameLength = Encoding.UTF8.GetByteCount(userName);
         var passwordLength = Encoding.UTF8.GetByteCount(password);
         var permissionsBytes = permissions is not null ? GetBytesFromPermissions(permissions) : [];
@@ -559,7 +568,7 @@ internal static class TcpContracts
 
     internal static byte[] CreateStream(string name)
     {
-        var nameLength = Encoding.UTF8.GetByteCount(name);
+        var nameLength = WireName.ByteCount(name, nameof(name));
         Span<byte> bytes = stackalloc byte[nameLength + 1];
         bytes[0] = (byte)nameLength;
         Encoding.UTF8.GetBytes(name, bytes[1..]);
@@ -568,7 +577,7 @@ internal static class TcpContracts
 
     internal static byte[] UpdateStream(Identifier streamId, string name)
     {
-        var nameLength = Encoding.UTF8.GetByteCount(name);
+        var nameLength = WireName.ByteCount(name, nameof(name));
         Span<byte> bytes = stackalloc byte[streamId.Length + nameLength + 3];
         bytes.WriteBytesFromIdentifier(streamId);
         var position = 2 + streamId.Length;
@@ -579,7 +588,7 @@ internal static class TcpContracts
 
     internal static byte[] CreateGroup(Identifier streamId, Identifier topicId, string name)
     {
-        var nameLength = Encoding.UTF8.GetByteCount(name);
+        var nameLength = WireName.ByteCount(name, nameof(name));
         Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 1 + nameLength];
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
         var position = 2 + streamId.Length + 2 + topicId.Length;
@@ -665,7 +674,7 @@ internal static class TcpContracts
         }
 
         var optionsLength = HeadersByteLength(options);
-        var nameLength = WireNameLength(name, nameof(name));
+        var nameLength = WireName.ByteCount(name, nameof(name));
         var length = 4 + streamId.Length + topicId.Length + 1 + nameLength + optionsLength;
         var rented = length > MaxStackAllocBytes ? ArrayPool<byte>.Shared.Rent(length) : null;
         try
@@ -719,7 +728,7 @@ internal static class TcpContracts
         }
 
         var optionsLength = HeadersByteLength(options);
-        var nameLength = WireNameLength(name, nameof(name));
+        var nameLength = WireName.ByteCount(name, nameof(name));
         var length = 2 + streamId.Length + 4 + 1 + nameLength + optionsLength;
         var rented = length > MaxStackAllocBytes ? ArrayPool<byte>.Shared.Rent(length) : null;
         try
@@ -741,23 +750,6 @@ internal static class TcpContracts
                 ArrayPool<byte>.Shared.Return(rented);
             }
         }
-    }
-
-    /// <summary>
-    ///     UTF-8 byte count of a length-prefixed wire name, bounded by what its one-byte prefix can carry.
-    /// </summary>
-    private static int WireNameLength(string name, string parameterName)
-    {
-        var length = Encoding.UTF8.GetByteCount(name);
-        if (length > MaxWireNameLength)
-        {
-            // Truncating into the prefix would ship a frame the server parses as a shorter
-            // name followed by garbage, instead of a request it can reject.
-            throw new ArgumentException(
-                $"{parameterName} must be at most {MaxWireNameLength} UTF-8 bytes, got {length}.", parameterName);
-        }
-
-        return length;
     }
 
     internal static byte[] GetTopicById(Identifier streamId, Identifier topicId)
