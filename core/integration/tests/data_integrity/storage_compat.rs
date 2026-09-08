@@ -1671,10 +1671,7 @@ prepare_queue_depth = 8
     let translated = replacement_configuration(&baseline, current);
     assert!(translated.get("system").is_none());
     assert_eq!(translated["path"].as_str(), Some("baseline-data"));
-    assert_eq!(
-        translated["partition"]["path"].as_str(),
-        Some("custom-partitions")
-    );
+    assert!(translated["partition"].get("path").is_none());
     assert_eq!(
         translated["partition"]["prepare_queue_depth"].as_integer(),
         Some(8)

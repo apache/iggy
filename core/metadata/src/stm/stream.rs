@@ -2751,6 +2751,8 @@ mod tests {
         CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
+    use iggy_common::{HeaderKey, HeaderKind, topic_option_keys};
+    use std::str::FromStr;
 
     #[test]
     fn truncate_partition_request_round_trips() {
@@ -2779,9 +2781,6 @@ mod tests {
 
     #[test]
     fn create_topic_stores_merged_options_and_typed_fields() {
-        use iggy_common::{HeaderKey, HeaderKind, TopicCreateOptions, topic_option_keys};
-        use std::str::FromStr;
-
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "s");
 
@@ -2820,11 +2819,21 @@ mod tests {
         assert_eq!(topic.compression_algorithm, CompressionAlgorithm::None);
 
         // partitions_count is create-consumed, never persisted.
-        assert_eq!(topic.options.len(), 3);
+        assert_eq!(topic.options.len(), 5);
         let expiry_key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).unwrap();
         let expiry = topic.options.get(&expiry_key).unwrap();
         assert!(expiry.explicit, "client-sent key keeps its provenance");
         assert_eq!(expiry.value.kind(), HeaderKind::Uint64);
+        for policy in [
+            topic_option_keys::DURABILITY,
+            topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+        ] {
+            let key = HeaderKey::from_str(policy).unwrap();
+            let option = topic.options.get(&key).unwrap();
+            assert!(option.explicit);
+            assert_eq!(option.value.kind(), HeaderKind::String);
+            assert_eq!(option.value.as_str().unwrap(), "replicated");
+        }
         let size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
         assert!(
             !topic.options.get(&size_key).unwrap().explicit,
