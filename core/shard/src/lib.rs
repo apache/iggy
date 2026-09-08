@@ -5331,13 +5331,23 @@ where
                             "metadata repair peer retained nothing in the requested range; \
                              re-requesting rather than converting to state transfer"
                         );
+                        // Charge the round, and ACT on exhaustion. `gap_repair_peer`
+                        // re-picks the primary deterministically, so dropping the
+                        // session on its own re-arms the same peer at the debounce
+                        // interval forever: the stall path never runs, so rotation
+                        // is never reached and the state-transfer escalation this
+                        // guard replaced stays out of reach.
+                        if self.burn_metadata_repair_attempt() {
+                            self.rotate_stalled_metadata_repair(
+                                consensus,
+                                header.replica,
+                                session.from_op,
+                                session.to_op,
+                            )
+                            .await;
+                            return;
+                        }
                         *self.metadata_repair.borrow_mut() = None;
-                        // Charged, not cleared. `gap_repair_peer` re-picks the
-                        // primary deterministically, so clearing makes this
-                        // request / `RangeEvicted` / re-arm cycle unbounded at the
-                        // debounce interval and puts the state-transfer escalation
-                        // this guard replaced out of reach.
-                        self.burn_metadata_repair_attempt();
                         return;
                     }
                     if consensus.state_transfer_stage() == consensus::StateTransferStage::Idle {
@@ -5796,13 +5806,8 @@ where
             })
         };
         if let Some((peer, nonce, session_from_op, to_op)) = stalled {
-            // What the walk has not reached, floored at the op this session was
-            // armed for. Recomputing would ask for a different window than the one
-            // reported missing: the merged-log scan opens above the snapshot floor
-            // and its `committed_elsewhere` fallback reports ops below even that,
-            // both already folded into `session.from_op`. It also carries the
-            // initial arm's snapshot clamp, so a retry cannot ask for compacted ops.
-            let from_op = session_from_op.max(consensus.commit_min() + 1);
+            let from_op =
+                stalled_repair_from_op(session_from_op, consensus.commit_min(), repairing_view);
             if from_op > to_op {
                 // `from_op` past `to_op` without `commit_min` reaching it: the
                 // primary-elect window above starts at the merged log's commit
@@ -10403,6 +10408,26 @@ where
     }
 }
 
+/// Where a stalled repair session reopens its window.
+///
+/// A merged-log session reopens exactly where it was armed. Its floor is COVERAGE,
+/// not the walk: `first_op_not_covered` reports ops whose journal entry is absent
+/// or diverging, and an op can be applied (`commit_min` past it) while its entry is
+/// gone. Raising the floor to `commit_min + 1` there skips the very op the scan
+/// reported, and the view change parks on it forever.
+///
+/// A tail-repair session is the other way round. Its window IS the commit gap, so
+/// ops the walk has since consumed must not be asked for again. `session.from_op`
+/// still floors it, carrying the initial arm's snapshot clamp so no retry asks for
+/// compacted ops.
+fn stalled_repair_from_op(session_from_op: u64, commit_min: u64, repairing_view: bool) -> u64 {
+    if repairing_view {
+        session_from_op
+    } else {
+        session_from_op.max(commit_min + 1)
+    }
+}
+
 /// Walk a merged-log source list one step past `avoid`, wrapping.
 ///
 /// A ring, not a filter. The list is `log_view`-ordered and identical on every
@@ -12917,7 +12942,7 @@ mod metadata_repair_session_tests {
 
     use super::{
         MetadataRepairSession, gap_repair_peer, metadata_repair_superseded, next_transfer_peer,
-        repair_chunk_walked,
+        repair_chunk_walked, stalled_repair_from_op,
     };
 
     /// Armed at view 3, against the window `11..=20`.
@@ -12930,6 +12955,31 @@ mod metadata_repair_session_tests {
             peer: 0,
             idle_ticks: 0,
         }
+    }
+
+    /// A merged-log session must re-ask for the op the coverage scan reported, even
+    /// once the walk has passed it. Coverage is about the journal ENTRY; an op can
+    /// be applied and still have no entry to serve, which is exactly what
+    /// `committed_elsewhere` reports.
+    #[test]
+    fn given_a_dropped_response_below_commit_min_when_retrying_should_still_ask_for_it() {
+        assert_eq!(
+            stalled_repair_from_op(5, 6, true),
+            5,
+            "clamping to commit_min + 1 would retry from 7 and skip the reported hole"
+        );
+    }
+
+    /// The tail-repair session is the other way round: its window is the commit gap,
+    /// so ops the walk consumed must not be re-requested.
+    #[test]
+    fn given_a_walked_window_when_retrying_a_tail_session_should_open_above_it() {
+        assert_eq!(stalled_repair_from_op(5, 6, false), 7);
+        assert_eq!(
+            stalled_repair_from_op(11, 3, false),
+            11,
+            "the arm floor still holds, so no retry asks for compacted ops"
+        );
     }
 
     #[test]

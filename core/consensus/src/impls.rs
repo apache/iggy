@@ -4484,14 +4484,47 @@ mod pipeline_entry_tests {
     }
 }
 
-/// A [`MessageBus`] that accepts everything and remembers nothing. Shared by the
-/// test modules, none of which care what happens to a frame.
+/// Fixtures every consensus test module needs.
 #[cfg(test)]
 pub mod test_bus {
+    use super::{Command, METADATA_GROUP, Message, StartViewHeader};
     use message_bus::{BusMessage, MessageBus};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
 
+    /// A `StartView` at `view` announcing head `op`. `commit == op` is the steady
+    /// case (no suffix); a lower `commit` keeps an uncommitted suffix.
+    ///
+    /// # Panics
+    /// Never: a zeroed buffer of the right size is a valid `StartViewHeader`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn make_start_view(
+        view: u32,
+        op: u64,
+        commit: u64,
+        replica: u8,
+        incarnation: u128,
+    ) -> Message<StartViewHeader> {
+        let size = std::mem::size_of::<StartViewHeader>();
+        let mut msg = Message::<StartViewHeader>::new(size);
+        let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
+            &mut msg.as_mut_slice()[..size],
+        )
+        .expect("zeroed bytes are a valid StartViewHeader");
+        header.command = Command::StartView;
+        header.cluster = 1;
+        header.view = view;
+        header.op = op;
+        header.commit = commit;
+        header.replica = replica;
+        header.incarnation = incarnation;
+        header.group = METADATA_GROUP;
+        header.size = size as u32;
+        msg
+    }
+
+    /// A [`MessageBus`] that accepts everything and remembers nothing.
     pub struct NoopBus;
 
     impl MessageBus for NoopBus {
@@ -4539,7 +4572,7 @@ mod timestamp_clamp_tests {
         }
     }
 
-    use crate::test_bus::NoopBus;
+    use crate::test_bus::{NoopBus, make_start_view};
 
     #[test]
     fn observed_log_timestamp_floors_new_primary_stamps() {
@@ -4591,34 +4624,6 @@ mod timestamp_clamp_tests {
             100_000,
             "a clock ahead of the log must stamp real time, not floor + 1"
         );
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    /// `commit == op` is the steady case (no suffix); a lower `commit` keeps an
-    /// uncommitted suffix.
-    fn make_start_view(
-        view: u32,
-        op: u64,
-        commit: u64,
-        replica: u8,
-        incarnation: u128,
-    ) -> Message<StartViewHeader> {
-        let size = std::mem::size_of::<StartViewHeader>();
-        let mut msg = Message::<StartViewHeader>::new(size);
-        let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
-            &mut msg.as_mut_slice()[..size],
-        )
-        .expect("zeroed bytes are a valid StartViewHeader");
-        header.command = Command::StartView;
-        header.cluster = 1;
-        header.view = view;
-        header.op = op;
-        header.commit = commit;
-        header.replica = replica;
-        header.incarnation = incarnation;
-        header.group = METADATA_GROUP;
-        header.size = size as u32;
-        msg
     }
 
     #[test]
@@ -5568,29 +5573,7 @@ mod recovery_barrier_tests {
 
     use super::*;
     use crate::LocalPipeline;
-    use crate::test_bus::NoopBus;
-
-    /// A `StartView` at `view` announcing head `op` with commit point `commit`.
-    fn start_view(view: u32, op: u64, commit: u64) -> Message<StartViewHeader> {
-        let size = std::mem::size_of::<StartViewHeader>();
-        let mut msg = Message::<StartViewHeader>::new(size);
-        let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
-            &mut msg.as_mut_slice()[..size],
-        )
-        .expect("zeroed bytes are a valid StartViewHeader");
-        header.command = Command::StartView;
-        header.cluster = 1;
-        header.view = view;
-        header.op = op;
-        header.commit = commit;
-        header.replica = 1;
-        header.group = METADATA_GROUP;
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            header.size = size as u32;
-        }
-        msg
-    }
+    use crate::test_bus::{NoopBus, make_start_view};
 
     /// Recovered at head 120, proven committed only through 100, in view 7.
     fn recovered_with_gated_suffix() -> VsrConsensus<NoopBus, LocalPipeline> {
@@ -5624,7 +5607,11 @@ mod recovery_barrier_tests {
         // them and nothing re-prepares them.
         assert!(
             !consensus
-                .handle_start_view(PlaneKind::Metadata, start_view(7, 105, 105).header(), &[])
+                .handle_start_view(
+                    PlaneKind::Metadata,
+                    make_start_view(7, 105, 105, 1, 0).header(),
+                    &[]
+                )
                 .is_empty(),
             "the StartView at the commit floor must be adopted"
         );
@@ -5654,7 +5641,11 @@ mod recovery_barrier_tests {
         // Head 120, commit still 100: 101..=120 re-replicate under the new view.
         assert!(
             !consensus
-                .handle_start_view(PlaneKind::Metadata, start_view(7, 120, 100).header(), &[])
+                .handle_start_view(
+                    PlaneKind::Metadata,
+                    make_start_view(7, 120, 100, 1, 0).header(),
+                    &[]
+                )
                 .is_empty(),
             "the StartView carrying the surviving suffix must be adopted"
         );

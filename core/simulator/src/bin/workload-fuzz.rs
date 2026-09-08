@@ -142,9 +142,10 @@ struct Args {
     ///
     /// Separate because a partition-only run satisfies the combined floor while the
     /// metadata oracle compares an empty chain against an empty chain and agrees.
-    /// Default `0`: a partition-focused run legitimately commits no metadata, so a
-    /// campaign that wants the metadata property tested asks for it.
-    #[arg(long, default_value_t = 0)]
+    /// Defaults to `1`, which is the floor `--min-ops-compared` carried before it
+    /// counted both planes; a campaign that wants no metadata coverage opts out
+    /// with `0`.
+    #[arg(long, default_value_t = 1)]
     min_metadata_ops_compared: usize,
     /// Fail the run if crash or restart injection was requested but never happened.
     /// Off by default, since a short run at low probability may legitimately draw
