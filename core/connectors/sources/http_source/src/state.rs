@@ -37,7 +37,7 @@ use std::collections::btree_map::Entry;
 use tracing::{info, warn};
 
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
-use crate::types::EndpointId;
+use crate::types::{EndpointId, unix_now_seconds};
 use crate::{CONNECTOR_NAME, EndpointAuthType, StaticEndpointConfig};
 
 /// Ceiling on how many endpoints one instance's registry will hold.
@@ -109,6 +109,7 @@ impl EndpointRegistry {
             return Ok(EndpointRegistry { endpoints });
         };
 
+        let now_seconds = unix_now_seconds();
         let mut restored = 0;
         let mut tombstones = 0;
         let mut dropped_static = 0;
@@ -134,7 +135,13 @@ impl EndpointRegistry {
             // `Existing`, so a stored `expires_at` that has merely passed is not
             // reported as a fault: the endpoint answers 404 on its own path and
             // that is the documented behaviour.
+            //
+            // Skipped for an endpoint whose expiry has already passed. Its
+            // secret is cleared below, so on the next restart this rule would
+            // report `MissingSecret` and blame the credential for a refusal
+            // that expiry already explains.
             if !revoked
+                && !endpoint.is_expired(now_seconds)
                 && let Err(reason) = admit_endpoint(
                     endpoint.auth_type,
                     &endpoint.auth_secret,
@@ -185,6 +192,39 @@ impl EndpointRegistry {
                 }
             }
         }
+        // Same reasoning as `revoke()`: the handler answers 404 on an expired
+        // endpoint before `authorize()` runs, so its stored secret is already
+        // dead weight, and nothing compacts the registry. Keeping it wrote a
+        // credential the operator can no longer use back to disk on every later
+        // flush, indefinitely, which is exactly what `revoke()` clears the
+        // secret to avoid.
+        //
+        // The endpoint keeps its slot and stays `Active`. Reclaiming it would
+        // make endpoints disappear on a clock condition rather than an operator
+        // action.
+        //
+        // Restore only, deliberately. An endpoint that expires while the
+        // instance is running keeps its stored secret until the next restart,
+        // because clearing it then would need a clock-driven sweep mutating the
+        // registry from `poll()`. `revoke` is what clears it immediately.
+        let mut expired_secrets = 0;
+        for endpoint in endpoints.values_mut() {
+            if endpoint.is_active()
+                && endpoint.is_expired(now_seconds)
+                && endpoint.auth_secret.is_some()
+            {
+                endpoint.auth_secret = None;
+                expired_secrets += 1;
+            }
+        }
+        // The third of the three restore-time faults that get a line of their
+        // own: an expired endpoint is otherwise silent at startup.
+        if expired_secrets > 0 {
+            warn!(
+                "Cleared the stored secret of {expired_secrets} expired endpoint(s) for {CONNECTOR_NAME} connector ID: {connector_id}; they keep their slot and answer 404 until re-registered"
+            );
+        }
+
         // Loud on purpose: these were serving before the restart, and the only
         // trace of them left is this line.
         if dropped_static > 0 {
@@ -541,6 +581,81 @@ mod tests {
     #[derive(Deserialize)]
     struct RegistryWithAddedField {
         endpoints: BTreeMap<String, EndpointWithAddedField>,
+    }
+
+    #[test]
+    fn given_an_expired_endpoint_when_restored_should_drop_its_stored_secret() {
+        // `revoke()` clears the secret so a leaked credential is not written
+        // back forever. An expired endpoint is refused the same way and just as
+        // early, before `authorize()` runs, so keeping its secret persisted it
+        // exactly as long.
+        let mut persisted = EndpointRegistry::default();
+        let mut expired = dynamic_endpoint(ENDPOINT_ONE);
+        expired.expires_at = Some(1);
+        assert!(persisted.insert(expired));
+
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("restore must succeed");
+
+        let endpoint = restored
+            .endpoint(ENDPOINT_ONE)
+            .expect("the endpoint must keep its slot");
+        assert!(
+            endpoint.auth_secret.is_none(),
+            "an expired endpoint must not carry its secret back into the state file"
+        );
+        assert!(
+            endpoint.is_active(),
+            "clearing the secret must not reclaim the slot or make it a tombstone"
+        );
+    }
+
+    #[test]
+    fn given_an_unexpired_endpoint_when_restored_should_keep_its_stored_secret() {
+        // The negative half: the clear is scoped to an expiry that has passed,
+        // not to having one at all.
+        let mut persisted = EndpointRegistry::default();
+        let mut live = dynamic_endpoint(ENDPOINT_TWO);
+        live.expires_at = Some(unix_now_seconds() + 3600);
+        assert!(persisted.insert(live));
+
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("restore must succeed");
+
+        assert!(
+            restored
+                .endpoint(ENDPOINT_TWO)
+                .expect("the endpoint must restore")
+                .auth_secret
+                .is_some(),
+            "an endpoint whose expiry has not passed still needs its secret"
+        );
+    }
+
+    #[test]
+    fn given_a_cleared_expired_secret_when_restored_again_should_stay_admitted() {
+        // The interaction the clear creates: the second restore sees an endpoint
+        // advertising Bearer with no secret, which is the shape `MissingSecret`
+        // exists to report. Expiry explains the refusal already, so it must not
+        // be blamed on the credential, and the endpoint must still restore.
+        let mut persisted = EndpointRegistry::default();
+        let mut expired = dynamic_endpoint(ENDPOINT_ONE);
+        expired.expires_at = Some(1);
+        assert!(persisted.insert(expired));
+
+        let once = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("the first restore must succeed");
+        let twice = EndpointRegistry::restore(&[], Some(registry_state(&once)), 1)
+            .expect("the second restore must succeed too");
+
+        let endpoint = twice
+            .endpoint(ENDPOINT_ONE)
+            .expect("the endpoint must survive both restores");
+        assert!(endpoint.auth_secret.is_none());
+        assert!(
+            endpoint.is_active(),
+            "a cleared secret must not turn an expired endpoint into a tombstone"
+        );
     }
 
     #[test]
