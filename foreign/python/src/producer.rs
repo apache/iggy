@@ -260,9 +260,9 @@ impl BackgroundProducerConfig {
         batch_size=1048576,
         batch_length=1000,
         max_buffer_size=33554432,
-        failure_mode=BackpressureMode::block(),
+        failure_mode=DefaultBackpressureMode::default(),
         max_in_flight=1,
-        sharding=ProducerSharding::Ordered,
+        sharding=DefaultProducerSharding::default(),
     ))]
     fn new(
         num_shards: i128,
@@ -270,9 +270,9 @@ impl BackgroundProducerConfig {
         batch_size: i128,
         batch_length: i128,
         max_buffer_size: i128,
-        failure_mode: BackpressureMode,
+        failure_mode: DefaultBackpressureMode,
         max_in_flight: i128,
-        sharding: ProducerSharding,
+        sharding: DefaultProducerSharding,
     ) -> PyResult<Self> {
         Ok(Self {
             num_shards: usize_param(num_shards, "num_shards")?,
@@ -280,9 +280,9 @@ impl BackgroundProducerConfig {
             batch_size: usize_param(batch_size, "batch_size")?,
             batch_length: usize_param(batch_length, "batch_length")?,
             max_buffer_size: IggyByteSize::from(u64_param(max_buffer_size, "max_buffer_size")?),
-            failure_mode,
+            failure_mode: failure_mode.resolve(),
             max_in_flight: usize_param(max_in_flight, "max_in_flight")?,
-            sharding,
+            sharding: sharding.resolve(),
         })
     }
 
@@ -528,6 +528,78 @@ impl<'py> IntoPyObject<'py> for ProducerMode {
             Self::Direct(config) => Ok(config.into_pyobject(py)?.into_any()),
             Self::Background(config) => Ok(config.into_pyobject(py)?.into_any()),
         }
+    }
+}
+
+#[derive(FromPyObject)]
+#[pyo3(transparent)]
+struct DefaultBackpressureMode(BackpressureMode);
+
+impl Default for DefaultBackpressureMode {
+    fn default() -> Self {
+        Self(BackpressureMode::block())
+    }
+}
+
+impl DefaultBackpressureMode {
+    fn resolve(self) -> BackpressureMode {
+        self.0
+    }
+}
+
+impl PyStubType for DefaultBackpressureMode {
+    fn type_output() -> TypeInfo {
+        BackpressureMode::type_output()
+    }
+
+    fn type_input() -> TypeInfo {
+        BackpressureMode::type_input()
+    }
+}
+
+impl<'py> IntoPyObject<'py> for DefaultBackpressureMode {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(py.Ellipsis().into_bound(py))
+    }
+}
+
+#[derive(FromPyObject)]
+#[pyo3(transparent)]
+struct DefaultProducerSharding(ProducerSharding);
+
+impl Default for DefaultProducerSharding {
+    fn default() -> Self {
+        Self(ProducerSharding::Ordered)
+    }
+}
+
+impl DefaultProducerSharding {
+    fn resolve(self) -> ProducerSharding {
+        self.0
+    }
+}
+
+impl PyStubType for DefaultProducerSharding {
+    fn type_output() -> TypeInfo {
+        ProducerSharding::type_output()
+    }
+
+    fn type_input() -> TypeInfo {
+        ProducerSharding::type_input()
+    }
+}
+
+impl<'py> IntoPyObject<'py> for DefaultProducerSharding {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(py.Ellipsis().into_bound(py))
     }
 }
 
