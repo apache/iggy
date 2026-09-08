@@ -44,7 +44,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
-use crate::auth::admit_endpoint;
+use crate::auth::{Admission, admit_endpoint};
 use crate::server::{INSTANCE_HEADER, RECEIVED_AT_HEADER, REMOTE_ADDR_HEADER};
 use crate::state::EndpointRegistry;
 use crate::types::{EndpointId, QueuedMessage, unix_now_seconds};
@@ -689,7 +689,7 @@ impl HttpSourceConfig {
                 &endpoint.hmac_header,
                 &endpoint.hmac_prefix,
                 endpoint.expires_at,
-                unix_now_seconds(),
+                Admission::Existing,
             ) {
                 return Err(Error::InvalidConfigValue(format!(
                     "endpoint {}: {reason}",
@@ -1234,34 +1234,40 @@ mod tests {
     }
 
     #[test]
-    fn given_config_endpoints_the_api_would_refuse_when_validated_should_refuse_them_too() {
-        // Both were admitted from TOML and refused by the management API, which
-        // is the drift the shared rule exists to stop. The unused secret rides
-        // into the state file in clear where nothing ever reads it; the past
-        // expiry 404s forever with only the serving count as a hint.
-        for (reason, json) in [
-            (
-                "takes no auth_secret",
-                r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
-                    {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none", "auth_secret": "whsec_unused"}
-                ]}"#,
-            ),
-            (
-                "already past",
-                r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
-                    {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none", "expires_at": 1}
-                ]}"#,
-            ),
-        ] {
-            let config = parse(json);
-            assert!(
-                matches!(
-                    config.validate(),
-                    Err(Error::InvalidConfigValue(message)) if message.contains(reason)
-                ),
-                "config must refuse what the management API refuses: {reason}"
-            );
-        }
+    fn given_a_config_endpoint_the_api_would_refuse_when_validated_should_refuse_it_too() {
+        // The time-invariant half of the shared rule. An unused secret rides
+        // into the state file in clear where nothing ever reads it, and it is
+        // just as wrong in TOML as through the API.
+        let config = parse(
+            r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
+                {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none", "auth_secret": "whsec_unused"}
+            ]}"#,
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("takes no auth_secret")
+        ));
+    }
+
+    #[test]
+    fn given_an_expired_static_endpoint_when_validated_should_not_fail_the_instance() {
+        // `validate()` runs inside `open()`, so any rule applied here is
+        // re-applied on every restart. Expiry is the one rule that does not
+        // survive that: the endpoint was admissible when it was written, and
+        // refusing it later takes down the whole instance, including the
+        // healthy endpoint beside it and the named topic path. An expired
+        // endpoint answers 404 on its own path instead, which is what the
+        // README documents and what the active-endpoint gauge reports.
+        let config = parse(
+            r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
+                {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none", "expires_at": 1},
+                {"endpoint_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "auth_type": "none"}
+            ]}"#,
+        );
+        assert!(
+            config.validate().is_ok(),
+            "one endpoint whose expiry has passed must not refuse the instance"
+        );
     }
 
     #[test]

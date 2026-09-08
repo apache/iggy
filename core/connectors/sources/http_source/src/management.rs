@@ -40,7 +40,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::auth::{Inadmissible, MAX_AUTH_SECRET_LEN, admit_endpoint, is_usable, validate_bearer};
+use crate::auth::{
+    Admission, Inadmissible, MAX_AUTH_SECRET_LEN, admit_endpoint, is_usable, validate_bearer,
+};
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState, RouteTable};
 use crate::server::{ServerState, bearer_header, error_response, refresh_routes};
 use crate::state::{InsertOutcome, MAX_ENDPOINTS};
@@ -122,7 +124,9 @@ async fn register_endpoint(
         &request.hmac_header,
         &request.hmac_prefix,
         request.expires_at,
-        unix_now_seconds(),
+        Admission::Creating {
+            now_seconds: unix_now_seconds(),
+        },
     ) {
         return error_response(StatusCode::BAD_REQUEST, reason.message());
     }

@@ -63,6 +63,25 @@ pub const MAX_AUTH_SECRET_LEN: usize = 4096;
 pub const MAX_HMAC_HEADER_LEN: usize = 256;
 pub const MAX_HMAC_PREFIX_LEN: usize = 64;
 
+/// When an endpoint is being admitted, which decides whether the rules that
+/// depend on the clock apply.
+///
+/// The distinction is load-bearing, not bookkeeping. `validate()` runs inside
+/// `open()`, so a rule applied there is re-applied on every restart. Most of
+/// what makes an endpoint inadmissible is time-invariant and safe to re-check;
+/// expiry is not, and re-checking it turns one endpoint's 404 into a failure
+/// of the whole instance, taking its other endpoints and its named topic path
+/// down with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// A new endpoint arriving through the management API. Every rule applies.
+    Creating { now_seconds: u64 },
+    /// An endpoint already declared in TOML or restored from state. It was
+    /// admissible when it was created; time has passed since, and that alone
+    /// must not refuse it.
+    Existing,
+}
+
 /// Why an endpoint may not be admitted.
 ///
 /// One enum rather than per-caller strings so the config path and the
@@ -122,7 +141,7 @@ pub fn admit_endpoint(
     hmac_header: &str,
     hmac_prefix: &str,
     expires_at: Option<u64>,
-    now_seconds: u64,
+    admission: Admission,
 ) -> Result<(), Inadmissible> {
     if auth_secret
         .as_ref()
@@ -151,7 +170,12 @@ pub fn admit_endpoint(
     if HeaderName::from_str(hmac_header).is_err() {
         return Err(Inadmissible::InvalidHmacHeader);
     }
-    if expires_at.is_some_and(|expires_at| expires_at <= now_seconds) {
+    // Only at creation. An endpoint that has since expired keeps serving 404
+    // on its own path, which is what the README documents and what the active
+    // endpoint gauge already reports.
+    if let Admission::Creating { now_seconds } = admission
+        && expires_at.is_some_and(|expires_at| expires_at <= now_seconds)
+    {
         return Err(Inadmissible::AlreadyExpired);
     }
     Ok(())
