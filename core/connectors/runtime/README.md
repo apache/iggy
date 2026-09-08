@@ -12,7 +12,7 @@ By default, runtime will look for the configuration file, to decide which connec
 
 To start the connector runtime, simply run `cargo run --bin iggy-connectors`.
 
-The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available via `docker pull apache/iggy-connect`. It ships in two flavors: a default image with every connector plugin bundled, and a `-slim` runtime-only image.
 
 The minimal viable configuration requires at least the Iggy credentials to create 2 separate instances of producer & consumer connections, the state directory path where source connectors can store their optional state, and the connectors configuration provider settings.
 

@@ -66,9 +66,17 @@ runs:
       shell: bash
       run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/bench/dashboard/server/Cargo.toml
 
-    - name: Validate iggy-connect bundle
+    - name: Validate iggy-connect bundle (runtime + connector plugins)
       shell: bash
-      run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/connectors/runtime/Cargo.toml
+      run: |
+        # The fat image bundles the runtime plus every connector plugin, so
+        # validate the plugins' dependency closures too. The manifest list is
+        # derived from cargo metadata so a newly added connector is license
+        # validated on the PR that adds it, with no change here.
+        MANIFEST_FLAGS="$(scripts/ci/connector-plugins.sh --manifest-flags)"
+        ./scripts/ci/third-party-licenses.sh --validate \
+          --manifest core/connectors/runtime/Cargo.toml \
+          $MANIFEST_FLAGS
 
     - name: Validate Python wheel bundle
       shell: bash

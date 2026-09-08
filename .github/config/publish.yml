@@ -96,9 +96,24 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/connectors/runtime/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
-    # Image ships only the runtime binary; plugin .so files are not bundled.
+    # Two published flavors from one Dockerfile. The fat flavor (empty suffix,
+    # runtime-fat stage) bundles every connector plugin and is the default;
+    # -slim (runtime stage) ships the runtime binary only. Each flavor keeps
+    # its own per-arch digest set and manifest tags. Components without a
+    # flavors list build their single default stage.
+    flavors:
+      - suffix: ""
+        target: runtime-fat
+      - suffix: "-slim"
+        target: runtime
+    # The fat image bundles the runtime plus every connector plugin, so any
+    # change under core/connectors/ must refresh :edge. crates: keeps
+    # sensitivity to shared workspace deps in the runtime's closure (e.g.
+    # iggy_common); paths: covers all plugin crates without a hardcoded
+    # per-plugin list, so a newly added connector is gated automatically.
     gate:
       crates: [iggy-connectors]
+      paths: [core/connectors]
 
   web-ui:
     tag_pattern: "^web-ui-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
