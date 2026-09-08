@@ -29,13 +29,18 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
 
+# cargo-machete matches package names against import paths. This package is
+# `questdb-rs` but its library is `questdb`, so the imports never mention
+# `questdb_rs` and it is reported as unused.
+[package.metadata.cargo-machete]
+ignored = ["questdb-rs"]
+
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
 humantime = { workspace = true }
-iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 questdb-rs = { workspace = true }
 rustls = { workspace = true }
