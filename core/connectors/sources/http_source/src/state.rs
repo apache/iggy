@@ -27,15 +27,13 @@
 //! the TOML those endpoints would otherwise live in; the README requires
 //! `chmod 700` on the state path.
 
-use axum::http::HeaderName;
 use iggy_connector_sdk::{ConnectorState, Error};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::auth::oversized_field;
+use crate::auth::{Admission, admit_endpoint};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::str::FromStr;
 use tracing::{info, warn};
 
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
@@ -121,38 +119,34 @@ impl EndpointRegistry {
             // built from the field. The key wins.
             endpoint.endpoint_id = endpoint_id.clone();
             let revoked = !endpoint.is_active();
-            // Warned about, never refused. `restore` failing is a hard
-            // `open()` failure, so a ceiling here would take a whole instance
-            // down over one stored value an operator cannot edit without the
-            // state file. Registration is where the ceiling is enforced; this
-            // only says the stored entry costs more than the README's sizing
-            // assumes.
+            // The same rule registration applies, asked here and only warned
+            // about. `restore` failing is a hard `open()` failure, so refusing
+            // would take a whole instance down over one stored value an
+            // operator cannot edit without the state file.
+            //
+            // Asked rather than re-derived, because the two hand-written checks
+            // that used to live here had already drifted from it: they covered
+            // the ceilings and a malformed `hmac_header`, and silently skipped
+            // an endpoint advertising auth with no usable secret. That one
+            // restores active, reads active on the admin API, and rejects every
+            // request forever, which is fail-closed and completely silent.
+            //
+            // `Existing`, so a stored `expires_at` that has merely passed is not
+            // reported as a fault: the endpoint answers 404 on its own path and
+            // that is the documented behaviour.
             if !revoked
-                && let Some(oversized) = oversized_field(
+                && let Err(reason) = admit_endpoint(
+                    endpoint.auth_type,
                     &endpoint.auth_secret,
                     &endpoint.hmac_header,
                     &endpoint.hmac_prefix,
+                    endpoint.expires_at,
+                    Admission::Existing,
                 )
             {
                 warn!(
-                    "Restored endpoint {} for {CONNECTOR_NAME} connector ID: {connector_id}: {oversized}; every mutation clones it and every flush rewrites it",
+                    "Restored endpoint {} for {CONNECTOR_NAME} connector ID: {connector_id}: {reason}; it is served but every request to it will be refused until it is re-registered",
                     endpoint_id.log_prefix()
-                );
-            }
-            // Registration rejects a malformed `hmac_header`, but state written
-            // by an older build, or edited by hand, can still carry one. Such an
-            // endpoint 401s every signed request forever because `HeaderMap::get`
-            // answers `None` for a name it cannot parse, and nothing else would
-            // ever say why. Restoring it anyway is deliberate: refusing to start
-            // over one bad entry would take the whole instance down with it.
-            if !revoked
-                && endpoint.auth_type.hmac_algorithm().is_some()
-                && HeaderName::from_str(&endpoint.hmac_header).is_err()
-            {
-                warn!(
-                    "Restored endpoint {} for {CONNECTOR_NAME} connector ID: {connector_id} with hmac_header '{}', which is not a valid HTTP header name; every signed request to it will be rejected until it is re-registered",
-                    endpoint_id.log_prefix(),
-                    endpoint.hmac_header
                 );
             }
             match endpoints.entry(endpoint_id) {
@@ -768,6 +762,33 @@ mod tests {
         assert!(
             registry.endpoint(&format!("{:032x}", 0)).is_none(),
             "the oldest revocation must be the one reclaimed"
+        );
+    }
+
+    #[test]
+    fn given_a_stored_endpoint_with_no_usable_secret_when_restored_should_still_serve() {
+        // It advertises a second factor and has none, so `RouteTable::build`
+        // derives no key and every request to it is refused. That is correct
+        // and it used to be completely silent: the endpoint restored active,
+        // the admin API reported it active, and nothing said why the sender
+        // was getting 401s. `restore` asks the same rule registration does now,
+        // and warns rather than refusing, because failing here takes the whole
+        // instance down over one stored entry.
+        let mut persisted = EndpointRegistry::default();
+        let mut endpoint = dynamic_endpoint(ENDPOINT_ONE);
+        endpoint.auth_type = EndpointAuthType::HmacSha256;
+        endpoint.auth_secret = None;
+        assert!(persisted.insert(endpoint));
+
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("one unusable stored entry must not fail the instance");
+
+        assert!(
+            restored
+                .endpoint(ENDPOINT_ONE)
+                .expect("the endpoint must survive")
+                .is_active(),
+            "refusing here would take down every other endpoint on the instance"
         );
     }
 
