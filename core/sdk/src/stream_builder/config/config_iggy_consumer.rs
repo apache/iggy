@@ -26,6 +26,134 @@ use std::sync::Arc;
 
 const DEFAULT_PARTITION_ID: u32 = 0;
 
+/// Describes the consumer that [`IggyStreamConsumer`] and [`IggyStream`] build.
+///
+/// The value is a plain description. It never talks to the server, and changing it later has no
+/// effect on a consumer that is built already.
+///
+/// # Creating a configuration
+///
+/// | Constructor | Use it for |
+/// | --- | --- |
+/// | [`builder()`](Self::builder) | naming every field you set |
+/// | [`from_stream_topic()`](Self::from_stream_topic) | one stream and one topic, defaults elsewhere |
+/// | [`new()`](Self::new) | every field, positional |
+/// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
+///
+/// The builder requires every field that is not an [`Option`], so
+/// [`init_retries()`](Self::init_retries) and [`encryptor()`](Self::encryptor) are the only two it
+/// lets you leave out.
+///
+/// # Fields and defaults
+///
+/// The defaults below are what [`default()`](Self::default) and
+/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder has no defaults.
+///
+/// | Field | Default | Controls |
+/// | --- | --- | --- |
+/// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | what is read |
+/// | [`stream_id()`](Self::stream_id), [`topic_id()`](Self::topic_id) | the same two names | the lookup that decides whether the stream and the topic exist |
+/// | [`consumer_name()`](Self::consumer_name) | `test_consumer`, or `consumer-{stream}-{topic}` | the name of the consumer, or of its group |
+/// | [`consumer_kind()`](Self::consumer_kind) | [`ConsumerKind::ConsumerGroup`] | whether the consumer joins a group or reads one partition alone |
+/// | [`partitions_count()`](Self::partitions_count) | 1 | two things, see below |
+/// | [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) | off | creating a missing stream |
+/// | [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) | off | creating a missing topic |
+/// | [`batch_length()`](Self::batch_length) | 100 | messages fetched per request |
+/// | [`polling_interval()`](Self::polling_interval) | 5 milliseconds | smallest gap between two requests |
+/// | [`polling_strategy()`](Self::polling_strategy) | [`PollingStrategy::last()`] | where reading each partition starts |
+/// | [`auto_commit()`](Self::auto_commit) | [`AutoCommitWhen::PollingMessages`] | when offsets are committed |
+/// | [`polling_retry_interval()`](Self::polling_retry_interval) | one second | the wait while polling is blocked |
+/// | [`init_retries()`](Self::init_retries), [`init_interval()`](Self::init_interval) | five retries, three seconds apart | retries for a missing stream or topic |
+/// | [`encryptor()`](Self::encryptor) | none | decrypting payloads and user headers |
+///
+/// [`partitions_count()`](Self::partitions_count) carries two meanings. It is the partition count
+/// of a topic that the build creates. For [`ConsumerKind::Consumer`] it is also the ID of the
+/// single partition the consumer reads. A [`ConsumerKind::ConsumerGroup`] ignores that second
+/// meaning, because the server assigns its partitions.
+///
+/// [`encryptor()`](Self::encryptor) replaces the encryptor of the [`IggyClient`] for this
+/// consumer. The key must match the one the producer used. An encryptor also rules out the default
+/// [`auto_commit()`](Self::auto_commit), because that setting commits a batch before it is
+/// decrypted. [`IggyConsumer::init()`] rejects the pair with [`IggyError::InvalidConfiguration`].
+///
+/// # Two defaults to look at twice
+///
+/// [`PollingStrategy::last()`] starts at the end of the partition and never consults the stored
+/// offset, so a restarted consumer skips whatever arrived while it was down. Set
+/// [`PollingStrategy::next()`] to resume where the previous run stopped.
+///
+/// [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) and
+/// [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) are off, so a consumer alone
+/// creates nothing. It waits out [`init_retries()`](Self::init_retries) instead, which covers a
+/// producer that creates the topic at the same time.
+///
+/// # Examples
+///
+/// One topic, with the defaults for everything else:
+///
+/// ```rust
+/// use iggy::prelude::*;
+///
+/// # fn example() -> Result<(), IggyError> {
+/// let config = IggyConsumerConfig::from_stream_topic(
+///     "my-stream",
+///     "my-topic",
+///     100,
+///     IggyDuration::new_from_secs(1),
+/// )?;
+///
+/// assert_eq!(config.consumer_name(), "consumer-my-stream-my-topic");
+/// assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
+/// assert_eq!(config.polling_strategy(), PollingStrategy::last());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A group that creates the topic it reads, resumes from the stored offset, and commits once a
+/// message has been handled:
+///
+/// ```rust
+/// use iggy::prelude::*;
+///
+/// # fn example() -> Result<(), IggyError> {
+/// let config = IggyConsumerConfig::builder()
+///     .stream_id(Identifier::from_str_value("my-stream")?)
+///     .stream_name("my-stream")
+///     .topic_id(Identifier::from_str_value("my-topic")?)
+///     .topic_name("my-topic")
+///     .consumer_name("order-workers")
+///     .consumer_kind(ConsumerKind::ConsumerGroup)
+///     .create_stream_if_not_exists(true)
+///     .create_topic_if_not_exists(true)
+///     .partitions_count(3)
+///     .batch_length(100)
+///     .polling_interval(IggyDuration::new_from_secs(1))
+///     .polling_strategy(PollingStrategy::next())
+///     .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
+///     .auto_commit(AutoCommit::After(AutoCommitAfter::ConsumingEachMessage))
+///     .init_retries(5)
+///     .init_interval(NonZeroIggyDuration::ONE_SECOND)
+///     .build();
+///
+/// assert_eq!(config.partitions_count(), 3);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The [`AutoCommitAfter`] variants above only commit under
+/// [`IggyConsumerMessageExt::consume_messages`].
+///
+/// [`AutoCommitAfter`]: crate::prelude::AutoCommitAfter
+/// [`AutoCommitWhen::PollingMessages`]: crate::prelude::AutoCommitWhen::PollingMessages
+/// [`ConsumerKind::Consumer`]: crate::prelude::ConsumerKind::Consumer
+/// [`ConsumerKind::ConsumerGroup`]: crate::prelude::ConsumerKind::ConsumerGroup
+/// [`IggyClient`]: crate::prelude::IggyClient
+/// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
+/// [`IggyConsumerMessageExt::consume_messages`]: crate::prelude::IggyConsumerMessageExt::consume_messages
+/// [`IggyStream`]: crate::prelude::IggyStream
+/// [`IggyStreamConsumer`]: crate::prelude::IggyStreamConsumer
+/// [`PollingStrategy::last()`]: crate::prelude::PollingStrategy::last
+/// [`PollingStrategy::next()`]: crate::prelude::PollingStrategy::next
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
 pub struct IggyConsumerConfig {
@@ -99,10 +227,12 @@ impl Default for IggyConsumerConfig {
 }
 
 impl IggyConsumerConfig {
-    /// Creates a new `IggyConsumerConfig` from the given arguments.
+    /// Sets every field at once, positionally.
     ///
-    /// # Args
+    /// This applies no defaults. [`builder()`](Self::builder) sets the same fields by name and is
+    /// easier to read.
     ///
+<<<<<<< HEAD
     /// * `stream_id` - The stream id.
     /// * `stream_name` - The stream name.
     /// * `topic_id` - The topic id.
@@ -120,13 +250,45 @@ impl IggyConsumerConfig {
     /// * `polling_retry_interval` - The polling retry interval.
     /// * `init_retries` - The number of init retries.
     /// * `init_interval` - The init interval.
+=======
+    /// # Examples
+>>>>>>> 587c879b7 (init IggyStream docs)
     ///
+    /// Describe a group that reads from the stored offset:
     ///
-    /// Returns:
-    /// A new `IggyConsumerConfig`.
+    /// ```rust
+    /// use iggy::prelude::*;
     ///
+<<<<<<< HEAD
     /// Ordinary consumers use partition 0. Use [`Self::with_partition_id`] to select another partition.
     ///
+=======
+    /// # fn example() -> Result<(), IggyError> {
+    /// let config = IggyConsumerConfig::new(
+    ///     Identifier::from_str_value("my-stream")?,
+    ///     "my-stream".to_string(),
+    ///     Identifier::from_str_value("my-topic")?,
+    ///     "my-topic".to_string(),
+    ///     AutoCommit::When(AutoCommitWhen::ConsumingEachMessage),
+    ///     100,
+    ///     true,
+    ///     true,
+    ///     "order-workers".to_string(),
+    ///     ConsumerKind::ConsumerGroup,
+    ///     IggyDuration::new_from_secs(1),
+    ///     PollingStrategy::next(),
+    ///     3,
+    ///     None,
+    ///     NonZeroIggyDuration::ONE_SECOND,
+    ///     Some(5),
+    ///     NonZeroIggyDuration::ONE_SECOND,
+    /// );
+    ///
+    /// assert_eq!(config.partitions_count(), 3);
+    /// # Ok(())
+    /// # }
+    /// ```
+>>>>>>> 587c879b7 (init IggyStream docs)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream_id: Identifier,
@@ -169,18 +331,44 @@ impl IggyConsumerConfig {
         }
     }
 
-    /// Creates a new `IggyConsumerConfig` from the given arguments.
+    /// Names one stream and one topic, and takes the defaults for the rest.
     ///
-    /// # Args
+    /// Each identifier is derived from the matching name. The consumer is called
+    /// `consumer-{stream}-{topic}` and joins a group under that name. It creates neither the
+    /// stream nor the topic, and it starts at the end of the partition.
     ///
+<<<<<<< HEAD
     /// * `stream` - The stream name.
     /// * `topic` - The topic name.
     /// * `batch_length` - The max number of messages to poll in a batch.
     /// * `polling_interval` - The interval between polling for new messages.
+=======
+    /// # Examples
+>>>>>>> 587c879b7 (init IggyStream docs)
     ///
-    /// Returns:
-    /// A new `IggyConsumerConfig`.
+    /// Describe one topic with 100 messages per request:
     ///
+    /// ```rust
+    /// use iggy::prelude::*;
+    ///
+    /// # fn example() -> Result<(), IggyError> {
+    /// let config = IggyConsumerConfig::from_stream_topic(
+    ///     "my-stream",
+    ///     "my-topic",
+    ///     100,
+    ///     IggyDuration::new_from_secs(1),
+    /// )?;
+    ///
+    /// assert_eq!(config.consumer_name(), "consumer-my-stream-my-topic");
+    /// assert!(!config.create_topic_if_not_exists());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidIdentifier`] when `stream` or `topic` is not a valid
+    /// identifier.
     pub fn from_stream_topic(
         stream: &str,
         topic: &str,
@@ -214,79 +402,110 @@ impl IggyConsumerConfig {
 }
 
 impl IggyConsumerConfig {
+<<<<<<< HEAD
     /// Selects the partition for an ordinary consumer. Consumer groups ignore this setting.
     pub fn with_partition_id(mut self, partition_id: u32) -> Self {
         self.partition_id = partition_id;
         self
     }
 
+=======
+    /// Returns the stream identifier that the build looks the stream up by.
+>>>>>>> 587c879b7 (init IggyStream docs)
     pub fn stream_id(&self) -> &Identifier {
         &self.stream_id
     }
 
+    /// Returns the name of the stream that is read.
     pub fn stream_name(&self) -> &str {
         &self.stream_name
     }
 
+    /// Returns the topic identifier that the build looks the topic up by.
     pub fn topic_id(&self) -> &Identifier {
         &self.topic_id
     }
 
+    /// Returns the name of the topic that is read.
     pub fn topic_name(&self) -> &str {
         &self.topic_name
     }
 
+    /// Returns when the consumer commits an offset by itself.
     pub fn auto_commit(&self) -> AutoCommit {
         self.auto_commit
     }
 
+    /// Returns how many messages one request fetches at most.
     pub fn batch_length(&self) -> u32 {
         self.batch_length
     }
+
+    /// Returns whether the build creates the stream when it is missing.
     pub fn create_stream_if_not_exists(&self) -> bool {
         self.create_stream_if_not_exists
     }
 
+    /// Returns whether the build creates the topic when it is missing.
     pub fn create_topic_if_not_exists(&self) -> bool {
         self.create_topic_if_not_exists
     }
 
+    /// Returns the name of the consumer, or of its group.
     pub fn consumer_name(&self) -> &str {
         &self.consumer_name
     }
 
+    /// Returns whether the consumer joins a group or reads one partition alone.
     pub fn consumer_kind(&self) -> ConsumerKind {
         self.consumer_kind
     }
 
+    /// Returns the smallest gap the consumer keeps between two requests.
     pub fn polling_interval(&self) -> IggyDuration {
         self.polling_interval
     }
 
+    /// Returns where reading each partition starts.
     pub fn polling_strategy(&self) -> PollingStrategy {
         self.polling_strategy
     }
 
+    /// Returns how many partitions a topic created by the build gets.
+    ///
+    /// For [`ConsumerKind::Consumer`] this is also the ID of the single partition that the
+    /// consumer reads.
+    ///
+    /// [`ConsumerKind::Consumer`]: crate::prelude::ConsumerKind::Consumer
     pub fn partitions_count(&self) -> u32 {
         self.partitions_count
     }
 
+<<<<<<< HEAD
     pub fn partition_id(&self) -> u32 {
         self.partition_id
     }
 
+=======
+    /// Returns the encryptor for payloads and user headers, if there is one.
+    ///
+    /// It replaces the encryptor of the client that builds the consumer.
+>>>>>>> 587c879b7 (init IggyStream docs)
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {
         self.encryptor.clone()
     }
 
+    /// Returns the wait between attempts while polling is blocked.
     pub fn polling_retry_interval(&self) -> NonZeroIggyDuration {
         self.polling_retry_interval
     }
 
+    /// Returns how often the build retries a missing stream or topic, if at all.
     pub fn init_retries(&self) -> Option<u32> {
         self.init_retries
     }
 
+    /// Returns the wait between those retries.
     pub fn init_interval(&self) -> NonZeroIggyDuration {
         self.init_interval
     }
