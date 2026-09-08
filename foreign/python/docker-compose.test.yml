@@ -33,6 +33,7 @@ services:
       - "3000:3000"
       - "8080:8080"
       - "8090:8090"
+      - "8092:8092"
     environment:
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
@@ -65,6 +66,7 @@ services:
       - IGGY_SERVER_TCP_PORT=8090
       - IGGY_SERVER_HTTP_PORT=3000
       - IGGY_SERVER_QUIC_PORT=8080
+      - IGGY_SERVER_WS_PORT=8092
       - PYTHONPATH=/workspace/foreign/python
       - PYTEST_ARGS=-v --tb=short
     volumes:

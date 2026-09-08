@@ -59,7 +59,7 @@ use iggy_binary_protocol::{
     AckLevel, Command, KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireDecode, WireEncode,
     WireIdentifier,
 };
-use iggy_common::{IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
+use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{AUTO_COMMIT_CLIENT_ID, BusMessage};
@@ -67,7 +67,10 @@ use metadata::impls::metadata::{
     StreamsFrontend, build_truncate_partition_client_message,
     build_truncate_partition_client_message_with_identifiers,
 };
-use partitions::{AutoCommitApplied, PollPlan, PollingArgs, PollingConsumer};
+use partitions::{
+    AutoCommitApplied, ConsumerOffsetCapacityError, PollFragments, PollPlan, PollingArgs,
+    PollingConsumer,
+};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
@@ -111,14 +114,8 @@ where
                         spawn_poll_io(Rc::clone(&shard), namespace, plan, reply);
                     }
                     Some(plan) => {
-                        let (fragments, current_offset, auto_commit) = plan.execute_resident();
-                        if let Some(applied) = auto_commit {
-                            submit_auto_commit(&shard, namespace, &applied);
-                        }
-                        let _ = reply.try_send(PartitionReadReply::Poll {
-                            fragments,
-                            current_offset,
-                        });
+                        let result = poll_reply(&shard, namespace, plan.execute_resident());
+                        let _ = reply.try_send(result);
                     }
                 }
             }
@@ -190,7 +187,7 @@ fn spawn_poll_io<B, MJ, S, SB>(
         // measures near-zero real time and never fires). Do not derive any
         // replicated or reply value from it, or replay determinism breaks.
         let poll_started = std::time::Instant::now();
-        let (fragments, current_offset, auto_commit) = plan.execute().await;
+        let result = plan.execute().await;
         let elapsed = poll_started.elapsed();
         if elapsed > std::time::Duration::from_secs(1) {
             warn!(
@@ -199,28 +196,67 @@ fn spawn_poll_io<B, MJ, S, SB>(
                 "slow partition poll; gather side may have timed out"
             );
         }
-        // Fire-and-forget: the poll reply is not gated on the offset commit.
-        if let Some(applied) = auto_commit {
-            submit_auto_commit(&shard, namespace, &applied);
-        }
-        let _ = reply.try_send(PartitionReadReply::Poll {
-            fragments,
-            current_offset,
-        });
+        let result = poll_reply(&shard, namespace, result);
+        let _ = reply.try_send(result);
     });
+}
+
+fn poll_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    result: Result<(PollFragments, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError>,
+) -> PartitionReadReply
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    match result {
+        Ok((fragments, current_offset, auto_commit)) => {
+            if let Some(applied) = auto_commit
+                && let Err(error) = submit_auto_commit(shard, namespace, applied)
+            {
+                PartitionReadReply::Rejected(error)
+            } else {
+                PartitionReadReply::Poll {
+                    fragments,
+                    current_offset,
+                }
+            }
+        }
+        Err(error) => {
+            if !error.uncertain {
+                shard.metrics().record_consumer_offset_denied(error.kind);
+            }
+            warn_auto_commit_capacity(namespace, error);
+            PartitionReadReply::Rejected(error.into())
+        }
+    }
 }
 
 /// Replicate a poll's auto-committed offset through the partition consensus so
 /// it survives failover, mirroring the explicit `StoreConsumerOffset` path: the
-/// same op code, submitted onto the owning shard's own pipeline. Best-effort and
-/// fire-and-forget -- the poll reply never waits on it, and a full inbox drops
-/// the op at WARN rather than backpressuring the reply.
+/// same op code, submitted onto the owning shard's own pipeline. The poll reply
+/// does not wait for commit, but a primary reserves cardinality before this
+/// submission and rejects the poll if the local inbox cannot accept it.
 ///
 /// The partition plane admits writes on the primary only (it asserts so), and a
 /// poll is served on whichever node owns the namespace locally, which may be a
-/// backup. So gate on primary status here and drop at WARN otherwise; auto-commit
+/// backup. So gate on primary status here. Auto-commit
 /// is server-managed best-effort (at-least-once delivery), so a follower-served
-/// poll simply does not advance the durable offset.
+/// poll simply does not advance the durable offset. The same contract covers a
+/// local cursor that never became durable: when the per-kind live map is over
+/// its limit the partition evicts such a cursor, and that consumer's next
+/// `Next` poll restarts from offset 0.
+///
+/// A poll whose auto-commit cannot be submitted is answered
+/// `TransientNotAccepted` and returns no messages, even though the fragments
+/// were already read: the owning shard's inbox refused the frame, or the
+/// partition changed primary or incarnation during the read. Like the
+/// `TooManyConsumerOffsets` refusal at the key limit, it returns no batch.
+/// Transient refusals permit retry. Capacity refusals need available capacity.
 ///
 /// Coalescing: an offset the partition's committed high-water already covers is
 /// dropped without a consensus op (the steady state for a re-poll of committed
@@ -230,61 +266,86 @@ fn spawn_poll_io<B, MJ, S, SB>(
 fn submit_auto_commit<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
-    applied: &AutoCommitApplied,
-) where
+    applied: AutoCommitApplied,
+) -> Result<(), IggyError>
+where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    enum AutoCommitGate {
-        Submit,
-        Covered,
-        NotPrimary,
-    }
-    let gate = shard
-        .plane
-        .partitions()
-        .with_partition(&namespace, |partition| {
-            let consensus = partition.consensus();
-            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
-                AutoCommitGate::NotPrimary
-            } else if partition.is_auto_commit_offset_covered(
-                applied.kind,
-                applied.consumer_id,
-                applied.offset,
-            ) {
-                AutoCommitGate::Covered
-            } else {
-                AutoCommitGate::Submit
-            }
-        });
-    match gate {
-        Some(AutoCommitGate::Submit) => {}
-        Some(AutoCommitGate::Covered) => return,
-        Some(AutoCommitGate::NotPrimary) | None => {
-            warn!(
+    // Everything inside is synchronous: `admit` rolls the eager cursor update
+    // back on `Err` in the same call, and no await may sit between the update
+    // and that rollback.
+    applied.admit(|applied| {
+        let primary = shard
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                let consensus = partition.consensus();
+                if !partition.auto_commit_admission_ready(applied) {
+                    return Err(IggyError::TransientNotAccepted);
+                }
+                Ok(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring())
+            });
+        if matches!(primary, None | Some(Err(_))) {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        if primary == Some(Ok(false)) {
+            debug!(
                 namespace_raw = namespace.inner(),
                 "auto-commit offset not replicated: partition not primary on this node (best-effort)"
             );
-            return;
+            return Ok(());
         }
-    }
-    let message = match build_auto_commit_request(namespace, applied) {
-        Ok(message) => message,
-        Err(error) => {
+        let reservation = match applied.reserve_durable() {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                if !error.uncertain {
+                    shard.metrics().record_consumer_offset_denied(applied.kind);
+                }
+                warn_auto_commit_capacity(namespace, error);
+                return Err(error.into());
+            }
+        };
+        let message = build_auto_commit_request(namespace, applied).inspect_err(|error| {
             warn!(
                 namespace_raw = namespace.inner(),
                 error = %error,
                 "failed to build auto-commit store-offset request"
             );
-            return;
-        }
-    };
-    // Routes by namespace to this same (owning, primary) shard's inbox; the pump
-    // admits it next turn exactly like a client store. `dispatch` never blocks.
-    shard.dispatch(message.into_generic());
+        })?;
+        // Routes by namespace to this same owning primary shard's inbox. The
+        // pump admits it next turn exactly like a client store. `dispatch`
+        // never blocks.
+        shard
+            .submit_auto_commit_offset(message, reservation)
+            .map_err(|_| IggyError::TransientNotAccepted)
+    })
+}
+
+fn warn_auto_commit_capacity(
+    namespace: IggyNamespace,
+    error: partitions::ConsumerOffsetCapacityError,
+) {
+    if error.first_in_episode && error.uncertain {
+        warn!(
+            namespace_raw = namespace.inner(),
+            kind = ?error.kind,
+            "consumer offset accounting unavailable during auto-commit"
+        );
+    } else if error.first_in_episode {
+        warn!(
+            namespace_raw = namespace.inner(),
+            kind = ?error.kind,
+            occupied = error.occupied,
+            limit = error.limit,
+            config = "[partition] consumer_offsets_max",
+            "consumer offset map limit reached during auto-commit"
+        );
+    }
 }
 
 /// Build the synthetic `StoreConsumerOffset` request for an auto-commit, keyed
@@ -395,13 +456,15 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
                 operation = ?header.operation,
                 "partition request with unresolved namespace; replying denied"
             );
-            send_deny_reply(
-                shard,
-                transport_client_id,
-                &header,
-                IggyError::ResourceNotFound(String::new()).as_code(),
-            )
-            .await;
+            let status = if matches!(
+                header.operation,
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+            ) {
+                error.as_code()
+            } else {
+                IggyError::ResourceNotFound(String::new()).as_code()
+            };
+            send_deny_reply(shard, transport_client_id, &header, status).await;
             return;
         }
     };
@@ -471,11 +534,8 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     // metadata access to resolve it.
     let request = match maybe_rewrite_consumer_offset_request(shard, request) {
         Ok(rewritten) => rewritten,
-        // Not reachable through the wire path: the same body already decoded in
-        // `resolve_partition_request_namespace` above, and re-encoding it can
-        // only fail past `u32::MAX` bytes against a 64 MiB request cap. Denying
-        // typed keeps a future re-encode failure from acking work the partition
-        // plane never saw.
+        // Metadata can change during the routing wait, so a previously valid
+        // group may be missing now. Preserve the typed failure before submit.
         Err(error) => {
             warn!(
                 transport_client_id,
@@ -544,6 +604,7 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let consumer_kind = consumer_offset_kind(&request);
     let Ok(ticket) = shard.partition_submit(namespace, request) else {
         // `PartitionSubmitRefused`: the frame never reached the owning shard,
         // so this is a known outcome and the client can be told now rather
@@ -569,6 +630,18 @@ async fn relay_partition_reply<B, MJ, S, SB>(
             // commits moments later. The client's read-timeout is the recovery.
             return;
         };
+        if let Some(kind) = consumer_kind
+            && reply
+                .as_slice()
+                .get(..size_of::<iggy_binary_protocol::ReplyHeader>())
+                .and_then(|bytes| {
+                    bytemuck::checked::try_from_bytes::<iggy_binary_protocol::ReplyHeader>(bytes)
+                        .ok()
+                })
+                .is_some_and(|header| header.status == IggyError::TooManyConsumerOffsets.as_code())
+        {
+            shard.metrics().record_consumer_offset_denied(kind);
+        }
         if let Err(error) = shard
             .bus
             .send_to_client(transport_client_id, reply.into_frozen())
@@ -582,6 +655,15 @@ async fn relay_partition_reply<B, MJ, S, SB>(
             );
         }
     });
+}
+
+fn consumer_offset_kind(request: &Message<RoutedRequestHeader>) -> Option<ConsumerKind> {
+    if request.header().operation != Operation::StoreConsumerOffset {
+        return None;
+    }
+    // WireConsumer starts with its kind byte. The dispatch path has already
+    // decoded and validated the complete request.
+    ConsumerKind::from_code(*request_body(request).first()?).ok()
 }
 
 /// Serve `poll_messages`: resolve the partition namespace, run the read on
@@ -651,7 +733,12 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
                     .await;
                     return;
                 }
-                Err(fallback) => fallback,
+                Err(ReadPolledMessagesError::Fallback(fallback)) => fallback,
+                Err(ReadPolledMessagesError::Rejected(error)) => {
+                    send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                        .await;
+                    return;
+                }
             }
         }
         // A generation fence: the client's cached assignment went stale after a
@@ -701,7 +788,7 @@ async fn read_polled_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     (namespace, partition_id, consumer, args): DecodedPollRequest,
-) -> Result<BusMessage, (Bytes, FrameChannel)>
+) -> Result<BusMessage, ReadPolledMessagesError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -730,8 +817,9 @@ where
                 error = %error,
                 "failed to re-encode polled batches; replying empty poll"
             );
-            empty_poll_fallback(partition_id)
+            ReadPolledMessagesError::Fallback(empty_poll_fallback(partition_id))
         }),
+        Some(PartitionReadReply::Rejected(error)) => Err(ReadPolledMessagesError::Rejected(error)),
         other => {
             warn!(
                 transport_client_id,
@@ -739,9 +827,16 @@ where
                 reply_was_none = other.is_none(),
                 "partition read failed; replying empty poll"
             );
-            Err(empty_poll_fallback(partition_id))
+            Err(ReadPolledMessagesError::Fallback(empty_poll_fallback(
+                partition_id,
+            )))
         }
     }
+}
+
+enum ReadPolledMessagesError {
+    Fallback((Bytes, FrameChannel)),
+    Rejected(IggyError),
 }
 
 /// The fail-fast poll reply for a partition that could not answer: the
@@ -1300,6 +1395,7 @@ mod tests {
     };
     use iggy_binary_protocol::ReplyHeader;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{
@@ -1319,6 +1415,146 @@ mod tests {
         LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology, ShardFrame,
         ShardIdentity, shard_channel,
     };
+
+    #[compio::test]
+    async fn given_invalid_partition_writes_when_resolving_should_preserve_offset_error_codes() {
+        const VSR_CLIENT: u128 = 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        // Stream 0 / topic 0 / partition 0 committed straight into the STM, so a
+        // group op resolves its namespace and reaches the group fence, which
+        // runs before the routable wait.
+        let md = shard.plane.metadata();
+        md.mux_stm.users().ensure_root_user("iggy", "hash");
+        let create_stream = CreateStreamRequest {
+            name: WireName::new("stream").unwrap(),
+            options: WireOptions::empty(),
+        };
+        md.mux_stm
+            .update(prepare_message(
+                Operation::CreateStream,
+                VSR_CLIENT,
+                1,
+                &create_stream.to_bytes(),
+            ))
+            .unwrap();
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+            created_view: 0,
+        };
+        md.mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                VSR_CLIENT,
+                2,
+                &create_topic.to_bytes(),
+            ))
+            .unwrap();
+
+        let offset_body = |operation: Operation,
+                           consumer: WireConsumer,
+                           stream_id: WireIdentifier,
+                           topic_id: WireIdentifier| {
+            if operation == Operation::StoreConsumerOffset {
+                StoreConsumerOffsetRequest {
+                    consumer,
+                    stream_id,
+                    topic_id,
+                    partition_id: Some(0),
+                    offset: 0,
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes()
+            } else {
+                DeleteConsumerOffsetRequest {
+                    consumer,
+                    stream_id,
+                    topic_id,
+                    partition_id: Some(0),
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes()
+            }
+        };
+        let mut cases = Vec::new();
+        for operation in [
+            Operation::StoreConsumerOffset,
+            Operation::DeleteConsumerOffset,
+        ] {
+            cases.push((operation, vec![1], IggyError::InvalidCommand));
+            cases.push((
+                operation,
+                offset_body(
+                    operation,
+                    WireConsumer::consumer(WireIdentifier::Numeric(1)),
+                    WireIdentifier::Numeric(404),
+                    WireIdentifier::Numeric(1),
+                )
+                .to_vec(),
+                IggyError::StreamIdNotFound(Identifier::numeric(404).unwrap()),
+            ));
+            // The group fence: an unknown group on a known topic answers the
+            // group's own not-found code, numeric and named, not a bare
+            // ResourceNotFound.
+            cases.push((
+                operation,
+                offset_body(
+                    operation,
+                    WireConsumer::consumer_group(WireIdentifier::Numeric(999)),
+                    WireIdentifier::Numeric(0),
+                    WireIdentifier::Numeric(0),
+                )
+                .to_vec(),
+                IggyError::ConsumerGroupIdNotFound(
+                    Identifier::numeric(999).unwrap(),
+                    Identifier::numeric(0).unwrap(),
+                ),
+            ));
+            cases.push((
+                operation,
+                offset_body(
+                    operation,
+                    WireConsumer::consumer_group(WireIdentifier::named("ghost").unwrap()),
+                    WireIdentifier::Numeric(0),
+                    WireIdentifier::Numeric(0),
+                )
+                .to_vec(),
+                IggyError::ConsumerGroupNameNotFound(
+                    "ghost".to_owned(),
+                    Identifier::numeric(0).unwrap(),
+                ),
+            ));
+        }
+        cases.push((
+            Operation::SendMessages,
+            vec![1],
+            IggyError::ResourceNotFound(String::new()),
+        ));
+        for (index, (operation, body, expected)) in cases.into_iter().enumerate() {
+            let request = request_message(operation, 1, 1, index as u64 + 1, &body);
+            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID)).await;
+            let replies = bus.client_replies.borrow();
+            assert_eq!(
+                replies.len(),
+                index + 1,
+                "{operation:?} must reply exactly once"
+            );
+            let (_, frame) = replies.last().unwrap();
+            let start = std::mem::offset_of!(ReplyHeader, status);
+            let status = u32::from_le_bytes(frame[start..start + 4].try_into().unwrap());
+            assert_eq!(status, expected.as_code(), "{operation:?}");
+        }
+    }
 
     /// An undecodable request body is a PERMANENT client error, so every read
     /// on this path must answer a nonzero status. The fail-fast shapes these
@@ -1480,6 +1716,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                consumer_offset_enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -1606,6 +1843,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                consumer_offset_enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -1671,6 +1909,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                consumer_offset_enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,

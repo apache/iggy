@@ -642,14 +642,14 @@ impl StateHandler for UpdatePermissionsRequest {
 /// The success reply here is deliberately empty: the raw token the caller needs
 /// is the one thing this apply must never see.
 ///
-/// The primary mints the raw token and its hash at ingress (server-ng
+/// The primary mints the raw token and its hash at ingress (server
 /// `pat::rewrite_pat_request_for_user`) and replicates only the hash. Minting
 /// inside this apply would call `ring::rand` on every replica and diverge the
 /// token index, and replicating the raw token would persist a live credential in
 /// every WAL and snapshot. So the raw token leaves the primary by a side channel
 /// (`maybe_rewrite_pat_request` returns it alongside the rewritten request) and
 /// the home shard splices it into this op's reply as a typed
-/// `RawPersonalAccessTokenResponse` (server-ng `responses::build_raw_pat_reply`).
+/// `RawPersonalAccessTokenResponse` (server `responses::build_raw_pat_reply`).
 ///
 /// One consequence rides on that: the secret exists only on the wire of the
 /// original reply, so a replayed request cannot be served from the client-table

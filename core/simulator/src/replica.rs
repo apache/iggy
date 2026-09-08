@@ -380,6 +380,7 @@ pub fn new_shard(
         messages_required_to_save: 1000,
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
         enforce_fsync: false, //Disable fsync for simulation
+        consumer_offset_enforce_fsync: false,
         validate_checksum: true,
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
         preallocate_segments: false,

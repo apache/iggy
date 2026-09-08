@@ -21,6 +21,7 @@ package org.apache.iggy.message;
 
 import javax.annotation.Nullable;
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -46,7 +47,7 @@ public record Message(MessageHeader header, byte[] payload, Map<HeaderKey, Heade
     }
 
     public static Message of(String payload, Map<HeaderKey, HeaderValue> userHeaders) {
-        final byte[] payloadBytes = payload.getBytes();
+        final byte[] payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
         final long userHeadersLength = getUserHeadersSize(userHeaders);
         final MessageHeader msgHeader = new MessageHeader(
                 BigInteger.ZERO,

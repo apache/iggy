@@ -12,7 +12,7 @@ docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 \
   -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
 
 # Or build from source (recommended for development)
-cd ../../ && cargo run --bin iggy-server
+cd ../../ && cargo run --bin iggy-server -- --with-default-root-credentials --fresh
 ```
 
 For server configuration options and help:
