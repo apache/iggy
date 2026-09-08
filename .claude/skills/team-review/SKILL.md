@@ -186,10 +186,10 @@ Counts: critical N, warning N, nit N, simplify N (Confirmed + Simplification sec
 Then write `<DIR>/report.md` with:
 
 1. H1 `# Iggy Team Review - <change desc> (<SHORTCOMMIT>)`.
-1. Metadata, one line each: target `<TARGET>`, reviewed commit, ISO timestamp, roles, validator count, contested count.
-1. The report above, verbatim.
-1. Appendix `## Raw findings per expert`: each role file verbatim in a fenced block.
-1. `## Validation record`: counts of PASS / FIX / REMOVE, sweep additions, contested outcomes.
+2. Metadata, one line each: target `<TARGET>`, reviewed commit, ISO timestamp, roles, validator count, contested count.
+3. The report above, verbatim.
+4. Appendix `## Raw findings per expert`: each role file verbatim in a fenced block.
+5. `## Validation record`: counts of PASS / FIX / REMOVE, sweep additions, contested outcomes.
 
 Last user-facing line: `Findings written: <DIR>/report.md`. No cleanup: one-shot agents end themselves, `<DIR>` stays in
 the scratchpad.
