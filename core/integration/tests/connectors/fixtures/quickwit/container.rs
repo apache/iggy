@@ -129,6 +129,10 @@ pub trait QuickwitOps: Sync {
     fn container(&self) -> &QuickwitContainer;
     fn http_client(&self) -> &HttpClient;
 
+    fn timestamp_field(&self) -> Option<&str> {
+        Some(INDEX_TIMESTAMP_FIELD)
+    }
+
     fn create_index(
         &self,
         index_config: &str,
@@ -176,6 +180,7 @@ pub trait QuickwitOps: Sync {
                 .http_client()
                 .post(&ingest_url)
                 .query(&[("commit", "force")])
+                // A scalar forces a commit without adding a searchable document.
                 .json("{}")
                 .send()
                 .await
@@ -204,13 +209,12 @@ pub trait QuickwitOps: Sync {
     {
         async move {
             let search_url = format!("{}/api/v1/{}/search", self.container().base_url(), index_id);
-            let descending = "-";
+            let mut request = self.http_client().get(&search_url).query(&[("query", "")]);
+            if let Some(timestamp_field) = self.timestamp_field() {
+                request = request.query(&[("sort_by", format!("-{timestamp_field}"))]);
+            }
 
-            let response = self
-                .http_client()
-                .get(&search_url)
-                .query(&[("query", "")])
-                .query(&[("sort_by", format!("{descending}{INDEX_TIMESTAMP_FIELD}"))])
+            let response = request
                 .send()
                 .await
                 .map_err(|e| TestBinaryError::InvalidState {
@@ -326,6 +330,7 @@ fn build_connector_envs(base_url: &str) -> HashMap<String, String> {
 pub struct QuickwitFixture {
     container: QuickwitContainer,
     http_client: HttpClient,
+    timestamp_field: Option<&'static str>,
 }
 
 impl QuickwitOps for QuickwitFixture {
@@ -335,6 +340,10 @@ impl QuickwitOps for QuickwitFixture {
 
     fn http_client(&self) -> &HttpClient {
         &self.http_client
+    }
+
+    fn timestamp_field(&self) -> Option<&str> {
+        self.timestamp_field
     }
 }
 
@@ -347,6 +356,7 @@ impl TestFixture for QuickwitFixture {
         Ok(Self {
             container,
             http_client,
+            timestamp_field: Some(INDEX_TIMESTAMP_FIELD),
         })
     }
 
@@ -386,6 +396,7 @@ impl TestFixture for QuickwitPreCreatedFixture {
         let inner = QuickwitFixture {
             container,
             http_client,
+            timestamp_field: Some(INDEX_TIMESTAMP_FIELD),
         };
 
         let index_config = get_index_config(seeds::names::TOPIC);
@@ -396,5 +407,66 @@ impl TestFixture for QuickwitPreCreatedFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         self.inner.connectors_runtime_envs()
+    }
+}
+
+pub struct QuickwitRawFixture {
+    inner: QuickwitFixture,
+}
+
+impl std::ops::Deref for QuickwitRawFixture {
+    type Target = QuickwitFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for QuickwitRawFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let mut inner = QuickwitFixture::setup().await?;
+        inner.timestamp_field = None;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_STREAMS_0_SCHEMA.to_string(), "raw".to_string());
+        envs.insert(
+            ENV_PLUGIN_INDEX.to_string(),
+            format!(
+                "version: 0.8\nindex_id: {}\ndoc_mapping:\n  mode: dynamic\n",
+                seeds::names::TOPIC
+            ),
+        );
+        envs
+    }
+}
+
+pub struct QuickwitTextFixture {
+    inner: QuickwitRawFixture,
+}
+
+impl std::ops::Deref for QuickwitTextFixture {
+    type Target = QuickwitRawFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for QuickwitTextFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: QuickwitRawFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_STREAMS_0_SCHEMA.to_string(), "text".to_string());
+        envs
     }
 }
