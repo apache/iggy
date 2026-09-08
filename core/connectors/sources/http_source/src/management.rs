@@ -42,11 +42,11 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::auth::{is_usable_secret, validate_bearer};
-use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
+use crate::routes::{Endpoint, EndpointOrigin, EndpointState, RouteTable};
 use crate::server::{ServerState, bearer_header, error_response, refresh_routes};
 use crate::state::{InsertOutcome, MAX_ENDPOINTS};
 use crate::types::{EndpointId, unix_now_seconds};
-use crate::{CONNECTOR_NAME, EndpointAuthType, SharedState};
+use crate::{CONNECTOR_NAME, EndpointAuthType, MutationOutcome, SharedState};
 
 /// Bytes of entropy behind a generated endpoint id. The URL is the bearer
 /// token for a secret-path endpoint, so it carries the whole secret.
@@ -157,11 +157,31 @@ async fn register_endpoint(
         state: EndpointState::Active,
     };
 
+    // Validated before it is published. `mutate_registry` publishes, arms the
+    // flush and posts the permit in one step, so the old order let a poll
+    // snapshot a registration this handler was about to refuse and the runtime
+    // persist it, while the caller was told 500. The rollback could not undo
+    // that, and `try_insert` may also have reclaimed tombstones inside the
+    // published clone, which `remove` never restores.
+    //
+    // Checked against the published instance set rather than `SERVERS`: it is a
+    // plain load, and `validate` runs under a lock that must not span an await.
+    let instances = state.published().instances.clone();
+    let instance_id = instance.id;
     let mut outcome = InsertOutcome::Collision;
-    instance.mutate_registry(|registry| {
-        outcome = registry.try_insert(endpoint);
-        outcome == InsertOutcome::Inserted
-    });
+    let applied = instance.try_mutate_registry(
+        |registry| {
+            outcome = registry.try_insert(endpoint);
+            outcome == InsertOutcome::Inserted
+        },
+        |candidate| RouteTable::build_with(&instances, Some((instance_id, candidate))).is_ok(),
+    );
+    if applied == MutationOutcome::Rejected {
+        warn!(
+            "Registration for {CONNECTOR_NAME} connector ID: {instance_id} would not project into a route table, refusing it"
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "route update failed");
+    }
     match outcome {
         InsertOutcome::Inserted => {}
         InsertOutcome::Collision => {

@@ -31,6 +31,7 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
 use crate::auth::is_usable_secret;
+use crate::state::EndpointRegistry;
 use crate::types::EndpointId;
 use crate::{EndpointAuthType, SharedState, StaticEndpointConfig};
 
@@ -232,6 +233,22 @@ impl RouteTable {
 
     /// Projects every joined instance's registry into one lookup table.
     pub fn build(instances: &[Arc<SharedState>]) -> Result<Self, RouteConflict> {
+        Self::build_with(instances, None)
+    }
+
+    /// As [`RouteTable::build`], but projecting `candidate` in place of the
+    /// named instance's own registry.
+    ///
+    /// Exists so a control-plane mutation can be checked before it is
+    /// published. Publishing first and undoing on failure cannot be made
+    /// correct: the flush is armed by the same call that publishes, so the
+    /// runtime may already have persisted the change this handler is about to
+    /// refuse, and an insert that reclaimed tombstones to make room does not
+    /// get them back.
+    pub fn build_with(
+        instances: &[Arc<SharedState>],
+        candidate: Option<(u32, &EndpointRegistry)>,
+    ) -> Result<Self, RouteConflict> {
         let mut table = RouteTable::default();
         for instance in instances {
             if let Some(topic_path) = &instance.config.topic_path {
@@ -248,7 +265,12 @@ impl RouteTable {
                     }
                 }
             }
-            for endpoint in instance.registry().endpoints() {
+            let own = instance.registry();
+            let registry = match candidate {
+                Some((candidate_id, candidate)) if candidate_id == instance.id => candidate,
+                _ => own.as_ref(),
+            };
+            for endpoint in registry.endpoints() {
                 match table.secret_paths.entry(endpoint.endpoint_id.clone()) {
                     Entry::Occupied(occupied) => {
                         return Err(RouteConflict::EndpointId {

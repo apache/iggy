@@ -152,6 +152,17 @@ fn drain_bridge(
     }
 }
 
+/// What a validated mutation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationOutcome {
+    /// Published, flush armed, change counted.
+    Applied,
+    /// The mutation itself declined; nothing was a change to begin with.
+    NoChange,
+    /// The candidate failed validation, so nothing was published or armed.
+    Rejected,
+}
+
 /// Clears the in-flight marker however `poll()` ends, including cancellation.
 /// The SDK drops the poll future when it stops the task, so without a guard a
 /// stopped source would look permanently mid-poll.
@@ -247,6 +258,28 @@ impl SharedState {
     /// endpoint, into one registry serialization and one state-store write per
     /// 404, which is a remote write on the HTTP state backend.
     pub fn mutate_registry(&self, mutation: impl FnOnce(&mut EndpointRegistry) -> bool) -> bool {
+        self.try_mutate_registry(mutation, |_| true) == MutationOutcome::Applied
+    }
+
+    /// A mutation that must prove itself before it becomes visible.
+    ///
+    /// `validate` sees the candidate registry while it is still private to this
+    /// call. Rejecting there publishes nothing, arms no flush and counts no
+    /// pending change, which is what the register path needs: publishing first
+    /// and undoing on failure cannot be made correct, because the same call
+    /// arms the flush, so the runtime may already have persisted a change the
+    /// caller is about to be told failed, and an insert that reclaimed
+    /// tombstones to make room does not get them back.
+    ///
+    /// `validate` must stay synchronous. It runs under `registry_writer`, and
+    /// an await there would put a `std::sync::Mutex` across it and make
+    /// `take_dirty_state`'s `try_lock` fail for the duration, silently skipping
+    /// flushes.
+    pub fn try_mutate_registry(
+        &self,
+        mutation: impl FnOnce(&mut EndpointRegistry) -> bool,
+        validate: impl FnOnce(&EndpointRegistry) -> bool,
+    ) -> MutationOutcome {
         {
             // `std::sync::Mutex`, because the guard never spans an await: the
             // mutation is a sync closure and the swap is a store. Holding a
@@ -258,7 +291,10 @@ impl SharedState {
                 .unwrap_or_else(PoisonError::into_inner);
             let mut next = EndpointRegistry::clone(&self.registry.load());
             if !mutation(&mut next) {
-                return false;
+                return MutationOutcome::NoChange;
+            }
+            if !validate(&next) {
+                return MutationOutcome::Rejected;
             }
             // Before the publish, not after. A reader between the two sees a
             // registry that has not changed yet and is told a flush is owed,
@@ -272,7 +308,7 @@ impl SharedState {
         // Notified after the gate is free, so the woken poll finds it open
         // rather than bouncing off `try_lock` and relying on the re-arm there.
         self.state_flush.notify_one();
-        true
+        MutationOutcome::Applied
     }
 
     /// Whether a mutation is still waiting to be handed to the runtime.
@@ -1546,6 +1582,55 @@ mod tests {
             source.shared.take_dirty_state().is_none(),
             "an unchanged registry must not be rewritten every poll"
         );
+    }
+
+    #[tokio::test]
+    async fn given_a_rejected_candidate_when_mutated_should_publish_and_arm_nothing() {
+        // The register path used to publish, arm the flush and post the permit
+        // before it knew the change was routable, so a poll could hand the
+        // runtime a registration the caller was then told had failed. Nothing
+        // may escape a rejected candidate: not the entry, not the dirty bit,
+        // not the pending count, and not a wakeup.
+        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+        let before = source.shared.registry().endpoints().count();
+
+        let outcome = source.shared.try_mutate_registry(
+            |registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42),
+            |_| false,
+        );
+
+        assert_eq!(outcome, MutationOutcome::Rejected);
+        assert!(
+            source
+                .shared
+                .registry()
+                .endpoint(ENDPOINT_ONE)
+                .expect("the endpoint must still be there")
+                .is_active(),
+            "a rejected candidate must not reach the published registry"
+        );
+        assert_eq!(source.shared.registry().endpoints().count(), before);
+        assert!(
+            !source.shared.has_pending_state(),
+            "and it must not arm a flush for a change that did not happen"
+        );
+        assert_eq!(source.shared.pending_change_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn given_an_accepted_candidate_when_mutated_should_behave_as_before() {
+        // The validating path is the only path now, so the ordinary case has to
+        // keep arming exactly as `mutate_registry` always did.
+        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+
+        let outcome = source.shared.try_mutate_registry(
+            |registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42),
+            |_| true,
+        );
+
+        assert_eq!(outcome, MutationOutcome::Applied);
+        assert!(source.shared.has_pending_state());
+        assert_eq!(source.shared.pending_change_count(), 1);
     }
 
     #[tokio::test]
