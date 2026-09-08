@@ -174,8 +174,8 @@ impl IggyClient {
         // is a no-op for the other transports since the protocol isn't known until the
         // connection string is parsed.
         let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-        let client = RustIggyClient::from_connection_string(&connection_string)
-            .map_err(to_runtime_error)?;
+        let client =
+            RustIggyClient::from_connection_string(&connection_string).map_err(to_runtime_error)?;
         Ok(Self {
             inner: Arc::new(client),
         })
@@ -186,12 +186,10 @@ impl IggyClient {
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
-            inner
-                .ping()
-                .await
-                .map_err(to_runtime_error)
-        })
+        future_into_py(
+            py,
+            async move { inner.ping().await.map_err(to_runtime_error) },
+        )
     }
 
     /// Get the statistics and details of the server and its running process.
@@ -210,10 +208,7 @@ impl IggyClient {
     fn get_stats<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let stats = inner
-                .get_stats()
-                .await
-                .map_err(to_runtime_error)?;
+            let stats = inner.get_stats().await.map_err(to_runtime_error)?;
             Ok(PyStats::from(stats))
         })
     }
@@ -288,10 +283,7 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            let user = inner
-                .get_user(&user_id)
-                .await
-                .map_err(to_runtime_error)?;
+            let user = inner.get_user(&user_id).await.map_err(to_runtime_error)?;
             Ok(user.map(PyUserInfoDetails::from))
         })
     }
@@ -308,10 +300,7 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            let users = inner
-                .get_users()
-                .await
-                .map_err(to_runtime_error)?;
+            let users = inner.get_users().await.map_err(to_runtime_error)?;
             Ok(users.into_iter().map(PyUserInfo::from).collect::<Vec<_>>())
         })
     }
@@ -503,10 +492,7 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
-                .logout_user()
-                .await
-                .map_err(to_runtime_error)?;
+            inner.logout_user().await.map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -519,10 +505,7 @@ impl IggyClient {
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
-                .connect()
-                .await
-                .map_err(to_runtime_error)?;
+            inner.connect().await.map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -534,10 +517,7 @@ impl IggyClient {
     fn create_stream<'a>(&self, py: Python<'a>, name: String) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
-                .create_stream(&name)
-                .await
-                .map_err(to_runtime_error)?;
+            inner.create_stream(&name).await.map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -575,10 +555,7 @@ impl IggyClient {
     fn get_streams<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let streams = inner
-                .get_streams()
-                .await
-                .map_err(to_runtime_error)?;
+            let streams = inner.get_streams().await.map_err(to_runtime_error)?;
             Ok(streams.into_iter().map(Stream::from).collect::<Vec<_>>())
         })
     }
@@ -890,10 +867,7 @@ impl IggyClient {
         // Absent stays absent: a key the caller did not pass is left alone
         // server-side rather than reset to a default.
         let compression_algorithm = compression_algorithm
-            .map(|algo| {
-                CompressionAlgorithm::from_str(&algo)
-                    .map_err(to_runtime_error)
-            })
+            .map(|algo| CompressionAlgorithm::from_str(&algo).map_err(to_runtime_error))
             .transpose()?;
         let update_options = TopicUpdateOptions {
             compression_algorithm,
@@ -1512,10 +1486,7 @@ impl IggyClient {
         let mut consumer = builder.build();
 
         future_into_py(py, async move {
-            consumer
-                .init()
-                .await
-                .map_err(to_runtime_error)?;
+            consumer.init().await.map_err(to_runtime_error)?;
             let state = consumer.state();
             let name = consumer.name().to_string();
             let stream = PyIdentifier::try_from(consumer.stream())?;
