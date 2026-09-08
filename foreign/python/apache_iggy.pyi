@@ -1325,8 +1325,7 @@ class IggyClient:
         Args:
             stream: Stream identifier as `str | int`.
             name: Topic name as `str`.
-            partitions_count: Number of partitions as `int`, between 1 and 1000
-                inclusive.
+            partitions_count: Number of partitions as `int`, at most 1000.
             compression_algorithm: Compression algorithm as `str | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.

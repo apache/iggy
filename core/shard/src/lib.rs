@@ -2530,10 +2530,6 @@ where
                     self.metrics.record_partition_removed();
                     confirmed_remove = true;
                     if let Some(partition) = removed {
-                        // The tombstone fences writes before this point. Rolling the
-                        // detached counters out here prevents late shard activity from
-                        // underflowing or leaking into the topic and stream totals.
-                        partition.stats.zero_out_all();
                         // Tail of the gap-drop count. The tick sweep drains it
                         // per pass, but `get_by_ns` stops answering the moment
                         // the reconciler tombstones the namespace, so whatever
