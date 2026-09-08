@@ -48,7 +48,7 @@ use bon::Builder;
 /// ```rust
 /// use iggy::prelude::*;
 ///
-/// # fn example() -> Result<(), IggyError> {
+/// # fn main() -> Result<(), IggyError> {
 /// let config = IggyStreamConfig::from_stream_topic(
 ///     "my-stream",
 ///     "my-topic",
@@ -69,7 +69,7 @@ use bon::Builder;
 /// ```rust
 /// use iggy::prelude::*;
 ///
-/// # fn example() -> Result<(), IggyError> {
+/// # fn main() -> Result<(), IggyError> {
 /// let producer_config = IggyProducerConfig::builder()
 ///     .stream_id(Identifier::from_str_value("my-stream")?)
 ///     .stream_name("my-stream")
@@ -150,7 +150,7 @@ impl IggyStreamConfig {
     /// ```rust
     /// use iggy::prelude::*;
     ///
-    /// # fn example() -> Result<(), IggyError> {
+    /// # fn main() -> Result<(), IggyError> {
     /// let config = IggyStreamConfig::from_stream_topic(
     ///     "my-stream",
     ///     "my-topic",

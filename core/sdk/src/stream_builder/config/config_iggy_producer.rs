@@ -80,7 +80,7 @@ use std::sync::Arc;
 /// ```rust
 /// use iggy::prelude::*;
 ///
-/// # fn example() -> Result<(), IggyError> {
+/// # fn main() -> Result<(), IggyError> {
 /// let config = IggyProducerConfig::from_stream_topic(
 ///     "my-stream",
 ///     "my-topic",
@@ -99,7 +99,7 @@ use std::sync::Arc;
 /// ```rust
 /// use iggy::prelude::*;
 ///
-/// # fn example() -> Result<(), IggyError> {
+/// # fn main() -> Result<(), IggyError> {
 /// let config = IggyProducerConfig::builder()
 ///     .stream_id(Identifier::from_str_value("my-stream")?)
 ///     .stream_name("my-stream")
@@ -181,7 +181,7 @@ impl IggyProducerConfig {
     /// ```rust
     /// use iggy::prelude::*;
     ///
-    /// # fn example() -> Result<(), IggyError> {
+    /// # fn main() -> Result<(), IggyError> {
     /// let config = IggyProducerConfig::new(
     ///     Identifier::from_str_value("my-stream")?,
     ///     "my-stream".to_string(),
@@ -238,7 +238,7 @@ impl IggyProducerConfig {
     /// ```rust
     /// use iggy::prelude::*;
     ///
-    /// # fn example() -> Result<(), IggyError> {
+    /// # fn main() -> Result<(), IggyError> {
     /// let config = IggyProducerConfig::from_stream_topic(
     ///     "my-stream",
     ///     "my-topic",
