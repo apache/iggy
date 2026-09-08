@@ -21,8 +21,6 @@ enabled = true
 version = 0
 name = "Quickwit sink 1"
 path = "target/release/libiggy_connector_quickwit_sink"
-# Set the format here. The PLUGIN_CONFIG_FORMAT env override also injects an
-# unsupported plugin_config.format field and prevents Quickwit initialization.
 plugin_config_format = "yaml"
 verbose = false
 

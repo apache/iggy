@@ -42,6 +42,7 @@ const QUICKWIT_LISTEN_ADDRESS: &str = "0.0.0.0";
 
 const ENV_PLUGIN_URL: &str = "IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_URL";
 const ENV_PLUGIN_INDEX: &str = "IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_INDEX";
+const ENV_PLUGIN_CONFIG_FORMAT: &str = "IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_FORMAT";
 const ENV_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_QUICKWIT_STREAMS_0_STREAM";
 const ENV_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_QUICKWIT_STREAMS_0_TOPICS";
 const ENV_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_QUICKWIT_STREAMS_0_SCHEMA";
@@ -306,6 +307,7 @@ retention:
 fn build_connector_envs(base_url: &str) -> HashMap<String, String> {
     HashMap::from([
         (ENV_PLUGIN_URL.to_string(), base_url.to_string()),
+        (ENV_PLUGIN_CONFIG_FORMAT.to_string(), "yaml".to_string()),
         (
             ENV_PLUGIN_INDEX.to_string(),
             get_index_config(seeds::names::TOPIC),

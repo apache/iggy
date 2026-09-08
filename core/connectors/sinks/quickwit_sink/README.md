@@ -18,7 +18,7 @@ The Quickwit connector sends data to the Quickwit API using HTTP. It checks read
 
 Duration values require units, such as `250ms` or `30s`. Invalid or zero durations prevent initialization. Unknown plugin configuration keys are rejected.
 
-Set `plugin_config_format` in the connector TOML. The runtime also treats `IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_FORMAT` as a plugin configuration override, injecting an unsupported `format` key. Setting that environment variable therefore prevents initialization.
+Set `plugin_config_format` in the connector TOML or with the `IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_FORMAT` environment variable.
 
 ```toml
 [plugin_config]
