@@ -228,6 +228,15 @@ pub struct SharedState {
     /// bridge. Cleared by a guard, so a cancelled poll clears it too, which is
     /// what makes a stopped poll task observable.
     poll_active: AtomicBool,
+    /// Set by `leave()` before it counts what the bridge still holds.
+    ///
+    /// The re-resolve in the request path narrows the window where a handler
+    /// enqueues into a departing instance, but does not close it: the gate
+    /// passes, and `enqueue` then checks `is_full`, builds the header map and
+    /// copies the body before `try_send`, all of which `leave()` can overtake.
+    /// A message landing after its count is never drained and the sender was
+    /// told 200. Checked after `try_send` so that answer becomes a 503 instead.
+    departed: AtomicBool,
     /// When the last `poll()` returned. Covers the gap between polls, where
     /// the SDK is awaiting a batch result and nothing is in flight.
     last_poll_at: AtomicU64,
@@ -369,6 +378,16 @@ impl SharedState {
         self.poll_active.load(Ordering::Acquire)
             || now_seconds.saturating_sub(self.last_poll_at.load(Ordering::Acquire))
                 <= POLL_LIVENESS_SECONDS
+    }
+
+    /// Marks the instance as having left the route table, before anything
+    /// counts what its bridge still holds.
+    pub(crate) fn mark_departed(&self) {
+        self.departed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn has_departed(&self) -> bool {
+        self.departed.load(Ordering::Acquire)
     }
 
     pub(crate) fn enter_poll(&self) -> PollGuard<'_> {
@@ -754,6 +773,7 @@ impl HttpSource {
             pending_changes: AtomicUsize::new(0),
             handed_changes: AtomicUsize::new(0),
             poll_active: AtomicBool::new(false),
+            departed: AtomicBool::new(false),
             last_poll_at: AtomicU64::new(0),
             registry_writer: StdMutex::new(()),
             state_flush: Arc::new(Notify::new()),

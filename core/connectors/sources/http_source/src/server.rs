@@ -191,10 +191,14 @@ pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
         instance.id
     );
 
-    // Counted after the routes are gone, which narrows the window but does
-    // not close it: a handler that already loaded the old table can still
-    // enqueue after this read. The SDK stops the poll task before close(), so
-    // whatever is queued here is unreachable either way.
+    // Flagged before the count, so a handler that got past the re-resolve gate
+    // and is still assembling its message sees this after its `try_send` and
+    // answers 503 rather than 200. Counting alone could not close that window:
+    // a message landing after this read is unreachable and the sender had
+    // already been told it was queued.
+    instance.mark_departed();
+    // The SDK stops the poll task before close(), so whatever is queued here is
+    // unreachable either way.
     let dropped = instance.sender.len() as u64 + staged_dropped;
     if dropped > 0 {
         warn!(
@@ -954,6 +958,22 @@ fn enqueue(
             instance.id, instance.config.buffer_capacity
         );
         return bridge_full_response();
+    }
+    // After the send, which is the only order that can see it: `leave()` sets
+    // this before it counts the bridge, so a message accepted past that point
+    // is one no `poll()` will ever drain. 200 would be a lie the sender cannot
+    // detect, and a 503 it retries.
+    //
+    // The message stays in the channel. `leave()` may or may not have counted
+    // it in `dropped_on_close` depending on which side won, so that diagnostic
+    // can over-report by one here. Preferable to the alternative, which is a
+    // sender that believes a lost request succeeded.
+    if instance.has_departed() {
+        error!(
+            "Refused a request for {CONNECTOR_NAME} connector ID: {}, it left the listener while the request was in flight",
+            instance.id
+        );
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing");
     }
     // Only now: a rejected request produced no message, so its header losses
     // would otherwise be counted against messages that never existed.
@@ -2020,6 +2040,56 @@ mod tests {
                 "{label}: every public response carries an `error` field, got: {body}"
             );
         }
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_a_departed_instance_when_posted_should_refuse_rather_than_queue() {
+        // What the re-resolve gate cannot reach. It passes, and `enqueue` then
+        // checks `is_full`, builds the header map and copies the body before
+        // `try_send`, any of which `leave()` can overtake. A message accepted
+        // after that is never drained, and 200 is a lie the sender cannot see.
+        //
+        // The flag is set directly rather than by racing a real `leave()`.
+        // Reproducing the interleaving needs `leave()` to land inside those few
+        // statements, and `leave()` on the last instance also tears the listener
+        // down, which would take the in-flight connection with it.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.topic_path = Some("github".to_string());
+        config.auth_bearer_token = None;
+        let mut source = open(1, config).await;
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        // Serving right now, so the refusal below cannot come from the route
+        // being absent.
+        let accepted = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let queued_before = shared.sender.len();
+
+        shared.mark_departed();
+        let refused = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            refused.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an instance that has left must refuse, not queue into a bridge no poll will drain"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before + 1,
+            "the message is already in the channel; the point is that the sender is told so"
+        );
         close(&mut source).await;
     }
 
