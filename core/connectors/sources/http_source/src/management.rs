@@ -35,14 +35,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngExt;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::auth::{
-    Admission, Inadmissible, MAX_AUTH_SECRET_LEN, admit_endpoint, is_usable, validate_bearer,
-};
+use crate::auth::{Admission, admit_endpoint, is_usable, oversized_secret, validate_bearer};
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState, RouteTable};
 use crate::server::{ServerState, bearer_header, error_response, refresh_routes};
 use crate::state::{InsertOutcome, MAX_ENDPOINTS};
@@ -111,8 +109,25 @@ async fn register_endpoint(
         Err(rejection) => return error_response(rejection.status(), "invalid request body"),
     };
 
-    let Some(instance) = state.instance(&request.instance) else {
-        return error_response(StatusCode::NOT_FOUND, "unknown instance");
+    // One snapshot, not two loads. `Published` bundles the instance set with
+    // the route table precisely so a caller cannot resolve an instance from one
+    // view and validate against another: an instance leaving between the two
+    // left `build_with` a set that never contained the candidate, so validation
+    // returned Ok without ever projecting it and the mutation committed to an
+    // instance whose poll task was already gone, stranding the pending change
+    // with no `close()` left to report it. Scoped so the guard does not span
+    // the republish await below.
+    let (instance, instances) = {
+        let published = state.published();
+        let Some(instance) = published
+            .instances
+            .iter()
+            .find(|instance| instance.instance_name == request.instance)
+            .map(Arc::clone)
+        else {
+            return error_response(StatusCode::NOT_FOUND, "unknown instance");
+        };
+        (instance, published.instances.clone())
     };
     // The same rule `validate()` applies to a TOML endpoint, minus the checks
     // that only make sense when the endpoint is being created. Shared because
@@ -152,7 +167,6 @@ async fn register_endpoint(
     //
     // Checked against the published instance set rather than `SERVERS`: it is a
     // plain load, and `validate` runs under a lock that must not span an await.
-    let instances = state.published().instances.clone();
     let instance_id = instance.id;
     let mut outcome = InsertOutcome::Collision;
     let applied = instance.try_mutate_registry(
@@ -249,14 +263,12 @@ async fn rotate_secret(
         // compute, so rotating to one silently removes the second factor.
         return error_response(StatusCode::BAD_REQUEST, "auth_secret must not be empty");
     }
-    if request.auth_secret.expose_secret().len() > MAX_AUTH_SECRET_LEN {
-        // The same ceiling registration applies. Rotation keeps the endpoint,
-        // so an oversized secret here would be deep-cloned on every mutation
-        // and re-serialized on every flush for the life of the endpoint.
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            Inadmissible::SecretTooLong.message(),
-        );
+    // The same predicate registration applies, not a second copy of it.
+    // Rotation keeps the endpoint, so an oversized secret accepted here is
+    // deep-cloned on every mutation and re-serialized on every flush for the
+    // life of the endpoint.
+    if let Some(oversized) = oversized_secret(&request.auth_secret) {
+        return error_response(StatusCode::BAD_REQUEST, oversized.message());
     }
     let Some(instance) = owner_of(&state, &endpoint_id) else {
         return error_response(StatusCode::NOT_FOUND, "not found");
@@ -585,7 +597,7 @@ impl EndpointSummary {
 mod tests {
     use super::*;
     use crate::HttpSource;
-    use crate::auth::{MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN};
+    use crate::auth::{MAX_AUTH_SECRET_LEN, MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN};
     use crate::test_support::{ENDPOINT_ONE, client, free_port};
     use axum::http::header;
     use iggy_connector_sdk::Source;

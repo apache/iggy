@@ -128,6 +128,36 @@ impl Display for Inadmissible {
     }
 }
 
+/// Whether any operator-supplied string on an endpoint is past its ceiling.
+///
+/// Shared so the three callers cannot drift: registration and rotation refuse
+/// on it, `restore` only warns. It names which field tripped rather than
+/// answering yes or no, so a warning can say what to shorten.
+pub fn oversized_field(
+    auth_secret: &Option<SecretString>,
+    hmac_header: &str,
+    hmac_prefix: &str,
+) -> Option<Inadmissible> {
+    if let Some(secret) = auth_secret
+        && let Some(oversized) = oversized_secret(secret)
+    {
+        return Some(oversized);
+    }
+    if hmac_header.len() > MAX_HMAC_HEADER_LEN {
+        return Some(Inadmissible::HmacHeaderTooLong);
+    }
+    if hmac_prefix.len() > MAX_HMAC_PREFIX_LEN {
+        return Some(Inadmissible::HmacPrefixTooLong);
+    }
+    None
+}
+
+/// The ceiling on a secret on its own, for a rotation, which carries nothing
+/// else. Shared with [`oversized_field`] so the two cannot disagree.
+pub fn oversized_secret(secret: &SecretString) -> Option<Inadmissible> {
+    (secret.expose_secret().len() > MAX_AUTH_SECRET_LEN).then_some(Inadmissible::SecretTooLong)
+}
+
 /// The one admission rule for an endpoint, whether it arrives from TOML or
 /// from the management API.
 ///
@@ -143,17 +173,8 @@ pub fn admit_endpoint(
     expires_at: Option<u64>,
     admission: Admission,
 ) -> Result<(), Inadmissible> {
-    if auth_secret
-        .as_ref()
-        .is_some_and(|secret| secret.expose_secret().len() > MAX_AUTH_SECRET_LEN)
-    {
-        return Err(Inadmissible::SecretTooLong);
-    }
-    if hmac_header.len() > MAX_HMAC_HEADER_LEN {
-        return Err(Inadmissible::HmacHeaderTooLong);
-    }
-    if hmac_prefix.len() > MAX_HMAC_PREFIX_LEN {
-        return Err(Inadmissible::HmacPrefixTooLong);
+    if let Some(oversized) = oversized_field(auth_secret, hmac_header, hmac_prefix) {
+        return Err(oversized);
     }
     if auth_type == EndpointAuthType::None {
         // `authorize` never reads a secret for an unauthenticated endpoint, so

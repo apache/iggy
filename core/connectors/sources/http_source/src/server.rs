@@ -1902,7 +1902,12 @@ mod tests {
         // `validate()` and `register_endpoint` refuse one, but restore takes
         // whatever the state store hands it rather than failing the instance,
         // so the refusal has to live where the credential is checked.
-        for auth_type in [EndpointAuthType::HmacSha256, EndpointAuthType::Bearer] {
+        // HMAC only. An empty presented bearer token needs the header value to
+        // keep a trailing space and HTTP strips it, so the bearer arm cannot be
+        // reached from here and asserting it over the wire would pass whether
+        // or not the guard exists. That half is covered by the `authorize`
+        // test above, which is the level it is observable at.
+        for auth_type in [EndpointAuthType::HmacSha256] {
             let mut config = config(free_port(), free_port(), &[]);
             config.endpoints = vec![];
             let mut source = open(1, config).await;
@@ -1934,7 +1939,6 @@ mod tests {
                         hex::encode(hmac::sign(&empty_key, body.as_bytes()))
                     ),
                 )
-                .header("Authorization", "Bearer ")
                 .body(body)
                 .send()
                 .await

@@ -31,7 +31,7 @@ use axum::http::HeaderName;
 use iggy_connector_sdk::{ConnectorState, Error};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::auth::{MAX_AUTH_SECRET_LEN, MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN};
+use crate::auth::oversized_field;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -128,15 +128,14 @@ impl EndpointRegistry {
             // only says the stored entry costs more than the README's sizing
             // assumes.
             if !revoked
-                && (endpoint
-                    .auth_secret
-                    .as_ref()
-                    .is_some_and(|secret| secret.expose_secret().len() > MAX_AUTH_SECRET_LEN)
-                    || endpoint.hmac_header.len() > MAX_HMAC_HEADER_LEN
-                    || endpoint.hmac_prefix.len() > MAX_HMAC_PREFIX_LEN)
+                && let Some(oversized) = oversized_field(
+                    &endpoint.auth_secret,
+                    &endpoint.hmac_header,
+                    &endpoint.hmac_prefix,
+                )
             {
                 warn!(
-                    "Restored endpoint {} for {CONNECTOR_NAME} connector ID: {connector_id} with values past the registration ceilings; every mutation clones them and every flush rewrites them",
+                    "Restored endpoint {} for {CONNECTOR_NAME} connector ID: {connector_id}: {oversized}; every mutation clones it and every flush rewrites it",
                     endpoint_id.log_prefix()
                 );
             }
@@ -372,6 +371,7 @@ where
 mod tests {
     use super::*;
     use crate::EndpointAuthType;
+    use crate::auth::{MAX_AUTH_SECRET_LEN, MAX_HMAC_PREFIX_LEN};
     use crate::routes::EndpointState;
     use crate::test_support::{ENDPOINT_ONE, ENDPOINT_TWO, endpoint_id, static_endpoint};
 

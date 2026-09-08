@@ -1651,7 +1651,12 @@ mod tests {
         // may escape a rejected candidate: not the entry, not the dirty bit,
         // not the pending count, and not a wakeup.
         let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
-        let before = source.shared.registry().endpoints().count();
+        let before = source
+            .shared
+            .registry()
+            .endpoints()
+            .filter(|endpoint| endpoint.is_active())
+            .count();
 
         let outcome = source.shared.try_mutate_registry(
             |registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42),
@@ -1668,7 +1673,16 @@ mod tests {
                 .is_active(),
             "a rejected candidate must not reach the published registry"
         );
-        assert_eq!(source.shared.registry().endpoints().count(), before);
+        assert_eq!(
+            source
+                .shared
+                .registry()
+                .endpoints()
+                .filter(|endpoint| endpoint.is_active())
+                .count(),
+            before,
+            "revoking changes no map length, so only the active count can show the rejection held"
+        );
         assert!(
             !source.shared.has_pending_state(),
             "and it must not arm a flush for a change that did not happen"
