@@ -302,6 +302,11 @@ pub(crate) fn init_source(
     }
 }
 
+/// A plugin's `iggy_source_close` together with whatever keeps the library that
+/// exports it mapped. Held instead of the bare `extern "C" fn` so the call stays
+/// valid once it is deferred off the calling thread.
+pub(crate) type SourceClose = Arc<dyn Fn(u32) -> i32 + Send + Sync>;
+
 /// Closes a source instance that `iggy_source_open` created and nothing else
 /// will ever reach.
 ///
@@ -316,7 +321,7 @@ pub(crate) fn init_source(
 /// record the instance, not by which call between them happens to be fallible.
 /// Adding a `?` inside it stays correct.
 pub(crate) struct SourceInstanceGuard {
-    close: Arc<dyn Fn(u32) -> i32 + Send + Sync>,
+    close: SourceClose,
     plugin_id: u32,
     key: String,
     armed: bool,
@@ -345,7 +350,7 @@ impl SourceInstanceGuard {
 
     /// Kept behind `for_container` so no production caller can build a guard
     /// that holds a close pointer without its library. Tests pass a closure.
-    fn new(close: Arc<dyn Fn(u32) -> i32 + Send + Sync>, plugin_id: u32, key: &str) -> Self {
+    fn new(close: SourceClose, plugin_id: u32, key: &str) -> Self {
         Self {
             close,
             plugin_id,
@@ -1050,6 +1055,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::future::ready;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -1076,83 +1082,127 @@ mod tests {
         }
     }
 
-    /// Records what `SourceInstanceGuard` passed to the FFI. A stub has to be a
-    /// plain `extern "C" fn`, so recording goes through statics rather than a
-    /// captured closure. Each test therefore gets its **own** stub and statics:
-    /// sharing one pair would make two tests that both reset and read it race,
-    /// since the suite runs them in the same process at the same time.
-    static ARMED_CLOSED_ID: AtomicU32 = AtomicU32::new(0);
-    static ARMED_CALLS: AtomicU32 = AtomicU32::new(0);
-
-    extern "C" fn armed_close(id: u32) -> i32 {
-        ARMED_CLOSED_ID.store(id, Ordering::SeqCst);
-        ARMED_CALLS.fetch_add(1, Ordering::SeqCst);
-        0
+    /// A close that records the ids it was handed and answers `result`.
+    ///
+    /// The guard takes its close as a closure, so each test owns its recorder
+    /// and nothing is shared between tests. An `extern "C" fn` cannot capture,
+    /// which is what used to force this through statics.
+    fn recording_close(result: i32) -> (SourceClose, Arc<Mutex<Vec<u32>>>) {
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = closed.clone();
+        (
+            Arc::new(move |id| {
+                recorded.lock().expect("close recorder").push(id);
+                result
+            }),
+            closed,
+        )
     }
 
-    static DISARMED_CALLS: AtomicU32 = AtomicU32::new(0);
-
-    extern "C" fn disarmed_close(_id: u32) -> i32 {
-        DISARMED_CALLS.fetch_add(1, Ordering::SeqCst);
-        0
-    }
-
-    static REFUSED_CALLS: AtomicU32 = AtomicU32::new(0);
-
-    extern "C" fn refusing_close(_id: u32) -> i32 {
-        REFUSED_CALLS.fetch_add(1, Ordering::SeqCst);
-        -1
+    /// The shape `start_connector` has: a guard armed over an instance nothing
+    /// else knows about, then a fallible step whose `?` returns before anything
+    /// records the id.
+    fn start_with_fallible_step(
+        close: SourceClose,
+        plugin_id: u32,
+        step: Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let instance_guard = SourceInstanceGuard::new(close, plugin_id, "random");
+        step?;
+        instance_guard.disarm();
+        Ok(())
     }
 
     #[test]
-    fn given_an_armed_guard_when_dropped_should_close_the_instance() {
+    fn given_armed_guard_when_dropped_should_close_the_instance() {
         // The leak this exists for: `init_source` has created the instance and
         // nothing outside the plugin knows its id yet, so an early return here
         // would strand it for the life of the process.
         let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
 
-        drop(SourceInstanceGuard::new(
-            Arc::new(move |id| armed_close(id)),
-            plugin_id,
-            "random",
-        ));
+        drop(SourceInstanceGuard::new(close, plugin_id, "random"));
 
         assert_eq!(
-            ARMED_CALLS.load(Ordering::SeqCst),
-            1,
-            "a guard still armed owns the instance and must close it"
-        );
-        assert_eq!(
-            ARMED_CLOSED_ID.load(Ordering::SeqCst),
-            plugin_id,
-            "closing any other id would leave this instance open and kill a live one"
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "a guard still armed owns the instance and must close exactly it"
         );
     }
 
     #[test]
-    fn given_a_disarmed_guard_when_dropped_should_leave_the_instance_open() {
-        // Disarmed means `details.info.id` names the instance, so `stop_connector`
-        // will close it. Closing here too would tear down a source that just
-        // started successfully.
-        let plugin_id = next_plugin_id();
+    fn given_disarmed_guard_when_dropped_should_leave_the_instance_open() {
+        // Disarmed means `details.info.id` names the instance, so
+        // `stop_connector` will close it. Closing here too would tear down a
+        // source that just started successfully.
+        //
+        // The armed guard goes first so the recorder is proven to move before
+        // it is required not to. Asserting an empty recorder on its own holds
+        // whether or not a guard was ever built.
+        let armed_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
+        drop(SourceInstanceGuard::new(close.clone(), armed_id, "random"));
+        assert_eq!(
+            *closed.lock().expect("close recorder"),
+            vec![armed_id],
+            "this recorder has to be able to move, or the assertion below is vacuous"
+        );
 
-        SourceInstanceGuard::new(Arc::new(move |id| disarmed_close(id)), plugin_id, "random")
-            .disarm();
+        SourceInstanceGuard::new(close, next_plugin_id(), "random").disarm();
 
         assert_eq!(
-            DISARMED_CALLS.load(Ordering::SeqCst),
-            0,
+            *closed.lock().expect("close recorder"),
+            vec![armed_id],
             "the instance is the manager's once its id is recorded"
         );
     }
 
+    #[test]
+    fn given_fallible_step_when_it_returns_early_should_close_the_instance() {
+        // The shape dropping or disarming inline cannot show, and the one the
+        // guard is there for: the `?` leaves with the guard still armed and
+        // never reaches `disarm`. The error arms call `close()` directly now,
+        // so this is the net under a `?` added inside the window later.
+        let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
+
+        let result = start_with_fallible_step(
+            close,
+            plugin_id,
+            Err(RuntimeError::InvalidConfiguration("injected".to_string())),
+        );
+
+        assert!(result.is_err(), "the injected failure has to propagate");
+        assert_eq!(
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "a `?` must not strand the instance it left behind"
+        );
+    }
+
+    #[test]
+    fn given_fallible_step_when_it_succeeds_should_leave_the_instance_open() {
+        // The other half of the same helper: reaching `disarm` hands the
+        // instance on rather than closing it.
+        let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
+
+        let result = start_with_fallible_step(close, plugin_id, Ok(()));
+
+        assert!(result.is_ok());
+        assert!(
+            closed.lock().expect("close recorder").is_empty(),
+            "a step that succeeded leaves the instance for the manager to close"
+        );
+    }
+
     #[tokio::test]
-    async fn given_an_armed_guard_when_dropped_inside_a_runtime_should_close_off_the_worker() {
+    async fn given_armed_guard_when_dropped_in_runtime_should_close_off_the_worker() {
         // `drop` cannot await, and `SourceContainer::close` drives the plugin's
-        // own teardown under `block_on`, so closing here would hold a worker
-        // for however long the plugin takes. It goes to the blocking pool
-        // instead, which is what the differing thread asserts. The close still
-        // has to happen.
+        // own teardown under `block_on`, so closing here would hold a worker for
+        // however long the plugin takes. It goes to the blocking pool instead,
+        // which is what the differing thread asserts. The close still has to
+        // happen.
         let plugin_id = next_plugin_id();
         let dropping_thread = std::thread::current().id();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1182,46 +1232,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_an_armed_guard_when_closed_should_finish_before_returning() {
-        // What the error arms rely on: once `close()` has returned, the
-        // instance is gone, so the error they return cannot reach an operator
-        // who then retries into a collision with it.
+    async fn given_armed_guard_when_closed_should_finish_before_returning() {
+        // What the error arms rely on: once `close()` has returned the instance
+        // is gone, so the error they return cannot reach an operator who then
+        // retries into a collision with it.
         let plugin_id = next_plugin_id();
-        let calls = Arc::new(AtomicU32::new(0));
-        let recorded = calls.clone();
+        let (close, closed) = recording_close(0);
 
-        let guard = SourceInstanceGuard::new(
-            Arc::new(move |_id| {
-                recorded.fetch_add(1, Ordering::SeqCst);
-                0
-            }),
-            plugin_id,
-            "random",
-        );
-        guard.close().await;
+        SourceInstanceGuard::new(close, plugin_id, "random")
+            .close()
+            .await;
 
         assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "close() must await the teardown, and the drop that follows must not repeat it"
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "close() has to await the teardown, and the drop after it must not repeat it"
         );
     }
 
     #[test]
-    fn given_a_refused_close_when_guard_drops_should_not_panic() {
+    fn given_refused_close_when_guard_drops_should_close_once_and_swallow_refusal() {
         // The plugin answers -1 for an id it does not know. Both callers are
         // already returning an error of their own, so the refusal is reported
-        // and not propagated; unwinding out of `drop` would be worse than the
-        // leak it is cleaning up after.
+        // and not propagated: unwinding out of `drop` would be worse than the
+        // leak it is cleaning up after. The harness gives no-panic for free, so
+        // what this asserts is the single call.
         let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(-1);
 
-        drop(SourceInstanceGuard::new(
-            Arc::new(move |id| refusing_close(id)),
-            plugin_id,
-            "random",
-        ));
+        drop(SourceInstanceGuard::new(close, plugin_id, "random"));
 
-        assert_eq!(REFUSED_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "a refusal must not become a retry or a second close"
+        );
     }
 
     #[test]
