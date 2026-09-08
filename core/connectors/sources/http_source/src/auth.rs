@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use axum::http::header::HeaderName;
 use ring::hmac;
 use secrecy::{ExposeSecret, SecretString};
+use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
 use subtle::ConstantTimeEq;
+
+use crate::EndpointAuthType;
 
 /// Validates `Authorization: Bearer <token>` in constant time.
 pub fn validate_bearer(authorization_header: Option<&str>, expected_token: &SecretString) -> bool {
@@ -44,15 +49,92 @@ fn strip_bearer(header_value: &str) -> Option<&str> {
         .then(|| token.trim_start_matches(' '))
 }
 
+/// Why an endpoint may not be admitted.
+///
+/// One enum rather than per-caller strings so the config path and the
+/// management API cannot drift on which endpoints they accept. They already
+/// had: config took an `auth_type: none` carrying a secret and an `expires_at`
+/// already past, both of which the API refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inadmissible {
+    /// `auth_type` advertises a second factor with no usable secret behind it.
+    MissingSecret,
+    /// `auth_type: none` carrying a secret nothing will ever read.
+    UnusedSecret,
+    /// `hmac_header` is not a valid HTTP header name.
+    InvalidHmacHeader,
+    /// `expires_at` is already at or past, so the endpoint would 404 forever.
+    AlreadyExpired,
+}
+
+impl Inadmissible {
+    /// The operator-facing reason. `&'static str` so it can be an API error
+    /// body without an allocation per refused request.
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::MissingSecret => "a non-empty auth_secret is required",
+            Self::UnusedSecret => "auth_type 'none' takes no auth_secret",
+            Self::InvalidHmacHeader => "hmac_header is not a valid HTTP header name",
+            Self::AlreadyExpired => "expires_at is already past",
+        }
+    }
+}
+
+impl Display for Inadmissible {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+/// The one admission rule for an endpoint, whether it arrives from TOML or
+/// from the management API.
+///
+/// Kept here beside [`is_usable_secret`] for the same reason that helper
+/// exists: the checks were written out at both call sites and only one of them
+/// stayed current, which is how `hmac_header` came to be validated on
+/// registration but not in config, twice over.
+pub fn admit_endpoint(
+    auth_type: EndpointAuthType,
+    auth_secret: &Option<SecretString>,
+    hmac_header: &str,
+    expires_at: Option<u64>,
+    now_seconds: u64,
+) -> Result<(), Inadmissible> {
+    if auth_type == EndpointAuthType::None {
+        // `authorize` never reads a secret for an unauthenticated endpoint, so
+        // accepting one only persists a credential nothing will ever check.
+        if auth_secret.is_some() {
+            return Err(Inadmissible::UnusedSecret);
+        }
+    } else if !is_usable_secret(auth_secret) {
+        return Err(Inadmissible::MissingSecret);
+    }
+    // `HeaderMap::get` answers `None` for a name it cannot parse rather than
+    // failing, so an endpoint carrying a malformed one 401s every signed
+    // request forever, survives a restart, and gives no clue why.
+    if HeaderName::from_str(hmac_header).is_err() {
+        return Err(Inadmissible::InvalidHmacHeader);
+    }
+    if expires_at.is_some_and(|expires_at| expires_at <= now_seconds) {
+        return Err(Inadmissible::AlreadyExpired);
+    }
+    Ok(())
+}
+
 /// Whether a secret is present and non-empty.
 ///
 /// An empty key is valid for HMAC, so accepting one would leave `auth_type`
 /// advertising a second factor that anyone holding the URL can compute. Shared
 /// so the config path and the management API cannot disagree about it.
 pub fn is_usable_secret(secret: &Option<SecretString>) -> bool {
-    secret
-        .as_ref()
-        .is_some_and(|secret| !secret.expose_secret().is_empty())
+    secret.as_ref().is_some_and(is_usable)
+}
+
+/// The same rule for a secret that is always present, such as a rotation's
+/// replacement. Delegated to rather than written out, so rotate cannot come to
+/// disagree with registration about what an empty secret means.
+pub fn is_usable(secret: &SecretString) -> bool {
+    !secret.expose_secret().is_empty()
 }
 
 /// Compares two secrets without leaking their contents through timing.

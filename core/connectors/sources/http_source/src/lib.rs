@@ -44,6 +44,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
+use crate::auth::admit_endpoint;
 use crate::server::{INSTANCE_HEADER, RECEIVED_AT_HEADER, REMOTE_ADDR_HEADER};
 use crate::state::EndpointRegistry;
 use crate::types::{EndpointId, QueuedMessage, unix_now_seconds};
@@ -670,31 +671,25 @@ impl HttpSourceConfig {
                     endpoint.endpoint_id.log_prefix()
                 )));
             }
-            if HeaderName::from_str(&endpoint.hmac_header).is_err() {
-                // An invalid name makes `HeaderMap::get` return `None`, so
-                // every signed request 401s forever with nothing naming why.
+            // The same rule the management API applies. Written out here
+            // once, these checks drifted: config admitted an `auth_type: none`
+            // carrying a secret, which then rode into the state file in clear
+            // where nothing reads it, and an `expires_at` already past, which
+            // 404s forever with only the serving count as a hint.
+            //
+            // Prefix only in the message: this becomes `last_error`, which the
+            // runtime logs and serves over its control API, and the operator
+            // fixes the endpoint while keeping the id.
+            if let Err(reason) = admit_endpoint(
+                endpoint.auth_type,
+                &endpoint.auth_secret,
+                &endpoint.hmac_header,
+                endpoint.expires_at,
+                unix_now_seconds(),
+            ) {
                 return Err(Error::InvalidConfigValue(format!(
-                    "endpoint {} declares hmac_header '{}', which is not a valid HTTP header name",
-                    endpoint.endpoint_id.log_prefix(),
-                    endpoint.hmac_header
-                )));
-            }
-            if endpoint.auth_type != EndpointAuthType::None
-                && !endpoint
-                    .auth_secret
-                    .as_ref()
-                    .is_some_and(|secret| !secret.expose_secret().is_empty())
-            {
-                // An empty key is perfectly valid for HMAC, so accepting one
-                // would leave `auth_type` advertising a second factor that
-                // anyone holding the URL can compute.
-                // Prefix only: this becomes `last_error`, which the runtime
-                // logs and serves over its control API, and the operator will
-                // fix the secret while keeping the id.
-                return Err(Error::InvalidConfigValue(format!(
-                    "endpoint {} declares auth_type {:?} but no non-empty auth_secret",
-                    endpoint.endpoint_id.log_prefix(),
-                    endpoint.auth_type
+                    "endpoint {}: {reason}",
+                    endpoint.endpoint_id.log_prefix()
                 )));
             }
         }
@@ -1232,6 +1227,37 @@ mod tests {
             ),
             "requests matching no route are metered under this name, and that series is the endpoint-id scan signal"
         );
+    }
+
+    #[test]
+    fn given_config_endpoints_the_api_would_refuse_when_validated_should_refuse_them_too() {
+        // Both were admitted from TOML and refused by the management API, which
+        // is the drift the shared rule exists to stop. The unused secret rides
+        // into the state file in clear where nothing ever reads it; the past
+        // expiry 404s forever with only the serving count as a hint.
+        for (reason, json) in [
+            (
+                "takes no auth_secret",
+                r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
+                    {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none", "auth_secret": "whsec_unused"}
+                ]}"#,
+            ),
+            (
+                "already past",
+                r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
+                    {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none", "expires_at": 1}
+                ]}"#,
+            ),
+        ] {
+            let config = parse(json);
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(Error::InvalidConfigValue(message)) if message.contains(reason)
+                ),
+                "config must refuse what the management API refuses: {reason}"
+            );
+        }
     }
 
     #[test]

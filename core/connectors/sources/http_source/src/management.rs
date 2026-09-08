@@ -29,19 +29,18 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngExt;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::auth::{is_usable_secret, validate_bearer};
+use crate::auth::{admit_endpoint, is_usable, validate_bearer};
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState, RouteTable};
 use crate::server::{ServerState, bearer_header, error_response, refresh_routes};
 use crate::state::{InsertOutcome, MAX_ENDPOINTS};
@@ -113,36 +112,18 @@ async fn register_endpoint(
     let Some(instance) = state.instance(&request.instance) else {
         return error_response(StatusCode::NOT_FOUND, "unknown instance");
     };
-    if request.auth_type != EndpointAuthType::None && !is_usable_secret(&request.auth_secret) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "a non-empty auth_secret is required",
-        );
-    }
-    // `authorize` never reads a secret for an unauthenticated endpoint, so
-    // accepting one only persists a credential nothing will ever check.
-    if request.auth_type == EndpointAuthType::None && request.auth_secret.is_some() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "auth_type 'none' takes no auth_secret",
-        );
-    }
-    if request
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= unix_now_seconds())
-    {
-        return error_response(StatusCode::BAD_REQUEST, "expires_at is already past");
-    }
-    // The same check the static config gets. `HeaderMap::get` answers `None`
-    // for a name it cannot parse rather than failing, so an endpoint
-    // registered with a malformed one would 401 every signed request forever,
-    // survive a restart, and give no clue why. Recovery would mean revoking,
-    // re-registering, and reconfiguring the sender.
-    if HeaderName::from_str(&request.hmac_header).is_err() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "hmac_header is not a valid HTTP header name",
-        );
+    // The same rule `validate()` applies to a TOML endpoint. Shared, because
+    // written out at both sites they drifted twice: `hmac_header` was
+    // validated here and not there, and the two secret rules were the other
+    // way round.
+    if let Err(reason) = admit_endpoint(
+        request.auth_type,
+        &request.auth_secret,
+        &request.hmac_header,
+        request.expires_at,
+        unix_now_seconds(),
+    ) {
+        return error_response(StatusCode::BAD_REQUEST, reason.message());
     }
 
     let endpoint_id = generate_endpoint_id();
@@ -258,7 +239,7 @@ async fn rotate_secret(
         Ok(body) => body,
         Err(rejection) => return error_response(rejection.status(), "invalid request body"),
     };
-    if request.auth_secret.expose_secret().is_empty() {
+    if !is_usable(&request.auth_secret) {
         // An empty HMAC key validates any signature the holder of the URL can
         // compute, so rotating to one silently removes the second factor.
         return error_response(StatusCode::BAD_REQUEST, "auth_secret must not be empty");
