@@ -6855,7 +6855,7 @@ where
     }
 
     /// Whether this view has already spent its merged-log repair budget.
-    fn metadata_repair_exhausted(&self, view: u32) -> bool {
+    const fn metadata_repair_exhausted(&self, view: u32) -> bool {
         let (charged_view, attempts) = self.metadata_repair_attempts.get();
         charged_view == view && attempts > partitions::REPAIR_MAX_STALL_RETRIES
     }
