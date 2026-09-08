@@ -563,7 +563,7 @@ impl<'py> IntoPyObject<'py> for DefaultBackpressureMode {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        Ok(py.Ellipsis().into_bound(py))
+        Ok(opaque_stub_default(py))
     }
 }
 
@@ -599,7 +599,7 @@ impl<'py> IntoPyObject<'py> for DefaultProducerSharding {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        Ok(py.Ellipsis().into_bound(py))
+        Ok(opaque_stub_default(py))
     }
 }
 
@@ -720,6 +720,13 @@ fn timedelta_type_info() -> TypeInfo {
     let mut type_info = <std::time::Duration>::type_input();
     type_info.source_module = None;
     type_info
+}
+
+fn opaque_stub_default(py: Python<'_>) -> Bound<'_, PyAny> {
+    // The stub generator renders objects without a stable Python expression as
+    // `...`. An actual Ellipsis is rendered as `Ellipsis`, which type checkers
+    // reject as a default for these public configuration types.
+    py.None().into_bound(py).get_type().into_any()
 }
 
 async fn shutdown(inner: Arc<RwLock<Option<RustIggyProducer>>>) -> PyResult<()> {
