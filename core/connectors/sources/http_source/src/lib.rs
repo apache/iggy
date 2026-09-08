@@ -674,11 +674,16 @@ impl HttpSourceConfig {
                     endpoint.endpoint_id.log_prefix()
                 )));
             }
-            // The same rule the management API applies. Written out here
-            // once, these checks drifted: config admitted an `auth_type: none`
-            // carrying a secret, which then rode into the state file in clear
-            // where nothing reads it, and an `expires_at` already past, which
-            // 404s forever with only the serving count as a hint.
+            // The same rule the management API applies, minus the checks that
+            // only make sense when an endpoint is being created. Written out
+            // here once, the two lists drifted: config admitted an
+            // `auth_type: none` carrying a secret, which then rode into the
+            // state file in clear where nothing reads it.
+            //
+            // `Existing`, so a TOML `expires_at` that has passed is still
+            // admitted. `validate()` runs inside `open()`, and refusing there
+            // would take the whole instance down on the first restart after
+            // that timestamp; the endpoint answers 404 on its own path instead.
             //
             // Prefix only in the message: this becomes `last_error`, which the
             // runtime logs and serves over its control API, and the operator

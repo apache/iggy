@@ -317,7 +317,7 @@ A metric with no series yet is absent from the scrape rather than reported as ze
 
 **Revocation tombstones accumulate.** They are retained deliberately, so a revocation survives a restart and stays auditable, and nothing evicts them.
 
-Each is roughly a hundred bytes in practice. Revoking clears the endpoint's `auth_secret`, so the largest of the field ceilings below never applies to a tombstone; what bounds one is the 256-byte cap on the revoke `reason`.
+Each is roughly a hundred bytes in practice. Revoking clears the endpoint's `auth_secret` and nothing else, so a tombstone still carries its `hmac_header` and `hmac_prefix`: the worst case is those two ceilings plus the 256-byte `reason`, a little over 600 bytes, not the secret's 4096.
 
 The whole registry is rewritten on every mutation, so a deployment that churns endpoints continuously will see the state file grow over time. An instance whose endpoints are all static writes no state file until something mutates its registry. Revoking a static endpoint through the management API does exactly that, and the tombstone it writes is what stops the TOML entry coming back.
 

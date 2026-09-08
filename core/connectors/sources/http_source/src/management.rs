@@ -112,11 +112,10 @@ async fn register_endpoint(
     // One snapshot, not two loads. `Published` bundles the instance set with
     // the route table precisely so a caller cannot resolve an instance from one
     // view and validate against another: an instance leaving between the two
-    // left `build_with` a set that never contained the candidate, so validation
-    // returned Ok without ever projecting it and the mutation committed to an
-    // instance whose poll task was already gone, stranding the pending change
-    // with no `close()` left to report it. Scoped so the guard does not span
-    // the republish await below.
+    // left the check a set that did not contain it, and whether that surfaced
+    // as a refusal or as an unvalidated commit depended on which guard happened
+    // to be in place. Taking both from one guard removes the question. Scoped,
+    // so it does not span the republish await below.
     let (instance, instances) = {
         let published = state.published();
         let Some(instance) = published

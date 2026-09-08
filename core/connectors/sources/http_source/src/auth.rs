@@ -84,10 +84,12 @@ pub enum Admission {
 
 /// Why an endpoint may not be admitted.
 ///
-/// One enum rather than per-caller strings so the config path and the
-/// management API cannot drift on which endpoints they accept. They already
-/// had: config took an `auth_type: none` carrying a secret and an `expires_at`
-/// already past, both of which the API refused.
+/// One enum rather than per-caller strings, so the callers cannot drift on the
+/// rules they share. Config had already drifted once, admitting an
+/// `auth_type: none` carrying a secret that the API refused.
+///
+/// They do differ on expiry, deliberately: see [`Admission`]. That difference
+/// is in the signature rather than in two divergent lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inadmissible {
     /// `auth_type` advertises a second factor with no usable secret behind it.
