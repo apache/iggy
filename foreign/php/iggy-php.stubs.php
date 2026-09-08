@@ -20,11 +20,6 @@
 // Stubs for iggy-php
 
 namespace Iggy {
-    enum Durability: string {
-        case Replicated = 'replicated';
-        case Persisted = 'persisted';
-    }
-
     class AutoCommit {
         public function __construct() {}
 
@@ -131,7 +126,7 @@ namespace Iggy {
         /**
          * Creates a topic.
          *
-         * Both durability options default independently to replicated. Other null options use server defaults.
+         * Every option left null resolves against the server default at admission.
          *
          * @param mixed $stream
          * @param string $name
@@ -140,14 +135,14 @@ namespace Iggy {
          * @param int|null $message_expiry_micros
          * @param int|null $max_topic_size
          * @param int|null $segment_size
-         * @param Durability|null $durability
-         * @param Durability|null $consumer_offset_durability
+         * @param \Iggy\Durability|null $durability
+         * @param \Iggy\Durability|null $consumer_offset_durability
          * @param int|null $messages_required_to_save
          * @param int|null $size_of_messages_required_to_save
          * @param bool|null $preallocate_segments
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?Durability $durability = null, ?Durability $consumer_offset_durability = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
 
         /**
          * Deletes a stream by id or name.
@@ -335,6 +330,11 @@ namespace Iggy {
          * @return string
          */
         public function topic(): string {}
+    }
+
+    enum Durability: string {
+      case Replicated = 'replicated';
+      case Persisted = 'persisted';
     }
 
     class MessageIterator implements \Iterator {
