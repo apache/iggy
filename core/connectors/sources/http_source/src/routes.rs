@@ -30,6 +30,7 @@ use std::collections::hash_map::Entry;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
+use crate::auth::is_usable_secret;
 use crate::types::EndpointId;
 use crate::{EndpointAuthType, SharedState, StaticEndpointConfig};
 
@@ -257,11 +258,24 @@ impl RouteTable {
                         });
                     }
                     Entry::Vacant(vacant) => {
-                        let hmac_key = endpoint
-                            .auth_type
-                            .hmac_algorithm()
-                            .zip(endpoint.auth_secret.as_ref())
-                            .map(|(algorithm, secret)| crate::auth::hmac_key(algorithm, secret));
+                        // Gated on `is_usable_secret`, not just presence. An
+                        // empty key is valid for HMAC, so `Some("")` builds a
+                        // real key that anyone holding the URL can sign for.
+                        // `validate()` and `register_endpoint` both refuse one,
+                        // but restore deliberately does not fail a whole
+                        // instance over one stored value, so this is where an
+                        // empty secret arriving from an older build or from the
+                        // state store has to fail closed. `authorize` already
+                        // rejects every signed request when the key is `None`.
+                        let hmac_key = if is_usable_secret(&endpoint.auth_secret) {
+                            endpoint
+                                .auth_type
+                                .hmac_algorithm()
+                                .zip(endpoint.auth_secret.as_ref())
+                                .map(|(algorithm, secret)| crate::auth::hmac_key(algorithm, secret))
+                        } else {
+                            None
+                        };
                         vacant.insert(RouteEntry {
                             instance: Arc::clone(instance),
                             endpoint: endpoint.clone(),

@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::{secrets_match, validate_bearer, validate_hmac};
+use crate::auth::{is_usable_secret, secrets_match, validate_bearer, validate_hmac};
 use crate::metrics::{Metrics, PathKind, UNROUTED};
 use crate::routes::{Endpoint, EndpointOrigin, RouteLookup, RouteTable};
 use crate::types::{QueuedMessage, clamp_header_value, unix_now_seconds};
@@ -924,10 +924,18 @@ fn authorize(
 ) -> bool {
     match endpoint.auth_type {
         EndpointAuthType::None => true,
-        EndpointAuthType::Bearer => endpoint
-            .auth_secret
-            .as_ref()
-            .is_some_and(|secret| validate_bearer(bearer_header(request_headers), secret)),
+        // `is_usable_secret` first: `constant_time_eq` on an empty expected
+        // token matches an empty presented one, so a stored `Some("")` would
+        // accept `Authorization: Bearer ` from anyone holding the URL. Same
+        // hole the HMAC arm has, and the same reason it is closed here rather
+        // than at restore, which must not fail an instance over one entry.
+        EndpointAuthType::Bearer => {
+            is_usable_secret(&endpoint.auth_secret)
+                && endpoint
+                    .auth_secret
+                    .as_ref()
+                    .is_some_and(|secret| validate_bearer(bearer_header(request_headers), secret))
+        }
         EndpointAuthType::HmacSha256 | EndpointAuthType::HmacSha1 => {
             // Absent only if the endpoint claims HMAC with no secret, which
             // `validate()` and the management API both refuse. Fail closed.
@@ -1830,6 +1838,94 @@ mod tests {
             )
         );
         close(&mut source).await;
+    }
+
+    #[test]
+    fn given_an_empty_bearer_secret_when_authorized_should_refuse_the_empty_token() {
+        // Driven through `authorize` rather than the listener on purpose. An
+        // empty presented token needs the header value to keep a trailing
+        // space, and HTTP strips it, so over the wire this cannot be reached -
+        // confirmed by mutation: removing the guard leaves the HTTP-level test
+        // passing. That makes the guard defence in depth for a caller that is
+        // not a browser or a proxy, and this is the only level that can show it
+        // working.
+        let endpoint = crate::routes::Endpoint {
+            endpoint_id: crate::test_support::endpoint_id(ENDPOINT_ONE),
+            auth_type: EndpointAuthType::Bearer,
+            auth_secret: Some(SecretString::from("")),
+            hmac_header: crate::DEFAULT_HMAC_HEADER.to_string(),
+            hmac_prefix: crate::DEFAULT_HMAC_PREFIX.to_string(),
+            expires_at: None,
+            origin: crate::routes::EndpointOrigin::Dynamic,
+            state: crate::routes::EndpointState::Active,
+        };
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("Authorization", "Bearer ".parse().expect("valid header"));
+
+        assert!(
+            !authorize(&endpoint, None, &request_headers, b"{}"),
+            "an empty stored secret matches an empty presented token, so it is not a second factor"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_stored_secret_when_signed_should_refuse_both_auth_types() {
+        // An empty key is valid for HMAC and an empty expected token compares
+        // equal to an empty presented one, so a stored `Some("")` used to make
+        // the endpoint signable by anyone holding the URL, on both auth types.
+        // `validate()` and `register_endpoint` refuse one, but restore takes
+        // whatever the state store hands it rather than failing the instance,
+        // so the refusal has to live where the credential is checked.
+        for auth_type in [EndpointAuthType::HmacSha256, EndpointAuthType::Bearer] {
+            let mut config = config(free_port(), free_port(), &[]);
+            config.endpoints = vec![];
+            let mut source = open(1, config).await;
+            let shared = Arc::clone(&source.shared);
+            let _polling = shared.enter_poll();
+
+            assert!(
+                shared.mutate_registry(|registry| registry.insert(crate::routes::Endpoint {
+                    endpoint_id: crate::test_support::endpoint_id(ENDPOINT_ONE),
+                    auth_type,
+                    auth_secret: Some(SecretString::from("")),
+                    hmac_header: crate::DEFAULT_HMAC_HEADER.to_string(),
+                    hmac_prefix: crate::DEFAULT_HMAC_PREFIX.to_string(),
+                    expires_at: None,
+                    origin: crate::routes::EndpointOrigin::Dynamic,
+                    state: crate::routes::EndpointState::Active,
+                }))
+            );
+            rebuild_routes(&source).await;
+
+            let body = "{}";
+            let empty_key = hmac::Key::new(hmac::HMAC_SHA256, b"");
+            let response = client()
+                .post(format!("{}/e/{ENDPOINT_ONE}", base_url(&source)))
+                .header(
+                    crate::DEFAULT_HMAC_HEADER,
+                    format!(
+                        "sha256={}",
+                        hex::encode(hmac::sign(&empty_key, body.as_bytes()))
+                    ),
+                )
+                .header("Authorization", "Bearer ")
+                .body(body)
+                .send()
+                .await
+                .expect("the request must reach the listener");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{auth_type:?}: an empty stored secret is not a second factor"
+            );
+            assert_eq!(
+                shared.sender.len(),
+                0,
+                "{auth_type:?}: and nothing may reach the bridge"
+            );
+            close(&mut source).await;
+        }
     }
 
     #[tokio::test]
