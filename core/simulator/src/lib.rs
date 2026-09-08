@@ -138,24 +138,47 @@ pub(crate) struct PartitionConsensusState {
 /// A pipeline head the commit walk is holding on: covered by the commit frontier,
 /// but not the op the state machine is next owed.
 ///
-/// What `drain_committable_prefix` / `peek_committable_head` refuse to drain. Legit
-/// and transient right after a partition promotion, whose `RebuildPipeline` seeds
-/// above an apply backlog the bounded journal walk clears over the following
-/// sweeps; permanent means the ops between are gone and nothing is repairing them.
+/// What `drain_committable_prefix` / `peek_committable_head` refuse to drain. Two
+/// different faults share that refusal and need different thresholds, so
+/// [`CommitPrefixHole::kind`] keeps them apart.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CommitPrefixHole {
     pub head_op: u64,
     pub commit_min: u64,
     pub commit_max: u64,
+    pub kind: CommitHoldKind,
+}
+
+/// Why a commit walk is holding below its pipeline head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CommitHoldKind {
+    /// `head_op > commit_min + 1`: the ops between never arrived. Legitimate and
+    /// transient right after a promotion, while the bounded journal walk clears the
+    /// apply backlog `RebuildPipeline` seeded above. Repair clears it, and
+    /// `commit_min` climbing is the proof repair is working.
+    MissingOps,
+    /// `head_op <= commit_min`: the walk applied this op and advanced past a
+    /// still-resident entry. Nothing missing, no repair owed, only a pop that can
+    /// no longer happen -- so it never self-clears, and `commit_min` keeps climbing
+    /// while the head stays frozen.
+    AppliedHead,
 }
 
 impl CommitPrefixHole {
     fn read(head: Option<PrepareHeader>, commit_min: u64, commit_max: u64) -> Option<Self> {
         let head = head?;
-        (head.op <= commit_max && head.op != commit_min + 1).then_some(Self {
+        if head.op > commit_max || head.op == commit_min + 1 {
+            return None;
+        }
+        Some(Self {
             head_op: head.op,
             commit_min,
             commit_max,
+            kind: if head.op > commit_min {
+                CommitHoldKind::MissingOps
+            } else {
+                CommitHoldKind::AppliedHead
+            },
         })
     }
 }
@@ -991,20 +1014,22 @@ impl Simulator {
                 continue;
             }
             for shard in &replica.shards {
-                let pending = shard.inbox_len();
-                // A fenced pump has exited, so its frames pile up exactly as a
-                // missed wake does. Reported apart: the fix is a failed commit,
-                // not a channel bug.
+                // First and unconditional. A fenced pump has exited, so its frames
+                // pile up exactly as a missed wake does and every lane assert below
+                // would misreport the cause -- and the pump's `FatalCommit` return
+                // is dropped at the spawn, so nothing else sees it. Gated on a
+                // non-empty inbox, a fenced pump that happened to drain would pass
+                // quiescence outright.
                 assert!(
-                    pending == 0 || shard.fenced_partition_fault().is_none(),
-                    "fenced pump: replica {replica_id} shard {} holds {pending} frame(s) at \
-                     quiescence because its pump exited on a fatal commit ({:?}). Not a lost \
-                     wakeup; fix the commit failure (seed {:#x}, schedule hash {:#x})",
+                    shard.fenced_partition_fault().is_none(),
+                    "fenced pump: replica {replica_id} shard {} exited on a fatal commit ({:?}). \
+                     Not a lost wakeup; fix the commit failure (seed {:#x}, schedule hash {:#x})",
                     shard.id,
                     shard.fenced_partition_fault(),
                     self.seed,
                     self.executor.schedule_hash(),
                 );
+                let pending = shard.inbox_len();
                 assert_eq!(
                     pending,
                     0,
@@ -1460,6 +1485,21 @@ impl Simulator {
         })
     }
 
+    /// A replica's metadata consensus handle, or `None` when it hosts no metadata
+    /// plane. The one way to reach it; do not hand-walk the shard-0 / plane /
+    /// metadata chain.
+    #[must_use]
+    pub(crate) fn metadata_consensus(
+        &self,
+        replica_idx: usize,
+    ) -> Option<&consensus::VsrConsensus<crate::bus::SharedSimOutbox>> {
+        self.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+    }
+
     /// The metadata pipeline head the commit walk is holding on, if any. See
     /// [`CommitPrefixHole`].
     #[must_use]
@@ -1467,11 +1507,7 @@ impl Simulator {
         &self,
         replica_idx: usize,
     ) -> Option<CommitPrefixHole> {
-        let consensus = self.replicas[replica_idx].shards[0]
-            .plane
-            .metadata()
-            .consensus
-            .as_ref()?;
+        let consensus = self.metadata_consensus(replica_idx)?;
         CommitPrefixHole::read(
             consensus.pipeline_head_header(),
             consensus.commit_min(),

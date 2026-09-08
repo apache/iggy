@@ -32,7 +32,6 @@
 //! non-vacuous: a chain nothing was compared against passes silently.
 
 use crate::Simulator;
-use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use journal::Journal;
 use server_common::sharding::IggyNamespace;
@@ -105,7 +104,7 @@ impl StateChecker {
                 continue;
             }
             let replica = &sim.replicas[usize::from(replica_idx)];
-            let Some(consensus) = replica.shards[0].plane.metadata().consensus.as_ref() else {
+            let Some(consensus) = sim.metadata_consensus(usize::from(replica_idx)) else {
                 continue;
             };
             let committed = consensus.commit_min();
@@ -255,7 +254,7 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
             continue;
         }
         let replica = &sim.replicas[usize::from(replica_idx)];
-        let Some(consensus) = replica.shards[0].plane.metadata().consensus.as_ref() else {
+        let Some(consensus) = sim.metadata_consensus(usize::from(replica_idx)) else {
             continue;
         };
         let committed = consensus.commit_min();
@@ -426,11 +425,8 @@ mod tests {
     #[should_panic(expected = "a hole in the committed log")]
     fn a_missing_committed_head_above_the_snapshot_floor_is_a_hole() {
         let sim = cluster_with_committed_ops();
-        let committed = sim.replicas[1].shards[0]
-            .plane
-            .metadata()
-            .consensus
-            .as_ref()
+        let committed = sim
+            .metadata_consensus(1)
             .expect("shard 0 owns metadata consensus")
             .commit_min();
         assert!(

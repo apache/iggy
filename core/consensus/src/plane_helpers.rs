@@ -442,11 +442,19 @@ where
 /// `commit_min + 1` or breaking partway hits that counter's sequential-advance
 /// assert. Pipeline-side twin of `commit_journal`'s gap-stop.
 ///
-/// Reported, not asserted: a promoted partition primary reaches it legitimately,
-/// `RebuildPipeline` seeding above `commit_min` while the walk that catches it up
-/// runs `COMMIT_WALK_OPS_MAX` ops per call. `commit_journal`'s journal fallback
-/// closes that backlog; a hold that never clears is caught by the simulator's
-/// contiguity invariant.
+/// Reported, not asserted: a promoted partition primary reaches it legitimately
+/// while its journal walk clears the apply backlog. Repair arms on the level, and
+/// a hold that never clears fails the simulator's contiguity invariant.
+///
+/// Do NOT read that as "the journal walk always finishes". It can stall on the
+/// partition plane: `committed_headers_from` reads resident headers only, while
+/// `commit_messages` evicts up to `commit_max` (the cluster frontier), so ops past
+/// the per-call cap can be flushed out from under the walk. Pre-existing; see
+/// `IggyPartition::collect_committable_from_journal`.
+///
+/// A head at or below `commit_min` is the other shape: applied already, no repair
+/// owed, only a pop that can no longer happen. Both journal walks stop below the
+/// head to keep it unreachable, so it is logged apart.
 ///
 /// # Panics
 /// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
@@ -457,7 +465,6 @@ where
 {
     let commit = consensus.commit_max();
     let commit_min = consensus.commit_min();
-    let replica = consensus.replica();
     let mut drained = Vec::new();
 
     consensus.with_pipeline_mut(|pipeline| {
@@ -467,15 +474,12 @@ where
                 break;
             }
             if head_op != next {
-                tracing::warn!(
-                    replica,
+                report_uncommittable_head(
+                    consensus.replica(),
                     head_op,
-                    expected_op = next,
                     commit_min,
-                    commit_max = commit,
-                    drained = drained.len(),
-                    "committable head sits above a hole in the committed prefix; holding the \
-                     commit walk until repair refills it"
+                    commit,
+                    drained.len(),
                 );
                 break;
             }
@@ -521,22 +525,53 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
-    let next = consensus.commit_min() + 1;
+    let commit_min = consensus.commit_min();
     let head = consensus
         .pipeline_head_header()
         .filter(|header| header.op <= commit)?;
-    if head.op != next {
-        tracing::warn!(
-            replica = consensus.replica(),
-            head_op = head.op,
-            commit_min = consensus.commit_min(),
-            commit_max = commit,
-            "committable head sits above a hole in the committed prefix; holding the \
-             commit walk until repair refills it"
-        );
+    if head.op != commit_min + 1 {
+        report_uncommittable_head(consensus.replica(), head.op, commit_min, commit, 0);
         return None;
     }
     Some(head)
+}
+
+/// Log a held pipeline head, with the remedy for the arm it is in.
+///
+/// `debug`, not `warn`, matching `tick_partitions` / `tick_metadata`: a hold is the
+/// steady state for a whole rejoin, so `warn` is one line per group per tick. A
+/// hold that never clears is caught by a simulator invariant, not by this line.
+fn report_uncommittable_head(
+    replica: u8,
+    head_op: u64,
+    commit_min: u64,
+    commit_max: u64,
+    drained: usize,
+) {
+    if head_op > commit_min {
+        tracing::debug!(
+            replica,
+            head_op,
+            expected_op = commit_min + 1,
+            commit_min,
+            commit_max,
+            drained,
+            "committable head sits above a hole in the committed prefix; holding the commit \
+             walk until the ops below it are journaled"
+        );
+    } else {
+        // Unreachable while both journal walks stop below the head, so this is a
+        // defect and not a state to wait out: nothing will pop or answer the entry.
+        tracing::error!(
+            replica,
+            head_op,
+            commit_min,
+            commit_max,
+            drained,
+            "committable head sits at or below the applied commit point; the commit walk \
+             advanced past a resident pipeline entry and its reply can no longer be sent"
+        );
+    }
 }
 
 /// Build reply for a committed prepare.
@@ -2035,6 +2070,58 @@ mod tests {
         let sent = consensus.message_bus().sent.borrow();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, 1);
+    }
+
+    /// `advance_commit_min` is strictly sequential, so draining op 7 with 6 never
+    /// applied panics the shard pump. Both gates must hold instead.
+    #[test]
+    fn given_a_hole_below_the_head_when_committing_should_hold_both_gates() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(5, 5);
+
+        // Op 6 never arrived; 7 and 8 did, and the cluster committed through 8.
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(7, 0, 70));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(8, 70, 80));
+        consensus.advance_commit_max(8);
+
+        assert!(
+            peek_committable_head(&consensus).is_none(),
+            "the head is covered by the frontier but op 6 is not applied"
+        );
+        assert!(
+            drain_committable_prefix(&consensus).is_empty(),
+            "the drain must hold on the same hole the peek does"
+        );
+        assert_eq!(
+            consensus.pipeline_head_header().map(|header| header.op),
+            Some(7),
+            "holding must not consume the entry"
+        );
+    }
+
+    /// The shape the journal-walk caps prevent. Both gates must still refuse it:
+    /// re-applying an applied op panics `advance_commit_min`.
+    #[test]
+    fn given_an_applied_head_when_committing_should_refuse_it() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(4, 4);
+
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(5, 0, 50));
+        consensus.advance_commit_max(6);
+        // The journal walk got there first and applied 5 and 6 out of the WAL.
+        consensus.advance_commit_min(5);
+        consensus.advance_commit_min(6);
+
+        assert!(
+            peek_committable_head(&consensus).is_none(),
+            "op 5 is already applied; re-applying it panics advance_commit_min"
+        );
+        assert!(
+            drain_committable_prefix(&consensus).is_empty(),
+            "the drain must refuse an applied head too"
+        );
     }
 
     #[test]
