@@ -113,6 +113,11 @@ pub struct HttpSource {
     /// landing inside `stage()` could drop the batch there with nothing
     /// counting it.
     staged: StdMutex<Option<StagedBatch>>,
+    /// Whether the batch the last `poll()` returned carried registry state.
+    ///
+    /// Read by `on_nack`, which may only re-arm a flush for a batch that was
+    /// actually carrying one. Written on every exit of `poll()`.
+    last_batch_carried_state: AtomicBool,
     /// Whether the last `poll()` returned a state-only batch, which decides
     /// which arm of the next poll's `select!` gets first refusal.
     ///
@@ -754,6 +759,7 @@ impl HttpSource {
             shared: Arc::new(shared),
             receiver: Mutex::new(receiver),
             staged: StdMutex::new(None),
+            last_batch_carried_state: AtomicBool::new(false),
             last_poll_was_state_only: AtomicBool::new(false),
             restore_error,
         }
@@ -813,14 +819,22 @@ impl HttpSource {
         let mut staged = self.lock_staged();
         let Some(batch) = staged.as_mut() else {
             drop(staged);
-            // Nothing staged means the batch carried no messages, which is
-            // usually a state flush the runtime could not persist or would not
-            // attempt. It can also be an empty batch that carried no state at
-            // all, when the writer gate was contended or nothing was dirty,
-            // and re-arming then costs one redundant flush rather than a lost
-            // one. `take_dirty_state` already cleared the flag, so re-arming
-            // here is the only thing that stops a revocation being lost while
-            // the API reports it durable. This is load-bearing, not defensive.
+            // Only a batch that actually carried state may re-arm. Re-arming
+            // unconditionally set the dirty bit with no pending change behind
+            // it, and `close()` then reported "0 change(s) not submitted" - a
+            // data-loss alarm on the one field the README tells operators to
+            // trust, raised for a flush that was never owed. It also spent the
+            // backoff budget on NACKs that had nothing to do with the state
+            // store. An empty batch that carried nothing needs no re-arm: if
+            // `take_dirty_state` declined because the writer gate was
+            // contended, it re-posted the permit itself, and if nothing was
+            // dirty there is nothing to retry.
+            if !self.last_batch_carried_state.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // `take_dirty_state` already cleared the flag, so re-arming here is
+            // the only thing that stops a revocation being lost while the API
+            // reports it durable. This is load-bearing, not defensive.
             self.shared.rearm_state_flush();
             warn!(
                 "Runtime NACKed the state flush for {CONNECTOR_NAME} connector ID: {}, re-arming it",
@@ -864,6 +878,13 @@ impl Source for HttpSource {
         // An unacknowledged batch outranks new traffic: replaying it in order
         // is what turns the runtime's NACK into a retry instead of a gap.
         if let Some(staged) = self.staged_batch() {
+            // Unreachable as written: only an empty batch carries state, an
+            // empty batch stages nothing, so no replay can follow one and the
+            // marker is already false here. Written anyway so the invariant is
+            // local to `poll()` rather than resting on that argument holding
+            // for every future caller of `stage`.
+            self.last_batch_carried_state
+                .store(false, Ordering::Release);
             return Ok(staged);
         }
 
@@ -916,6 +937,8 @@ impl Source for HttpSource {
             None
         };
 
+        self.last_batch_carried_state
+            .store(state.is_some(), Ordering::Release);
         Ok(ProducedMessages {
             schema: Schema::Raw,
             messages: self.stage(queued),
@@ -1961,6 +1984,58 @@ mod tests {
             .await
             .is_err(),
             "no flush was owed, so no permit may be waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_nacked_batch_that_carried_nothing_should_not_arm_a_flush() {
+        // `mutate_registry` posts a permit per mutation while one flush clears
+        // the flag for all of them, so a surplus permit fires a poll that finds
+        // nothing to flush and produces an empty batch carrying no state. The
+        // SDK NACKs whatever is in flight on a graceful stop, and re-arming for
+        // that batch set the dirty bit with no pending change behind it: the
+        // admin API then reported an owed flush and `close()` logged
+        // "0 change(s) not submitted", a data-loss alarm for a change that did
+        // not exist.
+        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
+
+        let flushed = source.poll().await.expect("poll must succeed");
+        assert!(
+            flushed.state.is_some(),
+            "the mutation must ride the first poll"
+        );
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ack must succeed");
+        assert!(!source.shared.has_pending_state());
+        assert_eq!(source.shared.pending_change_count(), 0);
+
+        // The surplus permit, and the poll it wakes.
+        source.shared.state_flush.notify_one();
+        let empty = source.poll().await.expect("poll must succeed");
+        assert!(empty.messages.is_empty());
+        assert!(
+            empty.state.is_none(),
+            "there was nothing left to flush, so this batch carries nothing"
+        );
+
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("nack must succeed");
+
+        assert!(
+            !source.shared.has_pending_state(),
+            "a NACK of a batch that carried no state must not claim a flush is owed"
+        );
+        assert_eq!(
+            source.shared.pending_change_count(),
+            0,
+            "and close() must not report changes that were never made"
         );
     }
 
