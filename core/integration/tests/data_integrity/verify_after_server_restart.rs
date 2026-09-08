@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
 use iggy::prelude::*;
 use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::harness::{TestHarness, TestServerConfig};
@@ -565,7 +566,7 @@ fn deletion_test_messages() -> Vec<IggyMessage> {
         .map(|offset| {
             IggyMessage::builder()
                 .id(offset + 1)
-                .payload(bytes::Bytes::from_static(b"deletion-stats-payload"))
+                .payload(Bytes::from_static(b"deletion-stats-payload"))
                 .build()
                 .expect("Failed to build message")
         })

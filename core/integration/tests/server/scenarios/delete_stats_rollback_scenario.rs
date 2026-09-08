@@ -74,6 +74,10 @@ pub async fn run(harness: &TestHarness) {
     delete_partitions_rolls_back_topic_and_stream(&client).await;
     delete_topic_rolls_back_the_stream(&client).await;
 
+    // The plainest statement of what this guards: every scope the scenario
+    // created is gone, so the server-wide totals owe nothing. `assert_clean_system`
+    // reads the entity lists, never the stats.
+    validate_system_stats(&client, 0, 0).await;
     assert_clean_system(&client).await;
 }
 

@@ -670,7 +670,6 @@ pub(in crate::http) async fn get_metrics(
     metrics.messages.set(gauge_value(messages_count));
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
-    metrics.observe_rollup_underflows(iggy_common::rollup_underflows());
     metrics.formatted_output()
 }
 

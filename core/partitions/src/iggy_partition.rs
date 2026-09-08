@@ -5947,6 +5947,8 @@ where
             budget_spent,
             ..SegmentRemoval::default()
         };
+        let mut shortfall = CleanupShortfall::default();
+        let mut removed_offsets: Option<(u64, u64)> = None;
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
             // victim is the front once the previous one is gone.
@@ -5979,13 +5981,13 @@ where
                 }
             }
 
-            // The removal loop above only reaches sealed segments, which always
-            // hold at least one message, so the count is inclusive end..=start.
-            // A one-message sealed segment has `start_offset == end_offset`, so
-            // the `+ 1` is required (a `start == end -> 0` special case would
-            // undercount it).
-            let messages_in_segment = segment.end_offset - segment.start_offset + 1;
-            settle_cleaned_segment(&self.stats, namespace, &segment, messages_in_segment);
+            let (messages_in_segment, segment_shortfall) =
+                settle_cleaned_segment(&self.stats, &segment);
+            shortfall.absorb(segment_shortfall);
+            removed_offsets = Some(match removed_offsets {
+                Some((from, _)) => (from, segment.end_offset),
+                None => (segment.start_offset, segment.end_offset),
+            });
 
             removal.segments += 1;
             removal.messages += messages_in_segment;
@@ -5999,6 +6001,8 @@ where
                 "deleted sealed segment during cleanup"
             );
         }
+
+        shortfall.report(namespace, removed_offsets);
 
         removal
     }
@@ -7260,37 +7264,69 @@ pub struct SegmentRemoval {
     pub budget_spent: bool,
 }
 
-/// Roll one cleaned-up segment out of the partition counters, naming the
-/// partition when the rollback could not be covered.
+/// What a cleanup rollback could not take out of the partition counters,
+/// summed over one [`IggyPartition::remove_sealed_segments_up_to`] call.
 ///
-/// Retention is the likeliest source of a clamped rollback: a partition on its
-/// way out keeps serving cleanup passes after the delete already settled its
-/// counters into the parents. The `stats_rollup_underflows` metric says a
-/// divergence happened and carries no ids; this says which partition and which
-/// segment, which is what an operator needs to act on it.
-fn settle_cleaned_segment(
-    stats: &PartitionStats,
-    namespace: IggyNamespace,
-    segment: &Segment,
-    messages_count: u64,
-) {
-    let size_shortfall = stats.decrement_size_bytes(segment.size.as_bytes_u64());
-    let segments_shortfall = stats.decrement_segments_count(1);
-    let messages_shortfall = stats.decrement_messages_count(messages_count);
-    if size_shortfall == 0 && segments_shortfall == 0 && messages_shortfall == 0 {
-        return;
+/// Accumulated rather than reported per segment: `UnderflowSite::report` in
+/// `iggy_common` already counts every clamp and power-of-two throttles its own
+/// line, so a per-segment `warn!` here is an unthrottled second copy of it. One
+/// line per call, carrying the offset range the call removed, says which
+/// partition and which segments without that.
+#[derive(Debug, Default, Clone, Copy)]
+struct CleanupShortfall {
+    size_bytes: u64,
+    segments: u32,
+    messages: u64,
+}
+
+impl CleanupShortfall {
+    const fn absorb(&mut self, other: Self) {
+        self.size_bytes += other.size_bytes;
+        self.segments += other.segments;
+        self.messages += other.messages;
     }
-    warn!(
-        target: "iggy.partitions.diag",
-        plane = "partitions",
-        namespace_raw = namespace.inner(),
-        start_offset = segment.start_offset,
-        size_shortfall,
-        segments_shortfall,
-        messages_shortfall,
-        "segment cleanup gave back more than the partition counters held; the parent totals \
-         are now low by the shortfall until a rebuild or a restart"
-    );
+
+    /// One line for the whole call, naming the partition and the offset range
+    /// it removed. Silent when the counters covered every rollback.
+    fn report(self, namespace: IggyNamespace, removed_offsets: Option<(u64, u64)>) {
+        if self.size_bytes == 0 && self.segments == 0 && self.messages == 0 {
+            return;
+        }
+        let (removed_from, removed_to) = removed_offsets.unwrap_or_default();
+        warn!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            namespace_raw = namespace.inner(),
+            removed_from,
+            removed_to,
+            size_shortfall = self.size_bytes,
+            segments_shortfall = self.segments,
+            messages_shortfall = self.messages,
+            "segment cleanup gave back more than the partition counters held; the parent \
+             totals are now low by the shortfall until a rebuild or a restart"
+        );
+    }
+}
+
+/// Roll one cleaned-up segment out of the partition counters.
+///
+/// Returns the messages the segment held, which is what the caller reports as
+/// removed, plus whatever the rollback could not cover. Retention is the
+/// likeliest source of a clamped rollback: a partition on its way out keeps
+/// serving cleanup passes after the delete already settled its counters into
+/// the parents.
+fn settle_cleaned_segment(stats: &PartitionStats, segment: &Segment) -> (u64, CleanupShortfall) {
+    // The removal loop only reaches sealed segments, which always hold at least
+    // one message, so the count is inclusive start..=end. A one-message sealed
+    // segment has `start_offset == end_offset`, so the `+ 1` is required (a
+    // `start == end -> 0` special case would undercount it).
+    let messages = segment.end_offset - segment.start_offset + 1;
+    let shortfall = CleanupShortfall {
+        size_bytes: stats.decrement_size_bytes(segment.size.as_bytes_u64()),
+        segments: stats.decrement_segments_count(1),
+        messages: stats.decrement_messages_count(messages),
+    };
+    (messages, shortfall)
 }
 
 /// Highest `end_offset` among the leading run of expired sealed segments, or

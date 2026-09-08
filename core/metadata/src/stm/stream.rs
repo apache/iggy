@@ -406,7 +406,8 @@ impl Stream {
 ///   partition's entry.
 /// * `left_right` drains the previous batch's `absorb_second` before the
 ///   current batch's `absorb_first` (0.11.8 `write.rs`), which is an
-///   implementation detail, not a contract.
+///   implementation detail, not a contract -- which is why the workspace
+///   manifest pins `left-right` to `=0.11.8` rather than floating 0.11.x.
 ///
 /// Narrowing both, `fetch_partition_build_inputs` refuses to register a
 /// partition the committed topic does not list. It does not close the window:
@@ -480,6 +481,16 @@ impl StatsRegistry {
     /// the reset gate: mint it at 0 and a purge that committed while this
     /// partition was torn down and rebuilt still counts as pending, so its
     /// deferred second-buffer apply wipes everything appended since.
+    ///
+    /// Caller contract, unchecked either way: `partition` must be the committed
+    /// record listed under `(stream_id, topic_id)`, and `parent` the committed
+    /// topic's own `Arc`. A fresh entry inherits both without comparing them to
+    /// anything, so a record from another topic seeds the identity gate with a
+    /// revision that never matches, and a parent from another topic sends this
+    /// partition's increments into a stranger's totals for the entry's whole
+    /// life. Read all three out of one `streams().read` (see
+    /// `fetch_partition_build_inputs` in the reconciler) and both hold by
+    /// construction.
     ///
     /// # Panics
     /// If the registry mutex is poisoned.
@@ -716,14 +727,31 @@ impl StatsRegistry {
             .lock()
             .expect("stats registry mutex poisoned")
             .retain(|key, _| live_topics.contains(key));
-        self.partitions
-            .lock()
-            .expect("stats registry mutex poisoned")
-            .retain(|key, entry| {
-                live_partitions
-                    .get(key)
-                    .is_some_and(|created_revision| *created_revision == entry.created_revision)
-            });
+        // Zeroing is the other half of the eviction, exactly as in
+        // [`Self::remove_partitions`]: a stale incarnation still mounted holds
+        // the same `Arc`, and its `ConfirmRemove` rolls those counters back
+        // through it. `rebuild_parent_totals` runs right after this and counts
+        // only survivors, so an entry dropped full leaves that later rollback
+        // to come out of a live sibling's totals.
+        let dropped: Vec<Arc<PartitionStats>> = {
+            let mut entries = self
+                .partitions
+                .lock()
+                .expect("stats registry mutex poisoned");
+            entries
+                .extract_if(|key, entry| {
+                    live_partitions
+                        .get(key)
+                        .is_none_or(|created_revision| *created_revision != entry.created_revision)
+                })
+                .map(|(_, entry)| entry.stats)
+                .collect()
+        };
+        // Guard released first: the rollback cascades into parent totals, which
+        // the partition map has no part in.
+        for stats in dropped {
+            stats.zero_out_all();
+        }
     }
 
     /// Recompute every topic and stream total as the sum of the partition
@@ -742,25 +770,41 @@ impl StatsRegistry {
     /// same convergence boot relies on: the reconciler registers each one and
     /// folds its on-disk delta in as it goes.
     ///
-    /// The `partitions` guard fences the MAP, not the counters, which the data
-    /// plane reaches through the `Arc`. An append landing between a child read
-    /// and its parent store is folded into the parent by `fetch_add` and then
-    /// overwritten, so the invariant is restored modulo whatever arrives during
-    /// the walk. That residue is bounded by the walk and by one append, and the
-    /// saturating rollback absorbs it; quiescing the data plane for a metadata
-    /// install would cost far more than it buys.
+    /// The counters are sampled under the guard and summed without it: the walk
+    /// visits every partition in the tree, and the same mutex is on the
+    /// get-or-create path the reconciler and every shard's boot recovery take.
+    /// Holding it across the walk would serialize them behind it.
+    ///
+    /// The guard fences the MAP, never the counters, which the data plane
+    /// reaches through the `Arc` regardless. An append landing between the
+    /// sample and the parent store is folded into the parent by `fetch_add` and
+    /// then overwritten, so the invariant is restored modulo whatever arrives
+    /// in between. That residue is bounded by the walk and by one append, and
+    /// the saturating rollback absorbs it; quiescing the data plane for a
+    /// metadata install would cost far more than it buys.
     ///
     /// # Panics
     /// If the registry mutex is poisoned.
-    // One acquisition for the whole walk: the stores it makes are plain atomic
-    // writes on the topic and stream `Arc`s, with no parent cascade and no way
-    // back into the map, so there is nothing for a tighter guard to protect.
-    #[allow(clippy::significant_drop_tightening)]
     fn rebuild_parent_totals(&self, streams: &IdSlab<Stream>) {
-        let entries = self
-            .partitions
-            .lock()
-            .expect("stats registry mutex poisoned");
+        let entries: AHashMap<(usize, usize, usize), (u64, u64, u32)> = {
+            let partitions = self
+                .partitions
+                .lock()
+                .expect("stats registry mutex poisoned");
+            partitions
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        *key,
+                        (
+                            entry.stats.size_bytes_inconsistent(),
+                            entry.stats.messages_count_inconsistent(),
+                            entry.stats.segments_count_inconsistent(),
+                        ),
+                    )
+                })
+                .collect()
+        };
         for (stream_key, stream) in streams {
             let mut stream_size_bytes = 0u64;
             let mut stream_messages_count = 0u64;
@@ -770,15 +814,14 @@ impl StatsRegistry {
                 let mut topic_messages_count = 0u64;
                 let mut topic_segments_count = 0u32;
                 for partition in &topic.partitions {
-                    let Some(entry) = entries.get(&(stream_key, topic_key, partition.id)) else {
+                    let Some((size_bytes, messages_count, segments_count)) =
+                        entries.get(&(stream_key, topic_key, partition.id))
+                    else {
                         continue;
                     };
-                    topic_size_bytes =
-                        topic_size_bytes.saturating_add(entry.stats.size_bytes_inconsistent());
-                    topic_messages_count = topic_messages_count
-                        .saturating_add(entry.stats.messages_count_inconsistent());
-                    topic_segments_count = topic_segments_count
-                        .saturating_add(entry.stats.segments_count_inconsistent());
+                    topic_size_bytes = topic_size_bytes.saturating_add(*size_bytes);
+                    topic_messages_count = topic_messages_count.saturating_add(*messages_count);
+                    topic_segments_count = topic_segments_count.saturating_add(*segments_count);
                 }
                 topic.stats.store_from_snapshot(
                     topic_size_bytes,
@@ -2547,21 +2590,11 @@ impl Snapshotable for Streams {
         // Boot: no live registry exists yet, so mint one. Safe because
         // `new_from_empty` clones this single inner onto the other left-right
         // buffer rather than building a second one.
-        let inner = StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
-        // Drop the checkpoint's aggregates here, BEFORE journal replay runs over
-        // this state machine. Boot rebuilds every counter from disk (each shard
-        // folds its `load_partition` deltas in), so the stored totals are never
-        // authoritative -- and a checkpoint reads a stream's total and its
-        // topics' as separate loads while the partition plane keeps counting, so
-        // they can disagree in either direction. Left in place, a replayed
-        // `DeleteTopic` over that torn shape rolls the topic back against a
-        // stream that never held it, clamps, and raises the rollup-underflow
-        // alarm on every boot with no real divergence behind it.
         //
-        // The registry is empty here, so this stores zero at both levels; it is
-        // the same walk state transfer uses, which is why there is no second
-        // spelling of it.
-        inner.stats_registry.rebuild_parent_totals(&inner.items);
+        // The checkpoint's topic and stream aggregates are not adopted (see
+        // `inner_from_snapshot`), so this starts every total at zero and boot
+        // folds the real ones back in from disk.
+        let inner = StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
         Ok(inner.into())
     }
 }
@@ -2584,9 +2617,8 @@ impl StreamsInner {
         // that slot next.
         registry.retain_from_snapshot(&snapshot);
         *self = Self::inner_from_snapshot(snapshot, registry);
-        // Last, over the totals `inner_from_snapshot` just stored: the donor's
-        // aggregates describe the donor's partitions, and this node kept its
-        // own the whole time.
+        // The donor's aggregates describe the donor's partitions; this node kept
+        // its own the whole time, so the totals come from the surviving entries.
         self.stats_registry.rebuild_parent_totals(&self.items);
     }
 
@@ -2594,6 +2626,18 @@ impl StreamsInner {
     /// `stats_registry`. Shared by wrapper construction
     /// ([`Snapshotable::from_snapshot`]) and the in-place restore command
     /// (state transfer), which absorbs it on both left-right buffers.
+    ///
+    /// [`StatsSnapshot`] is decoded but never stored. Both callers derive the
+    /// topic and stream totals from this node's own partition entries instead:
+    /// state transfer through [`StatsRegistry::rebuild_parent_totals`], boot by
+    /// folding each shard's `load_partition` delta in as it materializes.
+    /// Adopting them would be actively wrong at both ends. A checkpoint reads a
+    /// stream's total and its topics' as separate loads while the partition
+    /// plane keeps counting, so they can disagree in either direction, and a
+    /// replayed `DeleteTopic` over that torn shape rolls a topic back against a
+    /// stream that never held it, clamps, and raises the rollup-underflow alarm
+    /// on every boot with no real divergence behind it. A snapshot's totals are
+    /// the DONOR's, over children the receiver kept the whole time.
     pub(crate) fn inner_from_snapshot(
         snapshot: StreamsSnapshot,
         stats_registry: Arc<StatsRegistry>,
@@ -2603,11 +2647,6 @@ impl StreamsInner {
 
         for (slab_key, stream_snap) in snapshot.items {
             let stream_stats = stats_registry.stream(slab_key);
-            stream_stats.store_from_snapshot(
-                stream_snap.stats.size_bytes,
-                stream_snap.stats.messages_count,
-                stream_snap.stats.segments_count,
-            );
 
             let mut topic_index: AHashMap<Arc<str>, usize> = AHashMap::new();
             let mut topic_entries: Vec<(usize, Topic)> = Vec::new();
@@ -2615,11 +2654,6 @@ impl StreamsInner {
             for (topic_slab_key, topic_snap) in stream_snap.topics {
                 let topic_stats =
                     stats_registry.topic(slab_key, topic_slab_key, stream_stats.clone());
-                topic_stats.store_from_snapshot(
-                    topic_snap.stats.size_bytes,
-                    topic_snap.stats.messages_count,
-                    topic_snap.stats.segments_count,
-                );
                 let topic_name: Arc<str> = Arc::from(topic_snap.name.as_str());
                 let topic = Topic {
                     id: topic_snap.id,
@@ -3563,14 +3597,14 @@ mod tests {
         assert_eq!(stream_stats.messages_count_inconsistent(), 0);
     }
 
-    /// A state transfer stores the DONOR's topic and stream totals over
-    /// partition counters the receiver kept the whole time, so
-    /// `topic < sum(partitions)` is the ordinary post-transfer shape. Rolling a
-    /// partition out of a parent that never counted it subtracts past zero, and
-    /// the totals are unsigned: `get_stream` / `get_topic` / `/stats` would
-    /// serve ~1.8e19 until the process restarted.
+    /// A restore replaces the whole tree while the receiver's partition
+    /// counters keep running, and it adopts no aggregate of its own: without
+    /// the rebuild every topic and stream would come back at zero over live
+    /// children. Rolling a partition out of a parent that never counted it
+    /// subtracts past zero, and the totals are unsigned: `get_stream` /
+    /// `get_topic` / `/stats` would serve ~1.8e19 until the process restarted.
     #[test]
-    fn given_snapshot_totals_below_the_live_partitions_when_restoring_should_not_wrap_on_delete() {
+    fn given_a_restore_over_live_partition_counters_when_deleting_should_not_wrap() {
         let mut inner = inner_with_registered_partition();
         let stats = inner.stats_registry.partition_get(0, 0, 0).expect("stats");
         stats.increment_segments_count(3);
@@ -3578,14 +3612,7 @@ mod tests {
         stats.increment_size_bytes(512);
 
         // The donor captured this tree before any of that landed.
-        let mut snapshot = Streams::from(inner.clone()).to_snapshot();
-        let donor_totals = StatsSnapshot {
-            size_bytes: 0,
-            messages_count: 0,
-            segments_count: 0,
-        };
-        snapshot.items[0].1.stats = donor_totals.clone();
-        snapshot.items[0].1.topics[0].1.stats = donor_totals;
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
         inner.restore_in_place(snapshot);
 
         // The rebuild has to put the receiver's own children back into the
@@ -3611,8 +3638,8 @@ mod tests {
         let stream_stats = &inner.items[0].stats;
         assert_eq!(stream_stats.size_bytes_inconsistent(), 0);
         assert_eq!(stream_stats.messages_count_inconsistent(), 0);
-        // u32, so it wraps at a different modulus than the two above and needs
-        // its own assertion.
+        // Its own `clamped_sub!` expansion and its own `UnderflowSite`, so the
+        // u32 wiring needs an assertion of its own.
         assert_eq!(stream_stats.segments_count_inconsistent(), 0);
     }
 
@@ -4102,12 +4129,12 @@ mod tests {
 
     /// A checkpoint reads a stream's total and each of its topics' as separate
     /// loads while the partition plane keeps counting, so the two can disagree
-    /// in either direction. The boot restore drops both levels, and drops them
-    /// before journal replay runs: a replayed `DeleteTopic` over the surviving
-    /// residue rolls a topic back against a stream that never held it, clamps,
-    /// and raises the underflow alarm on every boot after.
+    /// in either direction. The boot restore adopts neither level, and journal
+    /// replay runs over what it produces: a replayed `DeleteTopic` over an
+    /// adopted torn shape would roll a topic back against a stream that never
+    /// held it, clamp, and raise the underflow alarm on every boot after.
     #[test]
-    fn given_a_torn_checkpoint_when_restoring_at_boot_should_drop_both_levels() {
+    fn given_a_torn_checkpoint_when_restoring_at_boot_should_adopt_neither_level() {
         let mut snapshot = Streams::from(inner_with_registered_partition()).to_snapshot();
         // Topics summing above their stream is the torn shape: the stream was
         // read first, and the topic kept counting before its own read.
@@ -4207,6 +4234,44 @@ mod tests {
             inner.stats_registry.partition_get(0, 0, 0).is_none(),
             "a partition the snapshot dropped must not keep its registry entry"
         );
+    }
+
+    /// The eviction has to empty what it drops. A partition the snapshot does
+    /// not carry stays mounted until the reconciler reaches it, holding the
+    /// same `Arc`, and its `ConfirmRemove` rolls those counters back through it.
+    /// The rebuild counts survivors only, so an entry dropped full leaves that
+    /// rollback to come out of a live sibling's totals.
+    #[test]
+    fn given_a_pruned_entry_when_its_partition_is_torn_down_later_should_leave_survivors_alone() {
+        let mut inner = inner_with_registered_partition();
+        let doomed = inner.stats_registry.partition_get(0, 0, 0).expect("stats");
+        doomed.increment_size_bytes(512);
+
+        // A donor tree with the same shape but a partition this node's entry
+        // cannot be, so the retain drops it and the restore registers nothing
+        // in its place.
+        let mut snapshot = Streams::from(inner.clone()).to_snapshot();
+        snapshot.items[0].1.topics[0].1.partitions[0].created_revision += 1;
+        inner.restore_in_place(snapshot);
+        assert!(inner.stats_registry.partition_get(0, 0, 0).is_none());
+
+        let survivor = inner.stats_registry.partition(
+            0,
+            0,
+            &committed_partition(&inner, 0, 0, 0),
+            inner.items[0].topics[0].stats.clone(),
+        );
+        survivor.increment_size_bytes(900);
+
+        // The mounted stale incarnation, reaching its drop point.
+        doomed.zero_out_all();
+
+        assert_eq!(
+            inner.items[0].topics[0].stats.size_bytes_inconsistent(),
+            900,
+            "the survivor's bytes must not pay for the pruned entry's rollback"
+        );
+        assert_eq!(inner.items[0].stats.size_bytes_inconsistent(), 900);
     }
 
     /// Admission is all that stands between a client and a namespace collision.

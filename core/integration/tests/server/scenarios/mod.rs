@@ -62,8 +62,14 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const PARTITION_ID: u32 = 0;
-const POLL_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+// One pair for every wait in these scenarios, because they all wait out the
+// same thing: the partition plane applies committed ops asynchronously on the
+// owning shard (a send folds into the shared stats and into the servable log at
+// commit-apply; purge and delete zero them when the reconciler drives the wipe),
+// so a read racing that window sees a pre-apply value. Retry until the
+// expectation holds, then make the terminal assertion for a real mismatch.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
+const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
@@ -73,14 +79,6 @@ const USERNAME_2: &str = "user2";
 const USERNAME_3: &str = "user3";
 const CONSUMER_KIND: ConsumerKind = ConsumerKind::Consumer;
 const MESSAGES_COUNT: u32 = 1337;
-
-// The partition plane applies committed ops asynchronously on the owning shard
-// (sends fold into the shared stats at commit-apply; purge/delete zero them
-// when the reconciler drives the wipe), so a read racing that window can see a
-// pre-apply value. Retry until the expectation holds, then make the terminal
-// assertion for a real mismatch.
-const STATS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
-const STATS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 const MESSAGE_PAYLOAD_SIZE_BYTES: u64 = 57;
 // The server accounts the actual on-disk batch framing: one 256-byte
@@ -111,7 +109,7 @@ fn create_messages(messages_count: u64) -> Vec<IggyMessage> {
         .collect()
 }
 
-/// Fetch the stream until its totals match or [`STATS_CONVERGENCE_TIMEOUT`]
+/// Fetch the stream until its totals match or [`CONVERGENCE_TIMEOUT`]
 /// expires, then assert on the last read.
 async fn validate_stream(
     client: &IggyClient,
@@ -119,7 +117,7 @@ async fn validate_stream(
     expected_size: u64,
     expected_messages_count: u64,
 ) {
-    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     let stream = loop {
         let stream = client
             .get_stream(&Identifier::named(stream_name).unwrap())
@@ -131,7 +129,7 @@ async fn validate_stream(
         {
             break stream;
         }
-        sleep(STATS_RETRY_INTERVAL).await;
+        sleep(RETRY_INTERVAL).await;
     };
     assert_eq!(stream.size, expected_size, "stream size mismatch");
     assert_eq!(
@@ -148,7 +146,7 @@ async fn validate_topic(
     expected_size: u64,
     expected_messages_count: u64,
 ) {
-    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     let topic = loop {
         let topic = client
             .get_topic(
@@ -163,7 +161,7 @@ async fn validate_topic(
         {
             break topic;
         }
-        sleep(STATS_RETRY_INTERVAL).await;
+        sleep(RETRY_INTERVAL).await;
     };
     assert_eq!(topic.size, expected_size, "topic size mismatch");
     assert_eq!(
@@ -179,7 +177,7 @@ async fn validate_system_stats(
     expected_size: u64,
     expected_messages_count: u64,
 ) {
-    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     let stats = loop {
         let stats = client.get_stats().await.unwrap();
         if (stats.messages_count == expected_messages_count
@@ -188,7 +186,7 @@ async fn validate_system_stats(
         {
             break stats;
         }
-        sleep(STATS_RETRY_INTERVAL).await;
+        sleep(RETRY_INTERVAL).await;
     };
     assert_eq!(
         stats.messages_count, expected_messages_count,
@@ -202,7 +200,7 @@ async fn validate_system_stats(
 }
 
 /// Poll until the partition serves `expected_count` messages or
-/// [`POLL_CONVERGENCE_TIMEOUT`] expires, returning the last poll result.
+/// [`CONVERGENCE_TIMEOUT`] expires, returning the last poll result.
 ///
 /// `send_messages` acks at consensus commit while the owning shard applies
 /// the batch asynchronously (see the materialisation race note at the top
@@ -217,7 +215,7 @@ async fn poll_until_expected_count(
     strategy: &PollingStrategy,
     expected_count: u32,
 ) -> PolledMessages {
-    let deadline = Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let polled = client
             .poll_messages(
@@ -234,7 +232,7 @@ async fn poll_until_expected_count(
         if polled.messages.len() as u32 == expected_count || Instant::now() >= deadline {
             return polled;
         }
-        sleep(POLL_RETRY_INTERVAL).await;
+        sleep(RETRY_INTERVAL).await;
     }
 }
 

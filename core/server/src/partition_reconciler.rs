@@ -580,12 +580,7 @@ async fn reconcile_additions(
     let partitions = ctx.shard.plane.partitions();
     let total_shards = u32::from(ctx.total_shards);
 
-    for TargetPartition {
-        ns,
-        epoch,
-        created_view,
-    } in target
-    {
+    for TargetPartition { ns, epoch } in target {
         if partitions.contains(&ns) {
             // Tombstoned but still in the map. Two cases, told apart by
             // whether teardown's disk delete succeeded:
@@ -660,6 +655,20 @@ async fn reconcile_additions(
         // bumps `Streams::revision`, which forces the next pass past the
         // fast-skip.
         if partitions.is_tombstoned(&ns) {
+            // Unless a teardown put it there. The mid-pass-recreate arm below
+            // tears down a prior life this shard never mounted, and a disk
+            // delete that failed leaves the tombstone standing with no
+            // `ConfirmRemove` behind it -- the same permanent fence the in-map
+            // branch above escapes, told apart by the same signal.
+            if ctx.has_pending_delete_failure(ns) {
+                trace!(
+                    shard = shard_id,
+                    ns_raw = ns.inner(),
+                    "additions: ns tombstoned before materialisation with a failed disk delete; re-driving teardown"
+                );
+                tear_down_owned_partition(ctx, ns, counters).await;
+                continue;
+            }
             trace!(
                 shard = shard_id,
                 ns_raw = ns.inner(),
@@ -727,7 +736,36 @@ async fn reconcile_additions(
             ctx.config
                 .system
                 .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
-        let built = if std::fs::metadata(&partition_dir).is_ok() {
+        let prior_life_on_disk = std::fs::metadata(&partition_dir).is_ok();
+
+        // The target was snapshotted before this read, so a delete plus a
+        // recreate of the same slab keys can commit in between. Everything
+        // below has to describe the incarnation the row will carry, so the
+        // committed record wins over the snapshot on both counts.
+        let created_revision = partition_metadata.created_revision;
+        let created_view = partition_metadata.created_view;
+        if created_revision != epoch {
+            trace!(
+                shard = shard_id,
+                ns_raw = ns.inner(),
+                target_epoch = epoch,
+                created_revision,
+                prior_life_on_disk,
+                "additions: recreate committed mid-pass; deferring the build to the next pass"
+            );
+            counters.deferred += 1;
+            // Skipping alone only settles it when nothing is on disk. With a
+            // directory there, the next pass takes the loader arm below and
+            // hydrates the NEW incarnation out of the OLD segments, so the
+            // prior life has to go first. Teardown tombstones until its
+            // `ConfirmRemove` lands, which is what holds that pass off.
+            if prior_life_on_disk {
+                tear_down_owned_partition(ctx, ns, counters).await;
+            }
+            continue;
+        }
+
+        let built = if prior_life_on_disk {
             load_partition_or_fence(
                 ctx.config.as_ref(),
                 ns,
@@ -746,7 +784,7 @@ async fn reconcile_additions(
                 ctx.config.as_ref(),
                 ns,
                 partition_stats,
-                epoch,
+                created_revision,
                 topic_runtime,
                 ctx.cluster_id,
                 ctx.self_replica_id,
@@ -762,7 +800,7 @@ async fn reconcile_additions(
                 ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                     namespace: ns,
                     partition: Box::new(partition),
-                    epoch,
+                    epoch: created_revision,
                 });
                 ctx.record_success(ns, FailureCause::Add);
                 counters.materialised += 1;
@@ -977,12 +1015,6 @@ async fn tear_down_owned_partition(
         partitions.tombstone(ns);
     }
     shards_table.remove(&ns);
-    // Registry entry only. The mounted partition's OWN counters are settled by
-    // the `ConfirmRemove` arm, which is the point where the partition value is
-    // dropped: a handler suspended mid-append resumes and increments through
-    // its cached handle, and anything settled before that drop leaves the
-    // increment in the parent totals with nothing left to roll it back.
-    settle_partition_stats(ctx, ns);
 
     if let Err(err) = delete_partitions_from_disk(
         ns.stream_id(),
@@ -1005,6 +1037,17 @@ async fn tear_down_owned_partition(
         return;
     }
 
+    // Registry entry only. The mounted partition's OWN counters are settled by
+    // the `ConfirmRemove` arm, which is the point where the partition value is
+    // dropped: a handler suspended mid-append resumes and increments through
+    // its cached handle, and anything settled before that drop leaves the
+    // increment in the parent totals with nothing left to roll it back.
+    //
+    // Paired with the enqueue, not with the fence above it: a failed disk
+    // delete returns without a `ConfirmRemove` behind it, and an entry already
+    // evicted would leave the still-mounted partition serving the registry-miss
+    // shape while its files are still there.
+    settle_partition_stats(ctx, ns);
     ctx.shard
         .enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace: ns });
     ctx.record_success(ns, FailureCause::Delete);
@@ -1222,9 +1265,6 @@ struct TargetPartition {
     /// partition: [`fetch_partition_build_inputs`] re-reads committed metadata
     /// for the namespaces actually built, and takes the stats there.
     epoch: u64,
-    /// The view a fresh materialisation seeds its consensus group with; see
-    /// `build_partition_fresh`.
-    created_view: u32,
 }
 
 /// Every committed partition, as the additions pass needs it.
@@ -1241,7 +1281,6 @@ fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<TargetPartition> {
                     entries.push(TargetPartition {
                         ns: IggyNamespace::new(stream.id, topic_id, partition.id),
                         epoch: partition.created_revision,
-                        created_view: partition.created_view,
                     });
                 }
             }
@@ -1273,6 +1312,16 @@ fn current_revision(ctx: &ReconcilerCtx) -> u64 {
 /// seeds that gate from the committed partition.)
 ///
 /// The mounted partition's own handle is settled later, on `ConfirmRemove`.
+///
+/// The window this opens, on the teardown-for-rebuild path only. Between this
+/// eviction and the rebuild's get-or-create a pass later, `partition_get`
+/// answers `None`, so every reply builder serves the registry-miss shape for
+/// the namespace (no segments, offset 0) and its parents read low by whatever
+/// the dead incarnation held. Deliberate: the alternative is carrying a
+/// materialisation signal through the registry so readers could tell "not
+/// mounted here" from "empty", and the numbers are wrong either way while the
+/// rebuild is pending. The rebuild folds the on-disk delta back in and the
+/// window closes on its own; a delete has no rebuild and so no window.
 fn settle_partition_stats(ctx: &ReconcilerCtx, ns: IggyNamespace) {
     ctx.stats_registry
         .remove_partitions(ns.stream_id(), ns.topic_id(), &[ns.partition_id()]);
@@ -2001,9 +2050,16 @@ mod tests {
     /// The metadata apply rolls a deleted partition out of its parents at
     /// commit, but the partition stays mounted until the reconciler tears it
     /// down, and appends in that window land in parents with no entry left to
-    /// account for them. Teardown is where that residue gets settled.
+    /// account for them. The `ConfirmRemove` arm is where that residue gets
+    /// settled: it drops the partition value, so it is the last moment a
+    /// suspended handler can still increment through its cached handle.
+    ///
+    /// Named for the drop point because that is what it holds: the apply had
+    /// already evicted the entry here, so [`settle_partition_stats`] finds
+    /// nothing and the rollback comes from the mounted partition's own handle
+    /// in `shard`'s pump. The eviction is guarded by the sibling test below.
     #[compio::test]
-    async fn teardown_settles_the_residue_the_metadata_delete_could_not_reach() {
+    async fn confirm_remove_rolls_back_what_the_metadata_delete_could_not_reach() {
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let mux = TestMux::default();
@@ -2033,13 +2089,13 @@ mod tests {
         assert_eq!(
             stream_size(&ctx),
             0,
-            "teardown must settle what landed after the commit that acked the delete"
+            "the drop point must roll back what landed after the commit that acked the delete"
         );
     }
 
-    /// The eviction half of the teardown settle, which the test above cannot
-    /// reach: there the metadata apply had already dropped the entry, so the
-    /// rollback came from the mounted partition's own handle. A stale
+    /// [`settle_partition_stats`], the half the test above cannot reach: there
+    /// the metadata apply had already dropped the entry, so the rollback came
+    /// from the mounted partition's own handle at the drop point. A stale
     /// incarnation left by a slab-key reuse still holds an entry the apply
     /// never named, and it has to go, or the rebuild's get-or-create inherits
     /// the dead incarnation's counters.

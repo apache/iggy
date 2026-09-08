@@ -88,13 +88,10 @@ async fn stream_size_validation(harness: &TestHarness) {
     stream_size_validation_scenario::run(harness).await;
 }
 
-#[iggy_harness(
-    test_client_transport = [Tcp, Http, Quic, WebSocket],
-    server(
-        quic.max_idle_timeout = "500s",
-        quic.keep_alive_interval = "15s"
-    )
-)]
+// One transport: the scenario asserts server-side rollback arithmetic, and
+// every call it makes (`get_stream`, `get_topic`, `get_stats`) is already
+// exercised on all four transports by the scenarios above.
+#[iggy_harness(test_client_transport = [Tcp])]
 async fn delete_stats_rollback(harness: &TestHarness) {
     delete_stats_rollback_scenario::run(harness).await;
 }

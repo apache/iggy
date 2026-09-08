@@ -21,8 +21,9 @@ use std::sync::{
 };
 use tracing::warn;
 
-/// Number of rollup decrements that could not be covered by the counter they
-/// were subtracted from.
+/// Process-wide number of rollup decrements that could not be covered by the
+/// counter they were subtracted from. One static for the whole node, summed
+/// across every stream, topic and partition it holds.
 ///
 /// A decrement bigger than the total it targets means the tree lost
 /// `parent >= sum(children)` somewhere upstream. The counters are unsigned, so
@@ -38,14 +39,15 @@ use tracing::warn;
 /// and that the aggregate needs a rebuild rather than time.
 static ROLLUP_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
 
-/// Monotonic count of clamped rollup decrements. Surfaced on `/metrics` so the
-/// clamp is alertable rather than log-grep-able.
+/// Monotonic process-wide count of clamped rollup decrements. Surfaced on
+/// `/metrics` so the clamp is alertable rather than log-grep-able.
 ///
-/// Hidden from the docs: `iggy_common` re-exports this module at its root, and
-/// a server-only diagnostic has no business in the published SDK surface.
-#[doc(hidden)]
+/// Named for the root it is reached from, not for this module: `iggy_common`
+/// globs the module into its crate root, so a bare `rollup_underflows` would
+/// sit in the published SDK surface next to the stream and topic types saying
+/// nothing about which rollup it counts.
 #[must_use]
-pub fn rollup_underflows() -> u64 {
+pub fn stats_rollup_underflows() -> u64 {
     ROLLUP_UNDERFLOWS.load(Ordering::Relaxed)
 }
 
@@ -73,15 +75,22 @@ impl UnderflowSite {
     /// lines per counter per rollback and a bulk delete turns that into a
     /// flood, so a shared count would hold a quiet pair's first-ever
     /// divergence back for up to 1023 events behind a noisy one.
+    ///
+    /// Both counts go on the line. `clamped` is this pair's, `total` is the
+    /// process-wide one [`stats_rollup_underflows`] exports, which carries no
+    /// scope or counter label -- without both an operator cannot tell which
+    /// pair moved the metric.
     fn report(&self, shortfall: u64) {
-        ROLLUP_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+        let total = ROLLUP_UNDERFLOWS.fetch_add(1, Ordering::Relaxed) + 1;
         let clamped = self.clamped.fetch_add(1, Ordering::Relaxed) + 1;
         if clamped.is_power_of_two() {
             warn!(
+                target: "iggy.stats.diag",
                 scope = self.scope,
                 counter = self.counter,
                 shortfall,
                 clamped,
+                total,
                 "rollup decrement exceeded the total it was subtracted from; clamped at zero"
             );
         }
@@ -110,7 +119,11 @@ macro_rules! clamped_sub {
         fn $name(counter: &$counter, amount: $amount, site: &'static UnderflowSite) -> $amount {
             let previous = counter
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some(current.saturating_sub(amount))
+                    // `None` on an already-zero counter: no store, and the
+                    // `Err` it returns carries that same zero, so the clamp
+                    // reports identically either way. That is the steady shape
+                    // for a scope whose rollback has already run.
+                    (current != 0).then(|| current.saturating_sub(amount))
                 })
                 .unwrap_or_else(|previous| previous);
             if previous < amount {
@@ -146,21 +159,20 @@ impl StreamStats {
             .fetch_add(segments_count, Ordering::AcqRel);
     }
 
-    /// Returns the shortfall -- how much of `size_bytes` this counter did not
-    /// hold -- so a caller that knows the ids can name where the divergence is.
-    /// Zero whenever the decrement was covered.
-    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
-        size_bytes - clamped_sub_u64(&self.size_bytes, size_bytes, &STREAM_SIZE_BYTES)
+    // A stream is the root, so a clamp here has nowhere left to be forwarded
+    // and no caller that could name a scope the `warn!` in `UnderflowSite`
+    // does not already carry. Only `PartitionStats` returns its shortfall,
+    // where the caller holds the namespace.
+    pub fn decrement_size_bytes(&self, size_bytes: u64) {
+        clamped_sub_u64(&self.size_bytes, size_bytes, &STREAM_SIZE_BYTES);
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
-        messages_count
-            - clamped_sub_u64(&self.messages_count, messages_count, &STREAM_MESSAGES_COUNT)
+    pub fn decrement_messages_count(&self, messages_count: u64) {
+        clamped_sub_u64(&self.messages_count, messages_count, &STREAM_MESSAGES_COUNT);
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
-        segments_count
-            - clamped_sub_u32(&self.segments_count, segments_count, &STREAM_SEGMENTS_COUNT)
+    pub fn decrement_segments_count(&self, segments_count: u32) {
+        clamped_sub_u32(&self.segments_count, segments_count, &STREAM_SEGMENTS_COUNT);
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -230,45 +242,21 @@ impl TopicStats {
         self.parent.clone()
     }
 
-    pub fn increment_parent_size_bytes(&self, size_bytes: u64) {
-        self.parent.increment_size_bytes(size_bytes);
-    }
-
-    pub fn increment_parent_messages_count(&self, messages_count: u64) {
-        self.parent.increment_messages_count(messages_count);
-    }
-
-    pub fn increment_parent_segments_count(&self, segments_count: u32) {
-        self.parent.increment_segments_count(segments_count);
-    }
-
     pub fn increment_size_bytes(&self, size_bytes: u64) {
         self.size_bytes.fetch_add(size_bytes, Ordering::AcqRel);
-        self.increment_parent_size_bytes(size_bytes);
+        self.parent.increment_size_bytes(size_bytes);
     }
 
     pub fn increment_messages_count(&self, messages_count: u64) {
         self.messages_count
             .fetch_add(messages_count, Ordering::AcqRel);
-        self.increment_parent_messages_count(messages_count);
+        self.parent.increment_messages_count(messages_count);
     }
 
     pub fn increment_segments_count(&self, segments_count: u32) {
         self.segments_count
             .fetch_add(segments_count, Ordering::AcqRel);
-        self.increment_parent_segments_count(segments_count);
-    }
-
-    pub fn decrement_parent_size_bytes(&self, size_bytes: u64) {
-        self.parent.decrement_size_bytes(size_bytes);
-    }
-
-    pub fn decrement_parent_messages_count(&self, messages_count: u64) {
-        self.parent.decrement_messages_count(messages_count);
-    }
-
-    pub fn decrement_parent_segments_count(&self, segments_count: u32) {
-        self.parent.decrement_segments_count(segments_count);
+        self.parent.increment_segments_count(segments_count);
     }
 
     // Forward what this level actually gave up, not what was asked for. A
@@ -276,26 +264,19 @@ impl TopicStats {
     // this subtree, so the ancestors do not hold them either -- passing the
     // full amount up would take them out of a sibling's live data instead.
     // Under `parent == sum(children)` the two are equal and nothing changes.
-    //
-    // Each returns this level's shortfall -- how much of the amount it did not
-    // hold, zero when the decrement was covered -- so a caller that knows the
-    // ids can name where the divergence is.
-    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
+    pub fn decrement_size_bytes(&self, size_bytes: u64) {
         let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &TOPIC_SIZE_BYTES);
-        self.decrement_parent_size_bytes(taken);
-        size_bytes - taken
+        self.parent.decrement_size_bytes(taken);
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
+    pub fn decrement_messages_count(&self, messages_count: u64) {
         let taken = clamped_sub_u64(&self.messages_count, messages_count, &TOPIC_MESSAGES_COUNT);
-        self.decrement_parent_messages_count(taken);
-        messages_count - taken
+        self.parent.decrement_messages_count(taken);
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
+    pub fn decrement_segments_count(&self, segments_count: u32) {
         let taken = clamped_sub_u32(&self.segments_count, segments_count, &TOPIC_SEGMENTS_COUNT);
-        self.decrement_parent_segments_count(taken);
-        segments_count - taken
+        self.parent.decrement_segments_count(taken);
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -372,30 +353,18 @@ impl PartitionStats {
 
     pub fn increment_size_bytes(&self, size_bytes: u64) {
         self.size_bytes.fetch_add(size_bytes, Ordering::AcqRel);
-        self.increment_parent_size_bytes(size_bytes);
+        self.parent.increment_size_bytes(size_bytes);
     }
 
     pub fn increment_messages_count(&self, messages_count: u64) {
         self.messages_count
             .fetch_add(messages_count, Ordering::AcqRel);
-        self.increment_parent_messages_count(messages_count);
+        self.parent.increment_messages_count(messages_count);
     }
 
     pub fn increment_segments_count(&self, segments_count: u32) {
         self.segments_count
             .fetch_add(segments_count, Ordering::AcqRel);
-        self.increment_parent_segments_count(segments_count);
-    }
-
-    pub fn increment_parent_size_bytes(&self, size_bytes: u64) {
-        self.parent.increment_size_bytes(size_bytes);
-    }
-
-    pub fn increment_parent_messages_count(&self, messages_count: u64) {
-        self.parent.increment_messages_count(messages_count);
-    }
-
-    pub fn increment_parent_segments_count(&self, segments_count: u32) {
         self.parent.increment_segments_count(segments_count);
     }
 
@@ -410,7 +379,7 @@ impl PartitionStats {
     // ids can name where the divergence is.
     pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
         let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &PARTITION_SIZE_BYTES);
-        self.decrement_parent_size_bytes(taken);
+        self.parent.decrement_size_bytes(taken);
         size_bytes - taken
     }
 
@@ -420,7 +389,7 @@ impl PartitionStats {
             messages_count,
             &PARTITION_MESSAGES_COUNT,
         );
-        self.decrement_parent_messages_count(taken);
+        self.parent.decrement_messages_count(taken);
         messages_count - taken
     }
 
@@ -430,20 +399,8 @@ impl PartitionStats {
             segments_count,
             &PARTITION_SEGMENTS_COUNT,
         );
-        self.decrement_parent_segments_count(taken);
+        self.parent.decrement_segments_count(taken);
         segments_count - taken
-    }
-
-    pub fn decrement_parent_size_bytes(&self, size_bytes: u64) {
-        self.parent.decrement_size_bytes(size_bytes);
-    }
-
-    pub fn decrement_parent_messages_count(&self, messages_count: u64) {
-        self.parent.decrement_messages_count(messages_count);
-    }
-
-    pub fn decrement_parent_segments_count(&self, segments_count: u32) {
-        self.parent.decrement_segments_count(segments_count);
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -524,7 +481,7 @@ mod tests {
     /// back. Those bytes are not in the parents any more, and taking them again
     /// would take a live sibling's instead.
     #[test]
-    fn given_a_late_decrement_on_a_rolled_back_partition_should_leave_siblings_alone() {
+    fn given_a_rolled_back_partition_when_a_late_decrement_arrives_should_leave_siblings_alone() {
         let stream = Arc::new(StreamStats::default());
         let topic = Arc::new(TopicStats::new(stream.clone()));
         let survivor = Arc::new(PartitionStats::new(topic.clone()));
@@ -584,8 +541,9 @@ mod tests {
 
         partition.zero_out_all();
 
-        // u32 wraps at a different modulus than the two u64 counters, so it
-        // needs its own coverage.
+        // `clamped_sub!` expands separately per width, so the u32 counter is
+        // its own wiring: same `saturating_sub` body, its own `UnderflowSite`
+        // and its own call sites at all three levels.
         assert_eq!(topic.segments_count_inconsistent(), 0);
         assert_eq!(stream.segments_count_inconsistent(), 0);
     }
