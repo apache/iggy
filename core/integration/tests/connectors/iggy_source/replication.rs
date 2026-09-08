@@ -22,7 +22,8 @@ use iggy::prelude::{
     Partitioning,
 };
 use iggy_common::{
-    Consumer, Identifier, MessageClient, PollingStrategy, StreamClient, TopicClient,
+    Consumer, Identifier, MessageClient, PartitionClient, PollingStrategy, StreamClient,
+    TopicClient,
 };
 use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use integration::harness::{
@@ -31,6 +32,7 @@ use integration::harness::{
 };
 use integration::iggy_harness;
 use reqwest::Client;
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +42,7 @@ const API_KEY: &str = "test-api-key";
 const SOURCE_KEY: &str = "iggy";
 const UPSTREAM_STREAM: &str = "upstream_stream";
 const UPSTREAM_TOPIC: &str = "upstream_topic";
+const MULTI_PARTITION_COUNT: u32 = 3;
 const TEST_MESSAGE_COUNT: usize = 5;
 const POLL_ATTEMPTS: usize = 200;
 const POLL_INTERVAL_MS: u64 = 50;
@@ -56,6 +59,13 @@ const INCLUDE_USER_HEADERS_ENV: &str =
 /// `connection_string` is injected through the runtime env override.
 pub struct IggySourceUpstreamFixture {
     upstream: ServerHandle,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersistedIggySourceState {
+    offsets: HashMap<u32, u64>,
+    messages_synced: u64,
+    errors_count: u64,
 }
 
 #[async_trait]
@@ -153,10 +163,22 @@ impl IggySourceUpstreamFixture {
     }
 
     pub async fn produce_messages(&self, client: &IggyClient, payloads: &[String]) {
+        self.produce_messages_to_partition(client, 0, 0, payloads)
+            .await;
+    }
+
+    pub async fn produce_messages_to_partition(
+        &self,
+        client: &IggyClient,
+        partition_id: u32,
+        sequence_start: u64,
+        payloads: &[String],
+    ) {
         let mut messages = payloads
             .iter()
             .enumerate()
             .map(|(i, payload)| {
+                let sequence = sequence_start + i as u64;
                 let mut headers = BTreeMap::new();
                 headers.insert(
                     HeaderKey::try_from(HEADER_PRODUCER_KEY).expect("valid header key"),
@@ -164,25 +186,31 @@ impl IggySourceUpstreamFixture {
                 );
                 headers.insert(
                     HeaderKey::try_from(HEADER_SEQ_KEY).expect("valid header key"),
-                    (i as u64).into(),
+                    sequence.into(),
                 );
                 IggyMessage::builder()
-                    .id((i as u128) + 1)
+                    .id(u128::from(sequence) + 1)
                     .payload(Bytes::from(payload.clone()))
                     .user_headers(headers)
                     .build()
                     .expect("Failed to build upstream message")
             })
             .collect::<Vec<_>>();
-        self.produce_iggy_messages(client, &mut messages).await;
+        self.produce_iggy_messages(client, partition_id, &mut messages)
+            .await;
     }
 
-    async fn produce_iggy_messages(&self, client: &IggyClient, messages: &mut [IggyMessage]) {
+    async fn produce_iggy_messages(
+        &self,
+        client: &IggyClient,
+        partition_id: u32,
+        messages: &mut [IggyMessage],
+    ) {
         client
             .send_messages(
                 &Identifier::named(UPSTREAM_STREAM).expect("valid stream name"),
                 &Identifier::named(UPSTREAM_TOPIC).expect("valid topic name"),
-                &Partitioning::partition_id(0),
+                &Partitioning::partition_id(partition_id),
                 messages,
             )
             .await
@@ -339,6 +367,40 @@ async fn wait_for_connector_log(harness: &TestHarness, marker: &str) {
     .expect("Iggy source did not log the expected message build failure");
 }
 
+async fn wait_for_source_state(
+    harness: &TestHarness,
+    expected_offsets: &HashMap<u32, u64>,
+    expected_messages_synced: u64,
+    minimum_errors: u64,
+) -> PersistedIggySourceState {
+    let state_path = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .state_path()
+        .join("source_iggy.state");
+
+    timeout(WAIT_TIMEOUT, async {
+        loop {
+            if let Ok(bytes) = tokio::fs::read(&state_path).await
+                && let Ok(state) = rmp_serde::from_slice::<PersistedIggySourceState>(&bytes)
+                && state.offsets == *expected_offsets
+                && state.messages_synced == expected_messages_synced
+                && state.errors_count >= minimum_errors
+            {
+                break state;
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "Iggy source state did not reach offsets {expected_offsets:?}, synced count \
+             {expected_messages_synced}, and at least {minimum_errors} error(s)"
+        )
+    })
+}
+
 #[iggy_harness(
     cluster_nodes = 1,
     server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
@@ -402,7 +464,7 @@ async fn malformed_user_headers_do_not_advance_source_offset(
             .expect("test message should be valid"),
     ];
     fixture
-        .produce_iggy_messages(&upstream_client, &mut blocked_batch)
+        .produce_iggy_messages(&upstream_client, 0, &mut blocked_batch)
         .await;
     wait_for_connector_log(harness, "Failed to convert upstream message at offset 1").await;
 
@@ -435,6 +497,136 @@ async fn malformed_user_headers_do_not_advance_source_offset(
         ],
         "The malformed offset and its tail should be replayed after restart"
     );
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn multiple_upstream_partitions_resume_from_independent_offsets(
+    harness: &mut TestHarness,
+    fixture: IggySourceUpstreamFixture,
+) {
+    let upstream_client = fixture.client().await.expect("upstream client");
+    fixture.ensure_upstream_topic(&upstream_client).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    let stream_id = Identifier::named(UPSTREAM_STREAM).expect("valid stream name");
+    let topic_id = Identifier::named(UPSTREAM_TOPIC).expect("valid topic name");
+    upstream_client
+        .create_partitions(
+            &stream_id,
+            &topic_id,
+            MULTI_PARTITION_COUNT.saturating_sub(1),
+        )
+        .await
+        .expect("Failed to create upstream partitions");
+    let topic = upstream_client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("Failed to fetch upstream topic")
+        .expect("Upstream topic should exist");
+    assert_eq!(topic.partitions_count, MULTI_PARTITION_COUNT);
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let partition_payloads = [
+        vec!["partition-0-message-0".to_string()],
+        vec![
+            "partition-1-message-0".to_string(),
+            "partition-1-message-1".to_string(),
+        ],
+        vec![
+            "partition-2-message-0".to_string(),
+            "partition-2-message-1".to_string(),
+            "partition-2-message-2".to_string(),
+        ],
+    ];
+    for (partition_id, payloads) in partition_payloads.iter().enumerate() {
+        fixture
+            .produce_messages_to_partition(
+                &upstream_client,
+                partition_id as u32,
+                (partition_id as u64) * 100,
+                payloads,
+            )
+            .await;
+    }
+
+    let initial_message_count = partition_payloads.iter().map(Vec::len).sum::<usize>();
+    let initial_received = drain_downstream_topic(
+        harness,
+        "iggy_source_multiple_partitions_before_restart",
+        initial_message_count,
+    )
+    .await;
+    let mut initial_actual = initial_received
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect::<Vec<_>>();
+    let mut initial_expected = partition_payloads
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    initial_actual.sort();
+    initial_expected.sort();
+    assert_eq!(initial_actual, initial_expected);
+
+    let initial_offsets = HashMap::from([(0, 0), (1, 1), (2, 2)]);
+    wait_for_source_state(harness, &initial_offsets, initial_message_count as u64, 0).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    let resumed_payloads = [
+        "partition-0-after-restart".to_string(),
+        "partition-1-after-restart".to_string(),
+        "partition-2-after-restart".to_string(),
+    ];
+    for (partition_id, payload) in resumed_payloads.iter().enumerate() {
+        fixture
+            .produce_messages_to_partition(
+                &upstream_client,
+                partition_id as u32,
+                1_000 + partition_id as u64,
+                std::slice::from_ref(payload),
+            )
+            .await;
+    }
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let total_message_count = initial_message_count + resumed_payloads.len();
+    let received_after_restart = drain_downstream_topic(
+        harness,
+        "iggy_source_multiple_partitions_after_restart",
+        total_message_count,
+    )
+    .await;
+    let mut actual_after_restart = received_after_restart
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect::<Vec<_>>();
+    let mut expected_after_restart = initial_expected;
+    expected_after_restart.extend(resumed_payloads);
+    actual_after_restart.sort();
+    expected_after_restart.sort();
+    assert_eq!(actual_after_restart, expected_after_restart);
+
+    let resumed_offsets = HashMap::from([(0, 1), (1, 2), (2, 3)]);
+    wait_for_source_state(harness, &resumed_offsets, total_message_count as u64, 0).await;
 }
 
 #[iggy_harness(

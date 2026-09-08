@@ -7836,6 +7836,7 @@ dependencies = [
  "reqwest-retry",
  "ring",
  "rmcp",
+ "rmp-serde",
  "rust-s3",
  "secrecy",
  "serde",
