@@ -903,8 +903,6 @@ clients_table_max = 8192
 # completed batch, prepare, checkpoint and error counters.
 wal_bytes_max = "256 MiB"
 
-# Directory relative to the topic path. The default layout remains streams/<stream>/topics/<topic>/partitions/<partition>.
-path = "partitions"
 # Verify the checksum of batches read from segment storage. A mismatch is reported rather than served.
 validate_checksum = true
 

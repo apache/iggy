@@ -63,12 +63,11 @@ impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ wal_bytes_max: {}, path: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
+            "{{ wal_bytes_max: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
              offset_reservation_lease: {}, \
              evicted_ring_capacity: {}, evicted_ring_bytes_max: {}, \
              transfer_served_cache_bytes_max: {}, transfer_artifact_bytes_max: {} }}",
             self.wal_bytes_max,
-            self.path,
             self.validate_checksum,
             self.prepare_queue_depth,
             self.dedup_clients_max,

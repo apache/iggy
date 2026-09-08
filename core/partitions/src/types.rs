@@ -342,10 +342,6 @@ pub enum RepairConclusion {
 pub struct PartitionPathLayout {
     /// `{path}/streams`: the directory holding per-stream dirs.
     pub streams_root: String,
-    /// Directory name of the per-topic level, fixed to `topics` by the server.
-    pub topics_dir: String,
-    /// Directory name of the per-partition level (`partition.path`).
-    pub partitions_dir: String,
 }
 
 /// Synthetic layout for tests and the simulator, where paths only key the
@@ -355,8 +351,6 @@ impl Default for PartitionPathLayout {
     fn default() -> Self {
         Self {
             streams_root: "/tmp/iggy_stub/streams".to_string(),
-            topics_dir: "topics".to_string(),
-            partitions_dir: "partitions".to_string(),
         }
     }
 }
@@ -403,10 +397,8 @@ impl PartitionsConfig {
         partition_id: usize,
     ) -> String {
         format!(
-            "{}/{stream_id}/{}/{topic_id}/{}/{partition_id}",
+            "{}/{stream_id}/topics/{topic_id}/partitions/{partition_id}",
             self.path_layout.streams_root,
-            self.path_layout.topics_dir,
-            self.path_layout.partitions_dir,
         )
     }
 

@@ -152,8 +152,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
             encryptor,
             path_layout: partitions::PartitionPathLayout {
                 streams_root: config.get_streams_path(),
-                topics_dir: "topics".to_owned(),
-                partitions_dir: config.partition.path.clone(),
             },
         },
         owned_partitions_capacity,
@@ -683,6 +681,33 @@ pub(in crate::boot) fn restore_metadata_consensus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_runtime_and_server_use_the_same_fixed_directory_layout() {
+        let server = ServerConfig {
+            path: "/var/lib/iggy".to_owned(),
+            ..ServerConfig::default()
+        };
+        let partition = PartitionsConfig {
+            messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+            size_of_messages_required_to_save: IggyByteSize::from(
+                iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            validate_checksum: server.partition.validate_checksum,
+            segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            encryptor: None,
+            path_layout: partitions::PartitionPathLayout {
+                streams_root: server.get_streams_path(),
+            },
+        };
+        for (stream, topic, id) in [(0, 0, 0), (1, 2, 3), (23, 45, 67)] {
+            assert_eq!(
+                server.get_partition_path(stream, topic, id),
+                partition.get_partition_path(stream, topic, id)
+            );
+        }
+    }
 
     #[test]
     fn superblock_fatal_window_converts_to_capped_backoff_retries() {

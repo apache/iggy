@@ -73,6 +73,11 @@ const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 /// enough. The partition knobs matter most: they are create-only options now,
 /// so a topic that boots without one can never be given it afterwards.
 const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
+    // Refuse obsolete layout overrides instead of silently reading another directory.
+    RelocatedKey {
+        path: "partition.path",
+        replacement: RelocatedTarget::Removed,
+    },
     RelocatedKey {
         path: "system.path",
         replacement: RelocatedTarget::MovedTo("path"),
@@ -336,11 +341,7 @@ impl ServerConfig {
     }
 
     pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
-        format!(
-            "{}/{}",
-            self.get_topic_path(stream_id, topic_id),
-            self.partition.path
-        )
+        format!("{}/partitions", self.get_topic_path(stream_id, topic_id))
     }
 
     pub fn get_partition_path(
@@ -483,6 +484,19 @@ mod tests {
     #[test]
     fn env_prefix_is_iggy() {
         assert_eq!(ServerConfig::ENV_PREFIX, "IGGY_");
+    }
+
+    #[test]
+    fn data_root_uses_fixed_stream_topic_and_partition_directories() {
+        let config = ServerConfig {
+            path: "/var/lib/iggy".to_owned(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            config.get_partition_path(1, 2, 3),
+            "/var/lib/iggy/streams/1/topics/2/partitions/3"
+        );
+        assert!(!ServerConfig::all_env_var_names().contains(&"IGGY_PARTITION_PATH"));
     }
 
     #[test]

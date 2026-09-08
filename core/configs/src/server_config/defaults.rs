@@ -188,7 +188,6 @@ impl Default for PartitionConfig {
                 .wal_bytes_max
                 .parse()
                 .expect("embedded WAL capacity is valid"),
-            path: SERVER_CONFIG.partition.path.to_owned(),
             validate_checksum: SERVER_CONFIG.partition.validate_checksum,
             prepare_queue_depth: partition.prepare_queue_depth as usize,
             dedup_clients_max: partition.dedup_clients_max as usize,

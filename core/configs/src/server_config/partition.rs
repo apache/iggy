@@ -172,8 +172,6 @@ pub struct PartitionConfig {
     #[serde(default = "default_wal_bytes_max")]
     #[config_env(leaf)]
     pub wal_bytes_max: IggyByteSize,
-    #[serde(default = "default_partition_path")]
-    pub path: String,
     #[serde(default = "default_validate_checksum")]
     pub validate_checksum: bool,
     /// Depth of a partition's prepare queue: how many uncommitted produce /
@@ -355,10 +353,6 @@ impl Validatable<ConfigurationError> for PartitionConfig {
         }
         Ok(())
     }
-}
-
-fn default_partition_path() -> String {
-    super::defaults::SERVER_CONFIG.partition.path.to_owned()
 }
 
 const fn default_validate_checksum() -> bool {
