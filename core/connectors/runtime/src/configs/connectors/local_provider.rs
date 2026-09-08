@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::configs::connectors::{
-    ConnectorConfig, ConnectorConfigVersionInfo, ConnectorConfigVersions, ConnectorsConfig,
-    ConnectorsConfigProvider, CreateSinkConfig, CreateSourceConfig, SinkConfig, SourceConfig,
+    ConnectorConfig, ConnectorConfigVersionInfo, ConnectorConfigVersions, ConnectorKey,
+    ConnectorsConfig, ConnectorsConfigProvider, CreateSinkConfig, CreateSourceConfig, SinkConfig,
+    SourceConfig,
 };
 use crate::error::RuntimeError;
 use ::configs::{ConfigProvider, FileConfigProvider, TypedEnvProvider};
@@ -392,18 +393,18 @@ impl BaseConnectorConfig {
 impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
     async fn create_sink_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         cmd: CreateSinkConfig,
     ) -> Result<SinkConfig, RuntimeError> {
         let sinks = self.state.connectors_config.sinks();
         let next_version = sinks
             .iter()
-            .filter(|entry| entry.key().key == key)
+            .filter(|entry| entry.key().key == key.as_str())
             .max_by_key(|entry| entry.config.version)
             .map(|entry| entry.config.version + 1)
             .unwrap_or(0);
 
-        let config = cmd.to_sink_config(key, next_version);
+        let config = cmd.into_sink_config(key, next_version);
         let connector_config = ConnectorConfig::Sink(config.clone());
         let connector_id: ConnectorId = (&connector_config).into();
 
@@ -418,7 +419,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
             SinkConfigFile {
                 config: config.clone(),
                 created_at: Utc::now(),
-                path: path.clone(),
+                path,
             },
         );
 
@@ -427,18 +428,18 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
 
     async fn create_source_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         cmd: CreateSourceConfig,
     ) -> Result<SourceConfig, RuntimeError> {
         let sources = &self.state.connectors_config.sources;
         let next_version = sources
             .iter()
-            .filter(|entry| entry.key().key == key)
+            .filter(|entry| entry.key().key == key.as_str())
             .max_by_key(|entry| entry.config.version)
             .map(|entry| entry.config.version + 1)
             .unwrap_or(0);
 
-        let config = cmd.to_source_config(key, next_version);
+        let config = cmd.into_source_config(key, next_version);
         let connector_config = ConnectorConfig::Source(config.clone());
         let connector_id: ConnectorId = (&connector_config).into();
 
@@ -453,7 +454,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
             SourceConfigFile {
                 config: config.clone(),
                 created_at: Utc::now(),
-                path: path.clone(),
+                path,
             },
         );
 
@@ -849,5 +850,34 @@ impl Provider for ConnectorEnvProvider {
                 .deserialize_with_runtime_prefix()
                 .map_err(|e| figment::Error::from(format!("Failed to deserialize env vars: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn given_valid_key_when_creating_source_config_should_write_prefixed_file() {
+        let dir = TempDir::new().unwrap();
+        let provider = LocalConnectorsConfigProvider::new(dir.path().to_str().unwrap())
+            .init()
+            .await
+            .unwrap();
+        let key: ConnectorKey = "random".parse().unwrap();
+
+        let config = provider
+            .create_source_config(&key, CreateSourceConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(config.key, "random");
+        assert_eq!(config.version, 0);
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["source_random_0.toml"]);
     }
 }

@@ -25,13 +25,12 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
-use crate::responses::resolve_partition_namespace;
+use crate::responses::{resolve_offset_group_id, resolve_partition_namespace};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     JoinConsumerGroupRequest as WireJoinConsumerGroupRequest,
     LeaveConsumerGroupRequest as WireLeaveConsumerGroupRequest,
@@ -226,16 +225,21 @@ where
     let body = request_body(&request);
     // The store/delete ops differ only in the decode type; this collapses
     // their identical decode -> resolve group id -> rewrite consumer id ->
-    // re-encode bodies. A non-group consumer or unresolved group returns the
-    // request untouched (the apply/read path handles the miss).
+    // re-encode bodies. Individual consumers pass through. A group identifier
+    // that metadata cannot resolve is rejected before it can create a raw file
+    // in the group-offset directory.
     macro_rules! rewrite_group_offset {
         ($ty:ty) => {{
             let mut wire = <$ty>::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            let Some(group_id) =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-            else {
+            if wire.consumer.kind != KIND_CONSUMER_GROUP {
                 return Ok(request);
-            };
+            }
+            let group_id = resolve_offset_group_id(
+                shard.plane.metadata().mux_stm.streams(),
+                &wire.stream_id,
+                &wire.topic_id,
+                &wire.consumer.id,
+            )?;
             // The partition-plane group-offset key is u32 (see the documented
             // ceiling on `Topic::next_consumer_group_id`). Clamp on the
             // ~4-billion-creates overflow rather than panic this live
@@ -253,30 +257,4 @@ where
     };
 
     rewrite_request_body(&request, &rewritten)
-}
-
-/// Resolve the monotonic group id for a group consumer-offset op, or `None` for
-/// an individual consumer (kind != 2) / unresolved group (leave the body as-is;
-/// the apply / read path handle the miss).
-fn resolve_group_offset_id<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    consumer: &WireConsumer,
-    namespace: (&WireIdentifier, &WireIdentifier),
-) -> Option<u64>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    if consumer.kind != KIND_CONSUMER_GROUP {
-        return None;
-    }
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .resolve_consumer_group_id(namespace.0, namespace.1, &consumer.id)
 }

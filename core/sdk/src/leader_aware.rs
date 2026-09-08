@@ -355,6 +355,8 @@ fn normalize_address(addr: &str) -> String {
 /// failed dial cannot cycle the request back through nodes it already tried.
 #[derive(Debug)]
 pub(crate) struct RosterWalk {
+    /// Whether the roster named at least one node when the walk was built.
+    roster_known: bool,
     remaining: VecDeque<String>,
     attempted: Vec<String>,
 }
@@ -382,6 +384,7 @@ impl RosterWalk {
         Self {
             remaining: ordered,
             attempted: vec![current.to_owned()],
+            roster_known: !roster.is_empty(),
         }
     }
 
@@ -405,6 +408,13 @@ impl RosterWalk {
         let endpoint = self.remaining.pop_front()?;
         self.attempted.push(endpoint.clone());
         Some(endpoint)
+    }
+
+    /// True only when the roster itself names one node. An empty roster (its
+    /// discovery failed) also leaves nothing to walk, but replaying that one
+    /// address would be a guess, not a decision.
+    pub(crate) fn is_single_endpoint(&self) -> bool {
+        self.roster_known && self.remaining.is_empty() && self.attempted.len() == 1
     }
 }
 
@@ -777,11 +787,26 @@ mod tests {
         assert_eq!(walk.next().as_deref(), Some("10.0.0.2:8090"));
         assert_eq!(walk.next().as_deref(), Some("10.0.0.3:8090"));
         assert_eq!(walk.next(), None);
+        assert!(
+            !walk.is_single_endpoint(),
+            "exhausting a cluster does not make it a single node"
+        );
 
         let mut from_last = RosterWalk::new("10.0.0.3:8090", &roster);
         assert_eq!(from_last.next().as_deref(), Some("10.0.0.1:8090"));
         assert_eq!(from_last.next().as_deref(), Some("10.0.0.2:8090"));
         assert_eq!(from_last.next(), None);
+    }
+
+    #[test]
+    fn given_single_endpoint_roster_when_exhausted_should_allow_local_retry() {
+        assert!(!RosterWalk::new("127.0.0.1:8090", &[]).is_single_endpoint());
+        let mut walk = RosterWalk::new("127.0.0.1:8090", &["localhost:8090".to_owned()]);
+        assert!(walk.is_single_endpoint());
+        assert_eq!(walk.next(), None);
+        assert!(walk.is_single_endpoint());
+        walk.record_attempt("127.0.0.2:8090");
+        assert!(!walk.is_single_endpoint());
     }
 
     #[test]
