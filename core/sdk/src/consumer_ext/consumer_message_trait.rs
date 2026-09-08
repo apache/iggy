@@ -87,8 +87,9 @@ pub trait IggyConsumerMessageExt<'a> {
     ///
     /// The loop stops when `shutdown_rx` resolves, which happens both when the sender sends and
     /// when the sender is dropped. It also stops when the consumer has no more messages, as
-    /// after `shutdown()` on the consumer. Either way it returns `Ok(())` and leaves the consumer
-    /// usable, so storing the counted offsets and leaving the group is still your call.
+    /// after `shutdown()` on the consumer. Every case returns `Ok(())`. After the two signal
+    /// cases the consumer stays usable, so storing the counted offsets and leaving the group is
+    /// still your call.
     ///
     /// Under `CommitPolicy::Auto`, a message counts before the consumer runs with
     /// `CommitAfter::Delivery`, and once it returns with success with `CommitAfter::Processing`.

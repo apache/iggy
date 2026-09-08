@@ -33,8 +33,9 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     ///
     /// The loop returns `Ok(())` when the signal arrives, when the sender is dropped, or when the
     /// consumer has no more messages, as after [`shutdown()`](crate::prelude::IggyConsumer::shutdown).
-    /// The consumer stays usable, so call [`shutdown()`](crate::prelude::IggyConsumer::shutdown)
-    /// afterwards to store the counted offsets and leave the consumer group.
+    /// After the two signal cases the consumer stays usable, so call
+    /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown) afterwards to store the counted
+    /// offsets and leave the consumer group.
     ///
     /// # Committing after a message
     ///
