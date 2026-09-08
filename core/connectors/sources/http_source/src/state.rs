@@ -30,6 +30,8 @@
 use axum::http::HeaderName;
 use iggy_connector_sdk::{ConnectorState, Error};
 use secrecy::{ExposeSecret, SecretString};
+
+use crate::auth::{MAX_AUTH_SECRET_LEN, MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -125,6 +127,25 @@ impl EndpointRegistry {
             // answers `None` for a name it cannot parse, and nothing else would
             // ever say why. Restoring it anyway is deliberate: refusing to start
             // over one bad entry would take the whole instance down with it.
+            // Warned about, never refused. `restore` failing is a hard
+            // `open()` failure, so a ceiling here would take a whole instance
+            // down over one stored value an operator cannot edit without the
+            // state file. Registration and rotation are where the ceiling is
+            // enforced; this only says the stored entry is costing more than
+            // the README's sizing assumes.
+            if !revoked
+                && (endpoint
+                    .auth_secret
+                    .as_ref()
+                    .is_some_and(|secret| secret.expose_secret().len() > MAX_AUTH_SECRET_LEN)
+                    || endpoint.hmac_header.len() > MAX_HMAC_HEADER_LEN
+                    || endpoint.hmac_prefix.len() > MAX_HMAC_PREFIX_LEN)
+            {
+                warn!(
+                    "Restored endpoint {} for {CONNECTOR_NAME} connector ID: {connector_id} with values past the registration ceilings; every mutation clones them and every flush rewrites them",
+                    endpoint_id.log_prefix()
+                );
+            }
             if !revoked
                 && endpoint.auth_type.hmac_algorithm().is_some()
                 && HeaderName::from_str(&endpoint.hmac_header).is_err()
@@ -743,6 +764,30 @@ mod tests {
         assert!(
             registry.endpoint(&format!("{:032x}", 0)).is_none(),
             "the oldest revocation must be the one reclaimed"
+        );
+    }
+
+    #[test]
+    fn given_stored_values_past_the_ceilings_when_restored_should_still_serve() {
+        // The ceilings are enforced where a caller can be told about them.
+        // Refusing here would turn one oversized stored value into a hard
+        // `open()` failure for the whole instance, and the operator cannot fix
+        // it without hand-editing the state file. It warns instead.
+        let mut persisted = EndpointRegistry::default();
+        let mut endpoint = dynamic_endpoint(ENDPOINT_ONE);
+        endpoint.auth_secret = Some(SecretString::from("x".repeat(MAX_AUTH_SECRET_LEN + 1)));
+        endpoint.hmac_prefix = "x".repeat(MAX_HMAC_PREFIX_LEN + 1);
+        assert!(persisted.insert(endpoint));
+
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("an oversized stored value must not fail the whole instance");
+
+        assert!(
+            restored
+                .endpoint(ENDPOINT_ONE)
+                .expect("the endpoint must survive")
+                .is_active(),
+            "it is still the endpoint the operator registered"
         );
     }
 

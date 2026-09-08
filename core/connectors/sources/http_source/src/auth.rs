@@ -49,6 +49,20 @@ fn strip_bearer(header_value: &str) -> Option<&str> {
         .then(|| token.trim_start_matches(' '))
 }
 
+/// Ceilings for the operator-supplied strings that ride an endpoint.
+///
+/// Unlike a revoke `reason`, which is written once onto a tombstone, these sit
+/// on active entries: every `mutate_registry` deep-clones them and every flush
+/// re-serializes the whole registry, so they are paid for repeatedly. Without a
+/// cap the only limit was the body limit, up to 64 MiB, times `MAX_ENDPOINTS`.
+///
+/// Generous on purpose. A real HMAC secret is tens of bytes and a header name
+/// is shorter still; these refuse abuse without refusing anything an operator
+/// would plausibly configure.
+pub const MAX_AUTH_SECRET_LEN: usize = 4096;
+pub const MAX_HMAC_HEADER_LEN: usize = 256;
+pub const MAX_HMAC_PREFIX_LEN: usize = 64;
+
 /// Why an endpoint may not be admitted.
 ///
 /// One enum rather than per-caller strings so the config path and the
@@ -65,6 +79,12 @@ pub enum Inadmissible {
     InvalidHmacHeader,
     /// `expires_at` is already at or past, so the endpoint would 404 forever.
     AlreadyExpired,
+    /// `auth_secret` is longer than [`MAX_AUTH_SECRET_LEN`].
+    SecretTooLong,
+    /// `hmac_header` is longer than [`MAX_HMAC_HEADER_LEN`].
+    HmacHeaderTooLong,
+    /// `hmac_prefix` is longer than [`MAX_HMAC_PREFIX_LEN`].
+    HmacPrefixTooLong,
 }
 
 impl Inadmissible {
@@ -76,6 +96,9 @@ impl Inadmissible {
             Self::UnusedSecret => "auth_type 'none' takes no auth_secret",
             Self::InvalidHmacHeader => "hmac_header is not a valid HTTP header name",
             Self::AlreadyExpired => "expires_at is already past",
+            Self::SecretTooLong => "auth_secret is longer than 4096 bytes",
+            Self::HmacHeaderTooLong => "hmac_header is longer than 256 bytes",
+            Self::HmacPrefixTooLong => "hmac_prefix is longer than 64 bytes",
         }
     }
 }
@@ -97,9 +120,22 @@ pub fn admit_endpoint(
     auth_type: EndpointAuthType,
     auth_secret: &Option<SecretString>,
     hmac_header: &str,
+    hmac_prefix: &str,
     expires_at: Option<u64>,
     now_seconds: u64,
 ) -> Result<(), Inadmissible> {
+    if auth_secret
+        .as_ref()
+        .is_some_and(|secret| secret.expose_secret().len() > MAX_AUTH_SECRET_LEN)
+    {
+        return Err(Inadmissible::SecretTooLong);
+    }
+    if hmac_header.len() > MAX_HMAC_HEADER_LEN {
+        return Err(Inadmissible::HmacHeaderTooLong);
+    }
+    if hmac_prefix.len() > MAX_HMAC_PREFIX_LEN {
+        return Err(Inadmissible::HmacPrefixTooLong);
+    }
     if auth_type == EndpointAuthType::None {
         // `authorize` never reads a secret for an unauthenticated endpoint, so
         // accepting one only persists a credential nothing will ever check.

@@ -684,6 +684,7 @@ impl HttpSourceConfig {
                 endpoint.auth_type,
                 &endpoint.auth_secret,
                 &endpoint.hmac_header,
+                &endpoint.hmac_prefix,
                 endpoint.expires_at,
                 unix_now_seconds(),
             ) {

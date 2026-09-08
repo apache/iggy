@@ -35,12 +35,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngExt;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::auth::{admit_endpoint, is_usable, validate_bearer};
+use crate::auth::{Inadmissible, MAX_AUTH_SECRET_LEN, admit_endpoint, is_usable, validate_bearer};
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState, RouteTable};
 use crate::server::{ServerState, bearer_header, error_response, refresh_routes};
 use crate::state::{InsertOutcome, MAX_ENDPOINTS};
@@ -120,6 +120,7 @@ async fn register_endpoint(
         request.auth_type,
         &request.auth_secret,
         &request.hmac_header,
+        &request.hmac_prefix,
         request.expires_at,
         unix_now_seconds(),
     ) {
@@ -243,6 +244,15 @@ async fn rotate_secret(
         // An empty HMAC key validates any signature the holder of the URL can
         // compute, so rotating to one silently removes the second factor.
         return error_response(StatusCode::BAD_REQUEST, "auth_secret must not be empty");
+    }
+    if request.auth_secret.expose_secret().len() > MAX_AUTH_SECRET_LEN {
+        // The same ceiling registration applies. Rotation keeps the endpoint,
+        // so an oversized secret here would be deep-cloned on every mutation
+        // and re-serialized on every flush for the life of the endpoint.
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            Inadmissible::SecretTooLong.message(),
+        );
     }
     let Some(instance) = owner_of(&state, &endpoint_id) else {
         return error_response(StatusCode::NOT_FOUND, "not found");
@@ -571,6 +581,7 @@ impl EndpointSummary {
 mod tests {
     use super::*;
     use crate::HttpSource;
+    use crate::auth::{MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN};
     use crate::test_support::{ENDPOINT_ONE, client, free_port};
     use axum::http::header;
     use iggy_connector_sdk::Source;
@@ -1187,6 +1198,70 @@ mod tests {
             body.get("error").is_some(),
             "every management error answers with an `error` field, got: {body}"
         );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_endpoint_fields_when_registered_should_reject() {
+        // These ride active entries, unlike a revoke reason on a tombstone, so
+        // every mutation deep-clones them and every flush re-serializes them.
+        // Uncapped, the only ceiling was the body limit times MAX_ENDPOINTS.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        for (field, body) in [
+            (
+                "auth_secret",
+                json!({"instance": "http_github", "auth_type": "hmac-sha256",
+                       "auth_secret": "x".repeat(MAX_AUTH_SECRET_LEN + 1)}),
+            ),
+            (
+                "hmac_header",
+                json!({"instance": "http_github", "auth_type": "hmac-sha256",
+                       "auth_secret": "whsec", "hmac_header": "x".repeat(MAX_HMAC_HEADER_LEN + 1)}),
+            ),
+            (
+                "hmac_prefix",
+                json!({"instance": "http_github", "auth_type": "hmac-sha256",
+                       "auth_secret": "whsec", "hmac_prefix": "x".repeat(MAX_HMAC_PREFIX_LEN + 1)}),
+            ),
+        ] {
+            let response = fixture.register(body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{field} must be capped at registration"
+            );
+        }
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_an_oversized_secret_when_rotated_should_reject() {
+        // Rotation keeps the endpoint, so an oversized secret accepted here
+        // would be paid for on every mutation and flush for its whole life.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        let registered = fixture
+            .register(
+                json!({"instance": "http_github", "auth_type": "hmac-sha256",
+                             "auth_secret": "whsec_initial"}),
+            )
+            .await;
+        let endpoint_id = registered
+            .json::<Value>()
+            .await
+            .expect("the response must be json")["endpoint_id"]
+            .as_str()
+            .expect("the response must carry the endpoint id")
+            .to_string();
+
+        let response = client()
+            .patch(format!("{}/admin/endpoints/{endpoint_id}", fixture.admin))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .json(&json!({"auth_secret": "x".repeat(MAX_AUTH_SECRET_LEN + 1)}))
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         fixture.close().await;
     }
 
