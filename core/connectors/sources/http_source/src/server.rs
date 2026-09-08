@@ -256,6 +256,30 @@ pub(crate) struct Published {
     pub(crate) routes: RouteTable,
 }
 
+impl Published {
+    /// Whether this listener should be taking traffic: an instance exists, a
+    /// route can reach it, and every instance is still polling.
+    ///
+    /// Every instance, not any. One load balancer fronts the whole listener, so
+    /// it can only take all of them in or out together. If one instance's poll
+    /// task has stopped while a sibling's is alive, `any` keeps the address in
+    /// rotation and the dead one's webhooks are accepted into a bridge nobody
+    /// drains, which is the exact failure this gate exists to catch. Shedding
+    /// the healthy sibling's traffic too costs availability that senders recover
+    /// by retrying; the alternative loses data already answered 200.
+    ///
+    /// Computed here so `/health` and `/admin/health` cannot answer differently
+    /// about the same listener, which is the one moment an operator reads both.
+    pub(crate) fn is_ready(&self, now_seconds: u64) -> bool {
+        self.routes.serves_anything(now_seconds)
+            && !self.instances.is_empty()
+            && self
+                .instances
+                .iter()
+                .all(|instance| instance.poll_is_live(now_seconds))
+    }
+}
+
 /// The part of a shared server the request handlers see.
 #[derive(Debug)]
 pub(crate) struct ServerState {
@@ -791,20 +815,9 @@ async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> Response
 /// task still running behind it.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
     let now = unix_now_seconds();
-    // One guard for both, so readiness cannot be computed from a route table
-    // and an instance set that were never published together.
-    let published = state.published();
-    let instances = &published.instances;
-    // Every instance, not any. One load balancer fronts the whole listener, so
-    // it can only take all of these in or out together. If one instance's poll
-    // task has stopped while a sibling's is alive, `any` keeps the address in
-    // rotation and the dead one's webhooks are accepted into a bridge nobody
-    // drains, which is the exact failure this gate exists to catch. Shedding
-    // the healthy sibling's traffic too costs availability that senders recover
-    // by retrying; the alternative loses data that was already answered 200.
-    let ready = published.routes.serves_anything(now)
-        && !instances.is_empty()
-        && instances.iter().all(|instance| instance.poll_is_live(now));
+    // One guard, so readiness cannot be computed from a route table and an
+    // instance set that were never published together.
+    let ready = state.published().is_ready(now);
     if !ready {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -818,13 +831,17 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
 }
 
 async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response {
-    let instances = state
-        .published()
+    // One snapshot and one clock read for the whole answer. Loaded twice, the
+    // per-instance array and the status below could describe different
+    // publishes, which is the disagreement `Published` exists to prevent, and
+    // the clock was being read once per instance on top of that.
+    let now = unix_now_seconds();
+    let published = state.published();
+    let instances = published
         .instances
         .iter()
         .map(|instance| {
             let registry = instance.registry();
-            let now = unix_now_seconds();
             InstanceHealth {
                 instance: instance.instance_name.clone(),
                 topic_path: instance.config.topic_path.clone(),
@@ -850,14 +867,7 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
     // Derived, not a constant: this answered "ok" while `/health` was
     // answering 503 for the same listener, which is the one moment an operator
     // is looking at both.
-    let now = unix_now_seconds();
-    let published = state.published();
-    let ready = published.routes.serves_anything(now)
-        && !published.instances.is_empty()
-        && published
-            .instances
-            .iter()
-            .all(|instance| instance.poll_is_live(now));
+    let ready = published.is_ready(now);
     Json(AdminHealth {
         status: if ready { "ok" } else { "degraded" },
         instances,
