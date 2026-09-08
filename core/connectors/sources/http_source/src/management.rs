@@ -174,7 +174,13 @@ async fn register_endpoint(
             outcome = registry.try_insert(endpoint);
             outcome == InsertOutcome::Inserted
         },
-        |candidate| RouteTable::build_with(&instances, Some((instance_id, candidate))).is_ok(),
+        // Id equality, not a table build. The validator runs under
+        // `registry_writer`, so a full projection here would clone every
+        // endpoint and derive an `hmac::Key` per active HMAC endpoint across
+        // every instance on the listener, to answer a yes/no question that
+        // needs none of it. `refresh_routes` does the real build below, outside
+        // the lock, and stays the authority.
+        |_candidate| RouteTable::claims_foreign_id(&instances, instance_id, &endpoint_id).is_ok(),
     );
     if applied == MutationOutcome::Rejected {
         warn!(

@@ -214,14 +214,6 @@ pub enum RouteConflict {
         held_by: u32,
         claimed_by: u32,
     },
-    /// A candidate registry was supplied for an instance the set does not
-    /// contain, so it was never projected.
-    ///
-    /// Its own variant rather than an `Ok`, because a validator that never saw
-    /// the candidate must not be indistinguishable from one that saw it and
-    /// approved. The caller snapshots the instance set before taking the
-    /// registry lock, so an instance leaving in that gap lands here.
-    CandidateNotProjected { claimed_by: u32 },
 }
 
 impl RouteTable {
@@ -242,6 +234,40 @@ impl RouteTable {
     /// Projects every joined instance's registry into one lookup table.
     pub fn build(instances: &[Arc<SharedState>]) -> Result<Self, RouteConflict> {
         Self::build_with(instances, None)
+    }
+
+    /// Whether a registration would claim an endpoint id a sibling instance
+    /// already serves.
+    ///
+    /// Id equality only, deliberately. This runs inside `registry_writer`, and
+    /// building a table there to answer a yes/no question would clone every
+    /// endpoint and derive an `hmac::Key` for every active HMAC endpoint on
+    /// every instance sharing the listener, up to `MAX_ENDPOINTS` each. The
+    /// real projection happens in `refresh_routes` afterwards, outside the
+    /// lock, and remains the authority: a sibling registering the same id is
+    /// holding its own writer lock, not this one, so this is a cheap early
+    /// refusal rather than a mutual exclusion.
+    ///
+    /// Only the new id can collide, because every entry already in the registry
+    /// was checked the same way when it was admitted.
+    pub fn claims_foreign_id(
+        instances: &[Arc<SharedState>],
+        registering: u32,
+        endpoint_id: &EndpointId,
+    ) -> Result<(), RouteConflict> {
+        for instance in instances {
+            if instance.id == registering {
+                continue;
+            }
+            if instance.registry().endpoint(endpoint_id.as_str()).is_some() {
+                return Err(RouteConflict::EndpointId {
+                    endpoint_id: endpoint_id.clone(),
+                    held_by: instance.id,
+                    claimed_by: registering,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// As [`RouteTable::build`], but projecting `candidate` in place of the
@@ -315,13 +341,6 @@ impl RouteTable {
                 }
             }
         }
-        if let Some((candidate_id, _)) = candidate
-            && !instances.iter().any(|instance| instance.id == candidate_id)
-        {
-            return Err(RouteConflict::CandidateNotProjected {
-                claimed_by: candidate_id,
-            });
-        }
         Ok(table)
     }
 
@@ -370,10 +389,6 @@ impl Display for RouteConflict {
             } => write!(
                 formatter,
                 "topic_path '{topic_path}' is already served by connector ID: {held_by}, claimed by connector ID: {claimed_by}"
-            ),
-            Self::CandidateNotProjected { claimed_by } => write!(
-                formatter,
-                "connector ID: {claimed_by} is no longer joined, so its pending change was never checked"
             ),
         }
     }
@@ -541,18 +556,43 @@ mod tests {
     }
 
     #[test]
-    fn given_a_candidate_for_an_absent_instance_when_built_should_refuse() {
-        // A candidate whose instance is not in the set was never projected, so
-        // an `Ok` here would be indistinguishable from "checked and fine". The
-        // caller snapshots the instance set before taking the registry lock, so
-        // a leave in that gap lands exactly here, and answering Ok would let an
-        // unvalidated registration through.
-        let only = instance(1, Some("github"), &[ENDPOINT_ONE]);
-        let candidate = EndpointRegistry::default();
+    fn given_an_id_a_sibling_serves_when_registering_should_refuse() {
+        // What the registration validator actually asks, and all it needs to:
+        // does another instance on this listener already serve the id. No
+        // clone, no key derivation, and it runs under the registry lock.
+        let first = instance(1, Some("github"), &[ENDPOINT_ONE]);
+        let second = instance(7, Some("stripe"), &[ENDPOINT_TWO]);
+        let instances = [Arc::clone(&first), Arc::clone(&second)];
+
+        let conflict = RouteTable::claims_foreign_id(&instances, 7, &endpoint_id(ENDPOINT_ONE))
+            .expect_err("instance 1 already serves it");
+        assert_eq!(
+            conflict,
+            RouteConflict::EndpointId {
+                endpoint_id: endpoint_id(ENDPOINT_ONE),
+                held_by: 1,
+                claimed_by: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn given_an_id_only_the_registrant_holds_when_registering_should_allow() {
+        // The registrant's own registry must not count against it: the
+        // candidate it is validating already contains the id being added, so
+        // comparing against itself would refuse every registration.
+        let first = instance(1, Some("github"), &[ENDPOINT_ONE]);
+        let second = instance(7, Some("stripe"), &[ENDPOINT_TWO]);
+        let instances = [Arc::clone(&first), Arc::clone(&second)];
 
         assert!(
-            RouteTable::build_with(&[only], Some((7, &candidate))).is_err(),
-            "a candidate that was never projected must not report success"
+            RouteTable::claims_foreign_id(&instances, 7, &endpoint_id(ENDPOINT_TWO)).is_ok(),
+            "an instance may keep serving the ids it already holds"
+        );
+        assert!(
+            RouteTable::claims_foreign_id(&instances, 7, &endpoint_id("c".repeat(32).as_str()))
+                .is_ok(),
+            "and a genuinely new id collides with nothing"
         );
     }
 
