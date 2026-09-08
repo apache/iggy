@@ -34,6 +34,7 @@ mod user_headers;
 use client::IggyClient;
 use config::{
     AutoLogin, HttpConfig, QuicConfig, QuicReconnectionConfig, TcpConfig, TcpReconnectionConfig,
+    WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
 };
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
@@ -65,6 +66,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<QuicConfig>()?;
     m.add_class::<QuicReconnectionConfig>()?;
     m.add_class::<HttpConfig>()?;
+    m.add_class::<WebSocketConfig>()?;
+    m.add_class::<WebSocketReconnectionConfig>()?;
+    m.add_class::<WebSocketFramingConfig>()?;
     m.add_class::<StreamDetails>()?;
     m.add_class::<Stream>()?;
     m.add_class::<Stats>()?;
