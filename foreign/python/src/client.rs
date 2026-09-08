@@ -42,6 +42,9 @@ use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
+use crate::producer::{
+    IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param,
+};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
@@ -1318,6 +1321,101 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             Ok(PySendMessagesResponse::from(response))
+        })
+    }
+
+    /// Creates and initializes a high-level producer bound to a stream and topic.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        stream,
+        topic,
+        partitioning=None,
+        mode=ProducerMode::default(),
+        create_stream_if_not_exists=true,
+        create_topic_if_not_exists=true,
+        topic_partitions_count=1,
+        topic_message_expiry=None,
+        topic_max_size=None,
+        send_retries=Some(3),
+        send_retry_interval=RetryInterval::default(),
+    ))]
+    #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
+    fn producer<'a>(
+        &self,
+        py: Python<'a>,
+        stream: &str,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "Partitioning | None"))]
+        partitioning: Option<&crate::partitioning::Partitioning>,
+        #[gen_stub(override_type(type_repr = "DirectProducerConfig | BackgroundProducerConfig"))]
+        mode: ProducerMode,
+        create_stream_if_not_exists: bool,
+        create_topic_if_not_exists: bool,
+        topic_partitions_count: i64,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))]
+        topic_message_expiry: Option<&IggyExpiry>,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))]
+        topic_max_size: Option<&MaxTopicSize>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        send_retries: Option<i64>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        send_retry_interval: RetryInterval,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let direct_config = match mode {
+            ProducerMode::Direct(config) => config,
+            ProducerMode::Background(config) => {
+                let _ = config;
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "background producer mode is not implemented",
+                ));
+            }
+        };
+
+        let topic_partitions_count =
+            producer_u32_param(topic_partitions_count, "topic_partitions_count")?;
+        let topic_message_expiry = topic_message_expiry
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .unwrap_or(RustIggyExpiry::ServerDefault);
+        let topic_max_size = topic_max_size
+            .map(RustMaxTopicSize::try_from)
+            .transpose()?
+            .unwrap_or(RustMaxTopicSize::ServerDefault);
+        let send_retries = send_retries
+            .map(|retries| producer_u32_param(retries, "send_retries"))
+            .transpose()?
+            .filter(|retries| *retries != 0);
+        let send_retry_interval = send_retry_interval.resolve()?;
+
+        let mut builder = self
+            .inner
+            .producer(stream, topic)
+            .map_err(to_runtime_error)?
+            .direct((&direct_config).into())
+            .send_retries(send_retries, send_retry_interval);
+
+        if let Some(partitioning) = partitioning {
+            builder = builder.partitioning(partitioning.inner.clone());
+        }
+        if create_stream_if_not_exists {
+            builder = builder.create_stream_if_not_exists();
+        } else {
+            builder = builder.do_not_create_stream_if_not_exists();
+        }
+        if create_topic_if_not_exists {
+            builder = builder.create_topic_if_not_exists(
+                topic_partitions_count,
+                topic_message_expiry,
+                topic_max_size,
+            );
+        } else {
+            builder = builder.do_not_create_topic_if_not_exists();
+        }
+
+        let producer = builder.build();
+        future_into_py(py, async move {
+            producer.init().await.map_err(to_runtime_error)?;
+            Ok(IggyProducer::new(producer))
         })
     }
 
