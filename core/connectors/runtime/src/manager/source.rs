@@ -236,10 +236,8 @@ impl SourceManager {
             state,
         )?;
         info!("Source connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
-        // Armed from here until the id is recorded below. Until then nothing
-        // outside the plugin knows this instance exists, so any early return
-        // would strand it: `stop_connector` closes `details.info.id`, which
-        // still names the previous one.
+        // Armed from here until the id is recorded below. `SourceInstanceGuard`
+        // carries why that window strands the instance.
         let instance_guard =
             source::SourceInstanceGuard::for_container(container.clone(), plugin_id, key);
 

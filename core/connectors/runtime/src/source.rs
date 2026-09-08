@@ -325,10 +325,11 @@ pub(crate) type SourceClose = Arc<dyn Fn(u32) -> i32 + Send + Sync>;
 /// which is still the previous instance. An early return in that window
 /// stranded the new one for the life of the process.
 ///
-/// A guard rather than a cleanup branch at the one call site that can fail
-/// today, because the window is defined by the two statements that open and
-/// record the instance, not by which call between them happens to be fallible.
-/// Adding a `?` inside it stays correct.
+/// A guard rather than a cleanup branch on each fallible call, because the
+/// window is defined by the two statements that open and record the instance,
+/// not by which call between them happens to be fallible today. Adding a `?`
+/// inside it stays correct. Both call sites use it.
+#[must_use = "dropping an armed guard closes the source instance"]
 pub(crate) struct SourceInstanceGuard {
     close: SourceClose,
     plugin_id: u32,
