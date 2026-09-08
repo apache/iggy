@@ -47,9 +47,11 @@ const COMMIT_PREFIX_HOLE_WEDGE_TICKS: u32 = 2_000;
 
 /// Ticks a replica may hold its commit walk below an ALREADY APPLIED head.
 ///
-/// Near zero: nothing clears this one, so there is no legitimate window to wait
-/// out. The slack only covers a reading taken between an apply and its pop.
-const COMMIT_PREFIX_APPLIED_HEAD_TICKS: u32 = 5;
+/// Reachable without a bug: a `set_commit_floor` jump can raise `commit_min` past
+/// a live pipeline. Nothing pops a head below the floor, so only a view change
+/// clears it, and this has to outlast the view-change escalation to avoid failing
+/// a run on the window in between.
+const COMMIT_PREFIX_APPLIED_HEAD_TICKS: u32 = 2_000;
 
 /// Per-(replica, namespace) high-water marks carried across ticks so each new
 /// reading can be compared against the last.
@@ -207,8 +209,8 @@ impl Invariants {
     /// - [`CommitHoldKind::MissingOps`] is legitimate while repair runs, so the
     ///   count restarts when `commit_min` advances and only a hole nothing refills
     ///   trips it.
-    /// - [`CommitHoldKind::AppliedHead`] never self-clears, so it gets a near-zero
-    ///   threshold. Resetting it on `commit_min` would be exactly wrong: the head
+    /// - [`CommitHoldKind::AppliedHead`] never self-clears; only a view change
+    ///   does. Resetting it on `commit_min` would be exactly wrong, since the head
     ///   is frozen while `commit_min` climbs.
     ///
     /// # Panics
@@ -233,8 +235,8 @@ impl Invariants {
             ),
             CommitHoldKind::AppliedHead => (
                 COMMIT_PREFIX_APPLIED_HEAD_TICKS,
-                "the commit walk advanced past this entry, so nothing is missing and nothing \
-                 will ever pop it: its reply can no longer be built and its awaiter never wakes",
+                "the commit point moved past this entry, so nothing is missing and no repair \
+                 is owed: only a view change can clear it, and none has",
             ),
         };
         let entry = self

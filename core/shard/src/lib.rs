@@ -1607,7 +1607,14 @@ where
     /// that go silent, serve unusable bytes, or terminate without closing the gap.
     /// It does not bound merely slow peers, whose chunks keep the clock from
     /// firing.
-    metadata_repair_attempts: Cell<u32>,
+    ///
+    /// Paired with the view the rounds were charged in, and spent per view. The
+    /// merged-log arm refuses to re-arm once the budget is out, and the exhausting
+    /// path leaves no session behind, so nothing would ever be superseded or walk:
+    /// unfenced, one spent budget would refuse merged-log repair for every later
+    /// view for the life of the process, and a replica that keeps winning
+    /// elections would never repair again.
+    metadata_repair_attempts: Cell<(u32, u32)>,
 
     /// Decode failures charged against one snapshot generation, as
     /// `(snapshot_seq, failures)`. `None` until a pulled artifact set first
@@ -1762,7 +1769,7 @@ where
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
-            metadata_repair_attempts: Cell::new(0),
+            metadata_repair_attempts: Cell::new((0, 0)),
             metadata_transfer_decode_failures: Cell::new(None),
         })
     }
@@ -2249,7 +2256,7 @@ where
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
-            metadata_repair_attempts: Cell::new(0),
+            metadata_repair_attempts: Cell::new((0, 0)),
             metadata_transfer_decode_failures: Cell::new(None),
         }
     }
@@ -5293,7 +5300,7 @@ where
                         // interval on a stream that will not come. Still charge a
                         // round, so a quorum that all answer this way stops asking
                         // instead of cycling the ring until the timeout.
-                        if self.burn_metadata_repair_attempt() {
+                        if self.burn_metadata_repair_attempt(consensus.view()) {
                             *self.metadata_repair.borrow_mut() = None;
                             tracing::warn!(
                                 shard = self.id,
@@ -5337,7 +5344,7 @@ where
                         // interval forever: the stall path never runs, so rotation
                         // is never reached and the state-transfer escalation this
                         // guard replaced stays out of reach.
-                        if self.burn_metadata_repair_attempt() {
+                        if self.burn_metadata_repair_attempt(consensus.view()) {
                             self.rotate_stalled_metadata_repair(
                                 consensus,
                                 header.replica,
@@ -5394,7 +5401,12 @@ where
         if header.nonce != session.nonce {
             return;
         }
-        if !partition.consensus().is_normal() || partition.consensus().view() != session.view {
+        // Twin of the `apply_repaired_prepare` gate: a primary-elect's merged-log
+        // session legitimately runs outside `Normal`, and dropping it here would
+        // discard the terminator that closes the window it is repairing.
+        if !consensus::repair_session_live(partition.consensus())
+            || partition.consensus().view() != session.view
+        {
             partition.repair = None;
             return;
         }
@@ -5824,7 +5836,7 @@ where
                 );
                 *self.metadata_repair.borrow_mut() = None;
                 self.note_metadata_repair_walked();
-            } else if self.burn_metadata_repair_attempt() {
+            } else if self.burn_metadata_repair_attempt(consensus.view()) {
                 self.rotate_stalled_metadata_repair(consensus, peer, from_op, to_op)
                     .await;
             } else {
@@ -6173,12 +6185,15 @@ where
         // list next tick -- including the sender that just answered `RangeEvicted`,
         // which is how the budget got spent. Once every sender has been asked and
         // charged, asking again is not progress; the view-change timeout is.
-        if self.metadata_repair_attempts.get() > partitions::REPAIR_MAX_STALL_RETRIES {
+        //
+        // Per view. A later view is a new merged log from a new quorum, so the
+        // senders that refused this one say nothing about it.
+        if self.metadata_repair_exhausted(consensus.view()) {
             tracing::debug!(
                 shard = self.id,
                 missing_op,
-                attempts = self.metadata_repair_attempts.get(),
-                "merged-log repair is out of retries; not re-arming"
+                view = consensus.view(),
+                "merged-log repair is out of retries for this view; not re-arming"
             );
             return;
         }
@@ -6828,10 +6843,21 @@ where
     /// or the rotation that mints a new one would reset the count and re-target
     /// forever without giving up on a peer. Only
     /// [`Self::note_metadata_repair_walked`] clears it.
-    fn burn_metadata_repair_attempt(&self) -> bool {
-        let attempts = self.metadata_repair_attempts.get() + 1;
-        self.metadata_repair_attempts.set(attempts);
+    fn burn_metadata_repair_attempt(&self, view: u32) -> bool {
+        let (charged_view, attempts) = self.metadata_repair_attempts.get();
+        let attempts = if charged_view == view {
+            attempts + 1
+        } else {
+            1
+        };
+        self.metadata_repair_attempts.set((view, attempts));
         attempts > partitions::REPAIR_MAX_STALL_RETRIES
+    }
+
+    /// Whether this view has already spent its merged-log repair budget.
+    fn metadata_repair_exhausted(&self, view: u32) -> bool {
+        let (charged_view, attempts) = self.metadata_repair_attempts.get();
+        charged_view == view && attempts > partitions::REPAIR_MAX_STALL_RETRIES
     }
 
     /// Burn one retry round; `true` once the budget is exhausted.
@@ -6881,7 +6907,7 @@ where
     /// already held, so a peer answering with nothing new used to clear its own
     /// budget and could never be rotated away from.
     fn note_metadata_repair_walked(&self) {
-        self.metadata_repair_attempts.set(0);
+        self.metadata_repair_attempts.set((0, 0));
         self.note_metadata_repair_clock();
     }
 
@@ -7527,20 +7553,15 @@ where
                         walk_cursor.get_or_insert(namespace);
                     }
                 }
-                let consensus_normal = partition.consensus().is_normal();
                 let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
                 let cluster = partition.consensus().cluster();
                 let self_id = partition.consensus().replica();
-                // The one session that legitimately runs outside `Normal`
-                // (`request_partition_view_repair`). Treated as superseded it would
-                // be dropped on the tick after it was armed, leaving the coverage
-                // scan with no fetcher; refused a stall retry it would pin the view
-                // change behind one lost frame. Mirrors
-                // `retry_stalled_metadata_repair`'s `repairing_view`.
-                let repairing_view = partition.consensus().view_log_is_pending()
-                    && partition.consensus().is_primary_for_view(consensus_view);
-                let session_live = consensus_normal || repairing_view;
+                // A primary-elect's merged-log session legitimately runs outside
+                // `Normal` (`request_partition_view_repair`). Same predicate as the
+                // two ingest sites, so the arming side and the ingest side cannot
+                // drift apart.
+                let session_live = consensus::repair_session_live(partition.consensus());
                 let repair_finished = partition.repair.is_some_and(|session| {
                     if !session_live || consensus_view != session.view {
                         return true;

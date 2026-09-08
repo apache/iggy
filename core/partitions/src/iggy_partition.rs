@@ -43,9 +43,9 @@ use consensus::{
     PlaneKind, Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus,
     ack_preflight, ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
     build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repaired_frontier_update,
-    replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
-    send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repair_session_live,
+    repaired_frontier_update, replicate_frozen_to_next_in_chain, replicate_preflight,
+    restamp_prepare_view, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -6729,7 +6729,11 @@ where
             return;
         };
         let consensus = self.consensus();
-        if !consensus.is_normal() || consensus.view() != session.view {
+        // NOT `is_normal` alone: a primary-elect repairing toward its parked
+        // merged log runs this in `ViewChange`, and dropping the session on its
+        // first inbound frame leaves the coverage scan re-arming every tick over
+        // a stream it can never keep.
+        if !repair_session_live(consensus) || consensus.view() != session.view {
             self.repair = None;
             return;
         }

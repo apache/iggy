@@ -433,6 +433,25 @@ where
     false
 }
 
+/// Whether a repair session may still run.
+///
+/// `Normal` is the ordinary case. The exception is a primary-elect that parked a
+/// merged log: its repair runs in `ViewChange` by design, because the log it is
+/// repairing toward is one nobody has started yet. Reading `is_normal` alone at an
+/// ingest site drops the frame AND the session, so the coverage scan re-arms every
+/// tick and nothing it fetches can ever land.
+///
+/// Every site that fences a repair session on status must use this, so the arming
+/// side and the ingest side cannot drift apart.
+pub fn repair_session_live<B, P>(consensus: &VsrConsensus<B, P>) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    consensus.is_normal()
+        || (consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view()))
+}
+
 /// Drain and return committable prepares from the pipeline head.
 ///
 /// Entries are drained from the head, while covered by the commit frontier, and
@@ -453,8 +472,9 @@ where
 /// `IggyPartition::collect_committable_from_journal`.
 ///
 /// A head at or below `commit_min` is the other shape: applied already, no repair
-/// owed, only a pop that can no longer happen. Both journal walks stop below the
-/// head to keep it unreachable, so it is logged apart.
+/// owed, only a pop that can no longer happen. The journal walks stop below the
+/// head so they cannot create it, but a `set_commit_floor` jump past a live
+/// pipeline still can, so it is logged apart rather than treated as impossible.
 ///
 /// # Panics
 /// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
@@ -560,16 +580,20 @@ fn report_uncommittable_head(
              walk until the ops below it are journaled"
         );
     } else {
-        // Unreachable while both journal walks stop below the head, so this is a
-        // defect and not a state to wait out: nothing will pop or answer the entry.
-        tracing::error!(
+        // Reported, not called a defect: a commit-floor jump reaches this state
+        // legitimately. `IggyMetadata`'s state-transfer install and
+        // `IggyPartition::complete_repair` both raise `commit_min` past a live
+        // pipeline via `set_commit_floor` without the `clear_pipeline` the
+        // partition transfer path pairs with it. Nothing pops a head below the
+        // floor, so it holds until a view change clears the pipeline.
+        tracing::warn!(
             replica,
             head_op,
             commit_min,
             commit_max,
             drained,
-            "committable head sits at or below the applied commit point; the commit walk \
-             advanced past a resident pipeline entry and its reply can no longer be sent"
+            "committable head sits at or below the applied commit point; nothing can pop \
+             or answer this entry until a view change clears the pipeline"
         );
     }
 }
