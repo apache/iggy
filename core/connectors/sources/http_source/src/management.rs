@@ -114,10 +114,10 @@ async fn register_endpoint(
     let Some(instance) = state.instance(&request.instance) else {
         return error_response(StatusCode::NOT_FOUND, "unknown instance");
     };
-    // The same rule `validate()` applies to a TOML endpoint. Shared, because
-    // written out at both sites they drifted twice: `hmac_header` was
-    // validated here and not there, and the two secret rules were the other
-    // way round.
+    // The same rule `validate()` applies to a TOML endpoint, minus the checks
+    // that only make sense when the endpoint is being created. Shared because
+    // written out at both sites the two lists drifted: config admitted an
+    // `auth_type: none` carrying a secret that this path refused.
     if let Err(reason) = admit_endpoint(
         request.auth_type,
         &request.auth_secret,

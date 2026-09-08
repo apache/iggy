@@ -121,18 +121,12 @@ impl EndpointRegistry {
             // built from the field. The key wins.
             endpoint.endpoint_id = endpoint_id.clone();
             let revoked = !endpoint.is_active();
-            // Registration rejects a malformed `hmac_header`, but state written
-            // by an older build, or edited by hand, can still carry one. Such an
-            // endpoint 401s every signed request forever because `HeaderMap::get`
-            // answers `None` for a name it cannot parse, and nothing else would
-            // ever say why. Restoring it anyway is deliberate: refusing to start
-            // over one bad entry would take the whole instance down with it.
             // Warned about, never refused. `restore` failing is a hard
             // `open()` failure, so a ceiling here would take a whole instance
             // down over one stored value an operator cannot edit without the
-            // state file. Registration and rotation are where the ceiling is
-            // enforced; this only says the stored entry is costing more than
-            // the README's sizing assumes.
+            // state file. Registration is where the ceiling is enforced; this
+            // only says the stored entry costs more than the README's sizing
+            // assumes.
             if !revoked
                 && (endpoint
                     .auth_secret
@@ -146,6 +140,12 @@ impl EndpointRegistry {
                     endpoint_id.log_prefix()
                 );
             }
+            // Registration rejects a malformed `hmac_header`, but state written
+            // by an older build, or edited by hand, can still carry one. Such an
+            // endpoint 401s every signed request forever because `HeaderMap::get`
+            // answers `None` for a name it cannot parse, and nothing else would
+            // ever say why. Restoring it anyway is deliberate: refusing to start
+            // over one bad entry would take the whole instance down with it.
             if !revoked
                 && endpoint.auth_type.hmac_algorithm().is_some()
                 && HeaderName::from_str(&endpoint.hmac_header).is_err()

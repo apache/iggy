@@ -175,6 +175,7 @@ Content-Type: application/json
 | 404 | Unknown path, or a revoked or expired endpoint | `{"error":"not found"}` |
 | 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
+| 405 | A known path with the wrong method | `{"error":"method not allowed"}` |
 | 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |
 | 503 | `GET /health` when any instance on the listener has stopped polling, or a POST whose instance bridge has no receiver | `{"status":"unavailable"}` or `{"error":"service unavailable"}` |
 
@@ -316,7 +317,7 @@ A metric with no series yet is absent from the scrape rather than reported as ze
 
 **Revocation tombstones accumulate.** They are retained deliberately, so a revocation survives a restart and stays auditable, and nothing evicts them.
 
-Each is roughly a hundred bytes in practice, bounded above by the field ceilings below rather than by the request body limit.
+Each is roughly a hundred bytes in practice. Revoking clears the endpoint's `auth_secret`, so the largest of the field ceilings below never applies to a tombstone; what bounds one is the 256-byte cap on the revoke `reason`.
 
 The whole registry is rewritten on every mutation, so a deployment that churns endpoints continuously will see the state file grow over time. An instance whose endpoints are all static writes no state file until something mutates its registry. Revoking a static endpoint through the management API does exactly that, and the tombstone it writes is what stops the TOML entry coming back.
 
@@ -324,7 +325,7 @@ Every control-plane mutation clones the whole registry, every flush clones and s
 
 That is fine at the hundreds of endpoints this connector is sized for. A deployment near the ceiling below should expect each mutation to cost a copy of the whole registry.
 
-`auth_secret` is capped at 4096 bytes, `hmac_header` at 256 and `hmac_prefix` at 64, on registration and rotation. A value already in the state file past one of those is warned about and still served: refusing it would take the whole instance down over one entry an operator cannot edit without the state file.
+`auth_secret` is capped at 4096 bytes, `hmac_header` at 256 and `hmac_prefix` at 64, on registration. Rotation carries only `auth_secret`, and applies the same cap to it. A value already in the state file past one of those is warned about and still served: refusing it would take the whole instance down over one entry an operator cannot edit without the state file.
 
 The registry is capped at `MAX_ENDPOINTS` (10000) per instance. At the cap the oldest revoked dynamic entries are reclaimed to make room; revoked static ones never are, because their tombstone is what outranks TOML. A registration that finds nothing reclaimable is refused with 507.
 

@@ -132,9 +132,9 @@ impl Display for Inadmissible {
 /// from the management API.
 ///
 /// Kept here beside [`is_usable_secret`] for the same reason that helper
-/// exists: the checks were written out at both call sites and only one of them
-/// stayed current, which is how `hmac_header` came to be validated on
-/// registration but not in config, twice over.
+/// exists: written out at both call sites, the two lists drifted. Config
+/// admitted an `auth_type: none` carrying a secret that the API refused, and
+/// nothing but a reader comparing the two functions would have caught it.
 pub fn admit_endpoint(
     auth_type: EndpointAuthType,
     auth_secret: &Option<SecretString>,
