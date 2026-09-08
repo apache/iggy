@@ -218,10 +218,14 @@ impl EndpointRegistry {
         self.endpoints.get_mut(endpoint_id)
     }
 
-    /// Registers a new endpoint, refusing to overwrite an existing one so a
-    /// generated-id collision can never silently retarget live traffic.
+    /// [`Self::try_insert`] for tests that only care whether the registry
+    /// changed.
     ///
-    /// Kept for callers that only care whether the registry changed.
+    /// Test-only on purpose. It collapses `Full` and `Collision` into one
+    /// `false`, so production code reaching for it would drop the distinction
+    /// between a registry at its ceiling and an id that is already taken, and
+    /// answer the caller the same way for both.
+    #[cfg(test)]
     pub fn insert(&mut self, endpoint: Endpoint) -> bool {
         self.try_insert(endpoint) == InsertOutcome::Inserted
     }

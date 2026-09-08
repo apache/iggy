@@ -251,7 +251,7 @@ impl SharedState {
     /// control plane and the scrape path. Cheap rather than free, since
     /// arc-swap's hybrid strategy takes a debt slot and can fall back to a
     /// full clone once a thread exhausts them.
-    pub fn registry(&self) -> Guard<Arc<EndpointRegistry>> {
+    pub(crate) fn registry(&self) -> Guard<Arc<EndpointRegistry>> {
         self.registry.load()
     }
 
@@ -263,7 +263,10 @@ impl SharedState {
     /// caller turn a stream of no-ops, repeatedly revoking an already-revoked
     /// endpoint, into one registry serialization and one state-store write per
     /// 404, which is a remote write on the HTTP state backend.
-    pub fn mutate_registry(&self, mutation: impl FnOnce(&mut EndpointRegistry) -> bool) -> bool {
+    pub(crate) fn mutate_registry(
+        &self,
+        mutation: impl FnOnce(&mut EndpointRegistry) -> bool,
+    ) -> bool {
         self.try_mutate_registry(mutation, |_| true) == MutationOutcome::Applied
     }
 
@@ -281,7 +284,7 @@ impl SharedState {
     /// an await there would put a `std::sync::Mutex` across it and make
     /// `take_dirty_state`'s `try_lock` fail for the duration, silently skipping
     /// flushes.
-    pub fn try_mutate_registry(
+    pub(crate) fn try_mutate_registry(
         &self,
         mutation: impl FnOnce(&mut EndpointRegistry) -> bool,
         validate: impl FnOnce(&EndpointRegistry) -> bool,
