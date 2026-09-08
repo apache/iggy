@@ -137,6 +137,15 @@ impl EndpointRegistry {
             }
             match endpoints.entry(endpoint_id) {
                 Entry::Occupied(mut occupied) if revoked => {
+                    // The map was seeded from TOML, so Occupied means TOML
+                    // still declares this id: the tombstone is static whatever
+                    // the state file says. Taking the persisted `origin`
+                    // verbatim let a `Dynamic` tombstone be the entry that
+                    // outranks a live TOML block, and `reclaimable_tombstones`
+                    // evicts exactly the dynamic ones, so the next restart
+                    // served that endpoint and its secret again. Reclamation is
+                    // only safe because a static tombstone is never eligible.
+                    endpoint.origin = EndpointOrigin::Static;
                     occupied.insert(endpoint);
                     tombstones += 1;
                 }
@@ -734,6 +743,51 @@ mod tests {
         assert!(
             registry.endpoint(&format!("{:032x}", 0)).is_none(),
             "the oldest revocation must be the one reclaimed"
+        );
+    }
+
+    #[test]
+    fn given_a_dynamic_tombstone_over_a_toml_id_when_restored_should_become_static() {
+        // The tombstone that outranks a live TOML block has to be static, or
+        // reclamation evicts it and the next restart serves that endpoint and
+        // its secret again. The id was registered dynamically first, revoked,
+        // and only then declared in TOML - which is how the persisted entry
+        // ends up carrying `Dynamic` while TOML still claims the id.
+        let mut persisted = EndpointRegistry::default();
+        assert!(persisted.insert(dynamic_endpoint(ENDPOINT_ONE)));
+        persisted.revoke(ENDPOINT_ONE, "compromised".to_string(), 42);
+
+        let mut restored = EndpointRegistry::restore(
+            &[static_endpoint(ENDPOINT_ONE)],
+            Some(registry_state(&persisted)),
+            1,
+        )
+        .expect("the registry must restore");
+
+        let endpoint = restored.endpoint(ENDPOINT_ONE).expect("entry must exist");
+        assert!(!endpoint.is_active(), "the revocation must survive");
+        assert_eq!(
+            endpoint.origin,
+            EndpointOrigin::Static,
+            "TOML declaring the id is what makes this tombstone static, whatever the state file recorded"
+        );
+
+        // The consequence, not just the field: at the ceiling this tombstone
+        // must not be the one reclaimed to make room.
+        // One short: the restored tombstone already occupies a slot, so this
+        // brings the registry to exactly the ceiling.
+        fill_with_tombstones(&mut restored, MAX_ENDPOINTS - 1, EndpointOrigin::Static);
+        assert_eq!(restored.endpoints.len(), MAX_ENDPOINTS);
+        assert_eq!(
+            restored.try_insert(dynamic_endpoint(ENDPOINT_TWO)),
+            InsertOutcome::Full,
+            "reclaiming it would resurrect the TOML endpoint on the next restart"
+        );
+        assert!(
+            !restored
+                .endpoint(ENDPOINT_ONE)
+                .expect("the tombstone must still be there")
+                .is_active()
         );
     }
 
