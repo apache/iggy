@@ -19,16 +19,18 @@ use std::sync::Arc;
 
 use iggy::clients::producer_config::BackpressureMode as RustBackpressureMode;
 use iggy::prelude::{
-    BackgroundConfig as RustBackgroundConfig, BalancedSharding,
-    DirectConfig as RustDirectConfig, Identifier, IggyByteSize, IggyDuration,
-    IggyMessage as RustIggyMessage, IggyProducer as RustIggyProducer, OrderedSharding, Sharding,
+    BackgroundConfig as RustBackgroundConfig, BalancedSharding, DirectConfig as RustDirectConfig,
+    Identifier, IggyByteSize, IggyDuration, IggyMessage as RustIggyMessage,
+    IggyProducer as RustIggyProducer, OrderedSharding, Sharding,
 };
+use pyo3::IntoPyObjectExt;
 use pyo3::conversion::FromPyObject;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDelta, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::RwLock;
 
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
@@ -70,11 +72,7 @@ impl DirectProducerConfig {
     /// Constructs direct-producer batching and pacing configuration.
     #[new]
     #[pyo3(signature = (*, batch_length=1000, linger_time=DefaultDuration::default()))]
-    fn new(
-        batch_length: i64,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta", imports=("datetime")))]
-        linger_time: DefaultDuration,
-    ) -> PyResult<Self> {
+    fn new(batch_length: i64, linger_time: DefaultDuration) -> PyResult<Self> {
         let batch_length = u32_param(batch_length, "batch_length")?;
         let linger_time = linger_time.resolve(IggyDuration::from(0))?;
         Ok(Self {
@@ -199,9 +197,7 @@ impl BackpressureMode {
                 "BackpressureMode.block_with_timeout({})",
                 duration_repr(timeout)
             ),
-            BackpressureKind::FailImmediately => {
-                "BackpressureMode.fail_immediately()".to_owned()
-            }
+            BackpressureKind::FailImmediately => "BackpressureMode.fail_immediately()".to_owned(),
         }
     }
 }
@@ -260,7 +256,7 @@ impl BackgroundProducerConfig {
     #[pyo3(signature = (
         *,
         num_shards=1,
-        linger_time=DefaultDuration::default(),
+        linger_time=DefaultDuration::one_millisecond(),
         batch_size=1048576,
         batch_length=1000,
         max_buffer_size=33554432,
@@ -270,7 +266,6 @@ impl BackgroundProducerConfig {
     ))]
     fn new(
         num_shards: i128,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta", imports=("datetime")))]
         linger_time: DefaultDuration,
         batch_size: i128,
         batch_length: i128,
@@ -284,10 +279,7 @@ impl BackgroundProducerConfig {
             linger_time: linger_time.resolve(IggyDuration::from(1_000))?,
             batch_size: usize_param(batch_size, "batch_size")?,
             batch_length: usize_param(batch_length, "batch_length")?,
-            max_buffer_size: IggyByteSize::from(u64_param(
-                max_buffer_size,
-                "max_buffer_size",
-            )?),
+            max_buffer_size: IggyByteSize::from(u64_param(max_buffer_size, "max_buffer_size")?),
             failure_mode,
             max_in_flight: usize_param(max_in_flight, "max_in_flight")?,
             sharding,
@@ -423,8 +415,9 @@ impl IggyProducer {
         &self,
         py: Python<'py>,
         #[gen_stub(override_type(type_repr = "list[SendMessage]"))] messages: &Bound<'_, PyList>,
-        #[gen_stub(override_type(type_repr = "Partitioning | None"))]
-        partitioning: Option<&Partitioning>,
+        #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
+            &Partitioning,
+        >,
     ) -> PyResult<Bound<'py, PyAny>> {
         let messages = extract_messages(messages)?;
         let partitioning = partitioning.map(|value| Arc::new(value.inner.clone()));
@@ -451,8 +444,9 @@ impl IggyProducer {
         stream: PyIdentifier,
         topic: PyIdentifier,
         #[gen_stub(override_type(type_repr = "list[SendMessage]"))] messages: &Bound<'_, PyList>,
-        #[gen_stub(override_type(type_repr = "Partitioning | None"))]
-        partitioning: Option<&Partitioning>,
+        #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
+            &Partitioning,
+        >,
     ) -> PyResult<Bound<'py, PyAny>> {
         let stream = Arc::new(Identifier::try_from(stream)?);
         let topic = Arc::new(Identifier::try_from(topic)?);
@@ -514,6 +508,29 @@ impl Default for ProducerMode {
     }
 }
 
+impl PyStubType for ProducerMode {
+    fn type_output() -> TypeInfo {
+        DirectProducerConfig::type_output() | BackgroundProducerConfig::type_output()
+    }
+
+    fn type_input() -> TypeInfo {
+        DirectProducerConfig::type_input() | BackgroundProducerConfig::type_input()
+    }
+}
+
+impl<'py> IntoPyObject<'py> for ProducerMode {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        match self {
+            Self::Direct(config) => Ok(config.into_pyobject(py)?.into_any()),
+            Self::Background(config) => Ok(config.into_pyobject(py)?.into_any()),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) enum RetryInterval {
     #[default]
@@ -534,6 +551,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for RetryInterval {
     }
 }
 
+impl PyStubType for RetryInterval {
+    fn type_output() -> TypeInfo {
+        <std::time::Duration>::type_output() | TypeInfo::none()
+    }
+
+    fn type_input() -> TypeInfo {
+        <std::time::Duration>::type_input() | TypeInfo::none()
+    }
+}
+
+impl<'py> IntoPyObject<'py> for RetryInterval {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        match self {
+            Self::Omitted => std::time::Duration::from_secs(1).into_bound_py_any(py),
+            Self::Disabled => Ok(py.None().into_bound(py)),
+            Self::Duration(duration) => Ok(duration.into_bound(py).into_any()),
+        }
+    }
+}
+
 impl RetryInterval {
     pub(crate) fn resolve(self) -> PyResult<Option<iggy::prelude::NonZeroIggyDuration>> {
         match self {
@@ -549,24 +590,64 @@ impl RetryInterval {
 }
 
 #[derive(Default)]
-struct DefaultDuration(Option<Py<PyDelta>>);
+enum DefaultDuration {
+    #[default]
+    Zero,
+    OneMillisecond,
+    Value(Py<PyDelta>),
+}
+
+impl DefaultDuration {
+    fn one_millisecond() -> Self {
+        Self::OneMillisecond
+    }
+}
+
+impl PyStubType for DefaultDuration {
+    fn type_output() -> TypeInfo {
+        timedelta_type_info()
+    }
+
+    fn type_input() -> TypeInfo {
+        timedelta_type_info()
+    }
+}
+
+impl<'py> IntoPyObject<'py> for DefaultDuration {
+    type Target = PyDelta;
+    type Output = Bound<'py, PyDelta>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        match self {
+            Self::Zero => std::time::Duration::ZERO.into_pyobject(py),
+            Self::OneMillisecond => std::time::Duration::from_millis(1).into_pyobject(py),
+            Self::Value(duration) => Ok(duration.into_bound(py)),
+        }
+    }
+}
 
 impl<'a, 'py> FromPyObject<'a, 'py> for DefaultDuration {
     type Error = PyErr;
 
     fn extract(object: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        Ok(Self(Some(object.extract::<Py<PyDelta>>()?)))
+        Ok(Self::Value(object.extract::<Py<PyDelta>>()?))
     }
 }
 
 impl DefaultDuration {
     fn resolve(self, default: IggyDuration) -> PyResult<IggyDuration> {
-        self.0
-            .as_ref()
-            .map(py_delta_to_iggy_duration)
-            .transpose()
-            .map(|duration| duration.unwrap_or(default))
+        match self {
+            Self::Value(duration) => py_delta_to_iggy_duration(&duration),
+            Self::Zero | Self::OneMillisecond => Ok(default),
+        }
     }
+}
+
+fn timedelta_type_info() -> TypeInfo {
+    let mut type_info = <std::time::Duration>::type_input();
+    type_info.source_module = None;
+    type_info
 }
 
 async fn shutdown(inner: Arc<RwLock<Option<RustIggyProducer>>>) -> PyResult<()> {
@@ -597,10 +678,7 @@ fn to_runtime_error(error: impl ToString) -> PyErr {
 
 pub(crate) fn u32_param(value: i64, parameter: &str) -> PyResult<u32> {
     u32::try_from(value).map_err(|_| {
-        PyValueError::new_err(format!(
-            "'{parameter}' must be between 0 and {}",
-            u32::MAX
-        ))
+        PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", u32::MAX))
     })
 }
 
@@ -615,10 +693,7 @@ fn usize_param(value: i128, parameter: &str) -> PyResult<usize> {
 
 fn u64_param(value: i128, parameter: &str) -> PyResult<u64> {
     u64::try_from(value).map_err(|_| {
-        PyValueError::new_err(format!(
-            "'{parameter}' must be between 0 and {}",
-            u64::MAX
-        ))
+        PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", u64::MAX))
     })
 }
 
@@ -655,7 +730,10 @@ mod tests {
     fn direct_batch_length_rejects_values_outside_u32() {
         assert!(u32_param(-1, "batch_length").is_err());
         assert!(u32_param(i64::from(u32::MAX) + 1, "batch_length").is_err());
-        assert_eq!(u32_param(i64::from(u32::MAX), "batch_length").unwrap(), u32::MAX);
+        assert_eq!(
+            u32_param(i64::from(u32::MAX), "batch_length").unwrap(),
+            u32::MAX
+        );
     }
 
     #[test]
@@ -682,7 +760,10 @@ mod tests {
             RustBackpressureMode::FailImmediately
         ));
         assert_eq!(rust.max_in_flight, 3);
-        assert_eq!(format!("{:?}", rust.sharding), "BalancedSharding { counter: 0 }");
+        assert_eq!(
+            format!("{:?}", rust.sharding),
+            "BalancedSharding { counter: 0 }"
+        );
     }
 
     #[test]
@@ -694,14 +775,19 @@ mod tests {
             direct.__repr__(),
             "DirectProducerConfig(batch_length=1000, linger_time=datetime.timedelta(seconds=0))"
         );
-        assert_eq!(BackpressureMode::block().__repr__(), "BackpressureMode.block()");
+        assert_eq!(
+            BackpressureMode::block().__repr__(),
+            "BackpressureMode.block()"
+        );
         assert_eq!(
             BackpressureMode::fail_immediately().__repr__(),
             "BackpressureMode.fail_immediately()"
         );
-        assert!(background
-            .__repr__()
-            .ends_with("sharding=ProducerSharding.ORDERED)"));
+        assert!(
+            background
+                .__repr__()
+                .ends_with("sharding=ProducerSharding.ORDERED)")
+        );
     }
 
     #[test]
@@ -721,8 +807,14 @@ mod tests {
     fn numeric_validation_uses_python_semantic_ranges() {
         assert!(usize_param(-1, "num_shards").is_err());
         assert!(u64_param(-1, "max_buffer_size").is_err());
-        assert_eq!(usize_param(usize::MAX as i128, "num_shards").unwrap(), usize::MAX);
-        assert_eq!(u64_param(u64::MAX as i128, "max_buffer_size").unwrap(), u64::MAX);
+        assert_eq!(
+            usize_param(usize::MAX as i128, "num_shards").unwrap(),
+            usize::MAX
+        );
+        assert_eq!(
+            u64_param(u64::MAX as i128, "max_buffer_size").unwrap(),
+            u64::MAX
+        );
     }
 
     #[test]
@@ -739,7 +831,10 @@ mod tests {
         assert_eq!(IggyDuration::from(1_000), rust.linger_time);
         assert_eq!(DEFAULT_BACKGROUND_BATCH_SIZE, rust.batch_size);
         assert_eq!(DEFAULT_BACKGROUND_BATCH_LENGTH, rust.batch_length);
-        assert_eq!(DEFAULT_BACKGROUND_MAX_BUFFER_SIZE, rust.max_buffer_size.as_bytes_u64());
+        assert_eq!(
+            DEFAULT_BACKGROUND_MAX_BUFFER_SIZE,
+            rust.max_buffer_size.as_bytes_u64()
+        );
         assert_eq!(DEFAULT_BACKGROUND_MAX_IN_FLIGHT, rust.max_in_flight);
     }
 }

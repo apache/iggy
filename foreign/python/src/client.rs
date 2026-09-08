@@ -42,9 +42,7 @@ use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
-use crate::producer::{
-    IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param,
-};
+use crate::producer::{IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
@@ -1345,20 +1343,20 @@ impl IggyClient {
         py: Python<'a>,
         stream: &str,
         topic: &str,
-        #[gen_stub(override_type(type_repr = "Partitioning | None"))]
-        partitioning: Option<&crate::partitioning::Partitioning>,
-        #[gen_stub(override_type(type_repr = "DirectProducerConfig | BackgroundProducerConfig"))]
+        #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
+            &crate::partitioning::Partitioning,
+        >,
         mode: ProducerMode,
         create_stream_if_not_exists: bool,
         create_topic_if_not_exists: bool,
         topic_partitions_count: i64,
-        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))]
-        topic_message_expiry: Option<&IggyExpiry>,
-        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))]
-        topic_max_size: Option<&MaxTopicSize>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] topic_message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] topic_max_size: Option<
+            &MaxTopicSize,
+        >,
         send_retries: Option<i64>,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         send_retry_interval: RetryInterval,
     ) -> PyResult<Bound<'a, PyAny>> {
         let direct_config = match mode {
