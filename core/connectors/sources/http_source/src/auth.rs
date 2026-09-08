@@ -111,6 +111,10 @@ pub enum Inadmissible {
 impl Inadmissible {
     /// The operator-facing reason. `&'static str` so it can be an API error
     /// body without an allocation per refused request.
+    /// `&'static str` so a 400 body costs no allocation, which is also why the
+    /// three ceilings appear as literals below rather than being formatted from
+    /// the consts. `given_ceiling_messages_should_quote_the_consts` fails if a
+    /// const moves and its message does not.
     pub fn message(&self) -> &'static str {
         match self {
             Self::MissingSecret => "a non-empty auth_secret is required",
@@ -402,6 +406,27 @@ mod tests {
             "sha256=",
             &hmac_key(hmac::HMAC_SHA256, &secret()),
         ));
+    }
+
+    #[test]
+    fn given_ceiling_messages_should_quote_the_consts() {
+        // `message()` returns `&'static str`, so these three numbers are
+        // literals and nothing ties them to the consts they describe. The
+        // existing ceiling tests cannot catch the drift because they build
+        // their oversized inputs FROM the consts, so raising a const moves the
+        // test and the code together and leaves only the message lying.
+        for (inadmissible, ceiling) in [
+            (Inadmissible::SecretTooLong, MAX_AUTH_SECRET_LEN),
+            (Inadmissible::HmacHeaderTooLong, MAX_HMAC_HEADER_LEN),
+            (Inadmissible::HmacPrefixTooLong, MAX_HMAC_PREFIX_LEN),
+        ] {
+            let message = inadmissible.message();
+            assert!(
+                message.contains(&ceiling.to_string()),
+                "{inadmissible:?} says '{message}' but its ceiling is {ceiling}; \
+                 raise the const and the operator is told the wrong number"
+            );
+        }
     }
 
     #[test]

@@ -40,7 +40,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::auth::{Admission, admit_endpoint, is_usable, oversized_secret, validate_bearer};
+use crate::auth::{
+    Admission, Inadmissible, admit_endpoint, is_usable, oversized_secret, validate_bearer,
+};
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState, RouteTable};
 use crate::server::{ServerState, bearer_header, error_response, refresh_routes};
 use crate::state::{InsertOutcome, MAX_ENDPOINTS};
@@ -266,7 +268,14 @@ async fn rotate_secret(
     if !is_usable(&request.auth_secret) {
         // An empty HMAC key validates any signature the holder of the URL can
         // compute, so rotating to one silently removes the second factor.
-        return error_response(StatusCode::BAD_REQUEST, "auth_secret must not be empty");
+        //
+        // The rule's own message rather than a second wording for it: this
+        // check is `MissingSecret` by another name, three lines from the
+        // `is_usable` it shares with `admit_endpoint`.
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            Inadmissible::MissingSecret.message(),
+        );
     }
     // The same predicate registration applies, not a second copy of it.
     // Rotation keeps the endpoint, so an oversized secret accepted here is
