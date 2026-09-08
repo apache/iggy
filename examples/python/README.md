@@ -42,6 +42,30 @@ pip install .
 
 ## Basic Examples
 
+### High-Level Direct Producer
+
+The high-level producer binds the destination once, initializes missing
+resources, applies producer-level batching and retry settings, and shuts down
+deterministically through an async context manager:
+
+```bash
+# Using uv
+uv run direct-producer/producer.py
+
+# Without using uv
+python direct-producer/producer.py
+```
+
+Pass a different connection string as the optional argument. For example:
+
+```bash
+uv run direct-producer/producer.py \
+  'iggy+tcp://iggy:iggy@127.0.0.1:8090'
+```
+
+The existing examples below use the low-level `IggyClient.send_messages()` API
+and remain useful when each call needs to specify its own destination.
+
 ### Getting Started
 
 Perfect introduction for newcomers to Iggy:

@@ -204,6 +204,70 @@ async def main():
 asyncio.run(main())
 ```
 
+## High-Level Producer
+
+Use `IggyClient.producer()` when an application repeatedly publishes to one
+stream and topic. Producer creation is asynchronous because it initializes the
+destination before returning. By default, it creates a missing stream and topic,
+uses balanced partitioning, sends directly in batches of up to 1,000 messages,
+and retries failed sends up to three times with a one-second retry interval.
+
+```python
+import asyncio
+from datetime import timedelta
+
+from apache_iggy import DirectProducerConfig, IggyClient, Partitioning, SendMessage
+
+
+async def main():
+    client = IggyClient.from_connection_string(
+        "iggy+tcp://iggy:iggy@127.0.0.1:8090"
+    )
+    await client.connect()
+
+    producer = await client.producer(
+        "orders",
+        "created",
+        partitioning=Partitioning.balanced(),
+        mode=DirectProducerConfig(
+            batch_length=500,
+            linger_time=timedelta(milliseconds=5),
+        ),
+        create_stream_if_not_exists=True,
+        create_topic_if_not_exists=True,
+        topic_partitions_count=3,
+        topic_message_expiry=None,
+        topic_max_size=None,
+        send_retries=3,
+        send_retry_interval=timedelta(seconds=1),
+    )
+
+    async with producer:
+        await producer.send_one(SendMessage("order-1"))
+        response = await producer.send(
+            [SendMessage("order-2"), SendMessage("order-3")]
+        )
+        print(f"Received {len(response.confirmations)} partition confirmations")
+
+
+asyncio.run(main())
+```
+
+The producer is bound to the stream and topic passed to `producer()`. Use
+`send_with_partitioning(messages, partitioning)` to override its partitioning
+strategy for one call, or `send_to(stream, topic, messages, partitioning)` to
+send to another existing destination. `send_to()` does not create or initialize
+that destination.
+
+Cleanup is asynchronous and must be explicit. Prefer `async with`, as above, so
+shutdown runs on both successful and exceptional exits. Otherwise, call
+`await producer.shutdown()` in a `finally` block. Shutdown waits for active
+sends, is safe to call more than once, and rejects later sends with
+`RuntimeError`. Object destruction does not perform asynchronous cleanup.
+
+Only direct mode is implemented currently. Passing `BackgroundProducerConfig`
+to `producer()` raises `NotImplementedError`.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.
