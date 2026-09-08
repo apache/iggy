@@ -78,7 +78,7 @@ where
             let wire = WireJoinConsumerGroupRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
             let in_flight =
-                gather_in_flight(shard, &wire.stream_id, &wire.topic_id, &wire.group_id).await;
+                gather_in_flight(shard, &wire.stream_id, &wire.topic_id, &wire.group_id).await?;
             ReplicatedJoinConsumerGroupRequest {
                 stream_id: wire.stream_id,
                 topic_id: wire.topic_id,
@@ -117,7 +117,7 @@ async fn gather_in_flight<B, MJ, S, SB>(
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     group_id: &WireIdentifier,
-) -> Vec<u32>
+) -> Result<Vec<u32>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -129,10 +129,10 @@ where
     let Some(monotonic_group_id) = streams.resolve_consumer_group_id(stream_id, topic_id, group_id)
     else {
         // Fresh group (e.g. create-if-not-exists): nothing polled yet.
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(partition_ids) = streams.topic_partition_ids(stream_id, topic_id) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     // Partitions a live member currently owns. A `last_polled` past the commit
     // only means in-flight work when a live member still holds the partition;
@@ -169,6 +169,9 @@ where
     let mut in_flight = Vec::new();
     let mut stale_clears = Vec::new();
     for (partition_id, ns, reply) in results {
+        if let Some(PartitionReadReply::Rejected(error)) = reply {
+            return Err(error);
+        }
         let Some(PartitionReadReply::GroupOffsetState {
             last_polled: Some(polled),
             committed,
@@ -194,7 +197,7 @@ where
     }
     // Fire the stale-mark clears concurrently too; the result is unused.
     futures::future::join_all(stale_clears).await;
-    in_flight
+    Ok(in_flight)
 }
 
 /// Rewrite a group consumer-offset op so its consumer id is the group's

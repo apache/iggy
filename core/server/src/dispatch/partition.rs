@@ -921,6 +921,11 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                     stored: Some(stored_offset),
                     current_offset,
                 }) => build_consumer_offset_body(partition_id, current_offset, stored_offset),
+                Some(PartitionReadReply::Rejected(error)) => {
+                    send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                        .await;
+                    return;
+                }
                 _ => Bytes::new(),
             }
         }
@@ -1376,6 +1381,7 @@ where
             );
             return Err(IggyError::TransientNotAccepted);
         }
+        Some(PartitionReadReply::Rejected(error)) => return Err(error),
         other => {
             debug!(
                 client_id,

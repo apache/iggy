@@ -700,12 +700,17 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
     harness.kill_cluster().unwrap();
     harness.restart_cluster().await.unwrap();
     let client = wait_until_cluster_serves(harness, &[0, 1, 2], CONVERGE_TIMEOUT).await;
-    let mut next = vec![
-        IggyMessage::builder()
-            .payload(bytes::Bytes::from_static(b"after-checkpoint"))
-            .build()
-            .unwrap(),
-    ];
+    // The transferred checkpoint body exceeds the former offsets-only
+    // artifact cap, so this also verifies admission of a large prepare.
+    let payload = bytes::Bytes::from(vec![3; 1024 * 1024]);
+    let mut next = (0..33)
+        .map(|_| {
+            IggyMessage::builder()
+                .payload(payload.clone())
+                .build()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let clients = [
         client,
         harness.root_client_for_node(1).await.unwrap(),
@@ -749,20 +754,27 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
             vec![value; 1024 * 1024]
         );
     }
-    verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id).await;
+    verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id, 2).await;
+    verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id, 1).await;
+    verify_transferred_quorum(harness, &stream, &topic).await;
 }
 
-async fn verify_checkpoint_quarantine(harness: &mut TestHarness, stream_id: u32, topic_id: u32) {
-    let directory = harness.node(2).data_path().join(format!(
+async fn verify_checkpoint_quarantine(
+    harness: &mut TestHarness,
+    stream_id: u32,
+    topic_id: u32,
+    node: usize,
+) {
+    let directory = harness.node(node).data_path().join(format!(
         "streams/{stream_id}/topics/{topic_id}/partitions/0"
     ));
-    harness.kill_node(2).unwrap();
+    harness.kill_node(node).unwrap();
     // An empty segment starting inside the existing segment makes the chain
     // structurally invalid even when recovery can use a sparse index.
     std::fs::write(directory.join("00000000000000000001.log"), []).unwrap();
     std::fs::write(directory.join("00000000000000000001.index"), []).unwrap();
-    harness.restart_node(2).unwrap();
-    let client = harness.root_client_for_node(2).await.unwrap();
+    harness.restart_node(node).unwrap();
+    let client = harness.root_client_for_node(node).await.unwrap();
     let stream = Identifier::numeric(stream_id).unwrap();
     let topic = Identifier::numeric(topic_id).unwrap();
     let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
@@ -794,6 +806,45 @@ async fn verify_checkpoint_quarantine(harness: &mut TestHarness, stream_id: u32,
         assert!(
             tokio::time::Instant::now() < deadline,
             "quarantined checkpoint must be restored by full state transfer"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn verify_transferred_quorum(
+    harness: &mut TestHarness,
+    stream: &Identifier,
+    topic: &Identifier,
+) {
+    harness.kill_cluster().unwrap();
+    harness.restart_node(1).unwrap();
+    harness.restart_node(2).unwrap();
+    let _ = wait_until_cluster_serves(harness, &[1, 2], CONVERGE_TIMEOUT).await;
+    let clients = [
+        harness.root_client_for_node(1).await.unwrap(),
+        harness.root_client_for_node(2).await.unwrap(),
+    ];
+    let mut messages = vec![
+        IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"after-donor-loss"))
+            .build()
+            .unwrap(),
+    ];
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        for client in &clients {
+            match client
+                .send_messages(stream, topic, &Partitioning::partition_id(0), &mut messages)
+                .await
+            {
+                Ok(_) => return,
+                Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("transferred quorum rejected the next operation: {error}"),
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "transferred replicas must elect without their donor"
         );
         sleep(POLL_INTERVAL).await;
     }

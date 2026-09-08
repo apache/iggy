@@ -43,9 +43,12 @@ use consensus::state_manifest::artifact_kind;
 use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
+use server_common::Message;
+use server_common::iobuf::Owned;
 use server_common::send_messages::decode_batch_slice;
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::collections::{HashMap, HashSet};
@@ -57,8 +60,8 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 /// Current state-transfer offsets format, including the prepare-chain anchor.
-pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO3";
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 3;
+pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 1;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -290,6 +293,7 @@ pub(crate) struct ConsumerOffsetsWire {
     pub purge_generation: u64,
     /// Checksum of the prepare at the offer's committed operation.
     pub prepare_checksum: Option<u128>,
+    pub checkpoint_prepare: Vec<u8>,
     /// The origin group's message-offset frontier: the offset the NEXT
     /// append will mint, `0` for a partition that never appended. Segments
     /// alone cannot carry this -- retention can GC every sealed segment
@@ -313,7 +317,7 @@ impl ConsumerOffsetsWire {
     /// {id u32, offset u64}xN | {id u32, offset u64}xM |
     /// {client u128, watermark u64, latest_commit u64, user_id u32,
     /// committed_window u128}xD | checksum_present u8 | prepare_checksum u128 |
-    /// XxHash3_64 trailer`. Little-endian throughout.
+    /// prepare_length u32 | checkpoint_prepare bytes | XxHash3_64 trailer`. Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         // Size exactly rather than guess; the reservation assert keeps the
@@ -326,6 +330,8 @@ impl ConsumerOffsetsWire {
             + self.dedup.len() * DEDUP_ENTRY_LEN
             + size_of::<u8>()
             + size_of::<u128>()
+            + size_of::<u32>()
+            + self.checkpoint_prepare.len()
             + size_of::<u64>();
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
@@ -351,6 +357,12 @@ impl ConsumerOffsetsWire {
         }
         out.push(u8::from(self.prepare_checksum.is_some()));
         out.extend_from_slice(&self.prepare_checksum.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(self.checkpoint_prepare.len())
+                .expect("bounded checkpoint prepare")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&self.checkpoint_prepare);
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
         out.extend_from_slice(&trailer.to_le_bytes());
@@ -399,6 +411,11 @@ impl ConsumerOffsetsWire {
             1 => Some(checksum),
             _ => return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum),
         };
+        let prepare_length = cursor.u32()? as usize;
+        if prepare_length > journal::partition_journal::PREPARE_BYTES_MAX {
+            return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum);
+        }
+        let checkpoint_prepare = cursor.take(prepare_length)?.to_vec();
         if !cursor.remaining().is_empty() {
             // Distinct from `Truncated`: extra bytes point at a NEWER
             // encoder, and telling the operator the artifact is short would
@@ -410,6 +427,7 @@ impl ConsumerOffsetsWire {
         Ok(Self {
             purge_generation,
             prepare_checksum,
+            checkpoint_prepare,
             next_offset,
             consumers,
             groups,
@@ -654,6 +672,7 @@ mod tests {
     fn table() -> ConsumerOffsetsWire {
         ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 3,
             next_offset: 43,
             consumers: vec![(1, 10), (7, 42)],
@@ -708,6 +727,7 @@ mod tests {
     fn given_empty_table_when_encoded_should_round_trip() {
         let empty = ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -776,6 +796,7 @@ mod tests {
     fn given_unordered_dedup_clients_when_decoded_should_reject() {
         let unordered = ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -792,6 +813,7 @@ mod tests {
     fn given_reserved_client_in_dedup_when_decoded_should_reject() {
         let reserved = ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -805,8 +827,8 @@ mod tests {
     }
 
     #[test]
-    fn given_previous_artifact_versions_when_decoded_should_reject() {
-        for magic in [b"ICO1", b"ICO2"] {
+    fn given_unknown_artifact_formats_when_decoded_should_reject() {
+        for magic in [b"BAD1", b"ICO9"] {
             let mut bytes = table().encode();
             bytes[..4].copy_from_slice(magic);
             let length = bytes.len() - 8;
@@ -887,6 +909,7 @@ mod tests {
     fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
         let duplicate = ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 0,
             consumers: vec![(5, 1), (5, 2)],
@@ -902,6 +925,7 @@ mod tests {
         );
         let unordered = ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -2223,10 +2247,19 @@ where
                         .then(|| self.consensus().last_prepare_checksum())
                 })
         };
-        if self.persistence.is_some() && prepare_checksum.is_none() {
+        let checkpoint_prepare = self
+            .log
+            .journal()
+            .inner
+            .repair_entry(commit_op)
+            .map_or_else(Vec::new, |prepare| prepare.as_slice().to_vec());
+        if self.persistence.is_some()
+            && (prepare_checksum.is_none() || (commit_op > 0 && checkpoint_prepare.is_empty()))
+        {
             return Err(PartitionTransferUnavailable::MissingPrepareChecksum { op: commit_op });
         }
         Ok(ConsumerOffsetsWire {
+            checkpoint_prepare,
             prepare_checksum,
             purge_generation: self.applied_purge_generation,
             next_offset,
@@ -2515,8 +2548,31 @@ where
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
-        if self.persistence.is_some() && offsets_wire.prepare_checksum.is_none() {
+        if self.persistence.is_some()
+            && (offsets_wire.prepare_checksum.is_none()
+                || (commit_op > 0 && offsets_wire.checkpoint_prepare.is_empty()))
+        {
             return Err(ConsumerOffsetsWireError::MissingPrepareChecksum.into());
+        }
+        if !offsets_wire.checkpoint_prepare.is_empty() {
+            let prepare = Message::<PrepareHeader>::try_from(Owned::copy_from_slice(
+                &offsets_wire.checkpoint_prepare,
+            ))
+            .map_err(|_| ConsumerOffsetsWireError::InvalidPrepareChecksum)?;
+            let header = prepare.header();
+            if header.op != commit_op
+                || header.group != self.consensus().group()
+                || Some(header.checksum) != offsets_wire.prepare_checksum
+                || header.size as usize != offsets_wire.checkpoint_prepare.len()
+                || (header.checksum != 0 && header.identity_checksum() != header.checksum)
+                || (header.checksum_body != 0
+                    && header.checksum_body
+                        != u128::from(iggy_common::calculate_checksum(
+                            &offsets_wire.checkpoint_prepare[size_of::<PrepareHeader>()..],
+                        )))
+            {
+                return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum.into());
+            }
         }
         // Anti-rewind against the LOCAL OFFSET COUNTER, not the commit
         // frontier: the partition journal is memory-only and
@@ -2760,6 +2816,9 @@ where
         partition_dir: &str,
         next_offset: u64,
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
+        if let Some(persistence) = &self.persistence {
+            persistence.retire_offset_files();
+        }
         // Sweep staging strays a dead earlier attempt left behind, keeping
         // only what THIS install is about to rename. Bounded disk hygiene;
         // the reuse-scan sweeps too, and boot sweeps ALL of `.staging`
@@ -3267,7 +3326,9 @@ where
         self.purge_deferred = false;
 
         if let Some(persistence) = &self.persistence {
-            persistence.reset(commit_op, offsets_wire.prepare_checksum);
+            let prepare = (!offsets_wire.checkpoint_prepare.is_empty())
+                .then(|| Owned::<4096>::copy_from_slice(&offsets_wire.checkpoint_prepare).into());
+            persistence.reset_with_prepare(commit_op, offsets_wire.prepare_checksum, prepare);
             self.start_persistence();
             persistence.drain_with_timeout().await.map_err(|source| {
                 PartitionInstallError::SwapIo {
@@ -3275,6 +3336,26 @@ where
                     source,
                 }
             })?;
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.certify_log_view(
+                self.consensus().log_view(),
+                commit_op,
+                offsets_wire.prepare_checksum.unwrap_or(0),
+            );
+            self.start_persistence();
+            persistence.drain_with_timeout().await.map_err(|source| {
+                PartitionInstallError::SwapIo {
+                    path: partition_dir.to_owned(),
+                    source,
+                }
+            })?;
+        }
+        if !offsets_wire.checkpoint_prepare.is_empty() {
+            self.log.journal().inner.restore_checkpoint_prepare(
+                commit_op,
+                Owned::<4096>::copy_from_slice(&offsets_wire.checkpoint_prepare).into(),
+            );
         }
         let consensus = self.consensus();
         if commit_op > consensus.commit_min() {
@@ -3330,6 +3411,9 @@ where
         minted_next_offset: u64,
         staged_was_empty: bool,
     ) -> Result<(), iggy_common::IggyError> {
+        if let Some(persistence) = &self.persistence {
+            persistence.retire_offset_files();
+        }
         // The empty plant below can land on a base offset this sweep unlinks,
         // so an in-flight poll's cached read fd would keep serving the retired
         // inodes as live data. Same hazard and same fix as `purge`.

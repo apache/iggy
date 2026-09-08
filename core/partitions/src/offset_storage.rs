@@ -130,6 +130,34 @@ pub async fn persist_offset(path: &str, offset: u64, persisted: bool) -> Result<
     }
 }
 
+/// Keep the original writer open so checkpoint observes its writeback errors.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened or written.
+pub async fn persist_offset_retained(
+    path: &str,
+    offset: u64,
+    existing: Option<compio::fs::File>,
+) -> Result<compio::fs::File, IggyError> {
+    let mut file = if let Some(file) = existing {
+        file
+    } else {
+        create_parent_dir(path).await?;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .await
+            .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?
+    };
+    file.write_all_at(encode_offset_record(offset), 0)
+        .await
+        .0
+        .map_err(|_| IggyError::CannotWriteToFile)?;
+    Ok(file)
+}
+
 async fn write_in_place<const N: usize>(path: &str, record: [u8; N]) -> Result<(), IggyError> {
     create_parent_dir(path).await?;
     let mut file = OpenOptions::new()
@@ -273,6 +301,18 @@ pub async fn persist_offset_max(
     offset: u64,
     persisted: bool,
 ) -> Result<PersistedOffset, IggyError> {
+    let result = read_offset_max(path, offset).await?;
+    if result.written {
+        persist_offset(path, result.offset, persisted).await?;
+    }
+    Ok(result)
+}
+
+/// Read the committed maximum without replacing its file.
+///
+/// # Errors
+/// Returns an error if the existing offset cannot be read.
+pub async fn read_offset_max(path: &str, offset: u64) -> Result<PersistedOffset, IggyError> {
     let on_disk = match read_offset_record(path).await? {
         Some(OffsetRecord::Value { offset, .. }) => Some(offset),
         Some(OffsetRecord::Corrupt {
@@ -295,9 +335,6 @@ pub async fn persist_offset_max(
     };
     let effective = on_disk.map_or(offset, |current| current.max(offset));
     let written = on_disk != Some(effective);
-    if written {
-        persist_offset(path, effective, persisted).await?;
-    }
     Ok(PersistedOffset {
         offset: effective,
         written,

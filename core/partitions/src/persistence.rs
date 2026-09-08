@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use futures::TryStreamExt;
 use iggy_binary_protocol::PrepareHeader;
 use journal::PartitionPrepareJournal;
-use journal::durable_storage::{DiskStorage, DurableStorage};
+use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage};
 use journal::partition_journal::PARTITION_WAL_BYTES_MAX;
 use server_common::Message;
 use server_common::iobuf::Frozen;
@@ -65,12 +66,16 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     lease: Option<Arc<WriterLease>>,
     epoch: Cell<u64>,
     journal: RefCell<Option<PartitionPrepareJournal<S>>>,
-    queue: RefCell<VecDeque<Mutation>>,
+    queue: RefCell<VecDeque<Mutation<S>>>,
+    offset_files: RefCell<HashMap<String, S::File>>,
+    retired_offset_files: RefCell<Vec<S::File>>,
     accepted: RefCell<AcceptedPrepares>,
     accepted_head: Cell<u64>,
     durable_head: Cell<u64>,
     checkpoint: Cell<u64>,
     checkpoint_checksum: Cell<Option<u128>>,
+    certified_log_view: Cell<Option<u32>>,
+    requested_log_view: Cell<Option<(u32, u64, u128)>>,
     checkpoint_requested: Cell<u64>,
     checkpoint_running: Cell<bool>,
     dirty_segments: RefCell<BTreeSet<u64>>,
@@ -313,7 +318,13 @@ impl AcceptedPrepares {
     }
 }
 
-enum Mutation {
+enum Mutation<S: DurableStorage> {
+    CertifyView {
+        epoch: u64,
+        view: u32,
+        op: u64,
+        checksum: u128,
+    },
     Purge {
         epoch: u64,
         generation: u64,
@@ -334,11 +345,13 @@ enum Mutation {
         through_op: u64,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
+        offset_files: Vec<S::File>,
     },
     Reset {
         epoch: u64,
         op: u64,
         checksum: Option<u128>,
+        prepare: Option<Frozen<4096>>,
     },
 }
 
@@ -415,6 +428,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             durable_head: Cell::new(journal.head()),
             checkpoint: Cell::new(journal.checkpoint_op()),
             checkpoint_checksum: Cell::new(journal.checkpoint_checksum()),
+            certified_log_view: Cell::new(journal.certified_log_view()),
+            requested_log_view: Cell::new(None),
             checkpoint_requested: Cell::new(journal.checkpoint_op()),
             checkpoint_running: Cell::new(false),
             dirty_segments: RefCell::new(BTreeSet::new()),
@@ -425,6 +440,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             disk_bytes: Cell::new(journal.size_bytes()),
             journal: RefCell::new(Some(journal)),
             queue: RefCell::new(VecDeque::new()),
+            offset_files: RefCell::new(HashMap::new()),
+            retired_offset_files: RefCell::new(Vec::new()),
             accepted: RefCell::new(accepted),
             queued_bytes: Cell::new(0),
             in_flight_bytes: Cell::new(0),
@@ -445,6 +462,43 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     #[cfg(test)]
     pub(crate) fn exhaust_capacity_for_test(&self) {
         self.disk_bytes.set(self.capacity);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_capacity_for_test(&self) {
+        self.disk_bytes.set(0);
+    }
+
+    pub const fn certified_log_view(&self) -> Option<u32> {
+        self.certified_log_view.get()
+    }
+
+    pub fn certify_log_view(&self, view: u32, op: u64, checksum: u128) -> bool {
+        if self.certified_log_view.get() == Some(view) {
+            return true;
+        }
+        if self.retired.get()
+            || self.failure.borrow().is_some()
+            || op > self.head()
+            || !(op == 0 && checksum == 0 || self.checksum(op) == Some(checksum))
+        {
+            return false;
+        }
+        let target = (view, op, checksum);
+        if self
+            .requested_log_view
+            .get()
+            .is_none_or(|(pending, _, _)| pending != view)
+        {
+            self.requested_log_view.set(Some(target));
+            self.queue.borrow_mut().push_back(Mutation::CertifyView {
+                epoch: self.epoch.get(),
+                view,
+                op,
+                checksum,
+            });
+        }
+        false
     }
 
     pub fn set_notifier(&self, notifier: PersistenceNotifier) {
@@ -527,6 +581,22 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.dirty_segments.borrow_mut().insert(start_offset);
     }
 
+    pub fn take_offset_file(&self, path: &str) -> Option<S::File> {
+        self.offset_files.borrow_mut().remove(path)
+    }
+
+    /// # Panics
+    /// Panics if the previous writer was not taken before replacement.
+    pub fn retain_offset_file(&self, path: String, file: S::File) {
+        assert!(self.offset_files.borrow_mut().insert(path, file).is_none());
+    }
+
+    pub fn retire_offset_file(&self, path: &str) {
+        if let Some(file) = self.take_offset_file(path) {
+            self.retired_offset_files.borrow_mut().push(file);
+        }
+    }
+
     pub fn mark_offset_dirty(&self, kind_index: usize, consumer_id: u32, exists: bool) {
         let mut offsets = self.dirty_offsets[kind_index].borrow_mut();
         if exists {
@@ -534,6 +604,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         } else {
             offsets.remove(&consumer_id);
         }
+    }
+
+    pub fn retire_offset_files(&self) {
+        self.retired_offset_files
+            .borrow_mut()
+            .extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
     }
 
     pub fn take_dirty_files(&self) -> (BTreeSet<u64>, [BTreeSet<u32>; 2]) {
@@ -559,11 +635,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             return;
         }
         self.checkpoint_requested.set(through_op);
+        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
+        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
         self.queue.borrow_mut().push_back(Mutation::Checkpoint {
             epoch: self.epoch.get(),
             through_op,
             files,
             directories,
+            offset_files,
         });
     }
 
@@ -576,6 +655,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             return;
         }
         self.checkpoint_requested.set(self.checkpoint.get());
+        self.certified_log_view.set(None);
+        self.requested_log_view.set(None);
         let epoch = self.epoch.get().wrapping_add(1);
         self.epoch.set(epoch);
         // Retained submissions still precede the replacement history.
@@ -619,6 +700,19 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn reset(&self, op: u64, checksum: Option<u128>) {
+        self.reset_with_prepare(op, checksum, None);
+    }
+
+    pub fn reset_with_prepare(
+        &self,
+        op: u64,
+        checksum: Option<u128>,
+        prepare: Option<Frozen<4096>>,
+    ) {
+        self.offset_files.borrow_mut().clear();
+        self.retired_offset_files.borrow_mut().clear();
+        self.certified_log_view.set(None);
+        self.requested_log_view.set(None);
         self.checkpoint_requested.set(op);
         let epoch = self.epoch.get().wrapping_add(1);
         self.epoch.set(epoch);
@@ -634,6 +728,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             epoch,
             op,
             checksum,
+            prepare,
         });
     }
 
@@ -653,6 +748,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         !self.checkpoint_pending()
             && (self.disk_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
                 >= self.capacity / 2
+                || self.retired_offset_files.borrow().len() >= CHECKPOINT_DIRTY_FILES_MAX
                 || self.dirty_segments.borrow().len() * 2
                     + self
                         .dirty_offsets
@@ -793,7 +889,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             };
             let (epoch, bytes) = match &mutation {
                 Mutation::Append { epoch, bytes, .. } => (*epoch, *bytes),
-                Mutation::Purge { epoch, .. }
+                Mutation::CertifyView { epoch, .. }
+                | Mutation::Purge { epoch, .. }
                 | Mutation::Truncate { epoch, .. }
                 | Mutation::Checkpoint { epoch, .. }
                 | Mutation::Reset { epoch, .. } => (*epoch, 0),
@@ -801,36 +898,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             self.queued_bytes
                 .set(self.queued_bytes.get().saturating_sub(bytes));
             self.in_flight_bytes.set(bytes);
-            let result = match mutation {
-                Mutation::Purge {
-                    generation, floor, ..
-                } => journal.mark_purge(generation, floor).await,
-                Mutation::Append {
-                    prepare, durable, ..
-                } => {
-                    self.append_batch(journal, prepare, durable, epoch, bytes)
-                        .await
-                }
-                Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
-                Mutation::Checkpoint {
-                    through_op,
-                    files,
-                    directories,
-                    ..
-                } => {
-                    self.checkpoint_running.set(true);
-                    let result = journal
-                        .checkpoint_files(through_op, &files, &directories)
-                        .await;
-                    self.checkpoint_running.set(false);
-                    if result.is_ok() {
-                        self.completed_checkpoints
-                            .set(self.completed_checkpoints.get() + 1);
-                    }
-                    result
-                }
-                Mutation::Reset { op, checksum, .. } => journal.reset(op, checksum).await,
-            };
+            let result = self.apply_mutation(journal, mutation, epoch, bytes).await;
             self.in_flight_bytes.set(0);
             if let Err(error) = result {
                 self.failed_writes.set(self.failed_writes.get() + 1);
@@ -841,7 +909,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             if epoch == self.epoch.get() && !self.retired.get() {
                 self.disk_bytes.set(journal.size_bytes());
                 let advanced = journal.durable_op() != self.durable_head.get()
-                    || journal.checkpoint_op() != self.checkpoint.get();
+                    || journal.checkpoint_op() != self.checkpoint.get()
+                    || journal.certified_log_view() != self.certified_log_view.get();
+                self.certified_log_view.set(journal.certified_log_view());
+                if self
+                    .requested_log_view
+                    .get()
+                    .is_some_and(|(view, _, _)| Some(view) == self.certified_log_view.get())
+                {
+                    self.requested_log_view.set(None);
+                }
                 self.durable_head.set(journal.durable_op());
                 if journal.checkpoint_op() > self.checkpoint.get() {
                     self.accepted
@@ -858,6 +935,66 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             }
         }
         guard.complete = true;
+    }
+
+    async fn apply_mutation(
+        &self,
+        journal: &mut PartitionPrepareJournal<S>,
+        mutation: Mutation<S>,
+        epoch: u64,
+        bytes: u64,
+    ) -> io::Result<()> {
+        match mutation {
+            Mutation::CertifyView {
+                view, op, checksum, ..
+            } => journal.certify_log_view(view, op, checksum).await,
+            Mutation::Purge {
+                generation, floor, ..
+            } => journal.mark_purge(generation, floor).await,
+            Mutation::Append {
+                prepare, durable, ..
+            } => {
+                self.append_batch(journal, prepare, durable, epoch, bytes)
+                    .await
+            }
+            Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
+            Mutation::Checkpoint {
+                through_op,
+                files,
+                directories,
+                offset_files,
+                ..
+            } => {
+                self.checkpoint_running.set(true);
+                let result = async {
+                    futures::stream::iter(offset_files.iter().map(Ok::<_, io::Error>))
+                        .try_for_each_concurrent(16, DurableFile::sync)
+                        .await?;
+                    journal
+                        .checkpoint_files(through_op, &files, &directories)
+                        .await
+                }
+                .await;
+                self.checkpoint_running.set(false);
+                if result.is_ok() {
+                    self.completed_checkpoints
+                        .set(self.completed_checkpoints.get() + 1);
+                }
+                result
+            }
+            Mutation::Reset {
+                op,
+                checksum,
+                prepare,
+                ..
+            } => {
+                if let Some(prepare) = prepare {
+                    journal.reset_with_prepare(prepare).await
+                } else {
+                    journal.reset(op, checksum).await
+                }
+            }
+        }
     }
 
     async fn append_batch(

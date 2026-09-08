@@ -1378,6 +1378,7 @@ pub(in crate::http) async fn get_consumer_offset(
         Some(
             PartitionReadReply::ConsumerOffset { stored: None, .. } | PartitionReadReply::NotFound,
         ) => Err(ReadError::NotFound),
+        Some(PartitionReadReply::Rejected(error)) => Err(ReadError::Rejected(error)),
         Some(_) => Err(ReadError::Rejected(IggyError::InvalidCommand)),
         None => Err(ReadError::Timeout),
     }

@@ -411,29 +411,28 @@ pub(in crate::http) struct TopicDurability {
 
 impl TopicDurability {
     pub fn confirmed_policy(self, state: &HttpInner) -> iggy_common::Durability {
-        let unchanged = state
+        state
             .shard
             .plane
             .metadata()
             .mux_stm
             .streams()
-            .read(|inner| {
-                inner
-                    .items
-                    .get(self.stream_id)
-                    .and_then(|stream| stream.topics.get(self.topic_id))
-                    .and_then(|topic| topic.partitions.first())
-                    .is_some_and(|partition| partition.created_revision == self.created_revision)
-            });
-        self.confirmed_policy_for(unchanged.then_some(self))
+            .read(|inner| self.confirmed_policy_in(inner))
     }
 
-    fn confirmed_policy_for(self, current: Option<Self>) -> iggy_common::Durability {
-        if current == Some(self) {
+    fn confirmed_policy_in(
+        self,
+        inner: &metadata::stm::stream::StreamsInner,
+    ) -> iggy_common::Durability {
+        let unchanged = inner
+            .items
+            .get(self.stream_id)
+            .and_then(|stream| stream.topics.get(self.topic_id))
+            .and_then(|topic| topic.partitions.first())
+            .is_some_and(|partition| partition.created_revision == self.created_revision);
+        if unchanged {
             self.durability
         } else {
-            // Every successful partition reply proves quorum commit even when
-            // namespace replacement prevents attesting the stronger guarantee.
             iggy_common::Durability::Replicated
         }
     }
@@ -488,33 +487,61 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn completed_produce_reports_only_the_policy_its_incarnation_can_attest() {
+    fn completed_produce_checks_the_stored_topic_incarnation() {
+        let mut inner = metadata::stm::stream::StreamsInner::default();
+        let mut stream = metadata::stm::stream::Stream::default();
+        let topic = metadata::stm::stream::Topic {
+            partitions: vec![metadata::stm::stream::Partition::new(
+                0,
+                1,
+                iggy_common::IggyTimestamp::default(),
+                3,
+                0,
+            )],
+            ..Default::default()
+        };
+        let topic_id = stream.topics.insert(topic);
+        let stream_id = inner.items.insert(stream);
         let original = super::TopicDurability {
-            stream_id: 1,
-            topic_id: 2,
+            stream_id,
+            topic_id,
             created_revision: 3,
             durability: iggy_common::Durability::Persisted,
         };
         assert_eq!(
-            original.confirmed_policy_for(Some(original)),
+            original.confirmed_policy_in(&inner),
             iggy_common::Durability::Persisted
         );
-        for current in [
-            None,
-            Some(super::TopicDurability {
-                created_revision: 4,
-                ..original
-            }),
-            Some(super::TopicDurability {
-                durability: iggy_common::Durability::Replicated,
-                ..original
-            }),
-        ] {
-            assert_eq!(
-                original.confirmed_policy_for(current),
-                iggy_common::Durability::Replicated
-            );
-        }
+        inner
+            .items
+            .get_mut(stream_id)
+            .unwrap()
+            .topics
+            .get_mut(topic_id)
+            .unwrap()
+            .name = "renamed".into();
+        assert_eq!(
+            original.confirmed_policy_in(&inner),
+            iggy_common::Durability::Persisted
+        );
+        inner
+            .items
+            .get_mut(stream_id)
+            .unwrap()
+            .topics
+            .get_mut(topic_id)
+            .unwrap()
+            .partitions[0]
+            .created_revision = 4;
+        assert_eq!(
+            original.confirmed_policy_in(&inner),
+            iggy_common::Durability::Replicated
+        );
+        inner.items.remove(stream_id);
+        assert_eq!(
+            original.confirmed_policy_in(&inner),
+            iggy_common::Durability::Replicated
+        );
     }
 
     /// Root's user id, the caller every fixture below writes and reads as.

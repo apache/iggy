@@ -35,7 +35,7 @@ pub const PARTITION_WAL_CAPACITY_MIN: u64 = 2 * (64 * 1024 * 1024 + 4096);
 pub const PARTITION_WAL_CAPACITY_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const RECORD_PREFIX: usize = 32;
 pub const PREPARE_BYTES_MAX: usize = 64 * 1024 * 1024;
-const STATE_MAGIC: &[u8; 8] = b"IGGYWAL2";
+const STATE_MAGIC: &[u8; 8] = b"IGGYWAL1";
 
 pub trait DurableAppend {
     /// # Errors
@@ -69,6 +69,7 @@ struct JournalState {
     head_checksum: u128,
     anchor_known: bool,
     checkpoint_prepare: bool,
+    certified_log_view: Option<u32>,
     purge_generation: u64,
     purge_floor: u64,
 }
@@ -158,6 +159,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         let state = existing.unwrap_or_else(|| JournalState {
             group,
             incarnation,
+            certified_log_view: Some(0),
             ..JournalState::default()
         });
         let mode = if existing.is_none() {
@@ -201,6 +203,39 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             }
         }
         Ok(journal)
+    }
+
+    pub const fn certified_log_view(&self) -> Option<u32> {
+        self.state.certified_log_view
+    }
+
+    /// Publish a complete canonical view only after its required head is durable.
+    ///
+    /// # Errors
+    /// Returns an error if the expected history is absent or persistence fails.
+    pub async fn certify_log_view(&mut self, view: u32, op: u64, checksum: u128) -> io::Result<()> {
+        self.ensure_healthy()?;
+        let matches = if op == self.state.checkpoint {
+            (op == 0 && checksum == 0) || self.state.checkpoint_checksum == checksum
+        } else {
+            self.entries
+                .get(&op)
+                .is_some_and(|entry| entry.checksum == checksum)
+        };
+        if op > self.state.head || !matches {
+            return Err(invalid("view certificate does not match WAL history"));
+        }
+        self.poisoned = true;
+        self.file.sync().await?;
+        let state = JournalState {
+            certified_log_view: Some(view),
+            ..self.state
+        };
+        self.publish(state).await?;
+        self.state = state;
+        self.durable_head = state.head;
+        self.poisoned = false;
+        Ok(())
     }
 
     #[must_use]
@@ -279,10 +314,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if from_op > self.state.head {
             return Ok(());
         }
+        self.state.certified_log_view = None;
         self.rewrite(
             self.state.checkpoint,
             self.state.checkpoint_checksum,
             Some(from_op),
+            None,
         )
         .await
     }
@@ -326,7 +363,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .ok_or_else(|| invalid("unknown WAL checkpoint"))?
             .checksum;
         self.state.anchor_known = true;
-        self.rewrite(through_op, checksum, None).await
+        self.rewrite(through_op, checksum, None, None).await
     }
 
     /// Install an already durable replacement state, such as a completed transfer.
@@ -337,7 +374,35 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     pub async fn reset(&mut self, op: u64, checksum: Option<u128>) -> io::Result<()> {
         self.ensure_healthy()?;
         self.state.anchor_known = checksum.is_some();
-        self.rewrite(op, checksum.unwrap_or(0), Some(0)).await
+        self.state.certified_log_view = None;
+        self.rewrite(op, checksum.unwrap_or(0), Some(0), None).await
+    }
+
+    /// Install the committed prepare together with its materialized checkpoint.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid checkpoint prepare or a storage failure.
+    pub async fn reset_with_prepare(&mut self, prepare: Frozen<4096>) -> io::Result<()> {
+        self.ensure_healthy()?;
+        let message =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(prepare.as_slice()))
+                .map_err(|_| invalid("invalid checkpoint prepare"))?;
+        let header = message.header();
+        if header.group != self.state.group
+            || (header.checksum != 0 && header.identity_checksum() != header.checksum)
+            || header.size as usize != prepare.len()
+            || (header.checksum_body != 0
+                && header.checksum_body
+                    != u128::from(XxHash3_64::oneshot(
+                        &prepare.as_slice()[size_of::<PrepareHeader>()..],
+                    )))
+        {
+            return Err(invalid("invalid checkpoint prepare identity or checksum"));
+        }
+        self.state.anchor_known = true;
+        self.state.certified_log_view = None;
+        self.rewrite(header.op, header.checksum, Some(0), Some(prepare))
+            .await
     }
 
     #[must_use]
@@ -349,7 +414,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// Returns an error if the purge marker cannot be published durably.
     pub async fn mark_purge(&mut self, generation: u64, floor: u64) -> io::Result<()> {
         self.ensure_healthy()?;
-        if generation <= self.state.purge_generation {
+        if generation < self.state.purge_generation
+            || (generation == self.state.purge_generation && floor <= self.state.purge_floor)
+        {
             return Ok(());
         }
         if floor > self.state.head {
@@ -452,6 +519,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             state.length += length as u64;
             state.head = header.op;
             state.head_checksum = header.checksum;
+            if state
+                .certified_log_view
+                .is_some_and(|view| header.view > view)
+            {
+                state.certified_log_view = None;
+            }
             if !state.anchor_known {
                 state.checkpoint_checksum = header.parent;
                 state.anchor_known = true;
@@ -680,6 +753,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         checkpoint: u64,
         checksum: u128,
         truncate: Option<u64>,
+        checkpoint_prepare: Option<Frozen<4096>>,
     ) -> io::Result<()> {
         // A failed publication can leave a newer frontier visible on disk.
         // Poison until reopen instead of overwriting that possibly durable state.
@@ -704,6 +778,21 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             checkpoint_prepare: false,
             ..self.state
         };
+        if let Some(prepare) = checkpoint_prepare {
+            let encoded = encode_record(prepare.as_slice(), generation)?;
+            let length = encoded.as_slice().len();
+            file.write_aligned(0, encoded).await?;
+            entries.insert(
+                checkpoint,
+                StoredPrepare {
+                    position: 0,
+                    length,
+                    checksum,
+                },
+            );
+            state.length = length as u64;
+            state.checkpoint_prepare = true;
+        }
         for (&op, entry) in &self.entries {
             if op < checkpoint || truncate.is_some_and(|from| op >= from) {
                 continue;
@@ -765,6 +854,8 @@ impl JournalState {
         bytes[80..96].copy_from_slice(&self.head_checksum.to_le_bytes());
         bytes[96] = u8::from(self.anchor_known);
         bytes[97] = u8::from(self.checkpoint_prepare);
+        bytes[98] = u8::from(self.certified_log_view.is_some());
+        bytes[120..124].copy_from_slice(&self.certified_log_view.unwrap_or(0).to_le_bytes());
         bytes[104..112].copy_from_slice(&self.purge_generation.to_le_bytes());
         bytes[112..120].copy_from_slice(&self.purge_floor.to_le_bytes());
         let checksum = XxHash3_64::oneshot(&bytes[16..]);
@@ -802,6 +893,15 @@ impl JournalState {
                 0 => false,
                 1 => true,
                 _ => return Err(invalid("invalid checkpoint prepare flag")),
+            },
+            certified_log_view: match bytes[98] {
+                0 => None,
+                1 => Some(u32::from_le_bytes(
+                    bytes[120..124]
+                        .try_into()
+                        .map_err(|_| invalid("invalid certified view"))?,
+                )),
+                _ => return Err(invalid("invalid certified view flag")),
             },
             purge_generation: read_u64(104)?,
             purge_floor: read_u64(112)?,
@@ -1013,6 +1113,79 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[compio::test]
+    async fn same_generation_purge_retry_persists_the_larger_floor() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.mark_purge(9, 1).await.unwrap();
+        journal.append(second.into_frozen()).await.unwrap();
+        journal.mark_purge(9, 2).await.unwrap();
+        journal.mark_purge(9, 1).await.unwrap();
+        drop(journal);
+        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.purge_marker(), (9, 2));
+    }
+
+    #[compio::test]
+    async fn view_certificate_requires_complete_matching_history() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        let checksum = first.header().checksum;
+        assert!(journal.certify_log_view(2, 1, checksum).await.is_err());
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.certify_log_view(2, 1, checksum).await.unwrap();
+        drop(journal);
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.certified_log_view(), Some(2));
+        journal.truncate_from(1).await.unwrap();
+        drop(journal);
+        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.certified_log_view(), None);
+    }
+
+    #[compio::test]
+    async fn transferred_checkpoint_retains_its_prepare_after_restart() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let checkpoint = prepare(7, 1234);
+        let checksum = checkpoint.header().checksum;
+        let expected = checkpoint.as_slice().to_vec();
+        journal
+            .reset_with_prepare(checkpoint.into_frozen())
+            .await
+            .unwrap();
+        journal.certify_log_view(2, 7, checksum).await.unwrap();
+        drop(journal);
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.checkpoint_op(), 7);
+        assert_eq!(journal.certified_log_view(), Some(2));
+        let prepares = journal.take_recovered_prepares();
+        assert_eq!(prepares.len(), 1);
+        assert_eq!(prepares[0].as_slice(), expected);
+        journal
+            .append(prepare(8, checksum).into_frozen())
+            .await
+            .unwrap();
     }
 
     #[compio::test]

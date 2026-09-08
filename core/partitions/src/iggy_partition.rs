@@ -149,6 +149,7 @@ where
     /// path transiently disappears and silently hides the disk tier.
     /// `None` only for in-memory (simulated) partitions.
     pub(crate) partition_dir: Option<String>,
+    segment_names_dirty: Cell<bool>,
     /// This topic's runtime knobs, resolved at topic admission and carried
     /// here by the builder. Every `None` field falls back to the shard-wide
     /// `PartitionsConfig` value (simulator and tests build partitions with
@@ -156,6 +157,7 @@ where
     pub(crate) runtime_options: TopicRuntimeOptions,
     pub(crate) persistence: Option<Rc<PartitionPersistence>>,
     pub(crate) materialization_missing: bool,
+    recovered_log_view: Option<u32>,
     pending_persisted_acks: RefCell<BTreeMap<u64, PrepareHeader>>,
     /// In-flight journal repair:
     /// set when the recovery handshake finds this replica behind the group's
@@ -567,9 +569,11 @@ where
             consumer_offsets_path: None,
             consumer_group_offsets_path: None,
             partition_dir: None,
+            segment_names_dirty: Cell::new(true),
             runtime_options: TopicRuntimeOptions::default(),
             persistence: None,
             materialization_missing: false,
+            recovered_log_view: None,
             pending_persisted_acks: RefCell::new(BTreeMap::new()),
             repair: None,
             gap_ticks: Cell::new(0),
@@ -772,6 +776,7 @@ where
             warn!(%error, "cannot open partition prepare WAL");
             IggyError::CannotReadFile
         })?;
+        self.restore_certified_log_view(&persistence).await?;
         if self.materialization_missing {
             self.persistence = Some(persistence);
             return Ok(());
@@ -823,6 +828,42 @@ where
             });
         }
         self.persistence = Some(persistence);
+        Ok(())
+    }
+
+    async fn restore_certified_log_view(
+        &mut self,
+        persistence: &Rc<PartitionPersistence>,
+    ) -> Result<(), IggyError> {
+        if !self.materialization_missing
+            && self.recovered_log_view.is_none()
+            && persistence.head() == 0
+        {
+            persistence.certify_log_view(self.consensus.log_view(), 0, 0);
+            if persistence.start() {
+                self.consensus
+                    .message_bus()
+                    .spawn(Rc::clone(persistence).run());
+            }
+            persistence
+                .drain_with_timeout()
+                .await
+                .map_err(|_| IggyError::CannotSyncFile)?;
+        }
+        if !self.materialization_missing {
+            match persistence.certified_log_view() {
+                Some(view) if view >= self.consensus.log_view() => {
+                    if view > self.consensus.view() {
+                        self.consensus.set_view(view);
+                    }
+                    self.consensus.set_log_view(view);
+                }
+                _ => {
+                    self.materialization_missing = true;
+                    self.ensure_materialization_recovery();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -990,6 +1031,9 @@ where
             }
             return;
         }
+        if self.materialization_missing || !self.ensure_wal_view() {
+            return;
+        }
         let durable_op = persistence.durable_op();
         loop {
             let ready = self
@@ -1003,8 +1047,10 @@ where
             let Some((_, header)) = self.pending_persisted_acks.borrow_mut().pop_first() else {
                 break;
             };
-            if persistence.checksum(header.op) == Some(header.checksum) {
-                self.send_prepare_ok(&header).await;
+            if persistence.checksum(header.op) == Some(header.checksum)
+                && !self.send_prepare_ok(&header).await
+            {
+                break;
             }
         }
     }
@@ -1033,10 +1079,56 @@ where
         }
     }
 
+    fn ensure_wal_view(&self) -> bool {
+        let Some(persistence) = &self.persistence else {
+            return true;
+        };
+        if persistence.certified_log_view() == Some(self.consensus.log_view()) {
+            return true;
+        }
+        if self.materialization_missing || !self.consensus.is_normal() {
+            return false;
+        }
+        self.persist_repaired_prefix();
+        let ready = persistence.certify_log_view(
+            self.consensus.log_view(),
+            self.consensus.sequencer().current_sequence(),
+            self.consensus.last_prepare_checksum(),
+        );
+        self.start_persistence();
+        ready
+    }
+
+    pub fn register_rebuilt_ack(&self, header: &PrepareHeader) -> bool {
+        let durable = !self.requires_persistence(header.operation)
+            || self.persistence.as_ref().is_some_and(|persistence| {
+                persistence.is_durable(header)
+                    && persistence.certified_log_view() == Some(self.consensus.log_view())
+            });
+        if !durable {
+            self.pending_persisted_acks
+                .borrow_mut()
+                .insert(header.op, *header);
+        }
+        durable
+    }
+
     fn submit_prepare_persistence(&self, prepare: Frozen<4096>, operation: Operation) -> bool {
         let Some(persistence) = &self.persistence else {
             return self.consensus.replica_count() == 1 || !self.requires_persistence(operation);
         };
+        // A previous admission may have stopped at capacity. Preserve the
+        // ordered prefix before submitting a newer forwarded prepare.
+        let op = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &prepare.as_slice()[..size_of::<PrepareHeader>()],
+        )
+        .map_or(u64::MAX, |header| header.op);
+        if op > persistence.head().saturating_add(1) {
+            self.persist_repaired_prefix_through(op.saturating_sub(1));
+            if op > persistence.head().saturating_add(1) {
+                return false;
+            }
+        }
         if let Err(error) = persistence.append(prepare, self.requires_persistence(operation)) {
             warn!(%error, namespace_raw = self.namespace().inner(), "partition WAL refused prepare");
             if error.kind() != std::io::ErrorKind::WouldBlock {
@@ -1049,10 +1141,17 @@ where
     }
 
     fn persist_repaired_prefix(&self) {
+        self.persist_repaired_prefix_through(u64::MAX);
+    }
+
+    fn persist_repaired_prefix_through(&self, through: u64) {
         let Some(persistence) = &self.persistence else {
             return;
         };
         while let Some(op) = persistence.head().checked_add(1) {
+            if op > through || op > self.consensus.sequencer().current_sequence() {
+                break;
+            }
             let Some(prepare) = self.log.journal().inner.repair_entry(op) else {
                 break;
             };
@@ -1087,6 +1186,7 @@ where
 
     pub fn set_partition_dir(&mut self, partition_dir: String) {
         self.partition_dir = Some(partition_dir);
+        self.segment_names_dirty.set(true);
     }
 
     /// Attach the durable superblock store the boot path opened for this
@@ -1102,6 +1202,7 @@ where
     /// As a separate call it was silently optional, and one of the three attach
     /// sites dropped it.
     pub fn set_superblock(&mut self, superblock: Rc<SB>, recovered: Option<&consensus::VsrState>) {
+        self.recovered_log_view = recovered.map(|state| state.log_view);
         self.superblock = Some(superblock);
         self.durable_offset_frontier
             .set(recovered.map_or(0, |state| state.offset_frontier));
@@ -1131,6 +1232,9 @@ where
     #[allow(clippy::future_not_send)]
     #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
     pub async fn persist_superblock_if_needed(&self) -> bool {
+        if !self.materialization_missing && !self.ensure_wal_view() {
+            return false;
+        }
         let Some(superblock) = self.superblock.as_ref() else {
             // No store (in-memory / simulated partitions): nothing can be
             // recorded, so keep the durable cells current instead. The
@@ -2521,6 +2625,46 @@ where
         Ok(())
     }
 
+    async fn write_consumer_offset(
+        &self,
+        path: &str,
+        offset: u64,
+        persisted: bool,
+    ) -> Result<(), IggyError> {
+        if let Some(persistence) = &self.persistence {
+            let file = crate::offset_storage::persist_offset_retained(
+                path,
+                offset,
+                persistence.take_offset_file(path),
+            )
+            .await
+            .inspect_err(|error| {
+                persistence.fail(std::io::Error::other(error.to_string()));
+            })?;
+            persistence.retain_offset_file(path.to_owned(), file);
+            Ok(())
+        } else {
+            persist_offset(path, offset, persisted).await
+        }
+    }
+
+    async fn write_cold_consumer_offset(
+        &self,
+        path: &str,
+        offset: u64,
+        persisted: bool,
+    ) -> Result<(u64, bool), IggyError> {
+        if self.persistence.is_some() {
+            let result = crate::offset_storage::read_offset_max(path, offset).await?;
+            self.write_consumer_offset(path, result.offset, false)
+                .await?;
+            Ok((result.offset, true))
+        } else {
+            let result = persist_offset_max(path, offset, persisted).await?;
+            Ok((result.offset, result.written))
+        }
+    }
+
     async fn persist_consumer_offset_commit(
         &self,
         pending: PendingConsumerOffsetCommit,
@@ -2552,12 +2696,12 @@ where
                     }
                     (Some(path), Some(state)) => {
                         let value = state.committed_offset.max(offset);
-                        persist_offset(path, value, persisted).await?;
+                        self.write_consumer_offset(path, value, persisted).await?;
                         (value, true)
                     }
                     (Some(path), None) => {
-                        let persisted = persist_offset_max(path, offset, persisted).await?;
-                        (persisted.offset, persisted.written)
+                        self.write_cold_consumer_offset(path, offset, persisted)
+                            .await?
                     }
                 };
                 self.durable_consumer_offsets.record_auto_commit(
@@ -2581,7 +2725,7 @@ where
             }
             PendingConsumerOffsetMutation::Upsert(offset) => {
                 if let Some(path) = path.as_deref() {
-                    persist_offset(path, offset, persisted).await?;
+                    self.write_consumer_offset(path, offset, persisted).await?;
                 }
                 let created = self.durable_consumer_offsets.record_explicit(
                     pending.kind,
@@ -2605,6 +2749,9 @@ where
                     // unsuccessful unlink would let boot resurrect the key.
                     match delete_persisted_offset(path).await {
                         Ok(removed) => {
+                            if let Some(persistence) = &self.persistence {
+                                persistence.retire_offset_file(path);
+                            }
                             if removed && persisted {
                                 self.mark_consumer_offset_dir_dirty(pending.kind);
                             }
@@ -5568,18 +5715,22 @@ where
         if messages_committed
             && self.consensus.replica_count() == 1
             && self.durability().is_persisted()
+            && self.segment_names_dirty.get()
             && let Some(directory) = &self.partition_dir
-            && let Err(error) = crate::state_transfer::fsync_dir(directory).await
         {
-            error!(%error, namespace_raw, "cannot publish persisted segment names");
-            self.fatal = Some(FatalCommit {
-                namespace_raw,
-                op: drained
-                    .last()
-                    .map_or_else(|| self.consensus.commit_min(), |entry| entry.header.op),
-                operation: Operation::SendMessages,
-            });
-            return;
+            if let Err(error) = crate::state_transfer::fsync_dir(directory).await {
+                error!(%error, namespace_raw, "cannot publish persisted segment names");
+                self.fatal = Some(FatalCommit {
+                    namespace_raw,
+                    op: drained
+                        .last()
+                        .map_or_else(|| self.consensus.commit_min(), |entry| entry.header.op),
+                    operation: Operation::SendMessages,
+                });
+                return;
+            }
+
+            self.segment_names_dirty.set(false);
         }
 
         // Commit replies and the applied frontier must follow directory
@@ -6565,6 +6716,7 @@ where
         config: &PartitionsConfig,
         start_offset: u64,
     ) -> Result<(), IggyError> {
+        self.segment_names_dirty.set(true);
         let namespace = self.namespace();
         let (messages_path, index_path) = self.partition_dir().map_or_else(
             || {
@@ -7103,6 +7255,9 @@ where
                     "purge could not remove a consumer offset file"
                 );
             } else {
+                if let Some(persistence) = &self.persistence {
+                    persistence.retire_offset_file(&path);
+                }
                 self.consumer_offset_capacity_for(kind)
                     .clear_stranded(consumer_id);
             }
@@ -7597,9 +7752,9 @@ where
         Ok(Some(base_offset))
     }
 
-    async fn send_prepare_ok(&self, header: &PrepareHeader) {
+    async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
         if self.materialization_missing {
-            return;
+            return false;
         }
         // Durable-before-send: a PrepareOk implies this replica's
         // (view, log_view), so it must not leave until they are durable, or a
@@ -7607,20 +7762,15 @@ where
         // commit in, losing a committed op. Mirrors the view-change dispatch
         // gate; withhold on persist failure and let the primary's prepare
         // retransmit re-drive the ack once a later persist succeeds.
-        if !self.persist_superblock_if_needed().await {
-            return;
+        if self.consensus.replica_count() > 1 && !self.register_rebuilt_ack(header) {
+            self.ensure_wal_view();
+            return false;
         }
-        if self.consensus.replica_count() > 1
-            && self.requires_persistence(header.operation)
-            && !self
-                .persistence
-                .as_ref()
-                .is_some_and(|persistence| persistence.is_durable(header))
-        {
+        if !self.persist_superblock_if_needed().await {
             self.pending_persisted_acks
                 .borrow_mut()
                 .insert(header.op, *header);
-            return;
+            return false;
         }
         // Same fail-closed shape for a purge this replica accepted but has not
         // applied: its counter still names the pre-purge offset space, so an ack
@@ -7629,7 +7779,7 @@ where
         // lands. Local commits still apply -- this fences the SEND, exactly as
         // the durability gate above does.
         if self.purge_deferred {
-            return;
+            return false;
         }
         // `VsrAction::RetransmitPrepares` reads from `self.log.journal`.
         // Both `SendMessages` (via `append_send_messages_to_journal`) and
@@ -7639,6 +7789,7 @@ where
         // (`header_by_op` is a linear scan, so re-proving that here would
         // put O(journal) on every ack; the call-order invariant stands in.)
         send_prepare_ok_common(self.consensus(), header, true).await;
+        true
     }
 }
 
@@ -8103,6 +8254,60 @@ mod tests {
     }
 
     #[compio::test]
+    async fn uncertified_log_view_requires_transfer_before_voting() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = partition_at_view(2, 2);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        let mut journal = journal::PartitionPrepareJournal::open(
+            &directory.path().join("prepares-0"),
+            partition.consensus().group(),
+            0,
+        )
+        .await
+        .unwrap();
+        journal.reset(7, Some(1234)).await.unwrap();
+        journal.certify_log_view(1, 7, 1234).await.unwrap();
+        drop(journal);
+        partition.open_persistence().await.unwrap();
+        assert!(partition.requires_state_transfer());
+        assert!(partition.consensus().is_transferring());
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+    }
+
+    #[compio::test]
+    async fn promotion_waits_for_the_matching_local_prepare_to_be_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = partition_at_view(1, 1);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::StoreConsumerOffset;
+                header.view = 1;
+                header.replica = 1;
+                header.group = partition.consensus().group();
+                header.cluster = TEST_CLUSTER;
+                header.op = 1;
+                header.timestamp = 1;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                header.checksum = header.identity_checksum();
+            },
+        );
+        let header = *prepare.header();
+        let persistence = partition.persistence.as_ref().unwrap();
+        persistence.append(prepare.into_frozen(), true).unwrap();
+        assert!(!partition.register_rebuilt_ack(&header));
+        assert!(partition.pending_persisted_acks.borrow().contains_key(&1));
+        partition.start_persistence();
+        persistence.drain_with_timeout().await.unwrap();
+        assert!(partition.register_rebuilt_ack(&header));
+    }
+
+    #[compio::test]
     async fn checkpoint_paths_include_offset_parent_directories() {
         let directory = tempfile::tempdir().unwrap();
         let mut partition = partition_at_view(1, 1);
@@ -8144,6 +8349,7 @@ mod tests {
         .await
         .unwrap();
         journal.reset(7, Some(1234)).await.unwrap();
+        journal.certify_log_view(1, 7, 1234).await.unwrap();
         drop(journal);
         partition.open_persistence().await.unwrap();
         assert_eq!(partition.consensus().sequencer().current_sequence(), 7);
@@ -8849,6 +9055,7 @@ mod tests {
 
         let offer = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 1_030,
             consumers: Vec::new(),
@@ -9404,6 +9611,7 @@ mod tests {
         partition.consumer_group_offsets_path = Some(groups.to_string_lossy().into_owned());
         let wire = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 10,
             consumers: vec![(7, 1), (8, 2)],
@@ -9495,18 +9703,51 @@ mod tests {
             .unwrap()
             .exhaust_capacity_for_test();
         backup.on_replicate(message).await;
-        let sent = backup.consensus().message_bus().sent_to_replicas.borrow();
-        let (_, forwarded) = sent
-            .iter()
-            .find(|(target, _)| *target == 2)
-            .expect("the downstream replica receives the prepare");
-        let header = bytemuck::checked::from_bytes::<PrepareHeader>(
-            &forwarded.as_slice()[..size_of::<PrepareHeader>()],
-        );
-        assert_eq!(header.command, Command::Prepare);
-        assert_eq!(backup.consensus().sequencer().current_sequence(), 1);
-        assert_eq!(backup.persistence.as_ref().unwrap().head(), 0);
-        assert!(!sent.iter().any(|(target, _)| *target == 0));
+        {
+            let sent = backup.consensus().message_bus().sent_to_replicas.borrow();
+            let (_, forwarded) = sent
+                .iter()
+                .find(|(target, _)| *target == 2)
+                .expect("the downstream replica receives the prepare");
+            let header = bytemuck::checked::from_bytes::<PrepareHeader>(
+                &forwarded.as_slice()[..size_of::<PrepareHeader>()],
+            );
+            assert_eq!(header.command, Command::Prepare);
+            assert_eq!(backup.consensus().sequencer().current_sequence(), 1);
+            assert_eq!(backup.persistence.as_ref().unwrap().head(), 0);
+            assert!(!sent.iter().any(|(target, _)| *target == 0));
+        }
+
+        backup
+            .persistence
+            .as_ref()
+            .unwrap()
+            .release_capacity_for_test();
+        let request = checksumless_send_request(namespace, 2);
+        let prepare = request.transmute_header(|old, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::SendMessages;
+            header.cluster = TEST_CLUSTER;
+            header.group = namespace.inner();
+            header.op = 2;
+            header.timestamp = 2;
+            header.size = old.size;
+        });
+        let forwarded = primary
+            .stamp_and_append_messages(prepare)
+            .await
+            .unwrap()
+            .prepare;
+        let message =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(forwarded.as_slice()))
+                .unwrap();
+        backup.on_replicate(message).await;
+        let persistence = backup.persistence.as_ref().unwrap();
+        assert_eq!(persistence.head(), 2);
+        assert_eq!(backup.consensus().sequencer().current_sequence(), 2);
+        assert!(persistence.failure().is_none());
+        persistence.drain_with_timeout().await.unwrap();
+        assert!(persistence.is_durable_through(2));
     }
 
     #[compio::test]
@@ -9537,6 +9778,37 @@ mod tests {
         assert!(partition.fatal().is_some());
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(replies.borrow().is_empty());
+    }
+
+    #[compio::test]
+    async fn persisted_singleton_skips_directory_sync_after_names_are_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 1);
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        for op in 1..=2 {
+            partition.consensus().advance_commit_max(op);
+            let header = PrepareHeader {
+                command: Command::Prepare,
+                operation: Operation::SendMessages,
+                op,
+                group: partition.consensus().group(),
+                client: 1,
+                request: op,
+                ..PrepareHeader::default()
+            };
+            partition
+                .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
+                .await;
+            assert!(partition.fatal().is_none());
+            assert_eq!(partition.consensus().commit_min(), op);
+            assert!(!partition.segment_names_dirty.get());
+            if op == 1 {
+                std::fs::remove_dir(directory.path()).unwrap();
+            }
+        }
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        assert!(partition.segment_names_dirty.get());
     }
 
     #[compio::test]
@@ -9673,6 +9945,7 @@ mod tests {
         }
         let wire = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 1,
             next_offset: 0,
             consumers: vec![(7, 5)],
@@ -12275,6 +12548,7 @@ mod tests {
 
         let behind = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 50,
             consumers: Vec::new(),
@@ -12304,6 +12578,7 @@ mod tests {
         // value, whose `purge.gen` hydration a kill-before-record leaves stale.
         let purged = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 1,
             next_offset: 0,
             consumers: Vec::new(),
@@ -12347,6 +12622,7 @@ mod tests {
 
         let stale = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 0,
             next_offset: 1_000,
             consumers: Vec::new(),
@@ -12400,6 +12676,7 @@ mod tests {
 
         let offer = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 1,
             next_offset: 50,
             consumers: Vec::new(),
@@ -12451,6 +12728,7 @@ mod tests {
 
         let reset = crate::state_transfer::ConsumerOffsetsWire {
             prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             purge_generation: 1,
             next_offset: 0,
             consumers: Vec::new(),

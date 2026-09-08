@@ -42,6 +42,7 @@ const MATERIALIZED_FILES: &[&str] = &[
 #[derive(Clone, Copy, Debug)]
 enum Mutation {
     Append,
+    CertifyView,
     Checkpoint,
     Truncate,
     Reset,
@@ -106,6 +107,7 @@ fn wal_fault_sweep_preserves_acknowledged_history_at_every_io_boundary() {
         let mut cases = 0;
         for mutation in [
             Mutation::Append,
+            Mutation::CertifyView,
             Mutation::Checkpoint,
             Mutation::Truncate,
             Mutation::Reset,
@@ -726,6 +728,33 @@ fn failed_group_barrier_never_acknowledges_a_partial_batch() {
 }
 
 #[test]
+fn checkpoint_syncs_the_retained_writer_before_reclaiming_its_history() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(4).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let path = Path::new("/partition/offset");
+        let mut file = storage.open(path, OpenMode::Create).await.unwrap();
+        file.write(0, b"offset".to_vec()).await.unwrap();
+        persistence.retain_offset_file(path.to_string_lossy().into_owned(), file);
+        storage.remove_file(path).await.unwrap();
+        persistence.retire_offset_file(path.to_str().unwrap());
+        persistence.checkpoint_files(4, Vec::new(), vec![Path::new(DIRECTORY).to_path_buf()]);
+        storage.fail_at(0, FaultMode::Before);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.failure().is_some());
+        assert_eq!(persistence.checkpoint_op(), 0);
+        storage.crash(Crash::PowerLoss);
+        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+            .await
+            .unwrap();
+        assert_eq!(recovered.checkpoint_op(), 0);
+        assert_eq!(recovered.head(), 4);
+    });
+}
+
+#[test]
 fn checkpoint_barriers_complete_before_wal_reclamation() {
     block_on(async {
         let (storage, persistence) = queued_batch(4).await;
@@ -976,6 +1005,16 @@ async fn mutate(
                 .append(prepare(4, last.checksum).into_frozen())
                 .await
         }
+        Mutation::CertifyView => {
+            let entries = journal.prepares().await?;
+            let last = bytemuck::checked::from_bytes::<PrepareHeader>(
+                &entries.last().unwrap().as_slice()[..size_of::<PrepareHeader>()],
+            );
+            let next = prepare(4, last.checksum);
+            let checksum = next.header().checksum;
+            journal.append_buffered(next.into_frozen()).await?;
+            journal.certify_log_view(2, 4, checksum).await
+        }
         Mutation::Checkpoint => {
             replace(storage, Path::new("/partition/materialized"), b"1,2").await?;
             journal.checkpoint(2).await
@@ -1026,6 +1065,15 @@ async fn assert_recovery(
         Mutation::Append => {
             assert!((3..=4).contains(&journal.head()));
             if completed {
+                assert_eq!(journal.head(), 4);
+            }
+        }
+        Mutation::CertifyView => {
+            assert!((3..=4).contains(&journal.head()));
+            if completed {
+                assert_eq!(journal.certified_log_view(), Some(2));
+            }
+            if journal.certified_log_view() == Some(2) {
                 assert_eq!(journal.head(), 4);
             }
         }
