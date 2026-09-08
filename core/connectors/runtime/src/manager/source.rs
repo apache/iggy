@@ -241,7 +241,7 @@ impl SourceManager {
         // would strand it: `stop_connector` closes `details.info.id`, which
         // still names the previous one.
         let instance =
-            source::SourceInstanceGuard::new(container.iggy_source_close, plugin_id, key);
+            source::SourceInstanceGuard::for_container(container.clone(), plugin_id, key);
 
         let (producer, encoder, transforms) =
             source::setup_source_producer(key, config, iggy_client).await?;

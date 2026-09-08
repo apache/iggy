@@ -248,7 +248,8 @@ pub async fn init(
                 let connector = source_connectors
                     .get_mut(&path)
                     .expect("source connector was inserted above");
-                close_failed_source(connector.container.iggy_source_close, plugin_id, &key);
+                let close = connector.container.iggy_source_close;
+                close_failed_source(&|id| close(id), plugin_id, &key);
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()
@@ -313,34 +314,56 @@ pub(crate) fn init_source(
 /// today, because the window is defined by the two statements that open and
 /// record the instance, not by which call between them happens to be fallible.
 /// Adding a `?` inside it stays correct.
-pub(crate) struct SourceInstanceGuard<'a> {
-    close: extern "C" fn(u32) -> i32,
+pub(crate) struct SourceInstanceGuard {
+    close: Arc<dyn Fn(u32) -> i32 + Send + Sync>,
     plugin_id: u32,
-    key: &'a str,
+    key: String,
     armed: bool,
 }
 
-impl<'a> SourceInstanceGuard<'a> {
-    pub(crate) fn new(close: extern "C" fn(u32) -> i32, plugin_id: u32, key: &'a str) -> Self {
+impl SourceInstanceGuard {
+    /// Arms a guard over an instance the caller has just opened through
+    /// `container`.
+    ///
+    /// The captured `Arc` is the point. `iggy_source_close` is a pointer read
+    /// out of a `dlopen`ed library and stays callable only while something
+    /// keeps that library mapped, so the guard owns the container rather than
+    /// relying on it being declared before the guard and therefore dropped
+    /// after it.
+    pub(crate) fn for_container(
+        container: Arc<Container<SourceApi>>,
+        plugin_id: u32,
+        key: &str,
+    ) -> Self {
+        Self::new(
+            Arc::new(move |id| (container.iggy_source_close)(id)),
+            plugin_id,
+            key,
+        )
+    }
+
+    /// Kept behind `for_container` so no production caller can build a guard
+    /// that holds a close pointer without its library. Tests pass a closure.
+    fn new(close: Arc<dyn Fn(u32) -> i32 + Send + Sync>, plugin_id: u32, key: &str) -> Self {
         Self {
             close,
             plugin_id,
-            key,
+            key: key.to_owned(),
             armed: true,
         }
     }
 
     /// Hands ownership of the instance to the caller, once something else can
-    /// close it. Call only after the plugin id is durably recorded.
+    /// close it. Call only after the plugin id is recorded on `SourceDetails`.
     pub(crate) fn disarm(mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for SourceInstanceGuard<'_> {
+impl Drop for SourceInstanceGuard {
     fn drop(&mut self) {
         if self.armed {
-            close_failed_source(self.close, self.plugin_id, self.key);
+            close_failed_source(self.close.as_ref(), self.plugin_id, &self.key);
         }
     }
 }
@@ -348,7 +371,7 @@ impl Drop for SourceInstanceGuard<'_> {
 /// Closes an instance whose setup did not finish, reporting a refusal rather
 /// than returning it: both callers are already on a failure path and have an
 /// error of their own to surface.
-pub(crate) fn close_failed_source(close: extern "C" fn(u32) -> i32, plugin_id: u32, key: &str) {
+pub(crate) fn close_failed_source(close: &dyn Fn(u32) -> i32, plugin_id: u32, key: &str) {
     let close_result = close(plugin_id);
     if close_result != 0 {
         warn!(
@@ -1048,7 +1071,11 @@ mod tests {
         // would strand it for the life of the process.
         let plugin_id = next_plugin_id();
 
-        drop(SourceInstanceGuard::new(armed_close, plugin_id, "random"));
+        drop(SourceInstanceGuard::new(
+            Arc::new(move |id| armed_close(id)),
+            plugin_id,
+            "random",
+        ));
 
         assert_eq!(
             ARMED_CALLS.load(Ordering::SeqCst),
@@ -1069,7 +1096,8 @@ mod tests {
         // started successfully.
         let plugin_id = next_plugin_id();
 
-        SourceInstanceGuard::new(disarmed_close, plugin_id, "random").disarm();
+        SourceInstanceGuard::new(Arc::new(move |id| disarmed_close(id)), plugin_id, "random")
+            .disarm();
 
         assert_eq!(
             DISARMED_CALLS.load(Ordering::SeqCst),
@@ -1087,7 +1115,7 @@ mod tests {
         let plugin_id = next_plugin_id();
 
         drop(SourceInstanceGuard::new(
-            refusing_close,
+            Arc::new(move |id| refusing_close(id)),
             plugin_id,
             "random",
         ));
