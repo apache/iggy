@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{POLL_CONVERGENCE_TIMEOUT, POLL_RETRY_INTERVAL};
+use super::{CONVERGENCE_TIMEOUT, RETRY_INTERVAL};
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_common::Credentials;
@@ -1203,14 +1203,14 @@ pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
 /// Poll from offset 0 with headroom (count 100) until exactly `expected`
 /// messages are served, so an extra resurfaced message fails the count
 /// instead of being cropped by the poll size. Panics after
-/// [`POLL_CONVERGENCE_TIMEOUT`] with the last observed count.
+/// [`CONVERGENCE_TIMEOUT`] with the last observed count.
 async fn poll_exactly(
     client: &IggyClient,
     stream_ident: &Identifier,
     topic_ident: &Identifier,
     expected: usize,
 ) -> PolledMessages {
-    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    let deadline = std::time::Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let polled = client
             .poll_messages(
@@ -1232,7 +1232,7 @@ async fn poll_exactly(
             "poll did not converge to {expected} messages, last saw {}",
             polled.messages.len()
         );
-        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+        tokio::time::sleep(RETRY_INTERVAL).await;
     }
 }
 
@@ -1318,7 +1318,7 @@ async fn maybe_restart(harness: &mut TestHarness, client: &IggyClient, restart_s
     let _ = client.disconnect().await;
     harness.restart_server().await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         // `connect` re-authenticates from the embedded credentials, so a
         // successful ping means the shards are serving, not merely listening.
@@ -1327,12 +1327,12 @@ async fn maybe_restart(harness: &mut TestHarness, client: &IggyClient, restart_s
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "server did not serve again within {POLL_CONVERGENCE_TIMEOUT:?} of restart"
+            "server did not serve again within {CONVERGENCE_TIMEOUT:?} of restart"
         );
         // Back to Disconnected, else the next `connect` no-ops on a half-open
         // connection and the ping keeps failing until the deadline.
         let _ = client.disconnect().await;
-        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+        tokio::time::sleep(RETRY_INTERVAL).await;
     }
 }
 
@@ -1501,17 +1501,17 @@ fn get_sorted_segment_offsets(partition_path: &str) -> Vec<u64> {
 }
 
 /// Wait until `dir` contains at least one entry, panicking with `context`
-/// once [`POLL_CONVERGENCE_TIMEOUT`] expires.
+/// once [`CONVERGENCE_TIMEOUT`] expires.
 ///
 /// A stored consumer offset is served from memory as soon as the store is
 /// acked, while the offset file is created asynchronously, so a single-shot
 /// existence check can run ahead of the flush. An offset that is never
 /// flushed still fails once the deadline expires.
 async fn await_dir_not_empty(dir: &str, context: &str) {
-    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    let deadline = std::time::Instant::now() + CONVERGENCE_TIMEOUT;
     while is_dir_empty(dir) {
         assert!(std::time::Instant::now() < deadline, "{context}");
-        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+        tokio::time::sleep(RETRY_INTERVAL).await;
     }
 }
 
@@ -1550,7 +1550,7 @@ async fn assert_fresh_empty_partition(partition_path: &str) {
 }
 
 /// Asserts no orphaned segment files remain after deletion, polling until the
-/// counts converge or [`POLL_CONVERGENCE_TIMEOUT`] expires.
+/// counts converge or [`CONVERGENCE_TIMEOUT`] expires.
 ///
 /// `get_sorted_segment_offsets` only checks .log files -- this additionally
 /// verifies that the .index file count matches, catching stale .index files
@@ -1558,7 +1558,7 @@ async fn assert_fresh_empty_partition(partition_path: &str) {
 /// separate awaits, so a layout that already converged on .log files can
 /// transiently show one extra .index file.
 async fn assert_no_orphaned_segment_files(partition_path: &str, expected_count: usize) {
-    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    let deadline = std::time::Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let log_count = count_files_with_ext(partition_path, LOG_EXTENSION);
         let index_count = count_files_with_ext(partition_path, INDEX_EXTENSION);
@@ -1569,7 +1569,7 @@ async fn assert_no_orphaned_segment_files(partition_path: &str, expected_count: 
             std::time::Instant::now() < deadline,
             "Expected {expected_count} .log and .index files, found {log_count} .log and {index_count} .index"
         );
-        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+        tokio::time::sleep(RETRY_INTERVAL).await;
     }
 }
 
