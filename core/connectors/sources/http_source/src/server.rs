@@ -654,25 +654,33 @@ async fn secret_path_outcome(
     // cloned the whole map on every request.
     let (parts, body) = request.into_parts();
     let request_headers = parts.headers;
-    let routes = &state.published().routes;
-    let entry = match routes.lookup_secret_path(endpoint_id, unix_now_seconds()) {
-        RouteLookup::Active(entry) => entry,
-        // Both answer as if the endpoint never existed, so a leaked URL cannot
-        // be used to confirm it was once live: a 410 for the expired case would
-        // be returned before any credential is checked and would say exactly
-        // that. The metric still names the owning instance, so only a genuinely
-        // unknown path is `unrouted`.
-        RouteLookup::Revoked(entry) | RouteLookup::Expired(entry) => {
-            return (
-                Some(Arc::clone(&entry.instance)),
-                error_response(StatusCode::NOT_FOUND, "not found"),
-            );
-        }
-        RouteLookup::Unknown => {
-            return (None, error_response(StatusCode::NOT_FOUND, "not found"));
+    // Scoped, so the published view is not pinned across the body read below.
+    // The read is paced by the client, so holding it would keep every route
+    // table and instance set reachable for as long as a caller cares to
+    // trickle, and would decide the outcome from a view taken before it began.
+    let instance = {
+        let published = state.published();
+        match published
+            .routes
+            .lookup_secret_path(endpoint_id, unix_now_seconds())
+        {
+            RouteLookup::Active(entry) => Arc::clone(&entry.instance),
+            // Both answer as if the endpoint never existed, so a leaked URL
+            // cannot be used to confirm it was once live: a 410 for the expired
+            // case would be returned before any credential is checked and would
+            // say exactly that. The metric still names the owning instance, so
+            // only a genuinely unknown path is `unrouted`.
+            RouteLookup::Revoked(entry) | RouteLookup::Expired(entry) => {
+                return (
+                    Some(Arc::clone(&entry.instance)),
+                    error_response(StatusCode::NOT_FOUND, "not found"),
+                );
+            }
+            RouteLookup::Unknown => {
+                return (None, error_response(StatusCode::NOT_FOUND, "not found"));
+            }
         }
     };
-    let instance = Arc::clone(&entry.instance);
     // Only now, once the id resolved to something that is actually serving.
     // An unknown or revoked id used to cost a full body read before its 404,
     // which is free amplification on the public listener. HMAC still needs the
@@ -680,6 +688,25 @@ async fn secret_path_outcome(
     let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
         Ok(body) => body,
         Err(error) => return (Some(instance), oversized_body_response(&error)),
+    };
+    // Resolved again, because the first answer is stale by exactly as long as
+    // the body took. A revoke that lands mid-read publishes its tombstone and
+    // is reported accepted, so honouring the first lookup would keep serving a
+    // dead key for as many requests as a caller had already opened. `ptr_eq`
+    // covers the other half: the instance can leave and another can join owning
+    // the same id, and this request was never authorized against that one.
+    let published = state.published();
+    let entry = match published
+        .routes
+        .lookup_secret_path(endpoint_id, unix_now_seconds())
+    {
+        RouteLookup::Active(entry) if Arc::ptr_eq(&entry.instance, &instance) => entry,
+        _ => {
+            return (
+                Some(instance),
+                error_response(StatusCode::NOT_FOUND, "not found"),
+            );
+        }
     };
     if !authorize(
         &entry.endpoint,
@@ -1090,6 +1117,7 @@ mod tests {
     use crate::test_support::{ENDPOINT_ONE, ENDPOINT_TWO, client, free_port};
     use iggy_connector_sdk::Source;
     use ring::hmac;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const STATIC_SECRET: &str = "whsec_static";
 
@@ -1800,6 +1828,85 @@ mod tests {
             scraped.contains(
                 "http_source_endpoints_active{instance=\"http_github\",kind=\"static\"} 1"
             )
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_a_revoke_during_the_body_read_should_refuse_the_request() {
+        // The window this closes: the route lookup used to resolve once, before
+        // a body the client paces, and `authorize` and `enqueue` then ran on
+        // that stale entry. A revoke landing mid-read was reported accepted by
+        // the management API while this request still went through on the dead
+        // key, and a caller could hold as many trickling connections open as it
+        // liked. Chunked encoding is what makes the timing exact.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        let mut source = open(1, config).await;
+        let addr = source.shared.config.listen_addr.clone();
+        let base = base_url(&source);
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        let body = "{}";
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("the listener must accept");
+        // Head and one chunk. The handler now sits inside `to_bytes`, past the
+        // point the old code had already committed its routing decision.
+        let head = format!(
+            "POST /e/{ENDPOINT_ONE} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{}: {}\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{body}\r\n",
+            crate::DEFAULT_HMAC_HEADER,
+            signature(body.as_bytes())
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head must be written");
+        stream.flush().await.expect("the head must be flushed");
+
+        // Proves the endpoint is still live at this moment on a second
+        // connection, so the parked request above resolved it as Active too and
+        // the 404 below cannot come from a revoke that landed too early. Also
+        // serves as the readiness gate: the listener has answered a full
+        // request, so it has certainly read the head sent before it.
+        assert_eq!(
+            post_signed(&base, ENDPOINT_ONE, body).await.status(),
+            StatusCode::OK,
+            "the endpoint must still be serving when the revoke is issued"
+        );
+
+        assert!(shared.mutate_registry(|registry| registry.revoke(
+            ENDPOINT_ONE,
+            "compromised".to_string(),
+            1
+        )));
+        rebuild_routes(&source).await;
+        let queued_before = shared.sender.len();
+
+        // Only now does the body finish.
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("the terminating chunk must be written");
+        stream.flush().await.expect("the body must be flushed");
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the response must arrive before the timeout")
+        .expect("the response must be readable");
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "a revoke that landed while the body streamed must be seen, got: {response}"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before,
+            "and nothing may reach the bridge on a key that is already dead"
         );
         close(&mut source).await;
     }
