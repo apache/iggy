@@ -8164,6 +8164,7 @@ dependencies = [
  "reqwest-retry",
  "ring",
  "rmcp",
+ "rmp-serde",
  "rumqttc-v4-next",
  "rumqttc-v5-next",
  "rust-s3",
