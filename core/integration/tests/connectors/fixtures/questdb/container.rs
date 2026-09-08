@@ -20,7 +20,6 @@ use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
-use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -32,6 +31,13 @@ const QUESTDB_IMAGE: &str = "docker.io/questdb/questdb";
 const QUESTDB_TAG: &str = "10.0.1";
 /// QuestDB serves the REST API and the QWP WebSocket upgrade on the same port.
 const QUESTDB_HTTP_PORT: u16 = 9000;
+
+/// Emitted once the server is accepting connections.
+const QUESTDB_READY_LOG: &str = "server-main enjoy";
+
+/// Attempts to resolve the published host port before giving up.
+const PORT_LOOKUP_ATTEMPTS: usize = 30;
+const PORT_LOOKUP_INTERVAL_MS: u64 = 200;
 
 pub const HEALTH_CHECK_ATTEMPTS: usize = 60;
 pub const HEALTH_CHECK_INTERVAL_MS: u64 = 1_000;
@@ -84,13 +90,15 @@ pub struct QuestDbContainer {
 
 impl QuestDbContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
+        // Wait on the startup log rather than an HTTP probe. An HTTP wait has
+        // to resolve the mapped host port while the container is still
+        // starting, and Docker occasionally has not published the mapping yet,
+        // which fails the whole fixture with "does not expose port 9000/tcp".
+        // The log line needs no port, and readiness is confirmed by the `/ping`
+        // poll in the sink fixture anyway.
         let container: ContainerAsync<GenericImage> = GenericImage::new(QUESTDB_IMAGE, QUESTDB_TAG)
             .with_exposed_port(QUESTDB_HTTP_PORT.tcp())
-            .with_wait_for(WaitFor::http(
-                HttpWaitStrategy::new("/ping")
-                    .with_port(QUESTDB_HTTP_PORT.tcp())
-                    .with_expected_status_code(204u16),
-            ))
+            .with_wait_for(WaitFor::message_on_stdout(QUESTDB_READY_LOG))
             .with_mapped_port(0, QUESTDB_HTTP_PORT.tcp())
             // Keep the footprint small; these suites write a few thousand rows.
             .with_env_var("QDB_CAIRO_COMMIT_LAG", "100")
@@ -102,20 +110,26 @@ impl QuestDbContainer {
                 message: format!("Failed to start container: {e}"),
             })?;
 
-        let ports = container
-            .ports()
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "QuestDbContainer".to_string(),
-                message: format!("Failed to get ports: {e}"),
-            })?;
-        let host_port = ports
-            .map_to_host_port_ipv4(QUESTDB_HTTP_PORT)
-            .or_else(|| ports.map_to_host_port_ipv6(QUESTDB_HTTP_PORT))
-            .ok_or_else(|| TestBinaryError::FixtureSetup {
-                fixture_type: "QuestDbContainer".to_string(),
-                message: "No mapping for QuestDB port".to_string(),
-            })?;
+        // The mapping can lag the container being up, so this retries rather
+        // than failing the fixture on the first miss.
+        let mut host_port = None;
+        for _ in 0..PORT_LOOKUP_ATTEMPTS {
+            if let Ok(ports) = container.ports().await
+                && let Some(port) = ports
+                    .map_to_host_port_ipv4(QUESTDB_HTTP_PORT)
+                    .or_else(|| ports.map_to_host_port_ipv6(QUESTDB_HTTP_PORT))
+            {
+                host_port = Some(port);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(PORT_LOOKUP_INTERVAL_MS)).await;
+        }
+        let host_port = host_port.ok_or_else(|| TestBinaryError::FixtureSetup {
+            fixture_type: "QuestDbContainer".to_string(),
+            message: format!(
+                "No host mapping for port {QUESTDB_HTTP_PORT} after {PORT_LOOKUP_ATTEMPTS} attempts"
+            ),
+        })?;
 
         let base_url = format!("http://localhost:{host_port}");
         info!("QuestDB container available at {base_url}");
