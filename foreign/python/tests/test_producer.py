@@ -580,17 +580,29 @@ class TestProducerLifecycle:
     """Test producer ownership, shutdown, and asynchronous context management."""
 
     @pytest.mark.asyncio
-    async def test_multiple_tasks_can_send_concurrently(
+    async def test_linger_sends_run_concurrently_under_shared_lifecycle_access(
         self, iggy_client: IggyClient, unique_name
     ):
-        producer = await iggy_client.producer(unique_name(), unique_name())
+        linger_seconds = 2
+        producer = await iggy_client.producer(
+            unique_name(),
+            unique_name(),
+            mode=DirectProducerConfig(linger_time=timedelta(seconds=linger_seconds)),
+        )
         try:
+            await producer.send_one(SendMessage("prime linger"))
+            started_at = time.monotonic()
             responses = await asyncio.gather(
-                *(producer.send_one(SendMessage(str(index))) for index in range(20))
+                producer.send_one(SendMessage("concurrent one")),
+                producer.send_one(SendMessage("concurrent two")),
             )
+            elapsed = time.monotonic() - started_at
 
-            assert len(responses) == 20
+            assert len(responses) == 2
             assert all(len(response.confirmations) == 1 for response in responses)
+            # Both reads wait against the same timestamp. A mutex around the
+            # producer would make the second wait through another full linger.
+            assert 1.2 <= elapsed < 3.6
         finally:
             await producer.shutdown()
 
@@ -742,6 +754,23 @@ class TestProducerValidationAndRetries:
             with pytest.raises(TypeError):
                 # pyrefly: ignore  # bad-argument-type
                 await producer.send_to(object(), "topic", [SendMessage("bad stream")])
+        finally:
+            await producer.shutdown()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("identifier", [-1, 2**32, 2**63])
+    async def test_send_to_identifier_overflow_is_not_folded_into_type_error(
+        self, iggy_client: IggyClient, unique_name, identifier: int
+    ):
+        producer = await iggy_client.producer(unique_name(), unique_name())
+        try:
+            for stream, topic in [(identifier, "topic"), ("stream", identifier)]:
+                with pytest.raises(OverflowError):
+                    await producer.send_to(
+                        stream,
+                        topic,
+                        [SendMessage("outside u32")],
+                    )
         finally:
             await producer.shutdown()
 

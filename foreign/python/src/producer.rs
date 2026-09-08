@@ -15,26 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
+#[cfg(test)]
 use iggy::clients::producer_config::BackpressureMode as RustBackpressureMode;
+#[cfg(test)]
+use iggy::prelude::BackgroundConfig as RustBackgroundConfig;
 use iggy::prelude::{
-    BackgroundConfig as RustBackgroundConfig, BalancedSharding, DirectConfig as RustDirectConfig,
-    Identifier, IggyByteSize, IggyDuration, IggyMessage as RustIggyMessage,
-    IggyProducer as RustIggyProducer, OrderedSharding, Sharding,
+    DirectConfig as RustDirectConfig, Identifier, IggyByteSize, IggyDuration,
+    IggyMessage as RustIggyMessage, IggyProducer as RustIggyProducer,
 };
 use pyo3::IntoPyObjectExt;
 use pyo3::conversion::FromPyObject;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDelta, PyList};
+use pyo3::types::{PyAny, PyDelta, PyInt, PyList, PyString};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
 use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::RwLock;
 
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
-use crate::identifier::PyIdentifier;
 use crate::partitioning::Partitioning;
 use crate::send_message::{SendMessage, SendMessagesResponse};
 
@@ -114,15 +115,6 @@ pub enum ProducerSharding {
     Balanced,
 }
 
-impl ProducerSharding {
-    fn into_rust(self) -> Box<dyn Sharding + Send + Sync> {
-        match self {
-            Self::Ordered => Box::new(OrderedSharding),
-            Self::Balanced => Box::new(BalancedSharding::default()),
-        }
-    }
-}
-
 /// What a background send does when the producer buffer is full.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[gen_stub_pyclass]
@@ -136,16 +128,6 @@ enum BackpressureKind {
     Block,
     BlockWithTimeout(IggyDuration),
     FailImmediately,
-}
-
-impl From<&BackpressureMode> for RustBackpressureMode {
-    fn from(mode: &BackpressureMode) -> Self {
-        match mode.kind {
-            BackpressureKind::Block => Self::Block,
-            BackpressureKind::BlockWithTimeout(timeout) => Self::BlockWithTimeout(timeout),
-            BackpressureKind::FailImmediately => Self::FailImmediately,
-        }
-    }
 }
 
 #[gen_stub_pymethods]
@@ -229,21 +211,6 @@ impl Default for BackgroundProducerConfig {
             max_in_flight: DEFAULT_BACKGROUND_MAX_IN_FLIGHT,
             sharding: ProducerSharding::Ordered,
         }
-    }
-}
-
-impl From<&BackgroundProducerConfig> for RustBackgroundConfig {
-    fn from(config: &BackgroundProducerConfig) -> Self {
-        RustBackgroundConfig::builder()
-            .num_shards(config.num_shards)
-            .linger_time(config.linger_time)
-            .batch_size(config.batch_size)
-            .batch_length(config.batch_length)
-            .max_buffer_size(config.max_buffer_size)
-            .failure_mode((&config.failure_mode).into())
-            .max_in_flight(config.max_in_flight)
-            .sharding(config.sharding.into_rust())
-            .build()
     }
 }
 
@@ -374,6 +341,8 @@ impl IggyProducer {
         let messages = extract_messages(messages)?;
         let inner = self.inner.clone();
         future_into_py(py, async move {
+            // Every send keeps a read guard for its full future. Concurrent sends
+            // remain possible while shutdown cannot consume an active producer.
             let producer = inner.read().await;
             let producer = producer
                 .as_ref()
@@ -441,15 +410,21 @@ impl IggyProducer {
     fn send_to<'py>(
         &self,
         py: Python<'py>,
-        stream: PyIdentifier,
-        topic: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.int"))] stream: &Bound<
+            '_,
+            PyAny,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.str | builtins.int"))] topic: &Bound<
+            '_,
+            PyAny,
+        >,
         #[gen_stub(override_type(type_repr = "list[SendMessage]"))] messages: &Bound<'_, PyList>,
         #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
             &Partitioning,
         >,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let stream = Arc::new(Identifier::try_from(stream)?);
-        let topic = Arc::new(Identifier::try_from(topic)?);
+        let stream = Arc::new(extract_send_to_identifier(stream, "stream")?);
+        let topic = Arc::new(extract_send_to_identifier(topic, "topic")?);
         let messages = extract_messages(messages)?;
         let partitioning = partitioning.map(|value| Arc::new(value.inner.clone()));
         let inner = self.inner.clone();
@@ -730,6 +705,8 @@ fn opaque_stub_default(py: Python<'_>) -> Bound<'_, PyAny> {
 }
 
 async fn shutdown(inner: Arc<RwLock<Option<RustIggyProducer>>>) -> PyResult<()> {
+    // Exclusive access must span consuming shutdown so another close waits for
+    // completion and no send can observe a producer being closed underneath it.
     let mut producer = inner.write().await;
     if let Some(producer) = producer.take() {
         producer.shutdown().await;
@@ -745,6 +722,21 @@ fn extract_messages(messages: &Bound<'_, PyList>) -> PyResult<Vec<RustIggyMessag
             Ok(clone_rust_message(&message))
         })
         .collect()
+}
+
+fn extract_send_to_identifier(value: &Bound<'_, PyAny>, parameter: &str) -> PyResult<Identifier> {
+    if let Ok(value) = value.cast::<PyString>() {
+        return Identifier::from_str(value.to_str()?)
+            .map_err(|error| PyValueError::new_err(error.to_string()));
+    }
+    if value.is_instance_of::<PyInt>() {
+        let value = value.extract::<u32>()?;
+        return Identifier::numeric(value)
+            .map_err(|error| PyValueError::new_err(error.to_string()));
+    }
+    Err(PyTypeError::new_err(format!(
+        "'{parameter}' must be a string or an integer"
+    )))
 }
 
 fn clone_rust_message(message: &SendMessage) -> RustIggyMessage {
@@ -778,6 +770,8 @@ fn u64_param(value: i128, parameter: &str) -> PyResult<u64> {
 
 #[cfg(test)]
 mod tests {
+    use pyo3::exceptions::{PyOverflowError, PyTypeError};
+
     use super::*;
 
     #[test]
@@ -816,33 +810,38 @@ mod tests {
     }
 
     #[test]
-    fn background_configuration_converts_to_rust() {
-        let python = BackgroundProducerConfig {
-            num_shards: 4,
-            linger_time: IggyDuration::from(2_000),
-            batch_size: 2_048,
-            batch_length: 32,
-            max_buffer_size: IggyByteSize::from(8_192),
-            failure_mode: BackpressureMode::fail_immediately(),
-            max_in_flight: 3,
-            sharding: ProducerSharding::Balanced,
-        };
-        let rust = RustBackgroundConfig::from(&python);
+    fn send_to_identifier_preserves_python_error_categories() {
+        Python::initialize();
+        Python::attach(|py| {
+            let string = PyString::new(py, "stream");
+            let numeric = 7_u32.into_pyobject(py).unwrap();
+            let negative = (-1_i64).into_pyobject(py).unwrap();
+            let too_large = (u64::from(u32::MAX) + 1).into_pyobject(py).unwrap();
+            let wrong_type = py.None().into_bound(py);
 
-        assert_eq!(rust.num_shards, 4);
-        assert_eq!(rust.linger_time, IggyDuration::from(2_000));
-        assert_eq!(rust.batch_size, 2_048);
-        assert_eq!(rust.batch_length, 32);
-        assert_eq!(rust.max_buffer_size.as_bytes_u64(), 8_192);
-        assert!(matches!(
-            rust.failure_mode,
-            RustBackpressureMode::FailImmediately
-        ));
-        assert_eq!(rust.max_in_flight, 3);
-        assert_eq!(
-            format!("{:?}", rust.sharding),
-            "BalancedSharding { counter: 0 }"
-        );
+            assert_eq!(
+                extract_send_to_identifier(string.as_any(), "stream")
+                    .unwrap()
+                    .get_string_value()
+                    .unwrap(),
+                "stream"
+            );
+            assert_eq!(
+                extract_send_to_identifier(numeric.as_any(), "stream")
+                    .unwrap()
+                    .get_u32_value()
+                    .unwrap(),
+                7
+            );
+
+            let negative = extract_send_to_identifier(negative.as_any(), "stream").unwrap_err();
+            let too_large = extract_send_to_identifier(too_large.as_any(), "stream").unwrap_err();
+            let wrong_type = extract_send_to_identifier(&wrong_type, "stream").unwrap_err();
+
+            assert!(negative.is_instance_of::<PyOverflowError>(py));
+            assert!(too_large.is_instance_of::<PyOverflowError>(py));
+            assert!(wrong_type.is_instance_of::<PyTypeError>(py));
+        });
     }
 
     #[test]

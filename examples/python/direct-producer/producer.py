@@ -25,6 +25,8 @@ from loguru import logger
 
 STREAM_NAME = "direct-producer-stream"
 TOPIC_NAME = "direct-producer-topic"
+SEND_TO_STREAM_NAME = "direct-producer-send-to-stream"
+SEND_TO_TOPIC_NAME = "direct-producer-send-to-topic"
 
 
 class ArgNamespace(NamedTuple):
@@ -45,12 +47,24 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(parser.parse_args()))
 
 
+async def ensure_send_to_destination(client: IggyClient) -> None:
+    if await client.get_stream(SEND_TO_STREAM_NAME) is None:
+        await client.create_stream(SEND_TO_STREAM_NAME)
+    if await client.get_topic(SEND_TO_STREAM_NAME, SEND_TO_TOPIC_NAME) is None:
+        await client.create_topic(
+            stream=SEND_TO_STREAM_NAME,
+            name=SEND_TO_TOPIC_NAME,
+            partitions_count=2,
+        )
+
+
 async def main() -> None:
     args = parse_args()
     client = IggyClient.from_connection_string(args.connection_string)
 
     logger.info("Connecting to Iggy")
     await client.connect()
+    await ensure_send_to_destination(client)
 
     producer = await client.producer(
         STREAM_NAME,
@@ -80,6 +94,26 @@ async def main() -> None:
         confirmation = await producer.send(messages)
         logger.info(
             "Sent a batch with {} confirmation(s)",
+            len(confirmation.confirmations),
+        )
+
+        confirmation = await producer.send_with_partitioning(
+            [SendMessage("partitioned message")],
+            Partitioning.partition_id(1),
+        )
+        logger.info(
+            "Sent to a selected partition with {} confirmation(s)",
+            len(confirmation.confirmations),
+        )
+
+        confirmation = await producer.send_to(
+            SEND_TO_STREAM_NAME,
+            SEND_TO_TOPIC_NAME,
+            [SendMessage("message for another topic")],
+            Partitioning.partition_id(0),
+        )
+        logger.info(
+            "Sent to another topic with {} confirmation(s)",
             len(confirmation.confirmations),
         )
 
