@@ -19,7 +19,7 @@ mod mapping;
 
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,6 +50,22 @@ const MAX_LOGGED_REJECTIONS_PER_BATCH: usize = 20;
 
 /// Upper bound on the payload text included when `log_rejected_payload` is on.
 const REJECTED_PAYLOAD_PREVIEW_BYTES: usize = 512;
+
+/// Installs a process-wide rustls crypto provider exactly once.
+///
+/// `rustls` picks a provider from crate features only when exactly one of
+/// `ring` and `aws-lc-rs` is linked. The connectors runtime links both, so
+/// `ClientConfig::builder()` cannot choose and **panics** instead of returning
+/// an error, taking down any `wss://` connection attempt. Installing one up
+/// front makes the choice explicit. A competing install by another plugin is
+/// not an error: the first one wins and either provider is correct here.
+static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    INSTALL_CRYPTO_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// Flush once the encoded buffer reaches this many bytes, independently of
 /// `batch_size`.
@@ -339,6 +355,7 @@ impl Sink for QuestDbSink {
             );
             return Err(error);
         }
+        ensure_crypto_provider();
         let connection_string = self.connection_string.expose_secret().to_owned();
         // `QuestDb::connect` dials the server, so this doubles as the
         // connectivity check the sink contract asks for in `open`.

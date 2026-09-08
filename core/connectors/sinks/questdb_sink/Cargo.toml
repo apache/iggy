@@ -38,6 +38,7 @@ humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 questdb-rs = { workspace = true }
+rustls = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 simd-json = { workspace = true }
