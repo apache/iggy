@@ -2005,6 +2005,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_the_instance_swapped_during_the_body_read_should_refuse_the_named_path() {
+        // The `ptr_eq` half, which the withdrawn-route test does not reach: the
+        // second lookup SUCCEEDS there, just against a different instance. Each
+        // instance carries its own `auth_bearer_token`, so without the identity
+        // check a request authorized against the one that resolved first is
+        // delivered into a stranger's bridge and a stranger's topic.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.topic_path = Some("github".to_string());
+        config.auth_bearer_token = None;
+        let mut source = open(1, config).await;
+        let addr = source.shared.config.listen_addr.clone();
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        let body = "{}";
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("the listener must accept");
+        let head = format!(
+            "POST /topics/github HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{body}\r\n"
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head must be written");
+        stream.flush().await.expect("the head must be flushed");
+
+        let probe = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body(body)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(probe.status(), StatusCode::OK);
+        let queued_before = shared.sender.len();
+
+        // A different instance takes the same topic path. The lookup below will
+        // succeed; only the identity check can tell it is the wrong one.
+        let rival = crate::test_support::instance(2, Some("github"), &[]);
+        publish(&source, vec![Arc::clone(&rival)]).await;
+
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("the terminating chunk must be written");
+        stream.flush().await.expect("the body must be flushed");
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the response must arrive before the timeout")
+        .expect("the response must be readable");
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "a request authorized against one instance must not be delivered to another, got: {response}"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before,
+            "and it must not reach the original instance's bridge either"
+        );
+        assert_eq!(rival.sender.len(), 0, "least of all the stranger's bridge");
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
     async fn given_the_route_withdrawn_during_the_body_read_should_refuse_the_named_path() {
         // The named path's version of the same window. Its instance can stop
         // serving the path while the body is still arriving, and the bridge
