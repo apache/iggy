@@ -39,7 +39,6 @@ poll_interval = "1s"
 batch_size = 1000
 tracking_column = "id"
 initial_offset = "0"
-max_connections = 10
 enable_cdc = false
 snake_case_columns = false
 include_metadata = true
