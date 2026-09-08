@@ -24,6 +24,7 @@ mod identifier;
 mod options;
 mod partitioning;
 mod permissions;
+mod producer;
 mod receive_message;
 mod send_message;
 mod stats;
@@ -45,6 +46,10 @@ use options::OptionSpec;
 use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use pyo3::prelude::*;
+use producer::{
+    BackgroundProducerConfig, BackpressureMode, DirectProducerConfig, IggyProducer,
+    ProducerSharding,
+};
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
@@ -62,6 +67,11 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessagesConfirmation>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<IggyProducer>()?;
+    m.add_class::<DirectProducerConfig>()?;
+    m.add_class::<BackgroundProducerConfig>()?;
+    m.add_class::<ProducerSharding>()?;
+    m.add_class::<BackpressureMode>()?;
     m.add_class::<AutoLogin>()?;
     m.add_class::<TcpConfig>()?;
     m.add_class::<TcpReconnectionConfig>()?;
