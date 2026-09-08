@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
+using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.Tests.UtilityTests;
 
@@ -30,6 +33,27 @@ public sealed class IdentifiersByteSerializationTests
         Assert.Throws<ArgumentException>(() => Identifier.String(val));
     }
 
+    [Theory]
+    [InlineData("café", 5)]
+    [InlineData("naïve-café", 12)]
+    [InlineData("日本語", 9)]
+    public void StringIdentifier_WithNonAscii_ShouldUseUtf8ByteLength(string value, int expectedLength)
+    {
+        var identifier = Identifier.String(value);
+
+        Assert.Equal(expectedLength, identifier.Length);
+        Assert.Equal(expectedLength, identifier.Value.Length);
+        Assert.Equal(value, identifier.GetString());
+    }
+
+    [Fact]
+    public void StringIdentifier_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        var val = new string('あ', 200);
+
+        Assert.Throws<ArgumentException>(() => Identifier.String(val));
+    }
+
     [Fact]
     public void KeyEntityId_WithInvalidLength_ShouldThrowArgumentException()
     {
@@ -37,6 +61,35 @@ public sealed class IdentifiersByteSerializationTests
         var val = string.Concat(Enumerable.Range(0, 500).Select(_ => character));
 
         Assert.Throws<ArgumentException>(() => Partitioning.EntityIdString(val));
+    }
+
+    [Theory]
+    [InlineData("café", 5)]
+    [InlineData("日本語", 9)]
+    public void KeyEntityId_WithNonAscii_ShouldUseUtf8ByteLength(string value, int expectedLength)
+    {
+        var partitioning = Partitioning.EntityIdString(value);
+
+        Assert.Equal(expectedLength, partitioning.Length);
+        Assert.Equal(expectedLength, partitioning.Value.Length);
+    }
+
+    [Fact]
+    public void KeyEntityId_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => Partitioning.EntityIdString(new string('あ', 200)));
+    }
+
+    [Fact]
+    public void HeaderKey_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => HeaderKey.FromString(new string('あ', 200)));
+    }
+
+    [Fact]
+    public void HeaderValue_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => HeaderValue.FromString(new string('あ', 200)));
     }
 
     [Fact]
@@ -65,9 +118,87 @@ public sealed class IdentifiersByteSerializationTests
     }
 
     [Fact]
+    public void Identifier_WithSameKindAndValue_ShouldBeEqual()
+    {
+        Assert.Equal(Identifier.Numeric(1), Identifier.Numeric(1));
+        Assert.Equal(Identifier.String("name"), Identifier.String("name"));
+        Assert.Equal(Identifier.Numeric(1).GetHashCode(), Identifier.Numeric(1).GetHashCode());
+        Assert.NotEqual(Identifier.Numeric(1), Identifier.Numeric(2));
+        Assert.NotEqual(Identifier.Numeric(1), Identifier.String("1"));
+    }
+
+    [Fact]
     public void Consumer_WithNegativeId_ShouldThrow()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => Consumer.New(-1));
         Assert.Throws<ArgumentOutOfRangeException>(() => Consumer.Group(-1));
+    }
+
+    [Fact]
+    public void Identifier_BuiltWithALegacyLengthInitializer_DerivesLengthFromValue()
+    {
+        var identifier = new Identifier { Kind = IdKind.String, Length = 1, Value = "café"u8.ToArray() };
+
+        Assert.Equal(5, identifier.Length);
+        Assert.Equal(Identifier.String("café"), identifier);
+    }
+
+    [Fact]
+    public void Partitioning_BuiltWithALegacyLengthInitializer_DerivesLengthFromValue()
+    {
+        var partitioning = new Partitioning
+        {
+            Kind = Enums.Partitioning.MessageKey,
+            Length = 1,
+            Value = "café"u8.ToArray()
+        };
+
+        Assert.Equal(5, partitioning.Length);
+    }
+
+    [Fact]
+    public void Identifier_WhenTheInitializerArrayIsMutated_KeepsTheOriginalValue()
+    {
+        var bytes = "abc"u8.ToArray();
+        var identifier = new Identifier { Kind = IdKind.String, Value = bytes };
+        var lookup = new HashSet<Identifier> { identifier };
+
+        bytes[0] = (byte)'z';
+
+        Assert.Equal("abc", identifier.GetString());
+        Assert.Contains(Identifier.String("abc"), lookup);
+    }
+
+    [Fact]
+    public void Identifier_WhenTheValueCopyIsMutated_KeepsTheOriginalValue()
+    {
+        var identifier = Identifier.String("abc");
+        var lookup = new HashSet<Identifier> { identifier };
+
+        identifier.Value[0] = (byte)'z';
+
+        Assert.Equal("abc", identifier.GetString());
+        Assert.Contains(Identifier.String("abc"), lookup);
+    }
+
+    [Fact]
+    public void Partitioning_WhenTheInitializerArrayIsMutated_KeepsTheOriginalValue()
+    {
+        var bytes = "abc"u8.ToArray();
+        var partitioning = Partitioning.EntityIdBytes(bytes);
+
+        bytes[0] = (byte)'z';
+
+        Assert.Equal("abc"u8.ToArray(), partitioning.Value);
+    }
+
+    [Fact]
+    public void Partitioning_WhenTheValueCopyIsMutated_KeepsTheOriginalValue()
+    {
+        var partitioning = Partitioning.EntityIdString("abc");
+
+        partitioning.Value[0] = (byte)'z';
+
+        Assert.Equal("abc"u8.ToArray(), partitioning.Value);
     }
 }

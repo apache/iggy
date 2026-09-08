@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Text;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Headers;
 
@@ -37,20 +38,18 @@ public readonly struct HeaderKey : IEquatable<HeaderKey>
     /// <summary>
     /// Creates a HeaderKey from a string value.
     /// </summary>
-    /// <param name="val">The string value (must be 1-255 characters).</param>
+    /// <param name="val">The string value (must be 1-255 UTF-8 bytes).</param>
     /// <returns>A new HeaderKey with String kind.</returns>
     /// <exception cref="ArgumentException">Thrown when value length is invalid.</exception>
     public static HeaderKey FromString(string val)
     {
-        if (val.Length is 0 or > 255)
-        {
-            throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(val));
-        }
+        var bytes = Encoding.UTF8.GetBytes(val);
+        WireName.Validate(bytes.Length, nameof(val));
 
         return new HeaderKey
         {
             Kind = HeaderKind.String,
-            Value = Encoding.UTF8.GetBytes(val)
+            Value = bytes
         };
     }
 
@@ -92,11 +91,7 @@ public readonly struct HeaderKey : IEquatable<HeaderKey>
     {
         var hash = new HashCode();
         hash.Add(Kind);
-        foreach (var b in Value)
-        {
-            hash.Add(b);
-        }
-
+        hash.AddBytes(Value);
         return hash.ToHashCode();
     }
 

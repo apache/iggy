@@ -659,21 +659,22 @@ view_probe_attempts_max = 5
 # waits before one is opened for it is repair_gap_debounce_interval below.
 repair_retry_interval = "1s"
 
-# How long a partition backup must hold committed ops it cannot walk to before
-# the shard's tick sweep opens a repair session for it (duration). The
-# level-triggered floor under every edge-triggered arming site, which a produce
-# stream can starve; must be nonzero.
+# How long a backup must hold committed ops it cannot walk to before the shard's
+# tick opens a repair session for it (duration). The level-triggered floor under
+# every edge-triggered arming site, which a produce stream can starve; must be
+# nonzero. Paces the partition sweep and the metadata detector alike.
 #
 # Floored at 50 consensus ticks (500ms at the 10ms tick), so values under that
 # arm no sooner: one tick of lag is ordinary pipelining, and repair against it
 # would fire on healthy traffic.
 #
 # Recovery latency for one hole is max(this, 500ms) plus up to one tick of sweep
-# granularity. Under a correlated fault the sweep opens at most 3 sessions per
-# tick and holds at most 8 at once, so the Nth group waiting on this shard adds
-# ceil(N / 3) ticks on top, and more while sessions are already in flight. That
-# cap is what keeps a node-wide rejoin from putting every group's repair stream
-# on one serving peer at once.
+# granularity. Under a correlated fault the partition sweep opens at most 3
+# sessions per tick and holds at most 8 at once, so the Nth group waiting on
+# this shard adds ceil(N / 3) ticks on top, and more while sessions are already
+# in flight. That cap is what keeps a node-wide rejoin from putting every
+# group's repair stream on one serving peer at once. There is one metadata group
+# per node, so its detector is not rate-capped.
 repair_gap_debounce_interval = "1s"
 
 # Prepares a peer serves per repair round before the requester walks to the next
@@ -1023,6 +1024,36 @@ prepare_queue_depth = 32
 # memory scales with partition count. Size it to the producers one partition
 # actually sees, not the node's client total.
 dedup_clients_max = 4096
+
+# Distinct durable consumer-offset keys a partition primary admits per kind.
+# Standalone consumers and consumer groups are counted separately. Existing
+# keys remain writable at the limit. A new key is rejected before consensus.
+# A non-empty auto_commit poll that needs a new offset key is also rejected
+# with TooManyConsumerOffsets and returns no messages. A poll whose auto_commit
+# cannot be submitted (the owning shard's inbox is full, or the partition
+# changed primary during the read) is rejected with TransientNotAccepted, also
+# without messages; both are retriable. Polls with auto_commit disabled do not
+# allocate offset keys and remain available.
+# UPGRADE: existing files are loaded even above this limit, but new keys then
+# remain blocked until offsets are explicitly deleted or this limit is raised.
+# Standalone offsets have no automatic expiry. Reuse stable consumer ids and
+# count existing numeric offset files per partition and kind before upgrading.
+# The environment override is IGGY_PARTITION_CONSUMER_OFFSETS_MAX.
+# UPGRADE: on replicated partitions, offset stores and deletes carrying NoAck
+# wait for VSR commit. First-party SDK offset methods request Quorum.
+# Must be > 0 and <= 262144.
+consumer_offsets_max = 4096
+
+# Whether consumer-offset files are written crash-safe. On, every committed
+# offset store writes a sibling file, fdatasyncs it and renames it over the
+# prior cursor, and the offsets directory is fsynced once per commit walk before
+# any reply in that walk is sent. Independent of the topic's enforce_fsync,
+# which governs message and index files. Off, the file is rewritten in place
+# with no sync. A lost or torn cursor can cause replay from the earliest retained
+# data. On, the filesystem must support both file and directory sync. A failed
+# required barrier is reported as a failure, even if the mutation is visible.
+# The environment override is IGGY_PARTITION_CONSUMER_OFFSET_ENFORCE_FSYNC.
+consumer_offset_enforce_fsync = false
 
 # How many offsets a partition claims in its superblock ahead of the mint
 # counter before it will append, so a crash-restarted replica resumes above
