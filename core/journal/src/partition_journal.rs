@@ -287,7 +287,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         .await
     }
 
-    /// Synchronize materialized files before removing their WAL coverage.
+    /// Synchronize required materialized files before removing their WAL coverage.
+    /// Authorized deletions are excluded by the caller. A missing listed path
+    /// does not prove deletion was authorized and cannot permit WAL reclamation.
     ///
     /// # Errors
     /// Returns an error if any file or directory barrier fails.

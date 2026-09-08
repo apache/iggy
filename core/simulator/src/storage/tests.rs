@@ -771,24 +771,32 @@ fn checkpoint_barriers_complete_before_wal_reclamation() {
 #[test]
 fn failed_materialization_keeps_wal_coverage_and_fences_completion() {
     block_on(async {
-        let (storage, persistence) = queued_batch(4).await;
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-        persistence.checkpoint_files(
-            4,
-            vec![Path::new("/partition/missing").to_path_buf()],
-            Vec::new(),
-        );
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-        assert!(persistence.failure().is_some());
-        assert_eq!(persistence.checkpoint_op(), 0);
-        storage.crash(Crash::PowerLoss);
-        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
-            .await
-            .unwrap();
-        assert_eq!(recovered.head(), 4);
-        assert_eq!(recovered.prepares().await.unwrap().len(), 4);
+        for missing_directory in [false, true] {
+            let (storage, persistence) = queued_batch(4).await;
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            let missing = vec![Path::new("/partition/missing").to_path_buf()];
+            let (files, directories) = if missing_directory {
+                (Vec::new(), missing)
+            } else {
+                (missing, Vec::new())
+            };
+            persistence.checkpoint_files(4, files, directories);
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            assert_eq!(
+                persistence.failure().unwrap().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert_eq!(persistence.checkpoint_op(), 0);
+            storage.crash(Crash::PowerLoss);
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.head(), 4);
+            assert_eq!(recovered.prepares().await.unwrap().len(), 4);
+        }
     });
 }
 

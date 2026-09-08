@@ -82,6 +82,8 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
         .await
         .unwrap()
         .expect("topic exists");
+    // The SDK sends both durability fields, including the independently
+    // defaulted offset policy. Explicit provenance describes those wire keys.
     for (key, expected_explicit) in [
         (topic_option_keys::DURABILITY, true),
         (topic_option_keys::CONSUMER_OFFSET_DURABILITY, true),
@@ -318,7 +320,8 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
         .await
         .unwrap()
         .expect("topic exists");
-    // The keys the update did not mention keep the values create resolved.
+    // The update preserves creation provenance. Both durability defaults were
+    // sent by the SDK at creation, whereas preallocate_segments was omitted.
     for (key, expected_explicit) in [
         (topic_option_keys::SEGMENT_SIZE, true),
         (topic_option_keys::DURABILITY, true),
