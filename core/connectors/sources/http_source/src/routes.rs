@@ -214,6 +214,14 @@ pub enum RouteConflict {
         held_by: u32,
         claimed_by: u32,
     },
+    /// A candidate registry was supplied for an instance the set does not
+    /// contain, so it was never projected.
+    ///
+    /// Its own variant rather than an `Ok`, because a validator that never saw
+    /// the candidate must not be indistinguishable from one that saw it and
+    /// approved. The caller snapshots the instance set before taking the
+    /// registry lock, so an instance leaving in that gap lands here.
+    CandidateNotProjected { claimed_by: u32 },
 }
 
 impl RouteTable {
@@ -307,6 +315,13 @@ impl RouteTable {
                 }
             }
         }
+        if let Some((candidate_id, _)) = candidate
+            && !instances.iter().any(|instance| instance.id == candidate_id)
+        {
+            return Err(RouteConflict::CandidateNotProjected {
+                claimed_by: candidate_id,
+            });
+        }
         Ok(table)
     }
 
@@ -355,6 +370,10 @@ impl Display for RouteConflict {
             } => write!(
                 formatter,
                 "topic_path '{topic_path}' is already served by connector ID: {held_by}, claimed by connector ID: {claimed_by}"
+            ),
+            Self::CandidateNotProjected { claimed_by } => write!(
+                formatter,
+                "connector ID: {claimed_by} is no longer joined, so its pending change was never checked"
             ),
         }
     }
@@ -439,6 +458,59 @@ mod tests {
         assert!(
             !message.contains(ENDPOINT_ONE),
             "but never in full: {message}"
+        );
+    }
+
+    #[test]
+    fn given_a_candidate_registry_when_built_should_project_it_instead_of_the_published_one() {
+        // The whole point of the candidate: a registration is checked before it
+        // is published, so the endpoint it would add has to be visible to the
+        // build. Without the substitution the build sees only what is already
+        // published, which cannot conflict with an endpoint that does not exist
+        // yet, so the validator would answer Ok to everything and the check
+        // would be a no-op nothing could detect.
+        let first = instance(1, Some("github"), &[ENDPOINT_ONE]);
+        let second = instance(7, Some("stripe"), &[]);
+
+        // Second is about to register an id the first already serves.
+        let mut candidate = EndpointRegistry::default();
+        assert!(candidate.insert(Endpoint::from(&StaticEndpointConfig {
+            endpoint_id: endpoint_id(ENDPOINT_ONE),
+            auth_type: EndpointAuthType::None,
+            auth_secret: None,
+            hmac_header: crate::DEFAULT_HMAC_HEADER.to_string(),
+            hmac_prefix: crate::DEFAULT_HMAC_PREFIX.to_string(),
+            expires_at: None,
+        })));
+
+        let instances = [Arc::clone(&first), Arc::clone(&second)];
+        RouteTable::build(&instances).expect("the published registries alone do not conflict");
+
+        let conflict = RouteTable::build_with(&instances, Some((7, &candidate)))
+            .expect_err("the candidate steals an id the first instance serves");
+        assert_eq!(
+            conflict,
+            RouteConflict::EndpointId {
+                endpoint_id: endpoint_id(ENDPOINT_ONE),
+                held_by: 1,
+                claimed_by: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_candidate_for_an_absent_instance_when_built_should_refuse() {
+        // A candidate whose instance is not in the set was never projected, so
+        // an `Ok` here would be indistinguishable from "checked and fine". The
+        // caller snapshots the instance set before taking the registry lock, so
+        // a leave in that gap lands exactly here, and answering Ok would let an
+        // unvalidated registration through.
+        let only = instance(1, Some("github"), &[ENDPOINT_ONE]);
+        let candidate = EndpointRegistry::default();
+
+        assert!(
+            RouteTable::build_with(&[only], Some((7, &candidate))).is_err(),
+            "a candidate that was never projected must not report success"
         );
     }
 
