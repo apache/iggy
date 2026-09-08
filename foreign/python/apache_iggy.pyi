@@ -31,12 +31,15 @@ __all__ = [
     "AutoCommitAfter",
     "AutoCommitWhen",
     "AutoLogin",
+    "BackgroundProducerConfig",
+    "BackpressureMode",
     "CacheMetrics",
     "CacheMetricsKey",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "DirectProducerConfig",
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
@@ -44,12 +47,14 @@ __all__ = [
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
+    "IggyProducer",
     "MaxTopicSize",
     "OptionSpec",
     "Partition",
     "Partitioning",
     "Permissions",
     "PollingStrategy",
+    "ProducerSharding",
     "QuicConfig",
     "QuicReconnectionConfig",
     "ReceiveMessage",
@@ -303,6 +308,72 @@ class AutoLogin:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class BackgroundProducerConfig:
+    r"""
+    Immutable configuration for the future background producer mode.
+    """
+    @property
+    def num_shards(self) -> builtins.int: ...
+    @property
+    def linger_time(self) -> datetime.timedelta: ...
+    @property
+    def batch_size(self) -> builtins.int: ...
+    @property
+    def batch_length(self) -> builtins.int: ...
+    @property
+    def max_buffer_size(self) -> builtins.int: ...
+    @property
+    def failure_mode(self) -> BackpressureMode: ...
+    @property
+    def max_in_flight(self) -> builtins.int: ...
+    @property
+    def sharding(self) -> ProducerSharding: ...
+    def __new__(
+        cls,
+        *,
+        num_shards: builtins.int = 1,
+        linger_time: datetime.timedelta = ...,
+        batch_size: builtins.int = 1048576,
+        batch_length: builtins.int = 1000,
+        max_buffer_size: builtins.int = 33554432,
+        failure_mode: BackpressureMode = ...,
+        max_in_flight: builtins.int = 1,
+        sharding: ProducerSharding = ...,
+    ) -> BackgroundProducerConfig:
+        r"""
+        Constructs the stable configuration surface for background mode.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class BackpressureMode:
+    r"""
+    What a background send does when the producer buffer is full.
+    """
+    @property
+    def timeout(self) -> datetime.timedelta | None:
+        r"""
+        The configured timeout, or `None` for modes without one.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    @staticmethod
+    def block() -> BackpressureMode:
+        r"""
+        Wait indefinitely for buffer capacity.
+        """
+    @staticmethod
+    def block_with_timeout(timeout: datetime.timedelta) -> BackpressureMode:
+        r"""
+        Wait up to `timeout` for buffer capacity.
+        """
+    @staticmethod
+    def fail_immediately() -> BackpressureMode:
+        r"""
+        Fail immediately when the producer buffer is full.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class CacheMetrics:
     r"""
     Cache metrics for a specific partition.
@@ -450,6 +521,29 @@ class ConsumerGroupMember:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
         """
+
+@typing.final
+class DirectProducerConfig:
+    r"""
+    Configuration for a producer that sends from the calling task.
+    """
+    @property
+    def batch_length(self) -> builtins.int:
+        r"""
+        Maximum number of messages sent in one request.
+        """
+    @property
+    def linger_time(self) -> datetime.timedelta:
+        r"""
+        Minimum gap requested between sequential direct sends.
+        """
+    def __new__(
+        cls, *, batch_length: builtins.int = 1000, linger_time: datetime.timedelta = ...
+    ) -> DirectProducerConfig:
+        r"""
+        Constructs direct-producer batching and pacing configuration.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class GlobalPermissions:
@@ -1670,6 +1764,23 @@ class IggyClient:
                 the supported unsigned 32-bit range.
             RuntimeError: If the request fails.
         """
+    def producer(
+        self,
+        stream: builtins.str,
+        topic: builtins.str,
+        partitioning: Partitioning | None = None,
+        mode: DirectProducerConfig | BackgroundProducerConfig = ...,
+        create_stream_if_not_exists: builtins.bool = True,
+        create_topic_if_not_exists: builtins.bool = True,
+        topic_partitions_count: builtins.int = 1,
+        topic_message_expiry: IggyExpiry | None = None,
+        topic_max_size: MaxTopicSize | None = None,
+        send_retries: builtins.int | None = 3,
+        send_retry_interval: datetime.timedelta | None = ...,
+    ) -> collections.abc.Awaitable[IggyProducer]:
+        r"""
+        Creates and initializes a high-level producer bound to a stream and topic.
+        """
     def poll_messages(
         self,
         stream: builtins.str | builtins.int,
@@ -1862,6 +1973,48 @@ class IggyExpiry:
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     ...
+
+@typing.final
+class IggyProducer:
+    r"""
+    A producer bound to one stream and topic and ready to send messages.
+    """
+    def send(
+        self, messages: list[SendMessage]
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends a batch to the producer's bound stream and topic.
+        """
+    def send_one(
+        self, message: SendMessage
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends one message to the producer's bound stream and topic.
+        """
+    def send_with_partitioning(
+        self, messages: list[SendMessage], partitioning: Partitioning | None = None
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends a batch with an optional per-call partitioning override.
+        """
+    def send_to(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        messages: list[SendMessage],
+        partitioning: Partitioning | None = None,
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends a batch to another existing stream and topic.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Waits for active sends and closes the producer. Repeated calls are safe.
+        """
+    def __aenter__(self) -> collections.abc.Awaitable[IggyProducer]: ...
+    def __aexit__(
+        self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any
+    ) -> collections.abc.Awaitable[builtins.bool]: ...
 
 class MaxTopicSize:
     r"""
@@ -3251,6 +3404,15 @@ class WebSocketReconnectionConfig:
                 raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ProducerSharding(enum.Enum):
+    r"""
+    How a background producer distributes sends among its workers.
+    """
+
+    ORDERED = ...
+    BALANCED = ...
 
 @typing.final
 class UserStatus(enum.Enum):
