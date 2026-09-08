@@ -22,6 +22,106 @@ use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Describes the producer that [`IggyStreamProducer`] and [`IggyStream`] build.
+///
+/// The value is a plain description. It never talks to the server, and changing it later has no
+/// effect on a producer that is built already.
+///
+/// # Creating a configuration
+///
+/// | Constructor | Use it for |
+/// | --- | --- |
+/// | [`builder()`](Self::builder) | naming every field you set |
+/// | [`from_stream_topic()`](Self::from_stream_topic) | one stream and one topic, defaults elsewhere |
+/// | [`new()`](Self::new) | every field, positional |
+/// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
+///
+/// The builder requires every field that is not an [`Option`], so it requires
+/// [`stream_id()`](Self::stream_id), [`stream_name()`](Self::stream_name),
+/// [`topic_id()`](Self::topic_id), [`topic_name()`](Self::topic_name),
+/// [`topic_partitions_count()`](Self::topic_partitions_count),
+/// [`batch_length()`](Self::batch_length), [`linger_time()`](Self::linger_time) and
+/// [`partitioning()`](Self::partitioning).
+///
+/// # Fields and defaults
+///
+/// The defaults below are what [`default()`](Self::default) and
+/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder has no defaults.
+///
+/// | Field | Default | Controls |
+/// | --- | --- | --- |
+/// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | where messages are appended |
+/// | [`stream_id()`](Self::stream_id), [`topic_id()`](Self::topic_id) | the same two names | nothing in the producer, see below |
+/// | [`topic_partitions_count()`](Self::topic_partitions_count) | 1 | partitions of a topic the build creates |
+/// | [`batch_length()`](Self::batch_length) | 100 | messages per request |
+/// | [`linger_time()`](Self::linger_time) | 5 milliseconds | smallest gap between two send calls |
+/// | [`partitioning()`](Self::partitioning) | [`Partitioning::balanced()`] | which partition a batch lands in |
+/// | [`send_retries_count()`](Self::send_retries_count) | three retries | retrying a failed request |
+/// | [`send_retries_interval()`](Self::send_retries_interval) | one second | pacing those retries |
+/// | [`encryptor()`](Self::encryptor) | none | encrypting payloads and user headers |
+///
+/// The build reads the two names, not the two identifiers, so [`stream_id()`](Self::stream_id) and
+/// [`topic_id()`](Self::topic_id) reach neither the producer nor the server. They are there for
+/// your own calls, such as passing [`stream_id()`](Self::stream_id) to
+/// [`StreamClient::delete_stream()`]. Keep each identifier and its name in step, because nothing
+/// checks that they match.
+///
+/// [`topic_partitions_count()`](Self::topic_partitions_count) applies to a topic that the build
+/// creates. An existing topic keeps the partitions it has.
+///
+/// [`encryptor()`](Self::encryptor) replaces the encryptor of the [`IggyClient`] for this
+/// producer. A consumer needs the same key to read those messages back.
+///
+/// # Examples
+///
+/// One topic, with the defaults for everything else:
+///
+/// ```rust
+/// use iggy::prelude::*;
+///
+/// # fn example() -> Result<(), IggyError> {
+/// let config = IggyProducerConfig::from_stream_topic(
+///     "my-stream",
+///     "my-topic",
+///     100,
+///     IggyDuration::new_from_secs(1),
+/// )?;
+///
+/// assert_eq!(config.topic_partitions_count(), 1);
+/// assert_eq!(config.send_retries_count(), Some(3));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Ten partitions, every message keyed to one of them, and five retries:
+///
+/// ```rust
+/// use iggy::prelude::*;
+///
+/// # fn example() -> Result<(), IggyError> {
+/// let config = IggyProducerConfig::builder()
+///     .stream_id(Identifier::from_str_value("my-stream")?)
+///     .stream_name("my-stream")
+///     .topic_id(Identifier::from_str_value("my-topic")?)
+///     .topic_name("my-topic")
+///     .topic_partitions_count(10)
+///     .batch_length(100)
+///     .linger_time(IggyDuration::new_from_secs(1))
+///     .partitioning(Partitioning::messages_key_str("my-key")?)
+///     .send_retries_count(5)
+///     .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
+///     .build();
+///
+/// assert_eq!(config.topic_partitions_count(), 10);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`IggyClient`]: crate::prelude::IggyClient
+/// [`IggyStream`]: crate::prelude::IggyStream
+/// [`IggyStreamProducer`]: crate::prelude::IggyStreamProducer
+/// [`Partitioning::balanced()`]: crate::prelude::Partitioning::balanced
+/// [`StreamClient::delete_stream()`]: crate::prelude::StreamClient::delete_stream
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
 pub struct IggyProducerConfig {
@@ -62,21 +162,38 @@ impl Default for IggyProducerConfig {
 }
 
 impl IggyProducerConfig {
-    /// Creates a new `IggyProducerConfig` with all fields defined.
+    /// Sets every field at once, positionally.
     ///
-    /// # Args
+    /// This applies no defaults. [`builder()`](Self::builder) sets the same fields by name and is
+    /// easier to read.
     ///
-    /// * `stream_name` - The stream name.
-    /// * `topic_name` - The topic name.
-    /// * `topic_partitions_count` - The number of partitions to create.
-    /// * `batch_length` - The max number of messages to send in a batch.
-    /// * `linger_time` - The interval between messages sent.
-    /// * `partitioning` - The partitioning strategy to use.
-    /// * `encryptor` - The encryptor to use.
+    /// # Examples
     ///
-    /// Returns:
-    /// A new `IggyProducerConfig`.
+    /// Describe a topic with three partitions and no retries:
     ///
+    /// ```rust
+    /// use iggy::prelude::*;
+    ///
+    /// # fn example() -> Result<(), IggyError> {
+    /// let config = IggyProducerConfig::new(
+    ///     Identifier::from_str_value("my-stream")?,
+    ///     "my-stream".to_string(),
+    ///     Identifier::from_str_value("my-topic")?,
+    ///     "my-topic".to_string(),
+    ///     3,
+    ///     100,
+    ///     IggyDuration::new_from_secs(1),
+    ///     Partitioning::balanced(),
+    ///     None,
+    ///     None,
+    ///     None,
+    /// );
+    ///
+    /// assert_eq!(config.send_retries_count(), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream_name: String,
         topic_name: String,
@@ -98,19 +215,36 @@ impl IggyProducerConfig {
         }
     }
 
-    /// Creates a new `IggyProducerConfig` from the given stream and topic names, along with the
-    /// max batch size and the send interval.
+    /// Names one stream and one topic, and takes the defaults for the rest.
     ///
-    /// # Args
+    /// Each identifier is derived from the matching name. The topic gets one partition, balanced
+    /// partitioning, three send retries one second apart, and no encryptor.
     ///
-    /// * `stream` - The stream name.
-    /// * `topic` - The topic name.
-    /// * `batch_length` - The max number of messages to send in a batch.
-    /// * `linger_time` - The interval between messages sent.
+    /// # Examples
     ///
-    /// Returns:
-    /// A new `IggyProducerConfig`.
+    /// Describe one topic with 100 messages per request:
     ///
+    /// ```rust
+    /// use iggy::prelude::*;
+    ///
+    /// # fn example() -> Result<(), IggyError> {
+    /// let config = IggyProducerConfig::from_stream_topic(
+    ///     "my-stream",
+    ///     "my-topic",
+    ///     100,
+    ///     IggyDuration::new_from_secs(1),
+    /// )?;
+    ///
+    /// assert_eq!(config.stream_name(), "my-stream");
+    /// assert_eq!(config.partitioning(), &Partitioning::balanced());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidIdentifier`] when `stream` or `topic` is not a valid
+    /// identifier.
     pub fn from_stream_topic(
         stream: &str,
         topic: &str,
@@ -135,22 +269,27 @@ impl IggyProducerConfig {
 }
 
 impl IggyProducerConfig {
+    /// Returns the name of the stream that messages are appended to.
     pub fn stream_name(&self) -> &str {
         &self.stream_name
     }
 
+    /// Returns the name of the topic that messages are appended to.
     pub fn topic_name(&self) -> &str {
         &self.topic_name
     }
 
+    /// Returns how many messages one request carries at most.
     pub fn batch_length(&self) -> u32 {
         self.batch_length
     }
 
+    /// Returns the smallest gap the producer keeps between two send calls.
     pub fn linger_time(&self) -> IggyDuration {
         self.linger_time
     }
 
+    /// Returns the strategy that decides which partition a batch lands in.
     pub fn partitioning(&self) -> &Partitioning {
         &self.partitioning
     }
@@ -165,10 +304,16 @@ impl IggyProducerConfig {
         self.topic_durability
     }
 
+    /// Returns how many partitions a topic created by the build gets.
+    ///
+    /// An existing topic keeps the partitions it has.
     pub fn topic_partitions_count(&self) -> u32 {
         self.topic_partitions_count
     }
 
+    /// Returns the encryptor for payloads and user headers, if there is one.
+    ///
+    /// It replaces the encryptor of the client that builds the producer.
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {
         self.encryptor.clone()
     }
