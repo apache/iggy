@@ -7762,6 +7762,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-retry",
  "rmcp",
+ "rmp-serde",
  "rust-s3",
  "secrecy",
  "serde",
