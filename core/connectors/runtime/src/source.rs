@@ -45,7 +45,7 @@ use crate::log::LOG_CALLBACK;
 use crate::metrics::SourceLabels;
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
-    SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
+    SourceConnectorProducer, SourceConnectorWrapper, close_plugin_instance, resolve_plugin_path,
     state::{StateStorage, StateStorageFactory},
     transform,
 };
@@ -186,7 +186,7 @@ pub async fn init(
             source_connectors.insert(
                 path.clone(),
                 SourceConnector {
-                    container,
+                    container: Arc::new(container),
                     plugins: Vec::new(),
                 },
             );
@@ -227,6 +227,15 @@ pub async fn init(
             continue;
         }
 
+        // A plugin left with `error` set is skipped by `handle`, so nothing
+        // would ever reach the instance `init_source` just created.
+        let instance_guard = {
+            let connector = source_connectors
+                .get_mut(&path)
+                .expect("source connector was inserted above");
+            SourceInstanceGuard::for_container(connector.container.clone(), plugin_id, &key)
+        };
+
         match setup_source_producer(&key, &config, iggy_client).await {
             Ok((producer, encoder, transforms)) => {
                 let connector = source_connectors
@@ -239,6 +248,7 @@ pub async fn init(
                     .expect("source plugin was pushed above");
                 plugin.producer = Some(SourceConnectorProducer { producer, encoder });
                 plugin.transforms = transforms;
+                instance_guard.disarm();
                 info!(
                     "Source container with name: {name} ({key}) initialized successfully with ID: {plugin_id}."
                 );
@@ -246,11 +256,10 @@ pub async fn init(
             Err(error) => {
                 let message = format!("Failed to set up source producer: {error}");
                 error!("Source: {name} ({key}) - {message}");
+                instance_guard.close().await;
                 let connector = source_connectors
                     .get_mut(&path)
                     .expect("source connector was inserted above");
-                let close = connector.container.iggy_source_close;
-                close_failed_source(&|id| close(id), plugin_id, &key);
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()
@@ -376,9 +385,11 @@ impl SourceInstanceGuard {
         let close = self.close.clone();
         let plugin_id = self.plugin_id;
         let key = std::mem::take(&mut self.key);
-        if tokio::task::spawn_blocking(move || close_failed_source(close.as_ref(), plugin_id, &key))
-            .await
-            .is_err()
+        if tokio::task::spawn_blocking(move || {
+            close_plugin_instance(close.as_ref(), "source", plugin_id, &key)
+        })
+        .await
+        .is_err()
         {
             warn!(
                 "Teardown of failed source connector with ID: {plugin_id} did not run to completion."
@@ -404,23 +415,13 @@ impl Drop for SourceInstanceGuard {
         // stays mapped until the call returns.
         match Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(move || close_failed_source(close.as_ref(), plugin_id, &key));
+                handle.spawn_blocking(move || {
+                    close_plugin_instance(close.as_ref(), "source", plugin_id, &key)
+                });
             }
             // No runtime to hand it to, and no worker to protect either.
-            Err(_) => close_failed_source(close.as_ref(), plugin_id, &key),
+            Err(_) => close_plugin_instance(close.as_ref(), "source", plugin_id, &key),
         }
-    }
-}
-
-/// Closes an instance whose setup did not finish, reporting a refusal rather
-/// than returning it: both callers are already on a failure path and have an
-/// error of their own to surface.
-pub(crate) fn close_failed_source(close: &dyn Fn(u32) -> i32, plugin_id: u32, key: &str) {
-    let close_result = close(plugin_id);
-    if close_result != 0 {
-        warn!(
-            "iggy_source_close returned {close_result} while cleaning up failed source connector with ID: {plugin_id} ({key})"
-        );
     }
 }
 
