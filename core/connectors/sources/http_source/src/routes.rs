@@ -499,6 +499,48 @@ mod tests {
     }
 
     #[test]
+    fn given_a_candidate_when_built_should_replace_only_its_own_instances_registry() {
+        // The discriminating half. Asserting only the conflict does not pin the
+        // substitution: "replace for the named instance", "replace for every
+        // instance" and "merge into the existing one" all produce the identical
+        // error from the negative case. Only the positive case tells them
+        // apart, and "replace for every instance" is the dangerous survivor -
+        // it would validate a registration on one instance against a table in
+        // which its sibling's real endpoints had been swapped out for the
+        // candidate, so a genuine collision would pass.
+        let first = instance(1, Some("github"), &[ENDPOINT_ONE]);
+        let second = instance(7, Some("stripe"), &[ENDPOINT_TWO]);
+        let instances = [Arc::clone(&first), Arc::clone(&second)];
+
+        // An empty candidate for instance 7 removes ENDPOINT_TWO and nothing
+        // else. Merging would keep it, giving 2; replacing for every instance
+        // would drop ENDPOINT_ONE as well, giving 0.
+        let empty = EndpointRegistry::default();
+        let table = RouteTable::build_with(&instances, Some((7, &empty)))
+            .expect("an empty candidate conflicts with nothing");
+        assert_eq!(
+            table.secret_path_count(),
+            1,
+            "only instance 7's registry may be replaced"
+        );
+        assert!(
+            matches!(
+                table.lookup_secret_path(ENDPOINT_ONE, NOW),
+                RouteLookup::Active(_)
+            ),
+            "instance 1 keeps serving its own endpoint"
+        );
+        assert!(matches!(
+            table.lookup_secret_path(ENDPOINT_TWO, NOW),
+            RouteLookup::Unknown
+        ));
+
+        // Both named paths survive either way, so they are asserted separately
+        // from the substitution they do not exercise.
+        assert_eq!(table.named_path_count(), 2);
+    }
+
+    #[test]
     fn given_a_candidate_for_an_absent_instance_when_built_should_refuse() {
         // A candidate whose instance is not in the set was never projected, so
         // an `Ok` here would be indistinguishable from "checked and fine". The
