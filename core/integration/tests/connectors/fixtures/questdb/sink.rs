@@ -33,7 +33,7 @@ use super::container::{
     ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE, ENV_SINK_TIMESTAMP_FIELD,
     ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT, ENV_SINK_UUID_COLUMNS,
     HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer, QuestDbOps,
-    create_http_client,
+    SINK_PLUGIN_PATH, create_http_client, ensure_plugin_built,
 };
 
 const POLL_ATTEMPTS: usize = 120;
@@ -223,6 +223,9 @@ impl QuestDbSinkFixture {
     }
 
     pub async fn setup_with_options(options: QuestDbSinkOptions) -> Result<Self, TestBinaryError> {
+        // Check before pulling or starting anything: a missing plugin should cost
+        // a second and name its own fix, not a container start and a timeout.
+        ensure_plugin_built()?;
         let container = QuestDbContainer::start().await?;
         let http_client = create_http_client();
         let sf_dir = if options.store_and_forward {
@@ -312,10 +315,7 @@ impl TestFixture for QuestDbSinkFixture {
             ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_string(),
             "questdb_sink_cg".to_string(),
         );
-        envs.insert(
-            ENV_SINK_PATH.to_string(),
-            "../../target/debug/libiggy_connector_questdb_sink".to_string(),
-        );
+        envs.insert(ENV_SINK_PATH.to_string(), SINK_PLUGIN_PATH.to_string());
 
         if let Some(value) = &self.options.timestamp_source {
             envs.insert(ENV_SINK_TIMESTAMP_SOURCE.to_string(), value.clone());

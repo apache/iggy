@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::path::Path;
+
 use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
@@ -48,6 +50,11 @@ pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
 // ── env-var keys injected into the connectors runtime ────────────────────────
 
 pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PATH";
+
+/// Where the connectors runtime looks for the plugin, relative to its working
+/// directory. Cargo runs the test with the same working directory, so the same
+/// relative path resolves here.
+pub const SINK_PLUGIN_PATH: &str = "../../target/debug/libiggy_connector_questdb_sink";
 pub const ENV_SINK_CONNECTION_STRING: &str =
     "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_CONNECTION_STRING";
 pub const ENV_SINK_TABLE: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_TABLE";
@@ -79,6 +86,32 @@ pub const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAM
 pub const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_SCHEMA";
 pub const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
     "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_CONSUMER_GROUP";
+
+/// Fails with an actionable message when the plugin has not been built.
+///
+/// Cargo has no dependency edge to a plugin: the runtime `dlopen`s it at a
+/// path, so `cargo test` never builds it. Without this check the runtime
+/// starts, fails to load the connector, and the test dies somewhere far away
+/// from the cause, typically as a timeout waiting for rows that were never
+/// going to arrive.
+pub fn ensure_plugin_built() -> Result<(), TestBinaryError> {
+    // The runtime appends the platform's suffix, so the configured path has
+    // none and every candidate has to be tried.
+    let built = ["dylib", "so", "dll"]
+        .iter()
+        .any(|extension| Path::new(&format!("{SINK_PLUGIN_PATH}.{extension}")).exists());
+    if built {
+        return Ok(());
+    }
+    Err(TestBinaryError::FixtureSetup {
+        fixture_type: "QuestDbContainer".to_string(),
+        message: format!(
+            "the QuestDB sink plugin is not built, so the connectors runtime would have \
+             nothing to load. Run `cargo build -p iggy_connector_questdb_sink` first. \
+             Looked for {SINK_PLUGIN_PATH}.{{dylib,so,dll}}"
+        ),
+    })
+}
 
 // ── Container ────────────────────────────────────────────────────────────────
 
