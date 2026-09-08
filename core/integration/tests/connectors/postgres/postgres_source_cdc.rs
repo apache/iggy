@@ -20,7 +20,9 @@ use super::{
     wait_for_source_errors,
 };
 use crate::connectors::create_test_messages;
-use crate::connectors::fixtures::{PostgresOps, PostgresSourceCdcFixture, PostgresSourceOps};
+use crate::connectors::fixtures::{
+    PostgresOps, PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture, PostgresSourceOps,
+};
 use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
@@ -46,8 +48,27 @@ async fn poll_cdc_records(
     consumer_id: &Identifier,
     want: usize,
 ) -> Vec<CdcRecord> {
+    poll_cdc_records_with_attempts(
+        client,
+        stream_id,
+        topic_id,
+        consumer_id,
+        want,
+        POLL_ATTEMPTS,
+    )
+    .await
+}
+
+async fn poll_cdc_records_with_attempts(
+    client: &IggyClient,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    consumer_id: &Identifier,
+    want: usize,
+    attempts: usize,
+) -> Vec<CdcRecord> {
     let mut received = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
+    for _ in 0..attempts {
         if let Ok(polled) = client
             .poll_messages(
                 stream_id,
@@ -353,7 +374,8 @@ async fn given_cdc_change_when_iggy_crashes_should_advance_slot_only_after_redel
         )
         .await;
 
-    wait_for_source_errors(&http, &api_url, errors_before_failure + 2).await;
+    let failed_source = wait_for_source_errors(&http, &api_url, errors_before_failure + 2).await;
+    assert_eq!(failed_source.status, ConnectorStatus::Error);
     assert!(
         slot_contains_change(&pool, &expected.name).await,
         "NACKed CDC change must remain available in the replication slot"
@@ -389,6 +411,106 @@ async fn given_cdc_change_when_iggy_crashes_should_advance_slot_only_after_redel
 
     let mut change_remains = slot_contains_change(&pool, &expected.name).await;
     for _ in 0..POLL_ATTEMPTS {
+        if !change_remains {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        change_remains = slot_contains_change(&pool, &expected.name).await;
+    }
+    assert!(
+        !change_remains,
+        "ACKed CDC change should be consumed from the replication slot"
+    );
+
+    pool.close().await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_delivery_failure_when_iggy_restarts_should_redeliver_cdc_without_runtime_restart(
+    harness: &mut TestHarness,
+    fixture: PostgresSourceCdcSlowPollFixture,
+) {
+    const REDELIVERY_ATTEMPTS: usize = POLL_ATTEMPTS * 3;
+
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .set_iggy_connection_options("reconnection_retries=0");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+    wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
+    let errors_before_failure = source_stats(&http, &api_url)
+        .await
+        .expect("PostgreSQL source stats should be present")
+        .errors;
+
+    harness.kill_node(0).expect("Failed to kill Iggy server");
+
+    let [expected] = create_test_messages(1).try_into().unwrap();
+    fixture
+        .insert_row(
+            &pool,
+            expected.id as i32,
+            &expected.name,
+            expected.count as i32,
+            expected.amount,
+            expected.active,
+            expected.timestamp,
+        )
+        .await;
+
+    let failed_source = wait_for_source_errors(&http, &api_url, errors_before_failure + 1).await;
+    assert_eq!(failed_source.status, ConnectorStatus::Error);
+    assert!(
+        slot_contains_change(&pool, &expected.name).await,
+        "NACKed CDC change must remain available in the replication slot"
+    );
+
+    harness
+        .restart_node(0)
+        .expect("Failed to restart only the Iggy server");
+
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "cdc_nack_survival_consumer".try_into().unwrap();
+    let received = poll_cdc_records_with_attempts(
+        &client,
+        &stream_id,
+        &topic_id,
+        &consumer_id,
+        1,
+        REDELIVERY_ATTEMPTS,
+    )
+    .await;
+
+    assert_eq!(received.len(), 1, "CDC change should be redelivered");
+    assert_eq!(received[0].operation_type, "INSERT");
+    assert_eq!(received[0].data["id"], serde_json::json!(expected.id));
+
+    let mut change_remains = slot_contains_change(&pool, &expected.name).await;
+    for _ in 0..REDELIVERY_ATTEMPTS {
         if !change_remains {
             break;
         }

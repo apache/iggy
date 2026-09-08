@@ -382,6 +382,53 @@ impl TestFixture for PostgresSourceDeleteFixture {
     }
 }
 
+/// The longer poll interval leaves time to restart Iggy before the SDK's
+/// consecutive-NACK limit stops the source.
+pub struct PostgresSourceDeleteSlowPollFixture {
+    inner: PostgresSourceDeleteFixture,
+}
+
+impl PostgresOps for PostgresSourceDeleteSlowPollFixture {
+    fn container(&self) -> &PostgresContainer {
+        self.inner.container()
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceDeleteSlowPollFixture {
+    fn table_name(&self) -> &str {
+        self.inner.table_name()
+    }
+}
+
+impl PostgresSourceDeleteSlowPollFixture {
+    pub async fn create_table(&self, pool: &Pool<Postgres>) {
+        self.inner.create_table(pool).await;
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<Postgres>, name: &str, value: i32) {
+        self.inner.insert_row(pool, name, value).await;
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<Postgres>) -> i64 {
+        self.inner.count_rows(pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceDeleteSlowPollFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: PostgresSourceDeleteFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "5s".to_string());
+        envs
+    }
+}
+
 /// PostgreSQL source fixture with an exact NUMERIC tracking column.
 pub struct PostgresSourceNumericTrackingFixture {
     container: PostgresContainer,

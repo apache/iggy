@@ -58,18 +58,22 @@ async fn source_stats(http: &Client, api_url: &str) -> Option<ConnectorStats> {
         .find(|connector| connector.key == SOURCE_KEY)
 }
 
-async fn wait_for_source_errors(http: &Client, api_url: &str, minimum_errors: u64) {
+async fn wait_for_source_errors(
+    http: &Client,
+    api_url: &str,
+    minimum_errors: u64,
+) -> ConnectorStats {
     timeout(SEND_FAILURE_TIMEOUT, async {
         loop {
             if let Some(source) = source_stats(http, api_url).await
                 && source.status == ConnectorStatus::Error
                 && source.errors >= minimum_errors
             {
-                break;
+                return source;
             }
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
     })
     .await
-    .expect("PostgreSQL source did not retry the NACKed batch");
+    .expect("PostgreSQL source did not retry the NACKed batch")
 }

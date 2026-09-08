@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_connector_sdk::api::ConnectorStatus;
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
@@ -31,8 +32,8 @@ use super::{
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     PostgresOps, PostgresSourceByteaFixture, PostgresSourceDeleteFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceNumericTrackingFixture, PostgresSourceOps,
+    PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture, PostgresSourceJsonbFixture,
+    PostgresSourceMarkFixture, PostgresSourceNumericTrackingFixture, PostgresSourceOps,
 };
 
 #[iggy_harness(
@@ -179,7 +180,8 @@ async fn given_delete_after_read_when_iggy_crashes_should_delete_only_after_rede
             .await;
     }
 
-    wait_for_source_errors(&http, &api_url, errors_before_failure + 2).await;
+    let failed_source = wait_for_source_errors(&http, &api_url, errors_before_failure + 2).await;
+    assert_eq!(failed_source.status, ConnectorStatus::Error);
     assert_eq!(
         fixture.count_rows(&pool).await,
         TEST_MESSAGE_COUNT as i64,
@@ -245,6 +247,102 @@ async fn given_delete_after_read_when_iggy_crashes_should_delete_only_after_rede
         remaining_rows = fixture.count_rows(&pool).await;
     }
     assert_eq!(remaining_rows, 0, "ACKed rows should be deleted");
+
+    pool.close().await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_delivery_failure_when_iggy_restarts_should_redeliver_without_runtime_restart(
+    harness: &mut TestHarness,
+    fixture: PostgresSourceDeleteSlowPollFixture,
+) {
+    const REDELIVERY_ATTEMPTS: usize = POLL_ATTEMPTS * 3;
+
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .set_iggy_connection_options("reconnection_retries=0");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+    let errors_before_failure = source_stats(&http, &api_url)
+        .await
+        .expect("PostgreSQL source stats should be present")
+        .errors;
+
+    harness.kill_node(0).expect("Failed to kill Iggy server");
+    fixture.insert_row(&pool, "single_nack", 1).await;
+
+    let failed_source = wait_for_source_errors(&http, &api_url, errors_before_failure + 1).await;
+    assert_eq!(failed_source.status, ConnectorStatus::Error);
+    assert_eq!(
+        fixture.count_rows(&pool).await,
+        1,
+        "NACKed row must not be deleted"
+    );
+
+    harness
+        .restart_node(0)
+        .expect("Failed to restart only the Iggy server");
+
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "nack_survival_consumer".try_into().unwrap();
+    let mut received = 0;
+
+    for _ in 0..REDELIVERY_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+            if received == 1 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert_eq!(received, 1, "NACKed row should be redelivered");
+
+    let mut remaining_rows = fixture.count_rows(&pool).await;
+    for _ in 0..REDELIVERY_ATTEMPTS {
+        if remaining_rows == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        remaining_rows = fixture.count_rows(&pool).await;
+    }
+    assert_eq!(remaining_rows, 0, "ACKed row should be deleted");
 
     pool.close().await;
 }

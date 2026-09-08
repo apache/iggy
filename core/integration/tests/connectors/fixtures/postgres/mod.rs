@@ -20,10 +20,11 @@ mod container;
 mod sink;
 mod source;
 
-pub use cdc::PostgresSourceCdcFixture;
+pub use cdc::{PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture};
 pub use container::{PostgresOps, PostgresSourceOps};
 pub use sink::{PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture};
 pub use source::{
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceNumericTrackingFixture,
+    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceDeleteSlowPollFixture,
+    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
+    PostgresSourceNumericTrackingFixture,
 };
