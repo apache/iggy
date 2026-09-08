@@ -20,6 +20,11 @@
 // Stubs for iggy-php
 
 namespace Iggy {
+    enum Durability: string {
+        case Replicated = 'replicated';
+        case Persisted = 'persisted';
+    }
+
     class AutoCommit {
         public function __construct() {}
 
@@ -126,7 +131,7 @@ namespace Iggy {
         /**
          * Creates a topic.
          *
-         * Every option left null resolves against the server default at admission.
+         * Both durability options default independently to replicated. Other null options use server defaults.
          *
          * @param mixed $stream
          * @param string $name
@@ -135,13 +140,14 @@ namespace Iggy {
          * @param int|null $message_expiry_micros
          * @param int|null $max_topic_size
          * @param int|null $segment_size
-         * @param bool|null $enforce_fsync
+         * @param Durability|null $durability
+         * @param Durability|null $consumer_offset_durability
          * @param int|null $messages_required_to_save
          * @param int|null $size_of_messages_required_to_save
          * @param bool|null $preallocate_segments
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?bool $enforce_fsync = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?Durability $durability = null, ?Durability $consumer_offset_durability = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
 
         /**
          * Deletes a stream by id or name.
@@ -515,9 +521,8 @@ namespace Iggy {
          * Delivery is at-least-once, so an earlier retry may already have committed the
          * same batch at a lower offset. The value never implies uniqueness.
          *
-         * A batch is confirmed once it is committed in memory, not once it is fsynced. A
-         * crash-restart can stamp a later batch with an offset a client has already
-         * recorded.
+         * Confirmation follows VSR quorum commit. Persisted message durability also
+         * requires recoverable stable-storage copies on the quorum.
          *
          * @var int
          */

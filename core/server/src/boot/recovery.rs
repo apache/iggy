@@ -107,8 +107,8 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // At-rest encryption: built once per shard from the shared config; the
     // ingestion path encrypts on the primary and the poll reply decrypts.
     // A bad key fails the boot rather than silently serving plaintext.
-    let encryptor = if config.system.encryption.enabled {
-        let aes = Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key)
+    let encryptor = if config.encryption.enabled {
+        let aes = Aes256GcmEncryptor::from_base64_key(&config.encryption.key)
             .map_err(|error| ServerError::Iggy(Box::new(error)))?;
         Some(Arc::new(EncryptorKind::Aes256Gcm(aes)))
     } else {
@@ -121,16 +121,15 @@ pub(in crate::boot) async fn build_shard_for_thread(
             size_of_messages_required_to_save: IggyByteSize::from(
                 iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
             ),
-            enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
-            consumer_offset_enforce_fsync: config.partition.consumer_offset_enforce_fsync,
-            validate_checksum: config.system.partition.validate_checksum,
+
+            validate_checksum: config.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             encryptor,
             path_layout: partitions::PartitionPathLayout {
-                streams_root: config.system.get_streams_path(),
-                topics_dir: config.system.topic.path.clone(),
-                partitions_dir: config.system.partition.path.clone(),
+                streams_root: config.get_streams_path(),
+                topics_dir: config.topic.path.clone(),
+                partitions_dir: config.partition.path.clone(),
             },
         },
         owned_partitions_capacity,
@@ -242,7 +241,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     } = wire_shell_handlers(
         &bus,
         &shard_handle,
-        Arc::clone(&config.system),
+        Arc::new(config.clone()),
         config.personal_access_token.max_tokens_per_user,
     );
     sessions
@@ -1000,6 +999,24 @@ mod tests {
             config_default as u64,
             shard::REPAIR_CHUNK_MAX,
             "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn wal_capacity_defaults_and_bounds_match_journal() {
+        assert_eq!(
+            configs::partition::PartitionConfig::default()
+                .wal_bytes_max
+                .as_bytes_u64(),
+            journal::partition_journal::PARTITION_WAL_BYTES_MAX
+        );
+        assert_eq!(
+            configs::partition::MIN_PARTITION_WAL_BYTES_MAX,
+            journal::partition_journal::PARTITION_WAL_CAPACITY_MIN
+        );
+        assert_eq!(
+            configs::partition::MAX_PARTITION_WAL_BYTES_MAX,
+            journal::partition_journal::PARTITION_WAL_CAPACITY_MAX
         );
     }
 

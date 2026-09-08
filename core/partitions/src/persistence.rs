@@ -1,0 +1,774 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use iggy_binary_protocol::PrepareHeader;
+use journal::PartitionPrepareJournal;
+use journal::durable_storage::{DiskStorage, DurableStorage};
+use journal::partition_journal::PARTITION_WAL_BYTES_MAX;
+use server_common::iobuf::Frozen;
+use smallvec::SmallVec;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, VecDeque};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const APPEND_BATCH_BYTES_MAX: u64 = 1024 * 1024;
+const APPEND_BATCH_OPS_MAX: usize = 64;
+
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug)]
+pub struct PersistenceCompletion {
+    pub group: u64,
+    pub instance: u64,
+    pub epoch: u64,
+}
+
+#[derive(Default)]
+pub struct PersistenceMetrics {
+    pub disk_bytes: u64,
+    pub queued_bytes: u64,
+    pub in_flight_bytes: u64,
+    pub checkpoints_pending: u64,
+    pub completed_batches: u64,
+    pub batched_prepares: u64,
+    pub completed_checkpoints: u64,
+    pub failed_writes: u64,
+}
+
+pub type PersistenceNotifier = Rc<dyn Fn(PersistenceCompletion)>;
+
+pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
+    group: u64,
+    instance: u64,
+    epoch: Cell<u64>,
+    journal: RefCell<Option<PartitionPrepareJournal<S>>>,
+    queue: RefCell<VecDeque<Mutation>>,
+    accepted: RefCell<AcceptedPrepares>,
+    accepted_head: Cell<u64>,
+    durable_head: Cell<u64>,
+    checkpoint: Cell<u64>,
+    checkpoint_checksum: Cell<Option<u128>>,
+    checkpoint_requested: Cell<u64>,
+    checkpoint_running: Cell<bool>,
+    dirty_segments: RefCell<BTreeSet<u64>>,
+    dirty_offsets: [RefCell<BTreeSet<u32>>; 2],
+    purge_generation: Cell<u64>,
+    purge_floor: Cell<u64>,
+    capacity: u64,
+    disk_bytes: Cell<u64>,
+    queued_bytes: Cell<u64>,
+    in_flight_bytes: Cell<u64>,
+    waiters: RefCell<Vec<std::task::Waker>>,
+    running: Cell<bool>,
+    retired: Cell<bool>,
+    failure: RefCell<Option<Arc<io::Error>>>,
+    notifier: RefCell<Option<PersistenceNotifier>>,
+    completed_batches: Cell<u64>,
+    batched_prepares: Cell<u64>,
+    completed_checkpoints: Cell<u64>,
+    failed_writes: Cell<u64>,
+}
+
+struct AcceptedPrepares {
+    base: u64,
+    checksums: VecDeque<u128>,
+}
+
+impl AcceptedPrepares {
+    fn checksum(&self, op: u64) -> Option<u128> {
+        let index = usize::try_from(op.checked_sub(self.base)?.checked_sub(1)?).ok()?;
+        self.checksums.get(index).copied()
+    }
+
+    fn truncate_from(&mut self, op: u64) {
+        let keep =
+            usize::try_from(op.saturating_sub(self.base).saturating_sub(1)).unwrap_or(usize::MAX);
+        self.checksums.truncate(keep);
+    }
+
+    fn checkpoint(&mut self, op: u64) {
+        let count = usize::try_from(op.saturating_sub(self.base))
+            .unwrap_or(usize::MAX)
+            .min(self.checksums.len());
+        self.checksums.drain(..count);
+        self.base = op;
+    }
+}
+
+enum Mutation {
+    Purge {
+        epoch: u64,
+        generation: u64,
+        floor: u64,
+    },
+    Append {
+        epoch: u64,
+        prepare: Frozen<4096>,
+        durable: bool,
+        bytes: u64,
+    },
+    Truncate {
+        epoch: u64,
+        from_op: u64,
+    },
+    Checkpoint {
+        epoch: u64,
+        through_op: u64,
+        files: Vec<PathBuf>,
+        directories: Vec<PathBuf>,
+    },
+    Reset {
+        epoch: u64,
+        op: u64,
+        checksum: Option<u128>,
+    },
+}
+
+impl PartitionPersistence {
+    /// # Errors
+    /// Returns an error if the partition WAL cannot be recovered.
+    pub async fn open(
+        directory: &Path,
+        group: u64,
+        incarnation: u64,
+    ) -> io::Result<(Rc<Self>, Vec<Frozen<4096>>)> {
+        Self::open_with_storage(directory, group, incarnation, DiskStorage).await
+    }
+}
+
+impl<S: DurableStorage> PartitionPersistence<S> {
+    /// # Errors
+    /// Returns an error if persistence fails, capacity is exhausted, or history is invalid.
+    pub async fn open_with_storage(
+        directory: &Path,
+        group: u64,
+        incarnation: u64,
+        storage: S,
+    ) -> io::Result<(Rc<Self>, Vec<Frozen<4096>>)> {
+        Self::open_with_capacity(
+            directory,
+            group,
+            incarnation,
+            storage,
+            PARTITION_WAL_BYTES_MAX,
+        )
+        .await
+    }
+
+    /// # Errors
+    /// Returns an error for invalid capacity or unverifiable durable history.
+    pub async fn open_with_capacity(
+        directory: &Path,
+        group: u64,
+        incarnation: u64,
+        storage: S,
+        capacity: u64,
+    ) -> io::Result<(Rc<Self>, Vec<Frozen<4096>>)> {
+        let journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            directory,
+            group,
+            incarnation,
+            storage,
+            capacity,
+        )
+        .await?;
+        let prepares = journal.prepares().await?;
+        let mut accepted = AcceptedPrepares {
+            base: journal.checkpoint_op(),
+            checksums: VecDeque::with_capacity(prepares.len()),
+        };
+        for prepare in &prepares {
+            let header = prepare_header(prepare)?;
+            accepted.checksums.push_back(header.checksum);
+        }
+        let persistence = Rc::new(Self {
+            group,
+            instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            epoch: Cell::new(0),
+            accepted_head: Cell::new(journal.head()),
+            durable_head: Cell::new(journal.head()),
+            checkpoint: Cell::new(journal.checkpoint_op()),
+            checkpoint_checksum: Cell::new(journal.checkpoint_checksum()),
+            checkpoint_requested: Cell::new(journal.checkpoint_op()),
+            checkpoint_running: Cell::new(false),
+            dirty_segments: RefCell::new(BTreeSet::new()),
+            dirty_offsets: std::array::from_fn(|_| RefCell::new(BTreeSet::new())),
+            purge_generation: Cell::new(journal.purge_marker().0),
+            purge_floor: Cell::new(journal.purge_marker().1),
+            capacity,
+            disk_bytes: Cell::new(journal.size_bytes()),
+            journal: RefCell::new(Some(journal)),
+            queue: RefCell::new(VecDeque::new()),
+            accepted: RefCell::new(accepted),
+            queued_bytes: Cell::new(0),
+            in_flight_bytes: Cell::new(0),
+            waiters: RefCell::new(Vec::new()),
+            running: Cell::new(false),
+            retired: Cell::new(false),
+            failure: RefCell::new(None),
+            notifier: RefCell::new(None),
+            completed_batches: Cell::new(0),
+            batched_prepares: Cell::new(0),
+            completed_checkpoints: Cell::new(0),
+            failed_writes: Cell::new(0),
+        });
+        Ok((persistence, prepares))
+    }
+
+    pub fn set_notifier(&self, notifier: PersistenceNotifier) {
+        *self.notifier.borrow_mut() = Some(notifier);
+    }
+
+    pub const fn accepts_completion(&self, completion: PersistenceCompletion) -> bool {
+        completion.instance == self.instance
+            && completion.epoch == self.epoch.get()
+            && !self.retired.get()
+    }
+
+    pub fn is_durable(&self, header: &PrepareHeader) -> bool {
+        !self.retired.get()
+            && self.failure.borrow().is_none()
+            && header.op <= self.durable_head.get()
+            && self.accepted.borrow().checksum(header.op) == Some(header.checksum)
+    }
+
+    pub fn is_durable_through(&self, op: u64) -> bool {
+        !self.retired.get() && self.failure.borrow().is_none() && op <= self.durable_head.get()
+    }
+
+    pub fn has_capacity(&self, frame_bytes: usize) -> bool {
+        let Ok(bytes) = journal::partition_journal::record_length(frame_bytes) else {
+            return false;
+        };
+        let bytes = bytes as u64;
+        !self.retired.get()
+            && self.failure.borrow().is_none()
+            && self
+                .disk_bytes
+                .get()
+                .saturating_add(self.queued_bytes.get())
+                .saturating_add(self.in_flight_bytes.get())
+                .saturating_add(bytes)
+                <= self.capacity
+    }
+
+    /// # Errors
+    /// Returns an error if persistence fails, capacity is exhausted, or history is invalid.
+    pub fn append(&self, prepare: Frozen<4096>, durable: bool) -> io::Result<()> {
+        let header = prepare_header(&prepare)?;
+        if self.accepted.borrow().checksum(header.op) == Some(header.checksum) {
+            return Ok(());
+        }
+        if !self.has_capacity(prepare.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "partition WAL capacity exhausted",
+            ));
+        }
+        if header.op != self.accepted_head.get().saturating_add(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition WAL submission is out of order",
+            ));
+        }
+        let bytes = journal::partition_journal::record_length(prepare.len())? as u64;
+        self.queued_bytes.set(self.queued_bytes.get() + bytes);
+        self.accepted
+            .borrow_mut()
+            .checksums
+            .push_back(header.checksum);
+        self.accepted_head.set(header.op);
+        self.queue.borrow_mut().push_back(Mutation::Append {
+            epoch: self.epoch.get(),
+            prepare,
+            durable,
+            bytes,
+        });
+        Ok(())
+    }
+
+    pub fn mark_segment_dirty(&self, start_offset: u64) {
+        self.dirty_segments.borrow_mut().insert(start_offset);
+    }
+
+    pub fn mark_offset_dirty(&self, kind_index: usize, consumer_id: u32, exists: bool) {
+        let mut offsets = self.dirty_offsets[kind_index].borrow_mut();
+        if exists {
+            offsets.insert(consumer_id);
+        } else {
+            offsets.remove(&consumer_id);
+        }
+    }
+
+    pub fn take_dirty_files(&self) -> (BTreeSet<u64>, [BTreeSet<u32>; 2]) {
+        (
+            std::mem::take(&mut *self.dirty_segments.borrow_mut()),
+            std::array::from_fn(|index| {
+                std::mem::take(&mut *self.dirty_offsets[index].borrow_mut())
+            }),
+        )
+    }
+
+    pub fn checkpoint(&self, through_op: u64) {
+        self.checkpoint_files(through_op, Vec::new(), Vec::new());
+    }
+
+    pub fn checkpoint_files(
+        &self,
+        through_op: u64,
+        files: Vec<PathBuf>,
+        directories: Vec<PathBuf>,
+    ) {
+        if through_op <= self.checkpoint_requested.get() {
+            return;
+        }
+        self.checkpoint_requested.set(through_op);
+        self.queue.borrow_mut().push_back(Mutation::Checkpoint {
+            epoch: self.epoch.get(),
+            through_op,
+            files,
+            directories,
+        });
+    }
+
+    pub const fn checkpoint_pending(&self) -> bool {
+        self.checkpoint_running.get() || self.checkpoint_requested.get() > self.checkpoint.get()
+    }
+
+    pub fn truncate_from(&self, from_op: u64) {
+        if from_op > self.accepted_head.get() {
+            return;
+        }
+        self.checkpoint_requested.set(self.checkpoint.get());
+        let epoch = self.epoch.get().wrapping_add(1);
+        self.epoch.set(epoch);
+        // Retained submissions still precede the replacement history.
+        self.queue
+            .borrow_mut()
+            .retain_mut(|mutation| match mutation {
+                Mutation::Append {
+                    epoch: previous,
+                    prepare,
+                    bytes,
+                    ..
+                } => {
+                    if prepare_header(prepare).is_ok_and(|header| header.op < from_op) {
+                        *previous = epoch;
+                        true
+                    } else {
+                        self.queued_bytes
+                            .set(self.queued_bytes.get().saturating_sub(*bytes));
+                        false
+                    }
+                }
+                Mutation::Checkpoint {
+                    epoch: previous,
+                    through_op,
+                    ..
+                } if *through_op < from_op => {
+                    *previous = epoch;
+                    self.checkpoint_requested
+                        .set(self.checkpoint_requested.get().max(*through_op));
+                    true
+                }
+                _ => false,
+            });
+        self.accepted.borrow_mut().truncate_from(from_op);
+        self.accepted_head.set(from_op.saturating_sub(1));
+        self.durable_head
+            .set(self.durable_head.get().min(from_op.saturating_sub(1)));
+        self.queue
+            .borrow_mut()
+            .push_back(Mutation::Truncate { epoch, from_op });
+    }
+
+    pub fn reset(&self, op: u64, checksum: Option<u128>) {
+        self.checkpoint_requested.set(op);
+        let epoch = self.epoch.get().wrapping_add(1);
+        self.epoch.set(epoch);
+        self.queue.borrow_mut().clear();
+        self.queued_bytes.set(0);
+        *self.accepted.borrow_mut() = AcceptedPrepares {
+            base: op,
+            checksums: VecDeque::new(),
+        };
+        self.accepted_head.set(op);
+        self.durable_head.set(0);
+        self.queue.borrow_mut().push_back(Mutation::Reset {
+            epoch,
+            op,
+            checksum,
+        });
+    }
+
+    pub fn mark_purge(&self, generation: u64, floor: u64) {
+        self.queue.borrow_mut().push_back(Mutation::Purge {
+            epoch: self.epoch.get(),
+            generation,
+            floor,
+        });
+    }
+
+    pub const fn purge_marker(&self) -> (u64, u64) {
+        (self.purge_generation.get(), self.purge_floor.get())
+    }
+
+    pub const fn needs_checkpoint(&self) -> bool {
+        !self.checkpoint_pending()
+            && self.disk_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
+                >= self.capacity / 2
+    }
+
+    pub fn take_metrics(&self) -> PersistenceMetrics {
+        PersistenceMetrics {
+            disk_bytes: self.disk_bytes.get(),
+            queued_bytes: self.queued_bytes.get(),
+            in_flight_bytes: self.in_flight_bytes.get(),
+            checkpoints_pending: u64::from(self.checkpoint_pending()),
+            completed_batches: self.completed_batches.replace(0),
+            batched_prepares: self.batched_prepares.replace(0),
+            completed_checkpoints: self.completed_checkpoints.replace(0),
+            failed_writes: self.failed_writes.replace(0),
+        }
+    }
+
+    pub fn failure(&self) -> Option<Arc<io::Error>> {
+        self.failure.borrow().clone()
+    }
+
+    pub const fn checkpoint_op(&self) -> u64 {
+        self.checkpoint.get()
+    }
+
+    pub fn checksum(&self, op: u64) -> Option<u128> {
+        if op == self.checkpoint.get() {
+            self.checkpoint_checksum.get()
+        } else {
+            self.accepted.borrow().checksum(op)
+        }
+    }
+
+    pub const fn head(&self) -> u64 {
+        self.accepted_head.get()
+    }
+
+    pub fn retire(&self) {
+        self.retired.set(true);
+        self.queue.borrow_mut().clear();
+    }
+
+    /// # Errors
+    /// Returns an error if persistence fails, capacity is exhausted, or history is invalid.
+    pub async fn drain(&self) -> io::Result<()> {
+        futures::future::poll_fn(|context| {
+            if let Some(error) = self.failure() {
+                return std::task::Poll::Ready(Err(io::Error::new(error.kind(), error)));
+            }
+            if !self.running.get() && self.queue.borrow().is_empty() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let mut waiters = self.waiters.borrow_mut();
+            if !waiters
+                .iter()
+                .any(|waiter| waiter.will_wake(context.waker()))
+            {
+                waiters.push(context.waker().clone());
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    pub fn start(&self) -> bool {
+        !self.retired.get()
+            && self.failure.borrow().is_none()
+            && !self.queue.borrow().is_empty()
+            && !self.running.replace(true)
+    }
+
+    pub async fn run(self: Rc<Self>) {
+        let Some(mut journal) = self.journal.borrow_mut().take() else {
+            self.running.set(false);
+            return;
+        };
+        loop {
+            if self.retired.get() {
+                break;
+            }
+            let Some(mutation) = self.queue.borrow_mut().pop_front() else {
+                break;
+            };
+            let (epoch, bytes) = match &mutation {
+                Mutation::Append { epoch, bytes, .. } => (*epoch, *bytes),
+                Mutation::Purge { epoch, .. }
+                | Mutation::Truncate { epoch, .. }
+                | Mutation::Checkpoint { epoch, .. }
+                | Mutation::Reset { epoch, .. } => (*epoch, 0),
+            };
+            self.queued_bytes
+                .set(self.queued_bytes.get().saturating_sub(bytes));
+            self.in_flight_bytes.set(bytes);
+            let result = match mutation {
+                Mutation::Purge {
+                    generation, floor, ..
+                } => journal.mark_purge(generation, floor).await,
+                Mutation::Append {
+                    prepare, durable, ..
+                } => {
+                    self.append_batch(&mut journal, prepare, durable, epoch, bytes)
+                        .await
+                }
+                Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
+                Mutation::Checkpoint {
+                    through_op,
+                    files,
+                    directories,
+                    ..
+                } => {
+                    self.checkpoint_running.set(true);
+                    let result = journal
+                        .checkpoint_files(through_op, &files, &directories)
+                        .await;
+                    self.checkpoint_running.set(false);
+                    if result.is_ok() {
+                        self.completed_checkpoints
+                            .set(self.completed_checkpoints.get() + 1);
+                    }
+                    result
+                }
+                Mutation::Reset { op, checksum, .. } => journal.reset(op, checksum).await,
+            };
+            self.in_flight_bytes.set(0);
+            if let Err(error) = result {
+                self.failed_writes.set(self.failed_writes.get() + 1);
+                *self.failure.borrow_mut() = Some(Arc::new(error));
+                self.notify();
+                break;
+            }
+            if epoch == self.epoch.get() && !self.retired.get() {
+                self.disk_bytes.set(journal.size_bytes());
+                let advanced = journal.durable_op() != self.durable_head.get()
+                    || journal.checkpoint_op() != self.checkpoint.get();
+                self.durable_head.set(journal.durable_op());
+                if journal.checkpoint_op() > self.checkpoint.get() {
+                    self.accepted
+                        .borrow_mut()
+                        .checkpoint(journal.checkpoint_op());
+                }
+                self.checkpoint.set(journal.checkpoint_op());
+                self.checkpoint_checksum.set(journal.checkpoint_checksum());
+                self.purge_generation.set(journal.purge_marker().0);
+                self.purge_floor.set(journal.purge_marker().1);
+                if advanced {
+                    self.notify();
+                }
+            }
+        }
+        *self.journal.borrow_mut() = Some(journal);
+        self.running.set(false);
+        for waiter in self.waiters.borrow_mut().drain(..) {
+            waiter.wake();
+        }
+    }
+
+    async fn append_batch(
+        &self,
+        journal: &mut PartitionPrepareJournal<S>,
+        first: Frozen<4096>,
+        mut durable: bool,
+        epoch: u64,
+        first_bytes: u64,
+    ) -> io::Result<()> {
+        let mut batch = SmallVec::<[Frozen<4096>; 8]>::new();
+        batch.push(first);
+        let mut bytes = first_bytes;
+        {
+            let mut queue = self.queue.borrow_mut();
+            while batch.len() < APPEND_BATCH_OPS_MAX {
+                let Some(Mutation::Append {
+                    epoch: next_epoch,
+                    bytes: next_bytes,
+                    ..
+                }) = queue.front()
+                else {
+                    break;
+                };
+                if *next_epoch != epoch
+                    || bytes.saturating_add(*next_bytes) > APPEND_BATCH_BYTES_MAX
+                {
+                    break;
+                }
+                let Some(Mutation::Append {
+                    prepare,
+                    durable: requires_sync,
+                    bytes: record_bytes,
+                    ..
+                }) = queue.pop_front()
+                else {
+                    unreachable!("append prefix was checked");
+                };
+                bytes += record_bytes;
+                self.queued_bytes
+                    .set(self.queued_bytes.get().saturating_sub(record_bytes));
+                durable |= requires_sync;
+                batch.push(prepare);
+            }
+        }
+        self.in_flight_bytes.set(bytes);
+        let count = batch.len() as u64;
+        for prepare in batch {
+            journal.append_buffered(prepare).await?;
+        }
+        if durable {
+            journal.sync().await?;
+            self.completed_batches.set(self.completed_batches.get() + 1);
+            self.batched_prepares
+                .set(self.batched_prepares.get() + count);
+        }
+        Ok(())
+    }
+
+    fn notify(&self) {
+        if let Some(notifier) = self.notifier.borrow().as_ref() {
+            notifier(PersistenceCompletion {
+                group: self.group,
+                instance: self.instance,
+                epoch: self.epoch.get(),
+            });
+        }
+    }
+}
+
+fn prepare_header(prepare: &Frozen<4096>) -> io::Result<&PrepareHeader> {
+    let bytes = prepare
+        .as_slice()
+        .get(..size_of::<PrepareHeader>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short prepare"))?;
+    bytemuck::checked::try_from_bytes(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid prepare"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::{Command, Operation};
+    use server_common::{Message, iobuf::Owned};
+    use tempfile::tempdir;
+
+    #[compio::test]
+    async fn completion_is_generation_scoped_and_buffered_work_does_not_ack_durability() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) = PartitionPersistence::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let notifications = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&notifications);
+        persistence.set_notifier(Rc::new(move |completion| {
+            captured.borrow_mut().push(completion);
+        }));
+        let first = prepare(1, 0);
+        persistence
+            .append(first.clone().into_frozen(), false)
+            .unwrap();
+        assert!(!persistence.is_durable(first.header()));
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(notifications.borrow().is_empty());
+        let next = prepare(2, first.header().checksum);
+        persistence
+            .append(next.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_durable(first.header()));
+        assert!(persistence.is_durable(next.header()));
+        let completion = notifications.borrow()[0];
+        assert!(persistence.accepts_completion(completion));
+        persistence.truncate_from(2);
+        assert!(!persistence.accepts_completion(completion));
+        assert!(!persistence.is_durable(next.header()));
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.drain().await.unwrap();
+        assert!(persistence.is_durable(first.header()));
+    }
+
+    #[compio::test]
+    async fn truncating_beyond_the_head_does_not_create_an_operation_gap() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) = PartitionPersistence::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        persistence.truncate_from(8);
+        assert_eq!(persistence.head(), 0);
+        let first = prepare(1, 0);
+        persistence.append(first.into_frozen(), true).unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert_eq!(persistence.head(), 1);
+        assert!(persistence.failure().is_none());
+    }
+
+    #[compio::test]
+    async fn checkpoint_tracks_only_dirty_files_and_preserves_committed_barriers_on_truncation() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) = PartitionPersistence::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        persistence.mark_segment_dirty(0);
+        persistence.mark_segment_dirty(0);
+        persistence.mark_offset_dirty(0, 7, true);
+        persistence.mark_offset_dirty(0, 7, false);
+        persistence.mark_offset_dirty(1, 9, true);
+        let (segments, offsets) = persistence.take_dirty_files();
+        assert_eq!(segments.into_iter().collect::<Vec<_>>(), vec![0]);
+        assert!(offsets[0].is_empty());
+        assert!(offsets[1].contains(&9));
+        let (segments, offsets) = persistence.take_dirty_files();
+        assert!(segments.is_empty());
+        assert!(offsets.iter().all(BTreeSet::is_empty));
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), true).unwrap();
+        persistence.append(second.into_frozen(), true).unwrap();
+        persistence.checkpoint(1);
+        persistence.truncate_from(2);
+        assert!(persistence.checkpoint_pending());
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.failure().is_none());
+        assert_eq!(persistence.checkpoint_op(), 1);
+        assert!(!persistence.checkpoint_pending());
+    }
+
+    fn prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
+        let mut owned = Owned::<4096>::zeroed(size_of::<PrepareHeader>());
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(owned.as_mut_slice());
+        header.command = Command::Prepare;
+        header.operation = Operation::StoreConsumerOffset;
+        header.group = 42;
+        header.op = op;
+        header.parent = parent;
+        header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+        header.checksum = header.identity_checksum();
+        Message::try_from(owned).unwrap()
+    }
+}

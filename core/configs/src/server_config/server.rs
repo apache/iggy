@@ -22,11 +22,15 @@ use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
 use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
+use super::sharding::ShardingConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
-use crate::common::system::SystemConfig;
+use crate::common::system::{
+    EncryptionConfig, INDEX_EXTENSION, LOG_EXTENSION, LoggingConfig, RuntimeConfig, StreamConfig,
+    TopicConfig,
+};
 use configs::{
     ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
     TypedEnvProvider,
@@ -37,8 +41,8 @@ use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
+use server_common::bootstrap::SystemPaths;
 use std::env;
-use std::sync::Arc;
 
 pub use crate::common::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
@@ -56,37 +60,14 @@ const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 /// enough. The partition knobs matter most: they are create-only options now,
 /// so a topic that boots without one can never be given it afterwards.
 const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
+    // Reject the removed table and every former environment mapping beneath it.
     RelocatedKey {
-        path: "system.topic.max_size",
-        replacement: Some("max_topic_size"),
-    },
-    RelocatedKey {
-        path: "system.topic.message_expiry",
-        replacement: Some("message_expiry"),
-    },
-    RelocatedKey {
-        path: "system.partition.enforce_fsync",
-        replacement: Some("enforce_fsync"),
-    },
-    RelocatedKey {
-        path: "system.partition.messages_required_to_save",
-        replacement: Some("messages_required_to_save"),
-    },
-    RelocatedKey {
-        path: "system.partition.size_of_messages_required_to_save",
-        replacement: Some("size_of_messages_required_to_save"),
-    },
-    RelocatedKey {
-        path: "system.segment.size",
-        replacement: Some("segment_size"),
-    },
-    RelocatedKey {
-        path: "system.segment.preallocate",
-        replacement: Some("preallocate_segments"),
-    },
-    RelocatedKey {
-        path: "system.message_deduplication",
+        path: "system",
         replacement: None,
+    },
+    RelocatedKey {
+        path: "partition.consumer_offset_enforce_fsync",
+        replacement: Some("consumer_offset_durability"),
     },
     // The whole table, not just its leaves. Caps are compile-time constants
     // enforced at admission, so a per-node value could only diverge from them.
@@ -96,11 +77,6 @@ const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
     },
 ];
 
-/// [`SystemConfig`] bound to this crate's own
-/// [`super::sharding::ShardingConfig`]. `core/server` names this alias
-/// wherever it refers to the system config.
-pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
-
 /// Top-level on-disk config schema for the `iggy-server` binary.
 ///
 /// Composes the shared section types from `crate::common` with the
@@ -108,6 +84,7 @@ pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
 /// by `super`.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[config_env(prefix = "IGGY_", name = "iggy-server-config")]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
@@ -116,7 +93,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
-    pub system: Arc<ServerSystemConfig>,
+    pub path: String,
+    pub runtime: RuntimeConfig,
+    pub logging: LoggingConfig,
+    pub encryption: EncryptionConfig,
+    pub memory_pool: MemoryPoolConfig,
+    pub sharding: ShardingConfig,
+    pub stream: StreamConfig,
+    pub topic: TopicConfig,
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
@@ -255,6 +239,162 @@ impl Provider for ServerConfigEnvProvider {
                 "Cannot deserialize environment variables for server config: {e}"
             ))
         })
+    }
+}
+
+impl ServerConfig {
+    pub fn get_system_path(&self) -> String {
+        self.path.to_string()
+    }
+
+    pub fn get_state_path(&self) -> String {
+        format!("{}/state", self.get_system_path())
+    }
+
+    pub fn get_state_messages_file_path(&self) -> String {
+        format!("{}/log", self.get_state_path())
+    }
+
+    pub fn get_state_info_path(&self) -> String {
+        format!("{}/info", self.get_state_path())
+    }
+    pub fn get_state_tokens_path(&self) -> String {
+        format!("{}/tokens", self.get_state_path())
+    }
+
+    pub fn get_runtime_path(&self) -> String {
+        format!("{}/{}", self.get_system_path(), self.runtime.path)
+    }
+
+    pub fn get_streams_path(&self) -> String {
+        format!("{}/{}", self.get_system_path(), self.stream.path)
+    }
+
+    pub fn get_stream_path(&self, stream_id: usize) -> String {
+        format!("{}/{}", self.get_streams_path(), stream_id)
+    }
+
+    pub fn get_topics_path(&self, stream_id: usize) -> String {
+        format!("{}/{}", self.get_stream_path(stream_id), self.topic.path)
+    }
+
+    pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {
+        format!("{}/{}", self.get_topics_path(stream_id), topic_id)
+    }
+
+    pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
+        format!(
+            "{}/{}",
+            self.get_topic_path(stream_id, topic_id),
+            self.partition.path
+        )
+    }
+
+    pub fn get_partition_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{}",
+            self.get_partitions_path(stream_id, topic_id),
+            partition_id
+        )
+    }
+
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/offsets",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    pub fn get_consumer_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/consumers",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    pub fn get_consumer_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/groups",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    pub fn get_segment_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        format!(
+            "{}/{:0>20}",
+            self.get_partition_path(stream_id, topic_id, partition_id),
+            start_offset
+        )
+    }
+
+    pub fn get_messages_file_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{LOG_EXTENSION}")
+    }
+
+    pub fn get_index_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{INDEX_EXTENSION}")
+    }
+}
+
+impl SystemPaths for ServerConfig {
+    fn get_system_path(&self) -> String {
+        ServerConfig::get_system_path(self)
+    }
+
+    fn get_state_path(&self) -> String {
+        ServerConfig::get_state_path(self)
+    }
+
+    fn get_state_messages_file_path(&self) -> String {
+        ServerConfig::get_state_messages_file_path(self)
+    }
+
+    fn get_streams_path(&self) -> String {
+        ServerConfig::get_streams_path(self)
+    }
+
+    fn get_runtime_path(&self) -> String {
+        ServerConfig::get_runtime_path(self)
     }
 }
 

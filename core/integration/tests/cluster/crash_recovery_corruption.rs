@@ -92,7 +92,7 @@ async fn create_stream_and_topic(client: &IggyClient) {
         partitions_count: Some(1),
         message_expiry: Some(IggyExpiry::NeverExpire),
         messages_required_to_save: Some(1),
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         ..TopicCreateOptions::default()
     };
     client
@@ -570,7 +570,7 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
 /// A crash can leave a node's segment `.log` shorter than its already durable
 /// `.index` claims: the two files are persisted concurrently, so death between
 /// them strands the entry of the chunk that was in flight even under
-/// `enforce_fsync`. That one entry is the whole window: every earlier entry
+/// `durability=persisted`. That one entry is the whole window: every earlier entry
 /// belongs to a completed serialized flush whose log fdatasync finished before
 /// the later flush began, so it is the shape the surgery reproduces. The index is a rebuildable local
 /// artifact and the log is the authority, so recovery must discard the index,
@@ -629,7 +629,7 @@ async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_sho
     // Cutting at the LAST entry's position lands the log end exactly on a
     // batch boundary, keeps whole batches behind it, and strands exactly one
     // entry past the end of the file - the only depth a crash can produce
-    // under `enforce_fsync`, where each serialized flush fdatasyncs the whole
+    // under `durability=persisted`, where each serialized flush fdatasyncs the whole
     // log before the next chunk's entry can exist. A deeper cut would
     // fabricate previously durable data loss, which recovery refuses by
     // design.

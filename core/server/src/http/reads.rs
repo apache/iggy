@@ -398,6 +398,73 @@ pub(in crate::http) fn authorize_data_plane(
         .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::http) struct TopicDurability {
+    stream_id: usize,
+    topic_id: usize,
+    created_revision: u64,
+    pub durability: iggy_common::Durability,
+}
+
+impl TopicDurability {
+    pub fn confirmed_policy(self, state: &HttpInner) -> iggy_common::Durability {
+        // Resolve by the numeric identity captured before dispatch. A rename does
+        // not change either the partition incarnation or its create-only policy.
+        let current = topic_durability(
+            state,
+            &Identifier::numeric(
+                u32::try_from(self.stream_id).expect("stream id fits wire bounds"),
+            )
+            .expect("stream id fits wire bounds"),
+            &Identifier::numeric(u32::try_from(self.topic_id).expect("topic id fits wire bounds"))
+                .expect("topic id fits wire bounds"),
+        );
+        self.confirmed_policy_for(current)
+    }
+
+    fn confirmed_policy_for(self, current: Option<Self>) -> iggy_common::Durability {
+        if current == Some(self) {
+            self.durability
+        } else {
+            // Every successful partition reply proves quorum commit even when
+            // namespace replacement prevents attesting the stronger guarantee.
+            iggy_common::Durability::Replicated
+        }
+    }
+}
+
+pub(in crate::http) fn topic_durability(
+    state: &HttpInner,
+    stream: &Identifier,
+    topic: &Identifier,
+) -> Option<TopicDurability> {
+    let stream = identifier_to_wire(stream).ok()?;
+    let topic = identifier_to_wire(topic).ok()?;
+    state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|inner| {
+            let stream_id = resolve_stream_id(inner, &stream)?;
+            let topic_id = resolve_topic_id(inner, stream_id, &topic)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let created_revision = topic
+                .partitions
+                .iter()
+                .map(|partition| partition.created_revision)
+                .min()?;
+            Some(TopicDurability {
+                stream_id,
+                topic_id,
+                created_revision,
+                durability: iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                    .durability,
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -413,6 +480,36 @@ mod tests {
     use metadata::AppliedFrontier;
     use std::future::pending;
     use std::sync::Arc;
+
+    #[test]
+    fn completed_produce_reports_only_the_policy_its_incarnation_can_attest() {
+        let original = super::TopicDurability {
+            stream_id: 1,
+            topic_id: 2,
+            created_revision: 3,
+            durability: iggy_common::Durability::Persisted,
+        };
+        assert_eq!(
+            original.confirmed_policy_for(Some(original)),
+            iggy_common::Durability::Persisted
+        );
+        for current in [
+            None,
+            Some(super::TopicDurability {
+                created_revision: 4,
+                ..original
+            }),
+            Some(super::TopicDurability {
+                durability: iggy_common::Durability::Replicated,
+                ..original
+            }),
+        ] {
+            assert_eq!(
+                original.confirmed_policy_for(current),
+                iggy_common::Durability::Replicated
+            );
+        }
+    }
 
     /// Root's user id, the caller every fixture below writes and reads as.
     const USER: u32 = 0;

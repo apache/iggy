@@ -240,8 +240,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRe
     TrackStream(stream_name);
 
     rust::Vec<iggy::ffi::HeaderEntry> options;
-    options.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("enforce_fsync")),
-                                        make_header_field(iggy::ffi::HeaderKind::String, to_payload("true"))));
+    options.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("durability")),
+                                        make_header_field(iggy::ffi::HeaderKind::String, to_payload("persisted"))));
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
                                          0, "server_default", std::move(options)));
 
@@ -250,11 +250,9 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRe
 
     // Admission re-encodes the block from its own parse, so a value comes back
     // in its key's catalog kind rather than in the kind that was sent.
-    rust::Vec<std::uint8_t> enforce_fsync_enabled;
-    enforce_fsync_enabled.push_back(1);
     EXPECT_TRUE(has_header(topic_details.options, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::String),
-                           to_payload("enforce_fsync"), static_cast<std::uint8_t>(iggy::ffi::HeaderKind::Bool),
-                           enforce_fsync_enabled));
+                           to_payload("durability"), static_cast<std::uint8_t>(iggy::ffi::HeaderKind::String),
+                           to_payload("persisted")));
 
     EXPECT_FALSE(topic_details.derived_options.empty());
     std::unordered_set<std::string> derived_option_keys;
@@ -262,7 +260,7 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRe
         derived_option_keys.insert(std::string(derived_option.key.value.begin(), derived_option.key.value.end()));
     }
     EXPECT_EQ(derived_option_keys.count("max_topic_size"), 1u);
-    EXPECT_EQ(derived_option_keys.count("enforce_fsync"), 0u);
+    EXPECT_EQ(derived_option_keys.count("durability"), 0u);
 
     rust::Vec<iggy::ffi::HeaderEntry> unknown_options;
     unknown_options.push_back(
@@ -291,7 +289,7 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicit
 
     rust::Vec<iggy::ffi::HeaderEntry> options;
     options.push_back(iggy::TopicOption::SegmentSize(segment_size_bytes));
-    options.push_back(iggy::TopicOption::EnforceFsync(true));
+    options.push_back(iggy::TopicOption::Durability(iggy::Durability::Persisted));
     options.push_back(iggy::TopicOption::MessagesRequiredToSave(messages_required_to_save));
     options.push_back(iggy::TopicOption::SizeOfMessagesRequiredToSave(size_of_messages_required_to_save));
     options.push_back(iggy::TopicOption::PreallocateSegments(false));
@@ -309,7 +307,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicit
 
     EXPECT_TRUE(has_header(topic_details.options, key_kind, to_payload("segment_size"), uint64_kind,
                            little_endian_bytes(segment_size_bytes, 8)));
-    EXPECT_TRUE(has_header(topic_details.options, key_kind, to_payload("enforce_fsync"), bool_kind, bool_bytes(true)));
+    EXPECT_TRUE(
+        has_header(topic_details.options, key_kind, to_payload("durability"), key_kind, to_payload("persisted")));
     EXPECT_TRUE(has_header(topic_details.options, key_kind, to_payload("messages_required_to_save"), uint32_kind,
                            little_endian_bytes(messages_required_to_save, 4)));
     EXPECT_TRUE(has_header(topic_details.options, key_kind, to_payload("size_of_messages_required_to_save"),
@@ -334,18 +333,18 @@ TEST_F(LowLevelE2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScop
     ASSERT_NO_THROW({ topic_options = client->describe_options("topic"); });
 
     const iggy::ffi::OptionSpec *segment_size = nullptr;
-    bool found_enforce_fsync                  = false;
+    bool found_durability                     = false;
     for (const auto &option : topic_options) {
         const std::string key = static_cast<std::string>(option.key);
         if (key == "segment_size") {
             segment_size = &option;
-        } else if (key == "enforce_fsync") {
-            found_enforce_fsync = true;
+        } else if (key == "durability") {
+            found_durability = true;
         }
     }
 
     ASSERT_NE(segment_size, nullptr) << "Topic catalog is missing segment_size";
-    EXPECT_TRUE(found_enforce_fsync) << "Topic catalog is missing enforce_fsync";
+    EXPECT_TRUE(found_durability) << "Topic catalog is missing durability";
     EXPECT_EQ(segment_size->kind, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::Uint64));
     EXPECT_FALSE(segment_size->default_value.empty());
     EXPECT_FALSE(segment_size->description.empty());

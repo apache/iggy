@@ -30,12 +30,9 @@ const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
 
 /// A config key that no longer exists, and what took over from it.
 ///
-/// Nothing else catches such a key. Its struct field is gone and no config
-/// table sets `deny_unknown_fields`, so figment drops an unrecognized key
-/// without a word from either source: a server still carrying
-/// `enforce_fsync = true` would boot reporting success and run without fsync.
-/// Every relocated key used to change behavior, so the boot is refused rather
-/// than warned about.
+/// Reject obsolete keys explicitly, including environment variables that the
+/// typed provider would otherwise ignore. These entries are rejection rules,
+/// never accepted mappings or compatibility aliases.
 #[derive(Debug, Clone, Copy)]
 pub struct RelocatedKey {
     /// Dotted config path, for example `system.segment.size`. A deleted table
@@ -272,10 +269,11 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
 mod tests {
     use super::*;
 
+    // Intentionally obsolete inputs verify rejection, not compatibility.
     const KEYS: &[RelocatedKey] = &[
         RelocatedKey {
             path: "system.partition.enforce_fsync",
-            replacement: Some("enforce_fsync"),
+            replacement: Some("durability"),
         },
         RelocatedKey {
             path: "system.message_deduplication",
@@ -297,7 +295,7 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC");
-        assert_eq!(found[0].1.replacement, Some("enforce_fsync"));
+        assert_eq!(found[0].1.replacement, Some("durability"));
     }
 
     #[test]

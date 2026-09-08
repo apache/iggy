@@ -231,6 +231,14 @@ The configuration file is loaded from the current working directory, but you can
 
 When config file is not found, the default values from embedded `config.toml` file are used.
 
+Topic creation accepts two independent policies: `durability` for message acknowledgments and `consumer_offset_durability` for explicit offset stores and deletes. Both default to `replicated`. This means VSR quorum commit without waiting for stable storage. `persisted` also requires recoverable stable-storage copies on the replication quorum. Both policies normally store data on disk. Poll auto-commit remains asynchronous and is not covered by the poll response's completion.
+
+This is a breaking configuration and SDK change. The old topic `enforce_fsync` option and global `consumer_offset_enforce_fsync` setting are removed without aliases. The former `[system.*]` tables are root tables, the data directory is `path` (`IGGY_PATH`), and environment names drop `SYSTEM_`. Unsupported `archive_expired` and `recreate_missing_state` settings are removed. Existing configurations and SDK callers must use the new fields.
+
+Segment flush thresholds control scheduling, independently of acknowledgment durability.
+
+The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
+
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 
 ---
@@ -271,7 +279,7 @@ Start the server:
 
 `cargo run --bin iggy-server`
 
-All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `system.path` in `config.toml`).
+All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `path` in `config.toml`).
 
 One can use default root credentials with optional `--with-default-root-credentials`.
 This flag is equivalent to setting `IGGY_ROOT_USERNAME=iggy` and `IGGY_ROOT_PASSWORD=iggy`, plus
@@ -291,7 +299,7 @@ You can also use environment variables to override any configuration setting:
    `IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server`
 
 - Set custom data path
-   `IGGY_SYSTEM_PATH=/data/iggy cargo run --bin iggy-server`
+   `IGGY_PATH=/data/iggy cargo run --bin iggy-server`
 
 - Enable HTTP transport
    `IGGY_HTTP_ENABLED=true cargo run --bin iggy-server`

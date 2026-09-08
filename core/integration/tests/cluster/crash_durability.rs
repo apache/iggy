@@ -75,7 +75,7 @@ async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool) {
             partitions_count: Some(1),
             message_expiry: Some(IggyExpiry::NeverExpire),
             messages_required_to_save: Some(1),
-            enforce_fsync: Some(true),
+            durability: iggy_common::Durability::Persisted,
             ..TopicCreateOptions::default()
         }
     } else {
@@ -521,4 +521,109 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
         .unwrap_or_else(|state| {
             panic!("eagerly flushed acked data must survive a whole-cluster SIGKILL: {state}")
         });
+}
+
+/// The kill follows the confirmation without waiting for segment installation.
+/// This exercises the prepare WAL rather than graceful shutdown or page-cache flushes.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_persisted_topic_when_killed_below_flush_threshold_should_recover_acked_messages(
+    harness: &mut TestHarness,
+) {
+    verify_persisted_restart(harness).await;
+}
+
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_persisted_singleton_when_killed_below_flush_threshold_should_recover_acked_messages(
+    harness: &mut TestHarness,
+) {
+    verify_persisted_restart(harness).await;
+}
+
+async fn verify_persisted_restart(harness: &mut TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    client
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                consumer_offset_durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let acked = produce_acked(&client, "durable-prepare", 12).await;
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let stored_offset = acked.last().unwrap().0;
+    client
+        .store_consumer_offset(
+            &consumer,
+            &stream,
+            &topic,
+            Some(PARTITION_ID),
+            stored_offset,
+        )
+        .await
+        .unwrap();
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let stored = client
+            .get_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
+            .await
+            .unwrap();
+        if stored.is_some_and(|stored| stored.stored_offset == stored_offset) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "durable offset was not recovered"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_persisted_topic_when_backup_misses_writes_should_repair_before_durable_ack(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut acked = produce_acked(&client, "before-repair", 4).await;
+    let leader = disk::leader_node_index(harness).await;
+    let backup = (0..3).find(|node| *node != leader).unwrap();
+    harness.kill_node(backup).unwrap();
+    acked.extend(produce_acked(&client, "missed", 8).await);
+    harness.restart_node(backup).unwrap();
+    sleep(Duration::from_secs(6)).await;
+    acked.extend(produce_acked(&client, "after-repair", 4).await);
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let client = wait_until_cluster_serves(harness, &[0, 1, 2], CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap();
 }

@@ -1063,11 +1063,16 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             ),
         },
         OptionDescriptor {
-            key: WireName::new(topic_option_keys::ENFORCE_FSYNC)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::Bool.as_code(),
-            default_value: Bytes::copy_from_slice(&[u8::from(iggy_common::DEFAULT_ENFORCE_FSYNC)]),
-            description: "Whether writes to this topic's partitions fsync".to_string(),
+            key: WireName::new(topic_option_keys::DURABILITY).map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::from_static(b"replicated"),
+            description: "Message completion: replicated or persisted. Independently defaults to replicated. A singleton quorum has one copy.".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::CONSUMER_OFFSET_DURABILITY).map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::from_static(b"replicated"),
+            description: "Explicit offset completion: replicated or persisted. Independently defaults to replicated. Poll auto-commit remains asynchronous.".to_string(),
         },
         OptionDescriptor {
             key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)

@@ -290,9 +290,9 @@ Secret owns it.
   {{- $server := .Values.server }}
   {{- $generated := include "iggy.secretName" . }}
   {{- if $server.encryption.enabled }}
-- name: IGGY_SYSTEM_ENCRYPTION_ENABLED
+- name: IGGY_ENCRYPTION_ENABLED
   value: "true"
-- name: IGGY_SYSTEM_ENCRYPTION_KEY
+- name: IGGY_ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
       name: {{ default $generated $server.encryption.existingSecret.name }}

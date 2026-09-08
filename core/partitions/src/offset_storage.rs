@@ -52,7 +52,7 @@ pub enum OffsetRecord {
     /// checksum, read as-is and upgraded by the next write.
     Value { offset: u64, checksummed: bool },
     /// Shorter than the value: a crash between the truncate and the write of an
-    /// in-place update, the default path while `consumer_offset_enforce_fsync`
+    /// in-place update, the default path while `consumer_offset_persisted`
     /// is off.
     Torn,
     /// The checksum does not describe the value stored beside it.
@@ -111,7 +111,7 @@ pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
 
 /// Overwrite a consumer-offset file with `offset` and a checksum over it.
 ///
-/// Without `enforce_fsync` the file is rewritten in place and no directory is
+/// Without `persisted` the file is rewritten in place and no directory is
 /// synced. With it, the record goes to a sibling inode, is data-synced and
 /// renamed over the prior file, so a failed write leaves the prior cursor
 /// intact, and the caller marks the parent directory for a sync on the next
@@ -121,9 +121,9 @@ pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
 ///
 /// # Errors
 /// [`IggyError`] when the directory, file, or write cannot be created or completed.
-pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
+pub async fn persist_offset(path: &str, offset: u64, persisted: bool) -> Result<(), IggyError> {
     let record = encode_offset_record(offset);
-    if enforce_fsync {
+    if persisted {
         replace_file(path, record, true, false).await
     } else {
         write_in_place(path, record).await
@@ -160,7 +160,7 @@ async fn create_parent_dir(path: &str) -> Result<(), IggyError> {
 
 pub(crate) async fn stage_offset_replacement(path: &str, offset: u64) -> Result<(), IggyError> {
     // Install can remove old files before publishing replacements. Staging
-    // must survive a crash regardless of the normal consumer-offset fsync knob.
+    // must survive a crash regardless of the normal consumer-offset durability policy.
     write_replacement(path, encode_offset_record(offset), true)
         .await
         .map(|_| ())
@@ -179,10 +179,10 @@ pub(crate) async fn discard_offset_replacement(path: &str) {
 async fn replace_file<const N: usize>(
     path: &str,
     record: [u8; N],
-    enforce_fsync: bool,
+    persisted: bool,
     sync_parent: bool,
 ) -> Result<(), IggyError> {
-    let temporary = write_replacement(path, record, enforce_fsync).await?;
+    let temporary = write_replacement(path, record, persisted).await?;
     if rename(&temporary, path).await.is_err() {
         let _ = remove_file(&temporary).await;
         return Err(IggyError::CannotWriteToFile);
@@ -203,7 +203,7 @@ async fn replace_file<const N: usize>(
 async fn write_replacement<const N: usize>(
     path: &str,
     record: [u8; N],
-    enforce_fsync: bool,
+    persisted: bool,
 ) -> Result<String, IggyError> {
     create_parent_dir(path).await?;
 
@@ -224,7 +224,7 @@ async fn write_replacement<const N: usize>(
         return Err(IggyError::CannotWriteToFile);
     }
 
-    if enforce_fsync && file.sync_data().await.is_err() {
+    if persisted && file.sync_data().await.is_err() {
         let _ = remove_file(&temporary).await;
         return Err(IggyError::CannotWriteToFile);
     }
@@ -271,7 +271,7 @@ pub struct PersistedOffset {
 pub async fn persist_offset_max(
     path: &str,
     offset: u64,
-    enforce_fsync: bool,
+    persisted: bool,
 ) -> Result<PersistedOffset, IggyError> {
     let on_disk = match read_offset_record(path).await? {
         Some(OffsetRecord::Value { offset, .. }) => Some(offset),
@@ -296,7 +296,7 @@ pub async fn persist_offset_max(
     let effective = on_disk.map_or(offset, |current| current.max(offset));
     let written = on_disk != Some(effective);
     if written {
-        persist_offset(path, effective, enforce_fsync).await?;
+        persist_offset(path, effective, persisted).await?;
     }
     Ok(PersistedOffset {
         offset: effective,
@@ -308,7 +308,7 @@ pub async fn persist_offset_max(
 /// to the incarnation (`created_revision`) it was applied for.
 ///
 /// Atomic replacement like [`persist_offset`] but ALWAYS data-synced, regardless of
-/// the consumer-offset fsync knob: purges are rare, the record is 16 bytes, and
+/// the consumer-offset durability policy: purges are rare, the record is 16 bytes, and
 /// a generation lost from the page cache in a crash makes the reconciler
 /// re-purge on restart, wiping messages appended after the purge. A failure
 /// leaves the previous record on disk so the caller keeps its in-memory

@@ -26,6 +26,7 @@ import enum
 import typing
 
 __all__ = [
+    "Durability",
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
@@ -1313,7 +1314,8 @@ class IggyClient:
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
         segment_size: builtins.int | None = None,
-        enforce_fsync: builtins.bool | None = None,
+        durability: Durability | None = None,
+        consumer_offset_durability: Durability | None = None,
         messages_required_to_save: builtins.int | None = None,
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
@@ -1330,7 +1332,8 @@ class IggyClient:
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
             segment_size: Per-topic segment size in bytes as `int | None`.
-            enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+            durability: Message completion policy, defaulting to replicated.
+            consumer_offset_durability: Independent offset policy, defaulting to replicated.
             messages_required_to_save: Message-count flush threshold as `int | None`.
             size_of_messages_required_to_save: Byte flush threshold as `int | None`.
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
@@ -2267,9 +2270,8 @@ class SendMessagesConfirmation:
         at-least-once, so an earlier retry may already have committed these
         messages at a lower offset.
 
-        A batch is confirmed once it is committed in memory, not once it is
-        fsynced. A crash-restart can stamp a later batch with an offset a client
-        has already recorded.
+        Confirmation follows VSR quorum commit. A topic with persisted message
+        durability also waits for recoverable stable-storage copies on the quorum.
 
         The legacy server confirms nothing, so its confirmation list is empty
         and this value is never reached.
@@ -2291,9 +2293,8 @@ class SendMessagesResponse:
 
         A reported `base_offset` never implies uniqueness, because delivery is
         at-least-once and an earlier retry may already have committed the same
-        messages at a lower offset. A batch is confirmed once it is committed in
-        memory, not once it is fsynced. A crash-restart can stamp a later batch
-        with an offset a client has already recorded.
+        messages at a lower offset. Confirmation follows the topic's message
+        durability policy: quorum commit, plus stable storage for persisted topics.
         """
 
 @typing.final
@@ -3205,3 +3206,7 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
+
+class Durability(str, enum.Enum):
+    REPLICATED = "replicated"
+    PERSISTED = "persisted"

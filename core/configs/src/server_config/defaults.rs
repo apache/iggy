@@ -33,7 +33,6 @@ use super::node::NodeConfig;
 use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
 use super::server::ServerConfig;
-use super::server::ServerSystemConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
@@ -42,7 +41,6 @@ use crate::common::server::{
     TelemetryConfig,
 };
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 // Same embedded TOML the shared sections read; re-exported so sibling
 // modules reach it as `super::defaults::SERVER_CONFIG`.
@@ -56,7 +54,14 @@ impl Default for ServerConfig {
             heartbeat: HeartbeatConfig::default(),
             node: NodeConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
-            system: Arc::new(ServerSystemConfig::default()),
+            stream: Default::default(),
+            topic: Default::default(),
+            path: SERVER_CONFIG.path.to_owned(),
+            runtime: Default::default(),
+            logging: Default::default(),
+            encryption: Default::default(),
+            memory_pool: Default::default(),
+            sharding: Default::default(),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),
@@ -181,10 +186,16 @@ impl Default for PartitionConfig {
         // schema cannot drift (same pattern as MetadataConfig above).
         let partition = &SERVER_CONFIG.partition;
         PartitionConfig {
+            wal_bytes_max: partition
+                .wal_bytes_max
+                .parse()
+                .expect("embedded WAL capacity is valid"),
+            path: SERVER_CONFIG.partition.path.to_owned(),
+            validate_checksum: SERVER_CONFIG.partition.validate_checksum,
             prepare_queue_depth: partition.prepare_queue_depth as usize,
             dedup_clients_max: partition.dedup_clients_max as usize,
             consumer_offsets_max: partition.consumer_offsets_max as usize,
-            consumer_offset_enforce_fsync: partition.consumer_offset_enforce_fsync,
+
             offset_reservation_lease: NonZeroU32::new(partition.offset_reservation_lease as u32)
                 .expect("the embedded config.toml carries a nonzero offset_reservation_lease"),
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,

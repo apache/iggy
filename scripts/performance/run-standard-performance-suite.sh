@@ -68,21 +68,21 @@ get_env_vars() {
 
     # Specific env vars based on bench type
     case "$bench_type" in
-    # fsync is a topic creation option (`enforce_fsync`) now, not server config,
-    # so the bench command carries `--enforce-fsync` (added by
+    # Durability is a topic creation option, so the bench command carries
+    # `--durability persisted` (added by
     # `construct_bench_command` off the same remark) and only the cache setting
     # is left to the server environment.
     *"no_cache_fsync"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false")
+        env_vars+=("IGGY_CACHE_ENABLED=false")
         ;;
     *"only_cache"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_SIZE=9GB")
+        env_vars+=("IGGY_CACHE_SIZE=9GB")
         ;;
     *"no_cache"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false")
+        env_vars+=("IGGY_CACHE_ENABLED=false")
         ;;
     *"no_wait"*)
-        env_vars+=("IGGY_SYSTEM_SEGMENT_SERVER_CONFIRMATION=no_wait")
+        env_vars+=("IGGY_SEGMENT_SERVER_CONFIRMATION=no_wait")
         ;;
     esac
 

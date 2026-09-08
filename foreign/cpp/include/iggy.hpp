@@ -403,6 +403,18 @@ inline iggy::ffi::HeaderEntry to_option_entry(const std::string_view key,
  *       partition storage is created. Changing them later could leave existing
  *       and new segments with different storage settings.
  */
+enum class Durability { Replicated, Persisted };
+
+constexpr std::string_view to_string(const Durability durability) {
+    switch (durability) {
+        case Durability::Replicated:
+            return "replicated";
+        case Durability::Persisted:
+            return "persisted";
+    }
+    throw std::invalid_argument("Unknown durability");
+}
+
 class TopicOption final {
   public:
     /**
@@ -420,13 +432,20 @@ class TopicOption final {
     }
 
     /**
-     * @brief Choose whether writes to this topic's partitions are fsynced.
+     * @brief Choose the message completion policy.
      *
-     * @param enabled Whether partition writes are fsynced.
+     * @param value The policy, defaulting to Replicated.
      * @return Encoded topic option entry.
      */
-    static iggy::ffi::HeaderEntry EnforceFsync(const bool enabled) {
-        return detail::to_option_entry("enforce_fsync", iggy::ffi::HeaderKind::Bool, detail::to_bool_bytes(enabled));
+    static iggy::ffi::HeaderEntry Durability(const iggy::Durability value = iggy::Durability::Replicated) {
+        return detail::to_option_entry("durability", iggy::ffi::HeaderKind::String,
+                                       detail::to_key_bytes(to_string(value)));
+    }
+
+    static iggy::ffi::HeaderEntry ConsumerOffsetDurability(
+        const iggy::Durability value = iggy::Durability::Replicated) {
+        return detail::to_option_entry("consumer_offset_durability", iggy::ffi::HeaderKind::String,
+                                       detail::to_key_bytes(to_string(value)));
     }
 
     /**

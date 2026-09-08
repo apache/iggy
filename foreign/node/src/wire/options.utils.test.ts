@@ -37,20 +37,22 @@ const prefixed = (block: Buffer): Buffer => {
  * nothing about interoperability; these bytes are the contract.
  */
 const GOLDEN_OPTIONS_BLOCK = Buffer.from([
-  2, 13, 0, 0, 0,
-  ...Buffer.from('enforce_fsync'),
+  2, 20, 0, 0, 0,
+  ...Buffer.from('preallocate_segments'),
   3, 1, 0, 0, 0, 1,
   2, 12, 0, 0, 0,
   ...Buffer.from('segment_size'),
   12, 8, 0, 0, 0,
-  0, 0, 0, 64, 0, 0, 0, 0
+  0, 0, 0, 64, 0, 0, 0, 0,
+  2, 10, 0, 0, 0, 100, 117, 114, 97, 98, 105, 108, 105, 116, 121, 2, 9, 0, 0, 0, 112, 101, 114, 115, 105, 115, 116, 101, 100
 ]);
 
 describe('serializeOptions', () => {
   it('encodes the cross-SDK golden vector byte for byte', () => {
     const encoded = serializeOptions([
-      { key: 'enforce_fsync', value: HeaderValue.Bool(true) },
-      { key: 'segment_size', value: HeaderValue.Uint64(1_073_741_824n) }
+      { key: 'preallocate_segments', value: HeaderValue.Bool(true) },
+      { key: 'segment_size', value: HeaderValue.Uint64(1_073_741_824n) },
+      { key: 'durability', value: HeaderValue.String('persisted') }
     ]);
 
     assert.deepEqual(encoded, GOLDEN_OPTIONS_BLOCK);

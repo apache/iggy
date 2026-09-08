@@ -1012,7 +1012,7 @@ fn data_topic_options() -> TopicCreateOptions {
             MAX_TOPIC_SIZE_BYTES,
         ))),
         segment_size: Some(IggyByteSize::from(SEGMENT_SIZE_BYTES)),
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         messages_required_to_save: Some(1),
         size_of_messages_required_to_save: Some(IggyByteSize::from(FLUSH_SIZE_BYTES)),
         // Left at the default, so only its provenance flag can tell a
@@ -1027,7 +1027,7 @@ fn data_topic_options() -> TopicCreateOptions {
 /// Options of the topic created after the checkpoint. Different values from
 /// [`data_topic_options`] where a key has a usable one, so a record attributed
 /// to the wrong topic cannot pass, and a different unsent key
-/// (`enforce_fsync`) for the provenance check.
+/// (`durability`) for the provenance check.
 fn wal_tail_topic_options() -> TopicCreateOptions {
     TopicCreateOptions {
         partitions_count: Some(PARTITIONS_COUNT),
@@ -1319,7 +1319,8 @@ async fn assert_topic_recovered(
         message_expiry: seed.message_expiry.map(|_| topic.message_expiry),
         max_topic_size: seed.max_topic_size.map(|_| topic.max_topic_size),
         segment_size: seed.segment_size.and(recovered.segment_size),
-        enforce_fsync: seed.enforce_fsync.and(recovered.enforce_fsync),
+        durability: recovered.durability,
+        consumer_offset_durability: recovered.consumer_offset_durability,
         messages_required_to_save: seed
             .messages_required_to_save
             .and(recovered.messages_required_to_save),
@@ -1351,10 +1352,8 @@ async fn assert_topic_recovered(
             seed.max_topic_size.is_some(),
         ),
         (topic_option_keys::SEGMENT_SIZE, seed.segment_size.is_some()),
-        (
-            topic_option_keys::ENFORCE_FSYNC,
-            seed.enforce_fsync.is_some(),
-        ),
+        (topic_option_keys::DURABILITY, true),
+        (topic_option_keys::CONSUMER_OFFSET_DURABILITY, true),
         (
             topic_option_keys::MESSAGES_REQUIRED_TO_SAVE,
             seed.messages_required_to_save.is_some(),

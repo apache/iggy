@@ -24,6 +24,7 @@ pub mod packet;
 pub mod ready_queue;
 pub mod replica;
 pub mod seeds;
+pub mod storage;
 pub mod workload;
 
 use bus::SimOutbox;

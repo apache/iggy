@@ -468,7 +468,7 @@ where
 /// `vec[i]` necessarily reaches shard `i`. The second receiver is the reply
 /// lane: cross-shard client `Reply` forwards, whose drops are terminal, ride
 /// a channel of their own so a consensus burst filling the main lane cannot
-/// evict them (see `[system.sharding] reply_inbox_capacity`).
+/// evict them (see `[sharding] reply_inbox_capacity`).
 #[must_use]
 pub fn shard_channel(
     owner_shard: u16,
@@ -671,27 +671,40 @@ pub enum LifecycleFrame {
     /// The `fd` is an owning [`DupedFd`] so that a frame dropped
     /// unprocessed (shutdown, pump drain abort, router panic before
     /// `install_*_fd`) closes the dup instead of leaking it.
-    ReplicaInboundSetup { fd: DupedFd, slot: u64 },
+    ReplicaInboundSetup {
+        fd: DupedFd,
+        slot: u64,
+    },
     /// Shard 0 dialed the higher-id peer `replica_id` and delegates the
     /// raw connection; the receiving shard runs the dialer handshake
     /// half, installs on success, and answers shard 0 with
     /// [`LifecycleFrame::ReplicaOutboundHandshakeDone`] so the
     /// pending-dial entry clears and the reconnect sweep may redial on
     /// failure.
-    ReplicaOutboundSetup { fd: DupedFd, replica_id: u8 },
+    ReplicaOutboundSetup {
+        fd: DupedFd,
+        replica_id: u8,
+    },
     /// Owning shard -> shard 0: a delegated inbound handshake finished
     /// (any outcome). Releases the global in-flight cap slot. Lost acks
     /// are covered by the slot's deadline expiry on shard 0.
-    ReplicaInboundHandshakeDone { slot: u64 },
+    ReplicaInboundHandshakeDone {
+        slot: u64,
+    },
     /// Owning shard -> shard 0: a delegated outbound handshake finished
     /// (any outcome). Clears the pending-dial entry for `replica_id`.
     /// Lost acks are covered by the entry's deadline expiry on shard 0.
-    ReplicaOutboundHandshakeDone { replica_id: u8 },
+    ReplicaOutboundHandshakeDone {
+        replica_id: u8,
+    },
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
     /// 16 bits of `meta.client_id`.
-    ClientConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
+    ClientConnectionSetup {
+        fd: DupedFd,
+        meta: ClientConnMeta,
+    },
     /// Shard 0 distributes an inbound SDK WebSocket client's pre-upgrade
     /// TCP connection fd to the owning shard. The HTTP-Upgrade handshake
     /// has NOT run yet at this point: the fd is plain TCP, the dup is
@@ -710,7 +723,10 @@ pub enum LifecycleFrame {
     /// state is non-serialisable and tied to the endpoint's reactor.
     /// Shard 0 therefore terminates QUIC locally and uses the existing
     /// `ForwardClientSend` variant for outbound traffic.
-    ClientWsConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
+    ClientWsConnectionSetup {
+        fd: DupedFd,
+        meta: ClientConnMeta,
+    },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.
     ForwardReplicaSend {
@@ -719,7 +735,10 @@ pub enum LifecycleFrame {
     },
     /// A shard that doesn't hold the client's TCP connection forwards a
     /// client send to the owning shard (top 16 bits of `client_id`).
-    ForwardClientSend { client_id: u128, msg: BusMessage },
+    ForwardClientSend {
+        client_id: u128,
+        msg: BusMessage,
+    },
     /// A peer shard hands a metadata consensus submit (login/logout) to
     /// shard 0, the metadata consensus owner. The committed op returns over
     /// the `reply` sender carried in [`MetadataSubmit`]. Always addressed to
@@ -762,6 +781,7 @@ pub enum LifecycleFrame {
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
     MetadataCommitTick,
+    PartitionPersistenceCompleted(partitions::PersistenceCompletion),
     /// Wake marker for the reconciler-to-pump funnel. Pump drains the
     /// shard's `reconcile_queue` on receipt; tail drain on every frame
     /// catches dropped markers.
@@ -1054,7 +1074,7 @@ const SEGMENT_SIZE_CEILING_BYTES: u64 = 1 << 30;
 /// SDK batch types), so the largest appendable batch is whatever the message bus
 /// will frame. This tracks the shipped `message_bus.max_message_size` default; an
 /// operator raising that is caught by the config validator, which requires
-/// `partition.transfer_artifact_bytes_max` to cover `system.segment.size` plus
+/// `partition.transfer_artifact_bytes_max` to cover the topic's `segment_size` plus
 /// the configured bus cap.
 const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -4057,6 +4077,7 @@ where
     ) where
         B: MessageBus + Clone + 'static,
         T: ShardsTable,
+        M: metadata::impls::metadata::StreamsFrontend,
     {
         let PartitionMaterialisation {
             epoch,
@@ -4120,8 +4141,18 @@ where
             stats,
             consensus,
             partitions.config().segment_size,
-            partitions.config().consumer_offset_enforce_fsync,
         );
+        let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map(|topic| {
+                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                })
+                .unwrap_or_default()
+        });
+        partition.set_runtime_options(runtime_options);
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state.as_ref());
@@ -7092,6 +7123,25 @@ where
         // spreads over every group instead of replaying the same prefix.
         rotate_sweep_to_cursor(namespace_scratch, self.partition_walk_cursor.get());
 
+        let mut persistence_metrics = partitions::PersistenceMetrics::default();
+        for namespace in namespace_scratch.iter() {
+            if let Some(partition) = partitions.get_mut_by_ns(namespace) {
+                partition.drive_persistence().await;
+                partition.checkpoint_persistence(partitions.config()).await;
+                if let Some(metrics) = partition.take_persistence_metrics() {
+                    persistence_metrics.disk_bytes += metrics.disk_bytes;
+                    persistence_metrics.queued_bytes += metrics.queued_bytes;
+                    persistence_metrics.in_flight_bytes += metrics.in_flight_bytes;
+                    persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
+                    persistence_metrics.completed_batches += metrics.completed_batches;
+                    persistence_metrics.batched_prepares += metrics.batched_prepares;
+                    persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
+                    persistence_metrics.failed_writes += metrics.failed_writes;
+                }
+            }
+        }
+        self.metrics.record_persistence(&persistence_metrics);
+
         // Pre-pass: issue every group's pending superblock write CONCURRENTLY.
         // A cluster-wide view change makes every group on this shard need one in
         // the same tick, and each `atomic_replace` is a create + write + 2
@@ -7716,7 +7766,7 @@ where
     /// passes, so admission cannot revoke a transfer midway.
     ///
     /// BOTH inputs are the configured ones. Dividing by the compile-time
-    /// segment ceiling instead of the deployed `system.segment.size` would make
+    /// segment ceiling instead of the deployed the topic's `segment_size` would make
     /// the numerator the only thing an operator controls: on a 64 MiB-segment
     /// deployment the same budget holds sixteen times as many payloads as a cap
     /// derived from the 1 GiB ceiling would admit, and rejoins serialise for no
@@ -10071,7 +10121,7 @@ const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 ///
 /// Same correlated-fan-out argument as the repair arm, and the walk is the
 /// costlier half: `commit_journal` reaches `commit_messages`, which flushes a
-/// segment and fsyncs under `enforce_fsync`.
+/// segment and synchronizes it under `durability=persisted`.
 ///
 /// The two caps together are what bound the tick: this one bounds how many
 /// groups a sweep walks, [`partitions::COMMIT_WALK_OPS_MAX`] bounds how far

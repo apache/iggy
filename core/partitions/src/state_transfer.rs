@@ -56,26 +56,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
-/// Framing marker for the consumer-offsets wire artifact, "ICO2". Bumped with
-/// the version when the dedup section was appended, so the magic alone tells
-/// the two layouts apart.
-pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO2";
-
-/// Version byte following the magic.
-///
-/// Any layout change bumps this, INCLUDING appended fields: the decoder
-/// deliberately fails closed on unknown versions and on trailing bytes,
-/// because a v2 field can change the meaning of fields v1 already read.
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 2;
-
-/// The previous framing, "ICO1" at version 1: the same layout without the
-/// dedup section. Still decoded so a rolling upgrade works in both orders --
-/// an upgraded replica rejoining behind the repair floor of an un-upgraded
-/// primary installs its artifact with an empty slice (dedup for that window
-/// degrades to at-least-once, exactly the pre-dedup behaviour) instead of
-/// refusing it and re-pulling forever.
-pub(crate) const CONSUMER_OFFSETS_MAGIC_V1: [u8; 4] = *b"ICO1";
-const CONSUMER_OFFSETS_VERSION_V1: u8 = 1;
+/// Current state-transfer offsets format, including the prepare-chain anchor.
+pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO3";
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 3;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -305,6 +288,8 @@ impl StagedSegmentMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ConsumerOffsetsWire {
     pub purge_generation: u64,
+    /// Checksum of the prepare at the offer's committed operation.
+    pub prepare_checksum: Option<u128>,
     /// The origin group's message-offset frontier: the offset the NEXT
     /// append will mint, `0` for a partition that never appended. Segments
     /// alone cannot carry this -- retention can GC every sealed segment
@@ -327,7 +312,7 @@ impl ConsumerOffsetsWire {
     /// consumer_count u32 | group_count u32 | dedup_count u32 |
     /// {id u32, offset u64}xN | {id u32, offset u64}xM |
     /// {client u128, watermark u64, latest_commit u64, user_id u32,
-    /// committed_window u128}xD |
+    /// committed_window u128}xD | checksum_present u8 | prepare_checksum u128 |
     /// XxHash3_64 trailer`. Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -339,6 +324,8 @@ impl ConsumerOffsetsWire {
             + 3 * size_of::<u32>()
             + (self.consumers.len() + self.groups.len()) * (size_of::<u32>() + size_of::<u64>())
             + self.dedup.len() * DEDUP_ENTRY_LEN
+            + size_of::<u8>()
+            + size_of::<u128>()
             + size_of::<u64>();
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
@@ -362,6 +349,8 @@ impl ConsumerOffsetsWire {
             out.extend_from_slice(&entry.user_id.to_le_bytes());
             out.extend_from_slice(&entry.committed_window.to_le_bytes());
         }
+        out.push(u8::from(self.prepare_checksum.is_some()));
+        out.extend_from_slice(&self.prepare_checksum.unwrap_or(0).to_le_bytes());
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
         out.extend_from_slice(&trailer.to_le_bytes());
@@ -389,30 +378,26 @@ impl ConsumerOffsetsWire {
         let mut cursor = LeCursor::new(content);
         let magic = cursor.take(CONSUMER_OFFSETS_MAGIC.len())?;
         let version = cursor.u8()?;
-        let carries_dedup = if magic == CONSUMER_OFFSETS_MAGIC {
-            if version != CONSUMER_OFFSETS_VERSION {
-                return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
-            }
-            true
-        } else if magic == CONSUMER_OFFSETS_MAGIC_V1 {
-            if version != CONSUMER_OFFSETS_VERSION_V1 {
-                return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
-            }
-            false
-        } else {
+        if magic != CONSUMER_OFFSETS_MAGIC {
             return Err(ConsumerOffsetsWireError::BadMagic);
-        };
+        }
+        if version != CONSUMER_OFFSETS_VERSION {
+            return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
+        }
         let purge_generation = cursor.u64()?;
         let next_offset = cursor.u64()?;
         let consumer_count = cursor.u32()?;
         let group_count = cursor.u32()?;
-        let dedup_count = if carries_dedup { cursor.u32()? } else { 0 };
+        let dedup_count = cursor.u32()?;
         let consumers = Self::decode_section(&mut cursor, "consumers", consumer_count)?;
         let groups = Self::decode_section(&mut cursor, "groups", group_count)?;
-        let dedup = if carries_dedup {
-            Self::decode_dedup_section(&mut cursor, dedup_count)?
-        } else {
-            Vec::new()
+        let dedup = Self::decode_dedup_section(&mut cursor, dedup_count)?;
+        let present = cursor.u8()?;
+        let checksum = cursor.u128()?;
+        let prepare_checksum = match present {
+            0 if checksum == 0 => None,
+            1 => Some(checksum),
+            _ => return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum),
         };
         if !cursor.remaining().is_empty() {
             // Distinct from `Truncated`: extra bytes point at a NEWER
@@ -424,6 +409,7 @@ impl ConsumerOffsetsWire {
         }
         Ok(Self {
             purge_generation,
+            prepare_checksum,
             next_offset,
             consumers,
             groups,
@@ -525,6 +511,8 @@ impl ConsumerOffsetsWire {
 /// different trust (this node's own bytes vs a peer's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumerOffsetsWireError {
+    InvalidPrepareChecksum,
+    MissingPrepareChecksum,
     Truncated,
     BadMagic,
     UnsupportedVersion {
@@ -569,6 +557,10 @@ impl From<Truncated> for ConsumerOffsetsWireError {
 impl fmt::Display for ConsumerOffsetsWireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidPrepareChecksum => write!(f, "invalid state-transfer prepare checksum"),
+            Self::MissingPrepareChecksum => {
+                write!(f, "durable state transfer requires a prepare checksum")
+            }
             Self::Truncated => write!(f, "consumer-offsets artifact is truncated"),
             Self::BadMagic => write!(f, "consumer-offsets artifact carries a foreign magic"),
             Self::TrailingBytes { extra } => write!(
@@ -657,6 +649,7 @@ mod tests {
 
     fn table() -> ConsumerOffsetsWire {
         ConsumerOffsetsWire {
+            prepare_checksum: None,
             purge_generation: 3,
             next_offset: 43,
             consumers: vec![(1, 10), (7, 42)],
@@ -688,8 +681,29 @@ mod tests {
     }
 
     #[test]
+    fn transferred_prepare_checksum_is_covered_by_the_artifact() {
+        let mut table = table();
+        table.prepare_checksum = Some(u128::MAX - 7);
+        let bytes = table.encode();
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&bytes)
+                .unwrap()
+                .prepare_checksum,
+            table.prepare_checksum
+        );
+        let mut corrupt = bytes;
+        let position = corrupt.len() - 9;
+        corrupt[position] ^= 1;
+        assert!(matches!(
+            ConsumerOffsetsWire::decode(&corrupt),
+            Err(ConsumerOffsetsWireError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn given_empty_table_when_encoded_should_round_trip() {
         let empty = ConsumerOffsetsWire {
+            prepare_checksum: None,
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -757,6 +771,7 @@ mod tests {
     #[test]
     fn given_unordered_dedup_clients_when_decoded_should_reject() {
         let unordered = ConsumerOffsetsWire {
+            prepare_checksum: None,
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -772,6 +787,7 @@ mod tests {
     #[test]
     fn given_reserved_client_in_dedup_when_decoded_should_reject() {
         let reserved = ConsumerOffsetsWire {
+            prepare_checksum: None,
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -785,51 +801,18 @@ mod tests {
     }
 
     #[test]
-    fn given_v1_artifact_when_decoded_should_install_empty_dedup() {
-        // An un-upgraded primary still ships "ICO1": same fields minus the
-        // dedup count and section. It must decode, with nothing to absorb.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC_V1);
-        bytes.push(CONSUMER_OFFSETS_VERSION_V1);
-        bytes.extend_from_slice(&3u64.to_le_bytes());
-        bytes.extend_from_slice(&43u64.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        for (id, offset) in [(7u32, 42u64), (2, 5)] {
-            bytes.extend_from_slice(&id.to_le_bytes());
-            bytes.extend_from_slice(&offset.to_le_bytes());
+    fn given_previous_artifact_versions_when_decoded_should_reject() {
+        for magic in [b"ICO1", b"ICO2"] {
+            let mut bytes = table().encode();
+            bytes[..4].copy_from_slice(magic);
+            let length = bytes.len() - 8;
+            let checksum = state_artifact_checksum(&bytes[..length]);
+            bytes[length..].copy_from_slice(&checksum.to_le_bytes());
+            assert_eq!(
+                ConsumerOffsetsWire::decode(&bytes),
+                Err(ConsumerOffsetsWireError::BadMagic)
+            );
         }
-        let trailer = state_artifact_checksum(&bytes);
-        bytes.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&bytes),
-            Ok(ConsumerOffsetsWire {
-                purge_generation: 3,
-                next_offset: 43,
-                consumers: vec![(7, 42)],
-                groups: vec![(2, 5)],
-                dedup: Vec::new(),
-            })
-        );
-    }
-
-    #[test]
-    fn given_v1_magic_with_wrong_version_when_decoded_should_reject() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC_V1);
-        bytes.push(CONSUMER_OFFSETS_VERSION);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        let trailer = state_artifact_checksum(&bytes);
-        bytes.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&bytes),
-            Err(ConsumerOffsetsWireError::UnsupportedVersion {
-                version: CONSUMER_OFFSETS_VERSION
-            })
-        );
     }
 
     #[test]
@@ -899,6 +882,7 @@ mod tests {
     #[test]
     fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
         let duplicate = ConsumerOffsetsWire {
+            prepare_checksum: None,
             purge_generation: 0,
             next_offset: 0,
             consumers: vec![(5, 1), (5, 2)],
@@ -913,6 +897,7 @@ mod tests {
             })
         );
         let unordered = ConsumerOffsetsWire {
+            prepare_checksum: None,
             purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
@@ -1229,6 +1214,9 @@ pub enum PartitionTransferUnavailable {
     /// In-memory / simulated partition: nothing on disk to serve.
     NoPartitionDir,
     RepairInProgress,
+    MissingPrepareChecksum {
+        op: u64,
+    },
     ConsumerOffsetsTooLarge {
         kind: ConsumerKind,
         count: usize,
@@ -1287,6 +1275,7 @@ impl PartitionTransferUnavailable {
             | Self::SegmentSetChanged
             | Self::OfferBuildInProgress { .. } => true,
             Self::NoPartitionDir
+            | Self::MissingPrepareChecksum { .. }
             | Self::ConsumerOffsetsTooLarge { .. }
             | Self::ConsumerOffsetStateInconsistent { .. }
             | Self::ManifestTooLarge { .. }
@@ -1300,6 +1289,9 @@ impl fmt::Display for PartitionTransferUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotCaughtUpPrimary => write!(f, "not the caught-up primary of this group"),
+            Self::MissingPrepareChecksum { op } => {
+                write!(f, "partition has no checksum for committed op {op}")
+            }
             Self::NoPartitionDir => write!(f, "partition has no on-disk directory"),
             Self::RepairInProgress => write!(f, "partition is itself mid-repair"),
             Self::ConsumerOffsetsTooLarge { kind, count, max } => write!(
@@ -2152,7 +2144,30 @@ where
         // must resume minting at N either way.
         let next_offset = self.offset_frontier();
         let dedup = self.dedup().watermarks_sorted();
+        let commit_op = self.consensus().commit_min();
+        let prepare_checksum = if commit_op == 0 {
+            Some(0)
+        } else {
+            self.log
+                .journal()
+                .inner
+                .header_by_op(commit_op)
+                .map(|header| header.checksum)
+                .or_else(|| {
+                    self.persistence
+                        .as_ref()
+                        .and_then(|persistence| persistence.checksum(commit_op))
+                })
+                .or_else(|| {
+                    (self.consensus().sequencer().current_sequence() == commit_op)
+                        .then(|| self.consensus().last_prepare_checksum())
+                })
+        };
+        if self.persistence.is_some() && prepare_checksum.is_none() {
+            return Err(PartitionTransferUnavailable::MissingPrepareChecksum { op: commit_op });
+        }
         Ok(ConsumerOffsetsWire {
+            prepare_checksum,
             purge_generation: self.applied_purge_generation,
             next_offset,
             consumers,
@@ -2440,6 +2455,9 @@ where
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
+        if self.persistence.is_some() && offsets_wire.prepare_checksum.is_none() {
+            return Err(ConsumerOffsetsWireError::MissingPrepareChecksum.into());
+        }
         // Anti-rewind against the LOCAL OFFSET COUNTER, not the commit
         // frontier: the partition journal is memory-only and
         // `restore_partition_view` restores view/log_view alone, so `commit_min`
@@ -2514,6 +2532,28 @@ where
         // this point, so a write fault leaves the old partition serviceable.
         stage_offset_writes(&planned_offsets).await?;
 
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+        if let Some(persistence) = &self.persistence {
+            self.start_persistence();
+            persistence
+                .drain()
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: partition_dir.clone(),
+                    source,
+                })?;
+            if let Err(source) = crate::install_backup::begin(Path::new(&partition_dir)).await {
+                // The backup rename may have landed before its directory barrier failed.
+                // Further commits could then be erased by rollback on the next boot.
+                self.fence_install_failure(commit_op);
+                return Err(PartitionInstallError::SwapIo {
+                    path: partition_dir.clone(),
+                    source,
+                });
+            }
+        }
+
         // ---- mutate phase ----
         // Record the INCOMING frontier before anything destructive: the swap
         // below unlinks the old chain and makes that durable before the first
@@ -2550,6 +2590,9 @@ where
                 .await
         };
         if !frontier_durable {
+            if self.persistence.is_some() {
+                self.fence_install_failure(commit_op);
+            }
             discard_offset_writes(&planned_offsets).await;
             return Err(PartitionInstallError::FrontierNotDurable {
                 frontier: offsets_wire.next_offset,
@@ -2559,8 +2602,6 @@ where
         // the segment vectors drained, and a concurrent replicated append
         // indexing `segments().len() - 1` on the emptied vec is exactly the
         // race every other segment-vec mutator takes this lock against.
-        let write_lock = self.write_lock.clone();
-        let _guard = write_lock.lock().await;
         // Captured before `staged` moves: the convergence may only claim an
         // offset frontier when the offer itself proved nothing is retained
         // below it.
@@ -2577,6 +2618,11 @@ where
             )
             .await;
         if outcome.is_err() {
+            if self.persistence.is_some() {
+                // Keep the rollback snapshot intact until boot reopens every file.
+                self.fence_install_failure(commit_op);
+                return outcome;
+            }
             discard_offset_writes(&planned_offsets).await;
             // A mutate-phase failure can leave the log drained or half
             // rebuilt while the disk already holds any prefix of the new
@@ -2618,6 +2664,15 @@ where
                 "state-transfer install could not record the installed offset frontier; \
                  the durable record stays at the pre-swap claim until the next view change"
             );
+        }
+        if self.persistence.is_some()
+            && let Err(source) = crate::install_backup::finish(Path::new(&partition_dir)).await
+        {
+            self.fence_install_failure(commit_op);
+            return Err(PartitionInstallError::SwapIo {
+                path: partition_dir,
+                source,
+            });
         }
         outcome
     }
@@ -2831,7 +2886,7 @@ where
                     source,
                 })?;
         } else {
-            let enforce_fsync = self.effective_enforce_fsync(config);
+            let persisted = self.durability().is_persisted();
             let segment_size = self.effective_segment_size(config);
             let preallocate_segments = self.effective_preallocate_segments(config);
             let last = self.log.segments().len() - 1;
@@ -2845,7 +2900,7 @@ where
                 let messages_writer = MessagesWriter::new(
                     &messages_reader.path(),
                     messages_w.size_counter(),
-                    enforce_fsync,
+                    persisted,
                     true,
                     preallocate_segments.then_some(segment_size),
                 )
@@ -2857,7 +2912,7 @@ where
                 let index_writer = IggyIndexWriter::new(
                     &index_reader.path(),
                     index_w.size_counter(),
-                    enforce_fsync,
+                    persisted,
                     true,
                 )
                 .await
@@ -3143,6 +3198,17 @@ where
         // before the swap.
         self.purge_deferred = false;
 
+        if let Some(persistence) = &self.persistence {
+            persistence.reset(commit_op, offsets_wire.prepare_checksum);
+            self.start_persistence();
+            persistence
+                .drain()
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: partition_dir.to_owned(),
+                    source,
+                })?;
+        }
         let consensus = self.consensus();
         if commit_op > consensus.commit_min() {
             consensus.set_commit_floor(commit_op);
@@ -3158,9 +3224,12 @@ where
         // its entries are backed by the same erased journal, and
         // `LocalPipeline::push` asserts op sequentiality in release, so a bare
         // rewind would turn the silent desync into a shard panic on a replica
-        // promoted mid-transfer. (`last_prepare_checksum` needs nothing: it is
-        // only read as a `parent:` stamp when building a prepare.)
+        // promoted mid-transfer. The checksum moves with the installed head so
+        // a new primary extends the same prepare chain as the other replicas.
         consensus.sequencer().set_sequence(commit_op);
+        if let Some(checksum) = offsets_wire.prepare_checksum {
+            consensus.set_last_prepare_checksum(checksum);
+        }
         consensus.clear_pipeline();
         consensus.advance_commit_max(commit_op);
         self.observed_view = self.consensus().view();

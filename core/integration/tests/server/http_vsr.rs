@@ -45,7 +45,7 @@ const PARTITION_ID: u32 = 0;
 const CONSUMER_ID: u32 = 1;
 
 const DURABILITY_HEADER: &str = "iggy-durability";
-const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
+const DURABILITY_REPLICATED: &str = "replicated";
 const DURABILITY_NONE: &str = "none";
 
 /// `?ack=none` answers before the commit; poll until visible, never unbounded.
@@ -297,7 +297,7 @@ async fn given_http_session_when_producing_and_polling_should_round_trip(harness
         StatusCode::CREATED,
         "produce must commit"
     );
-    assert_eq!(durability(&response), DURABILITY_REPLICATED_MEMORY);
+    assert_eq!(durability(&response), DURABILITY_REPLICATED);
 
     let polled = http
         .poll("http-stream", "http-topic", PARTITION_ID, 0, 10)
@@ -353,7 +353,7 @@ async fn given_one_session_when_producing_concurrently_should_not_cross_talk(
             "concurrent produce {i} must commit"
         );
         assert_eq!(
-            durability, DURABILITY_REPLICATED_MEMORY,
+            durability, DURABILITY_REPLICATED,
             "concurrent produce {i} must attest a replicated commit"
         );
     }
@@ -989,5 +989,118 @@ async fn given_garbage_or_empty_token_when_refreshing_should_reject_401(harness:
             StatusCode::UNAUTHORIZED,
             "refresh with an invalid token ({token:?}) must be 401"
         );
+    }
+}
+
+#[iggy_harness]
+async fn given_independent_durability_policies_when_producing_should_attest_message_policy(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.create_stream("durability-http").await.unwrap();
+    let stream = Identifier::named("durability-http").unwrap();
+    let http = HttpClient::login_root(harness).await;
+    for (index, (message_policy, offset_policy)) in [
+        (Durability::Replicated, Durability::Replicated),
+        (Durability::Replicated, Durability::Persisted),
+        (Durability::Persisted, Durability::Replicated),
+        (Durability::Persisted, Durability::Persisted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let topic = format!("policy-{index}");
+        let created = http
+            .client
+            .post(http.url("/streams/durability-http/topics"))
+            .bearer_auth(&http.token)
+            .json(&CreateTopic {
+                name: topic.clone(),
+                options: BTreeMap::from([
+                    ("durability".to_string(), message_policy.to_string()),
+                    (
+                        "consumer_offset_durability".to_string(),
+                        offset_policy.to_string(),
+                    ),
+                ]),
+                ..CreateTopic::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "{}",
+            created.text().await.unwrap()
+        );
+        let details = client
+            .get_topic(&stream, &Identifier::named(&topic).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let policies = iggy_common::TopicRuntimeOptions::from_resource_options(&details.options);
+        assert_eq!(policies.durability, message_policy);
+        assert_eq!(policies.consumer_offset_durability, offset_policy);
+        for (query, status, expected) in [
+            ("", StatusCode::CREATED, message_policy.as_ref()),
+            (
+                "?ack=replicated",
+                StatusCode::CREATED,
+                message_policy.as_ref(),
+            ),
+            ("?ack=none", StatusCode::ACCEPTED, "none"),
+        ] {
+            let message = IggyMessage::builder()
+                .payload("policy".into())
+                .build()
+                .unwrap();
+            let response = http
+                .produce_with_query(
+                    "durability-http",
+                    &topic,
+                    PARTITION_ID,
+                    vec![message],
+                    query,
+                )
+                .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(durability(&response), expected);
+        }
+    }
+}
+
+#[iggy_harness]
+async fn given_one_http_durability_option_when_creating_should_derive_the_other_as_replicated(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-policy-defaults", "initial", 1)
+        .await;
+    for key in ["durability", "consumer_offset_durability"] {
+        let response = http
+            .client
+            .post(http.url("/streams/http-policy-defaults/topics"))
+            .bearer_auth(&http.token)
+            .json(&CreateTopic {
+                name: key.to_string(),
+                options: BTreeMap::from([(key.to_string(), "persisted".to_string())]),
+                ..CreateTopic::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let topic: serde_json::Value = response.json().await.unwrap();
+        for policy in ["durability", "consumer_offset_durability"] {
+            assert_eq!(
+                topic["options"][policy]["value"],
+                if policy == key {
+                    "persisted"
+                } else {
+                    "replicated"
+                }
+            );
+            assert_eq!(topic["options"][policy]["explicit"], policy == key);
+        }
     }
 }

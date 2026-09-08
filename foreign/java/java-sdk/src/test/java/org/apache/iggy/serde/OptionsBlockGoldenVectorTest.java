@@ -38,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * interoperability; these bytes are the contract, and a change to the TLV layout has to break every
  * copy of them together.
  *
- * <p>{@code enforce_fsync} (a one-byte {@code Bool}) and {@code segment_size} (an eight-byte
+ * <p>{@code preallocate_segments} (a one-byte {@code Bool}) and {@code segment_size} (an eight-byte
  * {@code Uint64}) cover both value widths. What the vector pins is the per-entry byte layout, not a
  * key order: these two land sorted only because the Rust core holds options in a {@code BTreeMap},
  * and the server accepts the insertion order this SDK emits.
@@ -46,15 +46,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 class OptionsBlockGoldenVectorTest {
 
     private static final byte[] GOLDEN_OPTIONS_BLOCK = {
-        2, 13, 0, 0, 0, 'e', 'n', 'f', 'o', 'r', 'c', 'e', '_', 'f', 's', 'y', 'n', 'c', 3, 1, 0, 0, 0, 1, 2, 12, 0, 0,
-        0, 's', 'e', 'g', 'm', 'e', 'n', 't', '_', 's', 'i', 'z', 'e', 12, 8, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0
+        2, 20, 0, 0, 0, 'p', 'r', 'e', 'a', 'l', 'l', 'o', 'c', 'a', 't', 'e', '_', 's', 'e', 'g', 'm', 'e', 'n', 't',
+        's', 3, 1, 0, 0, 0, 1, 2, 12, 0, 0, 0, 's', 'e', 'g', 'm', 'e', 'n', 't', '_', 's', 'i', 'z', 'e', 12, 8, 0, 0,
+        0, 0, 0, 0, 64, 0, 0, 0, 0, 2, 10, 0, 0, 0, 100, 117, 114, 97, 98, 105, 108, 105, 116, 121, 2, 9, 0, 0, 0, 112,
+        101, 114, 115, 105, 115, 116, 101, 100
     };
 
     @Test
     void shouldEncodeTheCrossSdkGoldenVector() {
         Map<HeaderKey, HeaderValue> options = new LinkedHashMap<>();
-        options.put(HeaderKey.fromString("enforce_fsync"), HeaderValue.fromBool(true));
+        options.put(HeaderKey.fromString("preallocate_segments"), HeaderValue.fromBool(true));
         options.put(HeaderKey.fromString("segment_size"), HeaderValue.fromUint64(BigInteger.valueOf(1_073_741_824L)));
+
+        options.put(HeaderKey.fromString("durability"), HeaderValue.fromString("persisted"));
 
         ByteBuf encoded = BytesSerializer.toBytes(options);
 

@@ -37,10 +37,10 @@ const EXAMPLES: &str = r#"EXAMPLES:
     $ cargo r -r --bin iggy-bench -- balanced-producer-and-consumer-group --partitions 24 --producers 6 --consumers 6 tcp
     $ cargo r -r --bin iggy-bench -- -T 10GB bpc tcp
 
-    Durability-matched run, where every produce ack waits for an fsync
+    Durability-matched run, where every produce ack waits for durable quorum storage
     (--partitions 1 routes every producer straight to that partition):
 
-    $ cargo r -r --bin iggy-bench -- --enforce-fsync --messages-required-to-save 1 \
+    $ cargo r -r --bin iggy-bench -- --durability persisted --messages-required-to-save 1 \
         balanced-producer --partitions 1 --producers 8 tcp
 
 3) End-to-End Benchmarking:

@@ -129,7 +129,7 @@ use crate::http::extractor::{Authenticated, Identity};
 use crate::http::metrics::gauge_value;
 use crate::http::reads::{
     authorize_data_plane, gate_local_read, read_local, resolve_gate_stream, resolve_gate_topic,
-    resolve_gate_topic_ids, resolve_gate_user,
+    resolve_gate_topic_ids, resolve_gate_user, topic_durability,
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
@@ -165,11 +165,10 @@ const PONG: &str = "pong";
 const HTTP_READ_CLIENT_ID: u128 = 0;
 
 /// Response header attesting what durability a produce response proves:
-/// [`DURABILITY_REPLICATED_MEMORY`] after an awaited quorum commit,
-/// [`DURABILITY_NONE`] for a `?ack=none` fire-and-forget.
+/// The completed topic policy after an awaited quorum commit. If namespace
+/// replacement prevents attesting its incarnation, report the proven quorum
+/// guarantee. [`DURABILITY_NONE`] means `?ack=none` dispatch acceptance.
 const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
-
-const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
 
 const DURABILITY_NONE: &str = "none";
 
@@ -697,7 +696,7 @@ pub(in crate::http) async fn get_snapshot(
     ))
     .await?;
     let archive = snapshot::collect(
-        Arc::clone(&state.system_config),
+        Arc::clone(&state.server_config),
         command.compression,
         command.snapshot_types,
     )
@@ -941,7 +940,27 @@ pub(in crate::http) async fn create_topic(
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     // Rejects empty/oversized name and partitions_count > MAX.
     command.validate().map_err(WriteError::Rejected)?;
+    let durability = command
+        .options
+        .get(iggy_common::topic_option_keys::DURABILITY)
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| WriteError::Rejected(IggyError::InvalidOptionValue("durability".to_string())))?
+        .unwrap_or_default();
+    let consumer_offset_durability = command
+        .options
+        .get(iggy_common::topic_option_keys::CONSUMER_OFFSET_DURABILITY)
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| {
+            WriteError::Rejected(IggyError::InvalidOptionValue(
+                "consumer_offset_durability".to_string(),
+            ))
+        })?
+        .unwrap_or_default();
     let options = TopicCreateOptions {
+        durability,
+        consumer_offset_durability,
         partitions_count: Some(command.partitions_count),
         compression_algorithm: (command.compression_algorithm != CompressionAlgorithm::default())
             .then_some(command.compression_algorithm),
@@ -952,7 +971,9 @@ pub(in crate::http) async fn create_topic(
         raw: command.options,
         ..TopicCreateOptions::default()
     };
-    let wire_options = options.to_wire().map_err(WriteError::Rejected)?;
+    let wire_options = options
+        .to_explicit_wire(|key| options.raw.contains_key(key))
+        .map_err(WriteError::Rejected)?;
     // Re-parse the encoded block so `--set`-style raw string entries get the
     // same typed pre-consensus checks as native fields; unknown keys deny
     // here with the key name.
@@ -1371,7 +1392,7 @@ pub(in crate::http) async fn get_consumer_offset(
 /// consensus (at-least-once, no dedup, no session gate - concurrent produces
 /// on one credential are legal), and the committed reply comes back through
 /// the session's in-process reply slot rather than a submit return value.
-/// The default answers 201 + `Iggy-Durability: replicated-memory` only
+/// The default answers 201 with the completed message durability only
 /// after the quorum commit, with the commit's per-partition confirmations as
 /// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
 /// after dispatch and can carry no confirmation, having awaited none.
@@ -1405,6 +1426,7 @@ pub(in crate::http) async fn send_messages(
         .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
         ProduceAck::Replicated => {
+            let policy = topic_durability(&state, &stream_id, &topic_id);
             let (reply, header) = SendWrapper::new(partition_write_replicated(
                 &state,
                 &identity.session,
@@ -1412,10 +1434,10 @@ pub(in crate::http) async fn send_messages(
                 &body,
             ))
             .await?;
-            let durability = [(
-                DURABILITY_HEADER,
-                HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
-            )];
+            let policy = policy.map_or(iggy_common::Durability::Replicated, |policy| {
+                policy.confirmed_policy(&state)
+            });
+            let durability = [(DURABILITY_HEADER, HeaderValue::from_static(policy.into()))];
             // An unreadable confirmation still answers 201: the batch committed,
             // only its offsets did not survive the reply.
             let confirmations = send_confirmations(&reply, &header)

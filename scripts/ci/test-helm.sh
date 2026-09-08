@@ -271,7 +271,7 @@ validate() {
   grep -q 'name: tcp-replica' "$HELM_RENDER_DIR/cluster.yaml"
 
   grep -q 'name: IGGY_CLUSTER_AUTH_SHARED_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
-  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
   grep -q 'name: IGGY_HTTP_JWT_ENCODING_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
   if grep -qE '^ +(encryptionKey|clusterSharedSecret|jwtEncodingSecret):' "$HELM_RENDER_DIR/cluster.yaml"; then
     echo "Error: cluster render inlined a secret value instead of referencing the existing Secret" >&2
@@ -455,7 +455,7 @@ server:
       value: "0.0.0.0:8080"
     - name: IGGY_WEBSOCKET_ADDRESS
       value: "0.0.0.0:8092"
-    - name: IGGY_SYSTEM_SHARDING_CPU_ALLOCATION
+    - name: IGGY_SHARDING_CPU_ALLOCATION
       value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
 ui:
   image:
