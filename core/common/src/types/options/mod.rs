@@ -698,9 +698,10 @@ impl TopicUpdateOptions {
 
 /// Typed view of the known topic option keys, parsed from a wire block.
 ///
-/// `None` means the key was absent, which always means "resolve from server
-/// defaults at admission". Values that parse to their type's `ServerDefault`
-/// sentinel are normalized to `None` for the same reason.
+/// Optional fields left as `None` resolve from server defaults at admission.
+/// The two durability fields instead default independently to `Replicated`
+/// and are sent explicitly. Provenance describes the wire request, not whether
+/// application code assigned a field after constructing its default value.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicCreateOptions {
     /// Partitions to allocate. NOT an option key: it fills the `CreateTopic`
@@ -943,11 +944,15 @@ impl TopicCreateOptions {
                 self.consumer_offset_durability,
             ),
         ] {
-            if let Some(raw) = self.raw.get(key)
-                && raw.parse::<Durability>().ok() != Some(policy)
-            {
-                return Err(IggyError::InvalidOptionValue(key.to_owned()));
-            }
+            let policy = self.raw.get(key).map_or(Ok(policy), |raw| {
+                let raw = raw
+                    .parse::<Durability>()
+                    .map_err(|_| IggyError::InvalidOptionValue(key.to_owned()))?;
+                if policy.is_persisted() && raw != policy {
+                    return Err(IggyError::InvalidOptionValue(key.to_owned()));
+                }
+                Ok(raw)
+            })?;
             options.insert(
                 HeaderKey::from_str(key).expect("catalog key is valid"),
                 OptionValue::explicit(HeaderValue::from_str(policy.as_ref())?),
@@ -987,7 +992,7 @@ impl TopicCreateOptions {
     /// `FromStr` rules a config file value goes through, so a typed field
     /// survives the round trip rather than being silently dropped.
     pub fn to_string_options(&self) -> Result<BTreeMap<String, String>, IggyError> {
-        self.to_option_map()?;
+        let resolved = self.to_option_map()?;
         // Typed fields are inserted over the raw entries, matching the
         // collision rule `to_wire` applies.
         let mut options = self.raw.clone();
@@ -999,11 +1004,17 @@ impl TopicCreateOptions {
         }
         options.insert(
             topic_option_keys::DURABILITY.to_owned(),
-            self.durability.to_string(),
+            resolved[&HeaderKey::from_str(topic_option_keys::DURABILITY)
+                .expect("catalog key is valid")]
+                .value
+                .to_string_value(),
         );
         options.insert(
             topic_option_keys::CONSUMER_OFFSET_DURABILITY.to_owned(),
-            self.consumer_offset_durability.to_string(),
+            resolved[&HeaderKey::from_str(topic_option_keys::CONSUMER_OFFSET_DURABILITY)
+                .expect("catalog key is valid")]
+                .value
+                .to_string_value(),
         );
         if let Some(messages_required_to_save) = self.messages_required_to_save {
             options.insert(
@@ -1429,6 +1440,21 @@ mod tests {
         assert_eq!(runtime.durability, Durability::Persisted);
         assert_eq!(runtime.messages_required_to_save, Some(9));
         assert_eq!(runtime.size_of_messages_required_to_save, None);
+    }
+
+    #[test]
+    fn raw_durability_can_strengthen_the_replicated_default() {
+        let options = TopicCreateOptions {
+            raw: BTreeMap::from([("durability".to_owned(), "persisted".to_owned())]),
+            ..TopicCreateOptions::default()
+        };
+        let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
+        assert_eq!(parsed.durability, Durability::Persisted);
+        assert_eq!(parsed.consumer_offset_durability, Durability::Replicated);
+        assert_eq!(
+            options.to_string_options().unwrap()["durability"],
+            "persisted"
+        );
     }
 
     #[test]

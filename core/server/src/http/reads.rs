@@ -398,6 +398,9 @@ pub(in crate::http) fn authorize_data_plane(
         .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
 }
 
+static DURABILITY_KEY: std::sync::LazyLock<iggy_common::HeaderKey> =
+    std::sync::LazyLock::new(|| "durability".parse().expect("catalog key is valid"));
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::http) struct TopicDurability {
     stream_id: usize,
@@ -408,18 +411,21 @@ pub(in crate::http) struct TopicDurability {
 
 impl TopicDurability {
     pub fn confirmed_policy(self, state: &HttpInner) -> iggy_common::Durability {
-        // Resolve by the numeric identity captured before dispatch. A rename does
-        // not change either the partition incarnation or its create-only policy.
-        let current = topic_durability(
-            state,
-            &Identifier::numeric(
-                u32::try_from(self.stream_id).expect("stream id fits wire bounds"),
-            )
-            .expect("stream id fits wire bounds"),
-            &Identifier::numeric(u32::try_from(self.topic_id).expect("topic id fits wire bounds"))
-                .expect("topic id fits wire bounds"),
-        );
-        self.confirmed_policy_for(current)
+        let unchanged = state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| {
+                inner
+                    .items
+                    .get(self.stream_id)
+                    .and_then(|stream| stream.topics.get(self.topic_id))
+                    .and_then(|topic| topic.partitions.first())
+                    .is_some_and(|partition| partition.created_revision == self.created_revision)
+            });
+        self.confirmed_policy_for(unchanged.then_some(self))
     }
 
     fn confirmed_policy_for(self, current: Option<Self>) -> iggy_common::Durability {
@@ -450,17 +456,17 @@ pub(in crate::http) fn topic_durability(
             let stream_id = resolve_stream_id(inner, &stream)?;
             let topic_id = resolve_topic_id(inner, stream_id, &topic)?;
             let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
-            let created_revision = topic
-                .partitions
-                .iter()
-                .map(|partition| partition.created_revision)
-                .min()?;
+            let created_revision = topic.partitions.first()?.created_revision;
             Some(TopicDurability {
                 stream_id,
                 topic_id,
                 created_revision,
-                durability: iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
-                    .durability,
+                durability: topic
+                    .options
+                    .get(&DURABILITY_KEY)
+                    .and_then(|option| std::str::from_utf8(option.value.as_bytes()).ok())
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default(),
             })
         })
 }

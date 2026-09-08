@@ -4076,6 +4076,8 @@ where
     // while `partitions` builds as a plain dependency, so `RetainedPartitionLog`
     // and `adopt_retained_log` are configured out and the crate does not compile.
     // The feature forwards to `partitions/simulator` instead.
+    /// # Panics
+    /// Rejects persisted policies because this in-memory materializer has no durable backend.
     #[cfg(feature = "simulator")]
     pub fn init_partition(
         &self,
@@ -4163,6 +4165,11 @@ where
                 })
                 .unwrap_or_default()
         });
+        assert!(
+            !runtime_options.durability.is_persisted()
+                && !runtime_options.consumer_offset_durability.is_persisted(),
+            "the in-memory partition simulator does not implement persisted topics. Use storage fault-model tests or the real-server harness"
+        );
         partition.set_runtime_options(runtime_options);
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
@@ -4303,6 +4310,14 @@ where
         // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         if partition.persist_superblock_if_needed().await {
+            let wire_actions = if partition.requires_state_transfer() {
+                wire_actions
+                    .into_iter()
+                    .filter(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
+                    .collect()
+            } else {
+                wire_actions
+            };
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
             dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
         }
@@ -4380,6 +4395,14 @@ where
         // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         if partition.persist_superblock_if_needed().await {
+            let wire_actions = if partition.requires_state_transfer() {
+                wire_actions
+                    .into_iter()
+                    .filter(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
+                    .collect()
+            } else {
+                wire_actions
+            };
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
             dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
         }
@@ -4533,6 +4556,7 @@ where
             );
             return;
         };
+        partition.ensure_materialization_recovery();
         let actions =
             partition
                 .consensus()
@@ -4557,6 +4581,14 @@ where
         // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         if partition.persist_superblock_if_needed().await {
+            let wire_actions = if partition.requires_state_transfer() {
+                wire_actions
+                    .into_iter()
+                    .filter(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
+                    .collect()
+            } else {
+                wire_actions
+            };
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
             dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
         }
@@ -4695,7 +4727,9 @@ where
                 // advertises this replica's current view. Withhold on failure;
                 // the stale peer keeps heartbeating, so it re-triggers once a
                 // later persist succeeds.
-                if partition.persist_superblock_if_needed().await {
+                if !partition.requires_state_transfer()
+                    && partition.persist_superblock_if_needed().await
+                {
                     respond_start_view::<B, _, MJ>(consensus).await;
                 }
             }
@@ -4747,6 +4781,14 @@ where
         // tripwire, and skipping it would drop both silently the day this
         // handler emits one.
         if partition.persist_superblock_if_needed().await {
+            let wire_actions = if partition.requires_state_transfer() {
+                wire_actions
+                    .into_iter()
+                    .filter(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
+                    .collect()
+            } else {
+                wire_actions
+            };
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
             dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
         }
@@ -5618,6 +5660,14 @@ where
             // must already record. Same gate as the `on_do_view_change` and
             // `on_start_view` partition arms.
             if partition.persist_superblock_if_needed().await {
+                let wire_actions = if partition.requires_state_transfer() {
+                    wire_actions
+                        .into_iter()
+                        .filter(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
+                        .collect()
+                } else {
+                    wire_actions
+                };
                 dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
                 dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
             }
@@ -7138,7 +7188,6 @@ where
         for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_mut_by_ns(namespace) {
                 partition.drive_persistence().await;
-                partition.checkpoint_persistence(partitions.config()).await;
                 if let Some(metrics) = partition.take_persistence_metrics() {
                     persistence_metrics.disk_bytes += metrics.disk_bytes;
                     persistence_metrics.queued_bytes += metrics.queued_bytes;
@@ -7291,7 +7340,9 @@ where
             if consensus.status() != Status::Normal {
                 refresh_partition_dvc_suffix(partition);
             }
+            partition.ensure_materialization_recovery();
             let actions = consensus.tick(PlaneKind::Partitions);
+            partition.ensure_materialization_recovery();
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
             // it is also what retries a persist an earlier site withheld on.
@@ -7300,6 +7351,14 @@ where
             // sites for the rationale.
             dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
             if partition.persist_superblock_if_needed().await {
+                let wire_actions = if partition.requires_state_transfer() {
+                    wire_actions
+                        .into_iter()
+                        .filter(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
+                        .collect()
+                } else {
+                    wire_actions
+                };
                 dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
                 dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
             }
@@ -7321,6 +7380,14 @@ where
                     if walks < PARTITION_WALKS_PER_TICK_MAX {
                         walks += 1;
                         partition.resume_queued_requests().await;
+                    } else {
+                        walk_cursor.get_or_insert(namespace);
+                    }
+                }
+                if partition.needs_persistence_checkpoint() {
+                    if walks < PARTITION_WALKS_PER_TICK_MAX {
+                        walks += 1;
+                        partition.checkpoint_persistence(partitions.config()).await;
                     } else {
                         walk_cursor.get_or_insert(namespace);
                     }
@@ -11113,12 +11180,10 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
 ) where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
+    SB: SuperblockStore,
 {
-    use std::mem::size_of;
-
     let bus = consensus.message_bus();
     let self_id = consensus.replica();
-    let cluster = consensus.cluster();
     let journal = &partition.log.journal().inner;
 
     let send = |target: u8, msg: Frozen<MESSAGE_ALIGN>| async move {
@@ -11149,44 +11214,16 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 view,
                 from_op,
                 to_op,
-                target,
-                group,
+                ..
             } => {
+                if *view != consensus.view() {
+                    continue;
+                }
                 for op in *from_op..=*to_op {
-                    let Some(prepare_header) = journal.header_by_op(op) else {
-                        continue;
-                    };
-                    let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
-                        .transmute_header(|_, h: &mut PrepareOkHeader| {
-                            h.command = Command::PrepareOk;
-                            h.cluster = cluster;
-                            h.replica = self_id;
-                            h.view = *view;
-                            h.op = op;
-                            h.commit = consensus.commit_max();
-                            h.timestamp = prepare_header.timestamp;
-                            h.parent = prepare_header.parent;
-                            h.prepare_checksum = prepare_header.checksum;
-                            h.request = prepare_header.request;
-                            h.operation = prepare_header.operation;
-                            h.group = *group;
-                            h.size = size_of::<PrepareOkHeader>() as u32;
-                            h.seal();
-                        });
-                    send(*target, msg.into_generic().into_frozen()).await;
+                    partition.acknowledge_prepare(op).await;
                 }
             }
             VsrAction::RetransmitPrepares { targets } => {
-                // DURABILITY CAVEAT: the only `Storage` impl on
-                // `PartitionJournal` right now is the in-memory
-                // `PartitionJournalMemStorage`. After a process restart
-                // the journal is empty and every `journal.entry` below
-                // returns `None`, so retransmit silently drops the
-                // request and peers stall until a view change. The bus
-                // and consensus plumbing is correct; only the storage
-                // needs to become durable before cluster workloads go to
-                // production. Server boot emits a loud warning to the
-                // operator (see `main.rs`).
                 let current_view = consensus.view();
                 for (header, replicas) in targets {
                     let Some(prepare) = journal.entry(header).await else {
@@ -12476,5 +12513,94 @@ mod metadata_repair_session_tests {
         // A frame was lost inside the served chunk: re-requesting now would
         // race the retry timer for the same window.
         assert!(!repair_chunk_walked(5, 5, 12));
+    }
+}
+
+#[cfg(test)]
+mod partition_ack_durability_tests {
+    use super::*;
+    use iggy_common::PartitionStats;
+    use iggy_common::{Durability, IggyByteSize, TopicRuntimeOptions};
+    use message_bus::IggyMessageBus;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[compio::test]
+    async fn start_view_ack_waits_for_partition_wal_completion() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "iggy-start-view-wal-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let consensus =
+            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        consensus.mark_superblock_durable(0, 0);
+        let mut partition: IggyPartition<IggyMessageBus> = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+        );
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.set_runtime_options(TopicRuntimeOptions {
+            consumer_offset_durability: Durability::Persisted,
+            ..TopicRuntimeOptions::default()
+        });
+        partition.open_persistence().await.unwrap();
+        let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::StoreConsumerOffset;
+                header.cluster = 1;
+                header.group = 42;
+                header.op = 1;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                header.checksum = header.identity_checksum();
+            },
+        );
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .unwrap();
+        partition.consensus().sequencer().set_sequence(1);
+        dispatch_partition_journal_actions(
+            partition.consensus(),
+            &partition,
+            &[VsrAction::SendPrepareOk {
+                view: 0,
+                from_op: 1,
+                to_op: 1,
+                target: 0,
+                group: 42,
+            }],
+        )
+        .await;
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert!(
+            acknowledgments.is_empty(),
+            "StartView must not bypass the WAL barrier"
+        );
+        for _ in 0..100 {
+            compio::runtime::time::sleep(Duration::from_millis(10)).await;
+            partition.drive_persistence().await;
+            partition
+                .consensus()
+                .drain_loopback_into(&mut acknowledgments);
+            if !acknowledgments.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(acknowledgments.len(), 1);
+        drop(partition);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

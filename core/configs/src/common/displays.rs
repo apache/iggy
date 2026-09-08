@@ -21,7 +21,7 @@ use super::server::{
 };
 use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
-    system::{EncryptionConfig, LoggingConfig, StreamConfig, TopicConfig},
+    system::{EncryptionConfig, LoggingConfig},
 };
 use std::fmt::{Display, Formatter};
 
@@ -123,18 +123,6 @@ impl Display for HeartbeatConfig {
 impl Display for EncryptionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{{ enabled: {} }}", self.enabled)
-    }
-}
-
-impl Display for StreamConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
-    }
-}
-
-impl Display for TopicConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
     }
 }
 

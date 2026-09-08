@@ -28,12 +28,11 @@ use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
 use crate::common::system::{
-    EncryptionConfig, INDEX_EXTENSION, LOG_EXTENSION, LoggingConfig, RuntimeConfig, StreamConfig,
-    TopicConfig,
+    EncryptionConfig, INDEX_EXTENSION, LOG_EXTENSION, LoggingConfig, RuntimeConfig,
 };
 use configs::{
     ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
-    TypedEnvProvider,
+    RelocatedTarget, TypedEnvProvider,
 };
 use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
@@ -50,6 +49,20 @@ pub use crate::common::server::{
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
+pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_ENV_PATH",
+    "IGGY_DISPLAY_CONFIG",
+    "IGGY_ROOT_USERNAME",
+    "IGGY_ROOT_PASSWORD",
+    "IGGY_TEST_VERBOSE",
+    "IGGY_TEST_CLUSTER_NODES",
+    "IGGY_TEST_CLEANUP_DISABLED",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+    "IGGY_SHARD_EVENT_INTERVAL",
+    "IGGY_CI_BUILD",
+];
+
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
 /// Server config keys that became per-topic options, or went away with the
@@ -60,20 +73,56 @@ const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 /// enough. The partition knobs matter most: they are create-only options now,
 /// so a topic that boots without one can never be given it afterwards.
 const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
+    RelocatedKey {
+        path: "system.path",
+        replacement: RelocatedTarget::MovedTo("path"),
+    },
+    RelocatedKey {
+        path: "system.runtime",
+        replacement: RelocatedTarget::MovedTo("runtime"),
+    },
+    RelocatedKey {
+        path: "system.logging",
+        replacement: RelocatedTarget::MovedTo("logging"),
+    },
+    RelocatedKey {
+        path: "system.encryption",
+        replacement: RelocatedTarget::MovedTo("encryption"),
+    },
+    RelocatedKey {
+        path: "system.partition",
+        replacement: RelocatedTarget::MovedTo("partition"),
+    },
+    RelocatedKey {
+        path: "system.sharding",
+        replacement: RelocatedTarget::MovedTo("sharding"),
+    },
+    RelocatedKey {
+        path: "system.memory_pool",
+        replacement: RelocatedTarget::MovedTo("memory_pool"),
+    },
+    RelocatedKey {
+        path: "stream",
+        replacement: RelocatedTarget::Removed,
+    },
+    RelocatedKey {
+        path: "topic",
+        replacement: RelocatedTarget::Removed,
+    },
     // Reject the removed table and every former environment mapping beneath it.
     RelocatedKey {
         path: "system",
-        replacement: None,
+        replacement: RelocatedTarget::Removed,
     },
     RelocatedKey {
         path: "partition.consumer_offset_enforce_fsync",
-        replacement: Some("consumer_offset_durability"),
+        replacement: RelocatedTarget::TopicOption("consumer_offset_durability"),
     },
     // The whole table, not just its leaves. Caps are compile-time constants
     // enforced at admission, so a per-node value could only diverge from them.
     RelocatedKey {
         path: "extra",
-        replacement: None,
+        replacement: RelocatedTarget::Removed,
     },
 ];
 
@@ -99,8 +148,6 @@ pub struct ServerConfig {
     pub encryption: EncryptionConfig,
     pub memory_pool: MemoryPoolConfig,
     pub sharding: ShardingConfig,
-    pub stream: StreamConfig,
-    pub topic: TopicConfig,
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
@@ -203,6 +250,12 @@ impl ServerConfig {
             Some(default_config),
         )
         .with_relocated_keys(ServerConfig::ENV_PREFIX, RELOCATED_CONFIG_KEYS)
+        .with_known_env_names(
+            Self::all_env_var_names()
+                .into_iter()
+                .chain(SERVER_PROCESS_ENV_VARS.iter().copied())
+                .collect(),
+        )
     }
 
     /// All recognised env var names for [`ServerConfig`].
@@ -267,7 +320,7 @@ impl ServerConfig {
     }
 
     pub fn get_streams_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.stream.path)
+        format!("{}/streams", self.get_system_path())
     }
 
     pub fn get_stream_path(&self, stream_id: usize) -> String {
@@ -275,7 +328,7 @@ impl ServerConfig {
     }
 
     pub fn get_topics_path(&self, stream_id: usize) -> String {
-        format!("{}/{}", self.get_stream_path(stream_id), self.topic.path)
+        format!("{}/topics", self.get_stream_path(stream_id))
     }
 
     pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {

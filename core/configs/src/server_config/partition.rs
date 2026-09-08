@@ -157,7 +157,7 @@ fn default_consumer_offsets_max() -> usize {
 }
 
 pub const DEFAULT_PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
-pub const MIN_PARTITION_WAL_BYTES_MAX: u64 = 64 * 1024 * 1024 + 4096;
+pub const MIN_PARTITION_WAL_BYTES_MAX: u64 = 2 * (64 * 1024 * 1024 + 4096);
 pub const MAX_PARTITION_WAL_BYTES_MAX: u64 = 4 * 1024 * 1024 * 1024;
 
 fn default_wal_bytes_max() -> IggyByteSize {

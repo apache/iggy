@@ -54,8 +54,6 @@ impl Default for ServerConfig {
             heartbeat: HeartbeatConfig::default(),
             node: NodeConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
-            stream: Default::default(),
-            topic: Default::default(),
             path: SERVER_CONFIG.path.to_owned(),
             runtime: Default::default(),
             logging: Default::default(),

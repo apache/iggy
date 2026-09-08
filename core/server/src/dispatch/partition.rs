@@ -104,6 +104,16 @@ where
             return;
         };
         let partitions = shard.plane.partitions();
+        if partitions.with_partition(
+            &namespace,
+            partitions::IggyPartition::requires_state_transfer,
+        ) == Some(true)
+        {
+            let _ = reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+            return;
+        }
         match read {
             PartitionRead::Poll { consumer, args } => {
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {

@@ -51,7 +51,7 @@ enum Mutation {
 #[test]
 fn process_crash_preserves_completed_writes_but_power_loss_requires_file_and_directory_sync() {
     block_on(async {
-        let storage = SimStorage::default();
+        let storage = storage_for_partition().await;
         storage
             .create_directories(Path::new(DIRECTORY))
             .await
@@ -72,13 +72,13 @@ fn process_crash_preserves_completed_writes_but_power_loss_requires_file_and_dir
             b"buffered"
         );
         storage.crash(Crash::PowerLoss);
-        assert!(!storage.exists(path).unwrap());
+        assert!(!storage.exists(path).await.unwrap());
         let mut file = storage.open(path, OpenMode::Create).await.unwrap();
         file.write(0, b"synced".to_vec()).await.unwrap();
         file.sync().await.unwrap();
         storage.crash(Crash::PowerLoss);
         assert!(
-            !storage.exists(path).unwrap(),
+            !storage.exists(path).await.unwrap(),
             "file sync must not imply directory sync"
         );
         replace(&storage, path, b"durable").await.unwrap();
@@ -234,7 +234,7 @@ fn durable_quorum_covers_buffered_predecessors_and_losing_unsynced_replicas() {
             let second = prepare(2, first.header().checksum);
             let mut disks = Vec::new();
             for replica in 0..replicas {
-                let storage = SimStorage::default();
+                let storage = storage_for_partition().await;
                 let mut journal = PartitionPrepareJournal::open_with_storage(
                     Path::new(WAL),
                     42,
@@ -280,7 +280,7 @@ fn durable_quorum_covers_buffered_predecessors_and_losing_unsynced_replicas() {
 #[test]
 fn stalled_writer_does_not_release_acks_or_block_another_partition() {
     block_on(async {
-        let storage = SimStorage::default();
+        let storage = storage_for_partition().await;
         let (persistence, _) =
             PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                 .await
@@ -294,7 +294,7 @@ fn stalled_writer_does_not_release_acks_or_block_another_partition() {
         let mut writer = Box::pin(Rc::clone(&persistence).run());
         assert!(poll!(&mut writer).is_pending());
         assert!(!persistence.is_durable(first.header()));
-        let independent = SimStorage::default();
+        let independent = storage_for_partition().await;
         let mut journal =
             PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, independent)
                 .await
@@ -321,7 +321,7 @@ fn stalled_writer_does_not_release_acks_or_block_another_partition() {
 #[test]
 fn queue_capacity_and_retirement_withhold_unpersisted_acknowledgments() {
     block_on(async {
-        let storage = SimStorage::default();
+        let storage = storage_for_partition().await;
         let (persistence, _) =
             PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                 .await
@@ -405,7 +405,7 @@ fn interrupted_rollback_can_itself_restart_at_every_io_boundary() {
 #[test]
 fn failed_durable_completion_never_releases_a_prepare_ack() {
     block_on(async {
-        let storage = SimStorage::default();
+        let storage = storage_for_partition().await;
         let (persistence, _) =
             PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                 .await
@@ -420,7 +420,7 @@ fn failed_durable_completion_never_releases_a_prepare_ack() {
         let trace = storage.trace();
         for cut in 0..trace.len() {
             for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
-                let storage = SimStorage::default();
+                let storage = storage_for_partition().await;
                 let (persistence, _) =
                     PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                         .await
@@ -503,7 +503,7 @@ fn lost_frontier_cannot_turn_a_durable_journal_into_an_empty_one() {
 #[test]
 fn first_open_recovers_after_each_initialization_fault() {
     block_on(async {
-        let storage = SimStorage::default();
+        let storage = storage_for_partition().await;
         PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
             .await
             .unwrap();
@@ -511,7 +511,7 @@ fn first_open_recovers_after_each_initialization_fault() {
         for (cut, operation) in trace.iter().enumerate() {
             for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
                 for crash in [Crash::Process, Crash::PowerLoss] {
-                    let storage = SimStorage::default();
+                    let storage = storage_for_partition().await;
                     storage.fail_at(cut, mode);
                     let _ = PartitionPrepareJournal::open_with_storage(
                         Path::new(WAL),
@@ -543,7 +543,7 @@ fn first_open_recovers_after_each_initialization_fault() {
 #[test]
 fn deleting_and_recreating_a_partition_fences_an_old_writer_completion() {
     block_on(async {
-        let storage = SimStorage::default();
+        let storage = storage_for_partition().await;
         let (old, _) = PartitionPersistence::open_with_storage(
             Path::new("/partition/prepares-7"),
             42,
@@ -559,9 +559,14 @@ fn deleting_and_recreating_a_partition_fences_an_old_writer_completion() {
         let mut writer = Box::pin(Rc::clone(&old).run());
         assert!(poll!(&mut writer).is_pending());
         old.retire();
-        storage.remove_tree(Path::new(DIRECTORY)).unwrap();
+        storage.remove_tree(Path::new(DIRECTORY)).await.unwrap();
         storage.sync_directory(Path::new("/")).await.unwrap();
         storage.resume_writes();
+        storage
+            .create_directories(Path::new(DIRECTORY))
+            .await
+            .unwrap();
+        storage.sync_directory(Path::new("/")).await.unwrap();
         let (new, _) = PartitionPersistence::open_with_storage(
             Path::new("/partition/prepares-8"),
             42,
@@ -602,7 +607,7 @@ fn independent_message_and_offset_barriers_cover_the_required_prefix() {
                 iggy_common::Durability::Replicated,
                 iggy_common::Durability::Persisted,
             ] {
-                let storage = SimStorage::default();
+                let storage = storage_for_partition().await;
                 let (persistence, _) =
                     PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                         .await
@@ -672,6 +677,13 @@ fn queued_prepares_share_a_barrier_and_survive_power_loss_together() {
                 .filter(|operation| **operation == StorageOperation::DirectorySync)
                 .count(),
             2
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|operation| **operation == StorageOperation::Write)
+                .count(),
+            4
         );
         assert!(persistence.is_durable_through(65));
         storage.crash(Crash::PowerLoss);
@@ -780,8 +792,122 @@ fn failed_materialization_keeps_wal_coverage_and_fences_completion() {
     });
 }
 
-async fn queued_batch(count: u64) -> (SimStorage, Rc<PartitionPersistence<SimStorage>>) {
+#[test]
+fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
+    block_on(async {
+        let (storage, mut journal) = baseline().await;
+        storage.clear_trace();
+        journal.checkpoint(2).await.unwrap();
+        let unlink = storage
+            .trace()
+            .iter()
+            .position(|operation| *operation == StorageOperation::Unlink)
+            .unwrap();
+        for restart in [false, true] {
+            let (storage, mut journal) = baseline().await;
+            storage.fail_at(unlink, FaultMode::Before);
+            journal.checkpoint(2).await.unwrap();
+            storage.clear_trace();
+            let obsolete = Path::new("/partition/wal/prepares-0.wal");
+            assert!(storage.exists(obsolete).await.unwrap());
+            if restart {
+                drop(journal);
+                storage.crash(Crash::PowerLoss);
+                journal = PartitionPrepareJournal::open_with_storage(
+                    Path::new(WAL),
+                    42,
+                    7,
+                    storage.clone(),
+                )
+                .await
+                .unwrap();
+            } else {
+                let parent = journal
+                    .prepares()
+                    .await
+                    .unwrap()
+                    .last()
+                    .map(|prepare| {
+                        bytemuck::checked::from_bytes::<PrepareHeader>(
+                            &prepare.as_slice()[..size_of::<PrepareHeader>()],
+                        )
+                        .checksum
+                    })
+                    .unwrap();
+                journal
+                    .append(prepare(4, parent).into_frozen())
+                    .await
+                    .unwrap();
+            }
+            assert!(!storage.exists(obsolete).await.unwrap());
+            assert_eq!(journal.checkpoint_op(), 2);
+            assert!(journal.prepares().await.unwrap().iter().any(|prepare| {
+                bytemuck::checked::from_bytes::<PrepareHeader>(
+                    &prepare.as_slice()[..size_of::<PrepareHeader>()],
+                )
+                .op == 2
+            }));
+        }
+    });
+}
+
+#[test]
+fn dropping_a_stalled_writer_restores_ownership_and_releases_drain_waiters() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(1).await;
+        storage.pause_writes();
+        assert!(persistence.start());
+        let mut writer = Box::pin(Rc::clone(&persistence).run());
+        assert!(poll!(&mut writer).is_pending());
+        let mut drain = Box::pin(persistence.drain());
+        assert!(poll!(&mut drain).is_pending());
+        drop(writer);
+        assert_eq!(drain.await.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!persistence.start());
+    });
+}
+
+#[test]
+fn rename_rejects_a_nonempty_directory_and_a_fault_is_transient() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        storage
+            .create_directories(Path::new("/source"))
+            .await
+            .unwrap();
+        storage
+            .create_directories(Path::new("/target/child"))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .rename(Path::new("/source"), Path::new("/target"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::DirectoryNotEmpty
+        );
+        assert!(storage.exists(Path::new("/source")).await.unwrap());
+        storage.fail_at(0, FaultMode::Before);
+        assert!(storage.remove_tree(Path::new("/target")).await.is_err());
+        storage.remove_tree(Path::new("/target")).await.unwrap();
+        assert!(!storage.exists(Path::new("/target")).await.unwrap());
+    });
+}
+
+async fn storage_for_partition() -> SimStorage {
     let storage = SimStorage::default();
+    storage
+        .create_directories(Path::new(DIRECTORY))
+        .await
+        .unwrap();
+    storage.sync_directory(Path::new("/")).await.unwrap();
+    storage.clear_trace();
+    storage
+}
+
+async fn queued_batch(count: u64) -> (SimStorage, Rc<PartitionPersistence<SimStorage>>) {
+    let storage = storage_for_partition().await;
     let (persistence, _) =
         PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
             .await
@@ -797,7 +923,7 @@ async fn queued_batch(count: u64) -> (SimStorage, Rc<PartitionPersistence<SimSto
 }
 
 async fn baseline() -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
-    let storage = SimStorage::default();
+    let storage = storage_for_partition().await;
     let mut journal =
         PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
             .await
@@ -942,13 +1068,22 @@ async fn assert_recovery(
         Mutation::Purge => {
             assert_eq!(journal.head(), 3);
             assert!([(0, 0), (9, 3)].contains(&journal.purge_marker()));
-            if storage.exists(Path::new("/partition/purge.gen")).unwrap() {
+            if storage
+                .exists(Path::new("/partition/purge.gen"))
+                .await
+                .unwrap()
+            {
                 assert_eq!(journal.purge_marker(), (9, 3));
-                assert!(!storage.exists(Path::new("/partition/state")).unwrap());
+                assert!(!storage.exists(Path::new("/partition/state")).await.unwrap());
             }
             if completed {
                 assert_eq!(journal.purge_marker(), (9, 3));
-                assert!(storage.exists(Path::new("/partition/purge.gen")).unwrap());
+                assert!(
+                    storage
+                        .exists(Path::new("/partition/purge.gen"))
+                        .await
+                        .unwrap()
+                );
             }
         }
     }
@@ -956,6 +1091,7 @@ async fn assert_recovery(
     assert_eq!(
         entries.len() as u64,
         journal.head() - journal.checkpoint_op()
+            + u64::from(matches!(mutation, Mutation::Checkpoint) && journal.checkpoint_op() > 0)
     );
 }
 

@@ -432,11 +432,9 @@ mod tests {
     /// in their own unit tests, and a change to the TLV layout has to break all
     /// of them together instead of leaving one SDK talking to itself.
     ///
-    /// `preallocate_segments=true` (a `Bool`) and `segment_size=1 GiB` (a `Uint64`)
-    /// cover both a one-byte and an eight-byte value. What the vector pins is
-    /// the per-entry byte layout, not a key order: these two land sorted only
-    /// because `iggy_common` holds options in a `BTreeMap`, and
-    /// `unsorted_keys_are_accepted` covers the SDKs that emit insertion order.
+    /// The vector covers Bool, Uint64 and String values in insertion order.
+    /// It deliberately differs from Rust's sorted map order. Decoders accept
+    /// either ordering, and the bytes pin the per-entry layout across SDKs.
     const GOLDEN_OPTIONS_BLOCK: &[u8] = &[
         2, 20, 0, 0, 0, // key kind String, length 20
         b'p', b'r', b'e', b'a', b'l', b'l', b'o', b'c', b'a', b't', b'e', b'_', b's', b'e', b'g',

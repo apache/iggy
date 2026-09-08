@@ -627,3 +627,174 @@ async fn given_persisted_topic_when_backup_misses_writes_should_repair_before_du
         .await
         .unwrap();
 }
+
+#[iggy_harness(cluster_nodes = 3, server(partition.wal_bytes_max = "134225920 B"))]
+async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_the_log(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream_details = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::numeric(stream_details.id).unwrap();
+    let topic_details = client
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let topic = Identifier::numeric(topic_details.id).unwrap();
+    for batch in 1..=2u8 {
+        let payload = bytes::Bytes::from(vec![batch; 1024 * 1024]);
+        let mut messages = (0..33)
+            .map(|_| {
+                IggyMessage::builder()
+                    .payload(payload.clone())
+                    .build()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        client
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let checkpointed = (0..3).all(|node| {
+            let directory = harness.node(node).data_path().join(format!(
+                "streams/{}/topics/{}/partitions/0",
+                stream_details.id, topic_details.id
+            ));
+            std::fs::read_dir(directory).ok().is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("prepares-")
+                        && std::fs::read(entry.path().join("frontier"))
+                            .ok()
+                            .is_some_and(|bytes| {
+                                bytes.len() == 4096
+                                    && u64::from_le_bytes(bytes[48..56].try_into().unwrap()) == 2
+                                    && u64::from_le_bytes(bytes[72..80].try_into().unwrap()) == 2
+                            })
+                })
+            })
+        });
+        if checkpointed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "all replicas must checkpoint the same head before restart"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let client = wait_until_cluster_serves(harness, &[0, 1, 2], CONVERGE_TIMEOUT).await;
+    let mut next = vec![
+        IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"after-checkpoint"))
+            .build()
+            .unwrap(),
+    ];
+    let clients = [
+        client,
+        harness.root_client_for_node(1).await.unwrap(),
+        harness.root_client_for_node(2).await.unwrap(),
+    ];
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    let writer = 'admission: loop {
+        for (index, client) in clients.iter().enumerate() {
+            match client
+                .send_messages(&stream, &topic, &Partitioning::partition_id(0), &mut next)
+                .await
+            {
+                Ok(_) => break 'admission index,
+                Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("checkpointed cluster did not resume writes: {error}"),
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkpointed partition must elect a primary"
+        );
+        sleep(POLL_INTERVAL).await;
+    };
+    let client = &clients[writer];
+    for (offset, value) in [(0, 1u8), (65, 2u8)] {
+        let polled = client
+            .poll_messages(
+                &stream,
+                &topic,
+                Some(0),
+                &Consumer::default(),
+                &PollingStrategy::offset(offset),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(polled.messages.len(), 1);
+        assert_eq!(
+            polled.messages[0].payload.as_ref(),
+            vec![value; 1024 * 1024]
+        );
+    }
+    verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id).await;
+}
+
+async fn verify_checkpoint_quarantine(harness: &mut TestHarness, stream_id: u32, topic_id: u32) {
+    let directory = harness.node(2).data_path().join(format!(
+        "streams/{stream_id}/topics/{topic_id}/partitions/0"
+    ));
+    harness.kill_node(2).unwrap();
+    // An empty segment starting inside the existing segment makes the chain
+    // structurally invalid even when recovery can use a sparse index.
+    std::fs::write(directory.join("00000000000000000001.log"), []).unwrap();
+    std::fs::write(directory.join("00000000000000000001.index"), []).unwrap();
+    harness.restart_node(2).unwrap();
+    let client = harness.root_client_for_node(2).await.unwrap();
+    let stream = Identifier::numeric(stream_id).unwrap();
+    let topic = Identifier::numeric(topic_id).unwrap();
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let repaired = client
+            .poll_messages(
+                &stream,
+                &topic,
+                Some(0),
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                1,
+                false,
+            )
+            .await
+            .is_ok_and(|polled| {
+                polled
+                    .messages
+                    .first()
+                    .is_some_and(|message| message.payload.as_ref() == vec![1; 1024 * 1024])
+            });
+        let quarantined = std::fs::read_dir(directory.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("0.fenced."));
+        if repaired && quarantined && !directory.join("materialization.missing").exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "quarantined checkpoint must be restored by full state transfer"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}

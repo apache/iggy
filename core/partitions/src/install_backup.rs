@@ -37,15 +37,17 @@ pub async fn recover_with_storage<S: DurableStorage>(
     directory: &Path,
     storage: &S,
 ) -> io::Result<()> {
+    storage.remove_tree(&directory.join(BUILDING)).await?;
+    storage.remove_tree(&directory.join(RETIRED)).await?;
     let backup = directory.join(BACKUP);
-    if !storage.exists(&backup)? {
+    if !storage.exists(&backup).await? {
         return Ok(());
     }
-    for entry in storage.entries(directory)? {
+    for entry in storage.entries(directory).await? {
         if entry.name == BACKUP {
             continue;
         }
-        storage.remove_tree(&directory.join(&entry.name))?;
+        storage.remove_tree(&directory.join(&entry.name)).await?;
     }
     link_tree(&backup, directory, false, storage).await?;
     finish_with_storage(directory, storage).await
@@ -67,12 +69,12 @@ pub async fn begin_with_storage<S: DurableStorage>(
     directory: &Path,
     storage: &S,
 ) -> io::Result<()> {
-    if storage.exists(&directory.join(BACKUP))? {
+    if storage.exists(&directory.join(BACKUP)).await? {
         return Err(io::Error::other("partition install recovery is pending"));
     }
     let building = directory.join(BUILDING);
-    storage.remove_tree(&building)?;
-    storage.remove_tree(&directory.join(RETIRED))?;
+    storage.remove_tree(&building).await?;
+    storage.remove_tree(&directory.join(RETIRED)).await?;
     storage.create_directories(&building).await?;
     link_tree(directory, &building, true, storage).await?;
     storage.rename(&building, &directory.join(BACKUP)).await?;
@@ -97,7 +99,7 @@ pub async fn finish_with_storage<S: DurableStorage>(
     storage.rename(&directory.join(BACKUP), &retired).await?;
     storage.sync_directory(directory).await?;
     // The durable rename is the commit point. Cleanup never changes recovery.
-    if let Err(error) = storage.remove_tree(&retired) {
+    if let Err(error) = storage.remove_tree(&retired).await {
         tracing::warn!(%error, path = %retired.display(), "cannot remove completed install backup");
     }
     Ok(())
@@ -113,7 +115,7 @@ async fn link_tree<S: DurableStorage>(
     let mut directories = Vec::new();
     while let Some((source, target)) = pending.pop() {
         directories.push(target.clone());
-        for entry in storage.entries(&source)? {
+        for entry in storage.entries(&source).await? {
             let name = entry.name;
             if skip_scratch && is_scratch(&name.to_string_lossy()) {
                 continue;

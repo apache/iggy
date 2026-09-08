@@ -1066,13 +1066,13 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             key: WireName::new(topic_option_keys::DURABILITY).map_err(|_| IggyError::InvalidFormat)?,
             kind: HeaderKind::String.as_code(),
             default_value: Bytes::from_static(b"replicated"),
-            description: "Message completion: replicated or persisted. Independently defaults to replicated. A singleton quorum has one copy.".to_string(),
+            description: "Message completion: replicated or persisted. Independently defaults to replicated. A singleton quorum has one copy. In replicated groups, either persisted policy enables a WAL containing full message bodies and spends partition.wal_bytes_max on those bodies.".to_string(),
         },
         OptionDescriptor {
             key: WireName::new(topic_option_keys::CONSUMER_OFFSET_DURABILITY).map_err(|_| IggyError::InvalidFormat)?,
             kind: HeaderKind::String.as_code(),
             default_value: Bytes::from_static(b"replicated"),
-            description: "Explicit offset completion: replicated or persisted. Independently defaults to replicated. Poll auto-commit remains asynchronous.".to_string(),
+            description: "Explicit offset completion: replicated or persisted. Independently defaults to replicated. Poll auto-commit remains asynchronous. In replicated groups, persisted offsets also journal full message bodies, even with replicated message durability, and spend partition.wal_bytes_max on them.".to_string(),
         },
         OptionDescriptor {
             key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)

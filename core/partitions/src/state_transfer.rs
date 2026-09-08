@@ -562,7 +562,11 @@ impl fmt::Display for ConsumerOffsetsWireError {
                 write!(f, "durable state transfer requires a prepare checksum")
             }
             Self::Truncated => write!(f, "consumer-offsets artifact is truncated"),
-            Self::BadMagic => write!(f, "consumer-offsets artifact carries a foreign magic"),
+            Self::BadMagic => write!(
+                f,
+                "consumer-offsets artifact must use {} version {CONSUMER_OFFSETS_VERSION}",
+                String::from_utf8_lossy(&CONSUMER_OFFSETS_MAGIC)
+            ),
             Self::TrailingBytes { extra } => write!(
                 f,
                 "consumer-offsets artifact carries {extra} trailing bytes past this \
@@ -1524,6 +1528,55 @@ fn segment_dir_entries(partition_dir: &str) -> std::io::Result<Vec<PathBuf>> {
         .collect())
 }
 
+const MATERIALIZATION_MISSING: &str = "materialization.missing";
+
+/// Fence replacement files before quarantining the authoritative materialization.
+///
+/// # Errors
+/// Returns an error if the recovery fence cannot be published durably.
+pub async fn mark_materialization_missing(directory: &str, revision: u64) -> std::io::Result<()> {
+    let path = Path::new(directory).join(MATERIALIZATION_MISSING);
+    let temporary = Path::new(directory).join("materialization.missing.tmp");
+    let mut file = compio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .await?;
+    file.write_all_at(revision.to_le_bytes().to_vec(), 0)
+        .await
+        .0?;
+    file.sync_all().await?;
+    compio::fs::rename(temporary, path).await?;
+    fsync_dir(directory).await
+}
+
+/// # Errors
+/// Returns an error if the recovery fence cannot be read or validated.
+pub async fn materialization_is_missing(directory: &str, revision: u64) -> std::io::Result<bool> {
+    match compio::fs::read(Path::new(directory).join(MATERIALIZATION_MISSING)).await {
+        Ok(bytes) => {
+            let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid materialization fence",
+                )
+            })?;
+            Ok(u64::from_le_bytes(bytes) == revision)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn clear_materialization_missing(directory: &str) -> std::io::Result<()> {
+    match compio::fs::remove_file(Path::new(directory).join(MATERIALIZATION_MISSING)).await {
+        Ok(()) => fsync_dir(directory).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Move every segment file in `partition_dir` aside into `<dir>.fenced.<n>/`,
 /// returning the directory used.
 ///
@@ -2094,6 +2147,13 @@ where
         let Some(dir) = self.partition_dir.clone() else {
             return Ok(None);
         };
+        if let Some(persistence) = &self.persistence {
+            persistence.retire();
+            persistence.drain_with_timeout().await?;
+        }
+        if self.consensus().replica_count() > 1 {
+            mark_materialization_missing(&dir, self.created_revision).await?;
+        }
         quarantine_segment_files(&dir).await.map(Some)
     }
 
@@ -2536,13 +2596,12 @@ where
         let _guard = write_lock.lock().await;
         if let Some(persistence) = &self.persistence {
             self.start_persistence();
-            persistence
-                .drain()
-                .await
-                .map_err(|source| PartitionInstallError::SwapIo {
+            persistence.drain_with_timeout().await.map_err(|source| {
+                PartitionInstallError::SwapIo {
                     path: partition_dir.clone(),
                     source,
-                })?;
+                }
+            })?;
             if let Err(source) = crate::install_backup::begin(Path::new(&partition_dir)).await {
                 // The backup rename may have landed before its directory barrier failed.
                 // Further commits could then be erased by rollback on the next boot.
@@ -2673,6 +2732,15 @@ where
                 path: partition_dir,
                 source,
             });
+        }
+        if outcome.is_ok() && self.materialization_missing {
+            clear_materialization_missing(&partition_dir)
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: partition_dir.clone(),
+                    source,
+                })?;
+            self.materialization_missing = false;
         }
         outcome
     }
@@ -3201,13 +3269,12 @@ where
         if let Some(persistence) = &self.persistence {
             persistence.reset(commit_op, offsets_wire.prepare_checksum);
             self.start_persistence();
-            persistence
-                .drain()
-                .await
-                .map_err(|source| PartitionInstallError::SwapIo {
+            persistence.drain_with_timeout().await.map_err(|source| {
+                PartitionInstallError::SwapIo {
                     path: partition_dir.to_owned(),
                     source,
-                })?;
+                }
+            })?;
         }
         let consensus = self.consensus();
         if commit_op > consensus.commit_min() {

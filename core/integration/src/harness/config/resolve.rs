@@ -25,12 +25,7 @@ use std::collections::HashMap;
 /// `ServerConfig::all_env_var_names` cannot know them. `IGGY_CONFIG_PATH`
 /// selects the config file itself and the root credentials are consumed by
 /// `args.rs` before the config loads; `IGGY_TEST_VERBOSE` is harness-only.
-pub const NON_CONFIG_ENV_VARS: [&str; 4] = [
-    "IGGY_CONFIG_PATH",
-    "IGGY_ROOT_USERNAME",
-    "IGGY_ROOT_PASSWORD",
-    "IGGY_TEST_VERBOSE",
-];
+pub const NON_CONFIG_ENV_VARS: &[&str] = configs::server::SERVER_PROCESS_ENV_VARS;
 
 /// Resolve config paths to environment variable names.
 ///
@@ -69,7 +64,7 @@ pub fn resolve_config_paths(
                 env_vars.insert(m.env_name.to_string(), value.clone());
 
                 // Track if encryption key is set (auto-enable encryption)
-                if path == "encryption" || path == "encryption.key" || path == "encryption.key" {
+                if path == "encryption" || path == "encryption.key" {
                     needs_encryption_enabled = true;
                 }
             }

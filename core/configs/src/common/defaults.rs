@@ -21,7 +21,7 @@ use super::server::{
     PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, TelemetryConfig,
     TelemetryLogsConfig, TelemetryTracesConfig,
 };
-use super::system::{EncryptionConfig, LoggingConfig, RuntimeConfig, StreamConfig, TopicConfig};
+use super::system::{EncryptionConfig, LoggingConfig, RuntimeConfig};
 
 static_toml::static_toml! {
     // static_toml resolves relative to CARGO_MANIFEST_DIR (core/configs/).
@@ -220,22 +220,6 @@ impl Default for EncryptionConfig {
         EncryptionConfig {
             enabled: SERVER_CONFIG.encryption.enabled,
             key: SERVER_CONFIG.encryption.key.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for StreamConfig {
-    fn default() -> StreamConfig {
-        StreamConfig {
-            path: SERVER_CONFIG.stream.path.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for TopicConfig {
-    fn default() -> TopicConfig {
-        TopicConfig {
-            path: SERVER_CONFIG.topic.path.parse().unwrap(),
         }
     }
 }

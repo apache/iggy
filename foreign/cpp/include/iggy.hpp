@@ -387,6 +387,18 @@ inline iggy::ffi::HeaderEntry to_option_entry(const std::string_view key,
 
 }  // namespace detail
 
+enum class Durability { Replicated, Persisted };
+
+constexpr std::string_view to_string(const Durability durability) {
+    switch (durability) {
+        case Durability::Replicated:
+            return "replicated";
+        case Durability::Persisted:
+            return "persisted";
+    }
+    throw std::invalid_argument("Unknown durability");
+}
+
 /**
  * @brief Creates topic option entries for `Client::create_topic(...)`.
  *
@@ -403,18 +415,6 @@ inline iggy::ffi::HeaderEntry to_option_entry(const std::string_view key,
  *       partition storage is created. Changing them later could leave existing
  *       and new segments with different storage settings.
  */
-enum class Durability { Replicated, Persisted };
-
-constexpr std::string_view to_string(const Durability durability) {
-    switch (durability) {
-        case Durability::Replicated:
-            return "replicated";
-        case Durability::Persisted:
-            return "persisted";
-    }
-    throw std::invalid_argument("Unknown durability");
-}
-
 class TopicOption final {
   public:
     /**
@@ -442,6 +442,11 @@ class TopicOption final {
                                        detail::to_key_bytes(to_string(value)));
     }
 
+    /**
+     * @brief Choose explicit offset completion independently of message durability.
+     * @param value The policy, defaulting to Replicated.
+     * @return Encoded topic option entry.
+     */
     static iggy::ffi::HeaderEntry ConsumerOffsetDurability(
         const iggy::Durability value = iggy::Durability::Replicated) {
         return detail::to_option_entry("consumer_offset_durability", iggy::ffi::HeaderKind::String,

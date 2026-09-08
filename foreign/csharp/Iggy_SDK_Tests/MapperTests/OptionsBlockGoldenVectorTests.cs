@@ -31,10 +31,8 @@ namespace Apache.Iggy.Tests.MapperTests;
 ///     about interoperability; these bytes are the contract, and a change to the TLV layout has to
 ///     break every copy of them together.
 ///
-///     preallocate_segments (a one-byte Bool) and segment_size (an eight-byte Uint64) cover both value
-///     widths. What the vector pins is the per-entry byte layout, not a key order: these two land
-///     sorted only because the Rust core holds options in a BTreeMap, and the server accepts the
-///     insertion order this SDK emits.
+///     The vector covers Bool, Uint64 and String values in insertion order. It deliberately
+///     differs from Rust's sorted map order. Decoders accept either order.
 /// </summary>
 public sealed class OptionsBlockGoldenVectorTests
 {

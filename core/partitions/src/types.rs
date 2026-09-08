@@ -340,9 +340,9 @@ pub enum RepairConclusion {
 /// land next to the ones the server bootstrap created.
 #[derive(Debug, Clone)]
 pub struct PartitionPathLayout {
-    /// `{system.path}/{stream.path}`: the directory holding per-stream dirs.
+    /// `{path}/streams`: the directory holding per-stream dirs.
     pub streams_root: String,
-    /// Directory name of the per-topic level (`topic.path`).
+    /// Directory name of the per-topic level, fixed to `topics` by the server.
     pub topics_dir: String,
     /// Directory name of the per-partition level (`partition.path`).
     pub partitions_dir: String,

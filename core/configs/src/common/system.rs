@@ -74,19 +74,6 @@ pub struct EncryptionConfig {
     pub key: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct StreamConfig {
-    pub path: String,
-}
-
-/// Only the on-disk layout: a topic's size cap and message expiry are its own
-/// creation options now (`max_topic_size`, `message_expiry`), defaulting to
-/// `iggy_common::DEFAULT_MAX_TOPIC_SIZE` / `DEFAULT_MESSAGE_EXPIRY`.
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct TopicConfig {
-    pub path: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

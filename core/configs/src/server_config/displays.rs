@@ -36,7 +36,7 @@ impl Display for ServerConfig {
             f,
             "{{ consumer_group: {}, data_maintenance: {}, \
              heartbeat: {}, path: {}, runtime: {{ path: {} }}, logging: {}, \
-             encryption: {}, stream: {}, topic: {}, memory_pool: {:?}, sharding: {:?}, \
+             encryption: {}, memory_pool: {:?}, sharding: {:?}, \
              quic: {}, tcp: {}, http: {}, telemetry: {}, \
              metadata: {}, message_bus: {}, partition: {} }}",
             self.consumer_group,
@@ -46,8 +46,6 @@ impl Display for ServerConfig {
             self.runtime.path,
             self.logging,
             self.encryption,
-            self.stream,
-            self.topic,
             self.memory_pool,
             self.sharding,
             self.quic,

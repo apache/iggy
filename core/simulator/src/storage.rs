@@ -182,7 +182,10 @@ impl SimStorage {
             .fault
             .filter(|(at, _)| *at == index)
             .map(|(_, mode)| mode);
-        if state.fault.is_some_and(|(at, _)| index > at) || mode == Some(FaultMode::Before) {
+        if mode.is_some() {
+            state.fault = None;
+        }
+        if mode == Some(FaultMode::Before) {
             return Err(io::Error::other("injected storage failure"));
         }
         let result = action(&mut state, mode == Some(FaultMode::TornWrite))?;
@@ -267,10 +270,27 @@ impl DurableStorage for SimStorage {
         self.perform(StorageOperation::Rename, |state, _| {
             let (parent, name) = state.parent(source)?;
             let (target_parent, target_name) = state.parent(target)?;
-            let inode = state
-                .directory_mut(parent)?
-                .remove(&name)
-                .ok_or_else(missing)?;
+            let inode = *state.directory(parent)?.get(&name).ok_or_else(missing)?;
+            if let Some(&target_inode) = state.directory(target_parent)?.get(&target_name) {
+                if inode == target_inode {
+                    return Ok(());
+                }
+                match (&state.inodes[inode], &state.inodes[target_inode]) {
+                    (Inode::Directory { .. }, Inode::Directory { entries, .. })
+                        if !entries.is_empty() =>
+                    {
+                        return Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty));
+                    }
+                    (Inode::File { .. }, Inode::Directory { .. }) => {
+                        return Err(io::Error::from(io::ErrorKind::IsADirectory));
+                    }
+                    (Inode::Directory { .. }, Inode::File { .. }) => {
+                        return Err(io::Error::from(io::ErrorKind::NotADirectory));
+                    }
+                    _ => {}
+                }
+            }
+            state.directory_mut(parent)?.remove(&name);
             state
                 .directory_mut(target_parent)?
                 .insert(target_name, inode);
@@ -301,7 +321,7 @@ impl DurableStorage for SimStorage {
         })
     }
 
-    fn exists(&self, path: &Path) -> io::Result<bool> {
+    async fn exists(&self, path: &Path) -> io::Result<bool> {
         self.perform(StorageOperation::Exists, |state, _| {
             match state.lookup(path) {
                 Ok(_) => Ok(true),
@@ -311,7 +331,7 @@ impl DurableStorage for SimStorage {
         })
     }
 
-    fn entries(&self, path: &Path) -> io::Result<Vec<StorageEntry>> {
+    async fn entries(&self, path: &Path) -> io::Result<Vec<StorageEntry>> {
         self.perform(StorageOperation::List, |state, _| {
             let inode = state.lookup(path)?;
             Ok(state
@@ -325,16 +345,31 @@ impl DurableStorage for SimStorage {
         })
     }
 
-    fn remove_tree(&self, path: &Path) -> io::Result<()> {
-        self.perform(StorageOperation::RemoveTree, |state, _| {
-            let (parent, name) = match state.parent(path) {
-                Ok(parent) => parent,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            state.directory_mut(parent)?.remove(&name);
-            Ok(())
-        })
+    async fn remove_tree(&self, path: &Path) -> io::Result<()> {
+        let mut pending = vec![(path.to_path_buf(), false)];
+        while let Some((path, visited)) = pending.pop() {
+            let children = self.perform(StorageOperation::RemoveTree, |state, _| {
+                let inode = match state.lookup(&path) {
+                    Ok(inode) => inode,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(error) => return Err(error),
+                };
+                if !visited
+                    && let Inode::Directory { entries, .. } = &state.inodes[inode]
+                    && !entries.is_empty()
+                {
+                    return Ok(entries.keys().map(|name| path.join(name)).collect());
+                }
+                let (parent, name) = state.parent(&path)?;
+                state.directory_mut(parent)?.remove(&name);
+                Ok(Vec::new())
+            })?;
+            if !children.is_empty() {
+                pending.push((path, true));
+                pending.extend(children.into_iter().map(|path| (path, false)));
+            }
+        }
+        Ok(())
     }
 }
 

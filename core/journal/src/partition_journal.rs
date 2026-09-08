@@ -18,23 +18,24 @@
 #![allow(clippy::future_not_send)]
 
 use crate::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
+use futures::TryStreamExt;
 use iggy_binary_protocol::{Command, PrepareHeader};
 use server_common::{
     Message,
     iobuf::{Frozen, Owned},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use twox_hash::XxHash3_64;
 
 pub const PARTITION_WAL_BLOCK_SIZE: usize = 4096;
 pub const PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
-pub const PARTITION_WAL_CAPACITY_MIN: u64 = 64 * 1024 * 1024 + 4096;
+pub const PARTITION_WAL_CAPACITY_MIN: u64 = 2 * (64 * 1024 * 1024 + 4096);
 pub const PARTITION_WAL_CAPACITY_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const RECORD_PREFIX: usize = 32;
-const PREPARE_BYTES_MAX: usize = 64 * 1024 * 1024;
-const STATE_MAGIC: &[u8; 8] = b"IGGYWAL1";
+pub const PREPARE_BYTES_MAX: usize = 64 * 1024 * 1024;
+const STATE_MAGIC: &[u8; 8] = b"IGGYWAL2";
 
 pub trait DurableAppend {
     /// # Errors
@@ -51,6 +52,9 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     entries: BTreeMap<u64, StoredPrepare>,
     poisoned: bool,
     durable_head: u64,
+    obsolete: VecDeque<PathBuf>,
+    cleanup_directory_dirty: bool,
+    recovered_prepares: Vec<Message<PrepareHeader>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,6 +68,7 @@ struct JournalState {
     head: u64,
     head_checksum: u128,
     anchor_known: bool,
+    checkpoint_prepare: bool,
     purge_generation: u64,
     purge_floor: u64,
 }
@@ -85,6 +90,7 @@ impl PartitionPrepareJournal {
 
 impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// Open and verify the durably published partition history.
+    /// The caller must first durably materialize the parent directory.
     ///
     /// # Errors
     /// Returns an error on I/O failure, invalid history, or a poisoned journal.
@@ -122,15 +128,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 "partition WAL capacity is out of bounds or unaligned",
             ));
         }
-        storage.create_directories(directory).await?;
-        let mut ancestor = directory;
-        while let Some(parent) = ancestor.parent() {
-            if parent.as_os_str().is_empty() {
-                break;
-            }
-            storage.sync_directory(parent).await?;
-            ancestor = parent;
+        let parent = directory
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if !storage.exists(parent).await? {
+            return Err(invalid(
+                "partition WAL parent must already be durably materialized",
+            ));
         }
+        storage.create_directories(directory).await?;
+        storage.sync_directory(parent).await?;
         let state_path = directory.join("frontier");
         let existing = match storage.open(&state_path, OpenMode::Read).await {
             Ok(file) => {
@@ -172,41 +180,25 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             entries: BTreeMap::new(),
             poisoned: false,
             durable_head: state.head,
+            obsolete: VecDeque::new(),
+            cleanup_directory_dirty: false,
+            recovered_prepares: Vec::new(),
         };
-        let mut position = 0;
-        let mut previous = state.checkpoint;
-        let mut checksum = state.checkpoint_checksum;
-        while position < state.length {
-            let (header, length, _) = journal.read_record(position).await?;
-            if header.op
-                != previous
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("WAL op overflow"))?
-                || header.parent != checksum
-            {
-                return Err(invalid("partition WAL prepare chain is broken"));
-            }
-            journal.entries.insert(
-                header.op,
-                StoredPrepare {
-                    position,
-                    length,
-                    checksum: header.checksum,
-                },
-            );
-            previous = header.op;
-            checksum = header.checksum;
-            position += length as u64;
-        }
-        if position != state.length || previous != state.head || checksum != state.head_checksum {
-            return Err(invalid("partition WAL frontier disagrees with its data"));
-        }
+        journal.recover_entries().await?;
         // Only bytes covered by the durable frontier could have released an ack.
         journal.file.truncate(state.length).await?;
         journal.file.sync().await?;
         journal.storage.sync_directory(directory).await?;
         if existing.is_none() {
             journal.publish(state).await?;
+        }
+        journal.discover_obsolete().await?;
+        loop {
+            let remaining = journal.obsolete.len();
+            journal.cleanup_obsolete().await;
+            if journal.obsolete.is_empty() || journal.obsolete.len() == remaining {
+                break;
+            }
         }
         Ok(journal)
     }
@@ -255,11 +247,15 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .is_some_and(|entry| entry.checksum == header.checksum)
     }
 
+    pub fn take_recovered_prepares(&mut self) -> Vec<Message<PrepareHeader>> {
+        std::mem::take(&mut self.recovered_prepares)
+    }
+
     /// Read the retained prepares in operation order.
     ///
     /// # Errors
     /// Returns an error on I/O failure, invalid history, or a poisoned journal.
-    pub async fn prepares(&self) -> io::Result<Vec<Frozen<4096>>> {
+    pub async fn prepares(&self) -> io::Result<Vec<Message<PrepareHeader>>> {
         let mut prepares = Vec::with_capacity(self.entries.len());
         for entry in self.entries.values() {
             let (_, length, prepare) = self.read_record(entry.position).await?;
@@ -301,13 +297,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         files: &[std::path::PathBuf],
         directories: &[std::path::PathBuf],
     ) -> io::Result<()> {
-        for path in files {
-            self.storage
-                .open(path, OpenMode::Read)
-                .await?
-                .sync()
-                .await?;
-        }
+        futures::stream::iter(files.iter().map(Ok::<_, io::Error>))
+            .try_for_each_concurrent(16, |path| async {
+                self.storage.open(path, OpenMode::Read).await?.sync().await
+            })
+            .await?;
         for path in directories {
             self.storage.sync_directory(path).await?;
         }
@@ -395,69 +389,183 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// # Errors
     /// Returns an error on write failure, capacity exhaustion, or a history conflict.
     pub async fn append_buffered(&mut self, prepare: Frozen<4096>) -> io::Result<()> {
+        self.append_batch_buffered(std::slice::from_ref(&prepare))
+            .await
+    }
+
+    /// Append a contiguous extent, validating every operation before allocation or I/O.
+    ///
+    /// # Errors
+    /// Returns an error on invalid history, capacity exhaustion or failed write.
+    pub async fn append_batch_buffered(&mut self, prepares: &[Frozen<4096>]) -> io::Result<()> {
         self.ensure_healthy()?;
-        let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
-            prepare
-                .as_slice()
-                .get(..size_of::<PrepareHeader>())
-                .ok_or_else(|| invalid("short WAL prepare"))?,
-        )
-        .map_err(|_| invalid("invalid WAL prepare alignment"))?;
-        if self
-            .entries
-            .get(&header.op)
-            .is_some_and(|entry| entry.checksum == header.checksum)
-        {
+        self.cleanup_obsolete().await;
+        self.recovered_prepares.clear();
+        let mut state = self.state;
+        let mut records: Vec<(u64, StoredPrepare, usize)> = Vec::with_capacity(prepares.len());
+        for (index, prepare) in prepares.iter().enumerate() {
+            let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+                prepare
+                    .as_slice()
+                    .get(..size_of::<PrepareHeader>())
+                    .ok_or_else(|| invalid("short WAL prepare"))?,
+            )
+            .map_err(|_| invalid("invalid WAL prepare alignment"))?;
+            if self
+                .entries
+                .get(&header.op)
+                .is_some_and(|entry| entry.checksum == header.checksum)
+                || records.last().is_some_and(|(op, entry, _)| {
+                    *op == header.op && entry.checksum == header.checksum
+                })
+            {
+                continue;
+            }
+            if header.op
+                != state
+                    .head
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("WAL op exhausted"))?
+                || (state.anchor_known && header.parent != state.head_checksum)
+                || header.group != state.group
+            {
+                return Err(invalid("partition WAL append does not extend its history"));
+            }
+            let length = record_length(prepare.len())?;
+            if state.length.saturating_add(length as u64) > self.capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "partition WAL requires checkpoint",
+                ));
+            }
+            records.push((
+                header.op,
+                StoredPrepare {
+                    position: state.length,
+                    length,
+                    checksum: header.checksum,
+                },
+                index,
+            ));
+            state.length += length as u64;
+            state.head = header.op;
+            state.head_checksum = header.checksum;
+            if !state.anchor_known {
+                state.checkpoint_checksum = header.parent;
+                state.anchor_known = true;
+            }
+        }
+        if records.is_empty() {
             return Ok(());
         }
-        if header.op
-            != self
-                .state
-                .head
-                .checked_add(1)
-                .ok_or_else(|| invalid("WAL op exhausted"))?
-            || (self.state.anchor_known && header.parent != self.state.head_checksum)
-            || header.group != self.state.group
-        {
-            return Err(invalid("partition WAL append does not extend its history"));
-        }
-        let encoded = encode_record(prepare.as_slice(), self.state.generation)?;
-        let length = encoded.len();
-        if self.state.length + length as u64 > self.capacity {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "partition WAL requires checkpoint",
-            ));
+        let mut extent = Owned::zeroed(
+            usize::try_from(state.length - self.state.length)
+                .map_err(|_| invalid("WAL extent overflow"))?,
+        );
+        for (_, record, index) in &records {
+            let position = usize::try_from(record.position - self.state.length)
+                .map_err(|_| invalid("WAL extent overflow"))?;
+            encode_record_into(
+                prepares[*index].as_slice(),
+                state.generation,
+                &mut extent.as_mut_slice()[position..position + record.length],
+            )?;
         }
         self.poisoned = true;
-        self.file.write(self.state.length, encoded).await?;
-        let state = JournalState {
-            length: self.state.length + length as u64,
-            head: header.op,
-            head_checksum: header.checksum,
-            checkpoint_checksum: if self.state.anchor_known {
-                self.state.checkpoint_checksum
-            } else {
-                header.parent
-            },
-            anchor_known: true,
-            ..self.state
-        };
-        self.entries.insert(
-            header.op,
-            StoredPrepare {
-                position: self.state.length,
-                length,
-                checksum: header.checksum,
-            },
-        );
+        self.file.write_aligned(self.state.length, extent).await?;
+        for (op, record, _) in records {
+            self.entries.insert(op, record);
+        }
         self.state = state;
         self.poisoned = false;
         Ok(())
     }
 
+    async fn recover_entries(&mut self) -> io::Result<()> {
+        let state = self.state;
+        let mut position = 0;
+        let mut previous = state.checkpoint;
+        let mut checksum = state.checkpoint_checksum;
+        while position < state.length {
+            let (header, length, prepare) = self.read_record(position).await?;
+            self.recovered_prepares.push(prepare);
+            let checkpoint_prepare = position == 0 && state.checkpoint_prepare;
+            if checkpoint_prepare {
+                if header.op != state.checkpoint || header.checksum != state.checkpoint_checksum {
+                    return Err(invalid("partition WAL checkpoint prepare mismatch"));
+                }
+            } else if header.op
+                != previous
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("WAL op overflow"))?
+                || header.parent != checksum
+            {
+                return Err(invalid("partition WAL prepare chain is broken"));
+            }
+            self.entries.insert(
+                header.op,
+                StoredPrepare {
+                    position,
+                    length,
+                    checksum: header.checksum,
+                },
+            );
+            previous = header.op;
+            checksum = header.checksum;
+            position += length as u64;
+        }
+        if position != state.length || previous != state.head || checksum != state.head_checksum {
+            return Err(invalid("partition WAL frontier disagrees with its data"));
+        }
+        Ok(())
+    }
+
+    async fn discover_obsolete(&mut self) -> io::Result<()> {
+        for entry in self.storage.entries(&self.directory).await? {
+            let Some(name) = entry.name.to_str() else {
+                continue;
+            };
+            let generation = name
+                .strip_prefix("prepares-")
+                .and_then(|name| name.strip_suffix(".wal"))
+                .and_then(|value| value.parse::<u64>().ok());
+            if !entry.directory
+                && (generation.is_some_and(|generation| generation != self.state.generation)
+                    || name == "frontier.tmp")
+            {
+                self.obsolete.push_back(self.directory.join(entry.name));
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_obsolete(&mut self) {
+        let count = self.obsolete.len().min(16);
+        for _ in 0..count {
+            let Some(path) = self.obsolete.pop_front() else {
+                break;
+            };
+            match self.storage.remove_file(&path).await {
+                Ok(()) => self.cleanup_directory_dirty = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.cleanup_directory_dirty = true;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "cannot remove obsolete partition WAL generation");
+                    self.obsolete.push_back(path);
+                }
+            }
+        }
+        if self.cleanup_directory_dirty {
+            match self.storage.sync_directory(&self.directory).await {
+                Ok(()) => self.cleanup_directory_dirty = false,
+                Err(error) => tracing::warn!(%error, "cannot synchronize partition WAL cleanup"),
+            }
+        }
+    }
+
     async fn validate_unpublished_history(storage: &S, directory: &Path) -> io::Result<()> {
-        for entry in storage.entries(directory)? {
+        for entry in storage.entries(directory).await? {
             if entry.directory || entry.name == "frontier.tmp" {
                 continue;
             }
@@ -489,10 +597,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
     }
 
-    async fn read_record(&self, position: u64) -> io::Result<(PrepareHeader, usize, Frozen<4096>)> {
-        let prefix = self.file.read(position, RECORD_PREFIX).await?;
+    async fn read_record(
+        &self,
+        position: u64,
+    ) -> io::Result<(PrepareHeader, usize, Message<PrepareHeader>)> {
+        let prefix = self
+            .file
+            .read_aligned(position, PARTITION_WAL_BLOCK_SIZE)
+            .await?;
         let frame_length = u32::from_le_bytes(
-            prefix[..4]
+            prefix.as_slice()[..4]
                 .try_into()
                 .map_err(|_| invalid("invalid WAL prefix"))?,
         ) as usize;
@@ -503,14 +617,27 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         {
             return Err(invalid("partition WAL record crosses durable frontier"));
         }
-        let mut bytes = self.file.read(position, length).await?;
+        let mut buffer = if length == PARTITION_WAL_BLOCK_SIZE {
+            prefix
+        } else {
+            let mut bytes = Owned::zeroed(length);
+            bytes.as_mut_slice()[..PARTITION_WAL_BLOCK_SIZE].copy_from_slice(prefix.as_slice());
+            self.file
+                .read_aligned_tail(
+                    position + PARTITION_WAL_BLOCK_SIZE as u64,
+                    bytes,
+                    PARTITION_WAL_BLOCK_SIZE,
+                )
+                .await?
+        };
+        let bytes = buffer.as_mut_slice();
         let stored_hash = u64::from_le_bytes(
             bytes[16..24]
                 .try_into()
                 .map_err(|_| invalid("invalid WAL checksum"))?,
         );
         bytes[16..24].fill(0);
-        if XxHash3_64::oneshot(&bytes) != stored_hash {
+        if XxHash3_64::oneshot(&bytes[..RECORD_PREFIX + frame_length]) != stored_hash {
             return Err(invalid("partition WAL record checksum mismatch"));
         }
         let generation = u64::from_le_bytes(
@@ -521,11 +648,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if generation != self.state.generation {
             return Err(invalid("partition WAL stale record generation"));
         }
-        let mut owned = Owned::<4096>::zeroed(frame_length);
-        owned
-            .as_mut_slice()
-            .copy_from_slice(&bytes[RECORD_PREFIX..RECORD_PREFIX + frame_length]);
-        let message = Message::<PrepareHeader>::try_from(owned)
+        bytes.copy_within(RECORD_PREFIX..RECORD_PREFIX + frame_length, 0);
+        buffer.truncate(frame_length);
+        let message = Message::<PrepareHeader>::try_from(buffer)
             .map_err(|_| invalid("invalid partition WAL prepare"))?;
         let header = *message.header();
         if header.command != Command::Prepare
@@ -534,7 +659,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         {
             return Err(invalid("partition WAL prepare identity mismatch"));
         }
-        Ok((header, length, message.into_frozen()))
+        Ok((header, length, message))
     }
 
     async fn publish(&self, state: JournalState) -> io::Result<()> {
@@ -574,16 +699,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             head: checkpoint,
             head_checksum: checksum,
             length: 0,
+            checkpoint_prepare: false,
             ..self.state
         };
         for (&op, entry) in &self.entries {
-            if op <= checkpoint || truncate.is_some_and(|from| op >= from) {
+            if op < checkpoint || truncate.is_some_and(|from| op >= from) {
                 continue;
             }
             let prepare = self.read_record(entry.position).await?.2;
             let encoded = encode_record(prepare.as_slice(), generation)?;
-            let length = encoded.len();
-            file.write(state.length, encoded).await?;
+            let length = encoded.as_slice().len();
+            file.write_aligned(state.length, encoded).await?;
             entries.insert(
                 op,
                 StoredPrepare {
@@ -593,6 +719,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 },
             );
             state.length += length as u64;
+            state.checkpoint_prepare |= op == checkpoint;
             state.head = op;
             state.head_checksum = entry.checksum;
         }
@@ -605,9 +732,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.durable_head = state.head;
         self.entries = entries;
         self.poisoned = false;
-        if let Err(error) = self.storage.remove_file(&obsolete).await {
-            tracing::warn!(%error, "failed to remove superseded partition WAL file");
-        }
+        self.obsolete.push_back(obsolete);
+        self.cleanup_obsolete().await;
         Ok(())
     }
 }
@@ -636,6 +762,7 @@ impl JournalState {
         bytes[56..72].copy_from_slice(&self.checkpoint_checksum.to_le_bytes());
         bytes[80..96].copy_from_slice(&self.head_checksum.to_le_bytes());
         bytes[96] = u8::from(self.anchor_known);
+        bytes[97] = u8::from(self.checkpoint_prepare);
         bytes[104..112].copy_from_slice(&self.purge_generation.to_le_bytes());
         bytes[112..120].copy_from_slice(&self.purge_floor.to_le_bytes());
         let checksum = XxHash3_64::oneshot(&bytes[16..]);
@@ -669,6 +796,11 @@ impl JournalState {
                 1 => true,
                 _ => return Err(invalid("invalid WAL anchor flag")),
             },
+            checkpoint_prepare: match bytes[97] {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid("invalid checkpoint prepare flag")),
+            },
             purge_generation: read_u64(104)?,
             purge_floor: read_u64(112)?,
             checkpoint_checksum: u128::from_le_bytes(
@@ -686,6 +818,8 @@ impl JournalState {
             || !state.length.is_multiple_of(PARTITION_WAL_BLOCK_SIZE as u64)
             || state.head < state.checkpoint
             || (!state.anchor_known && state.head != state.checkpoint)
+            || (state.checkpoint_prepare
+                && (state.checkpoint == 0 || state.length == 0 || !state.anchor_known))
         {
             return Err(invalid("invalid partition WAL frontier bounds"));
         }
@@ -699,20 +833,31 @@ impl JournalState {
 /// Returns an error for a frame outside the protocol size bounds.
 pub fn record_length(frame_length: usize) -> io::Result<usize> {
     if !(size_of::<PrepareHeader>()..=PREPARE_BYTES_MAX).contains(&frame_length) {
-        return Err(invalid("partition WAL prepare length out of bounds"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "partition prepare size {frame_length} exceeds or falls below the supported range {}..={PREPARE_BYTES_MAX} bytes",
+                size_of::<PrepareHeader>()
+            ),
+        ));
     }
     Ok((RECORD_PREFIX + frame_length).next_multiple_of(PARTITION_WAL_BLOCK_SIZE))
 }
 
-fn encode_record(prepare: &[u8], generation: u64) -> io::Result<Vec<u8>> {
-    let mut bytes = vec![0; record_length(prepare.len())?];
+fn encode_record(prepare: &[u8], generation: u64) -> io::Result<Owned<4096>> {
+    let mut buffer = Owned::zeroed(record_length(prepare.len())?);
+    encode_record_into(prepare, generation, buffer.as_mut_slice())?;
+    Ok(buffer)
+}
+
+fn encode_record_into(prepare: &[u8], generation: u64, bytes: &mut [u8]) -> io::Result<()> {
     let length = u32::try_from(prepare.len()).map_err(|_| invalid("oversized prepare"))?;
     bytes[..4].copy_from_slice(&length.to_le_bytes());
     bytes[8..16].copy_from_slice(&generation.to_le_bytes());
     bytes[RECORD_PREFIX..RECORD_PREFIX + prepare.len()].copy_from_slice(prepare);
-    let checksum = XxHash3_64::oneshot(&bytes);
+    let checksum = XxHash3_64::oneshot(&bytes[..RECORD_PREFIX + prepare.len()]);
     bytes[16..24].copy_from_slice(&checksum.to_le_bytes());
-    Ok(bytes)
+    Ok(())
 }
 
 fn data_path(directory: &Path, generation: u64) -> PathBuf {
@@ -840,7 +985,7 @@ mod tests {
             .unwrap();
         assert_eq!(journal.checkpoint_op(), 1);
         assert_eq!(journal.head(), 2);
-        assert_eq!(journal.prepares().await.unwrap().len(), 1);
+        assert_eq!(journal.prepares().await.unwrap().len(), 2);
         journal.append(third.into_frozen()).await.unwrap();
         assert_eq!(journal.head(), 3);
         assert!(journal.truncate_from(1).await.is_err());
@@ -921,10 +1066,12 @@ mod tests {
         header.checksum_body = u128::from(checksum_body);
         header.checksum = header.identity_checksum();
         let first = Message::<PrepareHeader>::try_from(buffer).unwrap();
-        let second = prepare(2, first.header().checksum);
+        let second = sized_prepare(2, first.header().checksum, PREPARE_BYTES_MAX);
         let third = prepare(3, second.header().checksum);
         journal.append_buffered(first.into_frozen()).await.unwrap();
-        journal.append(second.into_frozen()).await.unwrap();
+        let fourth = prepare(4, third.header().checksum);
+        journal.append_buffered(second.into_frozen()).await.unwrap();
+        journal.append(third.into_frozen()).await.unwrap();
         drop(journal);
         let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
             directory.path(),
@@ -935,12 +1082,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(journal.head(), 2);
-        assert!(journal.size_bytes() > PARTITION_WAL_CAPACITY_MIN);
-        assert!(journal.append(third.clone().into_frozen()).await.is_err());
-        journal.checkpoint(2).await.unwrap();
-        journal.append(third.into_frozen()).await.unwrap();
         assert_eq!(journal.head(), 3);
+        assert!(journal.size_bytes() > PARTITION_WAL_CAPACITY_MIN);
+        assert!(journal.append(fourth.clone().into_frozen()).await.is_err());
+        journal.checkpoint(3).await.unwrap();
+        journal.append(fourth.into_frozen()).await.unwrap();
+        assert_eq!(journal.head(), 4);
     }
 
     #[test]
@@ -960,7 +1107,11 @@ mod tests {
     }
 
     fn prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
-        let mut buffer = Owned::<4096>::zeroed(size_of::<PrepareHeader>() + 16);
+        sized_prepare(op, parent, size_of::<PrepareHeader>() + 16)
+    }
+
+    fn sized_prepare(op: u64, parent: u128, length: usize) -> Message<PrepareHeader> {
+        let mut buffer = Owned::<4096>::zeroed(length);
         buffer.as_mut_slice()[size_of::<PrepareHeader>()..].fill(u8::try_from(op).unwrap());
         let checksum_body = XxHash3_64::oneshot(&buffer.as_slice()[size_of::<PrepareHeader>()..]);
         let length = buffer.as_slice().len();

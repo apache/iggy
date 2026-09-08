@@ -81,6 +81,30 @@ pub(in crate::boot) async fn build_shard_for_thread(
     roster_cells: &RosterCells,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
+    let retired_key: iggy_common::HeaderKey =
+        "enforce_fsync".parse().expect("retired key is valid");
+    let enabled = iggy_common::HeaderValue::from(true);
+    let retired_durability = metadata.mux_stm.streams().read(|inner| {
+        inner.items.iter().find_map(|(stream_id, stream)| {
+            stream.topics.iter().find_map(|(topic_id, topic)| {
+                topic
+                    .options
+                    .get(&retired_key)
+                    .is_some_and(|option| option.value == enabled)
+                    .then_some((stream_id, topic_id))
+            })
+        })
+    });
+    if let Some((stream_id, topic_id)) = retired_durability {
+        error!(
+            stream_id,
+            topic_id,
+            "stored topic uses removed enforce_fsync=true. Recreate it with explicit durability in a data directory prepared for this version. No legacy durability translation is performed"
+        );
+        return Err(ServerError::Iggy(Box::new(
+            iggy_common::IggyError::UnsupportedOptionKey("enforce_fsync".to_owned()),
+        )));
+    }
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
         inner
             .items
@@ -128,7 +152,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             encryptor,
             path_layout: partitions::PartitionPathLayout {
                 streams_root: config.get_streams_path(),
-                topics_dir: config.topic.path.clone(),
+                topics_dir: "topics".to_owned(),
                 partitions_dir: config.partition.path.clone(),
             },
         },

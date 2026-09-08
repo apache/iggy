@@ -31,16 +31,6 @@ cleaner_enabled = true
 # Interval for running the message cleaner.
 interval = "1 m"
 
-# This node's own client-facing identity, used when 'cluster.enabled' is false.
-[node]
-# A literal IP or a DNS hostname, without a port. Named to match its roster
-# counterpart 'cluster.nodes.advertised_address', which answers the same
-# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
-# is the bind address's answer to a question clients are not asking. Commented
-# out here because the shipped 'tcp.address' binds a concrete address and needs
-# no declaration.
-#advertised_address = "broker-1.example.com"
-
 # HTTP server configuration
 [http]
 # Determines if the HTTP server is active.
@@ -416,59 +406,6 @@ enabled = false
 # Should be a 32 bytes length key, provided as a base64 encoded string.
 # This key is required and used only if encryption is enabled.
 key = ""
-
-# Stream configuration
-[stream]
-# Path for storing stream-related data (string).
-# Specifies the directory where stream data is stored, relative to `path`.
-path = "streams"
-
-# Topic configuration
-[topic]
-# Path for storing topic-related data, relative to `stream.path`.
-path = "topics"
-
-# Retention is per topic, set at CreateTopic and readable on GetTopic:
-#   max_topic_size   - delete oldest sealed segments past this size
-#                      ("unlimited" when unset)
-#   message_expiry   - delete sealed segments older than this ("none" when unset)
-# Both policies can be active at once. The active segment is never touched.
-# Call GET /options/topic (or the SDK's describe_options) for the full catalog
-# with this server's defaults.
-
-# Topic durability and flush scheduling are set at creation and returned by GetTopic.
-# durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
-# Both independently default to "replicated". Neither inherits the other.
-# Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
-# "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
-# A singleton quorum is one replica. Its persisted completion follows recoverable local persistence.
-# Poll auto-commit remains asynchronous. A successful poll does not confirm that its submitted offset operation committed or became durable.
-# HTTP ack=none returns dispatch acceptance with Iggy-Durability: none, even for persisted topics.
-# messages_required_to_save defaults to 1024 and size_of_messages_required_to_save defaults to 1 MiB.
-# These thresholds schedule ordinary segment writes. Required persistence, capacity pressure and lifecycle operations can flush sooner.
-
-# Segment storage
-# Segment size is per topic, set at CreateTopic as `segment_size` (1 GiB when
-# unset). It is a soft limit: a segment may close one whole batch past it.
-# Bounds are enforced at creation - a 512 B multiple, at least 1 MiB, and no
-# larger than 1 GiB.
-#
-# `preallocate_segments` is per topic too: it reserves exactly `segment_size`
-# up front where the filesystem supports it. Off unless a topic asks for it --
-# with the default 1 GiB segment size it costs 1 GiB of real disk per
-# partition at creation.
-
-# Recovery behavior
-# Recovery validates message batches against their checksums and partition identity before serving data.
-# A genuinely incomplete tail can be truncated. Interior damage or valid records after a damaged range require refusal or repair, never blind truncation.
-# A sparse index that contradicts the message log is rebuilt only when the discrepancy fits the storage guarantee.
-# With message durability = "replicated", background writeback can preserve later pages before earlier ones, so recovery checks the log from byte zero.
-# With message durability = "persisted", completed durable segment flushes constrain the incomplete tail and permit the established index-anchored recovery path.
-# Durable prepares can still reside in the partition WAL rather than segments. Recovery reconciles that history with the materialized state before serving.
-# Index reconstruction and validation can take time across many segments. A slow recovery is not by itself evidence of a stalled server.
-# Unrecoverable local segment data is fenced and repaired from peers when available. A singleton cannot fetch a missing copy from another replica.
-# Fenced files remain available for diagnosis. Recovery must not replace an acknowledged durable history with an empty healthy partition.
-# Metadata and partition journals verify their own integrity and recovery frontiers independently of sparse indexes.
 
 # Memory pool configuration
 [memory_pool]
@@ -907,9 +844,57 @@ clients_table_max = 8192
 # plane), a pipeline exists per partition, so raising this multiplies pinned
 # request-buffer memory by the partition count. Keep it modest.
 [partition]
+# Retention is per topic, set at CreateTopic and readable on GetTopic:
+#   max_topic_size   - delete oldest sealed segments past this size
+#                      ("unlimited" when unset)
+#   message_expiry   - delete sealed segments older than this ("none" when unset)
+# Both policies can be active at once. The active segment is never touched.
+# Call GET /options/topic (or the SDK's describe_options) for the full catalog
+# with this server's defaults.
+
+# Topic durability and flush scheduling are set at creation and returned by GetTopic.
+# durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
+# Both independently default to "replicated". Neither inherits the other.
+# In replicated groups, either persisted policy enables the prepare WAL for full message bodies.
+# Persisted offsets with replicated messages still consume wal_bytes_max for message payloads.
+# Their barriers can also persist co-batched messages. Only replicated/replicated stays off this WAL.
+# Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
+# Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
+# "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
+# A singleton quorum is one replica. Its persisted completion follows recoverable local persistence.
+# Poll auto-commit remains asynchronous. A successful poll does not confirm that its submitted offset operation committed or became durable.
+# HTTP ack=none returns dispatch acceptance with Iggy-Durability: none, even for persisted topics.
+# messages_required_to_save defaults to 1024 and size_of_messages_required_to_save defaults to 1 MiB.
+# These thresholds schedule ordinary segment writes. Required persistence, capacity pressure and lifecycle operations can flush sooner.
+
+# Segment storage
+# Segment size is per topic, set at CreateTopic as `segment_size` (1 GiB when
+# unset). It is a soft limit: a segment may close one whole batch past it.
+# Bounds are enforced at creation - a 512 B multiple, at least 1 MiB, and no
+# larger than 1 GiB.
+#
+# `preallocate_segments` is per topic too: it reserves exactly `segment_size`
+# up front where the filesystem supports it. Off unless a topic asks for it --
+# with the default 1 GiB segment size it costs 1 GiB of real disk per
+# partition at creation.
+
+# Recovery behavior
+# Recovery validates message batches against their checksums and partition identity before serving data.
+# A genuinely incomplete tail can be truncated. Interior damage or valid records after a damaged range require refusal or repair, never blind truncation.
+# A sparse index that contradicts the message log is rebuilt only when the discrepancy fits the storage guarantee.
+# With message durability = "replicated", background writeback can preserve later pages before earlier ones, so recovery checks the log from byte zero.
+# With message durability = "persisted", completed durable segment flushes constrain the incomplete tail and permit the established index-anchored recovery path.
+# Durable prepares can still reside in the partition WAL rather than segments. Recovery reconciles that history with the materialized state before serving.
+# Index reconstruction and validation can take time across many segments. A slow recovery is not by itself evidence of a stalled server.
+# Unrecoverable local segment data is fenced and repaired from peers when available. A singleton cannot fetch a missing copy from another replica.
+# Fenced files remain available for diagnosis. Recovery must not replace an acknowledged durable history with an empty healthy partition.
+# Metadata and partition journals verify their own integrity and recovery frontiers independently of sparse indexes.
+
 # Per-partition active WAL and queued/in-flight prepare budget when either
-# topic policy is persisted. A 4 KiB multiple, from 64 MiB + 4 KiB to 4 GiB.
-# Checkpointing begins at half the budget. Temporary rewrites need extra disk
+# topic policy is persisted. A 4 KiB multiple, from 128 MiB + 8 KiB to 4 GiB.
+# The minimum accommodates the retained commit-point prepare and a maximum-size successor.
+# Checkpointing begins at half the byte budget or 1024 dirty files.
+# File barriers run with at most 16 concurrent operations. Temporary rewrites need extra disk
 # space. Lowering this budget preserves existing history and blocks new writes
 # until recovery and checkpointing reclaim enough space.
 # Checkpoints synchronize changed files through the partition writer. Other
@@ -1071,3 +1056,13 @@ close_grace = "2 s"
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
 handshake_grace = "10 s"
+
+# This node's own client-facing identity, used when 'cluster.enabled' is false.
+[node]
+# A literal IP or a DNS hostname, without a port. Named to match its roster
+# counterpart 'cluster.nodes.advertised_address', which answers the same
+# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
+# is the bind address's answer to a question clients are not asking. Commented
+# out here because the shipped 'tcp.address' binds a concrete address and needs
+# no declaration.
+#advertised_address = "broker-1.example.com"

@@ -233,9 +233,11 @@ When config file is not found, the default values from embedded `config.toml` fi
 
 Topic creation accepts two independent policies: `durability` for message acknowledgments and `consumer_offset_durability` for explicit offset stores and deletes. Both default to `replicated`. This means VSR quorum commit without waiting for stable storage. `persisted` also requires recoverable stable-storage copies on the replication quorum. Both policies normally store data on disk. Poll auto-commit remains asynchronous and is not covered by the poll response's completion.
 
-This is a breaking configuration and SDK change. The old topic `enforce_fsync` option and global `consumer_offset_enforce_fsync` setting are removed without aliases. The former `[system.*]` tables are root tables, the data directory is `path` (`IGGY_PATH`), and environment names drop `SYSTEM_`. Unsupported `archive_expired` and `recreate_missing_state` settings are removed. Existing configurations and SDK callers must use the new fields.
+This is a breaking configuration and SDK change. The old topic `enforce_fsync` option and global `consumer_offset_enforce_fsync` setting are removed without aliases. The former `[system.*]` tables are root tables, the data directory is `path` (`IGGY_PATH`), and environment names drop `SYSTEM_`. Unsupported `archive_expired` and `recreate_missing_state` settings are removed. Existing configurations and SDK callers must use the new fields. Stored topics with enforce_fsync=true are rejected rather than silently weakened or translated. Those topics require explicit export and recreation with a supported policy on this version. No automatic metadata migration is provided. The HTTP Iggy-Durability header changes from replicated-memory to replicated or persisted for awaited writes, and remains none for early dispatch acceptance. Stream and topic directory names are fixed to streams and topics beneath path.
 
 Segment flush thresholds control scheduling, independently of acknowledgment durability.
+
+Rust HTTP callers can use `HttpClient::send_messages_with_durability` to read the advertised guarantee alongside confirmations.
 
 The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
 

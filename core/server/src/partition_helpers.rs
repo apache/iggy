@@ -44,6 +44,7 @@ use iggy_common::{
     ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp,
     PartitionStats, TopicRuntimeOptions,
 };
+use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
 use metadata::stm::stream::Partition;
@@ -674,6 +675,17 @@ pub async fn load_partition_or_fence(
                 partitions.tombstone(namespace);
                 return Ok(None);
             }
+            if replica_count > 1 {
+                partitions::state_transfer::mark_materialization_missing(
+                    &partition_dir,
+                    partition_metadata.created_revision,
+                )
+                .await
+                .map_err(|error| {
+                    error!(%error, "cannot persist missing-materialization fence");
+                    ServerError::Iggy(Box::new(IggyError::CannotSyncFile))
+                })?;
+            }
             match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
                 Ok(fenced_dir) => error!(
                     stream_id,
@@ -1205,6 +1217,16 @@ pub async fn build_partition_fresh(
             source
         })?;
 
+    if runtime_options.durability.is_persisted()
+        || runtime_options.consumer_offset_durability.is_persisted()
+    {
+        persist_partition_hierarchy(
+            &config.get_partition_path(stream_id, topic_id, partition_id),
+            &config.get_system_path(),
+        )
+        .await?;
+    }
+
     // The hierarchy create above guarantees the directory exists; recover this
     // group's durable (view, log_view) before choosing how to join, so a
     // restart materialization resumes from the view it last recorded instead
@@ -1381,6 +1403,31 @@ pub async fn build_partition_fresh(
         .await
         .map_err(|error| ServerError::Iggy(Box::new(error)))?;
     Ok(partition)
+}
+
+async fn persist_partition_hierarchy(
+    partition_path: &str,
+    data_root: &str,
+) -> Result<(), ServerError> {
+    let root = Path::new(data_root);
+    let mut current = Path::new(partition_path);
+    loop {
+        DiskStorage
+            .sync_directory(current)
+            .await
+            .map_err(|_| ServerError::Iggy(Box::new(IggyError::CannotSyncFile)))?;
+        if current == root {
+            break;
+        }
+        let Some(parent) = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            break;
+        };
+        current = parent;
+    }
+    Ok(())
 }
 
 /// Recursive delete of partition root. Idempotent: `NotFound` is treated

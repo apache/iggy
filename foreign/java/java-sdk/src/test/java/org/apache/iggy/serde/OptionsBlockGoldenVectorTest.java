@@ -38,10 +38,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * interoperability; these bytes are the contract, and a change to the TLV layout has to break every
  * copy of them together.
  *
- * <p>{@code preallocate_segments} (a one-byte {@code Bool}) and {@code segment_size} (an eight-byte
- * {@code Uint64}) cover both value widths. What the vector pins is the per-entry byte layout, not a
- * key order: these two land sorted only because the Rust core holds options in a {@code BTreeMap},
- * and the server accepts the insertion order this SDK emits.
+ * <p>The vector covers Bool, Uint64 and String values in insertion order. It deliberately differs
+ * from Rust's sorted map order. Decoders accept either order and pin the same per-entry layout.
  */
 class OptionsBlockGoldenVectorTest {
 

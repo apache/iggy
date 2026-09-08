@@ -483,19 +483,25 @@ impl Client {
         let mut raw = crate::type_conversion::ffi_options_to_raw(options)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
 
-        // `None` is what tells admission to resolve the server default, so the
-        // sentinels the string parsers produce must collapse back to it.
+        // Both completion policies are sent explicitly and default independently.
         let durability = raw
             .remove("durability")
             .map(|value| value.parse::<iggy::prelude::Durability>())
             .transpose()
-            .map_err(|error| error.to_string())?
+            .map_err(|_| {
+                iggy::prelude::IggyError::InvalidOptionValue("durability".to_owned()).to_string()
+            })?
             .unwrap_or_default();
         let consumer_offset_durability = raw
             .remove("consumer_offset_durability")
             .map(|value| value.parse::<iggy::prelude::Durability>())
             .transpose()
-            .map_err(|error| error.to_string())?
+            .map_err(|_| {
+                iggy::prelude::IggyError::InvalidOptionValue(
+                    "consumer_offset_durability".to_owned(),
+                )
+                .to_string()
+            })?
             .unwrap_or_default();
         let options = TopicCreateOptions {
             durability,

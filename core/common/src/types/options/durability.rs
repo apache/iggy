@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumString, IntoStaticStr};
 
@@ -32,9 +33,10 @@ use strum::{AsRefStr, Display, EnumString, IntoStaticStr};
     EnumString,
     AsRefStr,
     IntoStaticStr,
+    ValueEnum,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum Durability {
     /// Quorum commit without an additional stable-storage barrier.
     #[default]

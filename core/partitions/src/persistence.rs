@@ -19,18 +19,22 @@ use iggy_binary_protocol::PrepareHeader;
 use journal::PartitionPrepareJournal;
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::partition_journal::PARTITION_WAL_BYTES_MAX;
+use server_common::Message;
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Duration;
 
 const APPEND_BATCH_BYTES_MAX: u64 = 1024 * 1024;
 const APPEND_BATCH_OPS_MAX: usize = 64;
+const CHECKPOINT_DIRTY_FILES_MAX: usize = 1024;
+const PERSISTENCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +62,7 @@ pub type PersistenceNotifier = Rc<dyn Fn(PersistenceCompletion)>;
 pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     group: u64,
     instance: u64,
+    lease: Option<Arc<WriterLease>>,
     epoch: Cell<u64>,
     journal: RefCell<Option<PartitionPrepareJournal<S>>>,
     queue: RefCell<VecDeque<Mutation>>,
@@ -78,6 +83,7 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     in_flight_bytes: Cell<u64>,
     waiters: RefCell<Vec<std::task::Waker>>,
     running: Cell<bool>,
+    writer_active: Cell<bool>,
     retired: Cell<bool>,
     failure: RefCell<Option<Arc<io::Error>>>,
     notifier: RefCell<Option<PersistenceNotifier>>,
@@ -85,6 +91,200 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     batched_prepares: Cell<u64>,
     completed_checkpoints: Cell<u64>,
     failed_writes: Cell<u64>,
+}
+
+struct WriterLease {
+    key: PathBuf,
+    id: u64,
+    retired: AtomicBool,
+    running: AtomicBool,
+    waiters: Mutex<Vec<std::task::Waker>>,
+}
+
+struct WriterRegistration {
+    id: u64,
+    writer: Weak<WriterLease>,
+    interrupted: bool,
+}
+
+static WRITERS: LazyLock<Mutex<HashMap<PathBuf, WriterRegistration>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl WriterLease {
+    async fn acquire(key: PathBuf) -> io::Result<Arc<Self>> {
+        loop {
+            let previous = {
+                let mut writers = WRITERS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if writers
+                    .get(&key)
+                    .is_some_and(|registration| registration.interrupted)
+                {
+                    return Err(io::Error::other(
+                        "interrupted partition WAL writer requires process restart",
+                    ));
+                }
+                if let Some(previous) = writers
+                    .get(&key)
+                    .and_then(|registration| registration.writer.upgrade())
+                {
+                    drop(writers);
+                    Some(previous)
+                } else {
+                    let lease = Arc::new(Self {
+                        key: key.clone(),
+                        id: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+                        retired: AtomicBool::new(false),
+                        running: AtomicBool::new(false),
+                        waiters: Mutex::new(Vec::new()),
+                    });
+                    writers.insert(
+                        key.clone(),
+                        WriterRegistration {
+                            id: lease.id,
+                            writer: Arc::downgrade(&lease),
+                            interrupted: false,
+                        },
+                    );
+                    drop(writers);
+                    return Ok(lease);
+                }
+            };
+            let Some(previous) = previous else { continue };
+            if !previous.retired.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "partition WAL already has an active writer",
+                ));
+            }
+            compio::runtime::time::timeout(
+                PERSISTENCE_DRAIN_TIMEOUT,
+                futures::future::poll_fn(|context| {
+                    let mut waiters = previous
+                        .waiters
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !previous.running.load(Ordering::Acquire) {
+                        return std::task::Poll::Ready(());
+                    }
+                    if !waiters
+                        .iter()
+                        .any(|waiter| waiter.will_wake(context.waker()))
+                    {
+                        waiters.push(context.waker().clone());
+                    }
+                    std::task::Poll::Pending
+                }),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "retired partition WAL writer did not stop",
+                )
+            })?;
+            let mut writers = WRITERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if writers
+                .get(&key)
+                .is_some_and(|registration| registration.id == previous.id)
+            {
+                writers.remove(&key);
+            }
+        }
+    }
+
+    fn finish(&self) {
+        self.running.store(false, Ordering::Release);
+        for waiter in self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            waiter.wake();
+        }
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        let mut writers = WRITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if writers
+            .get(&self.key)
+            .is_some_and(|registration| registration.id == self.id && !registration.interrupted)
+        {
+            writers.remove(&self.key);
+        }
+    }
+}
+
+struct WriterTicket<S: DurableStorage> {
+    owner: Rc<PartitionPersistence<S>>,
+    started: bool,
+}
+
+impl<S: DurableStorage> Drop for WriterTicket<S> {
+    fn drop(&mut self) {
+        if self.started {
+            return;
+        }
+        self.owner.fail(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "partition WAL writer was dropped before polling",
+        ));
+        self.owner.running.set(false);
+        if let Some(lease) = &self.owner.lease {
+            lease.finish();
+        }
+        for waiter in self.owner.waiters.borrow_mut().drain(..) {
+            waiter.wake();
+        }
+    }
+}
+
+struct WriterGuard<'a, S: DurableStorage> {
+    owner: &'a PartitionPersistence<S>,
+    journal: Option<PartitionPrepareJournal<S>>,
+    complete: bool,
+}
+
+impl<S: DurableStorage> Drop for WriterGuard<'_, S> {
+    fn drop(&mut self) {
+        *self.owner.journal.borrow_mut() = self.journal.take();
+        self.owner.in_flight_bytes.set(0);
+        self.owner.checkpoint_running.set(false);
+        if !self.complete
+            && let Some(lease) = &self.owner.lease
+        {
+            let mut writers = WRITERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(registration) = writers.get_mut(&lease.key)
+                && registration.id == lease.id
+            {
+                registration.interrupted = true;
+            }
+        }
+        if !self.complete && self.owner.failure.borrow().is_none() {
+            *self.owner.failure.borrow_mut() = Some(Arc::new(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "partition WAL writer stopped during a mutation",
+            )));
+        }
+        self.owner.writer_active.set(false);
+        self.owner.running.set(false);
+        if let Some(lease) = &self.owner.lease {
+            lease.finish();
+        }
+        for waiter in self.owner.waiters.borrow_mut().drain(..) {
+            waiter.wake();
+        }
+    }
 }
 
 struct AcceptedPrepares {
@@ -149,7 +349,7 @@ impl PartitionPersistence {
         directory: &Path,
         group: u64,
         incarnation: u64,
-    ) -> io::Result<(Rc<Self>, Vec<Frozen<4096>>)> {
+    ) -> io::Result<(Rc<Self>, Vec<Message<PrepareHeader>>)> {
         Self::open_with_storage(directory, group, incarnation, DiskStorage).await
     }
 }
@@ -162,7 +362,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         group: u64,
         incarnation: u64,
         storage: S,
-    ) -> io::Result<(Rc<Self>, Vec<Frozen<4096>>)> {
+    ) -> io::Result<(Rc<Self>, Vec<Message<PrepareHeader>>)> {
         Self::open_with_capacity(
             directory,
             group,
@@ -181,8 +381,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         incarnation: u64,
         storage: S,
         capacity: u64,
-    ) -> io::Result<(Rc<Self>, Vec<Frozen<4096>>)> {
-        let journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+    ) -> io::Result<(Rc<Self>, Vec<Message<PrepareHeader>>)> {
+        let lease = if let Some(key) = storage.writer_identity(directory)? {
+            Some(WriterLease::acquire(key).await?)
+        } else {
+            None
+        };
+        let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
             directory,
             group,
             incarnation,
@@ -190,18 +395,21 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             capacity,
         )
         .await?;
-        let prepares = journal.prepares().await?;
+        let prepares = journal.take_recovered_prepares();
         let mut accepted = AcceptedPrepares {
             base: journal.checkpoint_op(),
             checksums: VecDeque::with_capacity(prepares.len()),
         };
         for prepare in &prepares {
-            let header = prepare_header(prepare)?;
-            accepted.checksums.push_back(header.checksum);
+            let header = prepare.header();
+            if header.op > journal.checkpoint_op() {
+                accepted.checksums.push_back(header.checksum);
+            }
         }
         let persistence = Rc::new(Self {
             group,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            lease,
             epoch: Cell::new(0),
             accepted_head: Cell::new(journal.head()),
             durable_head: Cell::new(journal.head()),
@@ -222,6 +430,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             in_flight_bytes: Cell::new(0),
             waiters: RefCell::new(Vec::new()),
             running: Cell::new(false),
+            writer_active: Cell::new(false),
             retired: Cell::new(false),
             failure: RefCell::new(None),
             notifier: RefCell::new(None),
@@ -231,6 +440,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             failed_writes: Cell::new(0),
         });
         Ok((persistence, prepares))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_capacity_for_test(&self) {
+        self.disk_bytes.set(self.capacity);
     }
 
     pub fn set_notifier(&self, notifier: PersistenceNotifier) {
@@ -247,7 +461,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         !self.retired.get()
             && self.failure.borrow().is_none()
             && header.op <= self.durable_head.get()
-            && self.accepted.borrow().checksum(header.op) == Some(header.checksum)
+            && self.checksum(header.op) == Some(header.checksum)
+    }
+
+    pub const fn durable_op(&self) -> u64 {
+        self.durable_head.get()
     }
 
     pub fn is_durable_through(&self, op: u64) -> bool {
@@ -274,6 +492,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     /// Returns an error if persistence fails, capacity is exhausted, or history is invalid.
     pub fn append(&self, prepare: Frozen<4096>, durable: bool) -> io::Result<()> {
         let header = prepare_header(&prepare)?;
+        let bytes = journal::partition_journal::record_length(prepare.len())? as u64;
         if self.accepted.borrow().checksum(header.op) == Some(header.checksum) {
             return Ok(());
         }
@@ -289,7 +508,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 "partition WAL submission is out of order",
             ));
         }
-        let bytes = journal::partition_journal::record_length(prepare.len())? as u64;
         self.queued_bytes.set(self.queued_bytes.get() + bytes);
         self.accepted
             .borrow_mut()
@@ -431,10 +649,17 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         (self.purge_generation.get(), self.purge_floor.get())
     }
 
-    pub const fn needs_checkpoint(&self) -> bool {
+    pub fn needs_checkpoint(&self) -> bool {
         !self.checkpoint_pending()
-            && self.disk_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
+            && (self.disk_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
                 >= self.capacity / 2
+                || self.dirty_segments.borrow().len() * 2
+                    + self
+                        .dirty_offsets
+                        .iter()
+                        .map(|offsets| offsets.borrow().len())
+                        .sum::<usize>()
+                    >= CHECKPOINT_DIRTY_FILES_MAX)
     }
 
     pub fn take_metrics(&self) -> PersistenceMetrics {
@@ -448,6 +673,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             completed_checkpoints: self.completed_checkpoints.replace(0),
             failed_writes: self.failed_writes.replace(0),
         }
+    }
+
+    pub fn fail(&self, error: io::Error) {
+        self.failed_writes.set(self.failed_writes.get() + 1);
+        *self.failure.borrow_mut() = Some(Arc::new(error));
+        self.notify();
     }
 
     pub fn failure(&self) -> Option<Arc<io::Error>> {
@@ -472,14 +703,20 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub fn retire(&self) {
         self.retired.set(true);
+        if let Some(lease) = &self.lease {
+            lease.retired.store(true, Ordering::Release);
+        }
         self.queue.borrow_mut().clear();
+        self.queued_bytes.set(0);
     }
 
     /// # Errors
     /// Returns an error if persistence fails, capacity is exhausted, or history is invalid.
     pub async fn drain(&self) -> io::Result<()> {
         futures::future::poll_fn(|context| {
-            if let Some(error) = self.failure() {
+            if !self.running.get()
+                && let Some(error) = self.failure()
+            {
                 return std::task::Poll::Ready(Err(io::Error::new(error.kind(), error)));
             }
             if !self.running.get() && self.queue.borrow().is_empty() {
@@ -497,16 +734,54 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         .await
     }
 
-    pub fn start(&self) -> bool {
-        !self.retired.get()
-            && self.failure.borrow().is_none()
-            && !self.queue.borrow().is_empty()
-            && !self.running.replace(true)
+    /// # Errors
+    /// Returns a storage failure or a timeout without allowing a second writer.
+    pub async fn drain_with_timeout(&self) -> io::Result<()> {
+        compio::runtime::time::timeout(PERSISTENCE_DRAIN_TIMEOUT, self.drain())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "partition WAL drain timed out"))?
     }
 
-    pub async fn run(self: Rc<Self>) {
-        let Some(mut journal) = self.journal.borrow_mut().take() else {
-            self.running.set(false);
+    pub fn start(&self) -> bool {
+        let start = !self.retired.get()
+            && self.failure.borrow().is_none()
+            && !self.queue.borrow().is_empty()
+            && !self.running.replace(true);
+        if start && let Some(lease) = &self.lease {
+            lease.running.store(true, Ordering::Release);
+        }
+        start
+    }
+
+    pub fn run(self: Rc<Self>) -> impl Future<Output = ()> {
+        let mut ticket = WriterTicket {
+            owner: self,
+            started: false,
+        };
+        async move {
+            ticket.started = true;
+            Rc::clone(&ticket.owner).run_inner().await;
+        }
+    }
+
+    async fn run_inner(self: Rc<Self>) {
+        if self.writer_active.replace(true) {
+            self.fail(io::Error::other("partition WAL writer was started twice"));
+            return;
+        }
+        self.running.set(true);
+        if let Some(lease) = &self.lease {
+            lease.running.store(true, Ordering::Release);
+        }
+        let journal = self.journal.borrow_mut().take();
+        let mut guard = WriterGuard {
+            owner: &self,
+            journal,
+            complete: false,
+        };
+        let Some(journal) = guard.journal.as_mut() else {
+            self.fail(io::Error::other("partition WAL writer has no journal"));
+            guard.complete = true;
             return;
         };
         loop {
@@ -533,7 +808,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 Mutation::Append {
                     prepare, durable, ..
                 } => {
-                    self.append_batch(&mut journal, prepare, durable, epoch, bytes)
+                    self.append_batch(journal, prepare, durable, epoch, bytes)
                         .await
                 }
                 Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
@@ -582,11 +857,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 }
             }
         }
-        *self.journal.borrow_mut() = Some(journal);
-        self.running.set(false);
-        for waiter in self.waiters.borrow_mut().drain(..) {
-            waiter.wake();
-        }
+        guard.complete = true;
     }
 
     async fn append_batch(
@@ -634,9 +905,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         }
         self.in_flight_bytes.set(bytes);
         let count = batch.len() as u64;
-        for prepare in batch {
-            journal.append_buffered(prepare).await?;
-        }
+        journal.append_batch_buffered(&batch).await?;
         if durable {
             journal.sync().await?;
             self.completed_batches.set(self.completed_batches.get() + 1);
@@ -746,6 +1015,7 @@ mod tests {
         assert!(segments.is_empty());
         assert!(offsets.iter().all(BTreeSet::is_empty));
         let first = prepare(1, 0);
+        let checkpoint_header = *first.header();
         let second = prepare(2, first.header().checksum);
         persistence.append(first.into_frozen(), true).unwrap();
         persistence.append(second.into_frozen(), true).unwrap();
@@ -756,7 +1026,62 @@ mod tests {
         Rc::clone(&persistence).run().await;
         assert!(persistence.failure().is_none());
         assert_eq!(persistence.checkpoint_op(), 1);
+        assert!(persistence.is_durable(&checkpoint_header));
         assert!(!persistence.checkpoint_pending());
+    }
+
+    #[compio::test]
+    async fn dropping_an_unpolled_writer_releases_drain_waiters() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) = PartitionPersistence::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        persistence
+            .append(prepare(1, 0).into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        drop(Rc::clone(&persistence).run());
+        assert!(!persistence.running.get());
+        assert!(persistence.journal.borrow().is_some());
+        assert_eq!(
+            persistence.drain().await.unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[compio::test]
+    async fn replacement_waits_for_the_retired_writer_and_rejects_a_live_owner() {
+        let directory = tempdir().unwrap();
+        let (old, _) = PartitionPersistence::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert!(
+            PartitionPersistence::open(directory.path(), 42, 7)
+                .await
+                .is_err()
+        );
+        old.append(prepare(1, 0).into_frozen(), true).unwrap();
+        assert!(old.start());
+        old.retire();
+        let mut replacement = Box::pin(PartitionPersistence::open(directory.path(), 42, 7));
+        assert!(futures::poll!(&mut replacement).is_pending());
+        Rc::clone(&old).run().await;
+        let (replacement, _) = replacement.await.unwrap();
+        assert_eq!(replacement.head(), 0);
+        assert!(replacement.failure().is_none());
+    }
+
+    #[compio::test]
+    async fn dirty_file_count_requests_a_checkpoint_below_the_byte_threshold() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) = PartitionPersistence::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        for consumer_id in 0..u32::try_from(CHECKPOINT_DIRTY_FILES_MAX).unwrap() {
+            persistence.mark_offset_dirty(0, consumer_id, true);
+        }
+        assert!(persistence.needs_checkpoint());
+        assert_eq!(persistence.disk_bytes.get(), 0);
     }
 
     fn prepare(op: u64, parent: u128) -> Message<PrepareHeader> {

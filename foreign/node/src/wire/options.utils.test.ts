@@ -34,7 +34,8 @@ const prefixed = (block: Buffer): Buffer => {
  *
  * Rust pins the identical bytes in `core/binary_protocol/src/primitives/options.rs`,
  * as do the Go and Java SDKs. Round-tripping through this SDK's own decoder proves
- * nothing about interoperability; these bytes are the contract.
+ * nothing about interoperability. This insertion-order vector covers Bool, Uint64
+ * and String values, independently of Rust's sorted map order.
  */
 const GOLDEN_OPTIONS_BLOCK = Buffer.from([
   2, 20, 0, 0, 0,

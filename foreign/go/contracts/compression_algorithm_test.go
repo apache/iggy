@@ -57,7 +57,8 @@ func TestCompressionAlgorithm_StringNamesUnknownCode(t *testing.T) {
 //
 // Rust pins the identical bytes in core/binary_protocol/src/primitives/options.rs,
 // as do the Node and Java SDKs. Round-tripping through this SDK's own decoder
-// proves nothing about interoperability; these bytes are the contract.
+// proves nothing about interoperability. This insertion-order vector covers Bool,
+// Uint64 and String values, independently of Rust's sorted map order.
 var goldenOptionsBlock = []byte{
 	2, 20, 0, 0, 0,
 	'p', 'r', 'e', 'a', 'l', 'l', 'o', 'c', 'a', 't', 'e', '_', 's', 'e', 'g', 'm', 'e', 'n', 't', 's',

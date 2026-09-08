@@ -1104,3 +1104,42 @@ async fn given_one_http_durability_option_when_creating_should_derive_the_other_
         }
     }
 }
+
+#[iggy_harness]
+async fn given_http_sdk_when_sending_should_expose_the_advertised_durability(
+    harness: &TestHarness,
+) {
+    let address = harness.server().http_addr().unwrap();
+    let client = iggy::http::http_client::HttpClient::new(&format!("http://{address}")).unwrap();
+    client.login_user("iggy", "iggy").await.unwrap();
+    client.create_stream("sdk-durability").await.unwrap();
+    let stream = Identifier::named("sdk-durability").unwrap();
+    client
+        .create_topic(
+            &stream,
+            "persisted",
+            &TopicCreateOptions {
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut messages = vec![
+        IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"durable"))
+            .build()
+            .unwrap(),
+    ];
+    let (response, durability) = client
+        .send_messages_with_durability(
+            &stream,
+            &Identifier::named("persisted").unwrap(),
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+    assert_eq!(durability, Some(Durability::Persisted));
+    assert_eq!(response.confirmations.len(), 1);
+}
