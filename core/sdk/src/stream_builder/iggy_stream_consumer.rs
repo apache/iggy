@@ -79,14 +79,16 @@ use tracing::trace;
 ///
 /// | Option | [`IggyConsumerConfig`] | [`IggyConsumerBuilder`] |
 /// | --- | --- | --- |
-/// | [`polling_strategy()`] | [`PollingStrategy::last()`], so a run starts at the end of the partition and reads no history | [`PollingStrategy::next()`] |
+/// | [`polling_strategy()`] | [`PollingStrategy::last()`], so every poll starts [`batch_length()`] messages back from the end of the partition | [`PollingStrategy::next()`] |
 /// | [`auto_commit()`] | [`AutoCommitWhen::PollingMessages`], with no interval | the same trigger, plus a one-second interval |
 /// | [`batch_length()`] | 100 | 1000 |
 /// | [`init_retries()`] | five retries, three seconds apart | none |
 ///
-/// With [`PollingStrategy::last()`] the stored offset is never consulted, so a restarted consumer
-/// skips whatever arrived while it was down. Set [`PollingStrategy::next()`] to resume where the
-/// previous run stopped.
+/// [`PollingStrategy::last()`] never consults the stored offset, so a restarted consumer re-reads
+/// up to [`batch_length()`] messages that it handled before. If more messages arrived while it was
+/// down, it skips the oldest of them. See
+/// [the callouts on `IggyConsumerConfig`](IggyConsumerConfig#some-callouts-on-defaults), and set
+/// [`PollingStrategy::next()`] to resume where the previous run stopped.
 ///
 /// An encryptor rules out the default [`auto_commit()`]. That setting commits a batch before it is
 /// decrypted, so [`IggyConsumer::init()`] rejects the pair with

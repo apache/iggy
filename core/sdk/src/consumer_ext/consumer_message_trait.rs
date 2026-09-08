@@ -81,8 +81,9 @@ pub trait IggyConsumerMessageExt<'a> {
     ///
     /// The loop stops when `shutdown_rx` resolves, which happens both when the sender sends and
     /// when the sender is dropped. It also stops when the stream ends, which happens after
-    /// `shutdown()` on the consumer. Either way it returns `Ok(())` and leaves the consumer
-    /// usable, so committing the reading position and leaving the group is still your call.
+    /// `shutdown()` on the consumer. Every case returns `Ok(())`. After the two signal cases the
+    /// consumer stays usable, so committing the reading position and leaving the group is still
+    /// your call.
     ///
     /// A message whose handler returned an error is logged and skipped. The loop reads on.
     ///

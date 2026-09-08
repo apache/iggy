@@ -53,7 +53,7 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
 /// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | what is read |
-/// | [`stream_id()`](Self::stream_id), [`topic_id()`](Self::topic_id) | the same two names | the lookup that decides whether the stream and the topic exist |
+/// | [`stream_id()`](Self::stream_id), [`topic_id()`](Self::topic_id) | the same two names | the lookup that [`IggyStreamConsumer`] runs to decide whether the stream and the topic exist, and the name it creates them under |
 /// | [`consumer_name()`](Self::consumer_name) | `test_consumer`, or `consumer-{stream}-{topic}` | the name of the consumer, or of its group |
 /// | [`consumer_kind()`](Self::consumer_kind) | [`ConsumerKind::ConsumerGroup`] | whether the consumer joins a group or reads one partition alone |
 /// | [`partitions_count()`](Self::partitions_count) | 1 | two things, see below |
@@ -67,26 +67,34 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// | [`init_retries()`](Self::init_retries), [`init_interval()`](Self::init_interval) | five retries, three seconds apart | retries for a missing stream or topic |
 /// | [`encryptor()`](Self::encryptor) | none | decrypting payloads and user headers |
 ///
-/// [`partitions_count()`](Self::partitions_count) carries two meanings. It is the partition count
-/// of a topic that the build creates. For [`ConsumerKind::Consumer`] it is also the ID of the
-/// single partition the consumer reads. A [`ConsumerKind::ConsumerGroup`] ignores that second
-/// meaning, because the server assigns its partitions.
+/// ## Some callouts on defaults
 ///
-/// [`encryptor()`](Self::encryptor) replaces the encryptor of the [`IggyClient`] for this
-/// consumer. The key must match the one the producer used. An encryptor also rules out the default
-/// [`auto_commit()`](Self::auto_commit), because that setting commits a batch before it is
-/// decrypted. [`IggyConsumer::init()`] rejects the pair with [`IggyError::InvalidConfiguration`].
-///
-/// # Two defaults to look at twice
-///
-/// [`PollingStrategy::last()`] starts at the end of the partition and never consults the stored
-/// offset, so a restarted consumer skips whatever arrived while it was down. Set
-/// [`PollingStrategy::next()`] to resume where the previous run stopped.
+/// - [`partitions_count()`](Self::partitions_count) carries two meanings. It is the number of partitions
+///   that the build creates per topic. For [`ConsumerKind::Consumer`] it is also the ID of the
+///   single partition the consumer reads. A [`ConsumerKind::ConsumerGroup`] ignores that second
+///   meaning, because the server assigns its partitions.
+/// - [`encryptor()`](Self::encryptor) replaces the encryptor of the [`IggyClient`] for this
+///   consumer. The key must match the one the producer used. An encryptor also rules out the default
+///   [`auto_commit()`](Self::auto_commit), because that setting commits a batch before it is
+///   decrypted. [`IggyConsumer::init()`] rejects the pair with [`IggyError::InvalidConfiguration`].
+/// - [`PollingStrategy::last()`] never consults the stored offset. The server starts every poll
+///   [`batch_length()`](Self::batch_length) messages back from the end of the partition, so the first
+///   poll of a run returns up to that many messages that exist already. A restarted consumer
+///   therefore re-reads up to [`batch_length()`](Self::batch_length) messages that it handled before.
+///   If more messages arrived while it was down, it skips the oldest of them. Set
+///   [`PollingStrategy::next()`] to resume where the previous run stopped.
 ///
 /// [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) and
 /// [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) are off, so a consumer alone
 /// creates nothing. It waits out [`init_retries()`](Self::init_retries) instead, which covers a
 /// producer that creates the topic at the same time.
+///
+/// Keep [`stream_id()`](Self::stream_id) and [`stream_name()`](Self::stream_name) in agreement, and
+/// keep [`topic_id()`](Self::topic_id) and [`topic_name()`](Self::topic_name) in agreement.
+/// [`IggyStreamConsumer`] creates the stream and the topic under the name it reads from the two
+/// identifiers, and [`IggyConsumer::init()`] then looks the two names up. If a pair disagrees, the
+/// build creates one topic and reads another, and [`IggyConsumer::init()`] fails with
+/// [`IggyError::StreamNameNotFound`] or [`IggyError::TopicNameNotFound`].
 ///
 /// # Examples
 ///
@@ -95,7 +103,7 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// ```rust
 /// use iggy::prelude::*;
 ///
-/// # fn example() -> Result<(), IggyError> {
+/// # fn main() -> Result<(), IggyError> {
 /// let config = IggyConsumerConfig::from_stream_topic(
 ///     "my-stream",
 ///     "my-topic",
@@ -116,7 +124,7 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// ```rust
 /// use iggy::prelude::*;
 ///
-/// # fn example() -> Result<(), IggyError> {
+/// # fn main() -> Result<(), IggyError> {
 /// let config = IggyConsumerConfig::builder()
 ///     .stream_id(Identifier::from_str_value("my-stream")?)
 ///     .stream_name("my-stream")
@@ -223,7 +231,7 @@ impl IggyConsumerConfig {
     /// Sets every field at once, positionally.
     ///
     /// This applies no defaults. [`builder()`](Self::builder) sets the same fields by name and is
-    /// easier to read.
+    /// easier to read. Ordinary consumers use partition 0. Use [`Self::with_partition_id`] to select another partition.
     ///
     /// # Examples
     ///
@@ -233,6 +241,7 @@ impl IggyConsumerConfig {
     /// use iggy::prelude::*;
     ///
     /// # fn example() -> Result<(), IggyError> {
+    /// # fn main() -> Result<(), IggyError> {
     /// let config = IggyConsumerConfig::new(
     ///     Identifier::from_str_value("my-stream")?,
     ///     "my-stream".to_string(),
@@ -299,7 +308,10 @@ impl IggyConsumerConfig {
     ///
     /// Each identifier is derived from the matching name. The consumer is called
     /// `consumer-{stream}-{topic}` and joins a group under that name. It creates neither the
-    /// stream nor the topic, and it starts at the end of the partition.
+    /// stream nor the topic. It reads with [`PollingStrategy::last()`], so every poll starts
+    /// `batch_length` messages back from the end of the partition.
+    ///
+    /// [`PollingStrategy::last()`]: crate::prelude::PollingStrategy::last
     ///
     /// # Examples
     ///
@@ -308,7 +320,7 @@ impl IggyConsumerConfig {
     /// ```rust
     /// use iggy::prelude::*;
     ///
-    /// # fn example() -> Result<(), IggyError> {
+    /// # fn main() -> Result<(), IggyError> {
     /// let config = IggyConsumerConfig::from_stream_topic(
     ///     "my-stream",
     ///     "my-topic",
@@ -424,6 +436,7 @@ impl IggyConsumerConfig {
         self.partitions_count
     }
 
+    /// Returns the partition id the consumer binds to.
     pub fn partition_id(&self) -> u32 {
         self.partition_id
     }
