@@ -133,6 +133,7 @@ struct State {
     messages_processed: u64,
     rows_written: u64,
     rejected_rows: u64,
+    pending_acks: u64,
 }
 
 impl QuestDbSink {
@@ -219,6 +220,7 @@ impl QuestDbSink {
                 messages_processed: 0,
                 rows_written: 0,
                 rejected_rows: 0,
+                pending_acks: 0,
             }),
         }
     }
@@ -263,9 +265,15 @@ impl QuestDbSink {
                     sender
                         .flush_buffer(&mut buffer)
                         .map_err(FlushError::publishing)?;
-                    sender
-                        .wait(ack_level, flush_timeout)
-                        .map_err(FlushError::awaiting)?;
+                    if let Err(error) = sender.wait(ack_level, flush_timeout) {
+                        if !is_pending_ack(&error) {
+                            return Err(FlushError::awaiting(error));
+                        }
+                        outcome.pending_acks += 1;
+                        warn!(
+                            "{CONNECTOR_NAME} ID: {id} flushed rows whose acknowledgement has not arrived yet, stream: {stream}, topic: {topic}, partition_id: {partition_id}. The frames are persisted and delivery continues in the background, so this is lag rather than data loss: {error}"
+                        );
+                    }
                     pending = 0;
                 }
 
@@ -314,10 +322,16 @@ impl QuestDbSink {
                 sender
                     .flush_buffer(&mut buffer)
                     .map_err(FlushError::publishing)?;
-                if ack_level != AckLevel::Ok || flush_timeout > Duration::ZERO {
-                    sender
-                        .wait(ack_level, flush_timeout)
-                        .map_err(FlushError::awaiting)?;
+                if (ack_level != AckLevel::Ok || flush_timeout > Duration::ZERO)
+                    && let Err(error) = sender.wait(ack_level, flush_timeout)
+                {
+                    if !is_pending_ack(&error) {
+                        return Err(FlushError::awaiting(error));
+                    }
+                    outcome.pending_acks += 1;
+                    warn!(
+                        "{CONNECTOR_NAME} ID: {id} flushed rows whose acknowledgement has not arrived yet, stream: {stream}, topic: {topic}, partition_id: {partition_id}. The frames are persisted and delivery continues in the background, so this is lag rather than data loss: {error}"
+                    );
                 }
             }
             Ok(outcome)
@@ -441,6 +455,7 @@ impl Sink for QuestDbSink {
         state.messages_processed += received as u64;
         state.rows_written += total.rows_written as u64;
         state.rejected_rows += total.rejected_rows as u64;
+        state.pending_acks += total.pending_acks as u64;
         Ok(())
     }
 
@@ -457,8 +472,12 @@ impl Sink for QuestDbSink {
         }
         let state = self.state.lock().await;
         info!(
-            "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, rows written: {}, rejected: {}",
-            self.id, state.messages_processed, state.rows_written, state.rejected_rows
+            "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, rows written: {}, rejected: {}, flushes awaiting ack: {}",
+            self.id,
+            state.messages_processed,
+            state.rows_written,
+            state.rejected_rows,
+            state.pending_acks
         );
         Ok(())
     }
@@ -468,6 +487,9 @@ impl Sink for QuestDbSink {
 struct BatchOutcome {
     rows_written: usize,
     rejected_rows: usize,
+    /// Flushes whose acknowledgement had not arrived before the timeout. The
+    /// rows are persisted and still being delivered; this is lag, not loss.
+    pending_acks: usize,
     last_rejection: Option<String>,
 }
 
@@ -475,6 +497,7 @@ impl BatchOutcome {
     fn merge(&mut self, other: BatchOutcome) {
         self.rows_written += other.rows_written;
         self.rejected_rows += other.rejected_rows;
+        self.pending_acks += other.pending_acks;
         if other.last_rejection.is_some() {
             self.last_rejection = other.last_rejection;
         }
@@ -569,6 +592,19 @@ impl FlushError {
             error,
         }
     }
+}
+
+/// A `wait` that timed out without the server advancing its watermark.
+///
+/// The frames are already in the publication log, and the client keeps
+/// delivering them in the background, so this is delivery lag rather than a
+/// failure: the rows arrive once the server catches up or a reconnect
+/// completes. Re-flushing would duplicate them, and reporting it as a failure
+/// tells an operator they lost data they did not lose. Only `FailoverRetry`
+/// carries this meaning in the awaiting phase; a schema, parse or security
+/// rejection there is a genuine terminal error.
+fn is_pending_ack(error: &questdb::Error) -> bool {
+    error.code() == ErrorCode::FailoverRetry
 }
 
 /// Transport-level failures are worth retrying; server rejections are not,
@@ -830,6 +866,29 @@ mod tests {
         assert!(!is_retryable(ErrorCode::ServerSchemaMismatch, false));
         assert!(!is_retryable(ErrorCode::ServerSecurityError, false));
         assert!(!is_retryable(ErrorCode::ServerParseError, false));
+    }
+
+    #[test]
+    fn given_ack_timeout_when_classified_should_be_pending_not_failed() {
+        // The frames are already published and delivery continues, so this
+        // must not be reported as a lost batch.
+        let error = questdb::Error::new(
+            ErrorCode::FailoverRetry,
+            "wait(ok) timed out with no ack progress",
+        );
+        assert!(is_pending_ack(&error));
+    }
+
+    #[test]
+    fn given_terminal_rejection_when_classified_should_not_be_pending() {
+        for code in [
+            ErrorCode::ServerSchemaMismatch,
+            ErrorCode::ServerSecurityError,
+            ErrorCode::ServerParseError,
+        ] {
+            let error = questdb::Error::new(code, "rejected");
+            assert!(!is_pending_ack(&error), "{code:?} must stay terminal");
+        }
     }
 
     #[test]
