@@ -696,10 +696,18 @@ async fn named_path_outcome(
         // condition. The secret path keeps its 404 deliberately: that caller is
         // unauthenticated, and distinguishing "wrong id" from "busy" there
         // would confirm which endpoint ids exist.
+        //
+        // "route unavailable" rather than the "instance is closing" the admin
+        // API uses, because this arm covers two conditions and only one of them
+        // is a closure: the lookup can return nothing because the path was
+        // withdrawn, or it can return a different instance that has taken the
+        // path over. Naming a closure would be wrong for the handover, and the
+        // caller's action is the same either way. It also says no more about
+        // the listener's topology than a retry needs.
         _ => {
             return (
                 Some(instance),
-                error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing"),
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "route unavailable"),
             );
         }
     };
