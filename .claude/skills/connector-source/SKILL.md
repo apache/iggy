@@ -100,7 +100,8 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 
 ### IDs and timestamps
 
-- `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). Apache Iggy can dedupe on this.
+- `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). It rides the wire as the message id, which is what a **consumer** can dedupe an at-least-once duplicate on.
+- **Iggy itself does not dedupe on that id.** The server's only read of the field is `core/server/src/http/wire.rs`, which mints a fresh uuid when the incoming id is 0 and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
 - `origin_timestamp: Option<u64>` - source-system event time in nanoseconds. Lets downstream sinks reason about lag.
 - `timestamp` and `checksum` are Iggy-side - leave `None`.
 
@@ -151,8 +152,8 @@ Iggy consumer-loop labels use literal API names (`offset=`, `current_offset=`).
 4. Returning state only on success - state should advance on empty polls too.
 5. Unbounded data in `State` - rewritten every batch. keep O(constant).
 6. `std::sync::Mutex` - blocks the executor. Use `tokio::sync::Mutex`.
-7. Not setting `ProducedMessage.id` when a stable ID exists - loses idempotency.
-8. Spawning side tasks - the runtime owns the scheduler.
+7. Not setting `ProducedMessage.id` when a stable ID exists - leaves a consumer nothing to dedupe a replayed duplicate on. It does not make the write idempotent server-side, because nothing there reads it.
+8. Spawning side tasks - the runtime owns the scheduler. The one exception is a source that listens rather than polls and must own its listener (see [Concurrency](#concurrency) and the STOP list); it owes an explicit shutdown in the last `close()` that awaits its tasks.
 
 ## Tests
 

@@ -54,6 +54,8 @@ fn given_payload_json_should_serialize_correctly() { ... }
 
 You may **omit one part** when the test is small (`given_X_should_Y` instead of full `given_X_when_Y_should_Z`), but **stay consistent within a file**. Imperative `test_foo` / `does_bar` names are not the convention here.
 
+A test whose subject is a **type** rather than a scenario has no "given" to name, and drops the prefix: it reads `<subject>_should_<property>`. The canonical state round trip below is `state_should_be_serializable_and_deserializable` in all three shipped sources (`random_source`, `postgres_source`, `http_source`). Leave those as they are rather than bending them into the scenario form.
+
 ### Prove a test can fail, before trusting it
 
 A passing test says nothing until you have watched it fail. Break the behaviour it names, run the
