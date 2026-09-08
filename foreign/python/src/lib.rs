@@ -45,11 +45,11 @@ use consumer::{
 use options::OptionSpec;
 use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
-use pyo3::prelude::*;
 use producer::{
     BackgroundProducerConfig, BackpressureMode, DirectProducerConfig, IggyProducer,
     ProducerSharding,
 };
+use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
