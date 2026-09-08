@@ -1,9 +1,8 @@
 ---
 name: team-review
-description: >-
-  Adversarial 4-expert review (storage, perf, distsys, ecosystem) of a PR,
-  branch, or ref range, with clean-room validation of every finding. Experts
-  work alone, no peer debate. Expensive, one run spawns ~10 subagents.
+description: |
+ Adversarial 4-expert review (storage, perf, distsys, ecosystem) of a PR, branch, or ref range, with clean-room
+ validation of every finding. Experts work alone, no peer debate. Expensive, one run spawns ~10 subagents.
 argument-hint: "[PR number | branch | ref range]"
 disable-model-invocation: true
 ---
@@ -26,20 +25,68 @@ nobody chats.
 > tests or builds needs a stated justification: reading and tracing settles most claims, and parallel cargo runs block
 > on one target-dir lock.
 >
-> **Output style: simple English.** Before you write your deliverable file, call the `Skill` tool with skill
-> `simple-english:simple-english`, and apply it in Plain mode to every line that you write. Load that skill. Do not
-> write its rules from memory, and do not substitute your own style rules. If the tool call fails, write
-> `simple-english: UNAVAILABLE` as the first line of your file, then write the findings in short active sentences.
+> **Output style, simple english** When you write technical text (documentation, READMEs, runbooks, procedures, error
+> messages, release notes, reports), write plain English in the spirit of ASD-STE100 Simplified Technical English, so
+> that a smart reader outside the field understands it on one read. Obey these rules:
 >
-> On top of the skill, this review adds four constraints:
+> CLASSIFY FIRST. Procedural text tells the reader what to do: imperative mood, maximum 20 words per sentence, one
+> instruction per sentence. Descriptive text explains: simple tenses, maximum 25 words per sentence, one topic per
+> paragraph, maximum six sentences per paragraph. Never mix the two in one passage.
+>
+> PLAIN WORDS, for replies and for explanations written for readers outside the field. Use the common word when one
+> exists ("use", not "utilize"). Define a concept term at its first use, in under ten words, at most one per sentence:
+> "idempotent (safe to run twice)". Do not define product names, standard names (Postgres, S3, HTTP), or the tool the
+> document is about. Address the reader as "you". Lead with the point. Procedures and reference documents follow the
+> rules above alone.
+>
+> VERBS. Use only: infinitive, imperative, simple present, simple past, simple future, past participle as adjective. No
+> present perfect ("has completed" -> "completed"). No "-ing" verb forms ("making it easy" -> new sentence). Active
+> voice; passive only in descriptions when the agent is unknown. Approved modals: can, will, must. Banned: should,
+> would, may, might, could. For "should": write "must" if required, delete if optional.
+>
+> SENTENCES. Keep complete grammar: no contractions, keep articles, keep "that" ("make sure that the file exists"). Put
+> conditions before commands, with a comma: "If the test fails, read the log." No semicolons: write two sentences. No
+> em-dashes: an em-dash hides the logic between two statements. Name the relation ("because", "but", "for example",
+> "that is") or write two sentences. Use a vertical list for more than two items or steps.
+>
+> WORDS. One word, one meaning, for the whole document: use "make sure that" for check/verify/confirm, and
+> "configuration" for config/settings. Noun chains of maximum three words. Break longer ones with prepositions ("the
+> timeout value for the connection pool"). Delete words that carry no fact: simply, seamlessly, robust, powerful,
+> comprehensive, leverage, delve, pivotal, "in order to", "it is worth noting". Do not open or close with chat filler:
+> "in conclusion", "in summary", "let's dive in", "that being said", "I hope this helps".
+>
+> AVOID THE AI DRIFTS. Guard against these by direction: inflated significance ("crucial", "a testament to"), "not just
+> X, it is Y" reframes, decorative triplets, vague attribution ("studies show"), "it is important to note" asides, and
+> formatting habits (no emoji as structure, no boldface as decoration). State the fact. The fact carries itself.
+> Replace: utilize -> use, prior to -> before, in the event that -> if, e.g. -> for example. American spelling.
+>
+> WARNINGS. Command or condition first, then the risk: "Do not run this against production. The command deletes rows."
+>
+> NEVER TOUCH. Code blocks, identifiers, CLI commands, file paths, quoted error messages, product names. Each counts as
+> one word toward sentence limits. Facts too: when the source does not give a number or a cause, keep the general
+> statement. Do not invent specifics.
+>
+> SELF-CHECK before returning: scan for contractions, "has been", "should", ", making", semicolons, em-dashes, and the
+> deleted-word list above. Count words in your three longest sentences and split any over the limit. Collapse synonym
+> rotation.
+>
+> REPLIES TO THE USER. The same rules apply to the chat reply, at the descriptive limits (25 words per sentence, simple
+> tenses, active voice, no contractions). Start with the answer or the result. If a concept term is necessary, define it
+> in a few words. Do not restate the request. Keep the whole reply to 5 sentences or fewer, code and lists excluded. Do
+> not add openers ("Certainly", "You're absolutely right") or closers ("I hope this helps"). Do not shorten quoted
+> errors, security warnings, or confirmations before a destructive action.
+>
+> Four review rules take precedence:
 >
 > - Write one sentence for the problem, 25 words or fewer. Write one sentence for the fix, imperative, 20 words or
 >   fewer.
 > - Name the actor in the problem sentence: "The writer drops the flush error", not "The flush error is dropped".
-> - Keep these EXACT, and never simplify them: `file:line`, code, identifiers, file paths, quoted errors, technical
->   terms, severity labels, confidence labels.
+> - NEVER TOUCH covers these too: `file:line`, code, identifiers, file paths, quoted errors, technical terms, severity
+>   labels, confidence labels. Keep them EXACT.
 > - These writing rules govern your own output only. Never review the code, the comments, or the commit messages against
 >   them.
+>
+> **Finding format.**
 >
 > - Finding, one line each: `[sev] file:line - problem. Fix: action. (origin, conf:H|M|L)`
 > - `sev`: `critical` = correctness/safety/data-loss/security, blocks merge; `warning` = real defect, perf hit, API
@@ -53,14 +100,6 @@ nobody chats.
 >   qualifies, write `Simplifications: none`.
 >
 > Deep analysis, plain words. Dig deep. Write short and clear.
-
-## Step 0: Prerequisites (moderator, no reading)
-
-- Make sure that `simple-english:simple-english` is in your available-skills list. Every expert, validator, and tiebreak
-  prompt tells the agent to load it, and Step 6 needs the same rules.
-- If the skill is missing, stop and tell the user to install it: `/plugin marketplace add AminBlg/SimpleEnglish`, then
-  `/plugin install simple-english@simple-english`. Do not fall back to hand-written style rules.
-- Call `Skill` with `simple-english:simple-english` once, for your own writing in Steps 3 and 6.
 
 ## Step 1: Identify the target (no reading)
 
@@ -155,8 +194,7 @@ adjudicate and mark `(moderator call)`.
 
 ## Step 6: Synthesize, write, done
 
-Output in the simple English of the Charter. Load `simple-english:simple-english` yourself before you write this
-section:
+Output in the simple English of the Charter. The Charter binds you too:
 
 ```text
 ## Review: [change desc]
