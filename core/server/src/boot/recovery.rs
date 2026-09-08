@@ -155,7 +155,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                         let stats = inner.stats_registry.partition(
                             stream.id,
                             topic_id,
-                            partition.id,
+                            partition,
                             topic.stats.clone(),
                         );
                         owned.push((
