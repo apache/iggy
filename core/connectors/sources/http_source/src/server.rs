@@ -647,13 +647,26 @@ async fn named_path_outcome(
         Ok(body) => body,
         Err(error) => return (Some(instance), oversized_body_response(&error)),
     };
-    let response = enqueue(
-        &instance,
-        &request_headers,
-        remote_addr,
-        body,
-        &state.metrics,
-    );
+    // Resolved again for the same reason the secret path does it: the answer
+    // above is stale by however long the client took to send its body, and
+    // nothing bounds that. An instance that left in the meantime still owns a
+    // bridge whose receiver lives in `HttpSource`, so `try_send` would succeed
+    // and answer 200 for a message no `poll()` will ever drain. `leave()` reads
+    // `sender.len()` for `dropped_on_close` before that message exists, so the
+    // loss would not even be counted. `ptr_eq` also covers the swap: one
+    // instance leaves and another joins claiming the same topic path, and this
+    // request was never authorized against that one.
+    let published = state.published();
+    let serving = match published.routes.lookup_named_path(topic_path) {
+        Some(serving) if Arc::ptr_eq(serving, &instance) => serving,
+        _ => {
+            return (
+                Some(instance),
+                error_response(StatusCode::NOT_FOUND, "not found"),
+            );
+        }
+    };
+    let response = enqueue(serving, &request_headers, remote_addr, body, &state.metrics);
     (Some(instance), response)
 }
 
@@ -1984,6 +1997,76 @@ mod tests {
                 "{label}: every public response carries an `error` field, got: {body}"
             );
         }
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_the_route_withdrawn_during_the_body_read_should_refuse_the_named_path() {
+        // The named path's version of the same window. Its instance can stop
+        // serving the path while the body is still arriving, and the bridge
+        // still accepts the message because the receiver lives in `HttpSource`
+        // until the runtime closes it. The sender would get 200 for something
+        // no poll will drain, and `leave()` already took its `dropped_on_close`
+        // count before the message existed, so nothing would record the loss.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.topic_path = Some("github".to_string());
+        config.auth_bearer_token = None;
+        let mut source = open(1, config).await;
+        let addr = source.shared.config.listen_addr.clone();
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        let body = "{}";
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("the listener must accept");
+        let head = format!(
+            "POST /topics/github HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{body}\r\n"
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head must be written");
+        stream.flush().await.expect("the head must be flushed");
+
+        // Still serving right now, so the parked handler resolved it as such
+        // and the refusal below cannot come from a withdrawal that landed too
+        // early. Doubles as the readiness gate.
+        let probe = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body(body)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(probe.status(), StatusCode::OK);
+        let queued_before = shared.sender.len();
+
+        // The instance stops serving the path.
+        publish(&source, vec![]).await;
+
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("the terminating chunk must be written");
+        stream.flush().await.expect("the body must be flushed");
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the response must arrive before the timeout")
+        .expect("the response must be readable");
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "a path withdrawn while the body streamed must be seen, got: {response}"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before,
+            "and nothing may reach a bridge no poll will drain"
+        );
         close(&mut source).await;
     }
 
