@@ -24,15 +24,18 @@ use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
 use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
-use integration::harness::seeds;
+use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
 
 const API_KEY: &str = "test-api-key";
 const RESTORED_TOKEN: &str = "token-that-must-survive-a-restart";
+/// Doubles as the marker proving a revocation reached the state file.
+const REVOCATION_REASON: &str = "compromised";
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/source.toml")),
@@ -210,7 +213,7 @@ async fn management_registered_endpoint_accepts_until_revoked(
             fixture.admin_url()
         ))
         .header("Authorization", format!("Bearer {MANAGEMENT_TOKEN}"))
-        .json(&json!({"reason": "compromised"}))
+        .json(&json!({"reason": REVOCATION_REASON}))
         .send()
         .await
         .expect("Failed to revoke the endpoint");
@@ -246,11 +249,11 @@ async fn dynamic_endpoint_survives_connector_restart(
 
     // Registered with a secret so the restart proves the credential survives
     // the state round trip, not merely the endpoint id.
+    let state_path = registry_state_path(harness);
     let endpoint_id = register_secured_endpoint(&http, &fixture, GITHUB_INSTANCE).await;
-    // The registry only reaches the runtime once a poll carrying it has been
-    // sent, so wait for the connector to report it submitted before pulling
-    // the rug out from under it.
-    wait_for_submitted(&http, &fixture, &endpoint_id).await;
+    // The restart below boots from this file, so the registration has to be in
+    // it first. Reported-as-submitted is not the same thing.
+    wait_for_registry_on_disk(&state_path, &endpoint_id).await;
 
     let restarted = http
         .post(format!("{api_url}/sources/{GITHUB_INSTANCE}/restart"))
@@ -322,18 +325,21 @@ async fn revoked_static_endpoint_stays_revoked_across_restart(
         .expect("Failed to POST before revocation");
     assert_eq!(before.status(), StatusCode::OK);
 
+    let state_path = registry_state_path(harness);
     let revoked = http
         .delete(format!(
             "{}/admin/endpoints/{GITHUB_ENDPOINT_ID}",
             fixture.admin_url()
         ))
         .header("Authorization", format!("Bearer {MANAGEMENT_TOKEN}"))
-        .json(&json!({"reason": "compromised"}))
+        .json(&json!({"reason": REVOCATION_REASON}))
         .send()
         .await
         .expect("Failed to revoke the static endpoint");
     assert_eq!(revoked.status(), StatusCode::ACCEPTED);
-    wait_for_submitted(&http, &fixture, GITHUB_ENDPOINT_ID).await;
+    // The reason rides the tombstone, so it reaches disk only when the
+    // revocation does.
+    wait_for_registry_on_disk(&state_path, REVOCATION_REASON).await;
 
     let restarted = http
         .post(format!("{api_url}/sources/{GITHUB_INSTANCE}/restart"))
@@ -455,24 +461,42 @@ async fn register_endpoint(http: &Client, fixture: &HttpSourceFixture, instance:
         .to_string()
 }
 
-async fn wait_for_submitted(http: &Client, fixture: &HttpSourceFixture, endpoint_id: &str) {
+/// The state file the runtime keeps this connector's endpoint registry in.
+fn registry_state_path(harness: &TestHarness) -> PathBuf {
+    harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .state_path()
+        .join(format!("source_{GITHUB_INSTANCE}.state"))
+}
+
+/// Waits until a specific registry mutation is on disk, identified by a string
+/// that only it writes there.
+///
+/// `submitted` on the admin API says the registry left the plugin, not that the
+/// runtime wrote it, and the flag flips before the state does. A restart landing
+/// in that gap boots from a file the mutation never reached, so a test waiting on
+/// `submitted` goes red at random.
+///
+/// Waiting for the file to merely change is not enough either: a flush already in
+/// flight would satisfy that without carrying the mutation. MessagePack stores
+/// strings as a length prefix followed by their raw bytes, so `marker` appears
+/// verbatim once the mutation carrying it has landed.
+async fn wait_for_registry_on_disk(state_path: &Path, marker: &str) {
     for _ in 0..POLL_ATTEMPTS {
-        if let Ok(response) = http
-            .get(format!(
-                "{}/admin/endpoints/{endpoint_id}",
-                fixture.admin_url()
-            ))
-            .header("Authorization", format!("Bearer {MANAGEMENT_TOKEN}"))
-            .send()
-            .await
-            && let Ok(body) = response.json::<Value>().await
-            && body["submitted"] == json!(true)
+        if let Ok(state) = tokio::fs::read(state_path).await
+            && state
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
         {
             return;
         }
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
-    panic!("The registered endpoint was never handed to the runtime for persistence");
+    panic!(
+        "'{marker}' never reached {}, so a restart would not have seen it",
+        state_path.display()
+    );
 }
 
 /// Compares the typed status rather than a string: `ConnectorStatus`
