@@ -874,6 +874,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_wrong_content_type_when_registered_should_answer_unsupported_media_type() {
+        // Documented in the README's status table, so it is pinned rather than
+        // assumed: the JSON extractor's rejection carries this status, and
+        // `error_response` renders it in this API's shape like every other.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+
+        let response = client()
+            .post(format!("{}/admin/endpoints", fixture.admin))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(r#"{"instance":"http_github","auth_type":"none"}"#)
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body: Value = response.json().await.expect("the error must be json");
+        assert!(
+            body.get("error").is_some(),
+            "a rejected body still answers in this API's error shape, got: {body}"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
     async fn given_unknown_field_when_registered_should_reject() {
         let fixture = Fixture::start(Some(TOKEN)).await;
 

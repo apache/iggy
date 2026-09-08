@@ -525,6 +525,19 @@ fn public_router(state: Arc<ServerState>) -> Router {
         .route("/topics/{topic_path}", post(handle_named_path))
         .route("/e/{endpoint_id}", post(handle_secret_path))
         .route("/health", get(handle_health))
+        // Without these, a mistyped path got axum's empty-bodied 404 and a
+        // wrong method an undocumented 405, while every other response on this
+        // listener carries `{"error": ...}`. A sender parsing that field broke
+        // on exactly the two responses a misconfiguration produces.
+        //
+        // The admin listener deliberately keeps axum's bare fallback: an
+        // unconfigured management API is not mounted at all there, and
+        // answering with this crate's error shape would make "no token
+        // configured" look like a route that exists and refused.
+        .fallback(|| async { error_response(StatusCode::NOT_FOUND, "not found") })
+        .method_not_allowed_fallback(|| async {
+            error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        })
         .with_state(state)
 }
 
@@ -1926,6 +1939,52 @@ mod tests {
             );
             close(&mut source).await;
         }
+    }
+
+    #[tokio::test]
+    async fn given_an_unrouted_request_when_answered_should_use_this_api_error_shape() {
+        // Every other response on the public listener carries `{"error": ...}`,
+        // and the README documents that shape for "unknown path". Without a
+        // fallback a mistyped path got axum's empty-bodied 404 and a wrong
+        // method an undocumented 405, so a sender parsing `error` broke on
+        // exactly the two responses a misconfiguration produces.
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+        let base = base_url(&source);
+
+        for (label, response) in [
+            (
+                "unknown path",
+                client()
+                    .post(format!("{base}/nope"))
+                    .body("{}")
+                    .send()
+                    .await
+                    .expect("the request must reach the listener"),
+            ),
+            (
+                "wrong method",
+                client()
+                    .get(format!("{base}/e/{ENDPOINT_ONE}"))
+                    .send()
+                    .await
+                    .expect("the request must reach the listener"),
+            ),
+        ] {
+            let status = response.status();
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                "{label}: unexpected status {status}"
+            );
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: body must be this API's json: {error}"));
+            assert!(
+                body.get("error").is_some(),
+                "{label}: every public response carries an `error` field, got: {body}"
+            );
+        }
+        close(&mut source).await;
     }
 
     #[tokio::test]

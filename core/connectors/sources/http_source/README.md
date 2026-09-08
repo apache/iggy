@@ -119,9 +119,9 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
-| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. |
-| `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. |
-| `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. |
+| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 67108864**; a larger value fails `open()`. |
+| `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
+| `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. **Max 100000**; a larger value fails `open()`. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
 | `forward_headers` | array | `[]` | Request headers copied onto the message. Invalid names fail `open()`, as do `Authorization`, `Proxy-Authorization`, and `Cookie`, because forwarding a reusable credential would copy it onto every message and persist it in the log. |
 | `endpoints` | array | `[]` | Static secret-path endpoints. |
@@ -238,12 +238,15 @@ Rotation deliberately keeps the path: a webhook sender configures the URL once, 
 
 | Status | Condition |
 | ------ | --------- |
-| 400 | Empty `auth_secret`, an `expires_at` already in the past, or an `hmac_header` that is not a valid HTTP header name |
+| 400 | Empty `auth_secret`; an `auth_secret` supplied with `auth_type: none`; an `expires_at` already in the past; an `hmac_header` that is not a valid HTTP header name; a `reason`, `auth_secret`, `hmac_header` or `hmac_prefix` past its length cap |
 | 401 | Missing or wrong `management_token` |
 | 404 | Unknown endpoint, unknown `instance`, or the API is not configured |
-| 409 | Rotating a static endpoint, or a generated id collision |
+| 409 | Rotating a static endpoint, an endpoint whose `auth_type` is `none`, or one that has expired; or a generated id collision |
+| 415 | Missing or wrong `Content-Type` on a request that takes a body |
+| 422 | A body that parses as JSON but carries an unknown field or a wrong type |
 | 500 | The route table could not be rebuilt |
 | 503 | The owning instance closed while the request was in flight |
+| 507 | The registry is at `MAX_ENDPOINTS` with no reclaimable tombstone |
 
 Revocation writes a tombstone rather than deleting the entry. The tombstone persists, so a restart against a stale TOML file cannot resurrect an endpoint someone revoked. That rests on `open()` failing when the state file cannot be decoded, rather than falling back to the TOML: the connector reports the decode failure as `last_error` and serves nothing, instead of quietly putting revoked endpoints back on the wire.
 
