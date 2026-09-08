@@ -1588,9 +1588,15 @@ mod tests {
         }
     }
 
+    /// Test messages carry a real id, because 0 is the one value the server
+    /// replaces: `core/server/src/http/wire.rs` mints a fresh uuid for a zero
+    /// id, so a test that queued 0 could not tell a preserved id from a
+    /// replaced one. Distinct per message, so an assertion on order is an
+    /// assertion on identity too.
     fn queued(payload: &str) -> QueuedMessage {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         QueuedMessage {
-            id: 0,
+            id: u128::from(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             payload: payload.as_bytes().to_vec(),
             headers: None,
         }
@@ -1939,6 +1945,13 @@ mod tests {
         }
 
         let first = source.poll().await.expect("poll must succeed");
+        let first_ids: Vec<Option<u128>> = first.messages.iter().map(|m| m.id).collect();
+        assert!(
+            first_ids
+                .iter()
+                .all(|id| matches!(id, Some(id) if *id != 0)),
+            "a message has to leave with a real id, since the server mints over a 0"
+        );
         source
             .on_batch_result(SourceBatchResult::Nack)
             .await
@@ -1952,6 +1965,11 @@ mod tests {
         );
         assert_eq!(replayed.messages[0].payload, b"one");
         assert_eq!(replayed.messages[1].payload, b"two");
+        assert_eq!(
+            replayed.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            first_ids,
+            "a consumer dedupes this duplicate on the id, so it must survive the NACK"
+        );
         assert!(
             replayed.state.is_none(),
             "a replay carries messages only, never state"

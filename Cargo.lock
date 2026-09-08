@@ -7223,7 +7223,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tokio",
- "toml 1.1.4+spec-1.1.0",
+ "toml 1.1.5+spec-1.1.0",
  "tracing",
 ]
 
