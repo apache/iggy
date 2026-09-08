@@ -51,6 +51,7 @@ use crate::{
 };
 use iggy_connector_sdk::api::ConnectorStatus;
 use prometheus_client::metrics::counter::Counter;
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 const MAX_FAILED_TAIL_RETRIES: u32 = 3;
@@ -358,12 +359,50 @@ impl SourceInstanceGuard {
     pub(crate) fn disarm(mut self) {
         self.armed = false;
     }
+
+    /// Closes the instance and waits for the plugin to finish, so an error the
+    /// caller returns afterwards means the instance is already gone. A restart
+    /// retried straight away then has nothing left to collide with.
+    ///
+    /// `drop` cannot offer that ordering, which is why the error arms call this
+    /// instead of relying on it.
+    pub(crate) async fn close(mut self) {
+        self.armed = false;
+        let close = self.close.clone();
+        let plugin_id = self.plugin_id;
+        let key = std::mem::take(&mut self.key);
+        if tokio::task::spawn_blocking(move || close_failed_source(close.as_ref(), plugin_id, &key))
+            .await
+            .is_err()
+        {
+            warn!(
+                "Teardown of failed source connector with ID: {plugin_id} did not run to completion."
+            );
+        }
+    }
 }
 
 impl Drop for SourceInstanceGuard {
     fn drop(&mut self) {
-        if self.armed {
-            close_failed_source(self.close.as_ref(), self.plugin_id, &self.key);
+        if !self.armed {
+            return;
+        }
+
+        let close = self.close.clone();
+        let plugin_id = self.plugin_id;
+        let key = std::mem::take(&mut self.key);
+        // Nothing can await here, so the plugin's teardown cannot be bounded
+        // here either: `SourceContainer::close` drives the plugin's own
+        // `close()` under `block_on`, and that runs for as long as the plugin
+        // takes. Hand it to the blocking pool, where blocking is what the
+        // thread is for. The closure carries the container, so the library
+        // stays mapped until the call returns.
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || close_failed_source(close.as_ref(), plugin_id, &key));
+            }
+            // No runtime to hand it to, and no worker to protect either.
+            Err(_) => close_failed_source(close.as_ref(), plugin_id, &key),
         }
     }
 }
@@ -1012,6 +1051,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::ready;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
 
     static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
 
@@ -1103,6 +1143,67 @@ mod tests {
             DISARMED_CALLS.load(Ordering::SeqCst),
             0,
             "the instance is the manager's once its id is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_armed_guard_when_dropped_inside_a_runtime_should_close_off_the_worker() {
+        // `drop` cannot await, and `SourceContainer::close` drives the plugin's
+        // own teardown under `block_on`, so closing here would hold a worker
+        // for however long the plugin takes. It goes to the blocking pool
+        // instead, which is what the differing thread asserts. The close still
+        // has to happen.
+        let plugin_id = next_plugin_id();
+        let dropping_thread = std::thread::current().id();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        drop(SourceInstanceGuard::new(
+            Arc::new(move |id| {
+                let _ = sender.send((id, std::thread::current().id()));
+                0
+            }),
+            plugin_id,
+            "random",
+        ));
+
+        let (closed_id, closing_thread) =
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("the deferred close should run")
+                .expect("the deferred close should report the instance");
+        assert_eq!(
+            closed_id, plugin_id,
+            "the deferred close must reach the instance the guard was armed over"
+        );
+        assert_ne!(
+            closing_thread, dropping_thread,
+            "closing on the dropping thread holds it for the plugin's teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_armed_guard_when_closed_should_finish_before_returning() {
+        // What the error arms rely on: once `close()` has returned, the
+        // instance is gone, so the error they return cannot reach an operator
+        // who then retries into a collision with it.
+        let plugin_id = next_plugin_id();
+        let calls = Arc::new(AtomicU32::new(0));
+        let recorded = calls.clone();
+
+        let guard = SourceInstanceGuard::new(
+            Arc::new(move |_id| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+                0
+            }),
+            plugin_id,
+            "random",
+        );
+        guard.close().await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "close() must await the teardown, and the drop that follows must not repeat it"
         );
     }
 

@@ -240,11 +240,21 @@ impl SourceManager {
         // outside the plugin knows this instance exists, so any early return
         // would strand it: `stop_connector` closes `details.info.id`, which
         // still names the previous one.
-        let instance =
+        let instance_guard =
             source::SourceInstanceGuard::for_container(container.clone(), plugin_id, key);
 
         let (producer, encoder, transforms) =
-            source::setup_source_producer(key, config, iggy_client).await?;
+            match source::setup_source_producer(key, config, iggy_client).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    // Closed here rather than left to `drop` so this error
+                    // reaches the caller after teardown, not alongside it.
+                    // `drop` stays the net for a cancellation, and for any `?`
+                    // added inside this window later.
+                    instance_guard.close().await;
+                    return Err(error);
+                }
+            };
 
         let handle_callback = container.iggy_source_handle_v2;
         let batch_result_callback = container.iggy_source_batch_result;
@@ -272,7 +282,7 @@ impl SourceManager {
             metrics.increment_sources_running();
         }
         // `details.info.id` now names this instance, so a later stop reaches it.
-        instance.disarm();
+        instance_guard.disarm();
 
         Ok(())
     }
