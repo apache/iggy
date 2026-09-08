@@ -7733,6 +7733,7 @@ dependencies = [
  "iggy_common",
  "iggy_connector_sdk",
  "questdb-rs",
+ "rustls",
  "secrecy",
  "serde",
  "simd-json",
