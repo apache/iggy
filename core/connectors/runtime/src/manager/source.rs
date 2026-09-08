@@ -257,33 +257,32 @@ impl SourceManager {
         let handle_callback = container.iggy_source_handle_v2;
         let batch_result_callback = container.iggy_source_batch_result;
 
-        // The lock is taken before the spawn so that nothing can await between
+        // The lock is taken before the spawn so nothing can await between
         // registering the tasks and recording the id that reaches them. A
         // cancellation in that gap left the `SOURCE_SENDERS` entry and both
         // spawned tasks behind with no id naming them, and the forwarding loop
         // then ran for the life of the process. The guard closes the plugin
         // instance on that path but cannot reach either of those.
         //
-        // `spawn_source_handler` is synchronous, so holding the lock across it
-        // costs a spawn. The forwarding loop's own first act is to take this
-        // lock, so it simply waits for this block to end.
+        // The forwarding loop's own first act is to take this lock, so it waits
+        // for this block to end rather than racing it.
         {
             let mut details = details.lock().await;
-            details.handler_tasks = source::spawn_source_handler(
-                plugin_id,
-                key,
-                config.verbose,
-                config.benchmark,
-                producer,
-                encoder,
-                transforms,
-                state_storage,
-                handle_callback,
-                batch_result_callback,
-                context.clone(),
-            );
-            details.info.id = plugin_id;
-            details.config = config.clone();
+            details.record_started(plugin_id, config, || {
+                source::spawn_source_handler(
+                    plugin_id,
+                    key,
+                    config.verbose,
+                    config.benchmark,
+                    producer,
+                    encoder,
+                    transforms,
+                    state_storage,
+                    handle_callback,
+                    batch_result_callback,
+                    context.clone(),
+                )
+            });
         }
         // `details.info.id` now names this instance, so a later stop reaches it.
         instance_guard.disarm();
@@ -357,6 +356,27 @@ pub struct SourceDetails {
     pub handler_tasks: Vec<JoinHandle<()>>,
     pub container: Option<Arc<Container<SourceApi>>>,
     pub restart_guard: Arc<Mutex<()>>,
+}
+
+impl SourceDetails {
+    /// Records an instance that has just started, spawning its handlers in the
+    /// same breath.
+    ///
+    /// Deliberately not `async`, and that is the point. The id has to be
+    /// recorded under the same lock hold as the spawn: a cancellation between
+    /// the two strands the `SOURCE_SENDERS` entry and both tasks with nothing
+    /// naming them, which no guard can reach. Taking `spawn` as a closure is
+    /// what lets the compiler refuse an await added between them.
+    fn record_started(
+        &mut self,
+        plugin_id: u32,
+        config: &SourceConfig,
+        spawn: impl FnOnce() -> Vec<JoinHandle<()>>,
+    ) {
+        self.handler_tasks = spawn();
+        self.info.id = plugin_id;
+        self.config = config.clone();
+    }
 }
 
 impl fmt::Debug for SourceDetails {
@@ -492,6 +512,28 @@ mod tests {
             .await;
 
         assert_eq!(metrics.get_sources_running(), 1);
+    }
+
+    #[tokio::test]
+    async fn record_started_should_store_the_id_and_the_spawned_tasks() {
+        // Both have to land under one lock hold, so they are recorded together
+        // and there is nowhere to await between them. A stop reaches the
+        // instance through the id and drains it through the tasks, so losing
+        // either leaves something behind.
+        let mut details = create_test_source_details("pg", 1);
+        let config = details.config.clone();
+
+        details.record_started(7, &config, || vec![tokio::spawn(async {})]);
+
+        assert_eq!(
+            details.info.id, 7,
+            "a later stop closes whatever id this recorded"
+        );
+        assert_eq!(
+            details.handler_tasks.len(),
+            1,
+            "a stop drains the tasks recorded here, so they cannot be dropped"
+        );
     }
 
     #[tokio::test]
