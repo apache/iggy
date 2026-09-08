@@ -285,13 +285,19 @@ impl SourceManager {
                 context.clone(),
             );
             details.info.id = plugin_id;
-            details.info.status = ConnectorStatus::Running;
-            details.info.last_error = None;
             details.config = config.clone();
-            metrics.increment_sources_running();
         }
         // `details.info.id` now names this instance, so a later stop reaches it.
         instance_guard.disarm();
+
+        // Through `update_status`, which is the only thing that moves the gauge
+        // and moves it only on a real transition. Writing the status here and
+        // incrementing by hand as well meant two mechanisms counting one start:
+        // the forwarding loop reports `Running` too, for the boot path that
+        // never comes through here, and a stop decrements once. Reported twice
+        // and taken back once, the gauge climbed with every restart.
+        self.update_status(key, ConnectorStatus::Running, Some(metrics))
+            .await;
 
         Ok(())
     }
@@ -488,6 +494,29 @@ mod tests {
             .await;
 
         assert_eq!(metrics.get_sources_running(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_increment_metrics_once_when_running_is_reported_twice() {
+        // Both a start and the forwarding loop report `Running` for the same
+        // instance, so the gauge has to count instances rather than reports.
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "a second report of a status the connector already has must not move the gauge"
+        );
     }
 
     #[tokio::test]
