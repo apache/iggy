@@ -21,12 +21,57 @@
 //! other route handlers so this leaf never imports the state hub.
 
 use configs::http::HttpMetricsConfig;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, stats_rollup_underflows};
+use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::metrics::counter::Counter;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
+use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use tracing::error;
+
+/// Exports the process-wide clamped-rollup count as a counter series, read at
+/// encode time rather than mirrored into one.
+///
+/// Non-zero means a partition, topic or stream total was asked to give back
+/// more than it held, so what that scope now reports is low, and stays low
+/// until a rebuild or a restart. All three levels clamp and all three feed this
+/// one counter, which carries no scope label -- the `warn!` in `iggy_common`
+/// names the scope and counter that moved it.
+///
+/// Not "alert on any increase". A delete, a purge, a partition teardown and a
+/// snapshot restore each open a window where a retention pass hands back bytes
+/// the parents have already given up, and the clamp is the intended outcome
+/// there -- `given_a_rolled_back_partition_when_a_late_decrement_arrives_should_leave_siblings_alone`
+/// in `core/common/src/types/streaming_stats.rs` drives exactly that. What is
+/// worth paging on is a bounded rate OUTSIDE those windows: that is the shape
+/// that says the tree is diverging rather than settling.
+///
+/// A counter, not a gauge: the source only ever climbs within a process, so
+/// `rate()` and `increase()` are the queries an operator wants, and both are
+/// counter-only. A restart resets the source and the exposition together,
+/// which is the counter reset Prometheus expects.
+///
+/// Read only by the `/metrics` scrape, so it needs `http.enabled` and
+/// `http.metrics.enabled` -- as does every other series in this registry,
+/// which is the only Prometheus surface the server has. A TCP-only or
+/// QUIC-only deployment exports nothing, and the per-scope `warn!` in
+/// `iggy_common` is the whole signal there.
+#[derive(Debug)]
+struct StatsRollupUnderflows;
+
+impl Collector for StatsRollupUnderflows {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let counter = ConstCounter::new(stats_rollup_underflows());
+        let metric_encoder = encoder.encode_descriptor(
+            "stats_rollup_underflows",
+            "total count of aggregate stats decrements clamped at zero",
+            None,
+            counter.metric_type(),
+        )?;
+        counter.encode(metric_encoder)
+    }
+}
 
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
@@ -74,6 +119,9 @@ impl HttpMetrics {
         registry.register("messages", "total count of messages", messages.clone());
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
+        // Not a legacy-parity metric, and not a mirrored one: the source is a
+        // process-wide static the scrape reads directly.
+        registry.register_collector(Box::new(StatsRollupUnderflows));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -200,6 +248,25 @@ mod tests {
         assert!(
             output.ends_with("# EOF\n"),
             "missing exposition trailer:\n{output}"
+        );
+    }
+
+    /// Outside `PARITY_METRIC_NAMES`: the legacy server had no such series, so
+    /// it gets its own assertion rather than a row in the parity list.
+    ///
+    /// The value is a process-wide static shared with every other test in this
+    /// binary, so this asserts the series and its type, not a number.
+    #[test]
+    fn rollup_underflow_collector_lands_in_the_exposition() {
+        let metrics = HttpMetrics::init(&[]);
+        let output = metrics.formatted_output();
+        assert!(
+            output.contains("# TYPE stats_rollup_underflows counter\n"),
+            "expected the collector's series in the exposition:\n{output}"
+        );
+        assert!(
+            output.contains("\nstats_rollup_underflows_total "),
+            "expected the collector's sample in the exposition:\n{output}"
         );
     }
 
