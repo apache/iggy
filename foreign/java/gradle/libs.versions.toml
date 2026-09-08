@@ -55,7 +55,7 @@ typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.10.0"
+spotless = "8.10.1"
 shadow = "9.6.1"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"
