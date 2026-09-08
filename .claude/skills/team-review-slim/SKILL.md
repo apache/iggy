@@ -1,5 +1,5 @@
 ---
-name: team-review-small
+name: team-review-slim
 description: Team-review without the verification chain. Reviews a PR, the current branch against master, or of a ref range.
 argument-hint: "[PR number | branch | ref range]"
 disable-model-invocation: true
@@ -22,21 +22,18 @@ you load rides along every later turn. Reviewers are one-shot agents that delive
 > tests or builds needs a stated justification: reading and tracing settles most claims, and parallel cargo runs block
 > on one target-dir lock.
 >
-> **Output style: simple English.** A reader must understand each finding on one read.
+> **Output style: simple English.** Before you write your deliverable file, call the `Skill` tool with skill
+> `simple-english:simple-english`, and apply it in Plain mode to every line that you write. Load that skill. Do not
+> write its rules from memory, and do not substitute your own style rules. If the tool call fails, write
+> `simple-english: UNAVAILABLE` as the first line of your file, then write the findings in short active sentences.
+>
+> On top of the skill, this review adds four constraints:
 >
 > - Write one sentence for the problem, 25 words or fewer. Write one sentence for the fix, imperative, 20 words or
 >   fewer.
-> - Use active voice and name the actor: "The writer drops the flush error", not "The flush error is dropped".
-> - Use simple tenses only. No present perfect ("has completed" -> "completed"). No "-ing" verb forms
->   (", making the lock" -> a new sentence).
-> - Use can, will, and must. Do not use should, would, may, might, or could.
-> - Keep the articles, keep the word "that", and use no contractions.
-> - Use no semicolons and no em dashes. Write two sentences, or name the relation with "because", "but", or "for
->   example".
-> - Put the condition before the command: "If the queue is empty, return early."
-> - Delete words that carry no fact: simply, robust, seamlessly, leverage, "it is worth noting", "in order to".
-> - Keep these EXACT: `file:line`, code, identifiers, file paths, quoted errors,
->   technical terms, severity labels, confidence labels.
+> - Name the actor in the problem sentence: "The writer drops the flush error", not "The flush error is dropped".
+> - Keep these EXACT, and never simplify them: `file:line`, code, identifiers, file paths, quoted errors, technical
+>   terms, severity labels, confidence labels.
 > - These writing rules govern your own output only. Never review the code, the comments, or the commit messages
 >   against them.
 >
@@ -73,6 +70,14 @@ you load rides along every later turn. Reviewers are one-shot agents that delive
 > 5. Ask once whether the severity is calibrated. A cold-path clone is never `critical`.
 >
 > Deep analysis, plain words. Dig deep. Write short and clear.
+
+## Step 0: Prerequisites (moderator, no reading)
+
+- Make sure that `simple-english:simple-english` is in your available-skills list. Every expert prompt tells the agent
+  to load it, and the merge in Step 3 needs the same rules.
+- If the skill is missing, stop and tell the user to install it: `/plugin marketplace add AminBlg/SimpleEnglish`, then
+  `/plugin install simple-english@simple-english`. Do not fall back to hand-written style rules.
+- Call `Skill` with `simple-english:simple-english` once, for your own writing in Steps 3 and 4.
 
 ## Step 1: Identify the target (no reading)
 
