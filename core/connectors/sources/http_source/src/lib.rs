@@ -1121,6 +1121,22 @@ pub(crate) mod test_support {
         let source = HttpSource::new(id, config(topic_path, endpoint_ids), None);
         Arc::clone(&source.shared)
     }
+
+    /// Like `instance`, but hands back the `HttpSource` so its bridge keeps a
+    /// live receiver.
+    ///
+    /// `instance` drops the source, which leaves the bridge disconnected and
+    /// makes every `enqueue` on the result answer 503. A test that needs to
+    /// tell a refusal apart from a delivery has to hold this second value.
+    pub fn live_instance(
+        id: u32,
+        topic_path: Option<&str>,
+        endpoint_ids: &[&str],
+    ) -> (Arc<SharedState>, HttpSource) {
+        let source = HttpSource::new(id, config(topic_path, endpoint_ids), None);
+        let shared = Arc::clone(&source.shared);
+        (shared, source)
+    }
 }
 
 #[cfg(test)]

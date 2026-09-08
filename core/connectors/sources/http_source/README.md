@@ -177,9 +177,13 @@ Content-Type: application/json
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 405 | A known path with the wrong method | `{"error":"method not allowed"}` |
 | 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |
-| 503 | `GET /health` when any instance on the listener has stopped polling, or a POST whose instance bridge has no receiver | `{"status":"unavailable"}` or `{"error":"service unavailable"}` |
+| 503 | `GET /health` when any instance on the listener has stopped polling; a named-path POST whose instance stopped serving that path while the body was still arriving; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |
 
 Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
+
+The named path splits those two cases on purpose. A path that is not configured answers 404, which is permanent and correct. A configured path whose instance stopped serving it while the body was still arriving answers 503 instead: that caller already passed bearer auth, the path does exist, and only which instance serves it changed.
+
+A 404 there would tell a conventional client the resource is gone, and it would stop retrying, so a republish window would silently drop traffic that succeeds a moment later. The secret path keeps 404 for both cases, because its caller is unauthenticated and separating "wrong id" from "busy" would leak which ids exist.
 
 `GET /health` on the public listener answers 200 only while every instance on it is serving, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped would otherwise keep receiving traffic into a bridge nothing drains. Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
 

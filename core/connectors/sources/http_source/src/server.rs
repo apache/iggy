@@ -659,10 +659,19 @@ async fn named_path_outcome(
     let published = state.published();
     let serving = match published.routes.lookup_named_path(topic_path) {
         Some(serving) if Arc::ptr_eq(serving, &instance) => serving,
+        // 503, not the 404 the first lookup answers. This caller already passed
+        // bearer auth and the path it asked for does exist; what changed is
+        // which instance serves it, mid-request. A 404 tells a sender the
+        // resource is gone and conventional clients stop retrying, so a
+        // republish window silently drops traffic that would have succeeded a
+        // moment later. `management.rs` already answers 503 for this same
+        // condition. The secret path keeps its 404 deliberately: that caller is
+        // unauthenticated, and distinguishing "wrong id" from "busy" there
+        // would confirm which endpoint ids exist.
         _ => {
             return (
                 Some(instance),
-                error_response(StatusCode::NOT_FOUND, "not found"),
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing"),
             );
         }
     };
@@ -2043,7 +2052,13 @@ mod tests {
 
         // A different instance takes the same topic path. The lookup below will
         // succeed; only the identity check can tell it is the wrong one.
-        let rival = crate::test_support::instance(2, Some("github"), &[]);
+        //
+        // Its bridge is kept LIVE on purpose. With a dead receiver `enqueue`
+        // answers 503 for a disconnected bridge, which is now the same status
+        // the guard returns, so the refusal would be indistinguishable from the
+        // delivery it exists to prevent. Live, an unguarded request answers 200
+        // and leaves a message in the stranger's bridge.
+        let (rival, _rival_source) = crate::test_support::live_instance(2, Some("github"), &[]);
         publish(&source, vec![Arc::clone(&rival)]).await;
 
         stream
@@ -2060,12 +2075,12 @@ mod tests {
         .await
         .expect("the response must arrive before the timeout")
         .expect("the response must be readable");
-        // 404 specifically, not merely "not 200". Without the identity check
-        // the request reaches `enqueue` on the stranger, and a freshly built
-        // instance has no live receiver, so it answers 503 - which "not 200"
-        // would have accepted. Only the 404 says the guard refused it.
+        // 503 specifically, and an empty stranger's bridge. The status alone no
+        // longer separates the guard from a disconnected bridge, which is why
+        // the rival's receiver is alive: unguarded, this is a 200 with the
+        // message sitting in that bridge.
         assert!(
-            response.starts_with("HTTP/1.1 404"),
+            response.starts_with("HTTP/1.1 503"),
             "a request authorized against one instance must be refused, not handed to another, got: {response}"
         );
         assert_eq!(
@@ -2073,7 +2088,11 @@ mod tests {
             queued_before,
             "and it must not reach the original instance's bridge either"
         );
-        assert_eq!(rival.sender.len(), 0, "least of all the stranger's bridge");
+        assert_eq!(
+            rival.sender.len(),
+            0,
+            "least of all the stranger's live bridge"
+        );
         close(&mut source).await;
     }
 
@@ -2136,7 +2155,7 @@ mod tests {
         .expect("the response must arrive before the timeout")
         .expect("the response must be readable");
         assert!(
-            response.starts_with("HTTP/1.1 404"),
+            response.starts_with("HTTP/1.1 503"),
             "a path withdrawn while the body streamed must be seen, got: {response}"
         );
         assert_eq!(
