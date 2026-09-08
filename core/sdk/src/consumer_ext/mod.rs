@@ -55,7 +55,7 @@
 //!     IggyDuration::new_from_secs(1),
 //! )?;
 //! let (client, mut consumer) =
-//!     IggyStreamConsumer::with_client_from_url("iggy://iggy:iggy@localhost:8090", &config) // todo(haubur): Use tcp instead of iggy
+//!     IggyStreamConsumer::with_client_from_url("iggy://iggy:iggy@localhost:8090", &config)
 //!         .await?;
 //!
 //! let (sender, receiver) = oneshot::channel();
@@ -88,10 +88,10 @@ pub use consumer_message_trait::IggyConsumerMessageExt;
 ///
 /// [`consume()`](Self::consume) takes `&self`, so state that changes needs interior mutability,
 /// such as an [`AtomicU64`](std::sync::atomic::AtomicU64) or a
-/// [`Mutex`](tokio::sync::Mutex). The trait is also implemented for `&T`, so a reference to your
-/// type is itself a `MessageConsumer`.
+/// [`Mutex`](tokio::sync::Mutex). [`MessageConsumer`] is also implemented for `&T`, so a reference
+/// to your type is itself a [`MessageConsumer`].
 ///
-/// This trait is not in the prelude. Import it from
+/// [`MessageConsumer`] is not in the prelude. Import it from
 /// [`consumer_ext`](crate::consumer_ext).
 ///
 /// # Examples
@@ -126,10 +126,16 @@ pub trait LocalMessageConsumer {
     ///
     /// Return any [`IggyError`] that describes why this message could not be handled.
     /// [`IggyConsumerMessageExt::consume_messages`] logs that error and reads on, so a failed
-    /// message stops nothing. Under every
-    /// [`AutoCommitAfter`](crate::prelude::AutoCommitAfter) variant its offset is committed all
-    /// the same. Keep a message that must not be lost yourself, or commit by hand with
-    /// [`AutoCommit::Disabled`](crate::prelude::AutoCommit::Disabled).
+    /// message stops nothing. The error never suppresses a commit either, because every
+    /// [`AutoCommitAfter`](crate::prelude::AutoCommitAfter) variant applies its own trigger
+    /// whatever the handler returned. [`ConsumingEachMessage`] therefore commits the offset of a
+    /// failed message, while [`ConsumingEveryNthMessage`] and [`ConsumingAllMessages`] commit it
+    /// only when the offset meets their condition. Keep a message that must not be lost yourself,
+    /// or commit by hand with [`AutoCommit::Disabled`](crate::prelude::AutoCommit::Disabled).
+    ///
+    /// [`ConsumingAllMessages`]: crate::prelude::AutoCommitAfter::ConsumingAllMessages
+    /// [`ConsumingEachMessage`]: crate::prelude::AutoCommitAfter::ConsumingEachMessage
+    /// [`ConsumingEveryNthMessage`]: crate::prelude::AutoCommitAfter::ConsumingEveryNthMessage
     async fn consume(&self, message: ReceivedMessage) -> Result<(), IggyError>;
 }
 

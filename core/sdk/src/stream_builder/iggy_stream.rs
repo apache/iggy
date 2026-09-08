@@ -53,6 +53,11 @@ use tracing::trace;
 /// built with [`IggyStreamConfig::new()`] can therefore point the producer and the consumer at
 /// different topics. [`IggyStreamConfig::from_stream_topic()`] gives both the same pair.
 ///
+/// Those two facts combine into a trap. Only the producer half creates anything here, so if the
+/// consumer half names a topic that the producer half does not create, [`IggyConsumer::init()`]
+/// spends [`init_retries()`] and then fails with [`IggyError::TopicNameNotFound`]. Keep the two
+/// halves on the same stream and topic unless the other topic exists already.
+///
 /// # Examples
 ///
 /// Build a pair for one topic, send a message, and read it back:
@@ -168,6 +173,7 @@ use tracing::trace;
 /// [`batch_length()`]: crate::prelude::IggyProducerConfig::batch_length
 /// [`create_stream_if_not_exists()`]: crate::prelude::IggyConsumerConfig::create_stream_if_not_exists
 /// [`create_topic_if_not_exists()`]: crate::prelude::IggyConsumerConfig::create_topic_if_not_exists
+/// [`init_retries()`]: crate::prelude::IggyConsumerConfig::init_retries
 /// [`linger_time()`]: crate::prelude::IggyProducerConfig::linger_time
 /// [`topic_partitions_count()`]: crate::prelude::IggyProducerConfig::topic_partitions_count
 #[derive(Debug, Default, Clone, Eq, PartialEq)]

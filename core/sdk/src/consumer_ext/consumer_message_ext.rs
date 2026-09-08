@@ -33,9 +33,10 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     ///
     /// The loop returns `Ok(())` in three cases: the signal arrived, the sender was dropped, or
     /// the stream ended because [`shutdown()`](crate::prelude::IggyConsumer::shutdown) was called.
-    /// The consumer stays usable either way, so call
+    /// After the two signal cases the consumer stays usable, so call
     /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown) afterwards to commit the reading
-    /// position and leave the consumer group.
+    /// position and leave the consumer group. Under
+    /// [`AutoCommit::Disabled`](crate::prelude::AutoCommit::Disabled) that call commits nothing.
     ///
     /// # Committing after a message
     ///
