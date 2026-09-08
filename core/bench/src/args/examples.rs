@@ -21,6 +21,8 @@ Start iggy-server separately. The benchmark connects to a running server.
 Global options precede the kind, kind options precede the transport, and
 transport options precede the optional output subcommand.
 
+Default producer and consumer counts are six. Pinned workloads default to six streams.
+
 1) All benchmark kinds and aliases:
 
     Pinned producer (pp), consumer (pc), and producer/consumer (ppc):

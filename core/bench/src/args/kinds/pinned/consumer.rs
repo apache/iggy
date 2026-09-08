@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::args::{
-    common::IggyBenchArgs, defaults::DEFAULT_NUMBER_OF_PRODUCERS, props::BenchmarkKindProps,
+    common::IggyBenchArgs, defaults::DEFAULT_NUMBER_OF_CONSUMERS, props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -34,7 +34,7 @@ pub struct PinnedConsumerArgs {
     pub streams: Option<NonZeroU32>,
 
     /// Number of consumers
-    #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
+    #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
     pub consumers: NonZeroU32,
 }
 

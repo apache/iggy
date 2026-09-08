@@ -8,6 +8,8 @@ Iggy Bench CLI can be installed with `cargo install iggy-bench` and then simply 
 
 The WebSocket transport command is `websocket`, with `ws` as a shorthand.
 
+Producer and consumer counts default to six. Pinned workloads also default to six streams. Override the counts for the workload and available CPUs.
+
 ## Examples and topic options
 
 Start Iggy before running benchmarks. The tool connects to an existing server. Run `iggy-bench examples` for all eight benchmark kinds, their aliases, all four transports, and topic-option combinations. Global options precede the benchmark kind, kind-specific options follow it, and the server address follows the transport.
