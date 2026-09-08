@@ -347,8 +347,21 @@ jobs:
       - name: Run tests
         run: |
           cd foreign/python
+
+          # TCP and HTTP ports come from server-start's own outputs rather than
+          # duplicated literals, so a future default change here can't silently
+          # desync from what the server actually started with. QUIC and WebSocket
+          # stay literals below because server-start exposes no output for them.
+          tcp_port="${{ steps.iggy.outputs.tcp_address }}"
+          http_port="${{ steps.iggy.outputs.http_address }}"
+          tcp_port="${tcp_port##*:}"
+          http_port="${http_port##*:}"
+
           IGGY_SERVER_HOST=127.0.0.1 \
-          IGGY_SERVER_TCP_PORT=8090 \
+          IGGY_SERVER_TCP_PORT="$tcp_port" \
+          IGGY_SERVER_QUIC_PORT=8080 \
+          IGGY_SERVER_HTTP_PORT="$http_port" \
+          IGGY_SERVER_WS_PORT=8092 \
           IGGY_SERVER_DOCKER_IMAGE=iggy-server:local \
             uv run --no-sync pytest tests/ -v \
               --junitxml=../../reports/python-junit.xml \

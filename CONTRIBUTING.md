@@ -28,6 +28,23 @@ These require design discussion in the issue before coding:
 
 Authors of PRs must run the code locally. "Relying on CI" is not acceptable.
 
+### AI Assistance
+
+You are responsible for the code you submit, even if a tool wrote it.
+
+Using an AI assistant to help you code is fine. Submitting code you don't understand is
+not. Before you open a PR you must be able to explain what every part of the change does
+and why, answer review questions about it yourself, and defend the design without going
+back to the tool for an answer. If you can't, the PR isn't ready.
+
+While you're new to the project, please keep to **one open PR at a time**. Review takes
+longer than writing, so a queue of changes from one contributor holds up everyone else's.
+
+Maintainers may close a PR at first review if it reads as a relay between the reviewer and
+a model, rather than a change the author understands and takes responsibility for. That is
+a judgment about the submission, not about you, and it does not bar you from contributing
+again if you come back with a change you can take responsibility for.
+
 ### Green CI
 
 Maintainers will not start reviewing a PR while its CI is failing. Get the

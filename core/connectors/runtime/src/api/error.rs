@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::error::RuntimeError;
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use axum::{Json, extract::rejection::PathRejection, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 use thiserror::Error;
 use tracing::error;
@@ -27,6 +27,8 @@ pub enum ApiError {
     Error(#[from] RuntimeError),
     #[error(transparent)]
     JsonError(#[from] serde_json::Error),
+    #[error(transparent)]
+    PathRejection(#[from] PathRejection),
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +45,7 @@ impl IntoResponse for ApiError {
                 let status_code = match error {
                     RuntimeError::MissingIggyCredentials => StatusCode::BAD_REQUEST,
                     RuntimeError::InvalidConfiguration(_) => StatusCode::BAD_REQUEST,
+                    RuntimeError::InvalidConnectorKey(_) => StatusCode::BAD_REQUEST,
                     RuntimeError::CannotConvertConfiguration => StatusCode::BAD_REQUEST,
                     RuntimeError::SinkNotFound(_) => StatusCode::NOT_FOUND,
                     RuntimeError::SourceNotFound(_) => StatusCode::NOT_FOUND,
@@ -63,6 +66,16 @@ impl IntoResponse for ApiError {
                     Json(ErrorResponse {
                         code: "json_error".to_owned(),
                         reason: error.to_string(),
+                    }),
+                )
+            }
+            ApiError::PathRejection(rejection) => {
+                error!("There was a path error: {rejection}");
+                (
+                    rejection.status(),
+                    Json(ErrorResponse {
+                        code: "invalid_path".to_owned(),
+                        reason: rejection.body_text(),
                     }),
                 )
             }
