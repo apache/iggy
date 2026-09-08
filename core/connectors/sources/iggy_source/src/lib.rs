@@ -338,7 +338,7 @@ impl Source for IggySource {
                 self.max_retry_interval,
             ));
             debug!(
-                "Backing off for {delay:?} after {failures} consecutive failures for \
+                "Backing off for {delay:?} after {failures} consecutive poll failures for \
                  {CONNECTOR_NAME} connector ID: {}",
                 self.id
             );
@@ -351,8 +351,6 @@ impl Source for IggySource {
 
         let mut messages = Vec::with_capacity(self.partitions.len() * self.batch_size as usize);
         let mut errors_in_cycle: u64 = 0;
-        let mut any_success = false;
-        let mut connection_failure = false;
 
         for &partition_id in &self.partitions {
             let strategy = next_strategy(
@@ -373,7 +371,6 @@ impl Source for IggySource {
 
             match polled {
                 Ok(polled) => {
-                    any_success = true;
                     if polled.messages.is_empty() {
                         continue;
                     }
@@ -407,7 +404,6 @@ impl Source for IggySource {
                         self.id
                     );
                     errors_in_cycle += 1;
-                    connection_failure = true;
                     break;
                 }
             }
@@ -421,7 +417,7 @@ impl Source for IggySource {
         })?;
         *self.pending_state.lock().await = Some(candidate_state);
 
-        if connection_failure && !any_success {
+        if errors_in_cycle > 0 {
             self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
         } else {
             self.consecutive_failures.store(0, Ordering::Relaxed);
