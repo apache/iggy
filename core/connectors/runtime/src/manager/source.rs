@@ -258,27 +258,36 @@ impl SourceManager {
 
         let handle_callback = container.iggy_source_handle_v2;
         let batch_result_callback = container.iggy_source_batch_result;
-        let handler_tasks = source::spawn_source_handler(
-            plugin_id,
-            key,
-            config.verbose,
-            config.benchmark,
-            producer,
-            encoder,
-            transforms,
-            state_storage,
-            handle_callback,
-            batch_result_callback,
-            context.clone(),
-        );
 
+        // The lock is taken before the spawn so that nothing can await between
+        // registering the tasks and recording the id that reaches them. A
+        // cancellation in that gap left the `SOURCE_SENDERS` entry and both
+        // spawned tasks behind with no id naming them, and the forwarding loop
+        // then ran for the life of the process. The guard closes the plugin
+        // instance on that path but cannot reach either of those.
+        //
+        // `spawn_source_handler` is synchronous, so holding the lock across it
+        // costs a spawn. The forwarding loop's own first act is to take this
+        // lock, so it simply waits for this block to end.
         {
             let mut details = details.lock().await;
+            details.handler_tasks = source::spawn_source_handler(
+                plugin_id,
+                key,
+                config.verbose,
+                config.benchmark,
+                producer,
+                encoder,
+                transforms,
+                state_storage,
+                handle_callback,
+                batch_result_callback,
+                context.clone(),
+            );
             details.info.id = plugin_id;
             details.info.status = ConnectorStatus::Running;
             details.info.last_error = None;
             details.config = config.clone();
-            details.handler_tasks = handler_tasks;
             metrics.increment_sources_running();
         }
         // `details.info.id` now names this instance, so a later stop reaches it.
