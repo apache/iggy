@@ -378,12 +378,7 @@ impl IggyBenchArgs {
             BenchmarkKindCommand::Examples => unreachable!(),
         };
 
-        let transport = match self.transport_command() {
-            BenchmarkTransportCommand::Tcp(_) => "tcp",
-            BenchmarkTransportCommand::Quic(_) => "quic",
-            BenchmarkTransportCommand::Http(_) => "http",
-            BenchmarkTransportCommand::WebSocket(_) => "ws",
-        };
+        let transport = self.transport_command().as_str();
 
         let actors = match &self.benchmark_kind {
             BenchmarkKindCommand::PinnedProducer(_)

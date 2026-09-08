@@ -233,7 +233,9 @@ When config file is not found, the default values from embedded `config.toml` fi
 
 Topic creation accepts two independent policies: `durability` for message acknowledgments and `consumer_offset_durability` for explicit offset stores and deletes. Both default to `replicated`. This means VSR quorum commit without waiting for stable storage. `persisted` also requires recoverable stable-storage copies on the replication quorum. Both policies normally store data on disk. Poll auto-commit remains asynchronous and is not covered by the poll response's completion.
 
-This is a breaking configuration and SDK change. The old topic `enforce_fsync` option and global `consumer_offset_enforce_fsync` setting are removed without aliases. The former `[system.*]` tables are root tables, the data directory is `path` (`IGGY_PATH`), and environment names drop `SYSTEM_`. Unsupported `archive_expired` and `recreate_missing_state` settings are removed. Existing configurations and SDK callers must use the new fields. Stored topics with enforce_fsync=true are rejected rather than silently weakened or translated. Those topics require explicit export and recreation with a supported policy on this version. No automatic metadata migration is provided. The HTTP Iggy-Durability header changes from replicated-memory to replicated or persisted for awaited writes, and remains none for early dispatch acceptance. Stream and topic directory names are fixed to streams and topics beneath path.
+The data directory is configured with `path` or `IGGY_PATH`. Stream and topic data are stored beneath it in `streams` and `topics` directories.
+
+The HTTP `Iggy-Durability` header reports `replicated` or `persisted` for awaited writes, and `none` for early dispatch acceptance.
 
 Segment flush thresholds control scheduling, independently of acknowledgment durability.
 
@@ -440,7 +442,7 @@ To benchmark the project, first build the project in release mode:
 cargo build --release
 ```
 
-Then, run the benchmarking app with the desired options:
+Start `iggy-server` separately, then run the benchmarking app with the desired options:
 
 1. Sending (writing) benchmark
 
@@ -484,13 +486,25 @@ Then, run the benchmarking app with the desired options:
    cargo run --bin iggy-bench -r -- end-to-end-producing-consumer tcp
    ```
 
-These benchmarks would start the server with the default configuration, create a stream, topic and partition, and then send or poll the messages. The default configuration is optimized for the best performance, so you might want to tweak it for your needs. If you need more options, please refer to `iggy-bench` subcommands `help` and `examples`.
+8. End to end producing and consuming through a consumer group:
 
-For example, to run the benchmark for the already started server, provide the additional argument `--server-address 0.0.0.0:8090`.
+   ```bash
+   cargo run --bin iggy-bench -r -- end-to-end-producing-consumer-group tcp
+   ```
+
+The benchmark connects to a running server and creates the streams, topics, and partitions needed by the selected workload. Use `iggy-bench --help` and `iggy-bench examples` for all benchmark variants, transports, and topic-option examples. Both message and consumer-offset durability independently default to `replicated`.
+
+For example, to run the benchmark for the already started server, provide the additional argument `--server-address 127.0.0.1:8090`.
 
  **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `websocket`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
 
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
+
+### Host preparation
+
+Check `io_uring` access, process limits, memory headroom, CPU/NUMA placement, and sustained disk/network capacity before comparing runs. Measure host-tuning changes with the same workload and durability policies.
+
+Use the [benchmark host checklist](core/bench/README.md#host-preparation) for practical setup and repeatable measurements. The [Linux tuning guide](https://iggy.apache.org/docs/server/linux-tuning) explains swappiness, huge pages, writeback, CPU placement, and networking, with commands and upstream references.
 
 ---
 

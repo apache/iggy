@@ -331,7 +331,7 @@ mod tests {
     fn unknown_names_are_rejected_without_rejecting_known_process_settings() {
         let unknown = unknown_env_names(
             names(&[
-                "IGGY_ENCRYPTION_ENABELD",
+                "IGGY_ENCRYPTION_UNKNOWN",
                 "IGGY_TCP_ADDRESS",
                 "IGGY_ROOT_PASSWORD",
                 "PATH",
@@ -340,7 +340,7 @@ mod tests {
             "IGGY_",
             &["IGGY_TCP_ADDRESS", "IGGY_ROOT_PASSWORD"],
         );
-        assert_eq!(unknown, vec!["IGGY_ENCRYPTION_ENABELD"]);
+        assert_eq!(unknown, vec!["IGGY_ENCRYPTION_UNKNOWN"]);
     }
 
     #[test]
