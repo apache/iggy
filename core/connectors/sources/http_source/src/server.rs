@@ -2060,9 +2060,13 @@ mod tests {
         .await
         .expect("the response must arrive before the timeout")
         .expect("the response must be readable");
+        // 404 specifically, not merely "not 200". Without the identity check
+        // the request reaches `enqueue` on the stranger, and a freshly built
+        // instance has no live receiver, so it answers 503 - which "not 200"
+        // would have accepted. Only the 404 says the guard refused it.
         assert!(
-            !response.starts_with("HTTP/1.1 200"),
-            "a request authorized against one instance must not be delivered to another, got: {response}"
+            response.starts_with("HTTP/1.1 404"),
+            "a request authorized against one instance must be refused, not handed to another, got: {response}"
         );
         assert_eq!(
             shared.sender.len(),
