@@ -255,12 +255,19 @@ Unit tests:
 cargo test -p iggy_connector_questdb_sink
 ```
 
-Integration tests, which start a QuestDB container and drive the connector
-through the connectors runtime:
+Integration tests start a QuestDB container and drive the connector through the
+connectors runtime. **Build the plugin first**: the runtime `dlopen`s it from a
+path at runtime, so Cargo has no dependency edge to it and `cargo test` will not
+build it for you.
 
 ```bash
+cargo build -p iggy_connector_questdb_sink
 cargo nextest run -p integration -E 'test(/connectors::questdb::/)'
 ```
+
+The fixture checks for the built plugin before starting anything and fails in
+well under a second naming the build command, rather than starting a container
+and timing out waiting for rows that were never going to arrive.
 
 They need Docker. `cargo nextest` rather than `cargo test` because the harness
 resolves the server and runtime binaries through `CARGO_BIN_EXE_*`, which
