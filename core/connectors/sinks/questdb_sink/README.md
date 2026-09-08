@@ -44,6 +44,8 @@ include_headers = false
 ack_level = "ok"
 flush_timeout = "30s"
 batch_size = 1000
+max_flush_bytes = 1000000
+log_rejected_payload = false
 verbose_logging = false
 ```
 
@@ -122,6 +124,23 @@ under `<sf_dir>/<sender_id>-ingest-*/`.
   node without WAL shipping the rows are accepted but the durable watermark
   never advances, so every flush waits out `flush_timeout`.
 
+### Choosing an ack level
+
+`ok` returns once the server accepts a flush. `durable` additionally waits for
+the server to confirm the write-ahead log has shipped, which closes a real
+window: a primary that dies before shipping can lose rows it already
+acknowledged.
+
+That window is load-dependent. A moderate writer against healthy replication
+may survive a hard failover with no loss at all, which does not mean the window
+is absent. Choose `durable` when a lost tail would matter, not when a test
+happens to come out clean.
+
+The cost is a round trip per flush, so it is paid per *flush* rather than per
+row: larger batches amortise it. A run flushing ten rows every 250 ms measured
+roughly 8 rows/s under `durable` against 40 rows/s under `ok`, which is close to
+the worst case for the comparison.
+
 ## Types
 
 QuestDB creates the table and infers column types from the rows it receives.
@@ -173,9 +192,12 @@ Two further rules keep a retry from duplicating data:
   when delivery is unknown and documents that `FailoverRetry` can carry it, so
   the connector requires `in_doubt() == false` as well.
 
-Note that the runtime currently discards `consume()`'s return value at the FFI
-boundary ([#2927](https://github.com/apache/iggy/issues/2927)), so this
-classification affects logging only until that is fixed.
+The classification decides how a batch is reported: whether it is counted as
+failed, and how loudly it is logged. It does not yet decide whether the batch is
+retried, because the runtime discards `consume()`'s return value at the FFI
+boundary ([#2927](https://github.com/apache/iggy/issues/2927)). Once that is
+fixed the same classification starts driving retries, with no change needed
+here.
 
 ### Rejected records
 
@@ -233,9 +255,25 @@ Unit tests:
 cargo test -p iggy_connector_questdb_sink
 ```
 
-A developer harness against a live server is ignored by default:
+Integration tests, which start a QuestDB container and drive the connector
+through the connectors runtime:
 
 ```bash
-QUESTDB_CONF='ws::addr=127.0.0.1:9000;' \
-  cargo test -p iggy_connector_questdb_sink --test live_smoke -- --ignored --nocapture
+cargo nextest run -p integration -E 'test(/connectors::questdb::/)'
 ```
+
+They need Docker. `cargo nextest` rather than `cargo test` because the harness
+resolves the server and runtime binaries through `CARGO_BIN_EXE_*`, which
+plain `cargo test` does not set for another package's binaries.
+
+### Enterprise behaviour
+
+Multi-host failover, TLS and durable ACK have no single-node equivalent and the
+Enterprise image is not publicly pullable, so they cannot be covered here. They
+were verified by hand against a three-node cluster: token auth over `wss://`,
+an unreachable endpoint at the head of the address list, a primary stopped and
+restarted, two graceful promotions including one across zones, a window with no
+primary at all, and a hard stop of two nodes with a watchdog promotion. Rows
+were written continuously throughout with `DEDUP UPSERT KEYS` on the target
+table, and every run finished with a contiguous sequence: no gaps and no
+duplicates.
