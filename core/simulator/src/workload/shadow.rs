@@ -17,7 +17,7 @@
 
 //! Shadow state: the workload's prediction of server-side entity state.
 //!
-//! Name-keyed throughout. Server-ng does not yet ship reply bodies, so
+//! Name-keyed throughout. Server does not yet ship reply bodies, so
 //! the workload cannot observe server-assigned numeric ids. Lookups are
 //! by name; requests route via `WireIdentifier::named(...)`. When typed
 //! response bodies land, id-keyed maps return as a parallel index;

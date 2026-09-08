@@ -23,8 +23,6 @@ import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCounted;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.message.HeaderKey;
-import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
@@ -32,7 +30,6 @@ import org.apache.iggy.stream.StreamDetails;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
@@ -58,10 +55,7 @@ public class StreamsTcpClient implements StreamsClient {
 
     @Override
     public CompletableFuture<StreamDetails> createStream(String name) {
-        var payloadSize = 1 + name.length();
-        var payload = Unpooled.buffer(payloadSize);
-
-        payload.writeBytes(BytesSerializer.toBytes(name));
+        var payload = BytesSerializer.toBytes(name, "name");
 
         return connection().send(CommandCode.Stream.CREATE.getValue(), payload).thenApply(response -> {
             StreamDetails details = readStreamDetails(response);
@@ -102,15 +96,11 @@ public class StreamsTcpClient implements StreamsClient {
 
     @Override
     public CompletableFuture<Void> updateStream(StreamId streamId, String name) {
-        var payloadSize = 1 + name.length();
-        var idBytes = toBytes(streamId);
-        var payload = Unpooled.buffer(payloadSize + idBytes.capacity());
-
-        payload.writeBytes(idBytes);
-        payload.writeBytes(BytesSerializer.toBytes(name));
-        // Trailing options block. Streams have no catalog keys yet, so the
-        // server rejects every key; the empty block is the extension point.
-        payload.writeBytes(BytesSerializer.toBytes(Map.<HeaderKey, HeaderValue>of()));
+        var payload = toBytes(streamId);
+        payload.writeBytes(BytesSerializer.toBytes(name, "name"));
+        // No trailing options block: streams have no catalog keys yet and the
+        // server reads an absent block as empty. Settings will ride one here,
+        // as topics do.
 
         return connection().send(CommandCode.Stream.UPDATE.getValue(), payload).thenAccept(ReferenceCounted::release);
     }

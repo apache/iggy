@@ -24,6 +24,7 @@ pub trait ConsumerOffsetClient {
     /// Store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.
+    /// A new key at the per-partition limit returns [`IggyError::TooManyConsumerOffsets`] (3024).
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -35,6 +36,8 @@ pub trait ConsumerOffsetClient {
     /// Get the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.
+    /// An absent offset key returns `Ok(None)` when its stream, topic, and consumer group resolve.
+    /// A local auto-commit cursor can be visible before its durable store commits.
     async fn get_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -45,6 +48,10 @@ pub trait ConsumerOffsetClient {
     /// Delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.
+    /// A missing durable key returns [`IggyError::ConsumerOffsetNotFound`] (3021).
+    /// Missing numeric and named groups return codes 5000 and 5003 respectively.
+    /// A replica unable to admit the request returns [`IggyError::TransientNotAccepted`].
+    /// Deletion does not allocate a new key and is allowed at the offset limit.
     async fn delete_consumer_offset(
         &self,
         consumer: &Consumer,

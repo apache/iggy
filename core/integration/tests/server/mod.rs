@@ -78,6 +78,7 @@ mod partition_view_durability_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter).
 mod concurrent_addition;
+mod consumer_offset_quota_vsr;
 mod general;
 // The per-shard segment cleaner deletes expired / oversize segments from disk.
 mod message_cleanup;

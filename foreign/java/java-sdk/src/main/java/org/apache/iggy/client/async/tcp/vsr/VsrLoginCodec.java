@@ -25,6 +25,7 @@ import org.apache.iggy.IggyVersion;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * Rewrites serialized login payloads into the
@@ -46,18 +47,27 @@ final class VsrLoginCodec {
 
     static final String SDK_NAME = "java-sdk";
 
+    /** Bound on a u8-length-prefixed field, in encoded bytes. */
+    static final int MAX_SHORT_FIELD_LENGTH = 255;
+
+    private static final String UNKNOWN_SDK_VERSION = "unknown";
+
+    private static final byte[] SDK_NAME_FIELD = SDK_NAME.getBytes(StandardCharsets.UTF_8);
+    private static final byte[] SDK_VERSION_FIELD =
+            sdkVersionField(IggyVersion.getInstance().getVersion());
+
     private VsrLoginCodec() {}
 
     /**
      * {@code LoginUser} (code 38) payload in:
-     * {@code [username:u8-len][password:u8-len][version:u32-len][context:u32-len]}.
-     * The trailing version/context strings are superseded by the
-     * {@code ClientVersionInfo} prefix and dropped.
+     * {@code [username:u8-len][password:u8-len]}. Anything after the password
+     * is ignored.
      */
     static ByteBuf rewriteUserLogin(ByteBufAllocator alloc, ByteBuf loginPayload) {
         ByteBuf in = loginPayload.slice();
         byte[] username = readShortField(in, "username");
         byte[] password = readShortField(in, "password");
+        requireShortField(username, "username");
 
         ByteBuf body = alloc.buffer();
         writeVersionInfo(body);
@@ -75,6 +85,7 @@ final class VsrLoginCodec {
     static ByteBuf rewritePatLogin(ByteBufAllocator alloc, ByteBuf loginPayload) {
         ByteBuf in = loginPayload.slice();
         byte[] token = readShortField(in, "token");
+        requireShortField(token, "token");
 
         ByteBuf body = alloc.buffer();
         writeVersionInfo(body);
@@ -93,16 +104,29 @@ final class VsrLoginCodec {
 
     private static void writeVersionInfo(ByteBuf body) {
         body.writeIntLE(PROTOCOL_VERSION);
-        writeShortField(body, SDK_NAME.getBytes(StandardCharsets.UTF_8));
-        writeShortField(body, sdkVersion().getBytes(StandardCharsets.UTF_8));
+        writeShortField(body, SDK_NAME_FIELD);
+        writeShortField(body, SDK_VERSION_FIELD);
     }
 
-    private static String sdkVersion() {
-        String version = IggyVersion.getInstance().getVersion();
-        if (version == null || version.isEmpty()) {
-            return "unknown";
+    /**
+     * An over-long version is cut on the encoded bytes at a code point boundary, so the field
+     * always fits its u8 prefix and still decodes as UTF-8 on the server.
+     */
+    static byte[] sdkVersionField(String version) {
+        String value = version == null || version.isEmpty() ? UNKNOWN_SDK_VERSION : version;
+        byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
+        if (encoded.length <= MAX_SHORT_FIELD_LENGTH) {
+            return encoded;
         }
-        return version.length() > 255 ? version.substring(0, 255) : version;
+        int end = MAX_SHORT_FIELD_LENGTH;
+        while (isContinuationByte(encoded[end])) {
+            end--;
+        }
+        return Arrays.copyOf(encoded, end);
+    }
+
+    private static boolean isContinuationByte(byte value) {
+        return (value & 0xC0) == 0x80;
     }
 
     private static byte[] readShortField(ByteBuf in, String field) {
@@ -118,10 +142,18 @@ final class VsrLoginCodec {
         return value;
     }
 
-    private static void writeShortField(ByteBuf out, byte[] value) {
-        if (value.length == 0 || value.length > 255) {
-            throw new IggyInvalidArgumentException("Wire name fields must be 1..255 bytes, got " + value.length);
+    /**
+     * Runs before {@code alloc.buffer()}: the encoder releases the body only once the codec
+     * returns, so a throw after allocation would leak the pooled buffer.
+     */
+    private static void requireShortField(byte[] value, String field) {
+        if (value.length == 0 || value.length > MAX_SHORT_FIELD_LENGTH) {
+            throw new IggyInvalidArgumentException(
+                    "Login payload " + field + " must be 1.." + MAX_SHORT_FIELD_LENGTH + " bytes, got " + value.length);
         }
+    }
+
+    private static void writeShortField(ByteBuf out, byte[] value) {
         out.writeByte(value.length);
         out.writeBytes(value);
     }
