@@ -179,6 +179,24 @@ impl IggySource {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
+    fn try_recover_invalid_offset(
+        &self,
+        state: &mut State,
+        partition_id: u32,
+        poll_error: IggyError,
+    ) -> Result<(), IggyError> {
+        let IggyError::InvalidOffset(offset) = poll_error else {
+            return Err(poll_error);
+        };
+        warn!(
+            "Saved offset {offset} for partition {partition_id} no longer valid \
+             for {CONNECTOR_NAME} connector ID: {}, resetting to initial offset",
+            self.id
+        );
+        state.offsets.remove(&partition_id);
+        Ok(())
+    }
+
     async fn ensure_stream_and_topic(
         &self,
         client: &IggyClient,
@@ -388,23 +406,20 @@ impl Source for IggySource {
                     messages.extend(partition_messages);
                     candidate_state.offsets.insert(partition_id, last_offset);
                 }
-                Err(IggyError::InvalidOffset(offset)) => {
-                    warn!(
-                        "Saved offset {offset} for partition {partition_id} no longer valid \
-                         for {CONNECTOR_NAME} connector ID: {}, resetting to initial offset",
-                        self.id
-                    );
-                    candidate_state.offsets.remove(&partition_id);
+                Err(poll_error) => {
                     errors_in_cycle += 1;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to poll partition {partition_id} for {CONNECTOR_NAME} \
-                         connector ID: {}: {e}",
-                        self.id
-                    );
-                    errors_in_cycle += 1;
-                    break;
+                    if let Err(poll_error) = self.try_recover_invalid_offset(
+                        &mut candidate_state,
+                        partition_id,
+                        poll_error,
+                    ) {
+                        error!(
+                            "Failed to poll partition {partition_id} for {CONNECTOR_NAME} \
+                             connector ID: {}: {poll_error}",
+                            self.id
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -818,6 +833,51 @@ mod tests {
             next_strategy(InitialOffset::Offset(7), None),
             PollingStrategy::offset(7)
         );
+    }
+
+    #[test]
+    fn given_invalid_offset_should_reset_only_affected_partition_to_initial_strategy() {
+        let config = IggySourceConfig {
+            initial_offset: Some("earliest".to_string()),
+            ..test_config()
+        };
+        let source = IggySource::new(1, config, None);
+        let mut state = State {
+            offsets: HashMap::from([(0, 42), (1, 7)]),
+            messages_synced: 50,
+            errors_count: 3,
+        };
+
+        source
+            .try_recover_invalid_offset(&mut state, 0, IggyError::InvalidOffset(43))
+            .expect("invalid offset should be recoverable");
+
+        assert_eq!(state.offsets, HashMap::from([(1, 7)]));
+        assert_eq!(state.messages_synced, 50);
+        assert_eq!(state.errors_count, 3);
+        assert_eq!(
+            next_strategy(source.initial_offset, state.offsets.get(&0).copied()),
+            PollingStrategy::first()
+        );
+        assert_eq!(
+            next_strategy(source.initial_offset, state.offsets.get(&1).copied()),
+            PollingStrategy::offset(8)
+        );
+    }
+
+    #[test]
+    fn given_other_poll_error_should_preserve_partition_offsets() {
+        let source = IggySource::new(1, test_config(), None);
+        let mut state = State {
+            offsets: HashMap::from([(0, 42), (1, 7)]),
+            messages_synced: 50,
+            errors_count: 3,
+        };
+
+        let result = source.try_recover_invalid_offset(&mut state, 0, IggyError::Error);
+
+        assert!(matches!(result, Err(IggyError::Error)));
+        assert_eq!(state.offsets, HashMap::from([(0, 42), (1, 7)]));
     }
 
     #[test]
