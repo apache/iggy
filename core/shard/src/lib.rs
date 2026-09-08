@@ -2555,6 +2555,17 @@ where
                         // the floor with the partition value.
                         self.metrics
                             .record_partition_prepare_gap_drops(partition.take_prepare_gap_drops());
+                        // Roll whatever this partition still counts out of its
+                        // parent topic and stream. Here and not in the
+                        // reconciler's teardown: a handler suspended mid-append
+                        // holds its own `Arc` past the tombstone, and an earlier
+                        // settle leaves its increment in the parents with the
+                        // partition already gone. This is the drop point, so
+                        // nothing can add through that handle afterwards. The
+                        // rollback clamps, so the usual case -- the metadata
+                        // apply already zeroed these counters at commit -- takes
+                        // nothing.
+                        partition.stats.zero_out_all();
                     } else {
                         tracing::trace!(
                             shard = self_shard_id,
@@ -11749,6 +11760,9 @@ mod repair_scope_tests {
         assert_eq!(adopted_suffix_head(&pending, 98, 101), Some(100));
         assert_eq!(adopted_suffix_head(&pending, 99, 101), Some(100));
         assert_eq!(adopted_suffix_head(&pending, 100, 101), None);
+        // A parked head ABOVE the local head is a different shape -- ops this
+        // replica has not sequenced at all -- and stays out of scope.
+        assert_eq!(adopted_suffix_head(&pending, 98, 99), None);
         let suffix = adopted_suffix_head(&pending, 98, 101);
         assert_eq!(
             super::partition_repair_fetch_to_op(0, 98, suffix),
