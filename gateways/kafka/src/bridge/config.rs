@@ -24,10 +24,11 @@ use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::TopicMapping;
 
 const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
-/// Matches the Iggy server's own default root user - not a made-up example, the same default
-/// every fresh `iggy-server` and every CLI quick-start in this repo uses.
+/// Matches `DEFAULT_ROOT_USERNAME` (`core/server/src/boot/credentials.rs`) - the root user's
+/// username is always `iggy` regardless of how its password was provisioned, so defaulting this
+/// one field is safe. The password is a different story - see why there is no
+/// `DEFAULT_IGGY_PASSWORD` at [`IggyBridgeConfig::from_env`].
 const DEFAULT_IGGY_USERNAME: &str = "iggy";
-const DEFAULT_IGGY_PASSWORD: &str = "iggy";
 
 /// Connection + topic-mapping config for [`IggyBridge`](crate::bridge::iggy_bridge::IggyBridge).
 ///
@@ -56,7 +57,16 @@ impl IggyBridgeConfig {
     ];
 
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
-    /// out-of-the-box address and root credentials.
+    /// out-of-the-box address and root username.
+    ///
+    /// `IGGY_KAFKA_IGGY_PASSWORD` has no default and must be set explicitly. `iggy-server` only
+    /// provisions the well-known `iggy`/`iggy` root credentials when started with
+    /// `--with-default-root-credentials` (`args.rs`, itself documented "INSECURE - FOR DEVELOPMENT
+    /// ONLY!"); without that flag it generates a random password (`boot/credentials.rs`) that no
+    /// constant here could ever guess. Defaulting the password to `"iggy"` would make this bridge
+    /// silently authenticate as root, with the credential in no config file and no log, on any
+    /// server that does happen to run dev-flagged - the failure mode of getting it wrong is a
+    /// loud, immediate auth rejection instead.
     ///
     /// `IGGY_KAFKA_IGGY_STREAM` and `IGGY_KAFKA_TOPIC_MAP_PATH` both influence the mapping's
     /// default stream; when both are set, the TOML file's own `default_stream` wins and
@@ -66,15 +76,21 @@ impl IggyBridgeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::InvalidConfig`] if `IGGY_KAFKA_TOPIC_MAP_PATH` is set but the file
-    /// is missing or fails to parse.
+    /// Returns [`BridgeError::InvalidConfig`] if `IGGY_KAFKA_IGGY_PASSWORD` is unset, or if
+    /// `IGGY_KAFKA_TOPIC_MAP_PATH` is set but the file is missing or fails to parse.
     pub fn from_env() -> Result<Self, BridgeError> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
         let username = std::env::var("IGGY_KAFKA_IGGY_USERNAME")
             .unwrap_or_else(|_| DEFAULT_IGGY_USERNAME.to_string());
-        let password = std::env::var("IGGY_KAFKA_IGGY_PASSWORD")
-            .unwrap_or_else(|_| DEFAULT_IGGY_PASSWORD.to_string());
+        let password = std::env::var("IGGY_KAFKA_IGGY_PASSWORD").map_err(|_| {
+            BridgeError::InvalidConfig(
+                "IGGY_KAFKA_IGGY_PASSWORD must be set - iggy-server generates a random root \
+                 password unless started with --with-default-root-credentials, so there is no \
+                 safe default to fall back to"
+                    .to_string(),
+            )
+        })?;
         let stream_env = std::env::var("IGGY_KAFKA_IGGY_STREAM").ok();
         // Caught here, not left to TopicMapping::from_toml_str's own empty check: that
         // validation only runs when IGGY_KAFKA_TOPIC_MAP_PATH is set, since the no-file branch
@@ -150,14 +166,31 @@ mod tests {
 
     #[test]
     #[serial]
+    fn from_env_rejects_missing_password() {
+        // Safety: single-threaded within this function; no other test in this crate touches
+        // IGGY_KAFKA_IGGY_PASSWORD.
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+        }
+        let result = IggyBridgeConfig::from_env();
+        assert!(
+            matches!(result, Err(BridgeError::InvalidConfig(_))),
+            "no default password must mean no default: {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn from_env_rejects_missing_topic_map_file() {
         // Safety: single-threaded within this function; no other test in this crate touches
-        // IGGY_KAFKA_TOPIC_MAP_PATH.
+        // these three vars.
         unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::set_var("IGGY_KAFKA_TOPIC_MAP_PATH", "/nonexistent/topic_map.toml");
         }
         let result = IggyBridgeConfig::from_env();
         unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
             std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
         }
         assert!(matches!(result, Err(BridgeError::InvalidConfig(_))));
@@ -170,13 +203,15 @@ mod tests {
         std::fs::write(file.path(), "default_stream = \"from-toml\"\n").expect("write temp file");
 
         // Safety: single-threaded within this function; no other test in this crate touches
-        // IGGY_KAFKA_IGGY_STREAM or IGGY_KAFKA_TOPIC_MAP_PATH.
+        // these three vars.
         unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::set_var("IGGY_KAFKA_IGGY_STREAM", "from-env");
             std::env::set_var("IGGY_KAFKA_TOPIC_MAP_PATH", file.path());
         }
         let result = IggyBridgeConfig::from_env();
         unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
             std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
             std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
         }
@@ -191,12 +226,14 @@ mod tests {
     #[serial]
     fn from_env_rejects_empty_stream_env_var() {
         // Safety: single-threaded within this function; no other test in this crate touches
-        // IGGY_KAFKA_IGGY_STREAM.
+        // these two vars.
         unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::set_var("IGGY_KAFKA_IGGY_STREAM", "");
         }
         let result = IggyBridgeConfig::from_env();
         unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
             std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
         }
         assert!(matches!(result, Err(BridgeError::InvalidConfig(_))));

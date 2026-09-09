@@ -54,6 +54,23 @@ max-threads = 1
 filter = 'package(integration) and test(/connectors::elasticsearch::/)'
 test-group = "elasticsearch"
 
+# Each test in this binary spawns its own real iggy-server subprocess (isolated data dir, port
+# from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
+# under nextest - nextest runs every test as its own process, and #[serial]'s mutex only excludes
+# within one process (nextest does not support #[serial] macro, same gap the workaround above
+# documents). Without this override, nextest's default scheduler runs several of these processes
+# at once, and every one of them inherits this workspace's cpu_allocation = "numa:auto" /
+# pin_cores = true (config.toml) - concurrent pinned-core servers starve each other's shards
+# instead of running each on its own core budget, the same reason core/integration's own harness
+# (harness/handle/server.rs) overrides both settings for spawned test servers. This crate's harness
+# does not override them, so serializing is the fix here instead.
+[test-groups.kafka_bridge]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)'
+test-group = "kafka_bridge"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 

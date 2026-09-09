@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::time::Duration;
+
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
     StreamClient, TopicClient, TopicCreateOptions,
@@ -31,9 +33,26 @@ use crate::bridge::error::BridgeError;
 /// level once a handler maps a bridge failure to a retriable error code; the bridge blocking a
 /// request task inside an unbounded internal reconnect loop would just add a second, invisible
 /// retry layer underneath that one instead of surfacing the failure so the mapped code can be
-/// sent. At the default `reconnection_interval` (1s), a fully unreachable address fails in a few
-/// seconds rather than hanging.
+/// sent.
+///
+/// This bounds the *count*, not the *wall-clock time*, of that inner retry loop - see
+/// [`CONNECT_TIMEOUT`] for the latter.
 const RECONNECTION_RETRIES: u32 = 3;
+
+/// Wall-clock ceiling on the whole `client.connect()` call in [`IggyBridge::connect`], including
+/// every attempt [`RECONNECTION_RETRIES`] makes internally.
+///
+/// Without this, an unreachable-but-not-refusing address hangs far longer than "a few seconds":
+/// `TcpClient::establish_bounded` only applies its own `FAILOVER_DIAL_TIMEOUT` (2s) when at least
+/// two failover candidates are configured (`tcp_client.rs`) - a bridge always configures exactly
+/// one address, so that guard never engages, and the plain `TcpStream::connect` underneath has no
+/// deadline of its own. Against a firewall that drops SYN packets instead of refusing them, each
+/// of the up to `RECONNECTION_RETRIES + 1` dial attempts pays the kernel's own SYN-retry timeout
+/// (minutes, not seconds) rather than the `reconnection_interval` between attempts - a closed port
+/// (instant RST) never exercises this path, so the failure mode only shows up in production.
+/// 15s comfortably covers a slow-but-alive server's handshake (well above p99 login latency) while
+/// still failing well short of the pathological multi-minute case.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Owns one connected `IggyClient` and resolves Kafka topics against it.
 ///
@@ -57,10 +76,12 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Returns [`BridgeError::InvalidConfig`] if `config.address` is empty. Returns
-    /// [`BridgeError::Iggy`] if the address is malformed, the TCP connection fails, or
-    /// authentication is rejected - this is the boundary [`BridgeError::to_kafka_error_code`]
-    /// exists for: a handler calling this must map the error to a wire response, never panic or
-    /// unwrap, since an unreachable Iggy backend is an expected runtime condition, not a bug.
+    /// [`BridgeError::Iggy`] if the address is malformed, the TCP connection fails, connecting
+    /// takes longer than [`CONNECT_TIMEOUT`] (an unreachable-and-silently-dropping address, not
+    /// just a refused one, is covered - see that constant's doc), or authentication is rejected -
+    /// this is the boundary [`BridgeError::to_kafka_error_code`] exists for: a handler calling
+    /// this must map the error to a wire response, never panic or unwrap, since an unreachable
+    /// Iggy backend is an expected runtime condition, not a bug.
     pub async fn connect(config: IggyBridgeConfig) -> Result<Self, BridgeError> {
         if config.address.trim().is_empty() {
             return Err(BridgeError::InvalidConfig(
@@ -77,19 +98,38 @@ impl IggyBridge {
             .with_reconnection_max_retries(Some(RECONNECTION_RETRIES))
             .build()
             .map_err(BridgeError::Iggy)?;
-        client.connect().await.map_err(BridgeError::Iggy)?;
+        tokio::time::timeout(CONNECT_TIMEOUT, client.connect())
+            .await
+            .map_err(|_elapsed| BridgeError::Iggy(IggyError::CannotEstablishConnection))?
+            .map_err(BridgeError::Iggy)?;
         info!("Iggy bridge connected to {}", config.address);
 
         Ok(Self { client, config })
     }
 
-    /// Disconnects the underlying Iggy client.
+    /// Tears down the underlying Iggy client, including its background heartbeat task.
+    ///
+    /// Not `IggyClient::disconnect`: that only tears down the transport
+    /// (`TcpClient::disconnect_transport`) and never touches `heartbeat_handle` - only
+    /// `IggyClient`'s own `Drop` aborts that task (`client.rs`). A `disconnect`ed-but-not-dropped
+    /// bridge would keep heartbeating on a schedule, hit `NotConnected` (itself in the SDK's
+    /// retriable set), and reconnect plus re-authenticate using the credentials `connect`
+    /// configured, so the "closed" client silently comes back. `shutdown` sets
+    /// `ClientState::Shutdown`, which the heartbeat loop's next `ping` observes as
+    /// `IggyError::ClientShutdown` and self-terminates on, and which `sign_in_credentials` never
+    /// dials past.
+    ///
+    /// Takes `self` by value: `shutdown` is terminal (no reconnect is coming back from it), so
+    /// nothing legitimate is left to call on this bridge afterward. This does mean a bridge shared
+    /// via `Arc` cannot call this directly (`Arc::try_unwrap` first) - not a concern before
+    /// `#3535`/`#3536` wire an owning caller in.
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::Iggy`] if the client reports a disconnect failure.
-    pub async fn close(&self) -> Result<(), BridgeError> {
-        self.client.disconnect().await.map_err(BridgeError::Iggy)
+    /// Returns [`BridgeError::Iggy`] if the underlying client reports a shutdown failure (e.g. the
+    /// socket was already in a state that rejects a clean shutdown).
+    pub async fn close(self) -> Result<(), BridgeError> {
+        self.client.shutdown().await.map_err(BridgeError::Iggy)
     }
 
     /// Ensures the Iggy stream and topic backing `kafka_topic` exist, creating either or both if
@@ -120,7 +160,7 @@ impl IggyBridge {
         Ok(())
     }
 
-    /// Looks up (or creates) the stream named `stream_name`.
+    /// Ensures the stream named `stream_name` exists, creating it if missing.
     ///
     /// `Identifier::named` - never `Identifier::try_from`/`FromStr` - because the latter parses
     /// an all-digit string as a numeric Iggy ID rather than a name. A stream or topic named e.g.
@@ -128,33 +168,32 @@ impl IggyBridge {
     /// the first `ensure_stream_and_topic("42", ...)` creates a stream *named* `"42"`, but a
     /// second call would look it up *by ID* `42` instead, almost certainly finding nothing and
     /// breaking the "idempotent on repeated calls" guarantee.
+    ///
+    /// Returns the same *named* `Identifier` it was given, not the numeric id the SDK hands back
+    /// from `get`/`create` - streams are backed by a recycled slab (`core/metadata`'s
+    /// `stm/stream.rs`: freed keys are reused by the next created stream), so a numeric id
+    /// captured here could point at a *different* stream by the time `ensure_topic` uses it, if
+    /// this stream is deleted and recreated in between. The name has no such window.
     async fn ensure_stream(&self, stream_name: &str) -> Result<Identifier, BridgeError> {
         let identifier = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        if let Some(existing) = self
+        if let Some(_existing) = self
             .client
             .get_stream(&identifier)
             .await
             .map_err(BridgeError::Iggy)?
         {
             debug!("Iggy stream '{stream_name}' already exists");
-            return Identifier::numeric(existing.id).map_err(BridgeError::Iggy);
+            return Ok(identifier);
         }
 
         match self.client.create_stream(stream_name).await {
-            Ok(created) => {
+            Ok(_created) => {
                 info!("created Iggy stream '{stream_name}'");
-                Identifier::numeric(created.id).map_err(BridgeError::Iggy)
+                Ok(identifier)
             }
             Err(IggyError::StreamNameAlreadyExists(_)) => {
-                // Lost a create race - re-verify by name (the identifier this arm already has,
-                // fixed above) rather than trusting the race outcome alone.
-                let existing = self
-                    .client
-                    .get_stream(&identifier)
-                    .await
-                    .map_err(BridgeError::Iggy)?
-                    .ok_or_else(|| IggyError::StreamNameNotFound(stream_name.to_string()))?;
-                Identifier::numeric(existing.id).map_err(BridgeError::Iggy)
+                // Lost a create race - the name now exists regardless of who won it.
+                Ok(identifier)
             }
             Err(err) => Err(BridgeError::Iggy(err)),
         }

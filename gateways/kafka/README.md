@@ -73,14 +73,15 @@ real `iggy-server`).
 | --- | --- | --- |
 | `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to |
 | `IGGY_KAFKA_IGGY_USERNAME` | `iggy` | Iggy username |
-| `IGGY_KAFKA_IGGY_PASSWORD` | `iggy` | Iggy password |
+| `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only); otherwise it generates a random password, so a hardcoded default here could never be right and would invite running as root unnoticed |
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
 | `IGGY_KAFKA_TOPIC_MAP_PATH` | unset | Path to a topic-mapping TOML file (see below); omit to use only the default rule |
 
 The connection retries a fixed, bounded number of times (`RECONNECTION_RETRIES`, not the Iggy SDK
-client's own default of unlimited retries, one dial per second, forever), so a bridge call fails
-within a few seconds against an unreachable Iggy instead of blocking the calling task indefinitely.
-See `IggyBridge::connect`'s doc comment.
+client's own default of unlimited retries, one dial per second, forever), and the whole connect
+attempt - retries included - is capped at `CONNECT_TIMEOUT` (15s) wall-clock, so a bridge call
+fails in bounded time whether the address refuses the connection or silently drops it, instead of
+blocking the calling task indefinitely. See `IggyBridge::connect`'s doc comment.
 
 ### Topic mapping
 

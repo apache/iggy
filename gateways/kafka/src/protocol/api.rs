@@ -52,6 +52,12 @@ pub const ERROR_NONE: i16 = 0;
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 /// Retriable; Produce stub uses this until the Iggy bridge persists records.
 pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
+/// `bridge`'s mapping for `IggyError::TransientNotCommitted`.
+///
+/// The request's outcome is genuinely unknown (neither confirmed applied nor confirmed rejected),
+/// so a client must not blindly retry a Produce as if it were a plain retriable failure - that
+/// risks writing a duplicate.
+pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would

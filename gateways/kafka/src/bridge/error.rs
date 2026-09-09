@@ -19,8 +19,8 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_TOPIC_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_PARTITIONS, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -83,20 +83,40 @@ impl BridgeError {
 }
 
 /// Kept private so this association can change without touching call sites.
+///
+/// The connection-shaped set (`Disconnected`, `EmptyResponse`, `Unauthenticated`, `StaleClient`,
+/// `NotConnected`, `CannotEstablishConnection`, `TcpError`) mirrors exactly what
+/// `TcpClient::send_raw_with_response` (`tcp_client.rs`) itself treats as worth a reconnect retry.
+/// A mapping that only covered some of these would send a permanent-looking Kafka error for a
+/// condition the SDK itself considers transient. `Unauthenticated` belongs here, not with the
+/// credential-rejection group below: `fail_if_not_authenticated` (`binary_auth.rs`) returns it for
+/// `ClientState::Connected`, the ordinary window between a reconnect's TCP handshake completing
+/// and its auto-sign-in landing, not for a rejected login.
+///
+/// `TransientNotAccepted` (Iggy replica-side "retry, on any replica") is retriable the same way.
+/// `TransientNotCommitted` is not folded into that set: its outcome is genuinely unknown rather
+/// than known-safe-to-retry, so it maps to `REQUEST_TIMED_OUT` instead of
+/// `NOT_LEADER_OR_FOLLOWER` - a caller must not treat it as an ordinary retriable failure and risk
+/// a duplicate write.
 const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
     match err {
         IggyError::StreamIdNotFound(_)
         | IggyError::StreamNameNotFound(_)
         | IggyError::TopicIdNotFound(_, _)
         | IggyError::TopicNameNotFound(_, _) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-        IggyError::Unauthenticated
-        | IggyError::Unauthorized
+        IggyError::Unauthorized
         | IggyError::InvalidCredentials
         | IggyError::InvalidUsername
         | IggyError::InvalidPassword => ERROR_TOPIC_AUTHORIZATION_FAILED,
-        IggyError::Disconnected | IggyError::CannotEstablishConnection => {
-            ERROR_NOT_LEADER_OR_FOLLOWER
-        }
+        IggyError::Disconnected
+        | IggyError::EmptyResponse
+        | IggyError::Unauthenticated
+        | IggyError::StaleClient
+        | IggyError::NotConnected
+        | IggyError::CannotEstablishConnection
+        | IggyError::TcpError
+        | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
+        IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
         _ => ERROR_UNKNOWN_SERVER_ERROR,
     }
 }
@@ -128,9 +148,11 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_maps_to_topic_authorization_failed() {
+    fn unauthenticated_maps_to_not_leader_or_follower_for_retry() {
+        // Not a credential rejection: fail_if_not_authenticated (binary_auth.rs) returns this for
+        // ClientState::Connected, the ordinary window mid-reconnect before auto-sign-in lands.
         let err = BridgeError::Iggy(IggyError::Unauthenticated);
-        assert_eq!(err.to_kafka_error_code(), ERROR_TOPIC_AUTHORIZATION_FAILED);
+        assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
     }
 
     #[test]
@@ -155,6 +177,44 @@ mod tests {
     fn cannot_establish_connection_maps_to_not_leader_or_follower_for_retry() {
         let err = BridgeError::Iggy(IggyError::CannotEstablishConnection);
         assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn empty_response_maps_to_not_leader_or_follower_for_retry() {
+        let err = BridgeError::Iggy(IggyError::EmptyResponse);
+        assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn stale_client_maps_to_not_leader_or_follower_for_retry() {
+        let err = BridgeError::Iggy(IggyError::StaleClient);
+        assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn not_connected_maps_to_not_leader_or_follower_for_retry() {
+        let err = BridgeError::Iggy(IggyError::NotConnected);
+        assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn tcp_error_maps_to_not_leader_or_follower_for_retry() {
+        let err = BridgeError::Iggy(IggyError::TcpError);
+        assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn transient_not_accepted_maps_to_not_leader_or_follower_for_retry() {
+        let err = BridgeError::Iggy(IggyError::TransientNotAccepted);
+        assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn transient_not_committed_maps_to_request_timed_out_not_plain_retry() {
+        // Outcome is unknown, not known-safe-to-retry - must not share a code with the
+        // unambiguous retriable set, or a caller could blindly retry a Produce into a duplicate.
+        let err = BridgeError::Iggy(IggyError::TransientNotCommitted);
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
     }
 
     #[test]
