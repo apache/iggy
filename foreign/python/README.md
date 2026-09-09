@@ -134,7 +134,8 @@ running prek / committing / pushing. This list is not exhaustive and other hook 
 
 ## Client Configuration
 
-`IggyClient` takes a server address, a `TcpConfig`, or a `QuicConfig`:
+`IggyClient` takes a server address, a `TcpConfig`, a `QuicConfig`, an
+`HttpConfig`, or a `WebSocketConfig`:
 
 ```python
 import asyncio
@@ -168,8 +169,40 @@ async def main():
 asyncio.run(main())
 ```
 
-`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport; see
-`examples/python/getting-started/producer.py` for a config swap example.
+`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport, an
+`HttpConfig` for the HTTP transport, and a `WebSocketConfig` for the WebSocket
+transport. `examples/python/getting-started/producer.py` shows each swap in
+context.
+
+`HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
+`AutoLogin`: `connect()` does not dial over HTTP, but it does start the
+heartbeat that `heartbeat_interval` configures, so call it and then
+`login_user(...)`. And HTTP is single-consumer only: the `consumer_group(...)`
+path always fails with `Feature is unavailable`, at the join by default and at
+the returned consumer's first poll if you disable `auto_join_consumer_group`,
+so disabling it is not a workaround. A direct
+`poll_messages(consumer=Consumer.Group(...))` fails the same way unless you
+pass an explicit `partition_id`, and with one it degrades silently instead: the
+consumer kind is not carried on the HTTP wire, so the group is served as an
+ordinary consumer named after it, with no membership or partition assignment
+behind it. Use `Consumer.Single(...)` with `poll_messages(...)`. Delivery is
+also at-least-once: the default `retries=3` replays the full request body, so a
+send whose response was lost is applied twice, and only `retries=0` opts out.
+
+```python
+import asyncio
+
+from apache_iggy import HttpConfig, IggyClient
+
+
+async def main():
+    client = IggyClient(HttpConfig(api_url="http://127.0.0.1:3000"))
+    await client.connect()
+    await client.login_user("iggy", "iggy")
+
+
+asyncio.run(main())
+```
 
 ## Examples
 

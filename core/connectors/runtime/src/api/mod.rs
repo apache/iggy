@@ -34,6 +34,7 @@ use tracing::{error, info, warn};
 mod auth;
 pub mod config;
 mod error;
+mod key;
 mod models;
 mod sink;
 mod source;
