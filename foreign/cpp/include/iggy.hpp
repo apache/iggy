@@ -57,7 +57,7 @@ class StringTag {
     explicit StringTag(std::string value) : value_(std::move(value)) {}
     ~StringTag() = default;
 
-    std::string_view Value() const { return value_; }
+    [[nodiscard]] std::string_view Value() const { return value_; }
 
   private:
     std::string value_;
@@ -88,13 +88,13 @@ class LoginInfo final {
      * @brief Returns the numeric ID of the authenticated user.
      * @return Numeric user ID.
      */
-    std::uint32_t UserId() const noexcept { return user_id_; }
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
 
     /**
      * @brief Returns the HTTP access token when the login returned one.
      * @return Empty when the selected transport does not use an access token.
      */
-    std::optional<std::string_view> AccessToken() const noexcept {
+    [[nodiscard]] std::optional<std::string_view> AccessToken() const noexcept {
         if (!access_token_) {
             return std::nullopt;
         }
@@ -106,7 +106,7 @@ class LoginInfo final {
      * @return Empty when no access token was returned; otherwise the
      *         server-provided expiry value.
      */
-    std::optional<std::uint64_t> AccessTokenExpiry() const noexcept { return access_token_expiry_; }
+    [[nodiscard]] std::optional<std::uint64_t> AccessTokenExpiry() const noexcept { return access_token_expiry_; }
 
   private:
     LoginInfo(std::uint32_t user_id,
@@ -158,14 +158,14 @@ class Identifier final {
      * @brief Returns this identifier's representation.
      * @return Kind::Numeric or Kind::String.
      */
-    Kind Type() const noexcept { return kind_; }
+    [[nodiscard]] Kind Type() const noexcept { return kind_; }
 
     /**
      * @brief Returns the identifier payload.
      * @return Numeric ID for Kind::Numeric, or a view of the name for
      *         Kind::String.
      */
-    std::variant<std::uint32_t, std::string_view> Value() const noexcept {
+    [[nodiscard]] std::variant<std::uint32_t, std::string_view> Value() const noexcept {
         if (kind_ == Kind::Numeric) {
             return std::get<std::uint32_t>(value_);
         }
@@ -231,13 +231,13 @@ class HeaderField final {
      * @brief Returns the wire type of Value().
      * @return Header type tag.
      */
-    HeaderKind Kind() const noexcept { return kind_; }
+    [[nodiscard]] HeaderKind Kind() const noexcept { return kind_; }
 
     /**
      * @brief Returns bytes owned by this field.
      * @return Payload encoded according to Kind().
      */
-    const std::vector<std::uint8_t> &Value() const noexcept { return value_; }
+    [[nodiscard]] const std::vector<std::uint8_t> &Value() const noexcept { return value_; }
 
   private:
     HeaderField(HeaderKind kind, std::vector<std::uint8_t> value) : kind_(kind), value_(std::move(value)) {}
@@ -272,13 +272,13 @@ class HeaderEntry final {
      * @brief Returns the typed key.
      * @return Key owned by this entry.
      */
-    const HeaderField &Key() const noexcept { return key_; }
+    [[nodiscard]] const HeaderField &Key() const noexcept { return key_; }
 
     /**
      * @brief Returns the typed value.
      * @return Value owned by this entry.
      */
-    const HeaderField &Value() const noexcept { return value_; }
+    [[nodiscard]] const HeaderField &Value() const noexcept { return value_; }
 
   private:
     HeaderEntry(HeaderField key, HeaderField value) : key_(std::move(key)), value_(std::move(value)) {}
@@ -330,7 +330,7 @@ class ResourceOptions final {
      * @brief Returns entries supplied explicitly at resource creation.
      * @return Explicit entries as map from option name to typed value.
      */
-    const std::map<std::string, HeaderField> &Explicit() const noexcept { return explicit_; }
+    [[nodiscard]] const std::map<std::string, HeaderField> &Explicit() const noexcept { return explicit_; }
 
     /**
      * @brief Returns entries derived from configured defaults at admission.
@@ -338,7 +338,7 @@ class ResourceOptions final {
      * @note Stream responses currently expose explicit entries only, so this
      *       collection is empty for Stream and StreamDetails.
      */
-    const std::map<std::string, HeaderField> &Derived() const noexcept { return derived_; }
+    [[nodiscard]] const std::map<std::string, HeaderField> &Derived() const noexcept { return derived_; }
 
   private:
     explicit ResourceOptions(std::map<std::string, HeaderField> explicit_entries)
@@ -383,61 +383,61 @@ class Topic final {
      * @brief Returns the numeric topic ID assigned within its stream.
      * @return Numeric topic ID.
      */
-    std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
 
     /**
      * @brief Returns the server creation timestamp.
      * @return Timestamp in microseconds.
      */
-    std::uint64_t CreatedAt() const noexcept { return created_at_; }
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
 
     /**
      * @brief Returns the topic name.
      * @return Name owned by this value.
      */
-    const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
 
     /**
      * @brief Returns the aggregate retained topic size.
      * @return Size in bytes.
      */
-    std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
+    [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
      * @brief Returns the server-encoded message retention value.
      * @return Retention value in microseconds or a protocol sentinel.
      */
-    std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
+    [[nodiscard]] std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
      * @brief Returns the server-selected storage compression algorithm.
      * @return Algorithm name owned by this value.
      */
-    const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+    [[nodiscard]] const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
 
     /**
      * @brief Returns the configured maximum retained topic size.
      * @return Maximum size in bytes.
      */
-    std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
+    [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
-    std::uint64_t MessagesCount() const noexcept { return messages_count_; }
+    [[nodiscard]] std::uint64_t MessagesCount() const noexcept { return messages_count_; }
 
     /**
      * @brief Returns the number of partitions belonging to this topic.
      * @return Partition count.
      */
-    std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
 
     /**
      * @brief Returns topic creation options and their admission provenance.
      * @return Options owned by this value.
      */
-    const ResourceOptions &Options() const noexcept { return options_; }
+    [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
   private:
     Topic(std::uint32_t id,
@@ -491,37 +491,37 @@ class Partition final {
      * @brief Returns the numeric partition ID within its topic.
      * @return Numeric partition ID.
      */
-    std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
 
     /**
      * @brief Returns the server creation timestamp.
      * @return Timestamp in microseconds.
      */
-    std::uint64_t CreatedAt() const noexcept { return created_at_; }
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
 
     /**
      * @brief Returns the number of retained storage segments.
      * @return Segment count.
      */
-    std::uint32_t SegmentsCount() const noexcept { return segments_count_; }
+    [[nodiscard]] std::uint32_t SegmentsCount() const noexcept { return segments_count_; }
 
     /**
      * @brief Returns the current server-observed message offset.
      * @return Current message offset.
      */
-    std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
 
     /**
      * @brief Returns the retained partition size.
      * @return Size in bytes.
      */
-    std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
+    [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
      * @brief Returns the number of retained messages.
      * @return Message count.
      */
-    std::uint64_t MessagesCount() const noexcept { return messages_count_; }
+    [[nodiscard]] std::uint64_t MessagesCount() const noexcept { return messages_count_; }
 
   private:
     Partition(std::uint32_t id,
@@ -570,55 +570,55 @@ class TopicDetails final {
      * @brief Returns the numeric topic ID within its stream.
      * @return Numeric topic ID.
      */
-    std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
 
     /**
      * @brief Returns the server creation timestamp.
      * @return Timestamp in microseconds.
      */
-    std::uint64_t CreatedAt() const noexcept { return created_at_; }
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
 
     /**
      * @brief Returns the topic name.
      * @return Name owned by this value.
      */
-    const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
 
     /**
      * @brief Returns the aggregate retained topic size.
      * @return Size in bytes.
      */
-    std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
+    [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
      * @brief Returns the server-encoded message retention value.
      * @return Retention value in microseconds or a protocol sentinel.
      */
-    std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
+    [[nodiscard]] std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
      * @brief Returns the storage compression algorithm selected for this topic.
      * @return Algorithm name owned by this value.
      */
-    const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+    [[nodiscard]] const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
 
     /**
      * @brief Returns the maximum retained size configured for this topic.
      * @return Maximum size in bytes.
      */
-    std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
+    [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
-    std::uint64_t MessagesCount() const noexcept { return messages_count_; }
+    [[nodiscard]] std::uint64_t MessagesCount() const noexcept { return messages_count_; }
 
     /**
      * @brief Returns the number of partitions belonging to this topic.
      * @return Partition count.
      */
-    std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
 
     /**
      * @brief Returns one summary for each partition in the topic.
@@ -627,13 +627,13 @@ class TopicDetails final {
      * offsets, or consumer-group membership.
      * @return Partition summaries owned by this value.
      */
-    const std::vector<Partition> &Partitions() const noexcept { return partitions_; }
+    [[nodiscard]] const std::vector<Partition> &Partitions() const noexcept { return partitions_; }
 
     /**
      * @brief Returns topic creation options and their admission provenance.
      * @return Options owned by this value.
      */
-    const ResourceOptions &Options() const noexcept { return options_; }
+    [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
   private:
     TopicDetails(std::uint32_t id,
@@ -705,51 +705,51 @@ class StreamDetails final {
      * unchanged by a stream rename.
      * @return Numeric stream ID.
      */
-    std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
 
     /**
      * @brief Returns the server-recorded creation timestamp.
      * @return Timestamp in microseconds.
      */
-    std::uint64_t CreatedAt() const noexcept { return created_at_; }
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
 
     /**
      * @brief Returns the unique stream name observed by the server.
      * @return Reference owned by this value. It remains valid until this
      *         StreamDetails object is modified or destroyed.
      */
-    const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
 
     /**
      * @brief Returns the aggregate retained size of all stream topics.
      * @return Size in bytes observed by the server for this request.
      */
-    std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
+    [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
      * @brief Returns the aggregate number of messages in all stream topics.
      * @return Message count observed by the server for this request.
      */
-    std::uint64_t MessagesCount() const noexcept { return messages_count_; }
+    [[nodiscard]] std::uint64_t MessagesCount() const noexcept { return messages_count_; }
 
     /**
      * @brief Returns the number of topics belonging to the stream.
      * @return Topic count observed by the server for this request.
      */
-    std::uint32_t TopicsCount() const noexcept { return topics_count_; }
+    [[nodiscard]] std::uint32_t TopicsCount() const noexcept { return topics_count_; }
 
     /**
      * @brief Returns the topic summaries observed by the server.
      * @return Topic values owned by this StreamDetails object.
      */
-    const std::vector<Topic> &Topics() const noexcept { return topics_; }
+    [[nodiscard]] const std::vector<Topic> &Topics() const noexcept { return topics_; }
 
     /**
      * @brief Returns explicit stream creation options.
      * @return Options owned by this value.
      * @note The current bridge does not return derived stream options.
      */
-    const ResourceOptions &Options() const noexcept { return options_; }
+    [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
   private:
     StreamDetails(std::uint32_t id,
@@ -801,44 +801,44 @@ class Stream final {
      * @brief Returns the numeric ID assigned by the server.
      * @return Numeric stream ID.
      */
-    std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
 
     /**
      * @brief Returns the server-recorded creation timestamp.
      * @return Timestamp in microseconds.
      */
-    std::uint64_t CreatedAt() const noexcept { return created_at_; }
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
 
     /**
      * @brief Returns the stream name.
      * @return Name owned by this value.
      */
-    const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
 
     /**
      * @brief Returns the aggregate retained stream size.
      * @return Size in bytes.
      */
-    std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
+    [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
      * @brief Returns the aggregate number of retained stream messages.
      * @return Message count.
      */
-    std::uint64_t MessagesCount() const noexcept { return messages_count_; }
+    [[nodiscard]] std::uint64_t MessagesCount() const noexcept { return messages_count_; }
 
     /**
      * @brief Returns the number of topics belonging to the stream.
      * @return Topic count.
      */
-    std::uint32_t TopicsCount() const noexcept { return topics_count_; }
+    [[nodiscard]] std::uint32_t TopicsCount() const noexcept { return topics_count_; }
 
     /**
      * @brief Returns explicit stream creation options.
      * @return Options owned by this value.
      * @note The current bridge does not return derived stream options.
      */
-    const ResourceOptions &Options() const noexcept { return options_; }
+    [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
   private:
     Stream(std::uint32_t id,
@@ -890,7 +890,7 @@ class CompressionAlgorithm final : private detail::StringTag<CompressionAlgorith
      * @brief Returns the compression algorithm name.
      * @return Compression algorithm name.
      */
-    std::string_view Value() const { return detail::StringTag<CompressionAlgorithm>::Value(); }
+    [[nodiscard]] std::string_view Value() const { return detail::StringTag<CompressionAlgorithm>::Value(); }
 
   private:
     explicit CompressionAlgorithm(std::string algorithm)
@@ -929,7 +929,7 @@ class SnapshotCompression final : private detail::StringTag<SnapshotCompression>
      * @brief Returns the snapshot compression algorithm name.
      * @return Snapshot compression algorithm name.
      */
-    std::string_view Value() const { return detail::StringTag<SnapshotCompression>::Value(); }
+    [[nodiscard]] std::string_view Value() const { return detail::StringTag<SnapshotCompression>::Value(); }
 
   private:
     explicit SnapshotCompression(std::string snapshot_compression)
@@ -966,7 +966,7 @@ class SystemSnapshotType final : private detail::StringTag<SystemSnapshotType> {
      * @brief Returns the value passed to the client implementation.
      * @return System snapshot type name.
      */
-    std::string_view SnapshotTypeValue() const { return Value(); }
+    [[nodiscard]] std::string_view SnapshotTypeValue() const { return Value(); }
 
   private:
     explicit SystemSnapshotType(std::string snapshot_type)
@@ -1011,7 +1011,7 @@ class MaxTopicSize final : private detail::StringTag<MaxTopicSize> {
      * @brief Returns the value passed to the client implementation.
      * @return Topic size option or decimal byte count.
      */
-    std::string_view Value() const { return detail::StringTag<MaxTopicSize>::Value(); }
+    [[nodiscard]] std::string_view Value() const { return detail::StringTag<MaxTopicSize>::Value(); }
 
   private:
     explicit MaxTopicSize(std::string max_topic_size) : detail::StringTag<MaxTopicSize>(std::move(max_topic_size)) {}
@@ -1045,14 +1045,14 @@ class Expiry final {
      * @brief Returns the expiry policy kind.
      * @return One of server_default, never_expire, or duration.
      */
-    std::string_view Kind() const { return expiry_kind_; }
+    [[nodiscard]] std::string_view Kind() const { return expiry_kind_; }
 
     /**
      * @brief Returns the value associated with the expiry policy.
      * @return Duration in microseconds for Duration(), zero for ServerDefault(),
      *         or std::numeric_limits<std::uint64_t>::max() for NeverExpire().
      */
-    std::uint64_t Value() const { return expiry_value_; }
+    [[nodiscard]] std::uint64_t Value() const { return expiry_value_; }
 
   private:
     explicit Expiry(std::string expiry_kind, std::uint64_t expiry_value)
@@ -1079,7 +1079,7 @@ class TopicCreateOptions final {
      * @return Configured partition count, or `std::nullopt` to use the server
      *         default.
      */
-    std::optional<std::uint32_t> PartitionsCount() const noexcept { return partitions_count_; }
+    [[nodiscard]] std::optional<std::uint32_t> PartitionsCount() const noexcept { return partitions_count_; }
 
     /**
      * @brief Sets the number of partitions to create.
@@ -1096,7 +1096,9 @@ class TopicCreateOptions final {
      * @return Configured compression algorithm, or `std::nullopt` to use the
      *         server default.
      */
-    std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+    [[nodiscard]] std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept {
+        return compression_algorithm_;
+    }
 
     /**
      * @brief Sets the topic storage compression algorithm.
@@ -1113,7 +1115,7 @@ class TopicCreateOptions final {
      * @return Configured expiry policy, or `std::nullopt` to use the server
      *         default.
      */
-    std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+    [[nodiscard]] std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
      * @brief Sets the message retention policy.
@@ -1135,7 +1137,7 @@ class TopicCreateOptions final {
      * @return Configured size limit, or `std::nullopt` to use the server
      *         default.
      */
-    std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+    [[nodiscard]] std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
      * @brief Sets the maximum retained topic size.
@@ -1157,7 +1159,7 @@ class TopicCreateOptions final {
      * @return Configured segment size in bytes, or `std::nullopt` to use the
      *         server default.
      */
-    std::optional<std::uint64_t> SegmentSize() const noexcept { return segment_size_; }
+    [[nodiscard]] std::optional<std::uint64_t> SegmentSize() const noexcept { return segment_size_; }
 
     /**
      * @brief Sets the size at which each partition segment rotates.
@@ -1175,7 +1177,7 @@ class TopicCreateOptions final {
      * @brief Returns whether partition writes are synchronously flushed to disk.
      * @return Configured setting, or `std::nullopt` to use the server default.
      */
-    std::optional<bool> EnforceFsync() const noexcept { return enforce_fsync_; }
+    [[nodiscard]] std::optional<bool> EnforceFsync() const noexcept { return enforce_fsync_; }
 
     /**
      * @brief Sets whether partition writes are synchronously flushed to disk.
@@ -1191,7 +1193,9 @@ class TopicCreateOptions final {
      * @brief Returns the message-count threshold for flushing the journal.
      * @return Configured threshold, or `std::nullopt` to use the server default.
      */
-    std::optional<std::uint32_t> MessagesRequiredToSave() const noexcept { return messages_required_to_save_; }
+    [[nodiscard]] std::optional<std::uint32_t> MessagesRequiredToSave() const noexcept {
+        return messages_required_to_save_;
+    }
 
     /**
      * @brief Sets the message-count threshold for flushing the journal.
@@ -1211,7 +1215,7 @@ class TopicCreateOptions final {
      * @return Configured threshold in bytes, or `std::nullopt` to use the
      *         server default.
      */
-    std::optional<std::uint64_t> SizeOfMessagesRequiredToSave() const noexcept {
+    [[nodiscard]] std::optional<std::uint64_t> SizeOfMessagesRequiredToSave() const noexcept {
         return size_of_messages_required_to_save_;
     }
 
@@ -1234,7 +1238,7 @@ class TopicCreateOptions final {
      * @brief Returns whether partition segments are preallocated on disk.
      * @return Configured setting, or `std::nullopt` to use the server default.
      */
-    std::optional<bool> PreallocateSegments() const noexcept { return preallocate_segments_; }
+    [[nodiscard]] std::optional<bool> PreallocateSegments() const noexcept { return preallocate_segments_; }
 
     /**
      * @brief Sets whether partition segments are preallocated on disk.
@@ -1256,7 +1260,7 @@ class TopicCreateOptions final {
      * @note A dedicated setter takes precedence when it configures the same
      *       setting.
      */
-    const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+    [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
     /**
      * @brief Adds or replaces additional topic settings.
@@ -1320,7 +1324,9 @@ class TopicUpdateOptions final {
      * @return Compression algorithm to apply, or `std::nullopt` when this
      *         update leaves compression unchanged.
      */
-    std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+    [[nodiscard]] std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept {
+        return compression_algorithm_;
+    }
 
     /**
      * @brief Sets the storage compression algorithm.
@@ -1337,7 +1343,7 @@ class TopicUpdateOptions final {
      * @return Expiry policy to apply, or `std::nullopt` when this update leaves
      *         retention unchanged.
      */
-    std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+    [[nodiscard]] std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
      * @brief Sets the message retention policy.
@@ -1359,7 +1365,7 @@ class TopicUpdateOptions final {
      * @return Size limit to apply, or `std::nullopt` when this update leaves
      *         the limit unchanged.
      */
-    std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+    [[nodiscard]] std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
      * @brief Sets the maximum retained topic size.
@@ -1384,7 +1390,7 @@ class TopicUpdateOptions final {
      * @note A dedicated setter takes precedence when it configures the same
      *       setting.
      */
-    const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+    [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
     /**
      * @brief Adds or replaces additional mutable topic settings.
@@ -1438,7 +1444,7 @@ class StreamUpdateOptions final {
      * @return Ordered map of setting names and values.
      * @note The server currently rejects all stream settings.
      */
-    const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+    [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
     /**
      * @brief Adds or replaces requested stream settings.
@@ -1510,13 +1516,13 @@ class PollingStrategy final {
      * @brief Returns the polling strategy kind.
      * @return One of offset, timestamp, first, last, or next.
      */
-    std::string_view Kind() const { return polling_strategy_kind_; }
+    [[nodiscard]] std::string_view Kind() const { return polling_strategy_kind_; }
 
     /**
      * @brief Returns the value associated with the polling strategy.
      * @return Offset or timestamp for parameterized strategies; otherwise zero.
      */
-    std::uint64_t Value() const { return polling_strategy_value_; }
+    [[nodiscard]] std::uint64_t Value() const { return polling_strategy_value_; }
 
   private:
     explicit PollingStrategy(std::string kind, std::uint64_t value)
@@ -2132,7 +2138,7 @@ class IggyBlockingClient final {
         }
     }
 
-    ffi::Client *Handle() const;
+    [[nodiscard]] ffi::Client *Handle() const;
     void Reset() noexcept;
 
     ffi::Client *client_;
