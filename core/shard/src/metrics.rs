@@ -476,6 +476,25 @@ impl ShardMetrics {
             .sum()
     }
 
+    /// One `reason` summed over every variant, for the assertions that are about
+    /// the reason alone: `unroutable` and `misrouted` must stay at zero however
+    /// the drop was classified, while `full` and `disconnected` are what a
+    /// crashed inbox produces and cannot be asserted on. Listing variants at the
+    /// call site would let a new drop site under an unlisted one escape.
+    /// Unknown reasons read as zero, as in [`Self::frame_drop_count`].
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn frame_drop_count_for_reason(&self, reason: &'static str) -> u64 {
+        let Some(reason_idx) = reason_index(reason) else {
+            return 0;
+        };
+        self.cached_counters
+            .iter()
+            .filter_map(|variant| variant[reason_idx].get())
+            .map(prometheus_client::metrics::counter::Counter::get)
+            .sum()
+    }
+
     /// Snapshot of `partitions_materialised_total`. Test-only accessor;
     /// production scrape goes through the prometheus registry.
     #[cfg(test)]
@@ -754,6 +773,30 @@ mod tests {
             ),
             1,
             "a distinct reason gets its own counter",
+        );
+    }
+
+    #[test]
+    fn frame_drop_count_for_reason_sums_one_reason_across_variants() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE);
+        metrics.record_frame_drop(frame_drop_variant::PARTITION, frame_drop_reason::UNROUTABLE);
+        metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
+
+        assert_eq!(
+            metrics.frame_drop_count_for_reason(frame_drop_reason::UNROUTABLE),
+            2,
+            "one reason sums across every variant that recorded it",
+        );
+        assert_eq!(
+            metrics.frame_drop_count_for_reason(frame_drop_reason::MISROUTED),
+            0,
+            "an unproduced reason reads as zero, not as the total",
+        );
+        assert_eq!(
+            metrics.frame_drops_value(),
+            3,
+            "the per-reason view must not disturb the total",
         );
     }
 

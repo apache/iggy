@@ -3032,7 +3032,7 @@ where
     /// [`Self::on_message`] carrying the park provenance of a frame the pump is
     /// re-delivering, so a second park keeps the stamp and age the first one
     /// derived instead of deriving them again against newer committed state.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn dispatch_message(&self, message: MessageBag, provenance: Option<ParkProvenance>)
     where
         B: MessageBus + 'static,
@@ -3049,6 +3049,12 @@ where
                     let header = request.header();
                     (header.operation, header.group)
                 };
+                // Ahead of the park and the incarnation fence, which both read
+                // the frame as a partition request.
+                if !routing.0.is_plane_routable() {
+                    self.deny_unroutable_request(request.header()).await;
+                    return;
+                }
                 match self
                     .park_if_unmaterialised(request, routing.0, routing.1, provenance, &mut None)
                 {
@@ -3077,8 +3083,17 @@ where
             MessageBag::Prepare(prepare) => {
                 let routing = {
                     let header = prepare.header();
-                    (header.operation, header.group)
+                    (header.operation, header.group, header.op)
                 };
+                if !routing.0.is_plane_routable() {
+                    self.drop_unroutable_replicated(
+                        Command::Prepare,
+                        routing.0,
+                        routing.1,
+                        routing.2,
+                    );
+                    return;
+                }
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
@@ -3119,7 +3134,22 @@ where
                     ParkOutcome::Overflow(_) | ParkOutcome::Parked => {}
                 }
             }
-            MessageBag::PrepareOk(prepare_ok) => self.on_ack(prepare_ok).await,
+            MessageBag::PrepareOk(prepare_ok) => {
+                let routing = {
+                    let header = prepare_ok.header();
+                    (header.operation, header.group, header.op)
+                };
+                if !routing.0.is_plane_routable() {
+                    self.drop_unroutable_replicated(
+                        Command::PrepareOk,
+                        routing.0,
+                        routing.1,
+                        routing.2,
+                    );
+                    return;
+                }
+                self.on_ack(prepare_ok).await;
+            }
             MessageBag::StartViewChange(msg) => self.on_start_view_change(msg).await,
             MessageBag::DoViewChange(msg) => self.on_do_view_change(msg).await,
             MessageBag::StartView(msg) => self.on_start_view(msg).await,
@@ -3773,6 +3803,75 @@ where
             return;
         }
         self.metrics.record_partition_request_denied_transient();
+    }
+
+    /// Deny a request no consensus plane claims, and count the frame it drops.
+    /// `InvalidCommand` because no retry makes an operation routable. Counted as
+    /// a drop even though the client is answered: nothing was routed or
+    /// journaled, and `unroutable` is the counter a simulator run asserts on.
+    #[allow(clippy::future_not_send)]
+    async fn deny_unroutable_request(&self, request_header: &RoutedRequestHeader) {
+        self.metrics.record_frame_drop(
+            crate::metrics::frame_drop_variant::CONSENSUS,
+            crate::metrics::frame_drop_reason::UNROUTABLE,
+        );
+        tracing::error!(
+            shard = self.id,
+            client = request_header.client,
+            operation = ?request_header.operation,
+            namespace_raw = request_header.group,
+            "request operation is claimed by no consensus plane; denying it"
+        );
+        let reply = build_deny_reply_from_request_header(
+            request_header,
+            IggyError::InvalidCommand.as_code(),
+        );
+        if let Err(error) = self
+            .bus
+            .send_to_client(request_header.client, reply.into_generic().into_frozen())
+            .await
+        {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::CONSENSUS,
+                crate::metrics::frame_drop_reason::DELIVERY_FAILED,
+            );
+            tracing::warn!(
+                shard = self.id,
+                client = request_header.client,
+                operation = ?request_header.operation,
+                error = %error,
+                "failed to send deny for unroutable request"
+            );
+        }
+    }
+
+    /// Drop a replicated frame no consensus plane claims, and count it.
+    ///
+    /// No reply, unlike [`Self::deny_unroutable_request`]: a prepare or an ack
+    /// has no client waiting on this node. Terminal for the frame's group here,
+    /// as the unknown-discriminant drop in [`Self::dispatch`] is: nothing
+    /// journals or acks an operation no plane owns, so every later op in that
+    /// group waits behind the gap while quorum hides it. Nothing fences the
+    /// sending peer, so the counter and this log are the whole signal.
+    fn drop_unroutable_replicated(
+        &self,
+        command: Command,
+        operation: Operation,
+        namespace_raw: u64,
+        op: u64,
+    ) {
+        self.metrics.record_frame_drop(
+            crate::metrics::frame_drop_variant::CONSENSUS,
+            crate::metrics::frame_drop_reason::UNROUTABLE,
+        );
+        tracing::error!(
+            shard = self.id,
+            command = ?command,
+            operation = ?operation,
+            namespace_raw,
+            op,
+            "replicated frame operation is claimed by no consensus plane; dropping it"
+        );
     }
 
     /// [`Self::deny_partition_request_transient`] for synchronous callers:

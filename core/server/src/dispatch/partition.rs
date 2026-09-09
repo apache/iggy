@@ -1393,7 +1393,6 @@ mod tests {
     use crate::dispatch::test_support::{
         SpyBus, TestMux, TestShard, prepare_message, request_message, test_shard,
     };
-    use iggy_binary_protocol::ReplyHeader;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
@@ -1401,6 +1400,7 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
+    use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader};
     use iggy_binary_protocol::{WireName, WireOptions, WirePartitioning};
     use iggy_common::Identifier;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
@@ -1409,7 +1409,7 @@ mod tests {
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
     use server_common::sharding::ShardId;
-    use shard::metrics::ShardMetrics;
+    use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
     use shard::shards_table::PapayaShardsTable;
     use shard::{
         LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology, ShardFrame,
@@ -1887,6 +1887,122 @@ mod tests {
             "a tombstoned-namespace send must surface the retriable transient \
              status so the SDK replays it after the partition rematerialises"
         );
+    }
+
+    /// A request no plane claims must be denied at the shard boundary, not left
+    /// to the chain terminator and the client's read-timeout. `DeleteSegments`
+    /// is the live example: dispatch resolves it to `TruncatePartition`, so it
+    /// satisfies neither plane predicate. The deny is permanent -- a transient
+    /// code is what the SDK replays.
+    #[compio::test]
+    async fn unroutable_operation_must_reply_denied_not_silence() {
+        const TRANSPORT: u128 = 91;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                consumer_offset_enforce_fsync: false,
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let shard = Rc::new(TestShard::without_inbox(
+            ShardIdentity::new(0, "unroutable-operation-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+        ));
+
+        let request = request_message(Operation::DeleteSegments, TRANSPORT, SESSION, 1, &[]);
+        shard.on_message(MessageBag::Request(request)).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            1,
+            "a request no plane claims must be answered, not absorbed in silence"
+        );
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT, "reply must target the request's client");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::InvalidCommand.as_code(),
+            "the deny must be permanent; a transient status has the SDK replay it"
+        );
+    }
+
+    /// The replicated halves of the same hole. A prepare or an ack whose
+    /// operation no plane claims reaches the same terminator, and there is no
+    /// client to answer, so the counter and the log are the only record. Dropping
+    /// it is the only option: nothing journals or acks an operation no plane
+    /// owns.
+    #[compio::test]
+    async fn unroutable_replicated_frames_must_be_dropped_and_counted() {
+        const TRANSPORT: u128 = 91;
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let unroutable_drops = || {
+            shard
+                .metrics()
+                .frame_drop_count(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE)
+        };
+
+        let prepare = prepare_message(Operation::DeleteSegments, TRANSPORT, 1, &[]);
+        shard.on_message(MessageBag::Prepare(prepare)).await;
+        assert_eq!(
+            unroutable_drops(),
+            1,
+            "a prepare no plane claims must be counted, not absorbed by the chain"
+        );
+
+        shard
+            .on_message(MessageBag::PrepareOk(prepare_ok_message(
+                Operation::DeleteSegments,
+                1,
+            )))
+            .await;
+        assert_eq!(
+            unroutable_drops(),
+            2,
+            "an ack no plane claims must be counted, not absorbed by the chain"
+        );
+
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "replicated frames answer nobody on this node"
+        );
+    }
+
+    /// Bare `PrepareOk` for the routing guard: only `operation`, `group` and `op`
+    /// are read before the plane chain, so the rest stays zeroed.
+    fn prepare_ok_message(operation: Operation, op: u64) -> Message<PrepareOkHeader> {
+        let header_size = size_of::<PrepareOkHeader>();
+        let mut msg = Message::<PrepareOkHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<PrepareOkHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes form a valid PrepareOkHeader");
+        header.command = Command::PrepareOk;
+        header.size = u32::try_from(header_size).expect("ack size fits u32");
+        header.operation = operation;
+        header.op = op;
+        header.group = server_common::sharding::METADATA_GROUP;
+        msg
     }
 
     /// A send parked for a namespace that is torn down before materialising
