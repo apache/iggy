@@ -1437,6 +1437,41 @@ mod tests {
         (header, body)
     }
 
+    /// A DVC carrying `op` and `commit` only. Abstention: counts toward the
+    /// view-change quorum, says nothing about any op.
+    fn dvc_numbers_only(
+        replica: u8,
+        view: u32,
+        log_view: u32,
+        op: u64,
+        commit: u64,
+    ) -> (iggy_binary_protocol::DoViewChangeHeader, Body) {
+        use iggy_binary_protocol::DoViewChangeHeader;
+
+        let headers: Vec<PrepareHeader> = Vec::new();
+        let body = encode_body(&headers);
+        let header = DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: u32::try_from(std::mem::size_of::<DoViewChangeHeader>() + body.len())
+                .expect("synthetic DVC frame fits u32"),
+            view,
+            release: 0,
+            command: Command::DoViewChange,
+            replica,
+            reserved_frame: [0; 66],
+            op,
+            commit,
+            group: 0,
+            log_view,
+            reserved: [0; 68],
+            nack_bitset: 0,
+            present_bitset: 0,
+        };
+        (header, body)
+    }
+
     /// Headers for `low..=high`, high-to-low as a suffix requires, sealed and
     /// chained the way a real producer writes them.
     ///
@@ -1500,6 +1535,38 @@ mod tests {
         consensus.set_local_dvc_suffix(crate::dvc_merge::suffix_all_present(headers));
     }
 
+    /// The replica that prepared the head is gone for good, one survivor holds its
+    /// header without the body and the other never had it. Both survivors are
+    /// outside the ack set, so the op is truncated and the view starts. Counting the
+    /// header-only sender as neither copy nor nack instead waits for the crashed
+    /// replica forever.
+    #[test]
+    fn given_a_crashed_body_holder_when_merging_should_truncate_and_start_the_view() {
+        // View 3 of 3 replicas elects this one.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        // Bit 0 is op 4: its header, never journaled.
+        let local = suffix_headers(2, 4, 0);
+        consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(local, 0, 0b110));
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
+
+        // Replica 1 stops at op 3. Replica 2 held the only body and never reports.
+        let (dvc, body) = dvc_with_suffix(1, 3, 0, 3, 2, None);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        let pending = consensus
+            .pending_view_log()
+            .expect("two senders outside op 4's ack set decide it without replica 2");
+        assert_eq!(
+            pending.op_head, 3,
+            "op 4 never committed, so it is truncated"
+        );
+        assert_eq!(pending.commit_max, 2);
+    }
+
     #[test]
     fn given_an_undecidable_quorum_when_a_later_dvc_decides_it_should_start_the_view() {
         // Reaching a view-change quorum is not the same as deciding a log. Latching
@@ -1519,10 +1586,9 @@ mod tests {
 
         let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 5));
 
-        // Two peers report, reaching the quorum of 3. All three hold op 4's header,
-        // none can serve its body, and two replicas have yet to report.
+        // Two peers abstain, reaching the quorum of 3 and leaving op 4 one nack short.
         for replica in [1u8, 2] {
-            let (dvc, body) = dvc_with_suffix(replica, 5, 0, 4, 2, Some(4));
+            let (dvc, body) = dvc_numbers_only(replica, 5, 0, 4, 2);
             let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
             assert!(actions.is_empty());
         }

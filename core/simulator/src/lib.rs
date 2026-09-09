@@ -4535,6 +4535,84 @@ mod tests {
     /// finds two replicas at the same op passes in silence, so `ops_compared` counts
     /// only ops witnessed on more than one replica, the subset that exercised the
     /// property.
+    /// A replica prepares an op and stays down. One survivor holds its header
+    /// without the body, the other never had it, and the merge must read that as
+    /// proof both are outside the ack set. Otherwise it waits for the crashed
+    /// replica: on this seed the cluster reached view 103 against `log_view` 3 with
+    /// both survivors caught up and one request retried 266 times unanswered.
+    ///
+    /// Asserts the drain, so it fails as the fuzzer does with the outstanding-request
+    /// report attached.
+    #[test]
+    fn view_change_completes_without_the_replica_that_prepared_the_head() {
+        use crate::workload::{
+            self, FaultInjector, Workload,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        // `workload-fuzz --seed 211 --replicas 3 --ticks 4000 --plane metadata
+        // --journal-slots 80 --crash-prob 0.02 --restart-prob 0.08 --crash-primary`.
+        let seed = 211u64;
+        let root = tempfile::tempdir().expect("temp dir for the simulator's snapshots");
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        // A bounded journal is what drives the WAL drain behind the header-only sender.
+        let mut sim = Simulator::with_checkpoints(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+            false,
+            root.path(),
+        );
+        sim.set_metadata_journal_slots(80);
+
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
+        options.client_count = 1;
+        options.crash_per_tick_ratio = 0.02;
+        options.restart_per_tick_ratio = 0.08;
+        options.spare_primary = false;
+        options.weights = ActionWeights::metadata_only();
+        let mut workload = Workload::new(options);
+
+        let clients = [client];
+        let mut injector = FaultInjector::new(seed, replica_count);
+        let _ = workload::run_with_faults(
+            &mut sim,
+            &mut workload,
+            &clients,
+            4_000,
+            u64::MAX,
+            &mut injector,
+        );
+
+        assert!(
+            injector.crashes() > 0,
+            "no replica crashed, so no view change ran and this proves nothing"
+        );
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &workload),
+        );
+    }
+
     #[test]
     fn committed_metadata_agrees_across_replicas() {
         use crate::workload::{
