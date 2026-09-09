@@ -104,7 +104,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.86.7
+        uses: taiki-e/install-action@v2.87.3
         with:
           tool: cargo-llvm-cov
 
@@ -299,7 +299,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.86.7
+        uses: taiki-e/install-action@v2.87.3
         with:
           tool: cargo-llvm-cov
 
