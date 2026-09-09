@@ -245,8 +245,21 @@ impl IggyBridge {
             .create_topic(stream_id, topic_name, &options)
             .await
         {
-            Ok(_) => {
+            Ok(created) => {
                 info!("created Iggy topic '{topic_name}' with {partition_count} partitions");
+                // Cheap: TopicDetails is already in hand, no extra round trip. `partitions_count`
+                // is a hard argument to create_topic (Some(partition_count), never None), so the
+                // server has no "resolve at admission" substitution to fall back on here - but
+                // checking anyway, the same way the other two branches check their own
+                // postcondition, means a future server-side clamp/cap fails loudly here instead
+                // of this method silently reporting success under a broken contract.
+                if created.partitions_count != partition_count {
+                    return Err(BridgeError::PartitionCountMismatch {
+                        topic: kafka_topic.to_string(),
+                        existing: created.partitions_count,
+                        requested: partition_count,
+                    });
+                }
                 Ok(())
             }
             Err(IggyError::TopicNameAlreadyExists(_, _)) => {
@@ -325,18 +338,26 @@ impl IggyBridge {
                 ))
             })?;
 
-        let partition_details = details
+        // `TryFrom<GetTopicResponse> for TopicDetails` (wire_conversions.rs) sorts `partitions` by
+        // `id` on every decode, so a binary search is correct here, not just faster than the
+        // linear scan it replaces - for a 1000-partition topic, the difference is O(log n) vs
+        // O(n) probes on every high_watermark call.
+        let partition_details = match details
             .partitions
-            .iter()
-            .find(|p| p.id == partition)
-            .ok_or_else(|| BridgeError::PartitionOutOfRange {
-                // The Kafka-side name a caller (a future ListOffsets handler) actually asked
-                // about, not `topic_name` - a mapping override would otherwise quote the wrong
-                // (Iggy-side) name back at a Kafka client that never heard of it.
-                topic: kafka_topic.to_string(),
-                partition,
-                partitions_count: details.partitions_count,
-            })?;
+            .binary_search_by_key(&partition, |p| p.id)
+        {
+            Ok(index) => &details.partitions[index],
+            Err(_) => {
+                return Err(BridgeError::PartitionOutOfRange {
+                    // The Kafka-side name a caller (a future ListOffsets handler) actually asked
+                    // about, not `topic_name` - a mapping override would otherwise quote the
+                    // wrong (Iggy-side) name back at a Kafka client that never heard of it.
+                    topic: kafka_topic.to_string(),
+                    partition,
+                    partitions_count: details.partitions_count,
+                });
+            }
+        };
 
         Ok(
             if partition_details.messages_count == 0 && partition_details.current_offset == 0 {

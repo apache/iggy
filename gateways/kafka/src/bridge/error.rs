@@ -19,7 +19,7 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
     ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
@@ -32,6 +32,16 @@ pub enum BridgeError {
     InvalidConfig(String),
     /// The Iggy client could not connect or authenticate, or a call failed after connecting.
     /// Wraps the SDK's own error rather than re-deriving a parallel taxonomy.
+    ///
+    /// Caution logging or otherwise trusting this variant's `Display`: a server-side rejection
+    /// crosses the wire as a bare numeric code (`ReplyHeader.status` / a committed metadata
+    /// result), and the SDK reconstructs the full `IggyError` from just that code via
+    /// `IggyError::from_code` (`vsr.rs`). Any data-carrying variant's fields get
+    /// `Default::default()` in that path, not the real value - `Identifier::default()` is numeric
+    /// `0`, itself a valid id, so e.g. a reconstructed `StreamIdNotFound` can print "ID: 0" whether
+    /// or not stream 0 is the one that actually failed. Locally-constructed variants (this
+    /// module's own `ok_or_else` calls, for instance) carry real data; only ones that came back
+    /// from an actual server rejection are affected.
     #[error("Iggy client error: {0}")]
     Iggy(#[from] IggyError),
     /// `high_watermark` was asked about a partition index the topic doesn't have.
@@ -71,7 +81,7 @@ impl BridgeError {
         match self {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-            Self::PartitionCountMismatch { .. } => ERROR_INVALID_PARTITIONS,
+            Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,
             // Not a wire-response case in practice: an invalid bridge config is caught at
             // `IggyBridge::connect` before any handler exists to answer a Kafka request, so this
             // is reachable only if a future caller starts constructing configs at request time.
@@ -234,12 +244,14 @@ mod tests {
     }
 
     #[test]
-    fn partition_count_mismatch_maps_to_invalid_partitions() {
+    fn partition_count_mismatch_maps_to_topic_already_exists_not_invalid_partitions() {
+        // INVALID_PARTITIONS (37) means "count is below 1" (kafka-protocol's own error table) -
+        // a different condition than "this topic already exists with a different count".
         let err = BridgeError::PartitionCountMismatch {
             topic: "t".to_string(),
             existing: 3,
             requested: 5,
         };
-        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PARTITIONS);
+        assert_eq!(err.to_kafka_error_code(), ERROR_TOPIC_ALREADY_EXISTS);
     }
 }

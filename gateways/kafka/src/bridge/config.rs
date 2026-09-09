@@ -21,7 +21,7 @@ use secrecy::SecretString;
 use tracing::warn;
 
 use crate::bridge::error::BridgeError;
-use crate::bridge::topic_map::TopicMapping;
+use crate::bridge::topic_map::{TopicMapping, validate_identifier_name};
 
 const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
 /// Matches `DEFAULT_ROOT_USERNAME` (`core/server/src/boot/credentials.rs`) - the root user's
@@ -92,18 +92,15 @@ impl IggyBridgeConfig {
             )
         })?;
         let stream_env = std::env::var("IGGY_KAFKA_IGGY_STREAM").ok();
-        // Caught here, not left to TopicMapping::from_toml_str's own empty check: that
-        // validation only runs when IGGY_KAFKA_TOPIC_MAP_PATH is set, since the no-file branch
-        // below builds a TopicMapping directly rather than through the validating constructor.
-        // An explicitly-empty (not merely absent) IGGY_KAFKA_IGGY_STREAM would otherwise pass
+        // Caught here, not left to TopicMapping::from_toml_str's own validation: that only runs
+        // when IGGY_KAFKA_TOPIC_MAP_PATH is set, since the no-file branch below builds a
+        // TopicMapping directly rather than through the validating constructor. An invalid
+        // (empty, whitespace-padded, or oversized) IGGY_KAFKA_IGGY_STREAM would otherwise pass
         // from_env cleanly and only fail much later, deep in the first ensure_stream_and_topic
-        // call, as an opaque Identifier::named("") error.
-        if let Some(ref stream) = stream_env
-            && stream.trim().is_empty()
-        {
-            return Err(BridgeError::InvalidConfig(
-                "IGGY_KAFKA_IGGY_STREAM must not be empty".to_string(),
-            ));
+        // call, as an opaque Identifier::named error - or, for whitespace, not fail at all and
+        // silently create a stream named e.g. " kafka ".
+        if let Some(ref stream) = stream_env {
+            validate_identifier_name("IGGY_KAFKA_IGGY_STREAM", stream)?;
         }
         let topic_map_path = std::env::var("IGGY_KAFKA_TOPIC_MAP_PATH").ok();
 
@@ -162,6 +159,34 @@ mod tests {
             !debug_output.contains("correct-horse-battery-staple"),
             "Debug output must not expose the plaintext password: {debug_output}"
         );
+    }
+
+    /// Regression test for coverage: every other `from_env` test sets `IGGY_KAFKA_IGGY_ADDR`/
+    /// `_USERNAME`/`_STREAM` explicitly (or goes through the topic-map-file branch), so the four
+    /// documented defaults - address, username, no-file branch, and `default_stream` - never
+    /// actually ran.
+    #[test]
+    #[serial]
+    fn from_env_uses_documented_defaults_when_only_password_is_set() {
+        // Safety: single-threaded within this function; no other test in this crate touches
+        // these four vars.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+            std::env::remove_var("IGGY_KAFKA_IGGY_ADDR");
+            std::env::remove_var("IGGY_KAFKA_IGGY_USERNAME");
+            std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
+            std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
+        }
+        let result = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+        }
+
+        let config = result.expect("valid config from documented defaults alone");
+        assert_eq!(config.address, "127.0.0.1:8090");
+        assert_eq!(config.username, "iggy");
+        assert_eq!(config.topic_mapping.default_stream, "kafka");
+        assert!(config.topic_mapping.topics.is_empty());
     }
 
     #[test]
@@ -237,5 +262,25 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
         }
         assert!(matches!(result, Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_rejects_stream_env_var_with_whitespace_instead_of_trimming_it() {
+        // Safety: single-threaded within this function; no other test in this crate touches
+        // these two vars.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+            std::env::set_var("IGGY_KAFKA_IGGY_STREAM", " kafka ");
+        }
+        let result = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
+        }
+        assert!(
+            matches!(result, Err(BridgeError::InvalidConfig(_))),
+            "must reject, not silently trim, and store a stream named ' kafka '"
+        );
     }
 }

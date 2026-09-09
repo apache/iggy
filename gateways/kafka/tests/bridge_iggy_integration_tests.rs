@@ -34,7 +34,9 @@ use iggy::prelude::{
 use secrecy::SecretString;
 use serial_test::serial;
 
-use iggy_gateway_kafka::bridge::{BridgeError, IggyBridge, IggyBridgeConfig, TopicMapping};
+use iggy_gateway_kafka::bridge::{
+    BridgeError, IggyBridge, IggyBridgeConfig, TopicMapping, TopicOverride,
+};
 
 /// First port of the local reservation band. `u16` has no room above the highest ephemeral
 /// ceiling in use (macOS: 49152-65535), so "clear of ephemeral" only leaves room below the
@@ -301,6 +303,125 @@ async fn ensure_stream_and_topic_is_idempotent_on_repeated_calls() {
         .ensure_stream_and_topic("orders", 3)
         .await
         .expect("third call is still a no-op");
+
+    // Read back real state, not just three Oks: proves the second and third calls were actually
+    // no-ops against the one topic the first call created, not e.g. three independent topics
+    // that all happen to satisfy Ok(()) individually.
+    let raw = raw_client(&server).await;
+    let topics = raw
+        .get_topics(&Identifier::named("kafka").expect("valid stream name"))
+        .await
+        .expect("get_topics call");
+    assert_eq!(topics.len(), 1, "must be exactly one topic, not three");
+    assert_eq!(topics[0].name, "orders");
+    assert_eq!(topics[0].partitions_count, 3);
+}
+
+/// Regression test for coverage: nothing previously exercised `PartitionCountMismatch` on a real
+/// server - only unit tests constructed the variant directly.
+#[tokio::test]
+#[serial]
+async fn ensure_stream_and_topic_rejects_a_second_call_with_a_different_partition_count() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 3)
+        .await
+        .expect("first call creates the topic with 3 partitions");
+
+    let err = bridge
+        .ensure_stream_and_topic("orders", 5)
+        .await
+        .expect_err(
+            "a different partition count against an existing topic must not silently succeed",
+        );
+    match err {
+        BridgeError::PartitionCountMismatch {
+            topic,
+            existing,
+            requested,
+        } => {
+            assert_eq!(topic, "orders", "must report the Kafka-side name");
+            assert_eq!(existing, 3);
+            assert_eq!(requested, 5);
+        }
+        other => panic!("expected PartitionCountMismatch, got {other:?}"),
+    }
+}
+
+/// Regression test for coverage: every other test uses an empty `TopicMapping` (`HashMap::new()`),
+/// so the Kafka-name-vs-Iggy-name distinction `ensure_topic`/`high_watermark` deliberately
+/// maintain in their error paths (`kafka_topic`, not the resolved `topic_name`) can never actually
+/// differ and so can never be caught wrong. This test maps a Kafka topic to a differently-named
+/// Iggy stream/topic and checks both the happy path and the error paths report the Kafka-side
+/// name a real caller (a future handler) would recognize.
+#[tokio::test]
+#[serial]
+async fn bridge_operations_report_the_kafka_side_name_through_a_real_topic_mapping_override() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    config.topic_mapping.topics.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: "billing".to_string(),
+            topic: "orders_v2".to_string(),
+        },
+    );
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("must create the mapped Iggy stream/topic, not one named after the Kafka topic");
+
+    // The Iggy-side resources are named differently from the Kafka topic - confirms the mapping
+    // actually took effect, not that resolve() was a no-op that happened to pass either way.
+    let raw = raw_client(&server).await;
+    let billing_topics = raw
+        .get_topics(&Identifier::named("billing").expect("valid stream name"))
+        .await
+        .expect("get_topics call");
+    assert_eq!(billing_topics.len(), 1);
+    assert_eq!(billing_topics[0].name, "orders_v2");
+
+    let watermark = bridge
+        .high_watermark("orders", 0)
+        .await
+        .expect("must resolve through the mapping, not fail looking for a stream named 'orders'");
+    assert_eq!(watermark, 0);
+
+    let out_of_range = bridge
+        .high_watermark("orders", 5)
+        .await
+        .expect_err("partition 5 does not exist on a 1-partition topic");
+    assert!(
+        matches!(
+            &out_of_range,
+            BridgeError::PartitionOutOfRange { topic, .. } if topic == "orders"
+        ),
+        "error must quote the Kafka topic name 'orders', not the Iggy name 'orders_v2': \
+         {out_of_range:?}"
+    );
+
+    let mismatch = bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect_err("different partition count against the mapped topic must not silently succeed");
+    assert!(
+        matches!(
+            &mismatch,
+            BridgeError::PartitionCountMismatch { topic, .. } if topic == "orders"
+        ),
+        "error must quote the Kafka topic name 'orders', not the Iggy name 'orders_v2': \
+         {mismatch:?}"
+    );
 }
 
 #[tokio::test]

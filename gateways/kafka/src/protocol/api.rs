@@ -64,6 +64,13 @@ pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 /// misstate the failure point. Not sent by any stub response today.
 pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
+/// `bridge`'s mapping for `BridgeError::PartitionCountMismatch`: the topic exists, just not with
+/// the requested partition count.
+///
+/// Not [`ERROR_INVALID_PARTITIONS`] - `kafka-protocol`'s own error table (`error.rs`) defines that
+/// code's text as "Number of partitions is below 1", which is a different condition (a client
+/// asking for zero/negative partitions) than "this topic already exists with a different count".
+pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).

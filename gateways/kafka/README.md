@@ -123,7 +123,8 @@ two concurrent callers requesting different counts for the same topic must not b
 not found → `UNKNOWN_TOPIC_OR_PARTITION` (3), auth/credential failures →
 `TOPIC_AUTHORIZATION_FAILED` (29), connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6, the
 same retriable code the foundation's own stubs send, so a client backs off and retries),
-`PartitionCountMismatch` → `INVALID_PARTITIONS` (37), anything else → `UNKNOWN_SERVER_ERROR` (-1).
+`PartitionCountMismatch` → `TOPIC_ALREADY_EXISTS` (36, not `INVALID_PARTITIONS` - that code's own
+text is "below 1", a different condition), anything else → `UNKNOWN_SERVER_ERROR` (-1).
 
 ## Wire fixture tool
 

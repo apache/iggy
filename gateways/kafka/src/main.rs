@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
+use tracing::warn;
 
 use iggy_gateway_kafka::bridge::IggyBridgeConfig;
 use iggy_gateway_kafka::server::{bind_listener, init_tracing};
@@ -99,11 +100,34 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     Ok(())
 }
 
+/// Warns if any bridge-specific env var is set, since `main` doesn't read `IggyBridgeConfig` or
+/// call `IggyBridge::connect` yet (`#3535`/`#3536`).
+///
+/// `reject_unknown_kafka_env_vars`'s own accepted-but-unread carve-out for these vars exists so a
+/// user exporting them ahead of that wiring landing isn't told the name is unrecognized - but that
+/// silence is exactly what the guard's own doc comment warns an unread var would otherwise cause.
+/// This closes that gap: still accepted, no longer silent.
+fn warn_on_unused_bridge_env_vars() {
+    let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|var| std::env::var(var).is_ok())
+        .collect();
+    if !set.is_empty() {
+        warn!(
+            "{} set but not yet used: the Kafka <-> Iggy bridge isn't wired into the running \
+             gateway until #3535/#3536 land",
+            set.join(", ")
+        );
+    }
+}
+
 /// Build [`GatewayConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
 /// break the listener (a zero connection cap serves nothing, a zero timeout drops every
 /// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
 fn load_config() -> Result<GatewayConfig, String> {
     reject_unknown_kafka_env_vars()?;
+    warn_on_unused_bridge_env_vars();
     let mut config = GatewayConfig::default();
 
     if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {
