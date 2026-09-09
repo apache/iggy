@@ -45,6 +45,7 @@ const DEFAULT_POLL_INTERVAL: &str = "2s";
 const DEFAULT_RETRY_INTERVAL: &str = "1s";
 const DEFAULT_MAX_RETRY_INTERVAL: &str = "60s";
 const DEFAULT_BATCH_SIZE: u32 = 100;
+const MAX_BATCH_SIZE: u32 = 10_000;
 const AUTO_CREATED_PARTITIONS_COUNT: u32 = 1;
 
 /// Configuration for the Iggy source connector, replicating a topic from an
@@ -290,6 +291,8 @@ impl IggySource {
 #[async_trait]
 impl Source for IggySource {
     async fn open(&mut self) -> Result<(), Error> {
+        validate_batch_size(self.batch_size)?;
+
         let redacted = redact_connection_string(self.config.connection_string.expose_secret());
         info!(
             "Opening {CONNECTOR_NAME} connector ID: {}, upstream: {}/{} at {}",
@@ -391,7 +394,7 @@ impl Source for IggySource {
 
         let mut candidate_state = self.state.lock().await.clone();
 
-        let mut messages = Vec::with_capacity(self.partitions.len() * self.batch_size as usize);
+        let mut messages = Vec::with_capacity(self.batch_size as usize);
         let mut cycle_counts = PollCycleCounts::default();
 
         for &partition_id in &self.partitions {
@@ -542,6 +545,15 @@ impl Source for IggySource {
         );
         Ok(())
     }
+}
+
+fn validate_batch_size(batch_size: u32) -> Result<(), Error> {
+    if !(1..=MAX_BATCH_SIZE).contains(&batch_size) {
+        return Err(Error::InvalidConfigValue(format!(
+            "batch_size must be between 1 and {MAX_BATCH_SIZE}, got {batch_size}"
+        )));
+    }
+    Ok(())
 }
 
 fn next_strategy(initial: InitialOffset, saved_offset: Option<u64>) -> PollingStrategy {
@@ -942,6 +954,33 @@ mod tests {
 
         let source = IggySource::new(1, config, None);
         assert_eq!(source.initial_offset, InitialOffset::Earliest);
+    }
+
+    #[test]
+    fn given_out_of_range_batch_size_when_opening_should_reject_config() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for batch_size in [0, MAX_BATCH_SIZE + 1, u32::MAX] {
+                let config = IggySourceConfig {
+                    batch_size: Some(batch_size),
+                    ..test_config()
+                };
+                let mut source = IggySource::new(1, config, None);
+
+                let error = source
+                    .open()
+                    .await
+                    .expect_err("out-of-range batch_size should be rejected");
+
+                assert!(matches!(error, Error::InvalidConfigValue(_)));
+            }
+        });
+    }
+
+    #[test]
+    fn batch_size_at_supported_boundaries_should_be_valid() {
+        assert!(validate_batch_size(1).is_ok());
+        assert!(validate_batch_size(MAX_BATCH_SIZE).is_ok());
     }
 
     #[test]

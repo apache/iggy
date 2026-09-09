@@ -60,7 +60,7 @@ messages are requested from each upstream partition in one poll cycle.
 | `upstream_stream` | yes | none | Name of the stream to replicate from. |
 | `upstream_topic` | yes | none | Name of the topic to replicate from. |
 | `poll_interval` | no | `2s` | Delay before each upstream poll cycle. |
-| `batch_size` | no | `100` | Maximum messages requested from each upstream partition per poll cycle. |
+| `batch_size` | no | `100` | Maximum messages requested from each upstream partition per poll cycle. Must be between `1` and `10,000`. |
 | `initial_offset` | no | `earliest` | Starting position for a partition without a saved offset. Accepts `earliest`, `latest`, or an absolute numeric offset. |
 | `include_user_headers` | no | `true` | Copy user headers to downstream messages. |
 | `malformed_message_policy` | no | `block` | Handling for messages with unparsable user headers: `block` retries from the failed offset; `drop_headers` forwards the payload without those headers. |
@@ -112,6 +112,7 @@ partition's saved position and applies `initial_offset` again.
 
 - The connector discovers upstream partitions when it opens. Restart it after
   adding partitions to the upstream topic.
+- A `batch_size` outside `1..=10,000` prevents the connector from starting.
 - If the upstream stream is missing, the connector creates it. If the topic is
   missing, it creates the topic with one partition and no compression.
 - Invalid `initial_offset` values produce a warning and fall back to
