@@ -49,6 +49,22 @@ class TopicDetails;
 class Stream;
 class StreamDetails;
 
+namespace detail {
+/** @brief Internal base for string-backed option types. */
+template <typename Tag>
+class StringTag {
+  protected:
+    explicit StringTag(std::string value) : value_(std::move(value)) {}
+    ~StringTag() = default;
+
+    std::string_view Value() const { return value_; }
+
+  private:
+    std::string value_;
+};
+
+}  // namespace detail
+
 /**
  * @brief Exception thrown when an Iggy client operation fails.
  */
@@ -61,10 +77,10 @@ class IggyException : public std::runtime_error {
 /**
  * @brief Details returned after a successful login.
  *
- * The value identifies the authenticated user. HTTP logins also return the
- * access token retained by the client for later requests. Stateful transports
- * do not return an access token. The token is a credential: callers must not
- * write it to logs or expose it to untrusted code.
+ * Contains the authenticated user's ID. For HTTP connections, it also includes
+ * the access token retained by the client for subsequent requests. Stateful
+ * transports do not provide an access token. Treat the token as a credential:
+ * do not write it to logs or expose it to untrusted code.
  */
 class LoginInfo final {
   public:
@@ -77,8 +93,6 @@ class LoginInfo final {
     /**
      * @brief Returns the HTTP access token when the login returned one.
      * @return Empty when the selected transport does not use an access token.
-     *         A returned string view remains valid while this LoginInfo object
-     *         is not modified or destroyed.
      */
     std::optional<std::string_view> AccessToken() const noexcept {
         if (!access_token_) {
@@ -112,9 +126,9 @@ class LoginInfo final {
 /**
  * @brief Identifier for a server resource.
  *
- * An identifier is either a numeric server ID or a name. The factories enforce
- * the protocol's non-empty, 255-byte name limit. Numeric zero is valid because
- * the server can assign zero as a resource ID.
+ * Create an identifier from a server-assigned numeric ID or a resource name.
+ * Resource names must contain between 1 and 255 bytes. A numeric ID of zero is
+ * valid.
  */
 class Identifier final {
   public:
@@ -149,8 +163,7 @@ class Identifier final {
     /**
      * @brief Returns the identifier payload.
      * @return Numeric ID for Kind::Numeric, or a view of the name for
-     *         Kind::String. The string view remains valid while this
-     *         Identifier object is not modified or destroyed.
+     *         Kind::String.
      */
     std::variant<std::uint32_t, std::string_view> Value() const noexcept {
         if (kind_ == Kind::Numeric) {
@@ -174,9 +187,8 @@ class Identifier final {
 /**
  * @brief Type tag for a HeaderField payload.
  *
- * The tag and bytes use Iggy's header codec. Numeric payloads are little
- * endian. Create TopicOption values instead of encoding catalog options by
- * hand; use HeaderField directly only for application-defined headers.
+ * Specifies how a HeaderField payload is encoded. Each field stores a type tag
+ * and its corresponding bytes. Numeric payloads use little-endian byte order.
  */
 enum class HeaderKind : std::uint8_t {
     Raw     = 1,
@@ -199,9 +211,9 @@ enum class HeaderKind : std::uint8_t {
 /**
  * @brief One typed header key or value.
  *
- * HeaderField maps directly to Rust's header-field representation. Create()
- * preserves the supplied bytes and does not verify that they match @p kind.
- * Invalid key or value encodings are rejected when a request is sent.
+ * Create() preserves the supplied bytes without validating that they match the
+ * specified type. Invalid key or value encodings are rejected when the client
+ * sends a request.
  */
 class HeaderField final {
   public:
@@ -242,9 +254,7 @@ class HeaderField final {
 /**
  * @brief One typed header key-value pair.
  *
- * This maps directly to Rust's HeaderEntry. Topic options cross the C++ bridge
- * as header entries because their keys and values use the same typed codec as
- * message user headers.
+ * Topic options and message user headers use the same typed key-value format.
  */
 class HeaderEntry final {
   public:
@@ -285,14 +295,14 @@ class HeaderEntry final {
 /**
  * @brief Creation options attached to a stream or topic.
  *
- * This maps to Rust's ResourceOptions. Explicit() contains entries supplied by
- * the creating client. Derived() contains values the server resolved from its
- * configuration at admission time. Derived values describe that resource's
- * history and may differ if the resource is recreated under another server
- * configuration.
+ * Explicit() contains values supplied when the resource was created. Derived()
+ * contains values resolved from the server configuration at that time. Derived
+ * values describe the resource's creation settings and can differ when the
+ * resource is recreated with a different server configuration.
  *
- * Only explicit entries are sent; derived entries returned by Options() are
- * not resubmitted. For topic creation prefer `TopicCreateOptions`.
+ * When submitting creation options, only explicit entries are sent. Derived
+ * values returned by Options() are informational and are not resubmitted. Use
+ * TopicCreateOptions to configure a new topic.
  */
 class ResourceOptions final {
   public:
@@ -352,15 +362,20 @@ class ResourceOptions final {
 };
 
 /**
- * @brief Topic summary returned within StreamDetails.
+ * @brief Snapshot of one topic's metadata and aggregate statistics.
  *
- * A Topic owns its string fields and contains no Rust bridge values. It
- * describes server state observed during the enclosing stream read, not a live
- * view. Its aggregate statistics and partition count can change immediately
- * after that request completes.
+ * GetStream() returns one of these values for each observed topic. It owns its
+ * name and option data.
  *
- * Options() distinguishes values selected by the creating client from values
- * the server derived during admission. Partition details require GetTopic().
+ * The value describes the topic state observed by the server for one request.
+ * It is not a live view. SizeBytes(), MessagesCount(), and PartitionsCount()
+ * can become stale immediately after the request completes when another client
+ * changes the topic.
+ *
+ * Use GetTopic() to retrieve partition summaries. Topic IDs identify a topic
+ * within its stream for its lifetime and remain stable when it is renamed.
+ * CreatedAt() is the server timestamp, in microseconds, recorded when the
+ * topic was created.
  */
 class Topic final {
   public:
@@ -466,8 +481,9 @@ class Topic final {
 /**
  * @brief Partition metadata returned within TopicDetails.
  *
- * This is an observed summary, not a live partition handle. Offsets and
- * statistics can change immediately after GetTopic() returns.
+ * Represents the state of a partition when its topic was retrieved. This is a
+ * snapshot, not a live view, so offsets and statistics can change after
+ * GetTopic() returns.
  */
 class Partition final {
   public:
@@ -534,10 +550,19 @@ class Partition final {
 };
 
 /**
- * @brief Topic metadata and partition summaries returned by topic detail calls.
+ * @brief Snapshot of one topic's metadata, aggregate statistics, and partitions.
  *
- * Partitions() contains one observed summary per partition. It does not expose
- * segment metadata, messages, consumer offsets, or consumer-group membership.
+ * GetTopic() returns this value. It owns its name, partition summaries, and
+ * option data.
+ *
+ * The value describes the topic state observed by the server for one request.
+ * It is not a live view. Its metadata and partition summaries can become stale
+ * immediately after the request completes when another client changes the
+ * topic.
+ *
+ * Topic IDs identify a topic within its stream for its lifetime and remain
+ * stable when it is renamed. CreatedAt() is the server timestamp, in
+ * microseconds, recorded when the topic was created.
  */
 class TopicDetails final {
   public:
@@ -596,8 +621,11 @@ class TopicDetails final {
     std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
 
     /**
-     * @brief Returns partition summaries.
-     * @return Summaries owned by this value.
+     * @brief Returns one summary for each partition in the topic.
+     *
+     * The summaries do not include segment metadata, messages, consumer
+     * offsets, or consumer-group membership.
+     * @return Partition summaries owned by this value.
      */
     const std::vector<Partition> &Partitions() const noexcept { return partitions_; }
 
@@ -648,29 +676,10 @@ class TopicDetails final {
     ResourceOptions options_;
 };
 
-namespace detail {
-/** @brief Internal base for string-backed option types. */
-template <typename Tag>
-class StringTag {
-  protected:
-    explicit StringTag(std::string value) : value_(std::move(value)) {}
-    ~StringTag() = default;
-
-    std::string_view Value() const { return value_; }
-
-  private:
-    std::string value_;
-};
-
-}  // namespace detail
-
 /**
  * @brief Snapshot of one stream's metadata and aggregate statistics.
  *
- * CreateStream() and GetStream() return this value after converting the Rust
- * bridge response to ordinary C++ fields. It owns its name and topic
- * collection, so no bridge-owned string or container leaks through the public
- * API.
+ * CreateStream() and GetStream() return this value.
  *
  * The value describes the stream state observed by the server for one request.
  * It is not a live view or an atomic snapshot of later stream, topic, or
@@ -694,6 +703,7 @@ class StreamDetails final {
      *
      * This value can be passed to GetStream() while the stream exists. It is
      * unchanged by a stream rename.
+     * @return Numeric stream ID.
      */
     std::uint32_t Id() const noexcept { return id_; }
 
@@ -774,11 +784,16 @@ class StreamDetails final {
 };
 
 /**
- * @brief Summary of a stream returned by GetStreams().
+ * @brief Snapshot of one stream's metadata and aggregate statistics.
  *
- * Unlike StreamDetails, this value does not include topic summaries. Its
- * aggregate statistics describe the state observed by the server for one
- * request and can become stale when another client modifies the stream.
+ * GetStreams() returns one of these values for each observed stream.
+ *
+ * The value describes the stream state observed by the server for one request.
+ * It is not a live view. SizeBytes(), MessagesCount(), and TopicsCount() can
+ * become stale immediately after the request completes when another client
+ * changes the stream.
+ *
+ * Use GetStream() to retrieve topic summaries for a stream.
  */
 class Stream final {
   public:
@@ -872,10 +887,10 @@ class CompressionAlgorithm final : private detail::StringTag<CompressionAlgorith
     static CompressionAlgorithm Gzip() { return CompressionAlgorithm("gzip"); }
 
     /**
-     * @brief Returns the value passed to the client implementation.
+     * @brief Returns the compression algorithm name.
      * @return Compression algorithm name.
      */
-    std::string_view CompressionAlgorithmValue() const { return Value(); }
+    std::string_view Value() const { return detail::StringTag<CompressionAlgorithm>::Value(); }
 
   private:
     explicit CompressionAlgorithm(std::string algorithm)
@@ -911,10 +926,10 @@ class SnapshotCompression final : private detail::StringTag<SnapshotCompression>
     static SnapshotCompression Xz() { return SnapshotCompression("xz"); }
 
     /**
-     * @brief Returns the value passed to the client implementation.
+     * @brief Returns the snapshot compression algorithm name.
      * @return Snapshot compression algorithm name.
      */
-    std::string_view SnapshotCompressionValue() const { return Value(); }
+    std::string_view Value() const { return detail::StringTag<SnapshotCompression>::Value(); }
 
   private:
     explicit SnapshotCompression(std::string snapshot_compression)
@@ -923,9 +938,6 @@ class SnapshotCompression final : private detail::StringTag<SnapshotCompression>
 
 /**
  * @brief Selects data to include in a system snapshot.
- *
- * @note Each selected value is passed across the Rust FFI as a string. The
- *       Rust client rejects unsupported values.
  */
 class SystemSnapshotType final : private detail::StringTag<SystemSnapshotType> {
   public:
@@ -967,10 +979,8 @@ class SystemSnapshotType final : private detail::StringTag<SystemSnapshotType> {
  * A topic may use the server default, have no size limit, or use an explicit
  * byte limit.
  *
- * @note The value is passed across the Rust FFI as a string. The Rust parser
- *       accepts server_default, unlimited, and decimal byte counts. Zero maps
- *       to server_default, and std::numeric_limits<std::uint64_t>::max() maps
- *       to unlimited. The Rust client rejects unsupported values.
+ * Use ServerDefault(), Unlimited(), or FromBytes() to select the retention
+ * limit.
  */
 class MaxTopicSize final : private detail::StringTag<MaxTopicSize> {
   public:
@@ -1001,7 +1011,7 @@ class MaxTopicSize final : private detail::StringTag<MaxTopicSize> {
      * @brief Returns the value passed to the client implementation.
      * @return Topic size option or decimal byte count.
      */
-    std::string_view MaxTopicSizeValue() const { return Value(); }
+    std::string_view Value() const { return detail::StringTag<MaxTopicSize>::Value(); }
 
   private:
     explicit MaxTopicSize(std::string max_topic_size) : detail::StringTag<MaxTopicSize>(std::move(max_topic_size)) {}
@@ -1010,8 +1020,8 @@ class MaxTopicSize final : private detail::StringTag<MaxTopicSize> {
 /**
  * @brief Message retention policy for a topic.
  *
- * @note The expiry kind and value are passed across the Rust FFI as a pair.
- *       The Rust client rejects unsupported kinds.
+ * Use ServerDefault(), NeverExpire(), or Duration() to select the retention
+ * policy.
  */
 class Expiry final {
   public:
@@ -1035,14 +1045,14 @@ class Expiry final {
      * @brief Returns the expiry policy kind.
      * @return One of server_default, never_expire, or duration.
      */
-    std::string_view ExpiryKind() const { return expiry_kind_; }
+    std::string_view Kind() const { return expiry_kind_; }
 
     /**
      * @brief Returns the value associated with the expiry policy.
      * @return Duration in microseconds for Duration(), zero for ServerDefault(),
      *         or std::numeric_limits<std::uint64_t>::max() for NeverExpire().
      */
-    std::uint64_t ExpiryValue() const { return expiry_value_; }
+    std::uint64_t Value() const { return expiry_value_; }
 
   private:
     explicit Expiry(std::string expiry_kind, std::uint64_t expiry_value)
@@ -1055,57 +1065,64 @@ class Expiry final {
 /**
  * @brief Options for creating a topic.
  *
- * Mirrors Rust `TopicCreateOptions` (`core/common/src/types/options/mod.rs:698`).
- * Each `std::optional` field corresponds to a catalog key; `std::nullopt`
- * means the server default is used and the key is omitted from the request.
- * `Raw` carries forward-compatible string keys; a typed field wins on
- * collision when encoded. The wire form is the topic options TLV block
- * (`core/binary_protocol/src/primitives/options.rs:18`), the same encoding
- * used for message user headers.
+ * Use the typed setters to configure supported topic settings. Leave a setting
+ * unset to use the server default. Use SetRawEntries() for supported options
+ * that do not yet have a typed setter. When both specify the same option, the
+ * typed setting takes precedence.
  */
 class TopicCreateOptions final {
   public:
     TopicCreateOptions() = default;
 
     /**
-     * @brief Number of partitions to create with the topic.
-     * @return Partition count when set; `nullopt` uses the server default
-     *         `DEFAULT_PARTITIONS_COUNT` (1).
-     * @note Not an option key. Fills the `CreateTopic` command's fixed field;
-     *       it is consumed to compute assignments and is not stored as a topic
-     *       option. Must be `0..=1000` when set.
+     * @brief Returns the number of partitions to create.
+     * @return Configured partition count, or `std::nullopt` to use the server
+     *         default.
      */
     std::optional<std::uint32_t> PartitionsCount() const noexcept { return partitions_count_; }
+
+    /**
+     * @brief Sets the number of partitions to create.
+     * @param partitions_count Number of partitions, from 0 to 1,000 inclusive.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetPartitionsCount(std::uint32_t partitions_count) noexcept {
         partitions_count_ = partitions_count;
         return *this;
     }
 
     /**
-     * @brief Storage compression for the topic.
-     * @return Compression algorithm when set; `nullopt` uses the server default
-     *         (`none`).
-     * @note Catalog key `compression_algorithm` (`HeaderKind::String`, values
-     *       `none`, `gzip`). Also updatable via `TopicUpdateOptions`.
+     * @brief Returns the topic storage compression setting.
+     * @return Configured compression algorithm, or `std::nullopt` to use the
+     *         server default.
      */
     std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+
+    /**
+     * @brief Sets the topic storage compression algorithm.
+     * @param compression_algorithm Compression algorithm to use.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetCompressionAlgorithm(::iggy::CompressionAlgorithm compression_algorithm) {
         compression_algorithm_ = std::move(compression_algorithm);
         return *this;
     }
 
     /**
-     * @brief Message retention policy for the topic.
-     * @return Expiry when set; `nullopt` uses the server default
-     *         `IggyExpiry::ServerDefault` (alias `never_expire` with sentinel
-     *         `u64::MAX` on the wire as `Uint64`).
-     * @note Catalog key `message_expiry` (`Uint64` micros, or `String` like
-     *       `"7 days"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
-     *       Also updatable.
+     * @brief Returns the message retention policy.
+     * @return Configured expiry policy, or `std::nullopt` to use the server
+     *         default.
      */
     std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+
+    /**
+     * @brief Sets the message retention policy.
+     * @param message_expiry Expiry policy to apply. Expiry::ServerDefault()
+     *        clears an explicitly configured policy.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
-        if (message_expiry.ExpiryKind() == "server_default") {
+        if (message_expiry.Kind() == "server_default") {
             message_expiry_.reset();
         } else {
             message_expiry_ = std::move(message_expiry);
@@ -1114,17 +1131,20 @@ class TopicCreateOptions final {
     }
 
     /**
-     * @brief Maximum retained topic size.
-     * @return Max size when set; `nullopt` uses the server default
-     *         `MaxTopicSize::ServerDefault` (`unlimited`, `u64::MAX` on wire).
-     * @note Catalog key `max_topic_size` (`Uint64` bytes or `String` like
-     *       `"1 GiB"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
-     *       Must be `>=` the resolved segment size when both are set. Also
-     *       updatable.
+     * @brief Returns the maximum retained topic size.
+     * @return Configured size limit, or `std::nullopt` to use the server
+     *         default.
      */
     std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+
+    /**
+     * @brief Sets the maximum retained topic size.
+     * @param max_topic_size Maximum size to retain. The limit cannot be smaller
+     *        than the configured segment size.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
-        if (max_topic_size.MaxTopicSizeValue() == "server_default") {
+        if (max_topic_size.Value() == "server_default") {
             max_topic_size_.reset();
         } else {
             max_topic_size_ = std::move(max_topic_size);
@@ -1133,100 +1153,134 @@ class TopicCreateOptions final {
     }
 
     /**
-     * @brief Size at which a partition segment rotates.
-     * @return Segment size in bytes when set; `nullopt` uses the server default
-     *         `DEFAULT_SEGMENT_SIZE` (1 GiB).
-     * @note Catalog key `segment_size` (`Uint64` bytes, `String` `"128MiB"` via
-     *       `Raw`). Constraints: multiple of `512`, `1 MiB` (`MIN_TOPIC_SEGMENT_SIZE`)
-     *       `..=` `1 GiB` (`MAX_TOPIC_SEGMENT_SIZE`, the server segment ceiling
-     *       `core/common/src/types/options/mod.rs:310`). `0` normalizes to
-     *       `nullopt`. Creation-only; `UpdateTopic` rejects it.
+     * @brief Returns the partition segment size.
+     * @return Configured segment size in bytes, or `std::nullopt` to use the
+     *         server default.
      */
     std::optional<std::uint64_t> SegmentSize() const noexcept { return segment_size_; }
+
+    /**
+     * @brief Sets the size at which each partition segment rotates.
+     * @param segment_size Segment size in bytes. Specify zero to use the server
+     *        default; otherwise it must be a multiple of 512 between 1 MiB and
+     *        1 GiB inclusive.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetSegmentSize(std::uint64_t segment_size) noexcept {
         segment_size_ = segment_size;
         return *this;
     }
 
     /**
-     * @brief Whether partition writes are fsynced.
-     * @return Fsync flag when set; `nullopt` uses the server default
-     *         `DEFAULT_ENFORCE_FSYNC` (`false`).
-     * @note Catalog key `enforce_fsync` (`Bool` `0`/`1`, or `String`
-     *       `"true"`/`"false"` via `Raw`). Creation-only.
+     * @brief Returns whether partition writes are synchronously flushed to disk.
+     * @return Configured setting, or `std::nullopt` to use the server default.
      */
     std::optional<bool> EnforceFsync() const noexcept { return enforce_fsync_; }
+
+    /**
+     * @brief Sets whether partition writes are synchronously flushed to disk.
+     * @param enforce_fsync `true` to fsync writes; `false` otherwise.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetEnforceFsync(bool enforce_fsync) noexcept {
         enforce_fsync_ = enforce_fsync;
         return *this;
     }
 
     /**
-     * @brief Journal flush threshold in message count.
-     * @return Count when set; `nullopt` uses the server default
-     *         `DEFAULT_MESSAGES_REQUIRED_TO_SAVE` (`1024`).
-     * @note Catalog key `messages_required_to_save` (`Uint32`). Must be
-     *       `1..=16_777_216` (`MAX_MESSAGES_REQUIRED_TO_SAVE`). `0` is rejected.
-     *       Paired with `SizeOfMessagesRequiredToSave`; whichever trips first
-     *       flushes. Creation-only.
+     * @brief Returns the message-count threshold for flushing the journal.
+     * @return Configured threshold, or `std::nullopt` to use the server default.
      */
     std::optional<std::uint32_t> MessagesRequiredToSave() const noexcept { return messages_required_to_save_; }
+
+    /**
+     * @brief Sets the message-count threshold for flushing the journal.
+     *
+     * The journal is flushed when this or the byte threshold is reached first.
+     * @param messages_required_to_save Number of messages, from 1 to 16,777,216
+     *        inclusive.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetMessagesRequiredToSave(std::uint32_t messages_required_to_save) noexcept {
         messages_required_to_save_ = messages_required_to_save;
         return *this;
     }
 
     /**
-     * @brief Journal flush threshold in bytes.
-     * @return Byte threshold when set; `nullopt` uses the server default
-     *         `DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE` (1 MiB).
-     * @note Catalog key `size_of_messages_required_to_save` (`Uint64` bytes,
-     *       `String` like `"4KiB"` via `Raw`). Must be `1..=1 GiB`
-     *       (`MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE`). `0` normalizes to
-     *       `nullopt`. Paired with `MessagesRequiredToSave`. Creation-only.
+     * @brief Returns the byte threshold for flushing the journal.
+     * @return Configured threshold in bytes, or `std::nullopt` to use the
+     *         server default.
      */
     std::optional<std::uint64_t> SizeOfMessagesRequiredToSave() const noexcept {
         return size_of_messages_required_to_save_;
     }
+
+    /**
+     * @brief Sets the byte threshold for flushing the journal.
+     *
+     * The journal is flushed when this or the message-count threshold is reached
+     * first.
+     * @param size_of_messages_required_to_save Size in bytes. Specify zero to
+     *        use the server default; otherwise it must be between 1 and 1 GiB
+     *        inclusive.
+     * @return Reference to this options object.
+     */
     TopicCreateOptions &SetSizeOfMessagesRequiredToSave(std::uint64_t size_of_messages_required_to_save) noexcept {
         size_of_messages_required_to_save_ = size_of_messages_required_to_save;
         return *this;
     }
 
     /**
-     * @brief Whether segment bytes are reserved on disk at creation.
-     * @return Flag when set; `nullopt` uses the server default
-     *         `DEFAULT_PREALLOCATE_SEGMENTS` (`false`).
-     * @note Catalog key `preallocate_segments` (`Bool`). Creation-only.
-     *       Admission rejects `segment_size * partitions_count > 64 GiB`
-     *       (`MAX_PREALLOCATED_TOPIC_BYTES`).
+     * @brief Returns whether partition segments are preallocated on disk.
+     * @return Configured setting, or `std::nullopt` to use the server default.
      */
     std::optional<bool> PreallocateSegments() const noexcept { return preallocate_segments_; }
+
+    /**
+     * @brief Sets whether partition segments are preallocated on disk.
+     * @param preallocate_segments `true` to reserve segment space during topic
+     *        creation; `false` otherwise.
+     * @return Reference to this options object.
+     * @note The total preallocated space cannot exceed 64 GiB.
+     */
     TopicCreateOptions &SetPreallocateSegments(bool preallocate_segments) noexcept {
         preallocate_segments_ = preallocate_segments;
         return *this;
     }
 
     /**
-     * @brief Forward-compatible string keys not yet covered by a typed field.
-     * @return Ordered map of `key -> value` strings; values are parsed server-side
-     *         via the same `FromStr` as config file entries. An unknown key is
-     *         rejected with `UnsupportedOptionKey`; a bad value with
-     *         `InvalidOptionValue`.
-     * @note A typed field wins on collision when both `raw` and the typed setter
-     *       name the same key (`mod.rs:1374` `typed_field_wins_over_raw_entry_for_the_same_key`).
-     *       `partitions_count` is not a key and is rejected if placed in `raw`.
+     * @brief Returns additional topic settings as key-value pairs.
+     *
+     * Use this for supported settings that do not have a dedicated setter.
+     * @return Ordered map of setting names and values.
+     * @note A dedicated setter takes precedence when it configures the same
+     *       setting.
      */
     const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+
+    /**
+     * @brief Adds or replaces additional topic settings.
+     * @param entries Setting names and values to add.
+     * @return Reference to this options object.
+     * @note Unsupported names and invalid values are rejected when the topic is
+     *       created. Use SetPartitionsCount() rather than an entry for the
+     *       partition count.
+     */
     TopicCreateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
-            raw_.emplace(entry.first, entry.second);
+            raw_.insert_or_assign(entry.first, entry.second);
         }
         return *this;
     }
+    /**
+     * @brief Adds or replaces additional topic settings.
+     * @param entries Setting names and values to move into this options object.
+     * @return Reference to this options object.
+     * @see SetRawEntries(const std::map<std::string, std::string>&)
+     */
     TopicCreateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         for (auto &entry : entries) {
-            raw_.emplace(std::move(entry.first), std::move(entry.second));
+            raw_.insert_or_assign(std::move(entry.first), std::move(entry.second));
         }
         return *this;
     }
@@ -1249,41 +1303,50 @@ class TopicCreateOptions final {
 /**
  * @brief Options for updating a topic.
  *
- * Mirrors Rust `TopicUpdateOptions` (`core/common/src/types/options/mod.rs:640`).
- * Separate from `TopicCreateOptions` so creation-only keys cannot be set on
- * update. Patch semantics: `std::nullopt` keeps the topic's current value;
- * only the keys present are changed. Only `compression_algorithm`,
- * `message_expiry`, `max_topic_size` and `raw` keys in
- * `UPDATABLE_TOPIC_OPTION_KEYS` (`core/common/src/types/options/mod.rs:476`)
- * are accepted. Creation-only keys (`segment_size`, `enforce_fsync`,
- * `messages_required_to_save`, `size_of_messages_required_to_save`,
- * `preallocate_segments`) and unknown keys are rejected with
- * `UnsupportedOptionKey`.
+ * Use this class to change a topic's mutable settings. Leave a setting unset
+ * to retain its current value. Topic creation settings, such as the partition
+ * count and segment size, cannot be changed after the topic is created.
+ *
+ * Use the typed setters for supported settings. SetRawEntries() can configure
+ * other supported mutable settings. When both configure the same setting, the
+ * typed setting takes precedence.
  */
 class TopicUpdateOptions final {
   public:
     TopicUpdateOptions() = default;
 
     /**
-     * @brief New storage compression.
-     * @return Algorithm when set; `nullopt` keeps the current value.
-     * @note Catalog key `compression_algorithm` (`HeaderKind::String`, `none`/`gzip`).
+     * @brief Returns the requested storage compression update.
+     * @return Compression algorithm to apply, or `std::nullopt` when this
+     *         update leaves compression unchanged.
      */
     std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+
+    /**
+     * @brief Sets the storage compression algorithm.
+     * @param compression_algorithm Compression algorithm to apply.
+     * @return Reference to this options object.
+     */
     TopicUpdateOptions &SetCompressionAlgorithm(::iggy::CompressionAlgorithm compression_algorithm) {
         compression_algorithm_ = std::move(compression_algorithm);
         return *this;
     }
 
     /**
-     * @brief New message retention policy.
-     * @return Expiry when set; `nullopt` keeps the current value.
-     * @note Catalog key `message_expiry` (`Uint64` micros or `String` like
-     *       `"7 days"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
+     * @brief Returns the requested message retention update.
+     * @return Expiry policy to apply, or `std::nullopt` when this update leaves
+     *         retention unchanged.
      */
     std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+
+    /**
+     * @brief Sets the message retention policy.
+     * @param message_expiry Expiry policy to apply. Expiry::ServerDefault()
+     *        leaves the current policy unchanged.
+     * @return Reference to this options object.
+     */
     TopicUpdateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
-        if (message_expiry.ExpiryKind() == "server_default") {
+        if (message_expiry.Kind() == "server_default") {
             message_expiry_.reset();
         } else {
             message_expiry_ = std::move(message_expiry);
@@ -1292,14 +1355,20 @@ class TopicUpdateOptions final {
     }
 
     /**
-     * @brief New maximum retained topic size.
-     * @return Max size when set; `nullopt` keeps the current value.
-     * @note Catalog key `max_topic_size` (`Uint64` bytes or `String` like
-     *       `"1 GiB"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
+     * @brief Returns the requested maximum retained-size update.
+     * @return Size limit to apply, or `std::nullopt` when this update leaves
+     *         the limit unchanged.
      */
     std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+
+    /**
+     * @brief Sets the maximum retained topic size.
+     * @param max_topic_size Maximum size to retain. MaxTopicSize::ServerDefault()
+     *        leaves the current limit unchanged.
+     * @return Reference to this options object.
+     */
     TopicUpdateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
-        if (max_topic_size.MaxTopicSizeValue() == "server_default") {
+        if (max_topic_size.Value() == "server_default") {
             max_topic_size_.reset();
         } else {
             max_topic_size_ = std::move(max_topic_size);
@@ -1308,22 +1377,37 @@ class TopicUpdateOptions final {
     }
 
     /**
-     * @brief Forward-compatible updatable string keys.
-     * @return Ordered map of `key -> value`; only keys in the updatable catalog
-     *         are accepted. A create-only or unknown key is rejected with
-     *         `UnsupportedOptionKey`; a bad value with `InvalidOptionValue`.
-     * @note Typed field wins on collision.
+     * @brief Returns additional mutable topic settings as key-value pairs.
+     *
+     * Use this for supported settings that do not have a dedicated setter.
+     * @return Ordered map of setting names and values.
+     * @note A dedicated setter takes precedence when it configures the same
+     *       setting.
      */
     const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+
+    /**
+     * @brief Adds or replaces additional mutable topic settings.
+     * @param entries Setting names and values to add.
+     * @return Reference to this options object.
+     * @note Unsupported, immutable, or invalid settings are rejected when the
+     *       topic is updated.
+     */
     TopicUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
-            raw_.emplace(entry.first, entry.second);
+            raw_.insert_or_assign(entry.first, entry.second);
         }
         return *this;
     }
+    /**
+     * @brief Adds or replaces additional mutable topic settings.
+     * @param entries Setting names and values to move into this options object.
+     * @return Reference to this options object.
+     * @see SetRawEntries(const std::map<std::string, std::string>&)
+     */
     TopicUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         for (auto &entry : entries) {
-            raw_.emplace(std::move(entry.first), std::move(entry.second));
+            raw_.insert_or_assign(std::move(entry.first), std::move(entry.second));
         }
         return *this;
     }
@@ -1340,33 +1424,44 @@ class TopicUpdateOptions final {
 /**
  * @brief Options for updating a stream.
  *
- * Mirrors Rust `StreamUpdateOptions` (`core/common/src/types/options/mod.rs:547`).
- * Separate from creation because streams have no catalog keys yet. Patch
- * semantics: `std::nullopt` keeps current value; only keys present are
- * changed. Currently `UPDATABLE_STREAM_OPTION_KEYS` (`mod.rs:486`) is empty,
- * so every key is rejected with `UnsupportedOptionKey` until the first stream
- * option lands. `raw` carries forward-compatible string keys.
+ * Use this class to supply stream settings to UpdateStream(). Currently, Iggy
+ * does not support updating stream settings, so the server rejects every
+ * supplied setting. The raw entries are retained for compatibility with future
+ * server versions that add mutable stream settings.
  */
 class StreamUpdateOptions final {
   public:
     StreamUpdateOptions() = default;
 
     /**
-     * @brief Forward-compatible string keys for stream update.
-     * @return Ordered map of `key -> value` strings; values are parsed
-     *         server-side via `FromStr`. Unknown keys rejected with
-     *         `UnsupportedOptionKey`.
+     * @brief Returns the requested stream settings as key-value pairs.
+     * @return Ordered map of setting names and values.
+     * @note The server currently rejects all stream settings.
      */
     const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+
+    /**
+     * @brief Adds or replaces requested stream settings.
+     * @param entries Setting names and values to add.
+     * @return Reference to this options object.
+     * @note The server currently rejects all stream settings.
+     */
     StreamUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
-            raw_.emplace(entry.first, entry.second);
+            raw_.insert_or_assign(entry.first, entry.second);
         }
         return *this;
     }
+    /**
+     * @brief Adds or replaces requested stream settings.
+     * @param entries Setting names and values to move into this options object.
+     * @return Reference to this options object.
+     * @see SetRawEntries(const std::map<std::string, std::string>&)
+     * @note The server currently rejects all stream settings.
+     */
     StreamUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         for (auto &entry : entries) {
-            raw_.emplace(std::move(entry.first), std::move(entry.second));
+            raw_.insert_or_assign(std::move(entry.first), std::move(entry.second));
         }
         return *this;
     }
@@ -1415,13 +1510,13 @@ class PollingStrategy final {
      * @brief Returns the polling strategy kind.
      * @return One of offset, timestamp, first, last, or next.
      */
-    std::string_view PollingStrategyKind() const { return polling_strategy_kind_; }
+    std::string_view Kind() const { return polling_strategy_kind_; }
 
     /**
      * @brief Returns the value associated with the polling strategy.
      * @return Offset or timestamp for parameterized strategies; otherwise zero.
      */
-    std::uint64_t PollingStrategyValue() const { return polling_strategy_value_; }
+    std::uint64_t Value() const { return polling_strategy_value_; }
 
   private:
     explicit PollingStrategy(std::string kind, std::uint64_t value)
@@ -1892,11 +1987,10 @@ class IggyBlockingClient final {
     /**
      * @brief Creates a topic and its initial partitions in a stream.
      *
-     * Mirrors Rust `TopicClient::create_topic` (`core/common/src/traits/topic_client.rs:43`)
-     * with `TopicCreateOptions` (`core/common/src/types/options/mod.rs:698`).
-     * Each `std::optional` corresponds to a catalog key; `nullopt` uses the
-     * server default. `raw` carries forward string keys; a typed field wins
-     * on collision.
+     * The server creates the topic's initial partitions and applies the
+     * supplied TopicCreateOptions. Settings left unset use the server default.
+     * Use SetRawEntries() for supported settings without a dedicated setter.
+     * A dedicated setter takes precedence when it configures the same setting.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param name Unique topic name within @p stream.
@@ -1912,12 +2006,11 @@ class IggyBlockingClient final {
     /**
      * @brief Renames a topic and updates its mutable configuration.
      *
-     * Mirrors Rust `TopicClient::update_topic` with `TopicUpdateOptions`
-     * (`core/common/src/types/options/mod.rs:640`). Only `compression_algorithm`,
-     * `message_expiry`, `max_topic_size` and `raw` keys in
-     * `UPDATABLE_TOPIC_OPTION_KEYS` are accepted; `nullopt` keeps the current
-     * value. Creation-only keys (`segment_size`, `enforce_fsync`, etc.) are
-     * rejected.
+     * The supplied TopicUpdateOptions changes only the settings it contains;
+     * settings left unset retain their current values. Topic creation settings,
+     * such as the partition count and segment size, cannot be changed after the
+     * topic is created. Use SetRawEntries() for supported mutable settings
+     * without a dedicated setter.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Topic to update, addressed by numeric ID or name.

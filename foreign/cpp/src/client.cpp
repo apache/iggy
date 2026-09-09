@@ -70,9 +70,23 @@ StreamDetails IggyBlockingClient::CreateStream(std::string name) {
 
 void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options) {
     return RethrowAsIggyException([this, &stream, &name, &options] {
-        // Stream options are currently null-op (UPDATABLE_STREAM_OPTION_KEYS empty), no conversion needed.
-        (void)options;
-        Handle()->update_stream(stream.ToFfi(), std::move(name), rust::Vec<ffi::HeaderEntry>{});
+        rust::Vec<ffi::HeaderEntry> ffi_options;
+        ffi_options.reserve(options.RawEntries().size());
+        for (const auto &entry : options.RawEntries()) {
+            ffi::HeaderEntry ffi_entry;
+            ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
+            ffi_entry.key.value.reserve(entry.first.size());
+            for (char character : entry.first) {
+                ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
+            }
+            ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
+            ffi_entry.value.value.reserve(entry.second.size());
+            for (char character : entry.second) {
+                ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
+            }
+            ffi_options.push_back(std::move(ffi_entry));
+        }
+        Handle()->update_stream(stream.ToFfi(), std::move(name), std::move(ffi_options));
     });
 }
 
@@ -115,15 +129,15 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
         }
         if (auto value = options.CompressionAlgorithm()) {
             ffi_options.has_compression_algorithm = true;
-            ffi_options.compression_algorithm     = std::string(value->CompressionAlgorithmValue());
+            ffi_options.compression_algorithm     = std::string(value->Value());
         } else {
             ffi_options.has_compression_algorithm = false;
             ffi_options.compression_algorithm     = "";
         }
         if (auto value = options.MessageExpiry()) {
             ffi_options.has_message_expiry   = true;
-            ffi_options.message_expiry_kind  = std::string(value->ExpiryKind());
-            ffi_options.message_expiry_value = value->ExpiryValue();
+            ffi_options.message_expiry_kind  = std::string(value->Kind());
+            ffi_options.message_expiry_value = value->Value();
         } else {
             ffi_options.has_message_expiry   = false;
             ffi_options.message_expiry_kind  = "";
@@ -131,7 +145,7 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
         }
         if (auto value = options.MaxTopicSize()) {
             ffi_options.has_max_topic_size = true;
-            ffi_options.max_topic_size     = std::string(value->MaxTopicSizeValue());
+            ffi_options.max_topic_size     = std::string(value->Value());
         } else {
             ffi_options.has_max_topic_size = false;
             ffi_options.max_topic_size     = "";
@@ -199,15 +213,15 @@ void IggyBlockingClient::UpdateTopic(const Identifier &stream,
         ffi::TopicUpdateOptions ffi_options;
         if (auto value = options.CompressionAlgorithm()) {
             ffi_options.has_compression_algorithm = true;
-            ffi_options.compression_algorithm     = std::string(value->CompressionAlgorithmValue());
+            ffi_options.compression_algorithm     = std::string(value->Value());
         } else {
             ffi_options.has_compression_algorithm = false;
             ffi_options.compression_algorithm     = "";
         }
         if (auto value = options.MessageExpiry()) {
             ffi_options.has_message_expiry   = true;
-            ffi_options.message_expiry_kind  = std::string(value->ExpiryKind());
-            ffi_options.message_expiry_value = value->ExpiryValue();
+            ffi_options.message_expiry_kind  = std::string(value->Kind());
+            ffi_options.message_expiry_value = value->Value();
         } else {
             ffi_options.has_message_expiry   = false;
             ffi_options.message_expiry_kind  = "";
@@ -215,7 +229,7 @@ void IggyBlockingClient::UpdateTopic(const Identifier &stream,
         }
         if (auto value = options.MaxTopicSize()) {
             ffi_options.has_max_topic_size = true;
-            ffi_options.max_topic_size     = std::string(value->MaxTopicSizeValue());
+            ffi_options.max_topic_size     = std::string(value->Value());
         } else {
             ffi_options.has_max_topic_size = false;
             ffi_options.max_topic_size     = "";

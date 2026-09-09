@@ -138,6 +138,23 @@ TEST_F(E2E_Stream, UpdateStreamWithSameNameIsIdempotent) {
     EXPECT_EQ(second_read.Topics().size(), first_read.Topics().size());
 }
 
+TEST_F(E2E_Stream, UpdateStreamWithUnsupportedOptionsRejectsAndPreservesName) {
+    RecordProperty("description", "Rejects unsupported options without renaming the stream.");
+    const std::string stream_name         = GetRandomName();
+    const std::string updated_stream_name = GetRandomName();
+    auto client                           = GetLoggedInHighLevelClient();
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+
+    const auto options = iggy::StreamUpdateOptions().SetRawEntries({{"not_a_real_option", "true"}});
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name, options),
+                 std::exception);
+
+    const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    EXPECT_EQ(stream.Name(), stream_name);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(updated_stream_name)), std::exception);
+}
+
 TEST_F(E2E_Stream, UpdateStreamBeforeLoginThrows) {
     RecordProperty("description", "Rejects update_stream before connect, and after connect but before login.");
     const std::string stream_name         = GetRandomName();

@@ -41,17 +41,17 @@ const std::vector<std::uint8_t> &option_value_bytes(const iggy::HeaderEntry &ent
 }  // namespace
 
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::CompressionAlgorithm::None().CompressionAlgorithmValue(), "none");
-    EXPECT_EQ(iggy::CompressionAlgorithm::Gzip().CompressionAlgorithmValue(), "gzip");
+    EXPECT_EQ(iggy::CompressionAlgorithm::None().Value(), "none");
+    EXPECT_EQ(iggy::CompressionAlgorithm::Gzip().Value(), "gzip");
 }
 
 TEST(SnapshotCompressionTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::SnapshotCompression::Stored().SnapshotCompressionValue(), "stored");
-    EXPECT_EQ(iggy::SnapshotCompression::Deflated().SnapshotCompressionValue(), "deflated");
-    EXPECT_EQ(iggy::SnapshotCompression::Bzip2().SnapshotCompressionValue(), "bzip2");
-    EXPECT_EQ(iggy::SnapshotCompression::Zstd().SnapshotCompressionValue(), "zstd");
-    EXPECT_EQ(iggy::SnapshotCompression::Lzma().SnapshotCompressionValue(), "lzma");
-    EXPECT_EQ(iggy::SnapshotCompression::Xz().SnapshotCompressionValue(), "xz");
+    EXPECT_EQ(iggy::SnapshotCompression::Stored().Value(), "stored");
+    EXPECT_EQ(iggy::SnapshotCompression::Deflated().Value(), "deflated");
+    EXPECT_EQ(iggy::SnapshotCompression::Bzip2().Value(), "bzip2");
+    EXPECT_EQ(iggy::SnapshotCompression::Zstd().Value(), "zstd");
+    EXPECT_EQ(iggy::SnapshotCompression::Lzma().Value(), "lzma");
+    EXPECT_EQ(iggy::SnapshotCompression::Xz().Value(), "xz");
 }
 
 TEST(SystemSnapshotTypeTest, ReturnsExpectedValues) {
@@ -65,48 +65,48 @@ TEST(SystemSnapshotTypeTest, ReturnsExpectedValues) {
 }
 
 TEST(MaxTopicSizeTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::MaxTopicSize::ServerDefault().MaxTopicSizeValue(), "server_default");
-    EXPECT_EQ(iggy::MaxTopicSize::Unlimited().MaxTopicSizeValue(), "unlimited");
-    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(0).MaxTopicSizeValue(), "server_default");
-    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(std::numeric_limits<std::uint64_t>::max()).MaxTopicSizeValue(),
+    EXPECT_EQ(iggy::MaxTopicSize::ServerDefault().Value(), "server_default");
+    EXPECT_EQ(iggy::MaxTopicSize::Unlimited().Value(), "unlimited");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(0).Value(), "server_default");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(std::numeric_limits<std::uint64_t>::max()).Value(),
               "unlimited");
-    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(1024).MaxTopicSizeValue(), "1024");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(1024).Value(), "1024");
 }
 
 TEST(PollingStrategyTest, ReturnsExpectedKindAndValue) {
     const auto offset = iggy::PollingStrategy::Offset(7);
-    EXPECT_EQ(offset.PollingStrategyKind(), "offset");
-    EXPECT_EQ(offset.PollingStrategyValue(), 7u);
+    EXPECT_EQ(offset.Kind(), "offset");
+    EXPECT_EQ(offset.Value(), 7u);
 
     const auto timestamp = iggy::PollingStrategy::Timestamp(42);
-    EXPECT_EQ(timestamp.PollingStrategyKind(), "timestamp");
-    EXPECT_EQ(timestamp.PollingStrategyValue(), 42u);
+    EXPECT_EQ(timestamp.Kind(), "timestamp");
+    EXPECT_EQ(timestamp.Value(), 42u);
 
     const auto first = iggy::PollingStrategy::First();
-    EXPECT_EQ(first.PollingStrategyKind(), "first");
-    EXPECT_EQ(first.PollingStrategyValue(), 0u);
+    EXPECT_EQ(first.Kind(), "first");
+    EXPECT_EQ(first.Value(), 0u);
 
     const auto last = iggy::PollingStrategy::Last();
-    EXPECT_EQ(last.PollingStrategyKind(), "last");
-    EXPECT_EQ(last.PollingStrategyValue(), 0u);
+    EXPECT_EQ(last.Kind(), "last");
+    EXPECT_EQ(last.Value(), 0u);
 
     const auto next = iggy::PollingStrategy::Next();
-    EXPECT_EQ(next.PollingStrategyKind(), "next");
-    EXPECT_EQ(next.PollingStrategyValue(), 0u);
+    EXPECT_EQ(next.Kind(), "next");
+    EXPECT_EQ(next.Value(), 0u);
 }
 
 TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
     const auto server_default = iggy::Expiry::ServerDefault();
-    EXPECT_EQ(server_default.ExpiryKind(), "server_default");
-    EXPECT_EQ(server_default.ExpiryValue(), static_cast<std::uint64_t>(0));
+    EXPECT_EQ(server_default.Kind(), "server_default");
+    EXPECT_EQ(server_default.Value(), static_cast<std::uint64_t>(0));
 
     const auto never_expire = iggy::Expiry::NeverExpire();
-    EXPECT_EQ(never_expire.ExpiryKind(), "never_expire");
-    EXPECT_EQ(never_expire.ExpiryValue(), std::numeric_limits<std::uint64_t>::max());
+    EXPECT_EQ(never_expire.Kind(), "never_expire");
+    EXPECT_EQ(never_expire.Value(), std::numeric_limits<std::uint64_t>::max());
 
     const auto duration = iggy::Expiry::Duration(15);
-    EXPECT_EQ(duration.ExpiryKind(), "duration");
-    EXPECT_EQ(duration.ExpiryValue(), static_cast<std::uint64_t>(15));
+    EXPECT_EQ(duration.Kind(), "duration");
+    EXPECT_EQ(duration.Value(), static_cast<std::uint64_t>(15));
 }
 
 TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
@@ -225,12 +225,12 @@ TEST(TopicCreateOptionsTest, CompressionAlgorithmAndExpiryAndMaxTopicSize) {
         .SetMessageExpiry(iggy::Expiry::Duration(15))
         .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
     ASSERT_TRUE(options.CompressionAlgorithm().has_value());
-    EXPECT_EQ(options.CompressionAlgorithm()->CompressionAlgorithmValue(), "gzip");
+    EXPECT_EQ(options.CompressionAlgorithm()->Value(), "gzip");
     ASSERT_TRUE(options.MessageExpiry().has_value());
-    EXPECT_EQ(options.MessageExpiry()->ExpiryKind(), "duration");
-    EXPECT_EQ(options.MessageExpiry()->ExpiryValue(), 15u);
+    EXPECT_EQ(options.MessageExpiry()->Kind(), "duration");
+    EXPECT_EQ(options.MessageExpiry()->Value(), 15u);
     ASSERT_TRUE(options.MaxTopicSize().has_value());
-    EXPECT_EQ(options.MaxTopicSize()->MaxTopicSizeValue(), "1024");
+    EXPECT_EQ(options.MaxTopicSize()->Value(), "1024");
 }
 
 TEST(TopicCreateOptionsTest, ServerDefaultSentinelsClearValues) {
@@ -254,6 +254,26 @@ TEST(TopicCreateOptionsTest, RawMapStoresForwardCompatibleKeys) {
     EXPECT_EQ(options.RawEntries().at("a"), "1");
 }
 
+TEST(TopicCreateOptionsTest, RawMapReplacesDuplicateKeys) {
+    iggy::TopicCreateOptions options;
+    const std::map<std::string, std::string> first_entries{{"message_expiry", "7 days"}};
+    const std::map<std::string, std::string> second_entries{{"message_expiry", "1 day"}};
+
+    options.SetRawEntries(first_entries).SetRawEntries(second_entries);
+
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+}
+
+TEST(TopicCreateOptionsTest, RawMapReplacesDuplicateKeysWhenMoved) {
+    iggy::TopicCreateOptions options;
+    std::map<std::string, std::string> first_entries{{"message_expiry", "7 days"}};
+    std::map<std::string, std::string> second_entries{{"message_expiry", "1 day"}};
+
+    options.SetRawEntries(std::move(first_entries)).SetRawEntries(std::move(second_entries));
+
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+}
+
 TEST(TopicUpdateOptionsTest, DefaultHasNoValues) {
     const iggy::TopicUpdateOptions options;
     EXPECT_FALSE(options.CompressionAlgorithm().has_value());
@@ -268,11 +288,11 @@ TEST(TopicUpdateOptionsTest, StoresUpdatableFields) {
         .SetMessageExpiry(iggy::Expiry::NeverExpire())
         .SetMaxTopicSize(iggy::MaxTopicSize::Unlimited());
     ASSERT_TRUE(options.CompressionAlgorithm().has_value());
-    EXPECT_EQ(options.CompressionAlgorithm()->CompressionAlgorithmValue(), "gzip");
+    EXPECT_EQ(options.CompressionAlgorithm()->Value(), "gzip");
     ASSERT_TRUE(options.MessageExpiry().has_value());
-    EXPECT_EQ(options.MessageExpiry()->ExpiryKind(), "never_expire");
+    EXPECT_EQ(options.MessageExpiry()->Kind(), "never_expire");
     ASSERT_TRUE(options.MaxTopicSize().has_value());
-    EXPECT_EQ(options.MaxTopicSize()->MaxTopicSizeValue(), "unlimited");
+    EXPECT_EQ(options.MaxTopicSize()->Value(), "unlimited");
 }
 
 TEST(TopicUpdateOptionsTest, ServerDefaultSentinelsClearValues) {
@@ -294,12 +314,42 @@ TEST(TopicUpdateOptionsTest, RawMapStoresKeys) {
     EXPECT_EQ(options.RawEntries().size(), 2u);
 }
 
+TEST(TopicUpdateOptionsTest, RawMapReplacesDuplicateKeys) {
+    iggy::TopicUpdateOptions options;
+    const std::map<std::string, std::string> first_entries{{"message_expiry", "7 days"}};
+    const std::map<std::string, std::string> second_entries{{"message_expiry", "1 day"}};
+    std::map<std::string, std::string> third_entries{{"message_expiry", "7 days"}};
+    std::map<std::string, std::string> fourth_entries{{"message_expiry", "1 day"}};
+
+    options.SetRawEntries(first_entries).SetRawEntries(second_entries);
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+
+    options.SetRawEntries(std::move(third_entries)).SetRawEntries(std::move(fourth_entries));
+
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+}
+
 TEST(StreamUpdateOptionsTest, RawMapStoresKeys) {
     iggy::StreamUpdateOptions options;
     EXPECT_TRUE(options.RawEntries().empty());
     options.SetRawEntries({{"future_key", "future_value"}});
     EXPECT_EQ(options.RawEntries().count("future_key"), 1u);
     EXPECT_EQ(options.RawEntries().at("future_key"), "future_value");
+}
+
+TEST(StreamUpdateOptionsTest, RawMapReplacesDuplicateKeys) {
+    iggy::StreamUpdateOptions options;
+    std::map<std::string, std::string> first_entries{{"future_key", "first_value"}};
+    std::map<std::string, std::string> second_entries{{"future_key", "second_value"}};
+    const std::map<std::string, std::string> third_entries{{"future_key", "first_value"}};
+    const std::map<std::string, std::string> fourth_entries{{"future_key", "second_value"}};
+
+    options.SetRawEntries(std::move(first_entries)).SetRawEntries(std::move(second_entries));
+    EXPECT_EQ(options.RawEntries().at("future_key"), "second_value");
+
+    options.SetRawEntries(third_entries).SetRawEntries(fourth_entries);
+
+    EXPECT_EQ(options.RawEntries().at("future_key"), "second_value");
 }
 
 TEST(IggyExceptionTest, StoresMessage) {
