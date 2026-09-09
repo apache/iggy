@@ -42,6 +42,9 @@ batch_size = 100
 # batch when the upstream topic advances.
 initial_offset = "earliest"
 include_user_headers = true
+# "block" preserves malformed messages for retry; "drop_headers" forwards
+# their payload without user headers.
+malformed_message_policy = "block"
 retry_interval = "1s"
 max_retry_interval = "60s"
 verbose_logging = false

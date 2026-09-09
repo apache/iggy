@@ -51,8 +51,11 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADER_PRODUCER_KEY: &str = "producer";
 const HEADER_PRODUCER_VALUE: &str = "integration-test";
 const HEADER_SEQ_KEY: &str = "seq";
-const INCLUDE_USER_HEADERS_ENV: &str =
-    "IGGY_CONNECTORS_SOURCE_IGGY_PLUGIN_CONFIG_INCLUDE_USER_HEADERS";
+const MALFORMED_MESSAGE_POLICY_ENV: &str =
+    "IGGY_CONNECTORS_SOURCE_IGGY_PLUGIN_CONFIG_MALFORMED_MESSAGE_POLICY";
+const POLL_INTERVAL_ENV: &str = "IGGY_CONNECTORS_SOURCE_IGGY_PLUGIN_CONFIG_POLL_INTERVAL";
+const RETRY_INTERVAL_ENV: &str = "IGGY_CONNECTORS_SOURCE_IGGY_PLUGIN_CONFIG_RETRY_INTERVAL";
+const MAX_RETRY_INTERVAL_ENV: &str = "IGGY_CONNECTORS_SOURCE_IGGY_PLUGIN_CONFIG_MAX_RETRY_INTERVAL";
 
 /// Boots a second `iggy-server` that acts as the upstream cluster the
 /// `iggy_source` connector replicates from. The connector config's
@@ -350,23 +353,6 @@ async fn wait_for_source_error_after(http: &Client, api_url: &str, previous_erro
     .expect("Iggy source did not report a downstream send failure");
 }
 
-async fn wait_for_connector_log(harness: &TestHarness, marker: &str) {
-    timeout(WAIT_TIMEOUT, async {
-        loop {
-            let (stdout, stderr) = harness
-                .connectors_runtime()
-                .expect("connectors runtime")
-                .collect_logs();
-            if stdout.contains(marker) || stderr.contains(marker) {
-                break;
-            }
-            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-        }
-    })
-    .await
-    .expect("Iggy source did not log the expected message build failure");
-}
-
 async fn wait_for_source_state(
     harness: &TestHarness,
     expected_offsets: &HashMap<u32, u64>,
@@ -399,6 +385,45 @@ async fn wait_for_source_state(
              {expected_messages_synced}, and at least {minimum_errors} error(s)"
         )
     })
+}
+
+async fn restart_with_upstream_partition_count(
+    harness: &mut TestHarness,
+    upstream_client: &IggyClient,
+    expected_partitions: u32,
+) {
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+
+    let stream_id = Identifier::named(UPSTREAM_STREAM).expect("valid stream name");
+    let topic_id = Identifier::named(UPSTREAM_TOPIC).expect("valid topic name");
+    let topic = upstream_client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("Failed to fetch upstream topic")
+        .expect("Upstream topic should exist");
+    let additional_partitions = expected_partitions.saturating_sub(topic.partitions_count);
+    if additional_partitions > 0 {
+        upstream_client
+            .create_partitions(&stream_id, &topic_id, additional_partitions)
+            .await
+            .expect("Failed to create upstream partitions");
+    }
+
+    let topic = upstream_client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("Failed to fetch upstream topic")
+        .expect("Upstream topic should exist");
+    assert_eq!(topic.partitions_count, expected_partitions);
+
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
 }
 
 #[iggy_harness(
@@ -442,7 +467,7 @@ async fn iggy_source_replicates_messages_with_headers(
     server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn malformed_user_headers_do_not_advance_source_offset(
+async fn block_policy_commits_prefix_and_drop_headers_resumes_partition(
     harness: &mut TestHarness,
     fixture: IggySourceUpstreamFixture,
 ) {
@@ -457,6 +482,10 @@ async fn malformed_user_headers_do_not_advance_source_offset(
     assert_eq!(first_received.len(), 1, "Expected the first offset to sync");
 
     let mut blocked_batch = vec![
+        IggyMessage::builder()
+            .payload(Bytes::from_static(b"valid-prefix"))
+            .build()
+            .expect("test message should be valid"),
         message_with_unknown_header_kind("malformed-headers"),
         IggyMessage::builder()
             .payload(Bytes::from_static(b"after-malformed-headers"))
@@ -466,7 +495,21 @@ async fn malformed_user_headers_do_not_advance_source_offset(
     fixture
         .produce_iggy_messages(&upstream_client, 0, &mut blocked_batch)
         .await;
-    wait_for_connector_log(harness, "Failed to convert upstream message at offset 1").await;
+
+    let blocked_offsets = HashMap::from([(0, 1)]);
+    wait_for_source_state(harness, &blocked_offsets, 2, 1).await;
+
+    let received_while_blocked =
+        drain_downstream_topic(harness, "iggy_source_while_blocked", 2).await;
+    let blocked_payloads = received_while_blocked
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        blocked_payloads,
+        ["before-malformed-headers", "valid-prefix"],
+        "Only the valid prefix should be committed while the malformed offset is blocked"
+    );
 
     harness
         .server_mut()
@@ -476,14 +519,14 @@ async fn malformed_user_headers_do_not_advance_source_offset(
         .server_mut()
         .connectors_runtime_mut()
         .expect("connectors runtime")
-        .add_env(INCLUDE_USER_HEADERS_ENV, "false");
+        .add_env(MALFORMED_MESSAGE_POLICY_ENV, "drop_headers");
     harness
         .server_mut()
         .start_dependents()
         .await
-        .expect("Failed to restart connectors runtime without user headers");
+        .expect("Failed to restart connectors runtime with drop_headers policy");
 
-    let received = drain_downstream_topic(harness, "iggy_source_after_malformed", 3).await;
+    let received = drain_downstream_topic(harness, "iggy_source_after_malformed", 4).await;
     let payloads = received
         .iter()
         .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
@@ -492,10 +535,130 @@ async fn malformed_user_headers_do_not_advance_source_offset(
         payloads,
         [
             "before-malformed-headers",
+            "valid-prefix",
             "malformed-headers",
             "after-malformed-headers",
         ],
-        "The malformed offset and its tail should be replayed after restart"
+        "The malformed offset and its tail should resume without replaying the committed prefix"
+    );
+
+    let malformed = received
+        .iter()
+        .find(|message| message.payload.as_ref() == b"malformed-headers")
+        .expect("malformed message should be forwarded");
+    assert!(
+        malformed
+            .user_headers_map()
+            .expect("downstream user headers should be valid")
+            .is_none(),
+        "drop_headers should remove only the unparsable user headers"
+    );
+
+    let resumed_offsets = HashMap::from([(0, 3)]);
+    wait_for_source_state(harness, &resumed_offsets, 4, 2).await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn malformed_user_headers_do_not_back_off_healthy_partitions(
+    harness: &mut TestHarness,
+    fixture: IggySourceUpstreamFixture,
+) {
+    let upstream_client = fixture.client().await.expect("upstream client");
+    fixture.ensure_upstream_topic(&upstream_client).await;
+    let connectors_runtime = harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime");
+    connectors_runtime.add_env(RETRY_INTERVAL_ENV, "30s");
+    connectors_runtime.add_env(MAX_RETRY_INTERVAL_ENV, "30s");
+    restart_with_upstream_partition_count(harness, &upstream_client, MULTI_PARTITION_COUNT).await;
+
+    fixture
+        .produce_messages_to_partition(&upstream_client, 0, 0, &["healthy-partition-0".to_string()])
+        .await;
+    let mut malformed = [message_with_unknown_header_kind("blocked-partition-1")];
+    fixture
+        .produce_iggy_messages(&upstream_client, 1, &mut malformed)
+        .await;
+    fixture
+        .produce_messages_to_partition(&upstream_client, 2, 0, &["healthy-partition-2".to_string()])
+        .await;
+
+    let expected_offsets = HashMap::from([(0, 0), (2, 0)]);
+    wait_for_source_state(harness, &expected_offsets, 2, 1).await;
+
+    fixture
+        .produce_messages_to_partition(
+            &upstream_client,
+            2,
+            1,
+            &["healthy-after-conversion-error".to_string()],
+        )
+        .await;
+
+    let expected_offsets = HashMap::from([(0, 0), (2, 1)]);
+    wait_for_source_state(harness, &expected_offsets, 3, 2).await;
+
+    let received = drain_downstream_topic(harness, "iggy_source_partition_isolation", 3).await;
+    let mut payloads = received
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect::<Vec<_>>();
+    payloads.sort();
+    assert_eq!(
+        payloads,
+        [
+            "healthy-after-conversion-error",
+            "healthy-partition-0",
+            "healthy-partition-2",
+        ]
+    );
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn non_recoverable_poll_error_does_not_skip_remaining_partitions(
+    harness: &mut TestHarness,
+    fixture: IggySourceUpstreamFixture,
+) {
+    let upstream_client = fixture.client().await.expect("upstream client");
+    fixture.ensure_upstream_topic(&upstream_client).await;
+    let connectors_runtime = harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime");
+    connectors_runtime.add_env(POLL_INTERVAL_ENV, "5s");
+    connectors_runtime.add_env(RETRY_INTERVAL_ENV, "30s");
+    connectors_runtime.add_env(MAX_RETRY_INTERVAL_ENV, "30s");
+    restart_with_upstream_partition_count(harness, &upstream_client, MULTI_PARTITION_COUNT).await;
+
+    fixture
+        .produce_messages_to_partition(&upstream_client, 0, 0, &["before-topic-delete".to_string()])
+        .await;
+    let initial_offsets = HashMap::from([(0, 0)]);
+    let initial_state = wait_for_source_state(harness, &initial_offsets, 1, 0).await;
+    assert_eq!(initial_state.errors_count, 0);
+
+    upstream_client
+        .delete_topic(
+            &Identifier::named(UPSTREAM_STREAM).expect("valid stream name"),
+            &Identifier::named(UPSTREAM_TOPIC).expect("valid topic name"),
+        )
+        .await
+        .expect("Failed to delete upstream topic");
+
+    let failed_state = wait_for_source_state(harness, &initial_offsets, 1, 1).await;
+    assert_eq!(
+        failed_state.errors_count,
+        u64::from(MULTI_PARTITION_COUNT),
+        "Every discovered partition should be attempted before connector-wide backoff"
     );
 }
 
@@ -510,32 +673,7 @@ async fn multiple_upstream_partitions_resume_from_independent_offsets(
 ) {
     let upstream_client = fixture.client().await.expect("upstream client");
     fixture.ensure_upstream_topic(&upstream_client).await;
-
-    harness
-        .server_mut()
-        .stop_dependents()
-        .expect("Failed to stop connectors runtime");
-    let stream_id = Identifier::named(UPSTREAM_STREAM).expect("valid stream name");
-    let topic_id = Identifier::named(UPSTREAM_TOPIC).expect("valid topic name");
-    upstream_client
-        .create_partitions(
-            &stream_id,
-            &topic_id,
-            MULTI_PARTITION_COUNT.saturating_sub(1),
-        )
-        .await
-        .expect("Failed to create upstream partitions");
-    let topic = upstream_client
-        .get_topic(&stream_id, &topic_id)
-        .await
-        .expect("Failed to fetch upstream topic")
-        .expect("Upstream topic should exist");
-    assert_eq!(topic.partitions_count, MULTI_PARTITION_COUNT);
-    harness
-        .server_mut()
-        .start_dependents()
-        .await
-        .expect("Failed to restart connectors runtime");
+    restart_with_upstream_partition_count(harness, &upstream_client, MULTI_PARTITION_COUNT).await;
 
     let partition_payloads = [
         vec!["partition-0-message-0".to_string()],
