@@ -15150,6 +15150,174 @@ mod retention_tests {
 }
 
 #[cfg(test)]
+mod purge_poll_tests {
+    use super::tests::{journal_send_batch, repair_config, test_partition};
+    use super::*;
+    use crate::PollFragments;
+    use iggy_common::PollingStrategy;
+    use server_common::send_messages::decode_batch_slice;
+
+    #[compio::test]
+    async fn given_pending_disk_poll_when_purged_should_preserve_fresh_consumer_progress() {
+        Box::pin(assert_delayed_poll_preserves_fresh_progress(true)).await;
+    }
+
+    #[compio::test]
+    async fn given_disk_poll_without_auto_commit_when_purged_should_preserve_fresh_progress() {
+        Box::pin(assert_delayed_poll_preserves_fresh_progress(false)).await;
+    }
+
+    async fn assert_delayed_poll_preserves_fresh_progress(auto_commit: bool) {
+        let config = repair_config();
+        let (_directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
+        let consumer = PollingConsumer::Consumer(7, 0);
+        for op in 1..=3 {
+            journal_send_batch(&mut partition, op).await;
+        }
+        partition.consensus().advance_commit_max(3);
+        partition.commit_journal(&config).await;
+        assert_eq!(partition.offsets().commit_offset, 2);
+        assert_eq!(partition.log.segments().len(), 1);
+        assert!(!partition.log.active_segment().sealed);
+        assert!(partition.log.active_segment().size.as_bytes_u64() > 0);
+        assert!(
+            partition
+                .log
+                .journal()
+                .inner
+                .oldest_resident_offset()
+                .is_none()
+        );
+
+        let warm = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(PollingStrategy::offset(0), 1, true),
+            true,
+        );
+        assert!(warm.needs_off_pump_io());
+        let (warm_fragments, _, warm_commit) = warm.execute().await.expect("warm disk poll");
+        assert_eq!(polled_offsets(&warm_fragments), [0]);
+        assert_eq!(warm_commit.expect("warm poll commits").offset, 0);
+        assert_eq!(partition.get_consumer_offset(consumer), Some(0));
+        let read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
+        assert!(read_state.fd.borrow().is_some());
+
+        let delayed = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(PollingStrategy::offset(0), 3, auto_commit),
+            true,
+        );
+        assert!(delayed.needs_off_pump_io());
+        let mut delayed = std::pin::pin!(delayed.execute());
+        // The active segment needs no index I/O and its read descriptor is
+        // cached, so the first suspension holds a file clone in the real read.
+        assert!(
+            futures::poll!(delayed.as_mut()).is_pending(),
+            "the disk poll must suspend before purge",
+        );
+
+        partition.purge(&config, 1).await.expect("purge partition");
+        assert_eq!(partition.applied_purge_generation(), 1);
+        assert_eq!(partition.get_consumer_offset(consumer), None);
+        assert!(read_state.fd.borrow().is_none());
+        assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
+
+        for op in 4..=5 {
+            journal_send_batch(&mut partition, op).await;
+        }
+        partition.consensus().advance_commit_max(5);
+        partition.commit_journal(&config).await;
+        assert_eq!(partition.consensus().commit_min(), 5);
+        assert_eq!(partition.offsets().commit_offset, 1);
+
+        let (old_fragments, _, old_commit) = delayed.await.expect("complete delayed disk poll");
+        let stored_offset = partition.get_consumer_offset(consumer);
+        let admission_ready = old_commit
+            .as_ref()
+            .map(|commit| partition.auto_commit_admission_ready(commit));
+        let replication_offset = old_commit.map(|commit| commit.offset);
+        let (fresh_fragments, _, _) = partition
+            .build_poll_plan(
+                consumer,
+                &PollingArgs::new(PollingStrategy::offset(0), 3, false),
+                true,
+            )
+            .execute()
+            .await
+            .expect("poll fresh messages by offset");
+        let (next_fragments, _, _) = partition
+            .build_poll_plan(
+                consumer,
+                &PollingArgs::new(PollingStrategy::next(), 3, false),
+                true,
+            )
+            .execute()
+            .await
+            .expect("poll fresh messages with Next");
+
+        let old_offsets = polled_offsets(&old_fragments);
+        let fresh_offsets = polled_offsets(&fresh_fragments);
+        let next_offsets = polled_offsets(&next_fragments);
+        assert_eq!(fresh_offsets, [0, 1], "fresh messages must exist on disk");
+        // Returning or discarding the old read is independent of whether it
+        // may commit progress in the fresh history.
+        assert_eq!(
+            (stored_offset, replication_offset, next_offsets),
+            (None, None, vec![0, 1]),
+            "delayed poll auto_commit={auto_commit}, old offsets={old_offsets:?}, \
+             fresh offsets={fresh_offsets:?}, admission ready={admission_ready:?}; \
+             expected no stored or replicated \
+             offset and Next to return the fresh messages",
+        );
+    }
+
+    async fn disk_poll_partition(
+        config: &PartitionsConfig,
+    ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+        let directory = tempfile::tempdir().expect("create partition directory");
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.log.retire_front().expect("retire empty segment");
+        partition
+            .install_empty_segment(config, 0)
+            .await
+            .expect("install segment with real writers");
+
+        let consumer_path = directory.path().join("consumer_offsets");
+        let group_path = directory.path().join("consumer_group_offsets");
+        compio::fs::create_dir_all(&consumer_path)
+            .await
+            .expect("create consumer offsets directory");
+        compio::fs::create_dir_all(&group_path)
+            .await
+            .expect("create group offsets directory");
+        partition.configure_consumer_offset_storage(
+            consumer_path.to_string_lossy().into_owned(),
+            group_path.to_string_lossy().into_owned(),
+            ConsumerOffsets::with_capacity(1),
+            ConsumerGroupOffsets::with_capacity(1),
+            false,
+        );
+        (directory, partition)
+    }
+
+    fn polled_offsets(fragments: &PollFragments) -> Vec<u64> {
+        fragments
+            .iter()
+            .map(|fragment| {
+                let batch = decode_batch_slice(fragment.as_slice()).expect("decode polled batch");
+                assert_eq!(
+                    batch.message_count(),
+                    1,
+                    "fixture sends one message per batch"
+                );
+                batch.header.base_offset
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
 mod purge_floor_tests {
     use super::tests::{
         armed_session, build_segment_record, journal_send_batch, repair_config,
