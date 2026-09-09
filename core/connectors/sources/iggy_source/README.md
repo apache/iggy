@@ -11,7 +11,7 @@ partition so replication can resume after a restart.
 - Preserves payload bytes and non-zero message IDs.
 - Preserves user headers by default, with an option to omit them.
 - Stores per-partition offsets in the connector runtime's state storage.
-- Retries polling failures with exponential backoff and jitter.
+- Retries fully failed polling cycles with exponential backoff and jitter.
 - Creates the configured upstream stream or topic when it does not exist.
 
 ## Configuration
@@ -41,6 +41,7 @@ poll_interval = "1s"
 batch_size = 100
 initial_offset = "earliest"
 include_user_headers = true
+malformed_message_policy = "block"
 retry_interval = "1s"
 max_retry_interval = "60s"
 verbose_logging = false
@@ -62,7 +63,8 @@ messages are requested from each upstream partition in one poll cycle.
 | `batch_size` | no | `100` | Maximum messages requested from each upstream partition per poll cycle. |
 | `initial_offset` | no | `earliest` | Starting position for a partition without a saved offset. Accepts `earliest`, `latest`, or an absolute numeric offset. |
 | `include_user_headers` | no | `true` | Copy user headers to downstream messages. |
-| `retry_interval` | no | `1s` | Base delay used for exponential backoff after a failed poll cycle. |
+| `malformed_message_policy` | no | `block` | Handling for messages with unparsable user headers: `block` retries from the failed offset; `drop_headers` forwards the payload without those headers. |
+| `retry_interval` | no | `1s` | Base delay used for exponential backoff when every partition poll in a cycle fails. |
 | `max_retry_interval` | no | `60s` | Maximum delay between poll retries. |
 | `verbose_logging` | no | `false` | Log per-cycle connector details at info level instead of debug level. |
 
@@ -114,6 +116,14 @@ partition's saved position and applies `initial_offset` again.
   missing, it creates the topic with one partition and no compression.
 - Invalid `initial_offset` values produce a warning and fall back to
   `earliest`.
-- If user headers cannot be decoded, the connector rejects the complete polled
-  batch so its offsets are not advanced. Set `include_user_headers = false` to
-  replicate payloads without parsing upstream headers.
+- If user headers cannot be decoded, `malformed_message_policy = "block"`
+  forwards the valid prefix before the malformed message, leaves that
+  partition at the failed offset, and continues polling other partitions at
+  the normal `poll_interval`. Record conversion errors do not activate the
+  connector-wide polling backoff.
+- `malformed_message_policy = "drop_headers"` forwards a malformed message's
+  payload without its user headers and advances the partition offset. Setting
+  `include_user_headers = false` bypasses header parsing for every message.
+- A polling error on one partition is logged and counted without skipping the
+  remaining partitions. Connector-wide backoff is activated only when no
+  partition poll succeeds during the cycle.
