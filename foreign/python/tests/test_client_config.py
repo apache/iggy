@@ -257,8 +257,8 @@ class TestTcpConfig:
         ["", "127.0.0.1", "127.0.0.1:not-a-port", "127.0.0.1:70000", "::1:8090"],
     )
     def test_invalid_server_address_is_rejected(self, invalid_address: str):
-        """Test that a malformed address fails at construction, not at connect."""
-        with pytest.raises(ValueError):
+        """Test that a malformed address fails at construction, naming itself."""
+        with pytest.raises(ValueError, match="server_address"):
             TcpConfig(server_address=invalid_address)
 
     def test_negative_heartbeat_interval_is_rejected(self):

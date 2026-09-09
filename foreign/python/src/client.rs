@@ -19,7 +19,7 @@ use bytes::Bytes;
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyExpiry as RustIggyExpiry, IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
-    PollingStrategy as RustPollingStrategy, *,
+    Partitioning as RustPartitioning, PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
 use pyo3::prelude::*;
@@ -40,6 +40,7 @@ use crate::consumer::{
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
+use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
@@ -92,17 +93,19 @@ fn resolve_topic_params(
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
-    /// `QuicConfig`. This initializes a new runtime for asynchronous operations.
+    /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
+    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
+    /// new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
     ///
     /// Args:
-    ///     conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
-    ///         to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
-    ///         address is reported differently depending on the form: the string
-    ///         form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
-    ///         raise `ValueError` when they are constructed, before either ever
-    ///         reaches this call. Neither exception is a subclass of the other.
+    ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
+    ///         `HttpConfig`, or a `WebSocketConfig`. Defaults to `127.0.0.1:8090`
+    ///         over TCP with auto-login disabled. A malformed address is reported
+    ///         differently depending on the form: the string form raises
+    ///         `RuntimeError` here, while every config type raises `ValueError`
+    ///         when it is constructed, before any of them reaches this call. Neither
+    ///         exception is a subclass of the other.
     ///
     /// Raises:
     ///     RuntimeError: If the address passed as a string is not a valid
@@ -111,7 +114,9 @@ impl IggyClient {
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
-        #[gen_stub(override_type(type_repr = "TcpConfig | QuicConfig | builtins.str | None"))]
+        #[gen_stub(override_type(
+            type_repr = "TcpConfig | QuicConfig | HttpConfig | WebSocketConfig | builtins.str | None"
+        ))]
         conn: Option<PyClientConfig>,
     ) -> PyResult<Self> {
         let wrapper = match conn {
@@ -138,6 +143,12 @@ impl IggyClient {
                     QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
                 )
             }
+            Some(PyClientConfig::Http(config)) => ClientWrapper::Http(
+                HttpClient::create(config.client_config()).map_err(to_runtime_error)?,
+            ),
+            Some(PyClientConfig::WebSocket(config)) => ClientWrapper::WebSocket(
+                WebSocketClient::create(config.client_config()).map_err(to_runtime_error)?,
+            ),
             None => ClientWrapper::Tcp(
                 TcpClient::create(Arc::new(TcpClientConfig::default()))
                     .map_err(to_runtime_error)?,
@@ -500,8 +511,10 @@ impl IggyClient {
         })
     }
 
-    /// Connects the IggyClient to its service.
-    /// Raises `RuntimeError` if the connection fails.
+    /// Connects the IggyClient to its service and starts the heartbeat task.
+    /// Raises `RuntimeError` if the connection fails. Over HTTP there is no
+    /// connection to establish, so only the heartbeat starts and this call
+    /// succeeds even against an unreachable server.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -1181,18 +1194,36 @@ impl IggyClient {
         })
     }
 
-    /// Sends a list of messages to the specified topic.
-    /// Returns a SendMessagesResponse carrying the per-partition commit
-    /// confirmations, or a PyRuntimeError on failure. The confirmation list is
-    /// empty when the server reports no offsets, and the legacy server never
-    /// reports any.
+    /// Sends a batch of messages to a topic using the selected partitioning strategy.
+    ///
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     topic: Topic identifier as `str | int`.
+    ///     partitioning: A `Partitioning` strategy or an integer partition ID.
+    ///         Use `Partitioning.balanced()`, `Partitioning.partition_id(id)`, or
+    ///         `Partitioning.messages_key(key)`. An integer is shorthand for
+    ///         `Partitioning.partition_id(id)`.
+    ///     messages: Messages to send as `list[SendMessage]`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `SendMessagesResponse`. Its confirmations
+    ///     report the committed partition and batch base offset. The list is empty
+    ///     when the server reports no offsets, including on the legacy server.
+    ///
+    /// Raises:
+    ///     ValueError: If a string stream or topic identifier is invalid.
+    ///     TypeError: If `partitioning` or `messages` has an unsupported type.
+    ///     OverflowError: If a numeric stream, topic, or partition ID is outside
+    ///         the supported unsigned 32-bit range.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
         py: Python<'a>,
         stream: PyIdentifier,
         topic: PyIdentifier,
-        partitioning: u32,
+        #[gen_stub(override_type(type_repr = "Partitioning | builtins.int"))]
+        partitioning: PyPartitioning,
         #[gen_stub(override_type(type_repr = "list[SendMessage]"))] messages: &Bound<'_, PyList>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let messages: Vec<SendMessage> = messages
@@ -1209,7 +1240,7 @@ impl IggyClient {
 
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
-        let partitioning = Partitioning::partition_id(partitioning);
+        let partitioning = RustPartitioning::from(partitioning);
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
@@ -1237,7 +1268,7 @@ impl IggyClient {
         polling_strategy: &PollingStrategy,
         count: u32,
         auto_commit: bool,
-        partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let consumer = RustConsumer::try_from(consumer)?;
         let stream = Identifier::try_from(stream)?;
@@ -1279,6 +1310,15 @@ impl IggyClient {
     /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
     /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
     /// is zero.
+    ///
+    /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
+    /// left on, this call fails at the join with `Feature is unavailable`.
+    /// Turning it off is not a workaround: the join is skipped, but a group
+    /// member always polls without a partition, so the first poll fails with
+    /// the same error. Use `Consumer.Single(...)` with `poll_messages(...)`
+    /// instead - a `Consumer.Group(...)` poll with an explicit `partition_id`
+    /// does reach the server, but is served as an ordinary consumer named
+    /// after the group.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         name,

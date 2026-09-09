@@ -39,12 +39,14 @@ __all__ = [
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
+    "HttpConfig",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
     "MaxTopicSize",
     "OptionSpec",
     "Partition",
+    "Partitioning",
     "Permissions",
     "PollingStrategy",
     "QuicConfig",
@@ -66,6 +68,9 @@ __all__ = [
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
+    "WebSocketConfig",
+    "WebSocketFramingConfig",
+    "WebSocketReconnectionConfig",
 ]
 
 class AutoCommit:
@@ -895,26 +900,106 @@ class HeaderValue:
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
+class HttpConfig:
+    r"""
+    Configuration for the HTTP transport, accepted by `IggyClient(...)`.
+
+    Every field is keyword-only and optional.
+
+    There is no `AutoLogin` and no reconnection policy, and `connect()` does not
+    dial: it only starts the heartbeat, so `login_user(...)` has to follow it.
+
+    HTTP is single-consumer only. `consumer_group(...)` fails with
+    `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
+    names an explicit `partition_id`. With one, the consumer kind is not carried
+    on the HTTP wire, so the poll is served as an ordinary consumer named after
+    the group, with no membership, no partition assignment, and no rebalancing
+    behind it. Pass `Consumer.Single(...)` explicitly.
+    """
+    @property
+    def api_url(self) -> builtins.str: ...
+    @property
+    def retries(self) -> builtins.int: ...
+    @property
+    def has_jwt(self) -> builtins.bool:
+        r"""
+        Whether a JWT is configured, without exposing the token itself.
+        """
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        api_url: builtins.str | None = None,
+        retries: builtins.int | None = None,
+        jwt: builtins.str | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+    ) -> HttpConfig:
+        r"""
+        Constructs an HTTP configuration.
+
+        Args:
+            api_url: Base URL of the Iggy HTTP API, as `scheme://host[:port]`
+                only - no path, query, fragment, or credentials. Defaults to
+                `http://127.0.0.1:3000`.
+            retries: Number of retries to perform on transient errors, each one
+                replaying the full request (including its body) via automatic
+                middleware. Defaults to 3. Delivery is therefore at-least-once:
+                if the original request actually committed but its response
+                was lost (e.g. to a timeout), a retried call applies the same
+                operation again. Set to 0 to disable automatic replay and match
+                the other transports, which surface the failure instead of
+                silently resending.
+            jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to
+                `None`. Stored trimmed, since a token read from a file carries a
+                trailing newline that the `Authorization` header value rejects.
+                Rejected if empty or whitespace-only: accepting it would make
+                `has_jwt` report `True` while every call still fails
+                `Unauthenticated`.
+            heartbeat_interval: Interval between the client's liveness probes
+                (a bare `GET /ping`). Defaults to 5 seconds. Unlike TCP/QUIC,
+                HTTP has no persistent connection or session for this to keep
+                alive; it only proves the server is reachable.
+
+        Raises:
+            ValueError: If `api_url` is not a valid URL, if `retries` is outside
+                the range of an unsigned 32-bit integer, if `jwt` is empty or
+                whitespace-only, if a duration is negative, or if
+                `heartbeat_interval` is zero.
+            OverflowError: If `retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
     It provides asynchronous functionality through the contained runtime.
     """
     def __new__(
-        cls, conn: TcpConfig | QuicConfig | builtins.str | None = None
+        cls,
+        conn: TcpConfig
+        | QuicConfig
+        | HttpConfig
+        | WebSocketConfig
+        | builtins.str
+        | None = None,
     ) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
-        `QuicConfig`. This initializes a new runtime for asynchronous operations.
+        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
+        `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
+        new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
 
         Args:
-            conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
-                to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
-                address is reported differently depending on the form: the string
-                form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
-                raise `ValueError` when they are constructed, before either ever
-                reaches this call. Neither exception is a subclass of the other.
+            conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
+                `HttpConfig`, or a `WebSocketConfig`. Defaults to `127.0.0.1:8090`
+                over TCP with auto-login disabled. A malformed address is reported
+                differently depending on the form: the string form raises
+                `RuntimeError` here, while every config type raises `ValueError`
+                when it is constructed, before any of them reaches this call. Neither
+                exception is a subclass of the other.
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
@@ -1114,8 +1199,10 @@ class IggyClient:
         """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
-        Connects the IggyClient to its service.
-        Raises `RuntimeError` if the connection fails.
+        Connects the IggyClient to its service and starts the heartbeat task.
+        Raises `RuntimeError` if the connection fails. Over HTTP there is no
+        connection to establish, so only the heartbeat starts and this call
+        succeeds even against an unreachable server.
         """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
@@ -1493,15 +1580,32 @@ class IggyClient:
         self,
         stream: builtins.str | builtins.int,
         topic: builtins.str | builtins.int,
-        partitioning: builtins.int,
+        partitioning: Partitioning | builtins.int,
         messages: list[SendMessage],
     ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
-        Sends a list of messages to the specified topic.
-        Returns a SendMessagesResponse carrying the per-partition commit
-        confirmations, or a PyRuntimeError on failure. The confirmation list is
-        empty when the server reports no offsets, and the legacy server never
-        reports any.
+        Sends a batch of messages to a topic using the selected partitioning strategy.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            topic: Topic identifier as `str | int`.
+            partitioning: A `Partitioning` strategy or an integer partition ID.
+                Use `Partitioning.balanced()`, `Partitioning.partition_id(id)`, or
+                `Partitioning.messages_key(key)`. An integer is shorthand for
+                `Partitioning.partition_id(id)`.
+            messages: Messages to send as `list[SendMessage]`.
+
+        Returns:
+            An awaitable that resolves to `SendMessagesResponse`. Its confirmations
+            report the committed partition and batch base offset. The list is empty
+            when the server reports no offsets, including on the legacy server.
+
+        Raises:
+            ValueError: If a string stream or topic identifier is invalid.
+            TypeError: If `partitioning` or `messages` has an unsupported type.
+            OverflowError: If a numeric stream, topic, or partition ID is outside
+                the supported unsigned 32-bit range.
+            RuntimeError: If the request fails.
         """
     def poll_messages(
         self,
@@ -1545,6 +1649,15 @@ class IggyClient:
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
         `AutoCommit` interval is negative, or if any of those except `poll_interval`
         is zero.
+
+        Consumer groups are not available over HTTP. With `auto_join_consumer_group`
+        left on, this call fails at the join with `Feature is unavailable`.
+        Turning it off is not a workaround: the join is skipped, but a group
+        member always polls without a partition, so the first poll fails with
+        the same error. Use `Consumer.Single(...)` with `poll_messages(...)`
+        instead - a `Consumer.Group(...)` poll with an explicit `partition_id`
+        does reach the server, but is served as an ordinary consumer named
+        after the group.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
@@ -1804,6 +1917,42 @@ class Partition:
         """
 
 @typing.final
+class Partitioning:
+    r"""
+    Defines how a batch of messages is assigned to a topic partition.
+    """
+    @staticmethod
+    def balanced() -> Partitioning:
+        r"""
+        Routes the batch to one partition selected by round-robin.
+        """
+    @staticmethod
+    def partition_id(partition_id: builtins.int) -> Partitioning:
+        r"""
+        Routes the batch to the specified partition.
+
+        `partition_id` must be between 0 and `2**32 - 1`. The topic must contain
+        that partition when the batch is sent.
+
+        Raises:
+            TypeError: If `partition_id` is not an integer.
+            OverflowError: If `partition_id` is outside the supported unsigned
+                32-bit range.
+        """
+    @staticmethod
+    def messages_key(key: builtins.str | bytes) -> Partitioning:
+        r"""
+        Routes the batch to one partition selected by hashing `key`.
+
+        `key` may be `str` or `bytes`. Strings are encoded as UTF-8; the encoded
+        key must contain between 1 and 255 bytes.
+
+        Raises:
+            ValueError: If the encoded key is empty or exceeds 255 bytes.
+            TypeError: If `key` is not `str` or `bytes`.
+        """
+
+@typing.final
 class Permissions:
     r"""
     The permissions of a user: global permissions applied to all streams,
@@ -1954,7 +2103,7 @@ class QuicConfig:
                 seconds) instead, since `configure()` skips the setter entirely when
                 zero. Defaults to 10 seconds.
             validate_certificate: Whether to validate the server certificate. Defaults
-                to disabled, unlike the TCP and WebSocket transports.
+                to disabled; only the TCP transport validates by default.
 
         Raises:
             ValueError: If `server_address` or `client_address` is not a valid
@@ -1963,6 +2112,8 @@ class QuicConfig:
                 `max_idle_timeout` is not a whole number of milliseconds, if
                 `initial_mtu` is below quinn's minimum of 1200, or if a numeric
                 field is outside the range of its underlying wire type.
+            OverflowError: If a numeric field does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2010,6 +2161,8 @@ class QuicReconnectionConfig:
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2578,6 +2731,8 @@ class TcpReconnectionConfig:
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2855,6 +3010,186 @@ class UserInfoDetails:
         r"""
         The permissions of the user, or `None` when the user has none assigned.
         """
+
+@typing.final
+class WebSocketConfig:
+    r"""
+    Configuration for the WebSocket transport, accepted by `IggyClient(...)`.
+
+    Every field is keyword-only and optional.
+    """
+    @property
+    def server_address(self) -> builtins.str: ...
+    @property
+    def auto_login(self) -> AutoLogin: ...
+    @property
+    def reconnection(self) -> WebSocketReconnectionConfig: ...
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    @property
+    def framing(self) -> WebSocketFramingConfig: ...
+    @property
+    def tls_enabled(self) -> builtins.bool: ...
+    @property
+    def tls_domain(self) -> builtins.str: ...
+    @property
+    def tls_ca_file(self) -> builtins.str | None: ...
+    @property
+    def tls_validate_certificate(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        server_address: builtins.str | None = None,
+        auto_login: AutoLogin | None = None,
+        reconnection: WebSocketReconnectionConfig | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+        framing: WebSocketFramingConfig | None = None,
+        tls_enabled: builtins.bool | None = None,
+        tls_domain: builtins.str | None = None,
+        tls_ca_file: builtins.str | None = None,
+        tls_validate_certificate: builtins.bool | None = None,
+    ) -> WebSocketConfig:
+        r"""
+        Constructs a WebSocket configuration.
+
+        Args:
+            server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8092`.
+            auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            reconnection: Reconnection policy. Defaults to `WebSocketReconnectionConfig()`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+            framing: Frame- and buffer-level options. Defaults to `WebSocketFramingConfig()`.
+            tls_enabled: Whether to connect over TLS. Defaults to disabled.
+            tls_domain: Domain to validate the certificate against. Defaults to
+                `localhost`. Empty means it is taken from the IP `server_address`
+                resolves to.
+            tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
+                and `tls_validate_certificate` are both on; with either one off it
+                is kept but never consulted, so pairing it with
+                `tls_validate_certificate=False` pins nothing.
+            tls_validate_certificate: Whether to validate the server certificate.
+                Defaults to `False`; only the TCP transport validates by default.
+                Disabling this accepts any certificate the server presents,
+                including self-signed and mismatched ones, and takes precedence
+                over `tls_ca_file`.
+
+        Raises:
+            ValueError: If `server_address` is not a valid `host:port` pair, if a
+                duration is negative, or if `heartbeat_interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class WebSocketFramingConfig:
+    r"""
+    Frame- and buffer-level options passed through to the underlying WebSocket
+    implementation, accepted by `WebSocketConfig`'s `framing` argument.
+
+    Every field is keyword-only and optional; unset fields fall back to the
+    underlying WebSocket library's own defaults.
+    """
+    @property
+    def read_buffer_size(self) -> builtins.int | None: ...
+    @property
+    def write_buffer_size(self) -> builtins.int | None: ...
+    @property
+    def max_write_buffer_size(self) -> builtins.int | None: ...
+    @property
+    def max_message_size(self) -> builtins.int | None: ...
+    @property
+    def max_frame_size(self) -> builtins.int | None: ...
+    @property
+    def accept_unmasked_frames(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        read_buffer_size: builtins.int | None = None,
+        write_buffer_size: builtins.int | None = None,
+        max_write_buffer_size: builtins.int | None = None,
+        max_message_size: builtins.int | None = 64 << 20,
+        max_frame_size: builtins.int | None = 16 << 20,
+        accept_unmasked_frames: builtins.bool | None = None,
+    ) -> WebSocketFramingConfig:
+        r"""
+        Constructs a WebSocket framing configuration.
+
+        Args:
+            read_buffer_size: Read buffer size in bytes. Defaults to 128 KiB.
+            write_buffer_size: Write buffer size in bytes. Defaults to 128 KiB.
+            max_write_buffer_size: Maximum write buffer size in bytes. Defaults to
+                unbounded, which reads back as the largest value a pointer-sized
+                unsigned integer holds rather than as `None`.
+            max_message_size: Maximum message size in bytes, or an explicit `None`
+                to lift the limit entirely. Omitting the argument is not the same
+                as passing `None`: it keeps the underlying default of 64 MiB.
+                Lifting the limit lets a peer queue an arbitrarily large message
+                in memory, so prefer a finite value.
+            max_frame_size: Maximum frame size in bytes, or an explicit `None` to
+                lift the limit entirely. Omitting the argument keeps the
+                underlying default of 16 MiB, with the same caveat as
+                `max_message_size`.
+            accept_unmasked_frames: Whether to accept unmasked frames. Defaults to
+                `False`; clients should typically keep this off for RFC compliance.
+
+        Raises:
+            ValueError: If a numeric field is outside the range of a pointer-sized
+                unsigned integer, or if `max_write_buffer_size` does not come out
+                greater than `write_buffer_size`. tungstenite enforces the same
+                invariant with an `assert!` at connect time, which would otherwise
+                surface as an unrecoverable Rust panic instead of a `ValueError`.
+            OverflowError: If a numeric field does not fit a signed 128-bit integer,
+                raised by the underlying conversion before this constructor runs.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class WebSocketReconnectionConfig:
+    r"""
+    How the WebSocket client reconnects after the connection to the server is lost.
+    """
+    @property
+    def enabled(self) -> builtins.bool: ...
+    @property
+    def max_retries(self) -> builtins.int | None: ...
+    @property
+    def interval(self) -> datetime.timedelta: ...
+    @property
+    def reestablish_after(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        enabled: builtins.bool | None = None,
+        max_retries: builtins.int | None = None,
+        interval: datetime.timedelta | None = None,
+        reestablish_after: datetime.timedelta | None = None,
+    ) -> WebSocketReconnectionConfig:
+        r"""
+        Constructs a reconnection policy.
+
+        Args:
+            enabled: Whether to reconnect at all. Defaults to enabled.
+            max_retries: Redials of the configured server address after the first
+                attempt, or `None` for unlimited; `0` still makes that first
+                attempt. Unlike the TCP transport, WebSocket redials the one
+                address it was configured with rather than walking a cluster
+                roster, so this counts dials. Defaults to unlimited, which means
+                a call awaited while the server is down never returns:
+                `connect()` waits inside the retry loop, as do `send_messages()`
+                and `poll_messages()` once auto-login is configured. Set a finite
+                number for request/reply style usage, so a call fails instead.
+            interval: Delay before each redial. Defaults to 1 second.
+            reestablish_after: Cooldown before redialing after a previously
+                successful connection, measured from when it was established, so
+                a session that outlived the interval is redialed at once. Applied
+                from the first redial onward, not to the initial connect.
+                Defaults to 5 seconds.
+
+        Raises:
+            ValueError: If a duration is negative, if `max_retries` is outside the
+                range of an unsigned 32-bit integer, or if `interval` is zero.
+            OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+                raised by the underlying conversion before this constructor runs.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class UserStatus(enum.Enum):

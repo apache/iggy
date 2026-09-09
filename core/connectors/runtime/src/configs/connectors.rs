@@ -30,7 +30,9 @@ use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Formatter;
+use std::ops::Deref;
 use std::path::PathBuf;
+use std::str::FromStr;
 use strum::Display;
 
 #[derive(
@@ -47,6 +49,74 @@ pub enum ConfigFormat {
     Toml,
     #[strum(to_string = "text")]
     Text,
+}
+
+/// A connector key becomes part of a filename under the local provider's
+/// `config_dir` and of a URL under the HTTP provider, so it must stay a single
+/// path component. Requiring a leading letter or digit is what rules out `.`,
+/// `..` and hidden-file names outright, instead of relying on the `sink_` /
+/// `source_` filename prefix to neutralize them.
+#[derive(Debug)]
+pub struct ConnectorKey(String);
+
+impl ConnectorKey {
+    /// Leaves room for the `source_` prefix, the version suffix and the
+    /// `.toml` extension inside a 255-byte filename limit.
+    pub const MAX_LENGTH: usize = 128;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn is_valid(key: &str) -> bool {
+        key.len() <= Self::MAX_LENGTH
+            && key.as_bytes().split_first().is_some_and(|(first, rest)| {
+                first.is_ascii_alphanumeric()
+                    && rest.iter().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.')
+                    })
+            })
+    }
+}
+
+impl TryFrom<String> for ConnectorKey {
+    type Error = RuntimeError;
+
+    fn try_from(key: String) -> Result<Self, Self::Error> {
+        if Self::is_valid(&key) {
+            Ok(Self(key))
+        } else {
+            Err(RuntimeError::InvalidConnectorKey(key))
+        }
+    }
+}
+
+impl FromStr for ConnectorKey {
+    type Err = RuntimeError;
+
+    fn from_str(key: &str) -> Result<Self, Self::Err> {
+        Self::try_from(key.to_owned())
+    }
+}
+
+impl Deref for ConnectorKey {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<ConnectorKey> for String {
+    fn from(key: ConnectorKey) -> Self {
+        key.0
+    }
+}
+
+impl std::fmt::Display for ConnectorKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,17 +157,17 @@ pub struct CreateSinkConfig {
 }
 
 impl CreateSinkConfig {
-    fn to_sink_config(&self, key: &str, version: u64) -> SinkConfig {
+    fn into_sink_config(self, key: &ConnectorKey, version: u64) -> SinkConfig {
         SinkConfig {
-            key: key.to_owned(),
+            key: key.to_string(),
             enabled: self.enabled,
             version,
-            name: self.name.clone(),
-            path: self.path.clone(),
-            transforms: self.transforms.clone(),
-            streams: self.streams.clone(),
+            name: self.name,
+            path: self.path,
+            transforms: self.transforms,
+            streams: self.streams,
             plugin_config_format: self.plugin_config_format,
-            plugin_config: self.plugin_config.clone(),
+            plugin_config: self.plugin_config,
             verbose: self.verbose,
             benchmark: self.benchmark,
         }
@@ -140,17 +210,17 @@ pub struct CreateSourceConfig {
 }
 
 impl CreateSourceConfig {
-    fn to_source_config(&self, key: &str, version: u64) -> SourceConfig {
+    fn into_source_config(self, key: &ConnectorKey, version: u64) -> SourceConfig {
         SourceConfig {
-            key: key.to_owned(),
+            key: key.to_string(),
             enabled: self.enabled,
             version,
-            name: self.name.clone(),
-            path: self.path.clone(),
-            transforms: self.transforms.clone(),
-            streams: self.streams.clone(),
+            name: self.name,
+            path: self.path,
+            transforms: self.transforms,
+            streams: self.streams,
             plugin_config_format: self.plugin_config_format,
-            plugin_config: self.plugin_config.clone(),
+            plugin_config: self.plugin_config,
             verbose: self.verbose,
             benchmark: self.benchmark,
         }
@@ -222,16 +292,19 @@ pub struct ConnectorConfigVersions {
     pub sources: HashMap<String, ConnectorConfigVersionInfo>,
 }
 
+/// Only the two `create_*` methods take a parsed key: they are where the local
+/// provider turns the key into a filename, so the type carries the proof that
+/// the API boundary already validated it. The other methods only compare keys.
 #[async_trait]
 pub trait ConnectorsConfigProvider: Send + Sync {
     async fn create_sink_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         config: CreateSinkConfig,
     ) -> Result<SinkConfig, RuntimeError>;
     async fn create_source_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         config: CreateSourceConfig,
     ) -> Result<SourceConfig, RuntimeError>;
     async fn get_active_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
@@ -409,5 +482,82 @@ impl ConnectorsConfig {
 
     pub fn sources(&self) -> &HashMap<String, SourceConfig> {
         &self.sources
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_single_component_key_when_parsed_should_succeed() {
+        for key in ["postgres", "es-sink.v2_1", "A1", "9lives", "a.b-c_d"] {
+            let parsed: ConnectorKey = key
+                .parse()
+                .unwrap_or_else(|error| panic!("key {key:?} should be accepted, got: {error}"));
+            assert_eq!(parsed.as_str(), key);
+            assert_eq!(parsed.to_string(), key);
+        }
+    }
+
+    #[test]
+    fn given_key_at_the_length_limit_when_parsed_should_succeed() {
+        let key = "k".repeat(ConnectorKey::MAX_LENGTH);
+        assert_eq!(key.parse::<ConnectorKey>().unwrap().as_str(), key);
+    }
+
+    #[test]
+    fn given_key_over_the_length_limit_when_parsed_should_fail() {
+        assert_rejected(&"k".repeat(ConnectorKey::MAX_LENGTH + 1));
+    }
+
+    #[test]
+    fn given_key_with_path_separator_when_parsed_should_fail() {
+        for key in ["../../pwned", "x/../../../tmp/pwn", "a/b", "a\\b", "/abs"] {
+            assert_rejected(key);
+        }
+    }
+
+    #[test]
+    fn given_key_that_is_a_dot_segment_or_hidden_name_when_parsed_should_fail() {
+        for key in [".", "..", "..evil", ".hidden"] {
+            assert_rejected(key);
+        }
+    }
+
+    #[test]
+    fn given_key_with_characters_outside_the_charset_when_parsed_should_fail() {
+        for key in [
+            "",
+            "-leading-dash",
+            "_leading_underscore",
+            "with space",
+            "k\0ey",
+            "k\ney",
+            "ключ",
+            "a#b",
+        ] {
+            assert_rejected(key);
+        }
+    }
+
+    #[test]
+    fn given_owned_key_when_converted_should_apply_the_same_rule() {
+        let accepted = ConnectorKey::try_from("random".to_owned()).unwrap();
+        assert_eq!(accepted.as_str(), "random");
+
+        let rejected = ConnectorKey::try_from("../pwned".to_owned()).unwrap_err();
+        assert!(
+            matches!(&rejected, RuntimeError::InvalidConnectorKey(key) if key == "../pwned"),
+            "unexpected error: {rejected}"
+        );
+    }
+
+    fn assert_rejected(key: &str) {
+        let result = key.parse::<ConnectorKey>();
+        assert!(
+            matches!(&result, Err(RuntimeError::InvalidConnectorKey(rejected)) if rejected == key),
+            "key {key:?} should be rejected, got: {result:?}"
+        );
     }
 }

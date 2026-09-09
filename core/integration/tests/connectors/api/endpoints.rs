@@ -21,8 +21,15 @@ use iggy_connector_sdk::api::{
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
+use serde_json::{Value, json};
+use std::fs;
 
 const API_KEY: &str = "test-api-key";
+/// `config_dir` of `key_validation.toml`, relative to the crate root, which is
+/// the working directory of both the test process and the spawned runtime. It
+/// lives under the gitignored `test_logs/` so a regression that writes a config
+/// file cannot land in the source tree or be loaded by another test.
+const CONNECTORS_CONFIG_DIR: &str = "../../test_logs/connectors_api_key_validation";
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
@@ -242,4 +249,101 @@ async fn api_key_authentication_rejected_with_invalid_key(harness: &TestHarness)
         .unwrap();
 
     assert_eq!(response.status(), 401);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/key_validation.toml")),
+    seed = seeds::connector_stream
+)]
+async fn key_endpoints_reject_key_that_is_not_a_single_path_component(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+    let client = Client::new();
+    let config = json!({
+        "enabled": false,
+        "name": "x",
+        "path": "/tmp/evil.so",
+        "streams": []
+    });
+    let config_dir_before = config_dir_entries();
+
+    // Each entry is a percent-encoded path segment: axum decodes it before
+    // handing it to the handler, so `..%2F..%2Fpwned` arrives as `../../pwned`.
+    // The charset itself is covered by unit tests; these are the two probes
+    // from the issue report plus a hidden-file name.
+    let keys = ["..%2F..%2Fpwned", "x%2F..%2F..%2F..%2Ftmp%2Fpwn", ".hidden"];
+    for key in keys {
+        for kind in ["sources", "sinks"] {
+            let response = client
+                .post(format!("{api_address}/{kind}/{key}/configs"))
+                .header("api-key", API_KEY)
+                .json(&config)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "POST /{kind}/{key}/configs");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(
+                body["code"], "invalid_connector_key",
+                "POST /{kind}/{key}/configs body: {body}"
+            );
+
+            let response = client
+                .get(format!("{api_address}/{kind}/{key}"))
+                .header("api-key", API_KEY)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "GET /{kind}/{key}");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(
+                body["code"], "invalid_connector_key",
+                "GET /{kind}/{key} body: {body}"
+            );
+        }
+    }
+
+    assert_eq!(
+        config_dir_entries(),
+        config_dir_before,
+        "no config file should have been written"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn key_endpoints_accept_single_component_key(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+    let client = Client::new();
+
+    for (kind, code) in [("sources", "source_not_found"), ("sinks", "sink_not_found")] {
+        let response = client
+            .get(format!("{api_address}/{kind}/postgres-cdc.v2_1"))
+            .header("api-key", API_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "GET /{kind}/postgres-cdc.v2_1");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["code"], code,
+            "GET /{kind}/postgres-cdc.v2_1 body: {body}"
+        );
+    }
+}
+
+fn config_dir_entries() -> Vec<String> {
+    let mut entries: Vec<String> = fs::read_dir(CONNECTORS_CONFIG_DIR)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    entries
 }

@@ -41,6 +41,7 @@ pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 pub use crate::clients::producer_sharding::{BalancedSharding, OrderedSharding, Sharding};
 pub use crate::consumer_ext::IggyConsumerMessageExt;
+pub use crate::http::http_client::HttpClient;
 pub use crate::quic::quic_client::QuicClient;
 pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
@@ -66,8 +67,8 @@ pub use iggy_common::{
     TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
     TopicPermissions, TopicUpdateOptions, TransportEndpoints, TransportProtocol, UserId, UserInfo,
     UserInfoDetails, UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
-    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
-    topic_option_keys,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, WebSocketConfig, defaults,
+    locking, topic_option_keys,
 };
 pub use iggy_common::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,

@@ -23,11 +23,14 @@ from datetime import timedelta
 
 from apache_iggy import (
     AutoLogin,
+    HttpConfig,
     IggyClient,
+    QuicConfig,
     StreamDetails,
     TcpConfig,
     TcpReconnectionConfig,
     TopicDetails,
+    WebSocketConfig,
 )
 from apache_iggy import SendMessage as Message
 from loguru import logger
@@ -100,12 +103,14 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(args))
 
 
-def build_config(args: ArgNamespace) -> TcpConfig:
-    """Build the TCP client configuration with auto-login and reconnection."""
+def build_config(
+    args: ArgNamespace,
+) -> TcpConfig | QuicConfig | HttpConfig | WebSocketConfig:
+    """Build the client configuration, TCP with auto-login and reconnection."""
 
     # IggyClient(...) also accepts a QuicConfig for the QUIC transport. To use
-    # it, import QuicConfig and QuicReconnectionConfig above, change the return
-    # annotation to QuicConfig, and replace the return statement with:
+    # it, uncomment the return below and import QuicReconnectionConfig, which is
+    # left out above because only the commented block names it:
     #
     # return QuicConfig(
     #     server_address="127.0.0.1:8080",
@@ -115,8 +120,24 @@ def build_config(args: ArgNamespace) -> TcpConfig:
     #         enabled=True, interval=timedelta(seconds=1)
     #     ),
     # )
+
+    # IggyClient(...) also accepts an HttpConfig for the HTTP transport. HTTP
+    # has no AutoLogin or reconnection policy, so main() below would also need
+    # an explicit `await client.login_user(args.username, args.password)`
+    # after connecting:
+    # return HttpConfig(api_url="http://127.0.0.1:3000")
+
+    # IggyClient(...) also accepts a WebSocketConfig for the WebSocket transport.
+    # To use it, uncomment the return below and import WebSocketReconnectionConfig,
+    # which is left out above because only the commented block names it:
     #
-    # main() logs args.tcp_server_address, so change that line too.
+    # return WebSocketConfig(
+    #     server_address="127.0.0.1:8092",
+    #     auto_login=AutoLogin.username_password(args.username, args.password),
+    #     reconnection=WebSocketReconnectionConfig(
+    #         enabled=True, interval=timedelta(seconds=1)
+    #     ),
+    # )
 
     return TcpConfig(
         server_address=args.tcp_server_address,
@@ -137,7 +158,7 @@ async def main():
     except ValueError as error:
         logger.error(f"Invalid client configuration: {error}")
         return
-    logger.info(f"Connecting to {args.tcp_server_address} (TLS: {args.tls})")
+    logger.info(f"Connecting with {config}")
 
     client = IggyClient(config)
     logger.info("Connecting to IggyClient")
