@@ -47,7 +47,10 @@ thread_local! {
     // keep one client per thread. The `Rc` inner makes cloning cheap, so callers
     // take an owned handle.
     static HTTP_CLIENT: cyper::Client =
-        cyper::Client::new().expect("failed to build cyper HTTP client for JWKS");
+        cyper::Client::builder()
+            .redirect(cyper::redirect::Policy::none())
+            .build()
+            .expect("failed to build cyper HTTP client for JWKS");
 }
 
 fn get_http_client() -> cyper::Client {
