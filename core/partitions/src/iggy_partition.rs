@@ -15165,6 +15165,8 @@ mod purge_poll_tests {
     #[compio::test]
     async fn given_pending_disk_poll_when_fresh_history_covers_old_offset_should_preserve_progress()
     {
+        // Five fresh messages keep the old offset 2 within the new history, so an
+        // offset range check cannot distinguish the two histories.
         Box::pin(assert_delayed_poll_preserves_fresh_progress(true, 5)).await;
     }
 
@@ -15222,12 +15224,16 @@ mod purge_poll_tests {
             "the disk poll must suspend before purge",
         );
 
+        // Leave the read future unpolled until purge and the fresh append finish.
+        // Completion handling stays suspended even if the disk read finishes.
         partition.purge(&config, 1).await.expect("purge partition");
         assert_eq!(partition.applied_purge_generation(), 1);
         assert_eq!(partition.get_consumer_offset(consumer), None);
         assert!(read_state.fd.borrow().is_none());
         assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
 
+        // Consensus operation numbers continue through purge, while message
+        // offsets restart at zero in the new segment.
         let last_fresh_op = 3 + u64::from(fresh_message_count);
         for op in 4..=last_fresh_op {
             journal_send_batch(&mut partition, op).await;
@@ -15242,6 +15248,8 @@ mod purge_poll_tests {
 
         let (old_fragments, _, old_commit) = delayed.await.expect("complete delayed disk poll");
         let stored_offset = partition.get_consumer_offset(consumer);
+        // Observe the candidate before server submission. This test does not
+        // admit or replicate the automatic commit request.
         let admission_ready = old_commit
             .as_ref()
             .map(|commit| partition.auto_commit_admission_ready(commit));
