@@ -166,6 +166,19 @@ jobs:
       component: ${{ matrix.component }}
       task: ${{ matrix.task }}
 
+  # Swift SDK
+  test-swift:
+    name: Swift • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.swift_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.detect.outputs.swift_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
   # Other components
   test-other:
     name: Other • ${{ matrix.component }}/${{ matrix.task }}
@@ -208,7 +221,7 @@ jobs:
   # Final status check
   finalize_pr:
     runs-on: ubuntu-24.04-arm
-    needs: [common, detect, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-bdd, test-examples, test-other]
+    needs: [common, detect, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:
       - name: Get job execution times
@@ -292,6 +305,7 @@ jobs:
             const java = findJobInfo('Java •');
             const csharp = findJobInfo('C# •');
             const cpp = findJobInfo('C++ •');
+            const swift = findJobInfo('Swift •');
             const bdd = findJobInfo('BDD •');
             const examples = findJobInfo('Examples •');
             const other = findJobInfo('Other •');
@@ -313,6 +327,7 @@ jobs:
             core.setOutput('java_time', formatJobDuration(java));
             core.setOutput('csharp_time', formatJobDuration(csharp));
             core.setOutput('cpp_time', formatJobDuration(cpp));
+            core.setOutput('swift_time', formatJobDuration(swift));
             core.setOutput('bdd_time', formatJobDuration(bdd));
             core.setOutput('examples_time', formatJobDuration(examples));
             core.setOutput('other_time', formatJobDuration(other));
@@ -404,6 +419,7 @@ jobs:
           java_status=$(format_status "${{ needs.test-java.result }}" "${{ steps.times.outputs.java_time }}")
           csharp_status=$(format_status "${{ needs.test-csharp.result }}" "${{ steps.times.outputs.csharp_time }}")
           cpp_status=$(format_status "${{ needs.test-cpp.result }}" "${{ steps.times.outputs.cpp_time }}")
+          swift_status=$(format_status "${{ needs.test-swift.result }}" "${{ steps.times.outputs.swift_time }}")
           bdd_status=$(format_status "${{ needs.test-bdd.result }}" "${{ steps.times.outputs.bdd_time }}")
           examples_status=$(format_status "${{ needs.test-examples.result }}" "${{ steps.times.outputs.examples_time }}")
           other_status=$(format_status "${{ needs.test-other.result }}" "${{ steps.times.outputs.other_time }}")
@@ -416,6 +432,7 @@ jobs:
           echo "| ☕ Java | $java_status | ${{ steps.times.outputs.java_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🔷 C# | $csharp_status | ${{ steps.times.outputs.csharp_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🔶 C++ | $cpp_status | ${{ steps.times.outputs.cpp_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐦 Swift | $swift_status | ${{ steps.times.outputs.swift_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🧪 BDD | $bdd_status | ${{ steps.times.outputs.bdd_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 📚 Examples | $examples_status | ${{ steps.times.outputs.examples_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 📦 Other | $other_status | ${{ steps.times.outputs.other_time }} |" >> $GITHUB_STEP_SUMMARY
@@ -433,6 +450,7 @@ jobs:
              [[ "${{ needs.test-java.result }}" == "failure" ]] || \
              [[ "${{ needs.test-csharp.result }}" == "failure" ]] || \
              [[ "${{ needs.test-cpp.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-swift.result }}" == "failure" ]] || \
              [[ "${{ needs.test-bdd.result }}" == "failure" ]] || \
              [[ "${{ needs.test-examples.result }}" == "failure" ]] || \
              [[ "${{ needs.test-other.result }}" == "failure" ]]; then
@@ -449,6 +467,7 @@ jobs:
                [[ "${{ needs.test-java.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-csharp.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-cpp.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-swift.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-bdd.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-examples.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-other.result }}" == "cancelled" ]]; then

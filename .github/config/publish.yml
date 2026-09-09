@@ -147,3 +147,12 @@ components:
     registry: none
     version_file: "foreign/go/contracts/version.go"
     version_regex: 'const\s+Version\s*=\s*"([^"]+)"'
+
+  # ── Swift (tag only, no registry publish) ──────────────────────────────────
+  # SwiftPM resolves packages from git tags of a repository root, so the tag
+  # marks the release here and the package mirror is refreshed from it.
+  sdk-swift:
+    tag_pattern: "^foreign/swift/v([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
+    registry: none
+    version_file: "foreign/swift/Sources/Iggy/Iggy.swift"
+    version_regex: 'sdkVersion\s*=\s*"([^"]+)"'

@@ -98,5 +98,8 @@ services:
   cpp-bdd:
     <<: *server-bdd-deps
 
+  swift-bdd:
+    <<: *server-bdd-deps
+
 volumes:
   iggy_data:

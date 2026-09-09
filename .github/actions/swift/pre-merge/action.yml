@@ -1,0 +1,158 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: swift-pre-merge
+description: Swift pre-merge testing github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (lint, test, build, e2e)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Swift
+      uses: ./.github/actions/utils/setup-swift
+      with:
+        cache-key: ${{ inputs.task }}
+
+    # swift-format ships with the toolchain; the configuration lives in
+    # foreign/swift/.swift-format and the examples and BDD packages reuse it.
+    - name: Format Check
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        for dir in foreign/swift examples/swift/getting-started bdd/swift/tests; do
+          echo "Checking formatting in $dir..."
+          swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$dir/Sources" "$dir/Package.swift"
+          if [ -d "$dir/Tests" ]; then
+            swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$dir/Tests"
+          fi
+        done
+
+    # A warning-free build is the lint gate the Swift compiler provides: the
+    # SDK builds in Swift 6 language mode with strict concurrency checking.
+    - name: Build with warnings as errors
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/swift
+        swift build -Xswiftc -warnings-as-errors
+
+    - name: Test
+      shell: bash
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/swift
+        # The end-to-end suite skips itself while IGGY_TCP_ADDRESS is unset,
+        # so this runs the unit and fake-server suites only.
+        swift test --parallel
+
+    - name: Build
+      shell: bash
+      if: inputs.task == 'build'
+      run: |
+        cd foreign/swift
+        swift build -c release
+
+        cd ../../examples/swift/getting-started
+        swift build
+
+        cd ../../../bdd/swift/tests
+        swift build
+
+    - name: Setup Rust with cache for e2e
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/setup-rust-with-cache
+
+    - name: Build the end-to-end suite
+      shell: bash
+      if: inputs.task == 'e2e'
+      run: |
+        cd foreign/swift
+        swift build --build-tests
+
+    # The SDK speaks the VSR wire protocol, so every e2e lane runs against a
+    # locally built VSR server.
+    - name: Start Iggy server (plain)
+      id: iggy
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-swift-e2e.pid
+        log-file: ${{ runner.temp }}/iggy-swift-e2e.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-swift-e2e-data
+
+    - name: Run e2e tests
+      shell: bash
+      if: inputs.task == 'e2e'
+      env:
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
+        IGGY_ROOT_USERNAME: iggy
+        IGGY_ROOT_PASSWORD: iggy
+      run: |
+        echo "🧪 Running Swift e2e tests..."
+        cd foreign/swift
+        swift test --skip-build --filter IggyE2ETests
+
+    - name: Stop Iggy server (plain)
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy.outputs.pid_file }}
+        log-file: ${{ steps.iggy.outputs.log_file }}
+
+    - name: Start Iggy server (TLS)
+      id: iggy-tls
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-swift-e2e-tls.pid
+        log-file: ${{ runner.temp }}/iggy-swift-e2e-tls.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-swift-e2e-tls-data
+        IGGY_TCP_TLS_ENABLED: "true"
+        IGGY_TCP_TLS_CERT_FILE: core/certs/iggy_cert.pem
+        IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem
+
+    - name: Run TLS e2e tests
+      shell: bash
+      if: inputs.task == 'e2e'
+      env:
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
+        IGGY_TCP_TLS_ENABLED: "true"
+        IGGY_ROOT_USERNAME: iggy
+        IGGY_ROOT_PASSWORD: iggy
+      run: |
+        echo "🔐 Running Swift e2e tests over TLS..."
+        cd foreign/swift
+        swift test --skip-build --filter IggyE2ETests
+
+    - name: Stop Iggy server (TLS)
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
+        log-file: ${{ steps.iggy-tls.outputs.log_file }}
