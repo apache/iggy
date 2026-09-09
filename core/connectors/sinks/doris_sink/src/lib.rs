@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
-use iggy_connector_sdk::retry::{exponential_backoff, jitter};
+use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -300,7 +300,7 @@ impl DorisSink {
             }
 
             let response = request.send().await.map_err(|e| {
-                error!("Doris sink ID {} HTTP request failed: {e}", self.id);
+                warn!("Doris sink ID {} HTTP request failed: {e}", self.id);
                 Error::HttpRequestFailed(e.to_string())
             })?;
 
@@ -385,7 +385,9 @@ impl DorisSink {
                     "Doris sink ID {} stream load returned HTTP {status}: {response_for_log}",
                     self.id
                 );
-                error!("{msg}");
+                // Per-attempt detail only: `retry_async` logs each attempt and
+                // the terminal outcome, and `msg` travels in the returned error.
+                warn!("{msg}");
                 // 408/429 are 4xx but transient, so include them in the bounded
                 // in-request retry path.
                 return Err(match status {
@@ -417,36 +419,22 @@ impl DorisSink {
             ))
         })?;
 
-        let mut attempt = 0u32;
-        loop {
-            let error = match self
-                .send_stream_load(connected, label, body.clone())
-                .await
-                .and_then(|response| classify_status(self.id, &response).map(|()| response))
-            {
-                Ok(response) => return Ok(response),
-                Err(error) => error,
-            };
+        let policy = RetryPolicy {
+            max_attempts: connected.max_retries,
+            base_delay: connected.retry_delay,
+            max_delay: connected.max_retry_delay,
+        };
+        let context = format!("Doris sink ID {} Stream Load (label={label})", self.id);
 
-            attempt += 1;
-            if attempt >= connected.max_retries || !is_transient_error(&error) {
-                return Err(error);
+        retry_async(policy, &context, is_transient_error, || {
+            let body = body.clone();
+            async move {
+                let response = self.send_stream_load(connected, label, body).await?;
+                classify_status(self.id, &response)?;
+                Ok(response)
             }
-
-            // `attempt` counts completed attempts. Subtract one so the first
-            // retry waits exactly the configured base delay (base * 2^0).
-            let delay = jitter(exponential_backoff(
-                connected.retry_delay,
-                attempt - 1,
-                connected.max_retry_delay,
-            ))
-            .min(connected.max_retry_delay);
-            warn!(
-                "Doris sink ID {} transient Stream Load failure on attempt {attempt}/{} (label={label}): {error}; retrying in {delay:?}",
-                self.id, connected.max_retries
-            );
-            tokio::time::sleep(delay).await;
-        }
+        })
+        .await
     }
 }
 
@@ -1011,7 +999,7 @@ impl Sink for DorisSink {
                 self.id
             );
         }
-        // `exponential_backoff` already caps at the max, but a base above the cap
+        // `retry_backoff` already caps at the max, but a base above the cap
         // is a config mistake worth surfacing rather than silently flattening.
         let (retry_delay, max_retry_delay) = if retry_delay > max_retry_delay {
             warn!(

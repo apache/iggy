@@ -24,11 +24,13 @@
 //! - [`build_retry_client`] — wraps a `reqwest::Client` with the middleware
 //! - [`check_connectivity`] — single health-check probe (GET /health)
 //! - [`check_connectivity_with_retry`] — startup probe with exponential backoff
-//! - [`ConnectivityConfig`] — parameters for the startup retry loop
+//! - [`retry_async`] — generic retry loop for fallible async operations
+//! - [`RetryPolicy`] — attempt budget and backoff bounds for [`retry_async`]
 //! - [`is_transient_status`] — transient HTTP status predicate
 //! - [`parse_duration`] — humantime duration parsing with fallback
 //! - [`jitter`] — ±20 % random jitter for retry delays
 //! - [`exponential_backoff`] — capped exponential backoff
+//! - [`retry_backoff`] — jittered backoff for a 1-based retry number
 //! - [`parse_retry_after`] — HTTP `Retry-After` header parsing
 
 use anyhow::anyhow;
@@ -36,10 +38,12 @@ use http::Extensions;
 use humantime::Duration as HumanDuration;
 use rand::RngExt as _;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
+use std::fmt;
+use std::future::Future;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Circuit breaker
@@ -161,16 +165,21 @@ pub fn jitter(base: Duration) -> Duration {
 }
 
 /// True exponential backoff: `base × 2^attempt`, capped at `max_delay`.
+///
+/// `attempt` is 0-based. Retry loops count from 1, so passing their counter
+/// here makes the first retry wait twice `base`; use [`retry_backoff`], which
+/// takes a 1-based retry number and applies jitter and the cap.
 pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
     let factor = 2u64.saturating_pow(attempt);
     let millis = base
         .as_millis()
         .saturating_mul(factor as u128)
         .min(max_delay.as_millis());
-    let millis_u64 = u64::try_from(millis).unwrap_or(u64::MAX);
-    Duration::from_millis(millis_u64)
+    Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
+/// Ceiling for a server-supplied `Retry-After`.
+///
 /// Parse a `Retry-After` header value (integer seconds).
 /// Returns `None` for HTTP-date values — callers should fall back to their
 /// own backoff strategy.
@@ -179,6 +188,114 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
         return Some(Duration::from_secs(secs));
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Generic retry loop
+// ---------------------------------------------------------------------------
+
+/// Parameters for [`retry_async`].
+///
+/// `max_attempts` is a *total attempt count*, not a count of extra retries:
+/// `1` runs the operation once and never retries, `3` allows two retries. `0`
+/// behaves as `1`, so a misconfigured value degrades to a single attempt
+/// rather than skipping the operation entirely.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl RetryPolicy {
+    /// Jittered backoff before retry number `retry` (1-based). See
+    /// [`retry_backoff`].
+    pub fn backoff(&self, retry: u32) -> Duration {
+        retry_backoff(self.base_delay, retry, self.max_delay)
+    }
+}
+
+/// Jittered, capped backoff before retry number `retry` (1-based): the first
+/// retry waits `base_delay`, the second `2 × base_delay`, and so on, which is
+/// the convention the `retry_delay` config fields document.
+///
+/// The cap is re-applied after [`jitter`], because ±20 % jitter on an
+/// already-capped delay can otherwise land above `max_delay`, which the config
+/// fields document as a strict upper bound.
+///
+/// Prefer [`retry_async`], which calls this for you. Reach for it directly
+/// only in a loop that cannot be expressed as a retried `Result`.
+pub fn retry_backoff(base_delay: Duration, retry: u32, max_delay: Duration) -> Duration {
+    jitter(exponential_backoff(
+        base_delay,
+        retry.saturating_sub(1),
+        max_delay,
+    ))
+    .min(max_delay)
+}
+/// Run `operation`, retrying while it fails with an error `is_transient`
+/// accepts and the attempt budget in `policy` is not exhausted.
+///
+/// This is the retry skeleton for connectors whose failures surface as `Err`,
+/// including backends that report failure in-band (a 200 response carrying a
+/// failure status in its body) and so cannot use [`HttpRetryMiddleware`],
+/// which classifies on the status code alone.
+///
+/// `context` identifies the connector and operation in every log line this
+/// emits, e.g. `"Doris sink ID 3 Stream Load (label=abc)"`. Callers build it
+/// before the first attempt, so keep it off per-message paths.
+///
+/// Retries, recovery and giving up are all logged here, with the attempt
+/// counts callers would otherwise each have to track. The last error is
+/// returned unchanged so callers keep their own error classification.
+pub async fn retry_async<T, E, Op, Fut>(
+    policy: RetryPolicy,
+    context: &str,
+    is_transient: impl Fn(&E) -> bool,
+    mut operation: Op,
+) -> Result<T, E>
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: fmt::Display,
+{
+    let max_attempts = policy.max_attempts.max(1);
+    let mut attempt = 0u32;
+
+    loop {
+        let error = match operation().await {
+            Ok(value) => {
+                if attempt > 0 {
+                    info!("{context} succeeded after {attempt} retries.");
+                }
+                return Ok(value);
+            }
+            Err(error) => error,
+        };
+
+        attempt += 1;
+        let retryable = is_transient(&error);
+        let budget_exhausted = attempt >= max_attempts;
+        if budget_exhausted || !retryable {
+            let reason = if retryable {
+                "ran out of attempts"
+            } else {
+                "hit a non-retryable error"
+            };
+            // Both arms are terminal for the operation, so both log at error!.
+            // A caller that aborts on the `Err` (an `open()` probe) drops it at
+            // the FFI boundary, leaving this as the only record of the cause.
+            error!("{context} {reason} after {attempt} attempts: {error}");
+            return Err(error);
+        }
+
+        let delay = policy.backoff(attempt);
+        warn!(
+            "{context} failed on attempt {attempt}/{max_attempts}: {error}. \
+             Retrying in {delay:?}..."
+        );
+        tokio::time::sleep(delay).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,18 +318,19 @@ pub fn is_transient_status(status: reqwest::StatusCode) -> bool {
 /// (e.g. `"InfluxDB"`, `"Elasticsearch"`), allowing this middleware to be
 /// reused across connectors without misleading log output.
 ///
-/// The `max_retries` parameter is the *total attempt count* (not the number
-/// of extra attempts), consistent with the rest of the connector retry config:
-/// - `max_retries = 1` → one attempt, no retries on failure
-/// - `max_retries = 3` → up to three attempts (two retries after a failure)
+/// `max_retries` is a total attempt count, as described on [`RetryPolicy`].
 ///
 /// Non-transient error responses (4xx except 429) are returned as-is so
 /// callers can inspect the status and body to build a meaningful error.
+///
+/// The loop is hand-written rather than delegating to [`retry_async`] because
+/// a retry here is driven by an `Ok(Response)` carrying a transient status,
+/// and the final response is handed back to the caller instead of being turned
+/// into an `Err`. Backoff still comes from [`RetryPolicy`], so the timing
+/// matches every other connector retry: the first retry waits `retry_delay`.
 #[derive(Debug, Clone)]
 pub struct HttpRetryMiddleware {
-    max_retries: u32,
-    retry_delay: Duration,
-    max_delay: Duration,
+    policy: RetryPolicy,
     log_prefix: &'static str,
 }
 
@@ -224,9 +342,11 @@ impl HttpRetryMiddleware {
         log_prefix: &'static str,
     ) -> Self {
         Self {
-            max_retries,
-            retry_delay,
-            max_delay,
+            policy: RetryPolicy {
+                max_attempts: max_retries,
+                base_delay: retry_delay,
+                max_delay,
+            },
             log_prefix,
         }
     }
@@ -256,34 +376,28 @@ impl Middleware for HttpRetryMiddleware {
                         return Ok(response);
                     }
 
-                    // Parse Retry-After header on 429 before falling back to
-                    // our own calculated backoff.
+                    // Parse Retry-After on 429 before falling back to our own
+                    // calculated backoff.
                     let retry_after = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         response
                             .headers()
                             .get("Retry-After")
-                            .and_then(|v| v.to_str().ok())
+                            .and_then(|value| value.to_str().ok())
                             .and_then(parse_retry_after)
                     } else {
                         None
                     };
 
                     attempts += 1;
-                    if is_transient_status(status) && attempts < self.max_retries {
+                    if is_transient_status(status) && attempts < self.policy.max_attempts {
                         // Consume the error body for logging, then retry.
                         let body_text = response.text().await.unwrap_or_default();
-                        let delay = retry_after.unwrap_or_else(|| {
-                            jitter(exponential_backoff(
-                                self.retry_delay,
-                                attempts,
-                                self.max_delay,
-                            ))
-                        });
+                        let delay = retry_after.unwrap_or_else(|| self.policy.backoff(attempts));
                         warn!(
                             "{} transient error {status} \
                              (attempt {attempts}/{}): {body_text}. \
                              Retrying in {delay:?}...",
-                            self.log_prefix, self.max_retries
+                            self.log_prefix, self.policy.max_attempts
                         );
                         tokio::time::sleep(delay).await;
                         current_req = match next_req {
@@ -304,16 +418,12 @@ impl Middleware for HttpRetryMiddleware {
                 }
                 Err(e) => {
                     attempts += 1;
-                    if attempts < self.max_retries {
-                        let delay = jitter(exponential_backoff(
-                            self.retry_delay,
-                            attempts,
-                            self.max_delay,
-                        ));
+                    if attempts < self.policy.max_attempts {
+                        let delay = self.policy.backoff(attempts);
                         warn!(
                             "{} network error (attempt {attempts}/{}): {e}. \
                              Retrying in {delay:?}...",
-                            self.log_prefix, self.max_retries
+                            self.log_prefix, self.policy.max_attempts
                         );
                         tokio::time::sleep(delay).await;
                         current_req = match next_req {
@@ -358,18 +468,6 @@ pub fn build_retry_client(
 // Shared connectivity helper
 // ---------------------------------------------------------------------------
 
-/// Configuration for the startup connectivity retry loop.
-///
-/// This is intentionally separate from per-request retry config so that
-/// startup can wait patiently for a service (e.g. 10 retries over 60 s)
-/// without affecting the shorter per-request retry window used during
-/// normal operation.
-pub struct ConnectivityConfig {
-    pub max_open_retries: u32,
-    pub open_retry_max_delay: Duration,
-    pub retry_delay: Duration,
-}
-
 /// Probe `url` with a plain GET and return `Ok(())` if the response is 2xx.
 ///
 /// This is a single, non-retried attempt. The caller is responsible for the
@@ -398,49 +496,262 @@ pub async fn check_connectivity(
 
 /// Retry [`check_connectivity`] with exponential backoff + jitter.
 ///
-/// `connector_label` is used in log messages (e.g. `"InfluxDB sink connector ID: 1"`).
+/// `connector_label` names the connector in log messages (e.g. `"InfluxDB sink"`).
 /// `connector_id` is included in log messages for multi-instance deployments.
+///
+/// Startup usually wants a more patient policy than the per-request one (ten
+/// attempts over a minute, say), so callers pass their own [`RetryPolicy`]
+/// rather than reusing the one that governs live traffic.
 pub async fn check_connectivity_with_retry(
     client: &reqwest::Client,
     url: reqwest::Url,
     connector_label: &str,
     connector_id: u32,
-    cfg: &ConnectivityConfig,
+    policy: RetryPolicy,
 ) -> Result<(), crate::Error> {
-    let max_open_retries = cfg.max_open_retries.max(1);
-    let mut attempt = 0u32;
+    let context =
+        format!("{connector_label} startup connectivity for connector ID: {connector_id}");
 
-    loop {
-        match check_connectivity(client, url.clone(), connector_label).await {
-            Ok(()) => {
-                if attempt > 0 {
-                    tracing::info!(
-                        "{connector_label} connectivity established after {attempt} retries \
-                         for connector ID: {connector_id}"
-                    );
-                }
-                return Ok(());
+    retry_async(
+        policy,
+        &context,
+        |_| true,
+        || check_connectivity(client, url.clone(), connector_label),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Instant;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const BASE: Duration = Duration::from_millis(100);
+    const MAX: Duration = Duration::from_secs(10);
+
+    // `jitter` is ±20 %, so every timing assertion below is a band around the
+    // nominal delay rather than an equality.
+    const JITTER_LOW: f64 = 0.8;
+    const JITTER_HIGH: f64 = 1.2;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestError {
+        Transient,
+        Permanent,
+    }
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Transient => write!(f, "transient"),
+                Self::Permanent => write!(f, "permanent"),
             }
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_open_retries {
-                    tracing::error!(
-                        "{connector_label} connectivity check failed after {attempt} attempts \
-                         for connector ID: {connector_id}. Giving up: {e}"
-                    );
-                    return Err(e);
-                }
-                let backoff = jitter(exponential_backoff(
-                    cfg.retry_delay,
-                    attempt,
-                    cfg.open_retry_max_delay,
-                ));
-                tracing::warn!(
-                    "{connector_label} health check failed \
-                     (attempt {attempt}/{max_open_retries}) \
-                     for connector ID: {connector_id}. Retrying in {backoff:?}: {e}"
-                );
-                tokio::time::sleep(backoff).await;
+        }
+    }
+
+    fn is_transient(error: &TestError) -> bool {
+        matches!(error, TestError::Transient)
+    }
+
+    fn policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_delay: BASE,
+            max_delay: MAX,
+        }
+    }
+
+    /// Operation that fails with `error` for the first `failures` calls and then
+    /// succeeds, returning the 1-based number of the call that succeeded.
+    fn failing_times(
+        calls: &Cell<u32>,
+        failures: u32,
+        error: TestError,
+    ) -> impl FnMut() -> std::future::Ready<Result<u32, TestError>> + '_ {
+        move || {
+            let call = calls.get() + 1;
+            calls.set(call);
+            std::future::ready(if call <= failures {
+                Err(error)
+            } else {
+                Ok(call)
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_transient_failure_should_retry_until_it_succeeds() {
+        let calls = Cell::new(0);
+        let result = retry_async(
+            policy(4),
+            "test",
+            is_transient,
+            failing_times(&calls, 2, TestError::Transient),
+        )
+        .await;
+
+        assert_eq!(result, Ok(3));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_permanent_failure_should_not_retry() {
+        let calls = Cell::new(0);
+        let result = retry_async(
+            policy(4),
+            "test",
+            is_transient,
+            failing_times(&calls, 2, TestError::Permanent),
+        )
+        .await;
+
+        assert_eq!(result, Err(TestError::Permanent));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_exhausted_budget_should_return_the_last_error() {
+        let calls = Cell::new(0);
+        // Distinct error per attempt, so "last" is actually discriminated.
+        let result: Result<u32, u32> = retry_async(
+            policy(3),
+            "test",
+            |_| true,
+            || {
+                let call = calls.get() + 1;
+                calls.set(call);
+                std::future::ready(Err(call))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(3), "should surface the final attempt's error");
+        assert_eq!(calls.get(), 3, "max_attempts is a total attempt count");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_single_attempt_budget_should_run_the_operation_once() {
+        for max_attempts in [0, 1] {
+            let calls = Cell::new(0);
+            let result = retry_async(
+                policy(max_attempts),
+                "test",
+                is_transient,
+                failing_times(&calls, u32::MAX, TestError::Transient),
+            )
+            .await;
+
+            assert_eq!(result, Err(TestError::Transient));
+            assert_eq!(calls.get(), 1, "max_attempts = {max_attempts}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_successive_retries_should_double_the_delay() {
+        let calls = Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let result = retry_async(
+            policy(3),
+            "test",
+            is_transient,
+            failing_times(&calls, 2, TestError::Transient),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(result, Ok(3));
+        // base + 2 × base, each independently jittered. Passing the retry
+        // number straight to `exponential_backoff` would give 2 + 4 × base.
+        let nominal = BASE * 3;
+        assert!(
+            elapsed >= nominal.mul_f64(JITTER_LOW) && elapsed <= nominal.mul_f64(JITTER_HIGH),
+            "two retries waited {elapsed:?}, expected roughly {nominal:?}"
+        );
+    }
+
+    /// The regression test for the convention this helper exists to unify: the
+    /// first retry waits the configured base delay, not twice it.
+    // `HttpRetryMiddleware` is the path every HTTP connector rides, and the
+    // behaviours it covers are the ones that regressed unnoticed: the bound on
+    // `Retry-After`, the statuses the header is read on, and the first delay.
+    fn retry_client(max_attempts: u32, base: Duration, max: Duration) -> ClientWithMiddleware {
+        build_retry_client(reqwest::Client::new(), max_attempts, base, max, "test")
+    }
+
+    async fn mock_then_ok(status: u16, headers: &[(&str, &str)]) -> MockServer {
+        let server = MockServer::start().await;
+        let mut first = ResponseTemplate::new(status);
+        for (name, value) in headers {
+            first = first.insert_header(*name, *value);
+        }
+        Mock::given(method("GET"))
+            .respond_with(first)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn given_no_retry_after_should_wait_the_base_delay_on_the_first_retry() {
+        let server = mock_then_ok(503, &[]).await;
+        // 1s rather than 200ms so the pass band and the bug's band do not
+        // overlap: the bug produces jitter(2s) in [1.6s, 2.4s], a correct run
+        // produces jitter(1s) in [0.8s, 1.2s], and 1.4s separates them with
+        // room for two loopback round trips.
+        let base = Duration::from_secs(1);
+        let client = retry_client(3, base, Duration::from_secs(30));
+
+        let started = Instant::now();
+        let response = client.get(server.uri()).send().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), 200);
+        assert!(
+            elapsed >= base.mul_f64(JITTER_LOW),
+            "first retry waited {elapsed:?}, expected roughly {base:?}"
+        );
+        // Guards the middleware's own `policy.backoff(attempts)` wiring, which
+        // the pure `retry_backoff` tests do not reach: feeding a 1-based
+        // counter to the 0-based `exponential_backoff` doubles this delay.
+        assert!(
+            elapsed < base.mul_f64(1.4),
+            "first retry waited {elapsed:?}, past the {base:?} the config asks for"
+        );
+    }
+
+    #[test]
+    fn given_a_retry_number_should_back_off_from_the_base_delay() {
+        let policy = policy(8);
+        for (retry, factor) in [(1u32, 1.0), (2, 2.0), (3, 4.0), (4, 8.0)] {
+            let delay = policy.backoff(retry);
+            let nominal = BASE.mul_f64(factor);
+            assert!(
+                delay >= nominal.mul_f64(JITTER_LOW) && delay <= nominal.mul_f64(JITTER_HIGH),
+                "retry {retry} backed off {delay:?}, expected roughly {nominal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_jitter_on_a_capped_delay_should_never_exceed_max_delay() {
+        // Base far above the cap, so every draw starts clamped and only jitter
+        // could push it back over.
+        let policy = RetryPolicy {
+            max_attempts: 8,
+            base_delay: Duration::from_secs(30),
+            max_delay: Duration::from_secs(1),
+        };
+        for retry in 1..=8 {
+            for _ in 0..64 {
+                assert!(policy.backoff(retry) <= policy.max_delay);
             }
         }
     }
