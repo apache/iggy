@@ -15159,15 +15159,30 @@ mod purge_poll_tests {
 
     #[compio::test]
     async fn given_pending_disk_poll_when_purged_should_preserve_fresh_consumer_progress() {
-        Box::pin(assert_delayed_poll_preserves_fresh_progress(true)).await;
+        Box::pin(assert_delayed_poll_preserves_fresh_progress(true, 2)).await;
+    }
+
+    #[compio::test]
+    async fn given_pending_disk_poll_when_fresh_history_covers_old_offset_should_preserve_progress()
+    {
+        Box::pin(assert_delayed_poll_preserves_fresh_progress(true, 5)).await;
     }
 
     #[compio::test]
     async fn given_disk_poll_without_auto_commit_when_purged_should_preserve_fresh_progress() {
-        Box::pin(assert_delayed_poll_preserves_fresh_progress(false)).await;
+        for fresh_message_count in [2, 5] {
+            Box::pin(assert_delayed_poll_preserves_fresh_progress(
+                false,
+                fresh_message_count,
+            ))
+            .await;
+        }
     }
 
-    async fn assert_delayed_poll_preserves_fresh_progress(auto_commit: bool) {
+    async fn assert_delayed_poll_preserves_fresh_progress(
+        auto_commit: bool,
+        fresh_message_count: u32,
+    ) {
         let config = repair_config();
         let (_directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
         let consumer = PollingConsumer::Consumer(7, 0);
@@ -15189,16 +15204,7 @@ mod purge_poll_tests {
                 .is_none()
         );
 
-        let warm = partition.build_poll_plan(
-            consumer,
-            &PollingArgs::new(PollingStrategy::offset(0), 1, true),
-            true,
-        );
-        assert!(warm.needs_off_pump_io());
-        let (warm_fragments, _, warm_commit) = warm.execute().await.expect("warm disk poll");
-        assert_eq!(polled_offsets(&warm_fragments), [0]);
-        assert_eq!(warm_commit.expect("warm poll commits").offset, 0);
-        assert_eq!(partition.get_consumer_offset(consumer), Some(0));
+        assert_old_disk_reads(&mut partition, consumer).await;
         let read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
         assert!(read_state.fd.borrow().is_some());
 
@@ -15222,33 +15228,38 @@ mod purge_poll_tests {
         assert!(read_state.fd.borrow().is_none());
         assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
 
-        for op in 4..=5 {
+        let last_fresh_op = 3 + u64::from(fresh_message_count);
+        for op in 4..=last_fresh_op {
             journal_send_batch(&mut partition, op).await;
         }
-        partition.consensus().advance_commit_max(5);
+        partition.consensus().advance_commit_max(last_fresh_op);
         partition.commit_journal(&config).await;
-        assert_eq!(partition.consensus().commit_min(), 5);
-        assert_eq!(partition.offsets().commit_offset, 1);
+        assert_eq!(partition.consensus().commit_min(), last_fresh_op);
+        assert_eq!(
+            partition.offsets().commit_offset,
+            u64::from(fresh_message_count) - 1
+        );
 
         let (old_fragments, _, old_commit) = delayed.await.expect("complete delayed disk poll");
         let stored_offset = partition.get_consumer_offset(consumer);
         let admission_ready = old_commit
             .as_ref()
             .map(|commit| partition.auto_commit_admission_ready(commit));
-        let replication_offset = old_commit.map(|commit| commit.offset);
-        let (fresh_fragments, _, _) = partition
-            .build_poll_plan(
-                consumer,
-                &PollingArgs::new(PollingStrategy::offset(0), 3, false),
-                true,
-            )
+        let auto_commit_candidate_offset = old_commit.map(|commit| commit.offset);
+        let fresh = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(PollingStrategy::offset(0), fresh_message_count, false),
+            true,
+        );
+        assert!(fresh.needs_off_pump_io());
+        let (fresh_fragments, _, _) = fresh
             .execute()
             .await
             .expect("poll fresh messages by offset");
         let (next_fragments, _, _) = partition
             .build_poll_plan(
                 consumer,
-                &PollingArgs::new(PollingStrategy::next(), 3, false),
+                &PollingArgs::new(PollingStrategy::next(), fresh_message_count, false),
                 true,
             )
             .execute()
@@ -15258,17 +15269,51 @@ mod purge_poll_tests {
         let old_offsets = polled_offsets(&old_fragments);
         let fresh_offsets = polled_offsets(&fresh_fragments);
         let next_offsets = polled_offsets(&next_fragments);
-        assert_eq!(fresh_offsets, [0, 1], "fresh messages must exist on disk");
+        let expected_fresh_offsets = (0..u64::from(fresh_message_count)).collect::<Vec<_>>();
+        assert_eq!(
+            fresh_offsets, expected_fresh_offsets,
+            "fresh messages must exist on disk"
+        );
         // Returning or discarding the old read is independent of whether it
         // may commit progress in the fresh history.
         assert_eq!(
-            (stored_offset, replication_offset, next_offsets),
-            (None, None, vec![0, 1]),
+            (stored_offset, auto_commit_candidate_offset, next_offsets),
+            (None, None, expected_fresh_offsets),
             "delayed poll auto_commit={auto_commit}, old offsets={old_offsets:?}, \
              fresh offsets={fresh_offsets:?}, admission ready={admission_ready:?}; \
-             expected no stored or replicated \
-             offset and Next to return the fresh messages",
+             expected no stored offset or automatic commit candidate \
+             and Next to return the fresh messages",
         );
+    }
+
+    async fn assert_old_disk_reads(
+        partition: &mut IggyPartition<IggyMessageBus>,
+        consumer: PollingConsumer,
+    ) {
+        let warm = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(PollingStrategy::offset(0), 1, true),
+            true,
+        );
+        assert!(warm.needs_off_pump_io());
+        let (warm_fragments, _, warm_commit) = warm.execute().await.expect("warm disk poll");
+        assert_eq!(polled_offsets(&warm_fragments), [0]);
+        assert_eq!(warm_commit.expect("warm poll commits").offset, 0);
+        assert_eq!(partition.get_consumer_offset(consumer), Some(0));
+
+        let complete = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(PollingStrategy::offset(0), 3, false),
+            true,
+        );
+        assert!(complete.needs_off_pump_io());
+        let (complete_fragments, _, complete_commit) = complete
+            .execute()
+            .await
+            .expect("poll all old messages before purge");
+        assert_eq!(polled_offsets(&complete_fragments), [0, 1, 2]);
+        assert!(complete_commit.is_none());
+        assert_eq!(partition.get_consumer_offset(consumer), Some(0));
     }
 
     async fn disk_poll_partition(
