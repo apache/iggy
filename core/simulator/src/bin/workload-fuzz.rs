@@ -132,11 +132,21 @@ struct Args {
     /// empty shadow against empty committed state and agrees. `0` opts out.
     #[arg(long, default_value_t = 1)]
     min_commits: u64,
-    /// Committed metadata ops that must have been witnessed by more than one live
-    /// replica, i.e. that exercised cross-replica agreement. Ignored below two live
-    /// replicas, where the property is untestable rather than untested. `0` opts out.
+    /// Committed ops, on EITHER plane, that must have been witnessed by more than
+    /// one live replica, i.e. that exercised cross-replica agreement. Ignored below
+    /// two live replicas, where the property is untestable rather than untested.
+    /// `0` opts out.
     #[arg(long, default_value_t = 1)]
     min_ops_compared: usize,
+    /// As `--min-ops-compared`, but METADATA ops only.
+    ///
+    /// Separate because a partition-only run satisfies the combined floor while the
+    /// metadata oracle compares an empty chain against an empty chain and agrees.
+    /// Defaults to `1`, which is the floor `--min-ops-compared` carried before it
+    /// counted both planes; a campaign that wants no metadata coverage opts out
+    /// with `0`.
+    #[arg(long, default_value_t = 1)]
+    min_metadata_ops_compared: usize,
     /// Fail the run if crash or restart injection was requested but never happened.
     /// Off by default, since a short run at low probability may legitimately draw
     /// none; on for a campaign where such a seed is silently wasted.
@@ -562,9 +572,11 @@ fn run_quiesce_phase(
     };
     println!(
         "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
-         evictions={}; ops_compared={} replicas_compared={} namespaces_checked={})",
+         evictions={}; ops_compared={} partition_ops_compared={} replicas_compared={} \
+         namespaces_checked={})",
         workload.evictions(),
         convergence.ops_compared,
+        convergence.partition_ops_compared,
         convergence.replicas_compared,
         convergence.namespaces_checked,
     );
@@ -574,12 +586,28 @@ fn run_quiesce_phase(
          proved nothing about entity state (seed={seed:#x})"
     );
     let live = usize::from(replicas) - sim.crashed.len();
+    // Either plane satisfies it: a partition-plane run commits almost no metadata,
+    // so the metadata count alone called every such run vacuous.
+    let compared = convergence.ops_compared + convergence.partition_ops_compared;
     assert!(
-        args.min_ops_compared == 0 || live < 2 || convergence.ops_compared >= args.min_ops_compared,
-        "--min-ops-compared {}: {live} replicas live but only {} op(s) witnessed \
-         by more than one, so cross-replica agreement went untested \
-         (seed={seed:#x})",
+        args.min_ops_compared == 0 || live < 2 || compared >= args.min_ops_compared,
+        "--min-ops-compared {}: {live} replicas live but only {compared} op(s) witnessed \
+         by more than one ({} metadata, {} partition), so cross-replica agreement went \
+         untested (seed={seed:#x})",
         args.min_ops_compared,
+        convergence.ops_compared,
+        convergence.partition_ops_compared,
+    );
+    // The metadata half on its own: summing the planes above lets a partition-only
+    // run clear that floor while the metadata oracle compares nothing.
+    assert!(
+        args.min_metadata_ops_compared == 0
+            || live < 2
+            || convergence.ops_compared >= args.min_metadata_ops_compared,
+        "--min-metadata-ops-compared {}: {live} replicas live but only {} committed metadata \
+         op(s) witnessed by more than one, so the metadata oracle compared an empty chain \
+         (seed={seed:#x})",
+        args.min_metadata_ops_compared,
         convergence.ops_compared,
     );
     // Again after the drain: the drain both answers outstanding requests and
