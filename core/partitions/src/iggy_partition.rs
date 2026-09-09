@@ -43,9 +43,9 @@ use consensus::{
     PlaneKind, Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus,
     ack_preflight, ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
     build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repaired_frontier_update,
-    replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
-    send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repair_session_live,
+    repaired_frontier_update, replicate_frozen_to_next_in_chain, replicate_preflight,
+    restamp_prepare_view, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -4304,13 +4304,34 @@ where
     /// Committable entries (ops `commit_min+1 ..= commit_max`) read from the
     /// journal, for a backup whose pipeline is empty. Stops at the first missing
     /// op: a replication gap must not be skipped, or `advance_commit_min`'s
-    /// sequential contract breaks. Like the metadata plane's `commit_journal`,
-    /// the journal keeps its committed entries until they are flushed
-    /// (`commit_messages` drains only the committed prefix), so this read finds
-    /// every committed op while the uncommitted tail stays resident.
+    /// sequential contract breaks.
+    ///
+    /// KNOWN GAP: resident headers only. `commit_messages` evicts up to
+    /// `commit_max` (the cluster frontier, not this replica's commit point) while
+    /// `committed_headers_from` never reads the evicted ring, so a backlog past
+    /// [`COMMIT_WALK_OPS_MAX`] can have its un-reached ops flushed out from under
+    /// it and stop. Repair refetches them and the simulator's contiguity invariant
+    /// catches a walk that never recovers. Reading the ring here would close it
+    /// directly, but not as a one-line swap: the apply path needs batch bytes and
+    /// the ring is capacity-bounded, so headers it cannot back with bytes would
+    /// fence the partition instead of stalling it.
     fn collect_committable_from_journal(&self, max_ops: usize) -> Vec<PipelineEntry> {
         let from_op = self.consensus.commit_min() + 1;
+        // Stop below the pipeline head. The drain above holds rather than pops
+        // when the head is not the op owed next; walking that op out of the
+        // journal instead advances `commit_min` past a still-resident entry, and
+        // `on_ack` then finds the drain empty on every later ack -- no reply is
+        // ever shipped and each stranded entry leaves its awaiter parked.
+        //
+        // Only a head at or above `from_op` lowers the ceiling: an absent head is
+        // a backup's empty pipeline, and a lower head is already stranded and must
+        // not freeze the walk on top of that.
         let commit_max = self.consensus.commit_max();
+        let commit_max = self
+            .consensus
+            .pipeline_head_header()
+            .filter(|head| head.op >= from_op)
+            .map_or(commit_max, |head| commit_max.min(head.op - 1));
         self.log
             .journal()
             .inner
@@ -6708,7 +6729,11 @@ where
             return;
         };
         let consensus = self.consensus();
-        if !consensus.is_normal() || consensus.view() != session.view {
+        // NOT `is_normal` alone: a primary-elect repairing toward its parked
+        // merged log runs this in `ViewChange`, and dropping the session on its
+        // first inbound frame leaves the coverage scan re-arming every tick over
+        // a stream it can never keep.
+        if !repair_session_live(consensus) || consensus.view() != session.view {
             self.repair = None;
             return;
         }
@@ -8806,28 +8831,40 @@ mod tests {
         assert!(!dir.path().join("2").exists());
     }
 
+    /// `AckLevel::NoAck` stores apply on the primary only and never replicate, so
+    /// which replicas hold an offset is not agreed and a committed delete can
+    /// legitimately find nothing. Erroring on that fails the committed apply,
+    /// fences the partition, then crash-loops on every replay of the op.
+    ///
+    /// Both kinds, because they are separate maps with separate directories.
     #[compio::test]
     async fn given_absent_offset_file_when_delete_commits_should_skip_directory_sync() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut partition, sent) = recording_partition_at(0, 3);
-        partition.consumer_offsets_path =
-            Some(dir.path().join("missing").to_string_lossy().into_owned());
-        partition.stage_consumer_offset_delete(1, ConsumerKind::Consumer, 7);
-        partition.consensus.restore_commit_state(0, 1);
-        let header = PrepareHeader {
-            op: 1,
-            operation: Operation::DeleteConsumerOffset,
-            client: 42,
-            request: 1,
-            ..Default::default()
-        };
-        partition
-            .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
-            .await;
-        assert!(partition.fatal.is_none());
-        assert_eq!(partition.consensus.commit_min(), 1);
-        assert_eq!(partition.offset_dir_sync_count.get(), 0);
-        assert_eq!(sent.borrow().len(), 1);
+        for (op, kind) in [
+            (1, ConsumerKind::Consumer),
+            (2, ConsumerKind::ConsumerGroup),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut partition, sent) = recording_partition_at(0, 3);
+            let missing = Some(dir.path().join("missing").to_string_lossy().into_owned());
+            partition.consumer_offsets_path.clone_from(&missing);
+            partition.consumer_group_offsets_path = missing;
+            partition.stage_consumer_offset_delete(op, kind, 7);
+            partition.consensus.restore_commit_state(op - 1, op);
+            let header = PrepareHeader {
+                op,
+                operation: Operation::DeleteConsumerOffset,
+                client: 42,
+                request: 1,
+                ..Default::default()
+            };
+            partition
+                .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
+                .await;
+            assert!(partition.fatal.is_none(), "{kind:?} delete must not fence");
+            assert_eq!(partition.consensus.commit_min(), op);
+            assert_eq!(partition.offset_dir_sync_count.get(), 0);
+            assert_eq!(sent.borrow().len(), 1);
+        }
     }
 
     #[compio::test]
@@ -11071,6 +11108,63 @@ mod tests {
             .append(prepare.into_frozen())
             .await
             .expect("journal append");
+    }
+
+    /// Walking through the head advances `commit_min` past a resident entry only
+    /// `on_ack` can pop and answer, after which every later ack finds the drain
+    /// empty and no reply is ever shipped.
+    #[compio::test]
+    async fn given_a_pipeline_head_when_walking_the_journal_should_stop_below_it() {
+        let partition = test_partition();
+        for op in 1..=4 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition.consensus.restore_commit_state(0, 4);
+        partition.consensus.pipeline_message(
+            PlaneKind::Partitions,
+            &pipeline_prepare(3, Operation::CreateStream),
+        );
+
+        let ops: Vec<u64> = partition
+            .collect_committable_from_journal(COMMIT_WALK_OPS_MAX)
+            .into_iter()
+            .map(|entry| entry.header.op)
+            .collect();
+        assert_eq!(
+            ops,
+            vec![1, 2],
+            "the walk stops at the op the pipeline holds, leaving 3 to on_ack"
+        );
+    }
+
+    /// A backup journals replicated prepares and never populates a pipeline, so an
+    /// absent head must mean NO ceiling. Read as a ceiling of zero it would stop
+    /// every backup's commit walk.
+    #[compio::test]
+    async fn given_an_empty_pipeline_when_walking_the_journal_should_not_cap() {
+        let partition = test_partition();
+        for op in 1..=3 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition.consensus.restore_commit_state(0, 3);
+        assert!(partition.consensus.pipeline_head_header().is_none());
+
+        let ops: Vec<u64> = partition
+            .collect_committable_from_journal(COMMIT_WALK_OPS_MAX)
+            .into_iter()
+            .map(|entry| entry.header.op)
+            .collect();
+        assert_eq!(ops, vec![1, 2, 3], "a backup walks its whole committed run");
+    }
+
+    fn pipeline_prepare(op: u64, operation: Operation) -> Message<PrepareHeader> {
+        let size = std::mem::size_of::<PrepareHeader>();
+        Message::<PrepareHeader>::new(size).transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.op = op;
+            header.operation = operation;
+            header.size = u32::try_from(size).expect("prepare header size fits in u32");
+        })
     }
 
     /// A repaired `SendMessages` prepare with an explicit chain identity, as a
