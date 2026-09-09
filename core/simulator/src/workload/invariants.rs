@@ -92,7 +92,7 @@ impl Invariants {
     ///
     /// Globally:
     /// - total in-flight requests stay within the per-client queue ceiling,
-    /// - no shard has shed a frame for a [`BUG_ONLY_FRAME_DROP_REASONS`] reason,
+    /// - no shard has shed a frame for an `unroutable` or `misrouted` reason,
     /// - live replicas agree on every committed metadata op they share, and the
     ///   committed chain stays hash-linked (see [`StateChecker`]).
     ///
