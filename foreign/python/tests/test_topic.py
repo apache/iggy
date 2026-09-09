@@ -512,6 +512,53 @@ class TestCreateTopic:
             )
 
 
+class TestPartitions:
+    """Test adding and removing topic partitions."""
+
+    @pytest.mark.asyncio
+    async def test_create_partitions_adds_partitions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test create_partitions appends to the topic partition count."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=2
+        )
+        await iggy_client.create_partitions(stream_name, topic_name, 3)
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert topic.partitions_count == 5
+        assert len(topic.partitions) == 5
+
+    @pytest.mark.asyncio
+    async def test_delete_partitions_removes_last_partitions_by_numeric_ids(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test delete_partitions accepts numeric identifiers and updates the count."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=5
+        )
+        stream = await iggy_client.get_stream(stream_name)
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert stream is not None
+        assert topic is not None
+
+        await iggy_client.delete_partitions(stream.id, topic.id, 2)
+
+        updated_topic = await iggy_client.get_topic(stream.id, topic.id)
+        assert updated_topic is not None
+        assert updated_topic.partitions_count == 3
+        assert len(updated_topic.partitions) == 3
+
+
 class TestGetTopic:
     """Test topic retrieval via get_topic."""
 

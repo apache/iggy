@@ -1347,6 +1347,50 @@ class IggyClient:
             ValueError: If `message_expiry` or `max_topic_size` is out of range.
             PyRuntimeError: If another argument is invalid or the request fails.
         """
+    def create_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Add partitions to a topic.
+
+        New partitions are appended after the topic's existing partitions.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to add as `int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the partitions are created.
+
+        Raises:
+            RuntimeError: If an identifier or count is invalid, or the request
+                fails.
+        """
+    def delete_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Remove the last partitions from a topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to remove as `int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the partitions are deleted.
+
+        Raises:
+            RuntimeError: If an identifier or count is invalid, or the request
+                fails.
+        """
     def get_topic(
         self,
         stream_id: builtins.str | builtins.int,

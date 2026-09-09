@@ -789,6 +789,76 @@ impl IggyClient {
         })
     }
 
+    /// Add partitions to a topic.
+    ///
+    /// New partitions are appended after the topic's existing partitions.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     partitions_count: Number of partitions to add as `int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the partitions are created.
+    ///
+    /// Raises:
+    ///     RuntimeError: If an identifier or count is invalid, or the request
+    ///         fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn create_partitions<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        partitions_count: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .create_partitions(&stream_id, &topic_id, partitions_count)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Remove the last partitions from a topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     partitions_count: Number of partitions to remove as `int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the partitions are deleted.
+    ///
+    /// Raises:
+    ///     RuntimeError: If an identifier or count is invalid, or the request
+    ///         fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_partitions<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        partitions_count: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_partitions(&stream_id, &topic_id, partitions_count)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Gets topic by stream and id.
     /// Returns the topic details, or `None` if the topic does not exist.
     /// Raises `RuntimeError` on failure.
