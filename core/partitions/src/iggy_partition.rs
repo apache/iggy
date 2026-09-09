@@ -15151,6 +15151,11 @@ mod retention_tests {
 
 #[cfg(test)]
 mod purge_poll_tests {
+    //! A disk poll with automatic commit starts reading messages at offsets 0-2.
+    //! Before it completes, purge removes those messages and clears consumer
+    //! progress. Fresh messages are then appended starting at offset 0.
+    //! Completing the old poll must not advance progress over the fresh messages.
+
     use super::tests::{journal_send_batch, repair_config, test_partition};
     use super::*;
     use crate::PollFragments;
@@ -15165,8 +15170,9 @@ mod purge_poll_tests {
     #[compio::test]
     async fn given_pending_disk_poll_when_fresh_history_covers_old_offset_should_preserve_progress()
     {
-        // Five fresh messages keep the old offset 2 within the new history, so an
-        // offset range check cannot distinguish the two histories.
+        // The delayed poll targets old offsets 0-2. After purge, five fresh
+        // messages occupy offsets 0-4. Recording progress 2 from the old poll
+        // would make `Next` skip fresh offsets 0-2 even though 2 is in range.
         Box::pin(assert_delayed_poll_preserves_fresh_progress(true, 5)).await;
     }
 
