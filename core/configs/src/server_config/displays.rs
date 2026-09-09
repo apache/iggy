@@ -22,6 +22,7 @@
 //! [`ServerConfig`] formatter and the [`MessageBusConfig`] section
 //! formatter.
 
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
@@ -36,7 +37,7 @@ impl Display for ServerConfig {
             f,
             "{{ consumer_group: {}, data_maintenance: {}, \
              heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, \
-             metadata: {}, message_bus: {}, partition: {} }}",
+             metadata: {}, message_bus: {}, partition: {}, external_auth: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
@@ -48,6 +49,7 @@ impl Display for ServerConfig {
             self.metadata,
             self.message_bus,
             self.partition,
+            self.external_auth,
         )
     }
 }
@@ -146,6 +148,22 @@ impl Display for QuicCertificateConfig {
             f,
             "{{ self_signed: {}, cert_file: {}, key_file: {} }}",
             self.self_signed, self.cert_file, self.key_file
+        )
+    }
+}
+
+impl Display for ExternalAuthConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let url_indicator = if self.url.is_empty() {
+            "(not set)"
+        } else {
+            "[redacted]"
+        };
+        write!(
+            f,
+            "{{ enabled: {}, url: {url_indicator}, timeout: {}, \
+             forward_credentials: {}, user_id: {} }}",
+            self.enabled, self.timeout, self.forward_credentials, self.user_id,
         )
     }
 }
