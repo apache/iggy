@@ -38,18 +38,124 @@ use iggy_gateway_kafka::bridge::{
     BridgeError, IggyBridge, IggyBridgeConfig, TopicMapping, TopicOverride,
 };
 
-/// First port of the local reservation band. `u16` has no room above the highest ephemeral
-/// ceiling in use (macOS: 49152-65535), so "clear of ephemeral" only leaves room below the
-/// lowest floor (Linux default: 32768) - picked here below `core/integration`'s own
-/// `port_reserver.rs` band too (20000 up to that floor), so a `bind(0)` call in an unrelated
-/// process, including that harness's own test servers, is never handed a port this band claims.
-const PORT_LOCK_BAND_START: u16 = 15000;
-const PORT_LOCK_BAND_SLOTS: u16 = 200;
+/// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
+/// real ephemeral range leaves little room, but this crate never needs more than a handful live
+/// at once (this binary's own tests already run one at a time - see `.config/nextest.toml`'s
+/// `kafka_bridge` test-group).
+const DESIRED_SLOTS: u16 = 200;
+
+/// Lowest port `port_band()` will ever place its band at - clear of the well-known/privileged
+/// range (0-1023).
+const MIN_CANDIDATE_PORT: u16 = 10000;
+
+/// Ephemeral range assumed when the kernel's own can't be read (no `/proc` - e.g. macOS),
+/// matching the Linux default. Mirrors `core/integration`'s own `port_reserver.rs`.
+const DEFAULT_EPHEMERAL_RANGE: (u16, u16) = (32768, 60999);
+
+const IP_LOCAL_PORT_RANGE: &str = "/proc/sys/net/ipv4/ip_local_port_range";
+
+fn parse_ephemeral_range(range: &str) -> Option<(u16, u16)> {
+    let mut bounds = range.split_whitespace();
+    let floor: u16 = bounds.next()?.parse().ok()?;
+    let ceiling: u16 = bounds.next()?.parse().ok()?;
+    Some((floor, ceiling))
+}
+
+/// The range the kernel picks `bind(0)` ports from, read once.
+fn ephemeral_range() -> (u16, u16) {
+    static RANGE: OnceLock<(u16, u16)> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        std::fs::read_to_string(IP_LOCAL_PORT_RANGE)
+            .ok()
+            .as_deref()
+            .and_then(parse_ephemeral_range)
+            .unwrap_or(DEFAULT_EPHEMERAL_RANGE)
+    })
+}
+
+/// First port and slot count of a band clear of the kernel's ephemeral range: below the floor by
+/// preference (matches `core/integration`'s own `port_reserver.rs`), above the ceiling when the
+/// floor leaves no room there.
+///
+/// A *hardcoded* band, chosen once without reading the real range (this file's own prior version:
+/// `15000..15199`, on the unverified assumption that every real deployment's floor sits above
+/// it), is wrong on any box tuned wider - `net.ipv4.ip_local_port_range = "1024 65535"` swallows
+/// that whole band. `flock` alone doesn't save it either: it is advisory, so it only excludes
+/// another `PortGuard`-based process, never an unrelated `bind(0)` elsewhere on the box landing on
+/// the same number from the kernel's own ephemeral pool.
+fn port_band() -> (u16, u16) {
+    static BAND: OnceLock<(u16, u16)> = OnceLock::new();
+    *BAND.get_or_init(|| {
+        let (floor, ceiling) = ephemeral_range();
+        band_for(floor, ceiling)
+    })
+}
+
+/// Pure band-selection logic, split out from [`port_band`] so it's testable against synthetic
+/// ranges without needing to fake `/proc` contents.
+fn band_for(floor: u16, ceiling: u16) -> (u16, u16) {
+    if floor > MIN_CANDIDATE_PORT {
+        let room = floor - MIN_CANDIDATE_PORT;
+        return (MIN_CANDIDATE_PORT, room.min(DESIRED_SLOTS));
+    }
+    let Some(start) = ceiling.checked_add(1) else {
+        panic!(
+            "kernel ephemeral range [{floor}, {ceiling}] leaves no room for a test port band \
+             below {MIN_CANDIDATE_PORT} nor above {ceiling} - narrow the range, e.g. \
+             sysctl -w net.ipv4.ip_local_port_range='32768 60999'"
+        );
+    };
+    // start >= 1 (ceiling + 1), so this never overflows u16.
+    let room = u16::MAX - start + 1;
+    (start, room.min(DESIRED_SLOTS))
+}
+
+#[test]
+fn given_a_readable_range_when_parsed_should_take_both_bounds() {
+    assert_eq!(
+        parse_ephemeral_range("32768\t60999\n"),
+        Some((32768, 60999))
+    );
+    assert_eq!(parse_ephemeral_range("1024 65535"), Some((1024, 65535)));
+    assert_eq!(parse_ephemeral_range(""), None);
+    assert_eq!(parse_ephemeral_range("32768"), None);
+    assert_eq!(parse_ephemeral_range("garbage 60999"), None);
+}
+
+#[test]
+fn given_room_below_the_floor_when_choosing_a_band_should_take_it() {
+    let (start, slots) = band_for(32768, 60999);
+    assert_eq!(start, MIN_CANDIDATE_PORT);
+    assert!(
+        start + slots <= 32768,
+        "band [{start}, {}] runs into the ephemeral floor",
+        start + slots - 1
+    );
+}
+
+/// A box tuned `net.ipv4.ip_local_port_range = "1024 60999"` is exactly the case the prior
+/// hardcoded `15000..15199` band silently broke under: room below the floor down to
+/// `MIN_CANDIDATE_PORT` is gone, but the ceiling still leaves room above it.
+#[test]
+fn given_no_room_below_the_floor_when_choosing_a_band_should_fall_back_above_the_ceiling() {
+    let (start, slots) = band_for(1024, 60999);
+    assert!(slots > 0, "must find room above the ceiling, not just fail");
+    assert!(
+        start > 60999,
+        "band must start above the ephemeral ceiling, got {start}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "leaves no room")]
+fn given_no_room_on_either_side_when_choosing_a_band_should_fail_loudly() {
+    band_for(1024, u16::MAX);
+}
 
 /// Exclusive claim on one port, released (and the port freed for reuse) when dropped - including
 /// on an unclean process exit, since the OS drops the `flock` with the file descriptor. Unlike
-/// bind-then-drop, nothing ever binds the port on this side, so there is no TOCTOU window between
-/// picking it and `iggy-server` binding it: the lock, not a socket, is the allocator.
+/// bind-then-drop, this process itself never binds the port before `iggy-server` does; see
+/// `port_band`'s doc comment for the limits of that guarantee against *other* processes.
 struct PortGuard {
     port: u16,
     _lock: File,
@@ -57,10 +163,11 @@ struct PortGuard {
 
 impl PortGuard {
     fn acquire() -> Self {
+        let (band_start, band_slots) = port_band();
         let lock_dir = std::env::temp_dir().join("iggy-kafka-gateway-test-port-locks");
         std::fs::create_dir_all(&lock_dir).expect("create port lock dir");
-        for offset in 0..PORT_LOCK_BAND_SLOTS {
-            let port = PORT_LOCK_BAND_START + offset;
+        for offset in 0..band_slots {
+            let port = band_start + offset;
             let path = lock_dir.join(format!("{port}.lock"));
             let Ok(file) = OpenOptions::new()
                 .read(true)
@@ -76,8 +183,8 @@ impl PortGuard {
             }
         }
         panic!(
-            "no free port slot in [{PORT_LOCK_BAND_START}, {}]",
-            PORT_LOCK_BAND_START + PORT_LOCK_BAND_SLOTS - 1
+            "no free port slot in [{band_start}, {}]",
+            band_start + band_slots - 1
         );
     }
 }
