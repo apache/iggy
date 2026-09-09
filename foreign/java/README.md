@@ -182,6 +182,36 @@ var client = Iggy.tcpClientBuilder()
     .buildAndLogin();
 ```
 
+### Event Loop Threads
+
+Each TCP client drives a single connection, so by default it creates an event loop group
+with one thread. An application that opens many clients can instead register them all on
+one caller-owned group. The clients never shut that group down. Close the clients first,
+then shut the group down:
+
+```java
+var group = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
+
+var producer = Iggy.tcpClientBuilder()
+    .blocking()
+    .eventLoopGroup(group)
+    .credentials("iggy", "iggy")
+    .buildAndLogin();
+var consumer = Iggy.tcpClientBuilder()
+    .blocking()
+    .eventLoopGroup(group)
+    .credentials("iggy", "iggy")
+    .buildAndLogin();
+
+// ... later
+producer.close();
+consumer.close();
+group.shutdownGracefully();
+```
+
+Do not block in a completion callback. Callbacks run on the group's loops, so a blocked
+callback stalls every client that shares the group.
+
 ### Version Information
 
 ```java
