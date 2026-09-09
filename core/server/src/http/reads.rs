@@ -274,17 +274,23 @@ pub(in crate::http) async fn await_recovery_barrier(
     let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
         return Ok(());
     };
-    let barrier = consensus.recovery_barrier();
     // Gate on commit_MIN (locally applied), not commit_max (known committed):
     // a StartView adoption advances commit_max first and only then walks the
     // journal applying ops, and this task interleaves with that walk at its
     // await points -- a commit_max gate would serve state from before the
     // suffix applied (e.g. a pre-restart password change not yet visible).
-    if barrier_state(barrier, consensus.commit_min(), false) == BarrierWait::Ready {
+    if barrier_state(consensus.recovery_barrier(), consensus.commit_min(), false)
+        == BarrierWait::Ready
+    {
         return Ok(());
     }
     let deadline = std::time::Instant::now() + consensus.recovery_deadline();
     loop {
+        // Re-read per poll, like `commit_min`. `redecide_recovery_barrier` lowers
+        // the barrier when a view change settles the recovered suffix, so a reader
+        // holding the value it captured on entry waits out a barrier that no longer
+        // exists and then 503s on a replica that is serving.
+        let barrier = consensus.recovery_barrier();
         let expired = std::time::Instant::now() >= deadline;
         match barrier_state(barrier, consensus.commit_min(), expired) {
             BarrierWait::Ready => return Ok(()),

@@ -134,8 +134,8 @@ running prek / committing / pushing. This list is not exhaustive and other hook 
 
 ## Client Configuration
 
-`IggyClient` takes a server address, a `TcpConfig`, a `QuicConfig`, or an
-`HttpConfig`:
+`IggyClient` takes a server address, a `TcpConfig`, a `QuicConfig`, an
+`HttpConfig`, or a `WebSocketConfig`:
 
 ```python
 import asyncio
@@ -169,9 +169,10 @@ async def main():
 asyncio.run(main())
 ```
 
-`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport and an
-`HttpConfig` for the HTTP transport;
-`examples/python/getting-started/producer.py` shows either swap in context.
+`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport, an
+`HttpConfig` for the HTTP transport, and a `WebSocketConfig` for the WebSocket
+transport. `examples/python/getting-started/producer.py` shows each swap in
+context.
 
 `HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the

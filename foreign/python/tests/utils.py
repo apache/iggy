@@ -35,6 +35,7 @@ MAX_PASSWORD_BYTES = 100
 DEFAULT_TCP_PORT = 8090
 DEFAULT_QUIC_PORT = 8080
 DEFAULT_HTTP_PORT = 3000
+DEFAULT_WEBSOCKET_PORT = 8092
 
 
 def get_transport_config(port_env_var: str, default_port: int) -> tuple[str, int]:
@@ -94,6 +95,16 @@ def get_http_server_config() -> tuple[str, int]:
         tuple: (host, port) for the Iggy HTTP API
     """
     return get_transport_config("IGGY_SERVER_HTTP_PORT", DEFAULT_HTTP_PORT)
+
+
+def get_websocket_server_config() -> tuple[str, int]:
+    """
+    Get WebSocket server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy server
+    """
+    return get_transport_config("IGGY_SERVER_WS_PORT", DEFAULT_WEBSOCKET_PORT)
 
 
 def wait_for_server(host: str, port: int, timeout: int = 60, interval: int = 2) -> None:

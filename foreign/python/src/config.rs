@@ -22,6 +22,9 @@ use iggy::prelude::{
     QuicClientReconnectionConfig as RustQuicClientReconnectionConfig,
     TcpClientConfig as RustTcpClientConfig, TcpClientConfigBuilder,
     TcpClientReconnectionConfig as RustTcpClientReconnectionConfig,
+    WebSocketClientConfig as RustWebSocketClientConfig, WebSocketClientConfigBuilder,
+    WebSocketClientReconnectionConfig as RustWebSocketClientReconnectionConfig,
+    WebSocketConfig as RustWebSocketFramingConfig,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -571,7 +574,7 @@ impl QuicConfig {
     ///         seconds) instead, since `configure()` skips the setter entirely when
     ///         zero. Defaults to 10 seconds.
     ///     validate_certificate: Whether to validate the server certificate. Defaults
-    ///         to disabled, unlike the TCP and WebSocket transports.
+    ///         to disabled; only the TCP transport validates by default.
     ///
     /// Raises:
     ///     ValueError: If `server_address` or `client_address` is not a valid
@@ -964,6 +967,466 @@ impl HttpConfig {
     }
 }
 
+/// How the WebSocket client reconnects after the connection to the server is lost.
+#[gen_stub_pyclass]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct WebSocketReconnectionConfig {
+    pub(crate) inner: RustWebSocketClientReconnectionConfig,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl WebSocketReconnectionConfig {
+    /// Constructs a reconnection policy.
+    ///
+    /// Args:
+    ///     enabled: Whether to reconnect at all. Defaults to enabled.
+    ///     max_retries: Redials of the configured server address after the first
+    ///         attempt, or `None` for unlimited; `0` still makes that first
+    ///         attempt. Unlike the TCP transport, WebSocket redials the one
+    ///         address it was configured with rather than walking a cluster
+    ///         roster, so this counts dials. Defaults to unlimited, which means
+    ///         a call awaited while the server is down never returns:
+    ///         `connect()` waits inside the retry loop, as do `send_messages()`
+    ///         and `poll_messages()` once auto-login is configured. Set a finite
+    ///         number for request/reply style usage, so a call fails instead.
+    ///     interval: Delay before each redial. Defaults to 1 second.
+    ///     reestablish_after: Cooldown before redialing after a previously
+    ///         successful connection, measured from when it was established, so
+    ///         a session that outlived the interval is redialed at once. Applied
+    ///         from the first redial onward, not to the initial connect.
+    ///         Defaults to 5 seconds.
+    ///
+    /// Raises:
+    ///     ValueError: If a duration is negative, if `max_retries` is outside the
+    ///         range of an unsigned 32-bit integer, or if `interval` is zero.
+    ///     OverflowError: If `max_retries` does not fit a signed 64-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
+    #[new]
+    #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enabled: Option<bool>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_retries: Option<i64>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        reestablish_after: Option<Py<PyDelta>>,
+    ) -> PyResult<Self> {
+        let defaults = RustWebSocketClientReconnectionConfig::default();
+        let enabled = enabled.unwrap_or(defaults.enabled);
+        let max_retries = max_retries
+            .map(|max_retries| u32_param(max_retries, "max_retries"))
+            .transpose()?;
+        let interval = interval
+            .as_ref()
+            .map(py_delta_to_iggy_duration)
+            .transpose()?
+            .map(|interval| reject_zero(interval, "interval"))
+            .transpose()?
+            .unwrap_or(defaults.interval);
+        Ok(Self {
+            inner: RustWebSocketClientReconnectionConfig {
+                enabled,
+                max_retries,
+                interval,
+                reestablish_after: reestablish_after
+                    .as_ref()
+                    .map(py_delta_to_iggy_duration)
+                    .transpose()?
+                    .unwrap_or(defaults.reestablish_after),
+            },
+        })
+    }
+
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.inner.enabled
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
+    #[getter]
+    fn max_retries(&self) -> Option<u32> {
+        self.inner.max_retries
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.interval.get())
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn reestablish_after<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.reestablish_after)
+    }
+
+    fn __repr__(&self) -> String {
+        let max_retries = match self.inner.max_retries {
+            Some(max_retries) => max_retries.to_string(),
+            None => "None".to_owned(),
+        };
+        format!(
+            "WebSocketReconnectionConfig(enabled={}, max_retries={max_retries}, interval={}, reestablish_after={})",
+            python_bool(self.inner.enabled),
+            duration_repr(self.inner.interval.get()),
+            duration_repr(self.inner.reestablish_after),
+        )
+    }
+}
+
+/// Frame- and buffer-level options passed through to the underlying WebSocket
+/// implementation, accepted by `WebSocketConfig`'s `framing` argument.
+///
+/// Every field is keyword-only and optional; unset fields fall back to the
+/// underlying WebSocket library's own defaults.
+#[gen_stub_pyclass]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct WebSocketFramingConfig {
+    pub(crate) inner: RustWebSocketFramingConfig,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl WebSocketFramingConfig {
+    /// Constructs a WebSocket framing configuration.
+    ///
+    /// Args:
+    ///     read_buffer_size: Read buffer size in bytes. Defaults to 128 KiB.
+    ///     write_buffer_size: Write buffer size in bytes. Defaults to 128 KiB.
+    ///     max_write_buffer_size: Maximum write buffer size in bytes. Defaults to
+    ///         unbounded, which reads back as the largest value a pointer-sized
+    ///         unsigned integer holds rather than as `None`.
+    ///     max_message_size: Maximum message size in bytes, or an explicit `None`
+    ///         to lift the limit entirely. Omitting the argument is not the same
+    ///         as passing `None`: it keeps the underlying default of 64 MiB.
+    ///         Lifting the limit lets a peer queue an arbitrarily large message
+    ///         in memory, so prefer a finite value.
+    ///     max_frame_size: Maximum frame size in bytes, or an explicit `None` to
+    ///         lift the limit entirely. Omitting the argument keeps the
+    ///         underlying default of 16 MiB, with the same caveat as
+    ///         `max_message_size`.
+    ///     accept_unmasked_frames: Whether to accept unmasked frames. Defaults to
+    ///         `False`; clients should typically keep this off for RFC compliance.
+    ///
+    /// Raises:
+    ///     ValueError: If a numeric field is outside the range of a pointer-sized
+    ///         unsigned integer, or if `max_write_buffer_size` does not come out
+    ///         greater than `write_buffer_size`. tungstenite enforces the same
+    ///         invariant with an `assert!` at connect time, which would otherwise
+    ///         surface as an unrecoverable Rust panic instead of a `ValueError`.
+    ///     OverflowError: If a numeric field does not fit a signed 128-bit integer,
+    ///         raised by the underlying conversion before this constructor runs.
+    #[new]
+    #[pyo3(signature = (
+        *,
+        read_buffer_size=None,
+        write_buffer_size=None,
+        max_write_buffer_size=None,
+        max_message_size=64 << 20,
+        max_frame_size=16 << 20,
+        accept_unmasked_frames=None,
+    ))]
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] read_buffer_size: Option<
+            i128,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] write_buffer_size: Option<
+            i128,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_write_buffer_size: Option<
+            i128,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_message_size: Option<
+            i128,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_frame_size: Option<i128>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))]
+        accept_unmasked_frames: Option<bool>,
+    ) -> PyResult<Self> {
+        let mut inner = RustWebSocketFramingConfig::default();
+        if let Some(read_buffer_size) = read_buffer_size {
+            inner.read_buffer_size = Some(usize_param(read_buffer_size, "read_buffer_size")?);
+        }
+        if let Some(write_buffer_size) = write_buffer_size {
+            inner.write_buffer_size = Some(usize_param(write_buffer_size, "write_buffer_size")?);
+        }
+        if let Some(max_write_buffer_size) = max_write_buffer_size {
+            inner.max_write_buffer_size =
+                Some(usize_param(max_write_buffer_size, "max_write_buffer_size")?);
+        }
+        // Assigned unconditionally, unlike the buffer sizes above: `None` here
+        // means "no limit", and pyo3 cannot tell an omitted argument from an
+        // explicit `None` on its own. The signature defaults carry the
+        // underlying limits instead, so omission lands on `Some(default)` and
+        // only an explicit `None` reaches this as `None`.
+        inner.max_message_size = max_message_size
+            .map(|max_message_size| usize_param(max_message_size, "max_message_size"))
+            .transpose()?;
+        inner.max_frame_size = max_frame_size
+            .map(|max_frame_size| usize_param(max_frame_size, "max_frame_size"))
+            .transpose()?;
+        if let Some(accept_unmasked_frames) = accept_unmasked_frames {
+            inner.accept_unmasked_frames = accept_unmasked_frames;
+        }
+        if let (Some(write_buffer_size), Some(max_write_buffer_size)) =
+            (inner.write_buffer_size, inner.max_write_buffer_size)
+            && max_write_buffer_size <= write_buffer_size
+        {
+            return Err(PyValueError::new_err(format!(
+                "'max_write_buffer_size' ({max_write_buffer_size}) must be greater than \
+                 'write_buffer_size' ({write_buffer_size})"
+            )));
+        }
+
+        Ok(Self { inner })
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
+    #[getter]
+    fn read_buffer_size(&self) -> Option<usize> {
+        self.inner.read_buffer_size
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
+    #[getter]
+    fn write_buffer_size(&self) -> Option<usize> {
+        self.inner.write_buffer_size
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
+    #[getter]
+    fn max_write_buffer_size(&self) -> Option<usize> {
+        self.inner.max_write_buffer_size
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
+    #[getter]
+    fn max_message_size(&self) -> Option<usize> {
+        self.inner.max_message_size
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
+    #[getter]
+    fn max_frame_size(&self) -> Option<usize> {
+        self.inner.max_frame_size
+    }
+
+    #[getter]
+    fn accept_unmasked_frames(&self) -> bool {
+        self.inner.accept_unmasked_frames
+    }
+
+    fn __repr__(&self) -> String {
+        let optional_usize = |value: Option<usize>| match value {
+            Some(value) => value.to_string(),
+            None => "None".to_owned(),
+        };
+        format!(
+            "WebSocketFramingConfig(read_buffer_size={}, write_buffer_size={}, max_write_buffer_size={}, max_message_size={}, max_frame_size={}, accept_unmasked_frames={})",
+            optional_usize(self.inner.read_buffer_size),
+            optional_usize(self.inner.write_buffer_size),
+            optional_usize(self.inner.max_write_buffer_size),
+            optional_usize(self.inner.max_message_size),
+            optional_usize(self.inner.max_frame_size),
+            python_bool(self.inner.accept_unmasked_frames),
+        )
+    }
+}
+
+/// Configuration for the WebSocket transport, accepted by `IggyClient(...)`.
+///
+/// Every field is keyword-only and optional.
+#[gen_stub_pyclass]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct WebSocketConfig {
+    inner: Arc<RustWebSocketClientConfig>,
+}
+
+impl WebSocketConfig {
+    /// The configuration in the shape `WebSocketClient::create` expects.
+    pub(crate) fn client_config(&self) -> Arc<RustWebSocketClientConfig> {
+        self.inner.clone()
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl WebSocketConfig {
+    /// Constructs a WebSocket configuration.
+    ///
+    /// Args:
+    ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8092`.
+    ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+    ///     reconnection: Reconnection policy. Defaults to `WebSocketReconnectionConfig()`.
+    ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+    ///     framing: Frame- and buffer-level options. Defaults to `WebSocketFramingConfig()`.
+    ///     tls_enabled: Whether to connect over TLS. Defaults to disabled.
+    ///     tls_domain: Domain to validate the certificate against. Defaults to
+    ///         `localhost`. Empty means it is taken from the IP `server_address`
+    ///         resolves to.
+    ///     tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
+    ///         and `tls_validate_certificate` are both on; with either one off it
+    ///         is kept but never consulted, so pairing it with
+    ///         `tls_validate_certificate=False` pins nothing.
+    ///     tls_validate_certificate: Whether to validate the server certificate.
+    ///         Defaults to `False`; only the TCP transport validates by default.
+    ///         Disabling this accepts any certificate the server presents,
+    ///         including self-signed and mismatched ones, and takes precedence
+    ///         over `tls_ca_file`.
+    ///
+    /// Raises:
+    ///     ValueError: If `server_address` is not a valid `host:port` pair, if a
+    ///         duration is negative, or if `heartbeat_interval` is zero.
+    #[new]
+    #[pyo3(signature = (
+        *,
+        server_address=None,
+        auto_login=None,
+        reconnection=None,
+        heartbeat_interval=None,
+        framing=None,
+        tls_enabled=None,
+        tls_domain=None,
+        tls_ca_file=None,
+        tls_validate_certificate=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_address: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "AutoLogin | None"))] auto_login: Option<AutoLogin>,
+        #[gen_stub(override_type(type_repr = "WebSocketReconnectionConfig | None"))]
+        reconnection: Option<WebSocketReconnectionConfig>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        heartbeat_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "WebSocketFramingConfig | None"))] framing: Option<
+            WebSocketFramingConfig,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tls_enabled: Option<bool>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_domain: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_ca_file: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))]
+        tls_validate_certificate: Option<bool>,
+    ) -> PyResult<Self> {
+        // The builder starts from `WebSocketClientConfig::default()`, and its
+        // `build()` trims and validates the address whether or not one was set here.
+        let mut builder = WebSocketClientConfigBuilder::new();
+        if let Some(server_address) = server_address {
+            builder = builder.with_server_address(server_address);
+        }
+        let mut inner = builder
+            .build()
+            .map_err(|e| invalid_address("server_address", e))?;
+        if let Some(auto_login) = auto_login {
+            inner.auto_login = auto_login.inner;
+        }
+        if let Some(reconnection) = reconnection {
+            inner.reconnection = reconnection.inner;
+        }
+        if let Some(heartbeat_interval) = heartbeat_interval {
+            inner.heartbeat_interval = reject_zero(
+                py_delta_to_iggy_duration(&heartbeat_interval)?,
+                "heartbeat_interval",
+            )?;
+        }
+        if let Some(framing) = framing {
+            inner.ws_config = framing.inner;
+        }
+        if let Some(tls_enabled) = tls_enabled {
+            inner.tls_enabled = tls_enabled;
+        }
+        if let Some(tls_domain) = tls_domain {
+            inner.tls_domain = tls_domain;
+        }
+        if tls_ca_file.is_some() {
+            inner.tls_ca_file = tls_ca_file;
+        }
+        if let Some(tls_validate_certificate) = tls_validate_certificate {
+            inner.tls_validate_certificate = tls_validate_certificate;
+        }
+
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    #[getter]
+    fn server_address(&self) -> String {
+        self.inner.server_address.clone()
+    }
+
+    #[getter]
+    fn auto_login(&self) -> AutoLogin {
+        AutoLogin {
+            inner: self.inner.auto_login.clone(),
+        }
+    }
+
+    #[getter]
+    fn reconnection(&self) -> WebSocketReconnectionConfig {
+        WebSocketReconnectionConfig {
+            inner: self.inner.reconnection.clone(),
+        }
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn heartbeat_interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.heartbeat_interval.get())
+    }
+
+    #[getter]
+    fn framing(&self) -> WebSocketFramingConfig {
+        WebSocketFramingConfig {
+            inner: self.inner.ws_config.clone(),
+        }
+    }
+
+    #[getter]
+    fn tls_enabled(&self) -> bool {
+        self.inner.tls_enabled
+    }
+
+    #[getter]
+    fn tls_domain(&self) -> String {
+        self.inner.tls_domain.clone()
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.str | None"))]
+    #[getter]
+    fn tls_ca_file(&self) -> Option<String> {
+        self.inner.tls_ca_file.clone()
+    }
+
+    #[getter]
+    fn tls_validate_certificate(&self) -> bool {
+        self.inner.tls_validate_certificate
+    }
+
+    fn __repr__(&self) -> String {
+        let tls_ca_file = match &self.inner.tls_ca_file {
+            Some(tls_ca_file) => format!("{tls_ca_file:?}"),
+            None => "None".to_owned(),
+        };
+        format!(
+            "WebSocketConfig(server_address={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, framing={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={})",
+            self.inner.server_address,
+            self.auto_login().__repr__(),
+            self.reconnection().__repr__(),
+            duration_repr(self.inner.heartbeat_interval.get()),
+            self.framing().__repr__(),
+            python_bool(self.inner.tls_enabled),
+            self.inner.tls_domain,
+            python_bool(self.inner.tls_validate_certificate),
+        )
+    }
+}
+
 fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
@@ -1020,8 +1483,24 @@ fn varint_param(value: i64, parameter: &str) -> PyResult<u64> {
     Ok(value)
 }
 
+/// Converts a Python int to the unsigned pointer-sized integer a WebSocket
+/// framing field expects, naming the parameter in the error so a caller can
+/// tell which argument was out of range. Extracted as an `i128` rather than an
+/// `i64` so the whole `usize` range survives the way in: `max_write_buffer_size`
+/// defaults to `usize::MAX`, which an `i64` parameter would refuse to take back
+/// with an unnamed `OverflowError`, breaking `eval(repr(config))`.
+fn usize_param(value: i128, parameter: &str) -> PyResult<usize> {
+    usize::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!(
+            "'{parameter}' must be between 0 and {}",
+            usize::MAX
+        ))
+    })
+}
+
 /// What `IggyClient(...)` accepts: a bare `host:port`, a full `TcpConfig`, a
-/// `QuicConfig` for the QUIC transport, or an `HttpConfig` for the HTTP transport.
+/// `QuicConfig` for the QUIC transport, an `HttpConfig` for the HTTP transport,
+/// or a `WebSocketConfig` for the WebSocket transport.
 #[derive(FromPyObject)]
 pub enum PyClientConfig {
     #[pyo3(transparent)]
@@ -1030,7 +1509,51 @@ pub enum PyClientConfig {
     Quic(QuicConfig),
     #[pyo3(transparent)]
     Http(HttpConfig),
+    #[pyo3(transparent)]
+    WebSocket(WebSocketConfig),
     #[pyo3(transparent, annotation = "str")]
     ServerAddress(String),
 }
-impl_stub_type!(PyClientConfig = TcpConfig | QuicConfig | HttpConfig | String);
+impl_stub_type!(PyClientConfig = TcpConfig | QuicConfig | HttpConfig | WebSocketConfig | String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors the literal in `WebSocketFramingConfig::new`'s signature.
+    const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
+
+    /// Mirrors the literal in `WebSocketFramingConfig::new`'s signature.
+    const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
+
+    /// The signature defaults have to be literals for the generated stub to stay
+    /// valid Python, so nothing but this test stops them drifting from the SDK
+    /// (and so from tungstenite) on a dependency bump.
+    #[test]
+    fn defaults_should_match_the_sdk() {
+        let defaults = RustWebSocketFramingConfig::default();
+
+        assert_eq!(
+            defaults.max_message_size,
+            Some(DEFAULT_MAX_MESSAGE_SIZE),
+            "'max_message_size' drifted from the SDK, update the literal in \
+             WebSocketFramingConfig::new's signature too"
+        );
+        assert_eq!(
+            defaults.max_frame_size,
+            Some(DEFAULT_MAX_FRAME_SIZE),
+            "'max_frame_size' drifted from the SDK, update the literal in \
+             WebSocketFramingConfig::new's signature too"
+        );
+        assert!(
+            defaults.write_buffer_size.is_some(),
+            "'write_buffer_size' lost its default, so the write buffer invariant \
+             check in WebSocketFramingConfig::new would stop running"
+        );
+        assert!(
+            defaults.max_write_buffer_size.is_some(),
+            "'max_write_buffer_size' lost its default, so the write buffer \
+             invariant check in WebSocketFramingConfig::new would stop running"
+        );
+    }
+}

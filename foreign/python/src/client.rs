@@ -94,17 +94,17 @@ fn resolve_topic_params(
 #[pymethods]
 impl IggyClient {
     /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
-    /// `QuicConfig`, or an `HttpConfig`. This initializes a new runtime for
-    /// asynchronous operations.
+    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
+    /// new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
     ///
     /// Args:
-    ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, or an
-    ///         `HttpConfig`. Defaults to `127.0.0.1:8090` over TCP with auto-login
-    ///         disabled. A malformed address is reported differently depending on
-    ///         the form: the string form raises `RuntimeError` here, while
-    ///         `TcpConfig`/`QuicConfig`/`HttpConfig` raise `ValueError` when they
-    ///         are constructed, before any of them ever reaches this call. Neither
+    ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
+    ///         `HttpConfig`, or a `WebSocketConfig`. Defaults to `127.0.0.1:8090`
+    ///         over TCP with auto-login disabled. A malformed address is reported
+    ///         differently depending on the form: the string form raises
+    ///         `RuntimeError` here, while every config type raises `ValueError`
+    ///         when it is constructed, before any of them reaches this call. Neither
     ///         exception is a subclass of the other.
     ///
     /// Raises:
@@ -115,7 +115,7 @@ impl IggyClient {
     #[pyo3(signature = (conn=None))]
     fn new(
         #[gen_stub(override_type(
-            type_repr = "TcpConfig | QuicConfig | HttpConfig | builtins.str | None"
+            type_repr = "TcpConfig | QuicConfig | HttpConfig | WebSocketConfig | builtins.str | None"
         ))]
         conn: Option<PyClientConfig>,
     ) -> PyResult<Self> {
@@ -145,6 +145,9 @@ impl IggyClient {
             }
             Some(PyClientConfig::Http(config)) => ClientWrapper::Http(
                 HttpClient::create(config.client_config()).map_err(to_runtime_error)?,
+            ),
+            Some(PyClientConfig::WebSocket(config)) => ClientWrapper::WebSocket(
+                WebSocketClient::create(config.client_config()).map_err(to_runtime_error)?,
             ),
             None => ClientWrapper::Tcp(
                 TcpClient::create(Arc::new(TcpClientConfig::default()))
