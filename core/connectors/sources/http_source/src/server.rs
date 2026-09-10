@@ -669,6 +669,17 @@ async fn named_path_outcome(
         );
     }
 
+    // Ahead of the read, not just ahead of the copy. `enqueue`'s gate spares
+    // the header map and the payload copy, but by the time it runs `to_bytes`
+    // has already buffered up to `max_body_size_bytes` off the wire, and
+    // `Retry-After: 1` has the sender upload every byte of it again. Relaxed
+    // by nature, so `try_send` stays the real gate; this only declines work
+    // whose answer is already known.
+    if instance.sender.is_full() {
+        let response = reject_bridge_full(&instance, &state.metrics);
+        return (Some(instance), response);
+    }
+
     // `DefaultBodyLimit` guards the extractor, which is no longer in play, so
     // the cap is applied here instead.
     let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
@@ -752,6 +763,19 @@ async fn secret_path_outcome(
             }
         }
     };
+    // The named path's pre-read check, and here it also spares the HMAC over a
+    // body that is about to be discarded. It runs before `authorize`, which it
+    // has to: the signature covers the body, so any gate placed after auth has
+    // already paid for the read it exists to avoid. The cost is that a caller
+    // holding a live endpoint id learns the bridge is full without proving it
+    // holds the secret. That id is the routing credential and an unknown one
+    // is already 404 above, so this tells such a caller nothing the 401 below
+    // does not.
+    if instance.sender.is_full() {
+        let response = reject_bridge_full(&instance, &state.metrics);
+        return (Some(instance), response);
+    }
+
     // Only now, once the id resolved to something that is actually serving.
     // An unknown or revoked id used to cost a full body read before its 404,
     // which is free amplification on the public listener. HMAC still needs the
@@ -888,11 +912,17 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
     .into_response()
 }
 
-/// The 429 a full bridge answers with.
+/// Records and answers a request shed because its instance's bridge is full.
 ///
-/// Shared so the early check and the `try_send` gate cannot drift apart in
-/// status, `Retry-After`, or body.
-fn bridge_full_response() -> Response {
+/// Shared by the pre-read check in both handlers and by `enqueue`'s own two
+/// gates, so a shed request cannot drift apart between them in status,
+/// `Retry-After`, body, metric, or log line.
+fn reject_bridge_full(instance: &SharedState, metrics: &Metrics) -> Response {
+    metrics.record_rejected_full(&instance.instance_name);
+    debug!(
+        "Rejected a request for {CONNECTOR_NAME} connector ID: {}, bridge is full at {} messages",
+        instance.id, instance.config.buffer_capacity
+    );
     (
         StatusCode::TOO_MANY_REQUESTS,
         [(header::RETRY_AFTER, RETRY_AFTER_SECONDS)],
@@ -917,16 +947,11 @@ fn enqueue(
     metrics: &Metrics,
 ) -> Response {
     // Checked before the header map is built and the body copied, since a full
-    // bridge throws both away. `is_full` is racy, which is why `try_send`
-    // below stays the real gate; this only skips the work when the answer is
-    // already known.
+    // bridge throws both away. Both handlers check once more before they read
+    // the body at all; this one catches a bridge that filled during the read.
+    // `is_full` is racy, which is why `try_send` below stays the real gate.
     if instance.sender.is_full() {
-        metrics.record_rejected_full(&instance.instance_name);
-        debug!(
-            "Rejected a request for {CONNECTOR_NAME} connector ID: {}, bridge is full at {} messages",
-            instance.id, instance.config.buffer_capacity
-        );
-        return bridge_full_response();
+        return reject_bridge_full(instance, metrics);
     }
     let (headers, clamped, dropped) = message_headers(instance, request_headers, remote_addr);
     let message = QueuedMessage {
@@ -960,12 +985,7 @@ fn enqueue(
             )
                 .into_response();
         }
-        metrics.record_rejected_full(&instance.instance_name);
-        debug!(
-            "Rejected a request for {CONNECTOR_NAME} connector ID: {}, bridge is full at {} messages",
-            instance.id, instance.config.buffer_capacity
-        );
-        return bridge_full_response();
+        return reject_bridge_full(instance, metrics);
     }
     // After the send, which is the only order that can see it: `leave()` sets
     // this before it counts the bridge, so a message accepted past that point
@@ -1478,6 +1498,74 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1"),
             "a sender needs to be told when to come back, not just refused"
+        );
+        close(&mut source).await;
+    }
+
+    /// The ordering tests below use one discriminator: an oversized body sent
+    /// to a full bridge earns both a 413 and a 429, so whichever the handler
+    /// answers names the check that ran first. A 413 means `to_bytes` buffered
+    /// the whole body before anything looked at the bridge, which is the read
+    /// the pre-read gate exists to skip.
+    #[tokio::test]
+    async fn given_full_bridge_when_oversized_body_posted_should_refuse_before_reading_it() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.buffer_capacity = 2;
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+        let base = base_url(&source);
+
+        for _ in 0..2 {
+            assert_eq!(
+                post_signed(&base, ENDPOINT_ONE, "{}").await.status(),
+                StatusCode::OK
+            );
+        }
+        let oversized = "x".repeat(4096);
+        let response = client()
+            .post(format!("{base}/e/{ENDPOINT_ONE}"))
+            .header(crate::DEFAULT_HMAC_HEADER, signature(oversized.as_bytes()))
+            .body(oversized)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "413 here means the body was read, and hashed, before the bridge was checked"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_full_bridge_when_named_path_posted_oversized_should_refuse_before_reading_it() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.buffer_capacity = 2;
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+        let url = format!("{}/topics/github", base_url(&source));
+
+        for _ in 0..2 {
+            let accepted = client()
+                .post(&url)
+                .body("{}")
+                .send()
+                .await
+                .expect("the request must reach the listener");
+            assert_eq!(accepted.status(), StatusCode::OK);
+        }
+        let response = client()
+            .post(&url)
+            .body("x".repeat(4096))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "413 here means the body was read before the bridge was checked"
         );
         close(&mut source).await;
     }
