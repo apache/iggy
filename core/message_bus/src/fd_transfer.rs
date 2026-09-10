@@ -15,126 +15,102 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! File descriptor transfer between shards.
+//! TCP socket transfer between shards.
 //!
 //! After shard 0 accepts or connects a TCP socket and completes the
 //! handshake, it calls [`dup_fd`] to create a second kernel reference
-//! to the same socket. The duplicated fd is wrapped in an owning
+//! to the same socket. The duplicated socket is wrapped in an owning
 //! [`DupedFd`] and sent to the target shard via the inter-shard channel.
 //! The target shard calls [`wrap_duped_fd`] to construct a compio
 //! `TcpStream` on its own runtime.
 //!
-//! Shard 0 then drops its original `TcpStream`, closing its fd. The
-//! socket stays alive because the duplicated fd still references it
-//! in the kernel's file table.
+//! Shard 0 then drops its original `TcpStream`. The socket stays alive
+//! because the duplicated handle still references it in the kernel.
 //!
-//! [`DupedFd`] closes the underlying fd on drop, so a `ShardFrame`
+//! [`DupedFd`] closes the underlying socket on drop, so a `ShardFrame`
 //! discarded mid-flight (shutdown, pump drain abort, router panic
-//! before `install_*_fd`) does not leak the dup.
+//! before `install_*_fd`) does not leak the duplicate.
 
 use compio::net::TcpStream;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use tracing::warn;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
 
-/// Owning handle for a duplicated TCP socket fd.
+use socket2::{SockRef, Socket};
+
+/// Owning handle for a duplicated TCP socket.
 ///
 /// Produced by [`dup_fd`] and consumed by [`wrap_duped_fd`] on the
 /// target shard. If neither happens (frame dropped unprocessed), the
-/// fd is closed on drop so duped-but-unused sockets cannot accumulate.
+/// socket is closed on drop so duped-but-unused sockets cannot accumulate.
 ///
 /// The type is deliberately opaque: there is no public constructor
-/// from a raw fd. Call sites wishing to transfer ownership out (into
-/// a `TcpStream` wrapper) must go through [`wrap_duped_fd`], which
-/// consumes `self` by value.
+/// from a raw socket. Call sites wishing to transfer ownership out
+/// (into a `TcpStream` wrapper) must go through [`wrap_duped_fd`],
+/// which consumes `self` by value.
 #[derive(Debug)]
-pub struct DupedFd(RawFd);
+pub struct DupedFd(Socket);
 
 impl DupedFd {
     /// Expose the raw fd for logging purposes only. The fd remains
     /// owned by `self` and is still closed on drop; callers must not
     /// pass this value to `close(2)`, `from_raw_fd`, or similar.
+    #[cfg(unix)]
     #[must_use]
-    pub const fn as_raw_fd(&self) -> RawFd {
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+
+    /// Expose the raw socket for logging purposes only. Kept under the
+    /// historical `as_raw_fd` name because shard routing logs are fd-oriented.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn as_raw_fd(&self) -> RawSocket {
+        self.0.as_raw_socket()
+    }
+
+    fn into_socket(self) -> Socket {
         self.0
     }
-
-    /// Release ownership of the raw fd. The returned value becomes the
-    /// caller's responsibility to close. Used internally by
-    /// [`wrap_duped_fd`].
-    const fn into_raw(self) -> RawFd {
-        let fd = self.0;
-        std::mem::forget(self);
-        fd
-    }
 }
 
-impl Drop for DupedFd {
-    fn drop(&mut self) {
-        if self.0 >= 0 {
-            close_fd(self.0);
-        }
-    }
-}
-
-/// Duplicate the underlying file descriptor of a TCP stream with
-/// `FD_CLOEXEC` set atomically.
+/// Duplicate the underlying socket of a TCP stream.
 ///
 /// Returns an owning [`DupedFd`]. The caller must arrange for it to
 /// be consumed by [`wrap_duped_fd`] on the target shard; otherwise
-/// the `Drop` impl closes the dup when the holder (typically a
-/// `ShardFrame`) is discarded.
+/// the socket is closed when the holder (typically a `ShardFrame`) is
+/// discarded.
 ///
-/// Uses `fcntl(F_DUPFD_CLOEXEC)` rather than `dup(2)` so that any
-/// future `fork`+`exec` child cannot inherit this socket.
+/// Uses `socket2::Socket::try_clone`, which maps to `F_DUPFD_CLOEXEC`
+/// on Unix and a non-inheritable duplicated Winsock socket on Windows.
 ///
 /// # Errors
 ///
-/// Returns `io::Error` if the `fcntl(2)` syscall fails.
+/// Returns `io::Error` if duplicating the socket fails.
 pub fn dup_fd(stream: &TcpStream) -> io::Result<DupedFd> {
-    let original = stream.as_raw_fd();
-    // SAFETY: F_DUPFD_CLOEXEC allocates the lowest-numbered free fd >= 0
-    // referring to the same open file description as `original`, with
-    // FD_CLOEXEC set atomically. Safe to call on any valid fd.
-    let duped = unsafe { libc::fcntl(original, libc::F_DUPFD_CLOEXEC, 0) };
-    if duped == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(DupedFd(duped))
+    SockRef::from(stream).try_clone().map(DupedFd)
 }
 
-/// Wrap a previously duplicated fd into a compio `TcpStream`.
+/// Wrap a previously duplicated socket into a compio `TcpStream`.
 ///
 /// Must be called on the target shard's compio runtime so the
 /// `TcpStream` is registered with the correct `io_uring` instance.
 ///
-/// Takes `DupedFd` by value, so the type-system guarantees that (a)
-/// the fd originated from [`dup_fd`] and (b) ownership is transferred
+/// Takes `DupedFd` by value, so the type-system guarantees that (a) the
+/// socket originated from [`dup_fd`] and (b) ownership is transferred
 /// into the returned `TcpStream`, which will close the fd on drop.
-#[must_use]
-pub fn wrap_duped_fd(fd: DupedFd) -> TcpStream {
-    let raw = fd.into_raw();
-    // SAFETY: `DupedFd` guarantees `raw` is an open TCP fd whose
-    // ownership is being transferred here. No other resource holds it.
-    unsafe { TcpStream::from_raw_fd(raw) }
-}
-
-/// Close a raw fd. Internal helper used by [`DupedFd::drop`].
 ///
-/// Logs a warning on anything other than `EINTR` since that signals a
-/// resource accounting issue (wrong fd, double-close, or kernel fd
-/// table corruption) that callers cannot recover from here.
-fn close_fd(fd: RawFd) {
-    // SAFETY: caller (DupedFd::drop) owns this fd and is closing it.
-    let rc = unsafe { libc::close(fd) };
-    if rc == -1 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINTR) {
-            warn!(fd, error = %err, "close(2) failed on duped fd");
-        }
-    }
+/// # Errors
+///
+/// Returns `io::Error` if compio cannot adopt the duplicated socket on
+/// the current runtime.
+pub fn wrap_duped_fd(fd: DupedFd) -> io::Result<TcpStream> {
+    TcpStream::from_std(fd.into_socket().into())
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;

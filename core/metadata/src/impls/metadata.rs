@@ -176,16 +176,11 @@ impl IggySnapshot {
         })?;
 
         // Fsync the parent directory to ensure the rename is durable.
-        if let Some(parent) = path.parent() {
-            let dir = fs::File::open(parent).map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::DirSync,
-                source: e,
-            })?;
-            dir.sync_all().map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::DirSync,
-                source: e,
-            })?;
-        }
+        // No-op on Windows, which cannot fsync a directory handle.
+        server_common::fs_utils::fsync_parent_dir(path).map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::DirSync,
+            source: e,
+        })?;
 
         Ok(())
     }

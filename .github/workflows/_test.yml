@@ -43,7 +43,7 @@ jobs:
     runs-on: ${{
       (inputs.task == 'build-aarch64-gnu' || inputs.task == 'build-aarch64-musl') && 'ubuntu-24.04-arm' ||
       inputs.task == 'build-macos-aarch64' && 'macos-14' ||
-      inputs.task == 'build-windows-sdk' && 'windows-latest' ||
+      (inputs.task == 'build-windows-sdk' || inputs.task == 'build-windows-server') && 'windows-latest' ||
       'ubuntu-latest'
       }}
     timeout-minutes: 60
@@ -54,6 +54,27 @@ jobs:
       - name: Skip noop
         if: inputs.component == 'noop'
         run: echo "No changes detected, skipping tests"
+
+      - name: Install Windows native dependencies
+        if: inputs.task == 'build-windows-server'
+        shell: pwsh
+        run: |
+          $vcpkg = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkg
+          & (Join-Path $vcpkg 'bootstrap-vcpkg.bat') -disableMetrics
+          & (Join-Path $vcpkg 'vcpkg.exe') install hwloc:x64-windows pkgconf:x64-windows
+
+          $installed = Join-Path $vcpkg 'installed\x64-windows'
+          $hwlocLibrary = Join-Path $installed 'lib\hwloc.lib'
+          $pkgConfigLibrary = Join-Path $installed 'lib\libhwloc.lib'
+          if (-not (Test-Path $pkgConfigLibrary)) {
+            Copy-Item $hwlocLibrary $pkgConfigLibrary
+          }
+
+          "PKG_CONFIG=$(Join-Path $installed 'tools\pkgconf\pkgconf.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG_PATH=$(Join-Path $installed 'lib\pkgconfig')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$(Join-Path $installed 'bin')" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "$(Join-Path $installed 'tools\pkgconf')" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       # Rust
       # `breaking:storage` is the documented escape hatch for a deliberate

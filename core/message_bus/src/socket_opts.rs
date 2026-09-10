@@ -28,6 +28,12 @@ use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
 
+/// Listen backlog for the replica/client listeners. Replaces `libc::SOMAXCONN`,
+/// which has no Windows equivalent. Linux caps the effective value at
+/// `net.core.somaxconn` anyway, so a fixed request is portable and no more
+/// restrictive in practice.
+const LISTEN_BACKLOG: i32 = 1024;
+
 /// Disable Nagle on a per-connection socket.
 ///
 /// Linux does not propagate `TCP_NODELAY` from a listener socket to the fd
@@ -48,19 +54,24 @@ pub fn apply_nodelay_for_connection(stream: &TcpStream) -> io::Result<()> {
 /// Build a TCP listener that tolerates `TIME_WAIT` leftovers and bound-but-idle
 /// reservation sockets, but refuses a live listener on the same port.
 ///
-/// `SO_REUSEADDR` is all that takes: it rebinds over `TIME_WAIT` remnants of a
-/// previous process's connections and over a bound-not-listening reservation
-/// socket, while a second bind against an already-LISTENing socket still fails
-/// with `EADDRINUSE`. `SO_REUSEPORT` is deliberately NOT set: only shard 0
+/// On Unix, `SO_REUSEADDR` is all that takes: it rebinds over `TIME_WAIT`
+/// remnants of a previous process's connections and over a bound-not-listening
+/// reservation socket, while a second bind against an already-LISTENing socket
+/// still fails with `EADDRINUSE`. Windows' `SO_REUSEADDR` has different
+/// semantics and can bind over a live listener, so the listener keeps the
+/// default exclusive behavior there rather than weakening that refusal.
+///
+/// `SO_REUSEPORT` is deliberately NOT set on either platform: only shard 0
 /// binds the real listener, so nothing here needs the load balancing it
 /// exists for, and setting it would let a stale process holding the port
 /// silently split the accept queue with this one instead of failing the bind
 /// loudly.
 pub fn bind_reusable_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(unix)]
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(libc::SOMAXCONN)?;
+    socket.listen(LISTEN_BACKLOG)?;
     socket.set_nonblocking(true)?;
 
     let std_listener: std::net::TcpListener = socket.into();
@@ -92,6 +103,7 @@ mod tests {
         (socket, addr)
     }
 
+    #[cfg(unix)]
     #[test]
     fn reusable_tcp_listener_can_bind_over_reserved_port() {
         // Bound, not listening: a port held without joining the accept group,

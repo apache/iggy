@@ -210,6 +210,10 @@ pub struct ShardInfo {
 impl ShardInfo {
     /// Pin the calling thread to this shard's cores. On non-Linux this
     /// does nothing (no-op). Empty core set also does nothing.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::unused_self, clippy::unnecessary_wraps)
+    )]
     pub fn bind_cpu(&self) -> Result<(), ShardingError> {
         #[cfg(target_os = "linux")]
         {
@@ -241,6 +245,10 @@ impl ShardInfo {
     /// Pin the calling thread's memory to this shard's NUMA node so
     /// allocations stay local and fast. Does nothing if no node is set.
     /// On non-Linux this does nothing (no-op), mirroring [`Self::bind_cpu`].
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::unused_self, clippy::unnecessary_wraps)
+    )]
     pub fn bind_memory(&self) -> Result<(), ShardingError> {
         #[cfg(target_os = "linux")]
         {

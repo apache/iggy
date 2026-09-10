@@ -76,15 +76,16 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
         .taskrun_flag(true);
 
     // Permanent divergence, not a workaround to revisit: macOS runs compio's
-    // polling driver, which routes fs operations through the blocking pool, so
-    // a zero limit cannot work there by design. Upstream closed
+    // polling driver and Windows runs the IOCP driver, both of which route fs
+    // operations through the blocking pool, so a zero limit cannot work there
+    // by design. Upstream closed
     // https://github.com/compio-rs/compio/issues/446 by making blocking-pool
     // dispatch with no workers panic ("the thread pool is needed but no worker
     // thread is running", compio-driver asyncify.rs) instead of freeze.
     // io_uring targets keep the zero limit: no blocking pool exists on shard
     // threads, which `core/partitions` messages_writer relies on to justify
     // running fallocate inline (`spawn_blocking` would hit that same panic).
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     proactor.thread_pool_limit(0);
 
     compio::runtime::RuntimeBuilder::new()
