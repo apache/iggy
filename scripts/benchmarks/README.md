@@ -1,9 +1,9 @@
 # Poll completion experiments
 
-`poll_completion.py` compares the current poll path with completion owned by the
-partition. It runs one consumer against one shard over TCP, retains raw poll
-observations, and compares independent pairs of complete runs. It does not test
-the purge correctness contract; run the regression tests separately.
+`poll_completion.py` compares polling performance between two server builds. It
+runs one consumer against one shard over TCP, retains raw poll observations, and
+compares independent pairs of complete runs. Run correctness regression tests
+separately from these measurements.
 
 ## Build and environment
 
@@ -22,12 +22,15 @@ rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
 Build dependencies include `libhwloc-dev` and `libudev-dev`; the runner needs Python 3
 and `taskset`. Put sources used for builds, binaries, results, and fixture data in a
 Docker named volume. A bind mount of the repository is useful for copying source,
-but keep the measured fixture on the volume. Example container setup from the repo:
+but keep the measured fixture on the volume. Set `POLL_SECCOMP_PROFILE` to the
+absolute path of a seccomp profile for your Docker environment that permits
+`io_uring_setup`, `io_uring_enter`, and `io_uring_register`. Example container setup
+from the repository:
 
 ```sh
 docker volume create iggy-poll-lab
 docker run --name iggy-poll-lab --cpuset-cpus=0-3 --memory=8g \
-  --security-opt "seccomp=$PWD/performance_results/owner-poll-20260909/environment/io-uring-seccomp.json" \
+  --security-opt "seccomp=${POLL_SECCOMP_PROFILE:?Set the path to your io_uring seccomp profile}" \
   --mount type=volume,source=iggy-poll-lab,target=/work \
   --mount "type=bind,source=$PWD,target=/source,readonly" \
   -it rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 bash
@@ -36,9 +39,9 @@ docker run --name iggy-poll-lab --cpuset-cpus=0-3 --memory=8g \
 Retain the actual seccomp profile with environment records. This profile permits the
 required `io_uring` operations; replacing it with unrestricted seccomp changes the
 recorded setup. The runner pins the Linux server to guest CPU 0 and clients to CPUs
-1 and 2. The container permits CPUs 0 through 3 and has an 8 GiB ceiling. In this
-session Docker's VM has 10 guest CPUs and approximately 8 GiB shared memory; the
-container limit does not reserve that memory or dedicate host CPUs to the experiment.
+1 and 2. The container permits CPUs 0 through 3 and has an 8 GiB ceiling. Record the
+Docker VM's CPU count and available memory. The container limit does not reserve
+that memory or dedicate host CPUs to the experiment.
 
 For macOS, use native builds and a separate local results directory. The runner
 uses one shard and two Tokio worker threads without CPU affinity. It reads process
@@ -153,11 +156,13 @@ the analysis does not silently impose a new threshold for this guardrail.
 
 ## Diagnostics and retained evidence
 
-Build a separate diagnostic server with `--features poll-diagnostics`, and run it
-with `RUST_LOG=iggy.shard.poll_diagnostics=debug`. Logs identify resident and disk
-dispatch and the time disk completion waited for the shard. Use this to confirm the
-mechanism and fixture routing. Disable the feature and diagnostic logging for the
-performance comparison so tracing does not become part of the measured cost.
+Verify fixture routing with the diagnostics available in each server revision.
+When a revision provides the `poll-diagnostics` feature, build a separate diagnostic
+server with that feature and run it with `RUST_LOG=iggy.shard.poll_diagnostics=debug`.
+Those logs identify resident and disk dispatch and the time disk completion waited
+for the shard. The runner does not require this optional server feature. Disable
+diagnostic features and logging for the performance comparison so tracing does not
+become part of the measured cost.
 
 Each run retains commands, binary hashes, server logs, `polls.csv`,
 `run-manifest.json`, producer samples, process samples, and a summary. CPU counters
