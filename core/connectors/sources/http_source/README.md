@@ -298,7 +298,13 @@ The handler never blocks on a full bridge. Waiting would hold connections open a
 | 100 to 1000 req/s | 10000 (default) | Absorbs roughly ten seconds of burst |
 | Over 1000 req/s | 50000 to 100000 | Sustained bursts; tune against the buffer metrics |
 
-The bridge is bounded by message count, not bytes, so its worst case is `buffer_capacity * max_body_size_bytes`. At the defaults that is about 10 GB. Add the in-flight batch on top: at the moment of a send a batch exists as the staged copy this connector holds for replay, the SDK's serialized copy, and the runtime's decoded copy, so budget up to three times `max_batch_size * max_body_size_bytes` above the bridge. Size all of them together.
+The bridge is bounded by message count, not bytes, so its worst case is `buffer_capacity * max_body_size_bytes`. At the defaults that is about 10 GB.
+
+Add the in-flight batch on top. At the moment of a send a batch exists four times over: the staged copy this connector holds for replay, the copy `poll()` returned, the SDK's serialized copy, and the runtime's decoded copy. Budget up to four times `max_batch_size * max_body_size_bytes` above the bridge. The polled copy is the one that is easy to miss, because the SDK shadows it with the serialized bytes rather than consuming it, so it stays alive until the send has been answered.
+
+Concurrent request bodies are a third term, and nothing in this connector bounds it. Every in-flight POST buffers up to `max_body_size_bytes` before its message exists, and neither connections nor concurrent reads are capped here, so the term is that ceiling times however many requests are open at once. At a large `max_body_size_bytes` it dominates the bridge and the batches together. Only the reverse proxy in Operational notes bounds it.
+
+Size all of them together.
 
 ## Observability
 
