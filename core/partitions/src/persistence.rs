@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use iggy_binary_protocol::PrepareHeader;
 use journal::PartitionPrepareJournal;
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage};
-use journal::partition_journal::PARTITION_WAL_BYTES_MAX;
+use journal::partition_journal::{PARTITION_WAL_BYTES_MAX, SegmentPosition, SegmentReference};
 use server_common::Message;
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
@@ -78,12 +78,15 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     requested_log_view: Cell<Option<(u32, u64, u128)>>,
     checkpoint_requested: Cell<u64>,
     checkpoint_running: Cell<bool>,
+    checkpoint_needed: Cell<bool>,
     dirty_segments: RefCell<BTreeSet<u64>>,
     dirty_offsets: [RefCell<BTreeSet<u32>>; 2],
     purge_generation: Cell<u64>,
     purge_floor: Cell<u64>,
     capacity: u64,
     disk_bytes: Cell<u64>,
+    retained_bytes: Cell<u64>,
+    segment_checkpoint: Cell<Option<SegmentPosition>>,
     queued_bytes: Cell<u64>,
     in_flight_bytes: Cell<u64>,
     waiters: RefCell<Vec<std::task::Waker>>,
@@ -319,6 +322,11 @@ impl AcceptedPrepares {
 }
 
 enum Mutation<S: DurableStorage> {
+    EnableSegments {
+        epoch: u64,
+        initial: SegmentPosition,
+        max_size: u64,
+    },
     CertifyView {
         epoch: u64,
         view: u32,
@@ -352,6 +360,7 @@ enum Mutation<S: DurableStorage> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
+        segments: Option<(SegmentPosition, u64)>,
     },
 }
 
@@ -382,6 +391,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             incarnation,
             storage,
             PARTITION_WAL_BYTES_MAX,
+            false,
         )
         .await
     }
@@ -394,6 +404,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         incarnation: u64,
         storage: S,
         capacity: u64,
+        preallocate_segments: bool,
     ) -> io::Result<(Rc<Self>, Vec<Message<PrepareHeader>>)> {
         let lease = if let Some(key) = storage.writer_identity(directory)? {
             Some(WriterLease::acquire(key).await?)
@@ -406,6 +417,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             incarnation,
             storage,
             capacity,
+            preallocate_segments,
         )
         .await?;
         let prepares = journal.take_recovered_prepares();
@@ -432,12 +444,15 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             requested_log_view: Cell::new(None),
             checkpoint_requested: Cell::new(journal.checkpoint_op()),
             checkpoint_running: Cell::new(false),
+            checkpoint_needed: Cell::new(false),
             dirty_segments: RefCell::new(BTreeSet::new()),
             dirty_offsets: std::array::from_fn(|_| RefCell::new(BTreeSet::new())),
             purge_generation: Cell::new(journal.purge_marker().0),
             purge_floor: Cell::new(journal.purge_marker().1),
             capacity,
             disk_bytes: Cell::new(journal.size_bytes()),
+            retained_bytes: Cell::new(journal.retained_bytes()),
+            segment_checkpoint: Cell::new(journal.segment_checkpoint()),
             journal: RefCell::new(Some(journal)),
             queue: RefCell::new(VecDeque::new()),
             offset_files: RefCell::new(HashMap::new()),
@@ -462,11 +477,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     #[cfg(test)]
     pub(crate) fn exhaust_capacity_for_test(&self) {
         self.disk_bytes.set(self.capacity);
+        self.retained_bytes.set(self.capacity);
     }
 
     #[cfg(test)]
     pub(crate) fn release_capacity_for_test(&self) {
         self.disk_bytes.set(0);
+        self.retained_bytes.set(0);
     }
 
     pub const fn certified_log_view(&self) -> Option<u32> {
@@ -518,6 +535,54 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             && self.checksum(header.op) == Some(header.checksum)
     }
 
+    pub const fn segment_checkpoint(&self) -> Option<SegmentPosition> {
+        self.segment_checkpoint.get()
+    }
+
+    pub fn enable_segment_storage(&self, initial: SegmentPosition, max_size: u64) {
+        self.queue.borrow_mut().push_back(Mutation::EnableSegments {
+            epoch: self.epoch.get(),
+            initial,
+            max_size,
+        });
+    }
+
+    /// Verify the physical prefix before making its indexes and logical sizes visible.
+    ///
+    /// # Errors
+    /// Returns an error for a failed barrier or a body outside the durable segment range.
+    pub async fn validate_segment_prefix(
+        &self,
+        prepares: &[Frozen<4096>],
+        start_offset: u64,
+        mut position: u64,
+    ) -> io::Result<u64> {
+        self.drain_with_timeout().await?;
+        let journal = self.journal.borrow();
+        let journal = journal
+            .as_ref()
+            .ok_or_else(|| io::Error::other("segment writer has no journal"))?;
+        let initial = position;
+        for prepare in prepares {
+            let header = prepare_header(prepare)?;
+            let reference: SegmentReference = journal
+                .segment_reference(header)
+                .ok_or_else(|| io::Error::other("committed prepare has no durable segment body"))?;
+            if reference.start_offset != start_offset
+                || reference.position != position
+                || reference.length != (prepare.len() - size_of::<PrepareHeader>()) as u64
+            {
+                return Err(io::Error::other(
+                    "committed prepare differs from its segment position",
+                ));
+            }
+            position = position
+                .checked_add(reference.length)
+                .ok_or_else(|| io::Error::other("segment prefix overflow"))?;
+        }
+        Ok(position - initial)
+    }
+
     pub const fn durable_op(&self) -> u64 {
         self.durable_head.get()
     }
@@ -534,7 +599,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         !self.retired.get()
             && self.failure.borrow().is_none()
             && self
-                .disk_bytes
+                .retained_bytes
                 .get()
                 .saturating_add(self.queued_bytes.get())
                 .saturating_add(self.in_flight_bytes.get())
@@ -635,6 +700,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             return;
         }
         self.checkpoint_requested.set(through_op);
+        self.checkpoint_needed.set(false);
         let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
         offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
         self.queue.borrow_mut().push_back(Mutation::Checkpoint {
@@ -648,6 +714,10 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub const fn checkpoint_pending(&self) -> bool {
         self.checkpoint_running.get() || self.checkpoint_requested.get() > self.checkpoint.get()
+    }
+
+    pub fn request_checkpoint(&self) {
+        self.checkpoint_needed.set(true);
     }
 
     pub fn truncate_from(&self, from_op: u64) {
@@ -709,6 +779,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
     ) {
+        self.reset_with_segments(op, checksum, prepare, None);
+    }
+
+    pub fn reset_with_segments(
+        &self,
+        op: u64,
+        checksum: Option<u128>,
+        prepare: Option<Frozen<4096>>,
+        segments: Option<(SegmentPosition, u64)>,
+    ) {
         self.offset_files.borrow_mut().clear();
         self.retired_offset_files.borrow_mut().clear();
         self.certified_log_view.set(None);
@@ -729,6 +809,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             op,
             checksum,
             prepare,
+            segments,
         });
     }
 
@@ -746,8 +827,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub fn needs_checkpoint(&self) -> bool {
         !self.checkpoint_pending()
-            && (self.disk_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
-                >= self.capacity / 2
+            && (self.checkpoint_needed.get()
+                || self.retained_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
+                    >= self.capacity / 2
                 || self.retired_offset_files.borrow().len() >= CHECKPOINT_DIRTY_FILES_MAX
                 || self.dirty_segments.borrow().len() * 2
                     + self
@@ -890,6 +972,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             let (epoch, bytes) = match &mutation {
                 Mutation::Append { epoch, bytes, .. } => (*epoch, *bytes),
                 Mutation::CertifyView { epoch, .. }
+                | Mutation::EnableSegments { epoch, .. }
                 | Mutation::Purge { epoch, .. }
                 | Mutation::Truncate { epoch, .. }
                 | Mutation::Checkpoint { epoch, .. }
@@ -908,6 +991,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             }
             if epoch == self.epoch.get() && !self.retired.get() {
                 self.disk_bytes.set(journal.size_bytes());
+                self.retained_bytes.set(journal.retained_bytes());
+                self.segment_checkpoint.set(journal.segment_checkpoint());
                 let advanced = journal.durable_op() != self.durable_head.get()
                     || journal.checkpoint_op() != self.checkpoint.get()
                     || journal.certified_log_view() != self.certified_log_view.get();
@@ -945,6 +1030,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         bytes: u64,
     ) -> io::Result<()> {
         match mutation {
+            Mutation::EnableSegments {
+                initial, max_size, ..
+            } => journal.enable_segment_storage(initial, max_size).await,
             Mutation::CertifyView {
                 view, op, checksum, ..
             } => journal.certify_log_view(view, op, checksum).await,
@@ -986,9 +1074,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 op,
                 checksum,
                 prepare,
+                segments,
                 ..
             } => {
-                if let Some(prepare) = prepare {
+                if let Some((position, max_size)) = segments {
+                    journal
+                        .reset_with_segment_checkpoint(op, checksum, prepare, position, max_size)
+                        .await
+                } else if let Some(prepare) = prepare {
                     journal.reset_with_prepare(prepare).await
                 } else {
                     journal.reset(op, checksum).await

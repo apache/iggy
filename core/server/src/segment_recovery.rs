@@ -179,13 +179,32 @@ pub struct RecoveredSegment {
 /// Takes no offset ceiling. A legitimate gap is proved by the anchor the boot
 /// re-anchor writes beside the segment it plants, not inferred from how far the
 /// superblock's reservation happens to reach.
-#[allow(clippy::too_many_lines)]
 pub async fn load_persisted_segments(
     config: &ServerConfig,
     namespace: IggyNamespace,
     segment_size: IggyByteSize,
     durable_segments: bool,
     stats: &PartitionStats,
+) -> Result<Vec<RecoveredSegment>, ServerError> {
+    load_persisted_segments_with_checkpoint(
+        config,
+        namespace,
+        segment_size,
+        durable_segments,
+        stats,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn load_persisted_segments_with_checkpoint(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    segment_size: IggyByteSize,
+    durable_segments: bool,
+    stats: &PartitionStats,
+    checkpoint: Option<journal::partition_journal::SegmentPosition>,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
@@ -204,6 +223,11 @@ pub async fn load_persisted_segments(
     // sweep's silent return would swallow an EACCES that must not be ignored.
     let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path)?;
     start_offsets.sort_unstable();
+    if let Some(checkpoint) = checkpoint {
+        start_offsets.retain(|offset| {
+            *offset < checkpoint.next_offset || *offset == checkpoint.start_offset
+        });
+    }
 
     let max_size = segment_size;
     let mut scratch = ScanScratch::default();
@@ -221,17 +245,52 @@ pub async fn load_persisted_segments(
         let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
 
         let raw_messages_size = file_len(&messages_path)?;
-
-        let bounds = recover_segment_bounds(
-            identity,
-            &index_path,
-            &messages_path,
-            start_offset,
-            raw_messages_size,
-            durable_segments,
-            &mut scratch,
-        )
-        .await?;
+        let messages_size = checkpoint
+            .filter(|checkpoint| checkpoint.start_offset == start_offset)
+            .map_or(raw_messages_size, |checkpoint| checkpoint.length);
+        if raw_messages_size < messages_size {
+            return Err(
+                identity.refusal(PartitionRecoveryRefusal::StorageSizeMismatch {
+                    start_offset,
+                    on_disk_bytes: raw_messages_size,
+                    expected_bytes: messages_size,
+                }),
+            );
+        }
+        let bounds = if checkpoint.is_some() {
+            let messages = open_messages_file(identity, &messages_path)?;
+            let mut scanner = FileScanner::new(&messages, messages_size, &mut scratch);
+            recover_by_walking_log(
+                identity,
+                &mut scanner,
+                &messages_path,
+                start_offset,
+                messages_size,
+            )
+            .await?
+        } else {
+            recover_segment_bounds(
+                identity,
+                &index_path,
+                &messages_path,
+                start_offset,
+                raw_messages_size,
+                durable_segments,
+                &mut scratch,
+            )
+            .await?
+        };
+        if checkpoint.is_some()
+            && bounds.as_ref().map_or(0, |bounds| bounds.messages_size) != messages_size
+        {
+            return Err(
+                identity.refusal(PartitionRecoveryRefusal::StorageSizeMismatch {
+                    start_offset,
+                    on_disk_bytes: bounds.as_ref().map_or(0, |bounds| bounds.messages_size),
+                    expected_bytes: messages_size,
+                }),
+            );
+        }
 
         // `bounds == None` means the log holds no whole batch ANYWHERE: the
         // index-less walk tried from byte 0 and the damage probe found no
@@ -244,7 +303,7 @@ pub async fn load_persisted_segments(
         // tail-only -- the log and the index persist concurrently under
         // every config, so a torn index is reachable mid-chain, which is why
         // the walk exists rather than refusing the partition.
-        let recovered_empty = bounds.is_none();
+        let recovered_empty = bounds.is_none() && checkpoint.is_none();
         let bounds = bounds.unwrap_or_else(|| {
             if raw_messages_size > 0 {
                 warn!(
@@ -330,21 +389,34 @@ pub async fn load_persisted_segments(
         // index over the shortened log; the next boot re-discards it and
         // rebuilds from the log again, and truncation is monotone, so the
         // pair converges.
-        truncate_to(&plan.messages_path, messages_size)?;
+        if checkpoint.is_none() {
+            truncate_to(&plan.messages_path, messages_size)?;
+        }
         if let Some(staging_path) = &plan.rebuilt_index_staging {
             install_rebuilt_index(staging_path, &plan.index_path, identity.partition_path)?;
         } else {
             truncate_to(&plan.index_path, plan.index_size)?;
         }
 
-        let storage = SegmentStorage::new(
-            &plan.messages_path,
-            &plan.index_path,
-            messages_size,
-            plan.index_size,
-            true,
-        )
-        .await
+        let storage = if checkpoint.is_some() {
+            SegmentStorage::with_read_only_messages(
+                &plan.messages_path,
+                &plan.index_path,
+                plan.index_size,
+                true,
+                None,
+            )
+            .await
+        } else {
+            SegmentStorage::new(
+                &plan.messages_path,
+                &plan.index_path,
+                messages_size,
+                plan.index_size,
+                true,
+            )
+            .await
+        }
         .map_err(|source| {
             error!(
                 stream_id,
@@ -3303,6 +3375,59 @@ mod tests {
     /// an anchor must not launder an overlap either. Reachable because each end
     /// offset is walked from its own file with nothing clamping it against the
     /// next start.
+    #[compio::test]
+    async fn given_checkpointed_prefix_when_recovering_should_hide_tails_and_refuse_overlaps() {
+        let tmp = tempdir().unwrap();
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let committed = encoded_batch(0, 3);
+        let mut physical = committed.clone();
+        physical.extend(encoded_batch(3, 3));
+        let (messages_path, _) = write_segment(&config, 0, &physical, &index_entry(0, 0));
+        let (uncommitted_path, _) = write_segment(&config, 6, &encoded_batch(6, 3), &[]);
+        let checkpoint = journal::partition_journal::SegmentPosition {
+            start_offset: 0,
+            length: committed.len() as u64,
+            next_offset: 3,
+        };
+        let namespace = IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID);
+        let recovered = load_persisted_segments_with_checkpoint(
+            &config,
+            namespace,
+            IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            true,
+            &PartitionStats::default(),
+            Some(checkpoint),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 2);
+        assert_eq!(recovered[0].segment.size.as_bytes_u64(), checkpoint.length);
+        assert_eq!(bytes_of(&messages_path), physical);
+        assert!(Path::new(&uncommitted_path).exists());
+        drop(recovered);
+        let (overlap, _) = write_segment(&config, 1, &[], &[]);
+        let result = load_persisted_segments_with_checkpoint(
+            &config,
+            namespace,
+            IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            true,
+            &PartitionStats::default(),
+            Some(checkpoint),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::PartitionRecoveryRefused {
+                reason: PartitionRecoveryRefusal::Hole { .. },
+                ..
+            })
+        ));
+        assert!(Path::new(&overlap).exists());
+        assert_eq!(bytes_of(&messages_path), physical);
+    }
+
     #[compio::test]
     async fn given_overlapping_segments_when_recovering_should_refuse_even_when_anchored() {
         let tmp = tempdir().expect("tempdir");

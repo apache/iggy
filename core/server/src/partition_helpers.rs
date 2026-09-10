@@ -32,7 +32,9 @@
 use crate::offset_recovery::{
     RecoveredOffsets, load_consumer_group_offsets, load_consumer_offsets,
 };
-use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
+use crate::segment_recovery::{
+    RecoveredSegment, load_persisted_segments, load_persisted_segments_with_checkpoint,
+};
 use crate::server_error::{PartitionRecoveryRefusal, ServerError};
 use crate::shell::consensus_timers;
 use compio::fs::create_dir_all;
@@ -45,12 +47,14 @@ use iggy_common::{
     PartitionStats, TopicRuntimeOptions,
 };
 use journal::durable_storage::{DiskStorage, DurableStorage};
+use journal::partition_journal::SegmentPosition;
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
 use metadata::stm::stream::Partition;
 use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{
-    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
+    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionPersistence,
+    PartitionsConfig, Segment,
 };
 use server_common::SegmentStorage;
 use server_common::fs_utils::remove_dir_all;
@@ -766,7 +770,7 @@ pub async fn load_partition_or_fence(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn load_partition(
     config: &ServerConfig,
     partitions_config: &PartitionsConfig,
@@ -844,8 +848,40 @@ async fn load_partition(
     // recovered message timestamp here, or an NTP rewind across a restart could
     // regress persisted `base_timestamp`.
 
-    let recovered_segments =
-        recover_partition_segments(config, namespace, runtime_options, &stats).await?;
+    let recovered_persistence = if replica_count > 1 && runtime_options.durability.is_persisted() {
+        let directory = Path::new(&partition_dir)
+            .join(format!("prepares-{}", partition_metadata.created_revision));
+        Some(
+            PartitionPersistence::open_with_capacity(
+                &directory,
+                namespace.inner(),
+                partition_metadata.created_revision,
+                DiskStorage,
+                config.partition.wal_bytes_max.as_bytes_u64(),
+                runtime_options
+                    .preallocate_segments
+                    .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
+            )
+            .await
+            .map_err(|error| {
+                warn!(%error, "cannot recover partition prepare WAL before segment recovery");
+                ServerError::from(IggyError::CannotReadFile)
+            })?,
+        )
+    } else {
+        None
+    };
+    let segment_checkpoint = recovered_persistence
+        .as_ref()
+        .and_then(|(persistence, _)| persistence.segment_checkpoint());
+    let recovered_segments = recover_partition_segments(
+        config,
+        namespace,
+        runtime_options,
+        &stats,
+        segment_checkpoint,
+    )
+    .await?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_runtime_options(runtime_options);
@@ -876,14 +912,23 @@ async fn load_partition(
     .await?;
 
     partition.created_at = partition_metadata.created_at;
-    restore_partition_offsets(&mut partition, partitions_config, recovered_state.as_ref()).await?;
+    restore_partition_offsets(
+        &mut partition,
+        partitions_config,
+        recovered_state.as_ref(),
+        segment_checkpoint,
+    )
+    .await?;
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset).await?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
 
     partition
-        .open_persistence_with_capacity(config.partition.wal_bytes_max.as_bytes_u64())
+        .open_persistence_with_recovered(
+            config.partition.wal_bytes_max.as_bytes_u64(),
+            recovered_persistence,
+        )
         .await
         .map_err(|error| ServerError::Iggy(Box::new(error)))?;
     Ok(partition)
@@ -900,6 +945,7 @@ async fn restore_partition_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     partitions_config: &PartitionsConfig,
     recovered_state: Option<&VsrState>,
+    segment_checkpoint: Option<SegmentPosition>,
 ) -> Result<(), ServerError> {
     let sized_end = partition
         .log
@@ -929,8 +975,12 @@ async fn restore_partition_offsets(
         .max()
         .map(|start| start.min(durable_frontier))
         .filter(|&start| sized_end.is_none() && start > 0);
-    let current_offset = sized_end.or_else(|| empty_frontier.map(|start| start - 1));
-    partition.recovered_durable_offset = sized_end;
+    let checkpoint_end =
+        segment_checkpoint.and_then(|checkpoint| checkpoint.next_offset.checked_sub(1));
+    let current_offset = sized_end
+        .or_else(|| empty_frontier.map(|start| start - 1))
+        .max(checkpoint_end);
+    partition.recovered_durable_offset = sized_end.max(checkpoint_end);
     // The OFFSET COUNTER is restored from that file name (above), but the
     // `installed_frontier` CLAIM deliberately is not: the claim says "everything
     // below me is represented here", and `converge_to_empty_after_failed_install`
@@ -982,6 +1032,7 @@ async fn recover_partition_segments(
     namespace: IggyNamespace,
     runtime_options: TopicRuntimeOptions,
     stats: &PartitionStats,
+    checkpoint: Option<SegmentPosition>,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
@@ -990,18 +1041,29 @@ async fn recover_partition_segments(
         .segment_size
         .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
     let persisted = runtime_options.durability.is_persisted();
-    load_persisted_segments(config, namespace, segment_size, persisted, stats)
+    let recovered = if checkpoint.is_some() {
+        load_persisted_segments_with_checkpoint(
+            config,
+            namespace,
+            segment_size,
+            persisted,
+            stats,
+            checkpoint,
+        )
         .await
-        .map_err(|source| {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                error = %source,
-                "failed to load partition log during server bootstrap"
-            );
-            source
-        })
+    } else {
+        load_persisted_segments(config, namespace, segment_size, persisted, stats).await
+    };
+    recovered.map_err(|source| {
+        error!(
+            stream_id,
+            topic_id,
+            partition_id,
+            error = %source,
+            "failed to load partition log during server bootstrap"
+        );
+        source
+    })
 }
 
 /// Reopen writers over a recovered segment chain.
@@ -1036,6 +1098,21 @@ async fn hydrate_partition_log(
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
         let storage = &partition.log.storages()[active_index];
+        if storage.messages_writer.is_none()
+            && let (Some(index_reader), Some(index_writer)) =
+                (&storage.index_reader, &storage.index_writer)
+        {
+            partition.log.index_writers_mut()[active_index] = Some(Rc::new(
+                IggyIndexWriter::new(
+                    &index_reader.path(),
+                    index_writer.size_counter(),
+                    persisted,
+                    true,
+                )
+                .await?,
+            ));
+            return Ok(());
+        }
         if let (
             Some(messages_reader),
             Some(index_reader),

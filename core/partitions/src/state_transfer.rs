@@ -45,6 +45,7 @@ use consensus::{
 };
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
+use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
@@ -1552,6 +1553,31 @@ fn segment_dir_entries(partition_dir: &str) -> std::io::Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Remove physical tails outside the logical segment list after draining the WAL.
+/// The caller holds the write lock and has published a purge or install backup.
+pub(crate) async fn remove_public_segment_files(partition_dir: &str) -> std::io::Result<()> {
+    let directory = Path::new(partition_dir);
+    for entry in DiskStorage.entries(directory).await? {
+        let name = Path::new(&entry.name);
+        if !entry.directory
+            && name
+                .extension()
+                .is_some_and(|extension| extension == "log" || extension == "index")
+            && name
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.parse::<u64>().is_ok())
+        {
+            match DiskStorage.remove_file(&directory.join(&entry.name)).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
 const MATERIALIZATION_MISSING: &str = "materialization.missing";
 
 /// Fence replacement files before quarantining the authoritative materialization.
@@ -2883,6 +2909,18 @@ where
                 }
             }
         }
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.segment_checkpoint().is_some())
+        {
+            remove_public_segment_files(partition_dir)
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: partition_dir.to_owned(),
+                    source,
+                })?;
+        }
         fsync_dir(partition_dir)
             .await
             .map_err(|source| PartitionInstallError::SwapIo {
@@ -3328,7 +3366,23 @@ where
         if let Some(persistence) = &self.persistence {
             let prepare = (!offsets_wire.checkpoint_prepare.is_empty())
                 .then(|| Owned::<4096>::copy_from_slice(&offsets_wire.checkpoint_prepare).into());
-            persistence.reset_with_prepare(commit_op, offsets_wire.prepare_checksum, prepare);
+            let segments = self.durability().is_persisted().then(|| {
+                let segment = self.log.active_segment();
+                (
+                    journal::partition_journal::SegmentPosition {
+                        start_offset: segment.start_offset,
+                        length: segment.size.as_bytes_u64(),
+                        next_offset,
+                    },
+                    segment.max_size.as_bytes_u64(),
+                )
+            });
+            persistence.reset_with_segments(
+                commit_op,
+                offsets_wire.prepare_checksum,
+                prepare,
+                segments,
+            );
             self.start_persistence();
             persistence.drain_with_timeout().await.map_err(|source| {
                 PartitionInstallError::SwapIo {

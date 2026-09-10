@@ -743,6 +743,17 @@ where
     /// # Errors
     /// Returns an error if durable prepare history cannot be opened or replayed.
     pub async fn open_persistence_with_capacity(&mut self, capacity: u64) -> Result<(), IggyError> {
+        self.open_persistence_with_recovered(capacity, None).await
+    }
+
+    /// # Errors
+    /// Returns an error if durable history cannot be opened, migrated, or replayed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn open_persistence_with_recovered(
+        &mut self,
+        capacity: u64,
+        recovered: Option<(Rc<PartitionPersistence>, Vec<Message<PrepareHeader>>)>,
+    ) -> Result<(), IggyError> {
         if self.consensus.replica_count() > 1
             && let Some(directory) = &self.partition_dir
         {
@@ -764,18 +775,51 @@ where
             .ok_or(IggyError::CannotReadFile)?;
         let directory =
             std::path::Path::new(directory).join(format!("prepares-{}", self.created_revision));
-        let (persistence, prepares) = PartitionPersistence::open_with_capacity(
-            &directory,
-            self.namespace().inner(),
-            self.created_revision,
-            journal::durable_storage::DiskStorage,
-            capacity,
-        )
-        .await
-        .map_err(|error| {
-            warn!(%error, "cannot open partition prepare WAL");
-            IggyError::CannotReadFile
-        })?;
+        let (persistence, prepares) = if let Some(recovered) = recovered {
+            recovered
+        } else {
+            PartitionPersistence::open_with_capacity(
+                &directory,
+                self.namespace().inner(),
+                self.created_revision,
+                journal::durable_storage::DiskStorage,
+                capacity,
+                self.runtime_options
+                    .preallocate_segments
+                    .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
+            )
+            .await
+            .map_err(|error| {
+                warn!(%error, "cannot open partition prepare WAL");
+                IggyError::CannotReadFile
+            })?
+        };
+        if self.durability().is_persisted() && !self.materialization_missing {
+            let segment = self.log.active_segment();
+            let length = segment.size.as_bytes_u64();
+            let initial = journal::partition_journal::SegmentPosition {
+                start_offset: segment.start_offset,
+                length,
+                next_offset: if length == 0 {
+                    segment.start_offset
+                } else {
+                    segment
+                        .end_offset
+                        .checked_add(1)
+                        .ok_or(IggyError::CannotReadFile)?
+                },
+            };
+            persistence.enable_segment_storage(initial, segment.max_size.as_bytes_u64());
+            if persistence.start() {
+                self.consensus
+                    .message_bus()
+                    .spawn(Rc::clone(&persistence).run());
+            }
+            persistence.drain_with_timeout().await.map_err(|error| {
+                warn!(%error, "cannot enable partition segment persistence");
+                IggyError::CannotSyncFile
+            })?;
+        }
         self.restore_certified_log_view(&persistence).await?;
         if self.materialization_missing {
             self.persistence = Some(persistence);
@@ -6369,6 +6413,7 @@ where
         true
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn persist_frozen_batches_to_disk(
         &mut self,
         frozen_batches: Vec<Frozen<4096>>,
@@ -6380,6 +6425,45 @@ where
         }
 
         if !self.log.has_segments() {
+            return Ok(());
+        }
+
+        if let Some(persistence) = self
+            .persistence
+            .as_ref()
+            .filter(|persistence| persistence.segment_checkpoint().is_some())
+        {
+            let segment = self.log.active_segment();
+            let saved = persistence
+                .validate_segment_prefix(
+                    &frozen_batches,
+                    segment.start_offset,
+                    segment.size.as_bytes_u64(),
+                )
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot expose a non-durable segment prefix");
+                    IggyError::CannotSyncFile
+                })?;
+            let index_writer = self
+                .log
+                .index_writers()
+                .last()
+                .and_then(|writer| writer.as_ref())
+                .ok_or(IggyError::CannotWriteToFile)?;
+            let saved_indexes = index_writer.save_indexes(index_bytes).await?;
+            index_writer.advance(saved_indexes);
+            if let Some(writer) = self
+                .log
+                .messages_writers()
+                .last()
+                .and_then(|writer| writer.as_ref())
+            {
+                writer.advance(saved);
+            }
+            let segment_index = self.log.segments().len() - 1;
+            let segment = &mut self.log.segments_mut()[segment_index];
+            segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved);
             return Ok(());
         }
 
@@ -6620,6 +6704,7 @@ where
     ///
     /// Holds `write_lock` to serialize against the commit/rotate path, which
     /// runs on the separate consensus-tick loop.
+    #[allow(clippy::too_many_lines)]
     pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
         if self.persistence_checkpoint_pending() {
             return SegmentRemoval::default();
@@ -6641,6 +6726,13 @@ where
                 .take(SEGMENT_REMOVAL_BUDGET_PER_PASS + 1)
             {
                 if idx == last_idx || !segment.sealed || segment.end_offset > up_to_offset {
+                    break;
+                }
+                if let Some(persistence) = &self.persistence
+                    && let Some(checkpoint) = persistence.segment_checkpoint()
+                    && segment.end_offset >= checkpoint.next_offset
+                {
+                    persistence.request_checkpoint();
                     break;
                 }
                 if let Some((barrier_offset, kind, consumer_id)) = barrier
@@ -6781,25 +6873,43 @@ where
         let persisted = self.durability().is_persisted();
         let preallocate_segments = self.effective_preallocate_segments(config);
         let segment = Segment::new(start_offset, segment_size);
-        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
-            .await
-            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
-        let messages_size_bytes = storage
-            .messages_writer
+        let segment_bodies = self
+            .persistence
             .as_ref()
-            .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?
-            .size_counter();
-        let messages_writer = Rc::new(
-            MessagesWriter::new(
+            .is_some_and(|persistence| persistence.segment_checkpoint().is_some());
+        let storage = if segment_bodies {
+            SegmentStorage::with_read_only_messages(
                 &messages_path,
-                messages_size_bytes,
-                persisted,
+                &index_path,
+                0,
                 false,
-                preallocate_segments.then_some(segment_size),
+                preallocate_segments.then_some(segment_size.as_bytes_u64()),
             )
             .await
-            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
-        );
+        } else {
+            SegmentStorage::new(&messages_path, &index_path, 0, 0, false).await
+        }
+        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let messages_writer = if segment_bodies {
+            None
+        } else {
+            let messages_size_bytes = storage
+                .messages_writer
+                .as_ref()
+                .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?
+                .size_counter();
+            Some(Rc::new(
+                MessagesWriter::new(
+                    &messages_path,
+                    messages_size_bytes,
+                    persisted,
+                    false,
+                    preallocate_segments.then_some(segment_size),
+                )
+                .await
+                .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
+            ))
+        };
         let index_size_bytes = storage
             .index_writer
             .as_ref()
@@ -6811,7 +6921,7 @@ where
                 .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
         self.log
-            .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
+            .add_persisted_segment(segment, storage, messages_writer, Some(index_writer));
         Ok(())
     }
 
@@ -7152,9 +7262,30 @@ where
                             %error,
                             "failed to unlink segment file during purge"
                         );
+                        if self
+                            .persistence
+                            .as_ref()
+                            .is_some_and(|persistence| persistence.segment_checkpoint().is_some())
+                        {
+                            return Err(PurgeError::Unserviceable(IggyError::CannotWriteToFile));
+                        }
                     }
                 }
             }
+        }
+
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.segment_checkpoint().is_some())
+            && let Some(directory) = &self.partition_dir
+        {
+            crate::state_transfer::remove_public_segment_files(directory)
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot remove uncommitted segment files during purge");
+                    PurgeError::Unserviceable(IggyError::CannotDeleteFile)
+                })?;
         }
 
         // An in-flight state transfer was pulling the PRE-purge state: its
@@ -8194,6 +8325,9 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt;
+
     const TEST_CLUSTER: u128 = 1;
 
     pub(super) fn test_partition() -> IggyPartition<IggyMessageBus> {
@@ -8259,6 +8393,78 @@ mod tests {
         assert_eq!(partition.persistence.as_ref().unwrap().checkpoint_op(), 7);
         partition.commit_journal(&repair_config()).await;
         assert_eq!(partition.consensus().commit_min(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_persisted_preallocation_when_rotating_should_reserve_without_extending() {
+        const SEGMENT_BYTES: u64 = 1024 * 1024;
+        const BLOCK_BYTES: u64 = 512;
+
+        for preallocate in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut partition = partition_at_view(0, 0);
+            partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            partition.runtime_options.durability = iggy_common::Durability::Persisted;
+            partition.runtime_options.preallocate_segments = Some(preallocate);
+            partition.runtime_options.segment_size = Some(IggyByteSize::from(SEGMENT_BYTES));
+            partition.open_persistence().await.unwrap();
+            partition.log.retire_front().unwrap();
+            partition
+                .install_empty_segment(&repair_config(), 0)
+                .await
+                .unwrap();
+            let empty =
+                std::fs::metadata(directory.path().join("00000000000000000000.log")).unwrap();
+            assert_eq!(empty.len(), 0);
+            assert_eq!(
+                empty.blocks() * BLOCK_BYTES >= SEGMENT_BYTES,
+                preallocate,
+                "empty active segment allocation must follow preallocate_segments={preallocate}"
+            );
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            let namespace = partition.namespace();
+            let bodies = [
+                build_segment_record_with_payload(
+                    namespace,
+                    0,
+                    Bytes::from(vec![1; usize::try_from(SEGMENT_BYTES).unwrap()]),
+                ),
+                build_segment_record(namespace, 1),
+            ];
+            let mut parent = 0;
+            for (offset, body) in bodies.iter().enumerate() {
+                let total = size_of::<PrepareHeader>() + body.len();
+                let mut prepare = Message::<PrepareHeader>::new(total);
+                prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(body);
+                let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+                    header.command = Command::Prepare;
+                    header.operation = Operation::SendMessages;
+                    header.cluster = TEST_CLUSTER;
+                    header.group = namespace.inner();
+                    header.op = u64::try_from(offset).unwrap() + 1;
+                    header.parent = parent;
+                    header.size = u32::try_from(total).unwrap();
+                    header.checksum_body = u128::from(iggy_common::calculate_checksum(body));
+                    header.checksum = header.identity_checksum();
+                });
+                parent = prepare.header().checksum;
+                persistence.append(prepare.into_frozen(), true).unwrap();
+            }
+            partition.start_persistence();
+            persistence.drain_with_timeout().await.unwrap();
+
+            let rotated = directory.path().join("00000000000000000001.log");
+            let metadata = std::fs::metadata(&rotated).unwrap();
+            assert_eq!(std::fs::read(&rotated).unwrap(), bodies[1]);
+            assert_eq!(metadata.len(), bodies[1].len() as u64);
+            assert_eq!(
+                metadata.blocks() * BLOCK_BYTES >= SEGMENT_BYTES,
+                preallocate,
+                "rotated segment allocation must follow preallocate_segments={preallocate}"
+            );
+            assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
+        }
     }
 
     #[compio::test]
@@ -11313,13 +11519,21 @@ mod tests {
     /// stamped at `base_offset`, with a valid batch checksum so it decodes
     /// through `decode_batch_slice` and matches an `Offset` poll.
     pub(super) fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
+        build_segment_record_with_payload(namespace, base_offset, Bytes::from_static(b"abcdefgh"))
+    }
+
+    fn build_segment_record_with_payload(
+        namespace: IggyNamespace,
+        base_offset: u64,
+        payload: Bytes,
+    ) -> Vec<u8> {
         let mut batch = IggyMessages::with_capacity(1);
         batch.push(IggyMessage {
             header: IggyMessageHeader {
-                payload_length: 8,
+                payload_length: u32::try_from(payload.len()).unwrap(),
                 ..Default::default()
             },
-            payload: Bytes::from_static(b"abcdefgh"),
+            payload,
             user_headers: None,
         });
         let mut owned =

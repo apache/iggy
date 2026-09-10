@@ -22,7 +22,7 @@ use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use futures::channel::oneshot;
 use futures::lock::Mutex;
-use server_common::iobuf::Owned;
+use server_common::iobuf::{Frozen, Owned};
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -82,12 +82,25 @@ pub trait DurableStorage {
 }
 
 pub trait DurableFile {
+    /// Best-effort reservation that must not change bytes or logical length.
+    /// Backends without physical allocation may ignore this hint.
+    fn preallocate(&self, _path: &Path, _length: u64) {}
+
     /// # Errors
     /// Returns an error if the complete range cannot be read.
     fn read(&self, offset: u64, length: usize) -> impl Future<Output = io::Result<Vec<u8>>>;
     /// # Errors
     /// Returns an error if any part of the write fails.
     fn write(&mut self, offset: u64, bytes: Vec<u8>) -> impl Future<Output = io::Result<()>>;
+    /// # Errors
+    /// Returns an error if the immutable extent cannot be written completely.
+    fn write_frozen(
+        &mut self,
+        offset: u64,
+        bytes: Frozen<4096>,
+    ) -> impl Future<Output = io::Result<()>> {
+        async move { self.write(offset, bytes.as_slice().to_vec()).await }
+    }
     /// # Errors
     /// Returns an error if the aligned extent cannot be written completely.
     fn write_aligned(
@@ -246,6 +259,10 @@ impl DurableStorage for DiskStorage {
 }
 
 impl DurableFile for File {
+    fn preallocate(&self, path: &Path, length: u64) {
+        server_common::fs_utils::preallocate_file(self, path, length);
+    }
+
     async fn read(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
         let (result, bytes) = self.read_exact_at(vec![0; length], offset).await.into();
         result?;
@@ -253,6 +270,10 @@ impl DurableFile for File {
     }
 
     async fn write(&mut self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
+        self.write_all_at(bytes, offset).await.0
+    }
+
+    async fn write_frozen(&mut self, offset: u64, bytes: Frozen<4096>) -> io::Result<()> {
         self.write_all_at(bytes, offset).await.0
     }
 

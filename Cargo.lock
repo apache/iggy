@@ -12972,6 +12972,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "twox-hash",
 ]
 
 [[package]]

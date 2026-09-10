@@ -21,16 +21,20 @@ use super::{
 use crate::packet::PacketSimulatorOptions;
 use consensus::MetadataHandle;
 use futures::{executor::block_on, poll};
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
+use journal::partition_journal::{PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference};
 use journal::{DurableAppend, PartitionPrepareJournal};
 use partitions::{PartitionPersistence, install_backup};
 use server_common::{Message, iobuf::Owned};
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
+use twox_hash::XxHash3_64;
 
 const DIRECTORY: &str = "/partition";
 const WAL: &str = "/partition/wal";
+const OWNED_BATCH_BYTES: usize = 12 * 1024;
 const MATERIALIZED_FILES: &[&str] = &[
     "/partition/0.log",
     "/partition/0.index",
@@ -140,6 +144,61 @@ fn wal_fault_sweep_preserves_acknowledged_history_at_every_io_boundary() {
             }
         }
         eprintln!("partition WAL fault cases: {cases}");
+    });
+}
+
+#[test]
+fn referenced_wal_fault_sweep_preserves_bodies_through_publication_and_reclamation() {
+    block_on(async {
+        let mut cases = 0;
+        for mutation in [
+            Mutation::Append,
+            Mutation::CertifyView,
+            Mutation::Checkpoint,
+            Mutation::Truncate,
+            Mutation::Reset,
+            Mutation::Purge,
+        ] {
+            let (storage, mut journal) = referenced_baseline().await;
+            storage.clear_trace();
+            mutate_referenced(&storage, &mut journal, mutation)
+                .await
+                .unwrap();
+            let trace = storage.trace();
+            for (cut, operation) in trace.iter().enumerate() {
+                for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
+                    for crash in [Crash::Process, Crash::PowerLoss] {
+                        for writeback in [false, true] {
+                            let (storage, mut journal) = referenced_baseline().await;
+                            storage.fail_at(cut, mode);
+                            let completed = mutate_referenced(&storage, &mut journal, mutation)
+                                .await
+                                .is_ok();
+                            drop(journal);
+                            if writeback {
+                                storage.writeback();
+                            }
+                            storage.crash(crash);
+                            let context = format!(
+                                "{mutation:?} cut {cut} {operation:?} {mode:?} {crash:?} writeback={writeback}"
+                            );
+                            let recovered = PartitionPrepareJournal::open_with_storage(
+                                Path::new(WAL),
+                                42,
+                                7,
+                                storage.clone(),
+                            )
+                            .await
+                            .unwrap_or_else(|error| panic!("{context}: {error}"));
+                            assert_referenced_recovery(&recovered, mutation, completed, &context)
+                                .await;
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("referenced partition WAL fault cases: {cases}");
     });
 }
 
@@ -990,6 +1049,347 @@ async fn baseline() -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
     (storage, journal)
 }
 
+#[test]
+fn owned_segment_fault_sweep_preserves_acknowledged_bodies_and_checkpoint_bounds() {
+    block_on(async {
+        let mut cases = 0;
+        for mutation in [
+            Mutation::Append,
+            Mutation::Checkpoint,
+            Mutation::Truncate,
+            Mutation::Purge,
+        ] {
+            let (storage, mut journal) = owned_segment_baseline().await;
+            storage.clear_trace();
+            mutate_owned_segments(&mut journal, mutation).await.unwrap();
+            let trace = storage.trace();
+            for (cut, operation) in trace.iter().enumerate() {
+                for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
+                    for crash in [Crash::Process, Crash::PowerLoss] {
+                        for writeback in [false, true] {
+                            let (storage, mut journal) = owned_segment_baseline().await;
+                            storage.fail_at(cut, mode);
+                            let completed =
+                                mutate_owned_segments(&mut journal, mutation).await.is_ok();
+                            drop(journal);
+                            if writeback {
+                                storage.writeback();
+                            }
+                            storage.crash(crash);
+                            let context = format!(
+                                "{mutation:?} cut {cut} {operation:?} {mode:?} {crash:?} writeback={writeback}"
+                            );
+                            let recovered = PartitionPrepareJournal::open_with_storage(
+                                Path::new(WAL),
+                                42,
+                                7,
+                                storage,
+                            )
+                            .await
+                            .unwrap_or_else(|error| panic!("{context}: {error}"));
+                            assert_owned_segments(&recovered, mutation, completed, &context).await;
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!("owned segment fault cases: {cases}");
+    });
+}
+
+async fn owned_segment_baseline() -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
+    let storage = storage_for_partition().await;
+    let mut journal =
+        PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    journal
+        .enable_segment_storage(SegmentPosition::default(), (2 * OWNED_BATCH_BYTES) as u64)
+        .await
+        .unwrap();
+    let first = owned_prepare(1, 0, 0);
+    let second = owned_prepare(2, first.header().checksum, 1);
+    journal.append(first.into_frozen()).await.unwrap();
+    journal.append(second.into_frozen()).await.unwrap();
+    journal.checkpoint(1).await.unwrap();
+    (storage, journal)
+}
+
+async fn mutate_owned_segments(
+    journal: &mut PartitionPrepareJournal<SimStorage>,
+    mutation: Mutation,
+) -> io::Result<()> {
+    let first = owned_prepare(1, 0, 0);
+    let second = owned_prepare(2, first.header().checksum, 1);
+    match mutation {
+        Mutation::Append => {
+            journal
+                .append(owned_prepare(3, second.header().checksum, 2).into_frozen())
+                .await
+        }
+        Mutation::Checkpoint => journal.checkpoint(2).await,
+        Mutation::Truncate => journal.truncate_from(2).await,
+        Mutation::Purge => {
+            journal.mark_purge(1, 2).await?;
+            journal
+                .append(owned_prepare(3, second.header().checksum, 0).into_frozen())
+                .await
+        }
+        Mutation::CertifyView | Mutation::Reset => unreachable!("not part of this sweep"),
+    }
+}
+
+async fn assert_owned_segments(
+    journal: &PartitionPrepareJournal<SimStorage>,
+    mutation: Mutation,
+    completed: bool,
+    context: &str,
+) {
+    let first = owned_prepare(1, 0, 0);
+    let second = owned_prepare(2, first.header().checksum, 1);
+    let third = owned_prepare(
+        3,
+        second.header().checksum,
+        if matches!(mutation, Mutation::Purge) {
+            0
+        } else {
+            2
+        },
+    );
+    let expected = [first, second, third];
+    let checkpoint = journal.segment_checkpoint().unwrap();
+    let checkpointed = match mutation {
+        Mutation::Checkpoint if journal.checkpoint_op() == 2 => 2,
+        Mutation::Purge if journal.purge_marker() == (1, 2) => 0,
+        _ => 1,
+    };
+    assert_eq!(
+        checkpoint,
+        SegmentPosition {
+            start_offset: 0,
+            length: checkpointed * OWNED_BATCH_BYTES as u64,
+            next_offset: checkpointed
+        },
+        "{context}"
+    );
+    let expected_head = match mutation {
+        Mutation::Append | Mutation::Purge => 3,
+        Mutation::Truncate => 1,
+        _ => 2,
+    };
+    if completed {
+        assert_eq!(journal.head(), expected_head, "{context}");
+    }
+    assert!([2, expected_head].contains(&journal.head()), "{context}");
+    if completed && matches!(mutation, Mutation::Checkpoint) {
+        assert_eq!(checkpointed, 2, "{context}");
+    }
+    if completed && matches!(mutation, Mutation::Purge) {
+        assert_eq!(checkpointed, 0, "{context}");
+    }
+    let prepares = journal.prepares().await.unwrap();
+    let expected_ops: Vec<_> = (journal.checkpoint_op()..=journal.head()).collect();
+    assert_eq!(
+        prepares
+            .iter()
+            .map(|prepare| prepare.header().op)
+            .collect::<Vec<_>>(),
+        expected_ops,
+        "{context}"
+    );
+    for prepare in &prepares {
+        let index = usize::try_from(prepare.header().op - 1).unwrap();
+        assert_eq!(prepare.as_slice(), expected[index].as_slice(), "{context}");
+        assert!(
+            journal.segment_reference(prepare.header()).is_some(),
+            "{context}"
+        );
+    }
+    assert_eq!(
+        journal.size_bytes(),
+        (prepares.len() * PARTITION_WAL_BLOCK_SIZE) as u64,
+        "{context}"
+    );
+}
+
+fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
+    let mut body = vec![u8::try_from(op).unwrap(); OWNED_BATCH_BYTES];
+    let mut batch = BatchHeader::new(42, 0, OWNED_BATCH_BYTES as u64, 1);
+    batch.base_offset = offset;
+    batch.batch_checksum = batch.checksum_for_blob(&body[BATCH_HEADER_SIZE..]);
+    batch.encode_into(&mut body);
+    prepare_with_payload(op, parent, &body)
+}
+
+async fn referenced_baseline() -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
+    let storage = storage_for_partition().await;
+    let mut journal =
+        PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    let first = prepare(1, 0);
+    let second = prepare(2, first.header().checksum);
+    append_referenced(&storage, &mut journal, &first, 0, 0)
+        .await
+        .unwrap();
+    append_referenced(&storage, &mut journal, &second, 0, 1)
+        .await
+        .unwrap();
+    (storage, journal)
+}
+
+async fn append_referenced(
+    storage: &SimStorage,
+    journal: &mut PartitionPrepareJournal<SimStorage>,
+    prepare: &Message<PrepareHeader>,
+    generation: u64,
+    start_offset: u64,
+) -> io::Result<()> {
+    let body = &prepare.as_slice()[size_of::<PrepareHeader>()..];
+    let path = Path::new(DIRECTORY).join(format!("{start_offset:020}.log"));
+    let mut file = storage.open(&path, OpenMode::Create).await?;
+    file.write(0, body.to_vec()).await?;
+    file.sync().await?;
+    let reference = SegmentReference {
+        generation,
+        start_offset,
+        position: 0,
+        length: body.len() as u64,
+    };
+    journal
+        .append_batch_referenced_buffered(&[prepare.clone().into_frozen()], &[Some(reference)])
+        .await?;
+    journal.sync().await
+}
+
+async fn mutate_referenced(
+    storage: &SimStorage,
+    journal: &mut PartitionPrepareJournal<SimStorage>,
+    mutation: Mutation,
+) -> io::Result<()> {
+    let first = prepare(1, 0);
+    let second = prepare(2, first.header().checksum);
+    match mutation {
+        Mutation::Append => {
+            append_referenced(
+                storage,
+                journal,
+                &prepare(3, second.header().checksum),
+                0,
+                2,
+            )
+            .await
+        }
+        Mutation::CertifyView => {
+            journal
+                .certify_log_view(2, 2, second.header().checksum)
+                .await
+        }
+        Mutation::Checkpoint => journal.checkpoint(2).await,
+        Mutation::Truncate => journal.truncate_from(2).await,
+        Mutation::Reset => journal.reset(7, None).await,
+        Mutation::Purge => {
+            journal.mark_purge(1, 2).await?;
+            for offset in [0, 1] {
+                storage
+                    .remove_file(&Path::new(DIRECTORY).join(format!("{offset:020}.log")))
+                    .await?;
+            }
+            storage.sync_directory(Path::new(DIRECTORY)).await?;
+            append_referenced(
+                storage,
+                journal,
+                &prepare(3, second.header().checksum),
+                1,
+                0,
+            )
+            .await
+        }
+    }
+}
+
+async fn assert_referenced_recovery(
+    journal: &PartitionPrepareJournal<SimStorage>,
+    mutation: Mutation,
+    completed: bool,
+    context: &str,
+) {
+    match mutation {
+        Mutation::Append | Mutation::Purge => {
+            assert!((2..=3).contains(&journal.head()), "{context}");
+            if completed {
+                assert_eq!(journal.head(), 3, "{context}");
+            }
+        }
+        Mutation::Truncate => {
+            assert!((1..=2).contains(&journal.head()), "{context}");
+            if completed {
+                assert_eq!(journal.head(), 1, "{context}");
+            }
+        }
+        Mutation::Reset => {
+            assert!([2, 7].contains(&journal.head()), "{context}");
+            if completed {
+                assert_eq!(journal.head(), 7, "{context}");
+            }
+        }
+        Mutation::Checkpoint => {
+            assert_eq!(journal.head(), 2, "{context}");
+            assert!([0, 2].contains(&journal.checkpoint_op()), "{context}");
+            if completed {
+                assert_eq!(journal.checkpoint_op(), 2, "{context}");
+            }
+        }
+        Mutation::CertifyView => {
+            assert_eq!(journal.head(), 2, "{context}");
+            if completed {
+                assert_eq!(journal.certified_log_view(), Some(2), "{context}");
+            }
+        }
+    }
+    let first = prepare(1, 0);
+    let second = prepare(2, first.header().checksum);
+    let third = prepare(3, second.header().checksum);
+    let expected = [first, second, third];
+    let recovered = journal.prepares().await.unwrap();
+    let expected_ops: Vec<_> = if matches!(mutation, Mutation::Reset) && journal.head() == 7 {
+        assert_eq!(journal.checkpoint_op(), 7, "{context}");
+        Vec::new()
+    } else if matches!(mutation, Mutation::Checkpoint) && journal.checkpoint_op() == 2 {
+        vec![2]
+    } else {
+        assert_eq!(journal.checkpoint_op(), 0, "{context}");
+        (1..=journal.head()).collect()
+    };
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|entry| entry.header().op)
+            .collect::<Vec<_>>(),
+        expected_ops,
+        "{context}",
+    );
+    if matches!(mutation, Mutation::Purge) {
+        assert!(
+            [(0, 0), (1, 2)].contains(&journal.purge_marker()),
+            "{context}"
+        );
+        if completed || journal.head() == 3 {
+            assert_eq!(journal.purge_marker(), (1, 2), "{context}");
+        }
+    }
+    assert_eq!(
+        journal.size_bytes(),
+        (recovered.len() * PARTITION_WAL_BLOCK_SIZE) as u64,
+        "{context}"
+    );
+    for entry in recovered {
+        let index = usize::try_from(entry.header().op - 1).unwrap();
+        assert_eq!(entry.as_slice(), expected[index].as_slice(), "{context}");
+    }
+}
+
 async fn mutate(
     storage: &SimStorage,
     journal: &mut PartitionPrepareJournal<SimStorage>,
@@ -1168,8 +1568,7 @@ fn prepare_with_payload(op: u64, parent: u128, payload: &[u8]) -> Message<Prepar
     header.op = op;
     header.parent = parent;
     header.size = u32::try_from(length).unwrap();
-    // Distinct identities are sufficient here. The WAL additionally hashes the full record.
-    header.checksum_body = payload.iter().map(|byte| u128::from(*byte)).sum();
+    header.checksum_body = u128::from(XxHash3_64::oneshot(payload));
     header.checksum = header.identity_checksum();
     Message::try_from(buffer).unwrap()
 }
