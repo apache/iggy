@@ -1325,7 +1325,7 @@ class IggyClient:
         Args:
             stream: Stream identifier as `str | int`.
             name: Topic name as `str`.
-            partitions_count: Number of partitions as `int`.
+            partitions_count: Number of partitions as `int`, at most 1000.
             compression_algorithm: Compression algorithm as `str | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
@@ -1442,6 +1442,66 @@ class IggyClient:
 
         Raises:
             RuntimeError: If an identifier is invalid or the request fails.
+        """
+    def create_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Create partitions for a topic. New partition IDs continue from one past the
+        current highest ID; IDs removed by deletion can be reused. Existing consumer
+        groups are immediately rebalanced across all partitions, advancing their
+        generation and dropping pending revocations.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to create as `int`, between 1 and
+                1000 inclusive.
+
+        Returns:
+            An awaitable that resolves to `None` when the partitions are committed;
+            storage materialization completes asynchronously.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
+            RuntimeError: If the client is not authenticated, lacks global
+                `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+                `manage_topics`, or per-topic `manage_topic` permission, or the
+                request fails.
+        """
+    def delete_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete the last partitions from a topic, including all messages stored in them.
+        Existing consumer groups are immediately rebalanced across the remaining
+        partitions, advancing their generation and dropping pending revocations.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to delete as `int` from the end of
+                the topic; must be between 1 and 1000 inclusive and no greater than
+                its current count.
+
+        Returns:
+            An awaitable that resolves to `None` when deletion is accepted; storage
+            teardown completes asynchronously.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
+            RuntimeError: If the client is not authenticated, lacks global
+                `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+                `manage_topics`, or per-topic `manage_topic` permission, or the
+                request fails.
         """
     def create_consumer_group(
         self,
