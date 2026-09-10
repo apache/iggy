@@ -45,6 +45,16 @@ pub struct ExternalAuthConfig {
     /// inline grants share this single ID; the external principal string
     /// distinguishes sessions. Must not be 0 (root). The replicated
     /// state-machine gate recognizes this ID at boot.
+    ///
+    /// **Changing this value between restarts is safe.** External auth
+    /// sessions are connection-scoped and never persisted, so there is no
+    /// stale state referencing the old value. The server validates at boot
+    /// that the new value does not collide with any existing user in the
+    /// slab. Within a running process the value is immutable (set-once via
+    /// `OnceLock`); a hot-reload that attempts a different value panics.
+    /// In a cluster, all nodes should use the same value to avoid
+    /// operational confusion, though cross-node correctness is not
+    /// affected (session state is node-local).
     #[serde(default = "default_external_auth_user_id")]
     #[config_env(leaf)]
     pub user_id: u32,

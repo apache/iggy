@@ -73,6 +73,13 @@ where
     T: StateMachine,
 {
     inner: T,
+    /// Reserved user ID for external auth inline-grant sessions. The
+    /// in-apply authorization gate uses this to recognize the single
+    /// external-auth user without depending on config at replay time.
+    /// Set once at boot via [`Self::set_external_auth_user_id`]; `None`
+    /// means external auth is disabled. `OnceLock` (not `OnceCell`) so
+    /// the type stays sound if `MuxStateMachine` is ever made `Sync`.
+    external_auth_user_id: std::sync::OnceLock<u32>,
 }
 
 impl<T> MuxStateMachine<T>
@@ -81,12 +88,44 @@ where
 {
     #[must_use]
     pub const fn new(inner: T) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            external_auth_user_id: std::sync::OnceLock::new(),
+        }
     }
 
     #[must_use]
     pub const fn inner(&self) -> &T {
         &self.inner
+    }
+
+    /// Set the reserved external auth user ID. Called in the
+    /// `seed_baseline` callback before WAL replay (owner shard) or
+    /// after `from_factory_bundle` (peer shards). Config-derived and
+    /// immutable for the process lifetime.
+    ///
+    /// Idempotent for the same value (safe to call from both the Owner
+    /// `seed_baseline` and the post-recovery guard).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller tries to change the value after it is set:
+    /// that would silently split the authz gate between shards.
+    pub fn set_external_auth_user_id(&self, user_id: u32) {
+        if self.external_auth_user_id.set(user_id).is_err() {
+            // OnceCell::set failed, so a value is already present. Accept
+            // an idempotent re-set of the same value; reject a change.
+            let existing = self.external_auth_user_id.get().copied().unwrap_or(0);
+            assert_eq!(
+                existing, user_id,
+                "external_auth_user_id cannot change at runtime: was {existing}, attempted {user_id}"
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn external_auth_user_id(&self) -> Option<u32> {
+        self.external_auth_user_id.get().copied()
     }
 }
 
@@ -218,6 +257,13 @@ where
     T: StateMachine + RestoreSnapshotInPlace<SnapshotData>,
 {
     fn restore_snapshot_in_place(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        // Replaces the inner state machines (Users, Streams) in place.
+        // `external_auth_user_id` is intentionally NOT reset here: it is a
+        // config-derived value set at boot and immutable for the process
+        // lifetime. A state transfer replaces replicated state, not local
+        // config. If a future change makes this value cluster-negotiated
+        // rather than config-pinned, it must be included in the snapshot
+        // format (MetadataSnapshot) and restored here.
         self.inner.restore_snapshot_in_place(snapshot)
     }
 
@@ -350,5 +396,24 @@ mod tests {
         mux.fill_snapshot(&mut verify_snapshot).unwrap();
         assert!(verify_snapshot.users.is_some());
         assert!(verify_snapshot.streams.is_some());
+    }
+
+    #[test]
+    fn set_external_auth_user_id_is_idempotent_for_same_value() {
+        type MuxTuple = (Users, (Streams, ()));
+        let mux = MuxStateMachine::<MuxTuple>::default();
+        mux.set_external_auth_user_id(42);
+        // Idempotent: same value does not panic.
+        mux.set_external_auth_user_id(42);
+        assert_eq!(mux.external_auth_user_id(), Some(42));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot change at runtime")]
+    fn set_external_auth_user_id_panics_on_different_value() {
+        type MuxTuple = (Users, (Streams, ()));
+        let mux = MuxStateMachine::<MuxTuple>::default();
+        mux.set_external_auth_user_id(42);
+        mux.set_external_auth_user_id(99);
     }
 }

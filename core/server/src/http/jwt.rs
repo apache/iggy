@@ -167,6 +167,17 @@ impl JwtManager {
     ///
     /// Returns [`IggyError::CannotGenerateJwt`] if signing fails.
     pub fn generate(&self, user_id: UserId) -> Result<GeneratedToken, IggyError> {
+        self.generate_capped(user_id, u64::MAX)
+    }
+
+    /// Generate a token whose `exp` is capped at `max_expiry_secs` (unix
+    /// seconds). Used by external auth inline-grant sessions to honor the
+    /// auth service's `expires_at`.
+    pub fn generate_capped(
+        &self,
+        user_id: UserId,
+        max_expiry_secs: u64,
+    ) -> Result<GeneratedToken, IggyError> {
         let header = Header::new(self.algorithm);
         let iat = IggyTimestamp::now().to_secs();
         let expiry_secs = match self.access_token_expiry {
@@ -174,7 +185,7 @@ impl JwtManager {
             IggyExpiry::ServerDefault => 0,
             IggyExpiry::ExpireDuration(duration) => duration.as_secs(),
         };
-        let exp = iat + u64::from(expiry_secs);
+        let exp = (iat + u64::from(expiry_secs)).min(max_expiry_secs);
         let nbf = iat + u64::from(self.not_before.as_secs());
         let claims = JwtClaims {
             jti: Uuid::now_v7().to_string(),
@@ -189,6 +200,7 @@ impl JwtManager {
             .map_err(|_| IggyError::CannotGenerateJwt)?;
         Ok(GeneratedToken {
             user_id,
+            jti: claims.jti,
             access_token,
             access_token_expiry: exp,
         })
@@ -485,6 +497,7 @@ pub(in crate::http) struct JwtClaims {
 #[derive(Debug)]
 pub(in crate::http) struct GeneratedToken {
     pub user_id: UserId,
+    pub jti: String,
     pub access_token: String,
     pub access_token_expiry: u64,
 }

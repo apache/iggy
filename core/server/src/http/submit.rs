@@ -406,6 +406,13 @@ pub(in crate::http) async fn partition_write_replicated(
             );
             PartitionWriteError::Unavailable
         })?;
+    let session_perms = (state.external_auth.enabled
+        && session.user_id == state.external_auth.user_id)
+        .then(|| {
+            let sk = crate::http::extractor::SessionKey::from_table_key(&session.key);
+            sk.and_then(|k| state.session_grant_permissions(&k))
+        })
+        .flatten();
     dispatch_partition_request(
         &state.shard,
         message,
@@ -414,6 +421,7 @@ pub(in crate::http) async fn partition_write_replicated(
         session.client_id,
         Some(session.user_id),
         None,
+        session_perms.as_deref(),
     )
     .await;
     drop(next_data_request_id);
@@ -463,6 +471,13 @@ pub(in crate::http) async fn produce_unacked(
         request_id,
         body,
     );
+    let session_perms = (state.external_auth.enabled
+        && session.user_id == state.external_auth.user_id)
+        .then(|| {
+            let sk = crate::http::extractor::SessionKey::from_table_key(&session.key);
+            sk.and_then(|k| state.session_grant_permissions(&k))
+        })
+        .flatten();
     dispatch_partition_request(
         &state.shard,
         message,
@@ -471,6 +486,7 @@ pub(in crate::http) async fn produce_unacked(
         session.client_id,
         Some(session.user_id),
         None,
+        session_perms.as_deref(),
     )
     .await;
     drop(next_data_request_id);
