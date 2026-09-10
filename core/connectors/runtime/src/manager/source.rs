@@ -82,28 +82,23 @@ impl SourceManager {
         metrics: Option<&Arc<Metrics>>,
     ) {
         if let Some(source) = self.sources.get(key) {
-            let mut source = source.lock().await;
-            let old_status = source.info.status;
-            source.info.status = status;
-            if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
-                source.info.last_error = None;
-            }
-            if let Some(metrics) = metrics {
-                if old_status != ConnectorStatus::Running && status == ConnectorStatus::Running {
-                    metrics.increment_sources_running();
-                } else if old_status == ConnectorStatus::Running
-                    && status != ConnectorStatus::Running
-                {
-                    metrics.decrement_sources_running();
-                }
-            }
+            source.lock().await.apply_status(status, metrics);
         }
     }
 
-    pub async fn set_error(&self, key: &str, error_message: &str) {
+    pub async fn set_error(&self, key: &str, error_message: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(source) = self.sources.get(key) {
             let mut source = source.lock().await;
-            source.info.status = ConnectorStatus::Error;
+            // Through the shared transition, so leaving `Running` moves the
+            // gauge. Skipping it left an errored instance counted as running,
+            // and the loop's later `Stopped` could not correct that either,
+            // because by then the old status was `Error` and neither branch
+            // fires.
+            //
+            // The message is assigned after the transition, and that ordering is
+            // what preserves it. `Error` being outside the set that clears
+            // `last_error` is belt and braces here, not the mechanism.
+            source.apply_status(ConnectorStatus::Error, metrics);
             source.info.last_error = Some(ConnectorError::new(error_message));
         }
     }
@@ -283,18 +278,13 @@ impl SourceManager {
                     context.clone(),
                 )
             });
+            // In the same hold as the id record, not after it. Released first,
+            // this transition raced the forwarding loop's own report and could
+            // overwrite an `Error` the loop had already set.
+            details.apply_status(ConnectorStatus::Running, Some(metrics));
         }
         // `details.info.id` now names this instance, so a later stop reaches it.
         instance_guard.disarm();
-
-        // Through `update_status`, which is the only thing that moves the gauge
-        // and moves it only on a real transition. Writing the status here and
-        // incrementing by hand as well meant two mechanisms counting one start:
-        // the forwarding loop reports `Running` too, for the boot path that
-        // never comes through here, and a stop decrements once. Reported twice
-        // and taken back once, the gauge climbed with every restart.
-        self.update_status(key, ConnectorStatus::Running, Some(metrics))
-            .await;
 
         Ok(())
     }
@@ -359,6 +349,34 @@ pub struct SourceDetails {
 }
 
 impl SourceDetails {
+    /// Applies a status transition and the gauge move that belongs with it.
+    ///
+    /// On `&mut self` rather than behind a key, so it can run inside a lock the
+    /// caller already holds. `update_status` takes the lock and delegates;
+    /// `start_connector` calls it in the same hold as the id record.
+    ///
+    /// That matters: applied after releasing that lock, the initial `Running`
+    /// could land after the forwarding loop had already reported `Running` and
+    /// then failed its first batch, overwriting `Error`, clearing `last_error`,
+    /// and counting the instance a second time.
+    fn apply_status(&mut self, status: ConnectorStatus, metrics: Option<&Arc<Metrics>>) {
+        let old_status = self.info.status;
+        self.info.status = status;
+        if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
+            self.info.last_error = None;
+        }
+        let Some(metrics) = metrics else {
+            return;
+        };
+        // Only a real crossing of `Running` moves the gauge, so repeated
+        // reports of a status the connector already holds cost nothing.
+        if old_status != ConnectorStatus::Running && status == ConnectorStatus::Running {
+            metrics.increment_sources_running();
+        } else if old_status == ConnectorStatus::Running && status != ConnectorStatus::Running {
+            metrics.decrement_sources_running();
+        }
+    }
+
     /// Records an instance that has just started, spawning its handlers in the
     /// same breath.
     ///
@@ -537,6 +555,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_not_double_count_when_an_error_falls_between_two_running_reports() {
+        // The interleaving spetz measured on #4064: the forwarding loop reports
+        // `Running`, fails its first batch, and a second `Running` report lands
+        // afterwards. That second report crosses into `Running` again, so it
+        // increments a gauge the error never gave back, and the instance is
+        // counted twice.
+        //
+        // What the consecutive-`Running` test cannot see: there the second
+        // report finds the status already `Running`, so no crossing happens and
+        // no arithmetic is exercised. The error in the middle is the whole point.
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .set_error("pg", "first batch failed", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            0,
+            "an instance that has failed is not running, and the gauge has to say so \
+             or nothing later can correct it"
+        );
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "one instance, however many times its status crossed Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_error_message_when_the_status_becomes_error() {
+        // `set_error` routes through a transition that clears `last_error` for
+        // some statuses, so its observable contract is worth pinning: the
+        // status ends `Error` and the message survives.
+        //
+        // Worth knowing what this does NOT pin. The message is assigned after
+        // the transition, so widening the clear to include `Error` leaves this
+        // green; checked, and the mutant survives. The ordering is the
+        // mechanism, and no unit test can see an ordering inside one lock hold.
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        manager
+            .set_error("pg", "producer setup failed", Some(&metrics))
+            .await;
+
+        let source = manager.get("pg").await.expect("source must exist");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert_eq!(
+            source
+                .info
+                .last_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("producer setup failed"),
+            "the transition must not clear the message set right after it"
+        );
+    }
+
+    #[tokio::test]
     async fn should_increment_metrics_once_when_running_is_reported_twice() {
         // Both a start and the forwarding loop report `Running` for the same
         // instance, so the gauge has to count instances rather than reports.
@@ -575,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_running() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Running, None)
@@ -590,7 +679,7 @@ mod tests {
     async fn should_set_error_status_and_message() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
 
-        manager.set_error("pg", "connection failed").await;
+        manager.set_error("pg", "connection failed", None).await;
 
         let source = manager.get("pg").await.unwrap();
         let details = source.lock().await;
@@ -653,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_stopped() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Stopped, None)
@@ -705,6 +794,6 @@ mod tests {
     async fn set_error_should_be_noop_for_unknown_key() {
         let manager = SourceManager::new(vec![]);
 
-        manager.set_error("nonexistent", "some error").await;
+        manager.set_error("nonexistent", "some error", None).await;
     }
 }
