@@ -42,6 +42,35 @@ const BEARER: &str = "Bearer ";
 const JWT_KEY_PREFIX: &str = "jwt:";
 const PAT_KEY_PREFIX: &str = "pat:";
 
+/// Session table key identifying a credential. Two variants so JWTs and PATs
+/// occupy disjoint key spaces.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(in crate::http) enum SessionKey {
+    Jwt(String),
+    Pat(String),
+}
+
+impl SessionKey {
+    /// The prefixed string form used as the session table `HashMap` key.
+    pub(in crate::http) fn as_table_key(&self) -> String {
+        match self {
+            Self::Jwt(jti) => format!("{JWT_KEY_PREFIX}{jti}"),
+            Self::Pat(hash) => format!("{PAT_KEY_PREFIX}{hash}"),
+        }
+    }
+
+    /// Parse a prefixed table-key string back into a `SessionKey`.
+    /// Returns `None` if the prefix is unrecognized.
+    pub(in crate::http) fn from_table_key(key: &str) -> Option<Self> {
+        key.strip_prefix(JWT_KEY_PREFIX)
+            .map(|jti| Self::Jwt(jti.to_owned()))
+            .or_else(|| {
+                key.strip_prefix(PAT_KEY_PREFIX)
+                    .map(|hash| Self::Pat(hash.to_owned()))
+            })
+    }
+}
+
 /// Resolved caller identity for a protected write route: the shared VSR
 /// session established once per presenting credential (it carries the
 /// authenticated user id).
@@ -75,7 +104,8 @@ impl FromRequestParts<HttpState> for Authenticated {
         // critical section is synchronous), so a cooperatively-scheduled sibling
         // task on this thread never observes a borrowed session table.
         let (key, user_id, expiry) = SendWrapper::new(resolve_credential(state, bearer)).await?;
-        let session = SendWrapper::new(state.resolve_session(key, user_id, expiry)).await?;
+        let session =
+            SendWrapper::new(state.resolve_session(key.as_table_key(), user_id, expiry)).await?;
         Ok(Self {
             session: SendWrapper::new(session),
         })
@@ -94,6 +124,9 @@ impl FromRequestParts<HttpState> for Authenticated {
 /// [`resolve_credential`] chokepoint, so a JWT and a PAT are honored identically.
 pub struct Identity {
     pub user_id: u32,
+    /// Session table key. Used to look up session-scoped permissions for
+    /// external auth inline-grant sessions.
+    pub session_key: SessionKey,
     /// Original request path + query (e.g. `/streams?consistency=linearizable`),
     /// captured so a linearizable read that reaches a follower can build the
     /// `Location` for its 307 redirect to the primary. Empty only when the URI
@@ -126,7 +159,8 @@ impl FromRequestParts<HttpState> for Identity {
         // ever runs on (mirrors legacy `HttpSafeShard`). It holds no `RefCell`
         // borrow or `DashMap` guard across the `.await`, so a sibling task
         // scheduled on this thread meanwhile never observes a borrowed cell.
-        let (_key, user_id, _expiry) = SendWrapper::new(resolve_credential(state, bearer)).await?;
+        let (session_key, user_id, _expiry) =
+            SendWrapper::new(resolve_credential(state, bearer)).await?;
         let path_and_query = parts
             .uri
             .path_and_query()
@@ -144,6 +178,7 @@ impl FromRequestParts<HttpState> for Identity {
         }
         Ok(Self {
             user_id,
+            session_key,
             path_and_query,
             client_ip,
         })
@@ -177,22 +212,18 @@ pub(in crate::http) fn bearer_token(headers: &HeaderMap) -> Result<&str, IggyErr
 pub(in crate::http) async fn resolve_credential(
     state: &HttpState,
     bearer: &str,
-) -> Result<(String, u32, u64), AuthError> {
+) -> Result<(SessionKey, u32, u64), AuthError> {
     if let Ok(claims) = state.jwt.decode(bearer).await
         && let Ok(user_id) = claims.sub.parse::<u32>()
     {
-        return Ok((
-            format!("{JWT_KEY_PREFIX}{}", claims.jti),
-            user_id,
-            claims.exp,
-        ));
+        return Ok((SessionKey::Jwt(claims.jti), user_id, claims.exp));
     }
 
     let (user_id, expiry) = verify_pat_credentials_with_expiry(&state.shard, bearer)
         .map_err(|_| IggyError::Unauthenticated)?;
-    let key = format!(
-        "{PAT_KEY_PREFIX}{}",
-        PersonalAccessToken::hash_token(bearer)
-    );
-    Ok((key, user_id, expiry))
+    Ok((
+        SessionKey::Pat(PersonalAccessToken::hash_token(bearer)),
+        user_id,
+        expiry,
+    ))
 }

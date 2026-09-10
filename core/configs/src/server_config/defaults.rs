@@ -27,6 +27,7 @@ use super::cluster::{
     ClusterAuthConfig, ClusterConfig, ClusterCoordinatorConfig, ClusterNodeConfig,
     ClusterTlsConfig, TransportPorts,
 };
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
@@ -66,6 +67,7 @@ impl Default for ServerConfig {
             metadata: MetadataConfig::default(),
             partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
+            external_auth: ExternalAuthConfig::default(),
         }
     }
 }

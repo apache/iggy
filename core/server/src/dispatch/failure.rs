@@ -612,11 +612,13 @@ mod tests {
         )
         .into_generic();
 
+        let external_auth = Arc::new(configs::external_auth::ExternalAuthConfig::default());
         handle_client_request(
             &shard,
             &sessions,
             &system_config,
             1,
+            &external_auth,
             TRANSPORT,
             request.into_generic(),
         )

@@ -31,7 +31,7 @@
 //! HTTP spine keeps its own equivalent gates (see `crate::http`) because its
 //! error contract (404-before-403) is pinned client-visible behavior.
 
-mod authz;
+pub mod authz;
 mod failure;
 pub mod login_error;
 pub mod partition;
@@ -56,8 +56,9 @@ use crate::responses::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, RewriteStage, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
-use crate::wire::verify_request_checksum;
+use crate::wire::{request_body, verify_request_checksum};
 use ahash::{AHashMap, AHashSet};
+use configs::external_auth::ExternalAuthConfig;
 use configs::server::ServerSystemConfig;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
@@ -142,6 +143,7 @@ pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
 ) -> RequestHandler
 where
     B: ShellBus,
@@ -196,6 +198,7 @@ where
             &sessions,
             &system_config,
             max_tokens_per_user,
+            &external_auth,
             &queues,
             &active,
             client_id,
@@ -249,6 +252,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: &Arc<ExternalAuthConfig>,
     queues: &ClientRequestQueues,
     active: &ActiveClientRequests,
     client_id: u128,
@@ -279,6 +283,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
     let system_config = Arc::clone(system_config);
+    let external_auth = Arc::clone(external_auth);
     let queues = Rc::clone(queues);
     let active = Rc::clone(active);
     bus.spawn(async move {
@@ -294,6 +299,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
             sessions,
             system_config,
             max_tokens_per_user,
+            external_auth,
             queues,
             client_id,
         )
@@ -376,12 +382,13 @@ impl Drop for ActiveDrainSlot {
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn drain_client_requests<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
     queues: ClientRequestQueues,
     client_id: u128,
 ) where
@@ -400,6 +407,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
             &sessions,
             &system_config,
             max_tokens_per_user,
+            &external_auth,
             client_id,
             message,
         )
@@ -521,6 +529,7 @@ async fn handle_client_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: &Arc<ExternalAuthConfig>,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
 ) where
@@ -654,6 +663,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 shard,
                 sessions,
                 system_config,
+                external_auth,
                 transport_client_id,
                 request,
                 (user_id, client_address, metadata_watermark),
@@ -661,7 +671,14 @@ async fn handle_client_request<B, MJ, S, SB>(
             .await;
         }
         RequestClass::LoginRegister => {
-            handle_login_register_request(shard, sessions, transport_client_id, request).await;
+            handle_login_register_request(
+                shard,
+                sessions,
+                transport_client_id,
+                request,
+                external_auth,
+            )
+            .await;
         }
         RequestClass::Logout => {
             handle_logout_request(shard, sessions, transport_client_id, request).await;
@@ -712,6 +729,15 @@ async fn handle_client_request<B, MJ, S, SB>(
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
             // `None` rather than trust that.
+            let session_perms = user_id
+                .filter(|&uid| external_auth.enabled && uid == external_auth.user_id)
+                .and_then(|_| {
+                    let now_secs =
+                        iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
+                    sessions
+                        .borrow_mut()
+                        .session_permissions_for_connection(transport_client_id, now_secs)
+                });
             dispatch_partition_request(
                 shard,
                 request,
@@ -719,6 +745,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 bound_session,
                 transport_client_id,
                 user_id,
+                session_perms.as_deref(),
             )
             .await;
         }
@@ -740,6 +767,33 @@ async fn handle_client_request<B, MJ, S, SB>(
                         new_header.session = bound_session;
                     }
                 });
+            // Pre-submit authorization for external auth users on CG
+            // join/leave. The STM allow-list lets these through (it has no
+            // session-scoped permissions), so the dispatch-time check is the
+            // only topic-level gate. Regular users are checked by the STM's
+            // Permissioner.
+            if external_auth.enabled
+                && matches!(
+                    request.header().operation,
+                    Operation::JoinConsumerGroup | Operation::LeaveConsumerGroup
+                )
+                && user_id.is_some_and(|uid| uid == external_auth.user_id)
+            {
+                let now_secs =
+                    iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
+                let session_perms = sessions
+                    .borrow_mut()
+                    .session_permissions_for_connection(transport_client_id, now_secs);
+                if let Some(deny_code) = authz::authorize_consumer_group_op(
+                    shard,
+                    request.header().operation,
+                    request_body(&request),
+                    session_perms.as_deref(),
+                ) {
+                    send_deny_reply(shard, transport_client_id, request.header(), deny_code).await;
+                    return;
+                }
+            }
             let (request, raw_pat_token) = match tcp_chain(
                 shard,
                 sessions,
@@ -1081,6 +1135,7 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let system_config = Arc::new(ServerSystemConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         let multi_node = Rc::new(ClusterRoster {
             enabled: true,
@@ -1109,6 +1164,7 @@ mod tests {
                 &sessions,
                 &system_config,
                 1,
+                &external_auth,
                 TRANSPORT,
                 metadata_read(),
             )
@@ -1353,6 +1409,7 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let system_config = Arc::new(ServerSystemConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         for code in [LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE] {
             handle_client_request(
@@ -1360,6 +1417,7 @@ mod tests {
                 &sessions,
                 &system_config,
                 1,
+                &external_auth,
                 TRANSPORT,
                 non_replicated_request(TRANSPORT, code),
             )
@@ -1394,12 +1452,14 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let system_config = Arc::new(ServerSystemConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         handle_client_request(
             &shard,
             &sessions,
             &system_config,
             1,
+            &external_auth,
             TRANSPORT,
             wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
         )
@@ -1429,12 +1489,14 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let system_config = Arc::new(ServerSystemConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         handle_client_request(
             &shard,
             &sessions,
             &system_config,
             1,
+            &external_auth,
             TRANSPORT,
             non_replicated_request(TRANSPORT, PING_CODE),
         )
@@ -1462,6 +1524,7 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let system_config = Arc::new(ServerSystemConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         let mut message = wire_request(Operation::CreateStream, TRANSPORT, 1, 1, BODY);
         {
@@ -1478,6 +1541,7 @@ mod tests {
             &sessions,
             &system_config,
             1,
+            &external_auth,
             TRANSPORT,
             message.into_generic(),
         )
@@ -1521,6 +1585,7 @@ mod tests {
             &Rc::new(RefCell::new(SessionManager::new())),
             Arc::new(ServerSystemConfig::default()),
             1,
+            Arc::new(ExternalAuthConfig::default()),
         );
         assert_eq!(
             bus.connection_lost_hooks.get(),
@@ -1545,6 +1610,7 @@ mod tests {
             &Rc::new(RefCell::new(SessionManager::new())),
             Arc::new(ServerSystemConfig::default()),
             1,
+            Arc::new(ExternalAuthConfig::default()),
         );
 
         handler(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));

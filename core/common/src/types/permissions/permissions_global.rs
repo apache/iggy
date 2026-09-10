@@ -26,6 +26,7 @@ use std::fmt::Display;
 /// Global permissions are applied to all streams.
 /// Stream permissions are applied to a specific stream.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
+#[serde(default)]
 pub struct Permissions {
     /// Global permissions are applied to all streams.
     pub global: GlobalPermissions,
@@ -36,6 +37,7 @@ pub struct Permissions {
 
 /// `GlobalPermissions` are applied to all streams without a need to specify them one by one in the `streams` field.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
+#[serde(default)]
 pub struct GlobalPermissions {
     /// `manage_servers` permission allows to manage the servers and includes all the permissions of `read_servers`.
     pub manage_servers: bool,
@@ -104,6 +106,7 @@ pub struct GlobalPermissions {
 /// `StreamPermissions` are applied to a specific stream and its all topics. If you want to define granular permissions for each topic, use the `topics` field.
 /// These permissions do not override the global permissions, but extend them, and allow more granular control over the streams and the users that can access them.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
+#[serde(default)]
 pub struct StreamPermissions {
     /// `manage_stream` permission allows to manage the stream and includes all the permissions of `read_stream`.
     /// Also, it allows to manage all the topics of a stream, thus it has all the permissions of `manage_topics`.
@@ -143,6 +146,7 @@ pub struct StreamPermissions {
 
 /// `TopicPermissions` are applied to a specific topic of a stream. This is the lowest level of permissions.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
+#[serde(default)]
 pub struct TopicPermissions {
     /// `manage_topic` permission allows to manage the topic and includes all the permissions of `read_topic`.
     pub manage_topic: bool,

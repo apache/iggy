@@ -206,6 +206,7 @@ pub fn start(
     system_config: Arc<ServerSystemConfig>,
     roster: Rc<ClusterRoster>,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
+    external_auth: Arc<configs::external_auth::ExternalAuthConfig>,
 ) -> Result<(), ServerError> {
     let BoundHttp {
         listener,
@@ -228,11 +229,14 @@ pub fn start(
         registrations: RegistrationBarrier::default(),
         roster,
         max_http_sessions: crate::http::session::max_http_sessions(clients_table_max),
+        max_session_grants: crate::http::session::max_http_sessions(clients_table_max),
         max_tokens_per_user,
         in_flight_writes: Cell::new(0),
         forward,
         metrics: metrics::HttpMetrics::init(shard_metrics_all),
         metadata_watermarks: Rc::default(),
+        external_auth,
+        session_grants: RefCell::new(HashMap::new()),
     }));
     let app = router(
         state,
