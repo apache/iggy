@@ -45,6 +45,10 @@ const SEGMENT_SIZE: u64 = 1024 * 1024;
 /// 256 + 10 * (48 + 105000) = 1050736 >= 1 MiB.
 const PAYLOAD_SIZE: usize = 105_000;
 
+const MESSAGE_EXPIRY: Duration = Duration::from_millis(100);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Buffer time for cleaner to run after expiry conditions are met.
 const CLEANER_BUFFER: Duration = Duration::from_millis(300);
 
@@ -59,6 +63,7 @@ fn make_payload(fill: char) -> Bytes {
 fn cleanup_topic_options() -> TopicCreateOptions {
     TopicCreateOptions {
         partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
         segment_size: Some(IggyByteSize::from(SEGMENT_SIZE)),
         durability: iggy_common::Durability::Persisted,
         messages_required_to_save: Some(1),
@@ -71,21 +76,11 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    // The whole send burst has to land inside this window: expiry runs off each
-    // message's own timestamp, so a produce run that outlives it gets its
-    // oldest segments reclaimed before the pre-expiry poll ever runs. A 3-node
-    // vsr cluster in a debug build pays a consensus round-trip plus an fsync
-    // per request, which is what pushed the old one-message-per-request loop
-    // past the old 2s window.
-    let expiry = Duration::from_secs(4);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            &TopicCreateOptions {
-                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
-                ..cleanup_topic_options()
-            },
+            &cleanup_topic_options(),
         )
         .await
         .unwrap();
@@ -98,9 +93,6 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 40 messages in batches, spanning several 1 MiB segments.
-    // Batched rather than one request per message: the burst must fit inside
-    // `expiry` with room to spare, and each request costs a round-trip.
     let payload = make_payload('A');
     let total_messages: usize = 40;
     let batch_size = 10;
@@ -155,18 +147,8 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         "Should poll all messages before expiry"
     );
 
-    // Wait for expiry + cleaner
-    tokio::time::sleep(expiry + CLEANER_BUFFER).await;
-
-    let remaining_segments = get_segment_paths_for_partition(&partition_path);
-    assert!(
-        remaining_segments.len() < initial_count,
-        "Expected segments to be deleted after expiry"
-    );
-    assert!(
-        !remaining_segments.is_empty(),
-        "Active segment should not be deleted"
-    );
+    expire_messages(client, STREAM_NAME, TOPIC_NAME).await;
+    wait_for_segment_cleanup(&partition_path, initial_count).await;
 
     // Verify fewer messages available after cleanup
     let polled_after = client
@@ -358,13 +340,11 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             &TopicCreateOptions {
-                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
                 // 500 MiB (won't trigger)
                 max_topic_size: Some(MaxTopicSize::Custom(IggyByteSize::from(500 * 1024 * 1024))),
                 ..cleanup_topic_options()
@@ -381,10 +361,6 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 40 messages to create several segments (under size threshold, but
-    // will expire). Batched so the burst finishes well inside `expiry`: a
-    // per-message request pays a consensus round-trip plus an fsync, and a loop
-    // that outlives the window has its head reclaimed before the count below.
     let payload = make_payload('C');
     let total_messages: usize = 40;
     let batch_size = 10;
@@ -414,18 +390,8 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
     let initial_count = initial_segments.len();
     assert!(initial_count >= 2, "Expected at least 2 segments");
 
-    // Wait for time-based expiry
-    tokio::time::sleep(expiry + CLEANER_BUFFER).await;
-
-    let remaining_segments = get_segment_paths_for_partition(&partition_path);
-    assert!(
-        remaining_segments.len() < initial_count,
-        "Segments should be deleted after expiry"
-    );
-    assert!(
-        !remaining_segments.is_empty(),
-        "Active segment should not be deleted"
-    );
+    expire_messages(client, STREAM_NAME, TOPIC_NAME).await;
+    wait_for_segment_cleanup(&partition_path, initial_count).await;
 
     client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
@@ -440,14 +406,12 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(5);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             &TopicCreateOptions {
                 partitions_count: Some(PARTITIONS_COUNT),
-                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
                 ..cleanup_topic_options()
             },
         )
@@ -459,10 +423,6 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
     let messages_per_partition: usize = 40;
     let batch_size = 10;
 
-    // Send messages to all partitions. Batched: a per-message request costs a
-    // consensus round-trip plus an fsync, and `PARTITIONS_COUNT` × 110 of those
-    // outlive `expiry`, so the cleaner would reclaim the first partition's
-    // sealed segments before the last one had even been written.
     for partition_id in 0..PARTITIONS_COUNT {
         for chunk_start in (0..messages_per_partition).step_by(batch_size) {
             let mut messages: Vec<IggyMessage> = (chunk_start
@@ -490,7 +450,6 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
     // Collect initial segment counts
     let mut initial_counts: Vec<usize> = Vec::new();
 
-    // Wait until all partitions have >= 2 segments (up to 5s)
     for partition_id in 0..PARTITIONS_COUNT {
         let partition_path = data_path
             .join(format!(
@@ -499,7 +458,7 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
             .display()
             .to_string();
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
         let count = loop {
             let segments = get_segment_paths_for_partition(&partition_path);
             if segments.len() >= 2 {
@@ -507,21 +466,17 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!(
-                    "Partition {} should have at least 2 segments after 5s, got {}",
-                    partition_id,
+                    "Partition {partition_id} should have at least 2 segments after {CLEANUP_TIMEOUT:?}, got {}",
                     segments.len()
                 );
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
         };
         initial_counts.push(count);
     }
 
-    // Wait for expiry + cleaner
-    tokio::time::sleep(expiry + CLEANER_BUFFER).await;
+    expire_messages(client, STREAM_NAME, TOPIC_NAME).await;
 
-    // Verify cleanup in all partitions
-    let mut total_deleted = 0usize;
     for partition_id in 0..PARTITIONS_COUNT {
         let partition_path = data_path
             .join(format!(
@@ -529,21 +484,8 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
             ))
             .display()
             .to_string();
-        let remaining = get_segment_paths_for_partition(&partition_path);
-        let deleted = initial_counts[partition_id as usize].saturating_sub(remaining.len());
-        total_deleted += deleted;
-
-        assert!(
-            !remaining.is_empty(),
-            "Partition {} should retain active segment",
-            partition_id
-        );
+        wait_for_segment_cleanup(&partition_path, initial_counts[partition_id as usize]).await;
     }
-
-    assert!(
-        total_deleted > 0,
-        "At least some segments should be deleted"
-    );
 
     client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
@@ -675,12 +617,11 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
 ///
 /// Scenario:
 /// 1. Send 100 messages (several 1 MiB segments)
-/// 2. Consumer reads only 50 messages (stored offset ~49, within segment 0)
-/// 3. Wait for all segments to expire (4s expiry)
+/// 2. Consumer reads only 50 messages and stores offset 49
+/// 3. Enable expiry and wait for consumed segments to be removed
 /// 4. Verify consumer can still poll Next() and get contiguous offsets
 ///
-/// On unfixed code: the cleaner deletes segments 0+1 (expired, consumer offset
-/// not checked), consumer's Next() jumps to segment 2, skipping ~250 messages.
+/// Without the consumer barrier, cleanup also removes the unconsumed segments.
 pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path: &Path) {
     const TEST_STREAM: &str = "test_cleaner_barrier_stream";
     const TEST_TOPIC: &str = "test_cleaner_barrier_topic";
@@ -688,20 +629,11 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
     let stream = client.create_stream(TEST_STREAM).await.unwrap();
     let stream_id = stream.id;
 
-    // Expiry must outlast the send + first-poll phase. If segments expire
-    // before the consumer commits its first offset, there is no barrier yet
-    // and the cleaner legally deletes them, breaking the premise: the poll
-    // below then starts at the earliest surviving offset instead of 0.
-    // The sends are batched for the same reason (see below).
-    let expiry = Duration::from_secs(4);
     let topic = client
         .create_topic(
             &Identifier::named(TEST_STREAM).unwrap(),
             TEST_TOPIC,
-            &TopicCreateOptions {
-                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
-                ..cleanup_topic_options()
-            },
+            &cleanup_topic_options(),
         )
         .await
         .unwrap();
@@ -714,9 +646,6 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         .display()
         .to_string();
 
-    // Send 100 messages -> several sealed segments + active. Batched: one
-    // request per message costs a consensus round-trip plus an fsync each,
-    // which on a 3-node debug cluster runs the burst well past `expiry`.
     let payload = make_payload('B');
     let total_messages = 100u32;
     let batch_size = 10u32;
@@ -749,8 +678,6 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         initial_segments.len()
     );
 
-    // Consumer reads only 50 messages with auto_commit, storing offset ~49.
-    // This means the consumer has NOT read segments 1, 2, etc.
     let consumer = Consumer::new(Identifier::numeric(42).unwrap());
     let mut consumed_offsets = Vec::new();
     let mut remaining = 50u32;
@@ -768,6 +695,10 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
             )
             .await
             .unwrap();
+        assert!(
+            !polled.messages.is_empty(),
+            "messages must remain available before expiry is enabled"
+        );
         for msg in &polled.messages {
             consumed_offsets.push(msg.header.offset);
         }
@@ -779,8 +710,8 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         "Consumer should have read through offset 49"
     );
 
-    // Wait for expiry + cleaner buffer
-    tokio::time::sleep(expiry + CLEANER_BUFFER + CLEANER_BUFFER).await;
+    expire_messages(client, TEST_STREAM, TEST_TOPIC).await;
+    wait_for_segment_cleanup(&partition_path, initial_segments.len()).await;
 
     // Now poll Next() - consumer should continue from offset 50 without gaps.
     // BUG: on unfixed code, the cleaner deleted the segment holding offset 50
@@ -818,6 +749,41 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         .delete_stream(&Identifier::named(TEST_STREAM).unwrap())
         .await
         .unwrap();
+}
+
+async fn expire_messages(client: &IggyClient, stream: &str, topic: &str) {
+    // Slow setup must not consume the expiry window before the assertions are ready.
+    client
+        .update_topic(
+            &Identifier::named(stream).unwrap(),
+            &Identifier::named(topic).unwrap(),
+            topic,
+            &TopicUpdateOptions {
+                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(
+                    MESSAGE_EXPIRY,
+                ))),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Every previously sent batch must be eligible, including unconsumed batches.
+    tokio::time::sleep(MESSAGE_EXPIRY).await;
+}
+
+async fn wait_for_segment_cleanup(partition_path: &str, initial_count: usize) {
+    let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        let remaining = get_segment_paths_for_partition(partition_path).len();
+        if remaining > 0 && remaining < initial_count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cleanup must remove sealed segments and retain the active segment in {partition_path}: initial={initial_count}, remaining={remaining} after {CLEANUP_TIMEOUT:?}"
+        );
+        tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
+    }
 }
 
 fn get_segment_paths_for_partition(partition_path: &str) -> Vec<DirEntry> {
