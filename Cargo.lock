@@ -6864,6 +6864,7 @@ dependencies = [
  "rand 0.10.2",
  "rayon",
  "serde",
+ "serde_json",
  "sysinfo 0.39.6",
  "tokio",
  "tracing",

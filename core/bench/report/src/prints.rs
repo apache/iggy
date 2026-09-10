@@ -73,9 +73,12 @@ impl BenchmarkReport {
 
         info!("{}", params_print);
 
-        self.group_metrics
-            .iter()
-            .for_each(|s| println!("\n{}", s.formatted_string(pretty)));
+        for group in &self.group_metrics {
+            println!(
+                "\n{}",
+                group.formatted_string_with_duration(pretty, self.group_duration(group))
+            );
+        }
     }
 
     pub fn total_messages(&self) -> u64 {
@@ -137,23 +140,57 @@ impl BenchmarkReport {
             batches
         }
     }
+    fn group_duration(&self, group: &BenchmarkGroupMetrics) -> f64 {
+        self.individual_metrics
+            .iter()
+            .filter(|metrics| match group.summary.kind {
+                GroupMetricsKind::Producers => metrics.summary.actor_kind == ActorKind::Producer,
+                GroupMetricsKind::Consumers => metrics.summary.actor_kind == ActorKind::Consumer,
+                GroupMetricsKind::ProducingConsumers => {
+                    metrics.summary.actor_kind == ActorKind::ProducingConsumer
+                }
+                GroupMetricsKind::ProducersAndConsumers => {
+                    metrics.summary.actor_kind != ActorKind::ProducingConsumer
+                }
+            })
+            .map(|metrics| metrics.summary.total_time_secs)
+            .reduce(f64::max)
+            .unwrap_or_else(|| group.time_series_duration())
+    }
 }
 
 impl BenchmarkGroupMetrics {
     pub fn formatted_string(&self, pretty: bool) -> String {
+        self.formatted_string_with_duration(pretty, self.time_series_duration())
+    }
+
+    fn formatted_string_with_duration(&self, pretty: bool, duration: f64) -> String {
         if pretty {
             let width = get_terminal_width();
             if width >= WIDE_LAYOUT_THRESHOLD {
-                self.format_wide_layout()
+                self.format_wide_layout(duration)
             } else {
-                self.format_narrow_layout()
+                self.format_narrow_layout(duration)
             }
         } else {
-            self.format_original()
+            self.format_original(duration)
         }
     }
 
-    fn format_original(&self) -> String {
+    fn time_series_duration(&self) -> f64 {
+        [
+            &self.avg_throughput_mb_ts,
+            &self.avg_throughput_msg_ts,
+            &self.avg_latency_ts,
+        ]
+        .into_iter()
+        .filter_map(|series| series.points.last())
+        .map(|point| point.time_s)
+        .reduce(f64::max)
+        .unwrap_or(0.0)
+    }
+
+    fn format_original(&self, duration: f64) -> String {
         let (prefix, color) = match self.summary.kind {
             GroupMetricsKind::Producers => ("Producers Results", Color::Green),
             GroupMetricsKind::Consumers => ("Consumers Results", Color::Green),
@@ -178,10 +215,7 @@ impl BenchmarkGroupMetrics {
         let min = format!("{:.2}", self.summary.min_latency_ms);
         let max = format!("{:.2}", self.summary.max_latency_ms);
         let std_dev = format!("{:.2}", self.summary.std_dev_latency_ms);
-        let total_test_time = format!(
-            "{:.2}",
-            self.avg_throughput_mb_ts.points.last().unwrap().time_s
-        );
+        let total_test_time = format!("{:.2}", duration);
 
         format!(
         "{prefix}: Total throughput: {total_mb} MB/s, {total_msg} messages/s, average throughput per {actor}: {avg_mb} MB/s, \
@@ -193,7 +227,7 @@ impl BenchmarkGroupMetrics {
     .to_string()
     }
 
-    fn format_wide_layout(&self) -> String {
+    fn format_wide_layout(&self, duration: f64) -> String {
         let prefix = match self.summary.kind {
             GroupMetricsKind::Producers => "Producers Results",
             GroupMetricsKind::Consumers => "Consumers Results",
@@ -209,10 +243,7 @@ impl BenchmarkGroupMetrics {
 
         summary_table.add_row(vec![
             prefix.to_string(),
-            format!(
-                "{:.2} s",
-                self.avg_throughput_mb_ts.points.last().unwrap().time_s
-            ),
+            format!("{:.2} s", duration),
             format!(
                 "{:.2} MB/s",
                 self.summary.total_throughput_megabytes_per_second
@@ -254,7 +285,7 @@ impl BenchmarkGroupMetrics {
         format!("\n{}\n{}", summary_table, latency_table)
     }
 
-    fn format_narrow_layout(&self) -> String {
+    fn format_narrow_layout(&self, duration: f64) -> String {
         let prefix = match self.summary.kind {
             GroupMetricsKind::Producers => "Producers Results",
             GroupMetricsKind::Consumers => "Consumers Results",
@@ -272,13 +303,7 @@ impl BenchmarkGroupMetrics {
         table.add_row(vec![prefix.to_string(), String::new()]);
 
         table.add_row(vec!["Summary", ""]);
-        table.add_row(vec![
-            "Total Time".to_string(),
-            format!(
-                "{:.2} s",
-                self.avg_throughput_mb_ts.points.last().unwrap().time_s
-            ),
-        ]);
+        table.add_row(vec!["Total Time".to_string(), format!("{:.2} s", duration)]);
 
         table.add_row(vec!["Throughput", ""]);
         table.add_row(vec![
@@ -344,5 +369,121 @@ impl BenchmarkGroupMetrics {
         ]);
 
         format!("\n{}", table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::{
+        actor_kind::ActorKind, create_latency_chart, create_latency_distribution_chart,
+        create_throughput_chart, group_metrics::BenchmarkGroupMetrics,
+        individual_metrics::BenchmarkIndividualMetrics, report::BenchmarkReport,
+    };
+
+    #[test]
+    fn empty_time_series_format_in_every_layout() {
+        let group = group_without_time_series();
+        assert!(group.formatted_string(false).contains("total time: 0.00 s"));
+        assert!(
+            group
+                .format_wide_layout(group.time_series_duration())
+                .contains("0.00 s")
+        );
+        assert!(
+            group
+                .format_narrow_layout(group.time_series_duration())
+                .contains("0.00 s")
+        );
+    }
+
+    #[test]
+    fn report_duration_uses_matching_actors_when_time_series_are_empty() {
+        let group = group_without_time_series();
+        let mut consumer = individual_without_time_series();
+        consumer.summary.actor_kind = ActorKind::Consumer;
+        consumer.summary.total_time_secs = 9.0;
+        let report = BenchmarkReport {
+            group_metrics: vec![group.clone()],
+            individual_metrics: vec![individual_without_time_series(), consumer],
+            ..BenchmarkReport::default()
+        };
+        assert_eq!(report.group_duration(&group), 0.125);
+        assert!(
+            group
+                .formatted_string_with_duration(false, report.group_duration(&group))
+                .contains("total time: 0.12 s")
+        );
+        report.print_summary(false);
+    }
+
+    #[test]
+    fn charts_accept_short_run_with_empty_time_series() {
+        let report = BenchmarkReport {
+            group_metrics: vec![group_without_time_series()],
+            individual_metrics: vec![individual_without_time_series()],
+            ..BenchmarkReport::default()
+        };
+        for chart in [
+            create_throughput_chart(&report, false, false),
+            create_latency_chart(&report, false, false),
+            create_latency_distribution_chart(&report, false, false),
+        ] {
+            assert!(serde_json::to_value(chart).unwrap().is_object());
+        }
+    }
+
+    fn group_without_time_series() -> BenchmarkGroupMetrics {
+        serde_json::from_value(json!({
+            "summary": {
+                "kind": "producers",
+                "total_throughput_megabytes_per_second": 1.0,
+                "total_throughput_messages_per_second": 1.0,
+                "average_throughput_megabytes_per_second": 1.0,
+                "average_throughput_messages_per_second": 1.0,
+                "average_p50_latency_ms": 1.0,
+                "average_p90_latency_ms": 1.0,
+                "average_p95_latency_ms": 1.0,
+                "average_p99_latency_ms": 1.0,
+                "average_p999_latency_ms": 1.0,
+                "average_p9999_latency_ms": 1.0,
+                "average_latency_ms": 1.0,
+                "average_median_latency_ms": 1.0
+            },
+            "avg_throughput_mb_ts": { "points": [] },
+            "avg_throughput_msg_ts": { "points": [] },
+            "avg_latency_ts": { "points": [] }
+        }))
+        .unwrap()
+    }
+
+    fn individual_without_time_series() -> BenchmarkIndividualMetrics {
+        serde_json::from_value(json!({
+            "summary": {
+                "benchmark_kind": "pinned_producer",
+                "actor_kind": "producer",
+                "actor_id": 1,
+                "total_time_secs": 0.125,
+                "total_user_data_bytes": 256,
+                "total_bytes": 320,
+                "total_messages": 1,
+                "total_message_batches": 1,
+                "throughput_megabytes_per_second": 1.0,
+                "throughput_messages_per_second": 1.0,
+                "p50_latency_ms": 1.0,
+                "p90_latency_ms": 1.0,
+                "p95_latency_ms": 1.0,
+                "p99_latency_ms": 1.0,
+                "p999_latency_ms": 1.0,
+                "p9999_latency_ms": 1.0,
+                "avg_latency_ms": 1.0,
+                "median_latency_ms": 1.0
+            },
+            "throughput_mb_ts": { "points": [] },
+            "throughput_msg_ts": { "points": [] },
+            "latency_ts": { "points": [] }
+        }))
+        .unwrap()
     }
 }

@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use iggy::prelude::*;
 
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
+use crate::poll_artifacts::PollArtifacts;
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkConsumerConfig {
@@ -29,10 +32,13 @@ pub struct BenchmarkConsumerConfig {
     pub warmup_time: IggyDuration,
     pub polling_kind: PollingKind,
     pub origin_timestamp_latency_calculation: bool,
+    pub poll_artifacts: Option<Arc<PollArtifacts>>,
     pub pretty: bool,
 }
 
 pub trait ConsumerClient: Send + Sync {
+    fn start_measurement(&mut self, _capacity: usize) {}
+
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError>;
 }
 pub trait BenchmarkConsumerClient: ConsumerClient + BenchmarkInit + ApiLabel + Send + Sync {}

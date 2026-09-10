@@ -17,6 +17,13 @@
 
 use std::sync::Arc;
 
+use bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+    numeric_parameter::BenchmarkNumericParameter,
+};
+use iggy::prelude::*;
+
+use crate::poll_artifacts::PollArtifacts;
 use crate::utils::ClientFactory;
 use crate::{
     actors::{
@@ -32,12 +39,6 @@ use crate::{
     },
     utils::finish_condition::BenchmarkFinishCondition,
 };
-use bench_report::{
-    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
-    numeric_parameter::BenchmarkNumericParameter,
-};
-
-use iggy::prelude::*;
 
 pub enum TypedBenchmarkProducingConsumer {
     High(BenchmarkProducingConsumer<HighLevelProducerClient, HighLevelConsumerClient>),
@@ -63,6 +64,7 @@ impl TypedBenchmarkProducingConsumer {
         limit_bytes_per_second: Option<IggyByteSize>,
         polling_kind: PollingKind,
         origin_timestamp_latency_calculation: bool,
+        poll_artifacts: Option<Arc<PollArtifacts>>,
         pretty: bool,
     ) -> Self {
         let producer_config = BenchmarkProducerConfig {
@@ -72,6 +74,7 @@ impl TypedBenchmarkProducingConsumer {
             messages_per_batch,
             message_size,
             warmup_time,
+            poll_artifacts: poll_artifacts.clone(),
             pretty,
         };
 
@@ -83,6 +86,7 @@ impl TypedBenchmarkProducingConsumer {
             warmup_time,
             polling_kind,
             origin_timestamp_latency_calculation,
+            poll_artifacts,
             pretty,
         };
 

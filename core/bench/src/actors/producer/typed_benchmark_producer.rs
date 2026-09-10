@@ -15,6 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
+use bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+    numeric_parameter::BenchmarkNumericParameter,
+};
+use iggy::prelude::*;
+
+use crate::poll_artifacts::PollArtifacts;
 use crate::utils::ClientFactory;
 use crate::{
     actors::producer::{
@@ -26,12 +35,6 @@ use crate::{
     },
     utils::finish_condition::BenchmarkFinishCondition,
 };
-use bench_report::{
-    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
-    numeric_parameter::BenchmarkNumericParameter,
-};
-use iggy::prelude::*;
-use std::sync::Arc;
 
 pub enum TypedBenchmarkProducer {
     High(BenchmarkProducer<HighLevelProducerClient>),
@@ -54,6 +57,7 @@ impl TypedBenchmarkProducer {
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
+        poll_artifacts: Option<Arc<PollArtifacts>>,
         pretty: bool,
     ) -> Self {
         let config = BenchmarkProducerConfig {
@@ -63,6 +67,7 @@ impl TypedBenchmarkProducer {
             messages_per_batch,
             message_size,
             warmup_time,
+            poll_artifacts,
             pretty,
         };
 

@@ -15,14 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    actors::producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
-    analytics::{metrics::individual::from_records, record::BenchmarkRecord},
-    utils::{
-        batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
-        rate_limiter::BenchmarkRateLimiter,
-    },
-};
+use std::{sync::Arc, time::Duration};
+
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
@@ -33,9 +27,18 @@ use bench_report::{
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::info;
+
+use crate::poll_artifacts::ProducerRecorder;
+use crate::{
+    actors::producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
+    analytics::{metrics::individual::from_records, record::BenchmarkRecord},
+    utils::{
+        batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
+        rate_limiter::BenchmarkRateLimiter,
+    },
+};
 
 pub struct BenchmarkProducer<P: BenchmarkProducerClient> {
     pub client: P,
@@ -105,6 +108,11 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
         let mut total_bytes_processed = 0;
 
         let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+        let mut producer_recorder = self
+            .config
+            .poll_artifacts
+            .as_ref()
+            .map(|artifacts| ProducerRecorder::new(self.config.producer_id, artifacts.clone()));
         let start_timestamp = Instant::now();
 
         while !self.finish_condition.is_done() {
@@ -114,6 +122,9 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
                 continue;
             };
 
+            if let Some(recorder) = &mut producer_recorder {
+                recorder.record_batch(&batch);
+            }
             messages_processed += u64::from(batch.messages);
             batches_processed += 1;
             user_data_bytes_processed += batch.user_data_bytes;
@@ -152,6 +163,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
             }
         }
 
+        drop(producer_recorder);
         let metrics = from_records(
             &records,
             self.benchmark_kind,
