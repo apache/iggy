@@ -156,6 +156,28 @@ fn state_should_be_serializable_and_deserializable() {
 
 State is the only thing that survives a plugin restart. Silent corruption here means lost data on the next deploy.
 
+**The third test has two correct shapes, and which one applies is a design decision rather than a style choice.**
+
+Starting fresh is right when the state is a cursor. The worst case is re-reading from the beginning, which the at-least-once contract already permits, so discarding an undecodable cursor costs duplicates and nothing else.
+
+It is wrong when the state carries something whose *absence* is a downgrade rather than a repeat. `http_source` keeps its revocation tombstones in state, so starting fresh after a decode failure would serve every revoked endpoint again, with its secret. Its `restore` returns `Err` instead and the connector refuses to open. A source in that position asserts the refusal:
+
+```rust
+#[test]
+fn given_invalid_state_should_refuse_to_open() {
+    let invalid = ConnectorState(b"not valid msgpack".to_vec());
+
+    let restored = MyState::restore(&config_entries(), Some(invalid), 1);
+
+    assert!(
+        restored.is_err(),
+        "discarding this state silently would re-serve what it was revoking"
+    );
+}
+```
+
+Name the test for whichever it is and say why in a comment. What is never right is starting fresh silently when the state that was discarded was load-bearing.
+
 ### Sink unit tests
 
 Cover pure per-message logic:
