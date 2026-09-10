@@ -56,7 +56,6 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
-nix = { workspace = true }
 papaya = { workspace = true }
 ringbuffer = { workspace = true }
 server_common = { workspace = true }
