@@ -604,6 +604,8 @@ pub(crate) async fn source_forwarding_loop(
                 context.metrics.inc_errors_with_labels(&labels.counter);
                 context.sources.set_error(&plugin_key, &error_msg).await;
             }
+        } else if batch_result == SourceBatchResult::Ack {
+            context.sources.recover_from_error(&plugin_key).await;
         }
 
         let total_elapsed = total_start.elapsed();

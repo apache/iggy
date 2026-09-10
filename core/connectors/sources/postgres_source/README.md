@@ -63,15 +63,15 @@ cdc_backend = "builtin"
 | `include_metadata` | bool | `true` | Wrap results with metadata |
 | `payload_column` | string | none | Column to extract as payload |
 | `payload_format` | string | `bytea` | Format of payload_column: `bytea`, `text`, or `json_direct` |
-| `delete_after_read` | bool | `false` | Delete rows after reading |
-| `processed_column` | string | none | Boolean column to mark as processed |
+| `delete_after_read` | bool | `false` | Delete rows after reading; takes precedence over `processed_column` |
+| `processed_column` | string | none | Boolean column to mark as processed when `delete_after_read` is false |
 | `primary_key_column` | string | tracking_column | PK for delete/mark operations |
 | `custom_query` | string | none | Custom SQL with parameter substitution |
 | `replication_slot` | string | `iggy_slot` | Replication slot name (only used when `mode = "cdc"`) |
 | `capture_operations` | array | `["INSERT","UPDATE","DELETE"]` | CDC operations to capture |
 | `cdc_backend` | string | `builtin` | `builtin` or `pg_replicate` |
 | `verbose_logging` | bool | `false` | Log at info level instead of debug |
-| `max_retries` | u32 | `3` | Max retry attempts for transient errors |
+| `max_retries` | u32 | `3` | Max attempts for transient errors; `0` and `1` both perform one attempt |
 | `retry_delay` | string | `1s` | Base delay between retries (e.g., `500ms`, `2s`) |
 
 ## Delivery Failures
@@ -206,13 +206,20 @@ Example:
 
 ```sql
 SELECT * FROM $table
-WHERE created_at > '$offset'
+WHERE created_at > $offset
   AND (scheduled_at IS NULL OR scheduled_at <= '$now')
 ORDER BY created_at
 LIMIT $limit
 ```
 
+Custom queries do not advance the connector-managed offset because their result
+order cannot be inferred safely. Use `delete_after_read`, `processed_column`, or
+an external cursor condition when the query must exclude acknowledged rows.
+
 ## Delete After Read / Mark as Processed
+
+Both options may be present for compatibility. When `delete_after_read` is
+`true`, rows are deleted and `processed_column` is ignored.
 
 ### Delete After Read
 
@@ -247,9 +254,10 @@ batch boundary between poll and acknowledgement is left unchanged and returns
 in a later poll. Custom queries do not apply this boundary because their result
 order is not guaranteed.
 
-The connector persists the acknowledged offset before deleting or marking rows.
-If it stops in between, the rows have been delivered but may remain unchanged in
-PostgreSQL. The persisted offset prevents those rows from being selected again.
+For generated polling queries, the connector persists the acknowledged offset
+before deleting or marking rows. If it stops in between, the rows have been
+delivered but may remain unchanged in PostgreSQL. The persisted offset prevents
+those rows from being selected again.
 
 ## Supported Column Types
 
@@ -260,7 +268,7 @@ The connector handles these PostgreSQL types in JSON mode:
 | `BOOL` | boolean |
 | `INT2`, `INT4`, `INT8` | number |
 | `FLOAT4`, `FLOAT8` | number |
-| `NUMERIC` | number (parsed as f64) |
+| `NUMERIC` | string (exact decimal representation) |
 | `VARCHAR`, `TEXT`, `CHAR` | string |
 | `TIMESTAMP`, `TIMESTAMPTZ` | string (RFC3339) |
 | `UUID` | string |
@@ -394,7 +402,13 @@ capture_operations = ["INSERT", "UPDATE"]
 
 ### Automatic Retries
 
-The connector automatically retries transient database errors (connection issues, deadlocks, serialization failures) with exponential backoff. Configure with `max_retries` (default: 3) and `retry_delay` (default: `1s`). The actual delay is `retry_delay * attempt_number`. Non-transient errors fail immediately.
+The connector automatically retries transient database errors (connection issues, deadlocks, serialization failures) with linear backoff. Configure with `max_retries` (default: 3) and `retry_delay` (default: `1s`). The actual delay is `retry_delay * attempt_number`. Non-transient errors fail immediately.
+
+Polling operations use the complete configured retry schedule. Database work performed after an ACK, such as deleting or marking rows and advancing a replication slot, uses the same schedule but shares a 10-second deadline across the batch. When the configured schedule exceeds that window, unfinished ACK operations remain staged and are retried before the connector polls new rows.
+
+Every PostgreSQL statement has a 9-second server-side timeout so a stalled backend is cancelled before the 10-second ACK callback backstop expires.
+
+The connector stops after three consecutive replication-slot advance failures so repeated changes cannot be delivered indefinitely while WAL continues to grow.
 
 ### SQL Injection Protection
 

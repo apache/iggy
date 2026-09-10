@@ -452,8 +452,7 @@ impl PostgresSourceNumericTrackingFixture {
     pub async fn create_table(&self, pool: &Pool<Postgres>) {
         let query = format!(
             "CREATE TABLE IF NOT EXISTS {} (
-                id INTEGER PRIMARY KEY,
-                tracking_value NUMERIC NOT NULL
+                tracking_value NUMERIC PRIMARY KEY
             )",
             Self::TABLE
         );
@@ -463,13 +462,12 @@ impl PostgresSourceNumericTrackingFixture {
             .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
     }
 
-    pub async fn insert_row(&self, pool: &Pool<Postgres>, id: i32, tracking_value: &str) {
+    pub async fn insert_row(&self, pool: &Pool<Postgres>, tracking_value: &str) {
         let query = format!(
-            "INSERT INTO {} (id, tracking_value) VALUES ($1, $2::numeric)",
+            "INSERT INTO {} (tracking_value) VALUES ($1::numeric)",
             Self::TABLE
         );
         sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(id)
             .bind(tracking_value)
             .execute(pool)
             .await
@@ -499,7 +497,6 @@ impl TestFixture for PostgresSourceNumericTrackingFixture {
             ENV_SOURCE_TRACKING_COLUMN.to_string(),
             "tracking_value".to_string(),
         );
-        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
         envs.insert(

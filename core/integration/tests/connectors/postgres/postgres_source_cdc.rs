@@ -421,6 +421,7 @@ async fn given_cdc_change_when_iggy_crashes_should_advance_slot_only_after_redel
         !change_remains,
         "ACKed CDC change should be consumed from the replication slot"
     );
+    wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
 
     pool.close().await;
 }
@@ -521,6 +522,7 @@ async fn given_delivery_failure_when_iggy_restarts_should_redeliver_cdc_without_
         !change_remains,
         "ACKed CDC change should be consumed from the replication slot"
     );
+    wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
 
     pool.close().await;
 }

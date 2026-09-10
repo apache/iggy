@@ -343,8 +343,21 @@ async fn given_delivery_failure_when_iggy_restarts_should_redeliver_without_runt
         remaining_rows = fixture.count_rows(&pool).await;
     }
     assert_eq!(remaining_rows, 0, "ACKed row should be deleted");
+    wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
 
     pool.close().await;
+}
+
+async fn wait_for_source_status(http: &Client, api_url: &str, expected: ConnectorStatus) {
+    for _ in 0..POLL_ATTEMPTS {
+        if let Some(source) = source_stats(http, api_url).await
+            && source.status == expected
+        {
+            return;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    panic!("Source connector did not reach {expected:?} status in time");
 }
 
 #[iggy_harness(
@@ -561,12 +574,12 @@ async fn numeric_tracking_source_preserves_exact_ack_boundary(
     let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
-    fixture.insert_row(&pool, 1, TRACKING_VALUE).await;
+    fixture.insert_row(&pool, TRACKING_VALUE).await;
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "numeric_tracking_consumer".try_into().unwrap();
-    let mut received = false;
+    let mut received = None;
 
     for _ in 0..POLL_ATTEMPTS {
         if let Ok(polled) = client
@@ -580,14 +593,25 @@ async fn numeric_tracking_source_preserves_exact_ack_boundary(
                 true,
             )
             .await
-            && !polled.messages.is_empty()
         {
-            received = true;
-            break;
+            for message in polled.messages {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&message.payload) {
+                    received = Some(record);
+                    break;
+                }
+            }
+            if received.is_some() {
+                break;
+            }
         }
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
-    assert!(received, "NUMERIC tracking row should be delivered");
+    let received = received.expect("NUMERIC tracking row should be delivered");
+    assert_eq!(
+        received["data"]["tracking_value"],
+        serde_json::json!(TRACKING_VALUE),
+        "NUMERIC payload should preserve its exact decimal representation"
+    );
 
     let mut remaining_rows = fixture.count_rows(&pool).await;
     for _ in 0..POLL_ATTEMPTS {
