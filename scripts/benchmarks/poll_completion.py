@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements. See the NOTICE file
+# or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
-# regarding copyright ownership. The ASF licenses this file
+# regarding copyright ownership.  The ASF licenses this file
 # to you under the Apache License, Version 2.0 (the
 # "License"); you may not use this file except in compliance
-# with the License. You may obtain a copy of the License at
+# with the License.  You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing,
 # software distributed under the License is distributed on an
 # "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied. See the License for the
+# KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
 
@@ -98,15 +98,15 @@ def process_sample(pid):
         if library.proc_pid_rusage(pid, 0, ctypes.byref(usage)) != 0:
             raise OSError(ctypes.get_errno(), "proc_pid_rusage failed")
         class TimebaseInfo(ctypes.Structure):
-            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+            _fields_ = [("numerator", ctypes.c_uint32), ("denominator", ctypes.c_uint32)]
 
         timebase = TimebaseInfo()
         system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-        if system.mach_timebase_info(ctypes.byref(timebase)) != 0 or not timebase.denom:
+        if system.mach_timebase_info(ctypes.byref(timebase)) != 0 or not timebase.denominator:
             raise RuntimeError("Cannot convert native CPU clock ticks")
         return {
             "time": time.monotonic(), "unix_us": time.time_ns() // 1000,
-            "cpu_seconds": (usage.values[0] + usage.values[1]) * timebase.numer / timebase.denom / 1e9,
+            "cpu_seconds": (usage.values[0] + usage.values[1]) * timebase.numerator / timebase.denominator / 1e9,
             "rss_bytes": usage.values[6],
         }
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
