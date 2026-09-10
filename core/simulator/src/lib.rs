@@ -33,7 +33,7 @@ use deps::SimClock;
 use deps::SimSuperblock;
 use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
-use iggy_binary_protocol::{Command, GenericHeader, ReplyHeader};
+use iggy_binary_protocol::{Command, GenericHeader, PrepareHeader, ReplyHeader};
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
@@ -53,7 +53,7 @@ use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -133,6 +133,54 @@ pub(crate) struct PartitionConsensusState {
     /// Ops committed in the group. Not `PartitionOffsets::commit_offset`, the
     /// highest durably PERSISTED offset, which counts an uncommitted suffix.
     pub commit_min: u64,
+}
+
+/// A pipeline head the commit walk is holding on: covered by the commit frontier,
+/// but not the op the state machine is next owed.
+///
+/// What `drain_committable_prefix` / `peek_committable_head` refuse to drain. Two
+/// different faults share that refusal and need different thresholds, so
+/// [`CommitPrefixHole::kind`] keeps them apart.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommitPrefixHole {
+    pub head_op: u64,
+    pub commit_min: u64,
+    pub commit_max: u64,
+    pub kind: CommitHoldKind,
+}
+
+/// Why a commit walk is holding below its pipeline head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CommitHoldKind {
+    /// `head_op > commit_min + 1`: the ops between never arrived. Legitimate and
+    /// transient right after a promotion, while the bounded journal walk clears the
+    /// apply backlog `RebuildPipeline` seeded above. Repair clears it, and
+    /// `commit_min` climbing is the proof repair is working.
+    MissingOps,
+    /// `head_op <= commit_min`: the walk applied this op and advanced past a
+    /// still-resident entry. Nothing missing, no repair owed, only a pop that can
+    /// no longer happen -- so it never self-clears, and `commit_min` keeps climbing
+    /// while the head stays frozen.
+    AppliedHead,
+}
+
+impl CommitPrefixHole {
+    fn read(head: Option<PrepareHeader>, commit_min: u64, commit_max: u64) -> Option<Self> {
+        let head = head?;
+        if head.op > commit_max || head.op == commit_min + 1 {
+            return None;
+        }
+        Some(Self {
+            head_op: head.op,
+            commit_min,
+            commit_max,
+            kind: if head.op > commit_min {
+                CommitHoldKind::MissingOps
+            } else {
+                CommitHoldKind::AppliedHead
+            },
+        })
+    }
 }
 
 pub struct Simulator {
@@ -966,6 +1014,21 @@ impl Simulator {
                 continue;
             }
             for shard in &replica.shards {
+                // First and unconditional. A fenced pump has exited, so its frames
+                // pile up exactly as a missed wake does and every lane assert below
+                // would misreport the cause -- and the pump's `FatalCommit` return
+                // is dropped at the spawn, so nothing else sees it. Gated on a
+                // non-empty inbox, a fenced pump that happened to drain would pass
+                // quiescence outright.
+                assert!(
+                    shard.fenced_partition_fault().is_none(),
+                    "fenced pump: replica {replica_id} shard {} exited on a fatal commit ({:?}). \
+                     Not a lost wakeup; fix the commit failure (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    shard.fenced_partition_fault(),
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
                 let pending = shard.inbox_len();
                 assert_eq!(
                     pending,
@@ -1364,6 +1427,30 @@ impl Simulator {
         Some(partition.offsets())
     }
 
+    /// A replica's journaled partition-plane prepare headers over `ops`, or `None`
+    /// when it does not host the namespace.
+    ///
+    /// Repair headers, not resident ones. `evict_prefix` clears the resident vec as
+    /// the committed prefix flushes to segments and moves those entries to the
+    /// repair ring, so a resident-only read compares nothing at all once a run has
+    /// flushed. The ring is capacity-bounded, which makes this the recently
+    /// committed tail rather than the whole prefix -- and that tail is where a bad
+    /// repair or a mis-decided view change lands.
+    ///
+    /// One pass per replica per namespace, not one per op: both lookups behind
+    /// `repair_headers_in` are linear.
+    #[must_use]
+    pub(crate) fn partition_journaled_headers(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> Option<BTreeMap<u64, PrepareHeader>> {
+        let shard = self.replicas[replica_idx].partition_shard(namespace);
+        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        Some(partition.log.journal().inner.repair_headers_in(ops))
+    }
+
     /// Consensus view for a replica's partition-plane group, or `None` if that
     /// replica does not host the namespace.
     #[must_use]
@@ -1396,6 +1483,53 @@ impl Simulator {
             is_primary: consensus.is_primary(),
             commit_min: consensus.commit_min(),
         })
+    }
+
+    /// A replica's metadata consensus handle, or `None` when it hosts no metadata
+    /// plane. The one way to reach it; do not hand-walk the shard-0 / plane /
+    /// metadata chain.
+    #[must_use]
+    pub(crate) fn metadata_consensus(
+        &self,
+        replica_idx: usize,
+    ) -> Option<&consensus::VsrConsensus<crate::bus::SharedSimOutbox>> {
+        self.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+    }
+
+    /// The metadata pipeline head the commit walk is holding on, if any. See
+    /// [`CommitPrefixHole`].
+    #[must_use]
+    pub(crate) fn metadata_commit_prefix_hole(
+        &self,
+        replica_idx: usize,
+    ) -> Option<CommitPrefixHole> {
+        let consensus = self.metadata_consensus(replica_idx)?;
+        CommitPrefixHole::read(
+            consensus.pipeline_head_header(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        )
+    }
+
+    /// Partition-plane twin of [`Self::metadata_commit_prefix_hole`].
+    #[must_use]
+    pub(crate) fn partition_commit_prefix_hole(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+    ) -> Option<CommitPrefixHole> {
+        let shard = self.replicas[replica_idx].partition_shard(namespace);
+        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let consensus = partition.consensus();
+        CommitPrefixHole::read(
+            consensus.pipeline_head_header(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        )
     }
 
     /// Index of the current primary for `namespace`, as seen by the first live

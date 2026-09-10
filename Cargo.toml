@@ -44,6 +44,7 @@ members = [
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
+    "core/connectors/sinks/rabbitmq_sink",
     "core/connectors/sinks/redshift_sink",
     "core/connectors/sinks/s3_sink",
     "core/connectors/sinks/stdout_sink",
@@ -213,6 +214,7 @@ js-sys = "0.3"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 kafka-protocol = { version = "0.18.0", default-features = false, features = ["broker"] }
 keyring-core = "1.0.0"
+lapin = "2.5.1"
 lazy_static = "1.5.0"
 # Pinned exactly: `metadata::stm::stream`'s keyed stats evictions lean on
 # left-right draining the previous batch's `absorb_second` before the current

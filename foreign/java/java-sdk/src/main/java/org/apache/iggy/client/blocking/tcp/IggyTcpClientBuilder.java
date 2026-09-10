@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import io.netty.channel.IoEventLoopGroup;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
 import org.apache.iggy.config.RetryPolicy;
@@ -133,6 +134,36 @@ public final class IggyTcpClientBuilder {
      */
     public IggyTcpClientBuilder retryPolicy(RetryPolicy retryPolicy) {
         asyncBuilder.retryPolicy(retryPolicy);
+        return this;
+    }
+
+    /**
+     * Sets the number of event loop threads in the group that the client creates for itself.
+     *
+     * <p>The client drives a single channel, so the default of 1 is enough. If
+     * {@link #eventLoopGroup(IoEventLoopGroup)} is set, the client ignores this value.
+     *
+     * @param ioThreads the event loop thread count, at least 1
+     * @return this builder
+     */
+    public IggyTcpClientBuilder ioThreads(int ioThreads) {
+        asyncBuilder.ioThreads(ioThreads);
+        return this;
+    }
+
+    /**
+     * Sets a caller-owned event loop group shared across clients.
+     *
+     * <p>The client registers its channel on the group and never shuts the group down.
+     * After every client on the group is closed, the caller shuts the group down. The group
+     * must drive NIO channels.
+     *
+     * @param eventLoopGroup the group to register the client's channel on
+     * @return this builder
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the group is null
+     */
+    public IggyTcpClientBuilder eventLoopGroup(IoEventLoopGroup eventLoopGroup) {
+        asyncBuilder.eventLoopGroup(eventLoopGroup);
         return this;
     }
 
