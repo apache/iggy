@@ -96,7 +96,12 @@ pub enum CredentialType {
     PersonalAccessToken,
 }
 
-/// JSON response from the external auth service.
+/// JSON response from the external auth service. Fields are `Option`
+/// because different decisions use different subsets; `into_decision`
+/// validates the required fields per variant. A tagged enum would be
+/// cleaner but serde's internal-tag path buffers through `Value`,
+/// which loses string-to-integer map key parsing for
+/// `Permissions.streams: BTreeMap<u32, _>`.
 #[derive(Debug, Deserialize)]
 struct ExternalAuthResponse {
     decision: DecisionTag,
@@ -336,12 +341,13 @@ pub async fn callout_external_auth(
     let resp: ExternalAuthResponse = serde_json::from_slice(&bytes)
         .map_err(|e| ExternalAuthError::BadResponse(format!("invalid JSON: {e}")))?;
 
-    parse_decision(resp)
+    into_decision(resp)
 }
 
-/// Map a deserialized response to a decision. Extracted so tests can
-/// exercise the mapping without an HTTP round-trip.
-fn parse_decision(resp: ExternalAuthResponse) -> Result<ExternalAuthDecision, ExternalAuthError> {
+/// Validate required fields per decision variant and convert to the
+/// public type. Extracted so tests can exercise the mapping without
+/// an HTTP round-trip.
+fn into_decision(resp: ExternalAuthResponse) -> Result<ExternalAuthDecision, ExternalAuthError> {
     match resp.decision {
         DecisionTag::IggyUser => {
             let user_id = resp.user_id.ok_or_else(|| {
@@ -358,13 +364,11 @@ fn parse_decision(resp: ExternalAuthResponse) -> Result<ExternalAuthDecision, Ex
                     "inline_grant decision missing permissions".to_owned(),
                 )
             })?;
-            // When the external auth service omits expires_at, the grant
-            // logically never expires. On the HTTP path, generate_capped
-            // caps the JWT at the server's configured token expiry. On the
-            // binary transport, the raw u64::MAX rides on the connection
-            // and expires_at is only checked against the bus clock at
-            // dispatch time.
-            let expires_at = resp.expires_at.unwrap_or(u64::MAX);
+            let expires_at = resp.expires_at.ok_or_else(|| {
+                ExternalAuthError::BadResponse(
+                    "inline_grant decision missing expires_at".to_owned(),
+                )
+            })?;
             Ok(ExternalAuthDecision::InlineGrant {
                 principal,
                 permissions,
@@ -404,12 +408,12 @@ pub async fn try_external_auth(
 mod tests {
     use super::*;
 
-    /// Deserialize JSON and run the same decision-mapping logic that
-    /// `callout_external_auth` uses after receiving the HTTP body.
+    /// Deserialize JSON and convert to a decision, same as
+    /// `callout_external_auth` does after receiving the HTTP body.
     fn parse_response(json: &str) -> Result<ExternalAuthDecision, ExternalAuthError> {
         let resp: ExternalAuthResponse = serde_json::from_str(json)
             .map_err(|e| ExternalAuthError::BadResponse(format!("invalid JSON: {e}")))?;
-        parse_decision(resp)
+        into_decision(resp)
     }
 
     // ── request serialization (full schema) ─────────────────────────
@@ -527,7 +531,8 @@ mod tests {
         let json = r#"{
             "decision": "inline_grant",
             "principal": "dev-1",
-            "permissions": {}
+            "permissions": {},
+            "expires_at": 9999999999
         }"#;
         match parse_response(json).unwrap() {
             ExternalAuthDecision::InlineGrant {
@@ -546,10 +551,21 @@ mod tests {
                 assert!(!permissions.global.manage_topics);
                 assert!(!permissions.global.read_topics);
                 assert!(permissions.streams.is_none());
-                assert_eq!(expires_at, u64::MAX, "omitted expires_at defaults to MAX");
+                assert_eq!(expires_at, 9_999_999_999);
             }
             other => panic!("expected InlineGrant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn response_inline_grant_missing_expires_at_should_error() {
+        let json = r#"{
+            "decision": "inline_grant",
+            "principal": "dev-1",
+            "permissions": {}
+        }"#;
+        let err = parse_response(json).unwrap_err();
+        assert!(err.to_string().contains("missing expires_at"));
     }
 
     #[test]
