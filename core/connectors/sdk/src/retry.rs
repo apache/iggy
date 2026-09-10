@@ -253,14 +253,9 @@ impl<E> RetryFailure<E> {
     }
 }
 
-impl<E> std::error::Error for RetryFailure<E>
-where
-    E: std::error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
+// No `source()`: `Display` already prints the inner error, so returning it
+// here repeats the same text in an error chain.
+impl<E> std::error::Error for RetryFailure<E> where E: std::error::Error + 'static {}
 
 impl<E: fmt::Display> fmt::Display for RetryFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -269,9 +264,14 @@ impl<E: fmt::Display> fmt::Display for RetryFailure<E> {
         } else {
             "hit a non-retryable error"
         };
+        let plural = if self.attempts == 1 {
+            "attempt"
+        } else {
+            "attempts"
+        };
         write!(
             f,
-            "{reason} after {} attempts: {}",
+            "{reason} after {} {plural}: {}",
             self.attempts, self.error
         )
     }
@@ -312,7 +312,8 @@ where
         let error = match operation().await {
             Ok(value) => {
                 if attempt > 0 {
-                    info!("{context} succeeded after {attempt} retries.");
+                    let plural = if attempt == 1 { "retry" } else { "retries" };
+                    info!("{context} succeeded after {attempt} {plural}.");
                 }
                 return Ok(value);
             }
@@ -563,8 +564,9 @@ pub async fn check_connectivity_with_retry(
     )
     .await
     .map_err(|failure| {
-        // Sole record of the cause: `open()`'s Err is dropped at the FFI
-        // boundary and the runtime logs only "Plugin initialization failed".
+        // `open()`'s Err reaches the FFI boundary and is dropped there, so the
+        // runtime logs only "Plugin initialization failed". Some callers log
+        // the error again themselves.
         error!("{context} {failure}");
         failure.into_error()
     })
@@ -824,9 +826,20 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(response.status(), 200);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "expected exactly one retry"
+        );
         assert!(
             elapsed >= Duration::from_millis(900),
             "used the computed backoff instead of Retry-After: waited {elapsed:?}"
+        );
+        // The header asks for 1s. Anything far past it means the middleware
+        // added its own backoff on top instead of honoring the header.
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "waited {elapsed:?}, past the 1s the header asked for"
         );
     }
 

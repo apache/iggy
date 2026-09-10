@@ -82,8 +82,8 @@ for getting them to the external system reliably and efficiently.
 - SDK helpers cover the simple case: `iggy_connector_sdk::retry::check_connectivity_with_retry(...)` for `open()`, `HttpRetryMiddleware` for default 429/5xx/network policy on reqwest clients.
 - Custom strategies: `reqwest-middleware` + `reqwest_retry::RetryTransientMiddleware::new_with_policy_and_strategy`. `http_sink` defines its own `HttpSinkRetryStrategy` (honors `success_status_codes`, per-status decisions).
 - Non-HTTP clients: write `is_transient_error(&e)` mapping driver-specific codes. `postgres_sink::is_transient_error` maps SQLSTATEs `40001`, `40P01`, `57P01-03`, `08000/03/06`.
-- Retry loop: new connectors use `iggy_connector_sdk::retry::retry_async(policy, context, should_retry, op)` for anything that fails as `Err`; it owns attempt counting, backoff and logging. Several existing sinks still hand-roll the loop and are being migrated.
-- Backoff only (loops that cannot return `Result`): `retry_backoff(base, retry, max)`, where `retry` is 1-based. `exponential_backoff` is the 0-based primitive underneath; call it directly only if you already hold a 0-based index, as `sdk/src/source.rs::nack_retry_delay` does, since passing a 1-based counter doubles the first delay.
+- Retry loop: new connectors use `iggy_connector_sdk::retry::retry_async(policy, context, should_retry, op)` for anything that fails as `Err`. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }`; the caller logs the terminal failure.
+- Backoff only, for a loop that computes its own delay (it retries on an `Ok` response, carries a deadline, or reconnects between attempts): `retry_backoff(base, retry, max)`, where `retry` is 1-based. `exponential_backoff` is the 0-based primitive underneath, and it applies no jitter; call it directly only when the delay must be exact, as `sdk/src/source.rs::nack_retry_delay` needs for its tests.
 - Cap retries at 3 total attempts.
 
 ### Idempotency

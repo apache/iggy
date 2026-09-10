@@ -385,8 +385,8 @@ impl DorisSink {
                     "Doris sink ID {} stream load returned HTTP {status}: {response_for_log}",
                     self.id
                 );
-                // Per-attempt detail only: `retry_async` logs every attempt and
-                // `consume` logs the terminal error, in which `msg` travels.
+                // Per-attempt detail only: `retry_async` logs every retried
+                // attempt, and `consume` logs the terminal error carrying `msg`.
                 warn!("{msg}");
                 // 408/429 are 4xx but transient, so include them in the bounded
                 // in-request retry path.
