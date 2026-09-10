@@ -7349,12 +7349,15 @@ name = "iggy_connector_quickwit_sink"
 version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
- "dashmap",
+ "base64 0.23.1",
+ "humantime",
  "iggy_connector_sdk",
  "reqwest 0.13.4",
+ "reqwest-middleware",
  "serde",
  "serde_yaml_ng",
  "simd-json",
+ "tokio",
  "tracing",
 ]
 
@@ -7469,6 +7472,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

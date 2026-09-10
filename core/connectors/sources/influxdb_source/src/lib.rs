@@ -31,8 +31,7 @@ use common::{
     validate_cursor_field,
 };
 use iggy_connector_sdk::retry::{
-    CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
-    parse_duration,
+    CircuitBreaker, RetryPolicy, build_retry_client, check_connectivity_with_retry, parse_duration,
 };
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessages, Schema, Source, source_connector,
@@ -420,13 +419,13 @@ impl Source for InfluxDbSource {
             health_url,
             CONNECTOR_NAME,
             self.id,
-            &ConnectivityConfig {
-                max_open_retries: self.config.max_open_retries(),
-                open_retry_max_delay: parse_duration(
+            RetryPolicy {
+                max_attempts: self.config.max_open_retries(),
+                base_delay: self.retry_delay,
+                max_delay: parse_duration(
                     self.config.open_retry_max_delay(),
                     DEFAULT_OPEN_RETRY_MAX_DELAY,
                 ),
-                retry_delay: self.retry_delay,
             },
         )
         .await?;
