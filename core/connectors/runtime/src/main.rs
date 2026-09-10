@@ -354,12 +354,7 @@ pub(crate) fn resolve_plugin_path(path: &str) -> Result<String, RuntimeError> {
     let with_extension = if ALLOWED_PLUGIN_EXTENSIONS.contains(&extension) {
         path.to_string()
     } else {
-        let os_extension = match std::env::consts::OS {
-            "macos" => "dylib",
-            "windows" => "dll",
-            _ => "so",
-        };
-        format!("{path}.{os_extension}")
+        format!("{path}.{}", std::env::consts::DLL_EXTENSION)
     };
 
     let candidate = std::path::Path::new(&with_extension);
@@ -548,10 +543,7 @@ mod tests {
     fn path_without_extension_gets_os_suffix() {
         let result = resolve_plugin_path("/tmp/nonexistent_test_plugin");
         let err = result.unwrap_err().to_string();
-        let expected_ext = match std::env::consts::OS {
-            "macos" => "dylib",
-            _ => "so",
-        };
+        let expected_ext = std::env::consts::DLL_EXTENSION;
         assert!(
             err.contains(&format!("nonexistent_test_plugin.{expected_ext}")),
             "Error should mention OS-specific extension, got: {err}"
