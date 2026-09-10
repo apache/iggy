@@ -161,7 +161,7 @@ impl IggyBenchArgs {
                 Self::command()
                     .error(
                         ErrorKind::ArgumentConflict,
-                        "--total-messages-size must be at least 2x greater than --message-size",
+                        "--total-data must be at least twice --message-size",
                     )
                     .exit();
             }

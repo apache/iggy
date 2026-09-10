@@ -602,9 +602,9 @@ pub struct TopicRuntimeDefaults {
 }
 
 /// A topic's resolved runtime knobs, as carried from the metadata plane to
-/// each of its partitions. `None` means "keep the shard-wide configured
-/// value": topics created without an options block (simulator, unit tests)
-/// have no resolved values to carry.
+/// each of its partitions. An unset segment size uses `DEFAULT_SEGMENT_SIZE`;
+/// other unset fields keep their shard defaults. Topics without an options
+/// block (simulator, unit tests) have no resolved values to carry.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TopicRuntimeOptions {
     pub segment_size: Option<IggyByteSize>,
@@ -616,6 +616,12 @@ pub struct TopicRuntimeOptions {
 }
 
 impl TopicRuntimeOptions {
+    #[must_use]
+    pub fn effective_segment_size(self) -> IggyByteSize {
+        self.segment_size
+            .unwrap_or_else(|| IggyByteSize::from(DEFAULT_SEGMENT_SIZE))
+    }
+
     /// Derive the runtime knobs from a topic's persisted options map.
     ///
     /// Degrades per key, not per map. An entry this build cannot interpret

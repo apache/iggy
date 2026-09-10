@@ -21,12 +21,20 @@ use super::{
 use crate::packet::PacketSimulatorOptions;
 use consensus::MetadataHandle;
 use futures::{executor::block_on, poll};
-use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
+use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
 use journal::partition_journal::{PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference};
 use journal::{DurableAppend, PartitionPrepareJournal};
 use partitions::{PartitionPersistence, install_backup};
-use server_common::{Message, iobuf::Owned};
+use server_common::send_messages::{
+    BATCH_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+};
+use server_common::sharding::IggyNamespace;
+use server_common::{
+    Message,
+    iobuf::{IOV_MAX, Owned},
+};
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
@@ -501,6 +509,204 @@ fn failed_durable_completion_never_releases_a_prepare_ack() {
 }
 
 #[test]
+fn synchronized_corruption_and_shortening_of_owned_segment_blocks_is_refused() {
+    block_on(async {
+        let retained = Path::new("/partition/wal/segment-0-0.log");
+        for damage in ["bit flip", "zero block", "short file"] {
+            for block in 0..2 * OWNED_BATCH_BYTES / PARTITION_WAL_BLOCK_SIZE {
+                let (storage, journal) = owned_segment_baseline().await;
+                assert!(
+                    journal
+                        .prepares()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|prepare| prepare.header().checksum_body == 0)
+                );
+                drop(journal);
+                let mut file = storage.open(retained, OpenMode::ReadWrite).await.unwrap();
+                let offset = (block * PARTITION_WAL_BLOCK_SIZE) as u64;
+                match damage {
+                    "bit flip" => {
+                        let mut byte = file.read(offset, 1).await.unwrap();
+                        byte[0] ^= 1;
+                        file.write(offset, byte).await.unwrap();
+                    }
+                    "zero block" => file
+                        .write(offset, vec![0; PARTITION_WAL_BLOCK_SIZE])
+                        .await
+                        .unwrap(),
+                    "short file" => file.truncate(offset).await.unwrap(),
+                    _ => unreachable!(),
+                }
+                file.sync().await.unwrap();
+                let damaged = file
+                    .read(0, usize::try_from(file.length().await.unwrap()).unwrap())
+                    .await
+                    .unwrap();
+                storage.crash(Crash::PowerLoss);
+                assert!(
+                    PartitionPrepareJournal::open_with_storage(
+                        Path::new(WAL),
+                        42,
+                        7,
+                        storage.clone()
+                    )
+                    .await
+                    .is_err(),
+                    "{damage}, block {block}"
+                );
+                let file = storage.open(retained, OpenMode::Read).await.unwrap();
+                assert_eq!(file.read(0, damaged.len()).await.unwrap(), damaged);
+            }
+        }
+    });
+}
+
+#[test]
+fn metadata_only_append_skips_segment_barriers_after_durable_bodies() {
+    block_on(async {
+        let (storage, mut journal) = owned_segment_baseline().await;
+        let parent = journal
+            .prepares()
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .header()
+            .checksum;
+        let offset = prepare(3, parent).transmute_header(|original, header: &mut PrepareHeader| {
+            *header = original;
+            header.operation = Operation::StoreConsumerOffset;
+            header.checksum = header.identity_checksum();
+        });
+        storage.clear_trace();
+        journal.append(offset.clone().into_frozen()).await.unwrap();
+        assert_eq!(
+            storage
+                .trace()
+                .iter()
+                .filter(|operation| **operation == StorageOperation::FileSync)
+                .count(),
+            2,
+            "only the WAL and frontier need new file barriers"
+        );
+        assert_eq!(
+            storage
+                .trace()
+                .iter()
+                .filter(|operation| **operation == StorageOperation::Exists)
+                .count(),
+            0
+        );
+        storage.crash(Crash::PowerLoss);
+        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .prepares()
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_slice(),
+            offset.as_slice()
+        );
+    });
+}
+
+#[test]
+fn a_full_offset_writer_cache_synchronizes_overflow_and_reports_barrier_failure() {
+    const OFFSET_KEYS: usize = 128;
+    block_on(async {
+        let (storage, persistence) = queued_batch(1).await;
+        for key in 0..OFFSET_KEYS {
+            let path = format!("/partition/offset-{key}");
+            let mut file = storage
+                .open(Path::new(&path), OpenMode::Create)
+                .await
+                .unwrap();
+            file.write(0, b"cached".to_vec()).await.unwrap();
+            persistence.retain_offset_file(path, file).await.unwrap();
+        }
+        let path = Path::new("/partition/overflow");
+        let mut file = storage.open(path, OpenMode::Create).await.unwrap();
+        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+        file.write(0, b"durable".to_vec()).await.unwrap();
+        storage.clear_trace();
+        persistence
+            .retain_offset_file(path.to_string_lossy().into_owned(), file)
+            .await
+            .unwrap();
+        assert_eq!(storage.trace(), vec![StorageOperation::FileSync]);
+        assert!(
+            persistence
+                .take_offset_file(path.to_str().unwrap())
+                .is_none()
+        );
+
+        let mut file = storage.open(path, OpenMode::ReadWrite).await.unwrap();
+        file.write(0, b"pending".to_vec()).await.unwrap();
+        storage.fail_at(0, FaultMode::Before);
+        assert!(
+            persistence
+                .retain_offset_file(path.to_string_lossy().into_owned(), file)
+                .await
+                .is_err()
+        );
+        storage.crash(Crash::PowerLoss);
+        let file = storage.open(path, OpenMode::Read).await.unwrap();
+        assert_eq!(file.read(0, 7).await.unwrap(), b"durable");
+    });
+}
+
+#[test]
+fn checkpoint_skips_duplicate_offset_sync_but_still_refuses_a_missing_path() {
+    block_on(async {
+        for missing in [false, true] {
+            let (storage, persistence) = queued_batch(1).await;
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            let path = Path::new("/partition/offset");
+            let mut file = storage.open(path, OpenMode::Create).await.unwrap();
+            file.write(0, b"offset".to_vec()).await.unwrap();
+            persistence
+                .retain_offset_file(path.to_string_lossy().into_owned(), file)
+                .await
+                .unwrap();
+            if missing {
+                storage.remove_file(path).await.unwrap();
+            }
+            persistence.checkpoint_files(
+                1,
+                vec![path.to_path_buf()],
+                vec![Path::new(DIRECTORY).to_path_buf()],
+            );
+            storage.clear_trace();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            if missing {
+                assert!(persistence.failure().is_some());
+                assert_eq!(persistence.checkpoint_op(), 0);
+            } else {
+                assert!(persistence.failure().is_none());
+                assert_eq!(persistence.checkpoint_op(), 1);
+                assert_eq!(
+                    storage
+                        .trace()
+                        .iter()
+                        .filter(|operation| **operation == StorageOperation::FileSync)
+                        .count(),
+                    3,
+                    "original offset writer, replacement WAL, frontier"
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn synchronized_corruption_in_any_record_block_is_refused() {
     block_on(async {
         for block in 0..8 {
@@ -795,7 +1001,12 @@ fn checkpoint_syncs_the_retained_writer_before_reclaiming_its_history() {
         let path = Path::new("/partition/offset");
         let mut file = storage.open(path, OpenMode::Create).await.unwrap();
         file.write(0, b"offset".to_vec()).await.unwrap();
-        persistence.retain_offset_file(path.to_string_lossy().into_owned(), file);
+        assert!(
+            persistence
+                .retain_offset_file(path.to_string_lossy().into_owned(), file)
+                .await
+                .is_ok()
+        );
         storage.remove_file(path).await.unwrap();
         persistence.retire_offset_file(path.to_str().unwrap());
         persistence.checkpoint_files(4, Vec::new(), vec![Path::new(DIRECTORY).to_path_buf()]);
@@ -1116,6 +1327,355 @@ async fn owned_segment_baseline() -> (SimStorage, PartitionPrepareJournal<SimSto
     (storage, journal)
 }
 
+#[test]
+fn sealed_tail_recovery_preserves_the_public_name_at_every_crash_boundary() {
+    block_on(async {
+        let (storage, mut journal) = owned_segment_baseline().await;
+        journal.checkpoint(2).await.unwrap();
+        drop(journal);
+        storage.clear_trace();
+        drop(
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap(),
+        );
+        let trace = storage.trace();
+        let public = Path::new("/partition/00000000000000000000.log");
+        let mut cases = 0;
+        for (cut, operation) in trace.iter().enumerate() {
+            for mode in [FaultMode::Before, FaultMode::After] {
+                for crash in [Crash::Process, Crash::PowerLoss] {
+                    for writeback in [false, true] {
+                        let (storage, mut journal) = owned_segment_baseline().await;
+                        journal.checkpoint(2).await.unwrap();
+                        drop(journal);
+                        storage.fail_at(cut, mode);
+                        let _ = PartitionPrepareJournal::open_with_storage(
+                            Path::new(WAL),
+                            42,
+                            7,
+                            storage.clone(),
+                        )
+                        .await;
+                        if writeback {
+                            storage.writeback();
+                        }
+                        storage.crash(crash);
+                        let context = format!(
+                            "cut {cut} {operation:?} {mode:?} {crash:?} writeback={writeback}"
+                        );
+                        let recovered = PartitionPrepareJournal::open_with_storage(
+                            Path::new(WAL),
+                            42,
+                            7,
+                            storage.clone(),
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: {error}"));
+                        assert_eq!(recovered.checkpoint_op(), 2, "{context}");
+                        let bytes = storage
+                            .open(public, OpenMode::Read)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("{context}: public tail missing: {error}")
+                            })
+                            .read(0, 2 * OWNED_BATCH_BYTES)
+                            .await
+                            .unwrap();
+                        let first = owned_prepare(1, 0, 0);
+                        let second = owned_prepare(2, first.header().checksum, 1);
+                        assert_eq!(
+                            &bytes[..OWNED_BATCH_BYTES],
+                            &first.as_slice()[size_of::<PrepareHeader>()..],
+                            "{context}"
+                        );
+                        assert_eq!(
+                            &bytes[OWNED_BATCH_BYTES..],
+                            &second.as_slice()[size_of::<PrepareHeader>()..],
+                            "{context}"
+                        );
+                        assert!(
+                            !storage
+                                .exists(&public.with_extension("log.tmp"))
+                                .await
+                                .unwrap(),
+                            "{context}: recovery temporary must be removed"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("sealed tail recovery fault cases: {cases}");
+    });
+}
+
+#[test]
+fn sealed_tail_removed_by_retention_stays_absent_after_recovery() {
+    block_on(async {
+        let (storage, mut journal) = owned_segment_baseline().await;
+        journal.checkpoint(2).await.unwrap();
+        drop(journal);
+        let public = Path::new("/partition/00000000000000000000.log");
+        storage.remove_file(public).await.unwrap();
+        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+        for crash in [Crash::Process, Crash::PowerLoss] {
+            storage.crash(crash);
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.checkpoint_op(), 2);
+            assert_eq!(
+                recovered.prepares().await.unwrap().len(),
+                1,
+                "the private checkpoint prepare remains repairable"
+            );
+            assert!(
+                !storage.exists(public).await.unwrap(),
+                "recovery must not resurrect retained data"
+            );
+        }
+    });
+}
+
+#[test]
+fn adjacent_segment_bodies_share_writes_bounded_by_rotation_and_iov_max() {
+    block_on(async {
+        for (count, batches_per_segment) in [(5, 2), (IOV_MAX + 1, IOV_MAX + 1)] {
+            let storage = storage_for_partition().await;
+            let mut journal =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                    .await
+                    .unwrap();
+            journal
+                .enable_segment_storage(
+                    SegmentPosition::default(),
+                    (batches_per_segment * OWNED_BATCH_BYTES) as u64,
+                )
+                .await
+                .unwrap();
+            let mut parent = 0;
+            let prepares: Vec<_> = (0..count)
+                .map(|index| {
+                    let prepare = owned_prepare(1, parent, index as u64).transmute_header(
+                        |original, header: &mut PrepareHeader| {
+                            *header = original;
+                            header.op = index as u64 + 1;
+                            header.checksum = header.identity_checksum();
+                        },
+                    );
+                    parent = prepare.header().checksum;
+                    prepare.into_frozen()
+                })
+                .collect();
+            storage.clear_trace();
+            journal.append_batch_buffered(&prepares).await.unwrap();
+            journal.sync().await.unwrap();
+            let body_writes = count.div_ceil(batches_per_segment.min(IOV_MAX));
+            assert_eq!(
+                storage
+                    .trace()
+                    .iter()
+                    .filter(|operation| **operation == StorageOperation::Write)
+                    .count(),
+                body_writes + 2,
+                "body groups plus WAL and frontier writes"
+            );
+            drop(journal);
+            storage.crash(Crash::PowerLoss);
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                    .await
+                    .unwrap();
+            let recovered = recovered.prepares().await.unwrap();
+            assert_eq!(recovered.len(), prepares.len());
+            for (actual, expected) in recovered.iter().zip(&prepares) {
+                assert_eq!(actual.as_slice(), expected.as_slice());
+            }
+        }
+    });
+}
+
+#[test]
+fn live_rollback_preserves_public_index_handles_for_replacement_and_checkpoint() {
+    block_on(async {
+        let (storage, mut journal) = owned_segment_baseline().await;
+        let first = owned_prepare(1, 0, 0);
+        let second = owned_prepare(2, first.header().checksum, 1);
+        let third = owned_prepare(3, second.header().checksum, 2);
+        journal.append(third.clone().into_frozen()).await.unwrap();
+        let log_path = Path::new("/partition/00000000000000000002.log");
+        let index_path = Path::new("/partition/00000000000000000002.index");
+        let mut index = storage.open(index_path, OpenMode::Create).await.unwrap();
+        index.write(0, b"old-index".to_vec()).await.unwrap();
+        journal.truncate_from(3).await.unwrap();
+        assert!(storage.exists(log_path).await.unwrap());
+        assert!(storage.exists(index_path).await.unwrap());
+        journal.append(third.into_frozen()).await.unwrap();
+        index.write(0, b"new-index".to_vec()).await.unwrap();
+        assert_eq!(
+            storage
+                .open(index_path, OpenMode::Read)
+                .await
+                .unwrap()
+                .read(0, 9)
+                .await
+                .unwrap(),
+            b"new-index"
+        );
+        journal
+            .checkpoint_files(
+                3,
+                &[log_path.into(), index_path.into()],
+                &[Path::new(DIRECTORY).into()],
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap();
+        drop(journal);
+        storage.crash(Crash::PowerLoss);
+        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+            .await
+            .unwrap();
+        assert_eq!(recovered.checkpoint_op(), 3);
+        assert_eq!(recovered.prepares().await.unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn durable_prefix_validation_remains_available_during_a_pending_append() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        persistence
+            .enable_segment_storage(SegmentPosition::default(), (4 * OWNED_BATCH_BYTES) as u64);
+        let first = owned_prepare(1, 0, 0).into_frozen();
+        persistence.append(first.clone(), true).unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let parent = bytemuck::checked::from_bytes::<PrepareHeader>(
+            &first.as_slice()[..size_of::<PrepareHeader>()],
+        )
+        .checksum;
+        let second = owned_prepare(2, parent, 1).into_frozen();
+        persistence.append(second.clone(), true).unwrap();
+        storage.pause_writes();
+        assert!(persistence.start());
+        let mut writer = Box::pin(Rc::clone(&persistence).run());
+        assert!(poll!(&mut writer).is_pending());
+        assert_eq!(
+            persistence
+                .validate_segment_prefix(std::slice::from_ref(&first), 0, 0)
+                .unwrap(),
+            OWNED_BATCH_BYTES as u64
+        );
+        assert!(
+            persistence
+                .validate_segment_prefix(std::slice::from_ref(&second), 0, OWNED_BATCH_BYTES as u64)
+                .is_err()
+        );
+        assert!(persistence.failure().is_none());
+        storage.resume_writes();
+        writer.await;
+        let metrics = persistence.take_metrics();
+        assert_eq!(metrics.disk_bytes, 2 * PARTITION_WAL_BLOCK_SIZE as u64);
+        assert_eq!(
+            metrics.retained_bytes,
+            2 * journal::partition_journal::record_length(first.len()).unwrap() as u64
+        );
+        assert!(metrics.retained_bytes > metrics.disk_bytes);
+        assert_eq!(
+            persistence
+                .validate_segment_prefix(std::slice::from_ref(&second), 0, OWNED_BATCH_BYTES as u64)
+                .unwrap(),
+            OWNED_BATCH_BYTES as u64
+        );
+        persistence.truncate_from(2);
+        assert!(
+            persistence
+                .validate_segment_prefix(std::slice::from_ref(&second), 0, OWNED_BATCH_BYTES as u64)
+                .is_err()
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.failure().is_none());
+        assert!(
+            persistence
+                .validate_segment_prefix(std::slice::from_ref(&first), 0, 0)
+                .is_ok()
+        );
+        persistence.reset_with_segments(
+            2,
+            None,
+            None,
+            Some((
+                SegmentPosition {
+                    start_offset: 2,
+                    length: 0,
+                    next_offset: 2,
+                },
+                (4 * OWNED_BATCH_BYTES) as u64,
+            )),
+        );
+        assert!(
+            persistence
+                .validate_segment_prefix(std::slice::from_ref(&first), 0, 0)
+                .is_err()
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.failure().is_none());
+    });
+}
+
+#[test]
+fn failed_vectored_body_group_never_publishes_a_partial_prefix() {
+    block_on(async {
+        let first = owned_prepare(1, 0, 0);
+        let second = owned_prepare(2, first.header().checksum, 1);
+        let third = owned_prepare(3, second.header().checksum, 2);
+        let fourth = owned_prepare(4, third.header().checksum, 3);
+        let prepares = [third.into_frozen(), fourth.into_frozen()];
+        let (storage, mut journal) = owned_segment_baseline().await;
+        storage.clear_trace();
+        journal.append_batch_buffered(&prepares).await.unwrap();
+        journal.sync().await.unwrap();
+        let operations = storage.trace().len();
+        for cut in 0..operations {
+            for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
+                let (storage, mut journal) = owned_segment_baseline().await;
+                storage.fail_at(cut, mode);
+                let acknowledged = journal.append_batch_buffered(&prepares).await.is_ok()
+                    && journal.sync().await.is_ok();
+                drop(journal);
+                storage.crash(Crash::PowerLoss);
+                let recovered =
+                    PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                        .await
+                        .unwrap();
+                assert!(matches!(recovered.head(), 2 | 4), "cut {cut}, {mode:?}");
+                if acknowledged {
+                    assert_eq!(recovered.head(), 4, "cut {cut}, {mode:?}");
+                }
+                let actual = recovered.prepares().await.unwrap();
+                assert_eq!(actual[0].as_slice(), first.as_slice());
+                assert_eq!(actual[1].as_slice(), second.as_slice());
+                for (actual, expected) in actual[2..].iter().zip(&prepares) {
+                    assert_eq!(
+                        actual.as_slice(),
+                        expected.as_slice(),
+                        "cut {cut}, {mode:?}"
+                    );
+                }
+            }
+        }
+    });
+}
+
 async fn mutate_owned_segments(
     journal: &mut PartitionPrepareJournal<SimStorage>,
     mutation: Mutation,
@@ -1201,25 +1761,60 @@ async fn assert_owned_segments(
     for prepare in &prepares {
         let index = usize::try_from(prepare.header().op - 1).unwrap();
         assert_eq!(prepare.as_slice(), expected[index].as_slice(), "{context}");
-        assert!(
+        assert_eq!(
             journal.segment_reference(prepare.header()).is_some(),
+            prepare.header().op > journal.purge_marker().1,
             "{context}"
         );
     }
     assert_eq!(
         journal.size_bytes(),
-        (prepares.len() * PARTITION_WAL_BLOCK_SIZE) as u64,
+        prepares
+            .iter()
+            .map(|prepare| {
+                if prepare.header().op <= journal.purge_marker().1 {
+                    journal::partition_journal::record_length(prepare.as_slice().len()).unwrap()
+                        as u64
+                } else {
+                    PARTITION_WAL_BLOCK_SIZE as u64
+                }
+            })
+            .sum::<u64>(),
         "{context}"
     );
 }
 
 fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
-    let mut body = vec![u8::try_from(op).unwrap(); OWNED_BATCH_BYTES];
-    let mut batch = BatchHeader::new(42, 0, OWNED_BATCH_BYTES as u64, 1);
-    batch.base_offset = offset;
-    batch.batch_checksum = batch.checksum_for_blob(&body[BATCH_HEADER_SIZE..]);
-    batch.encode_into(&mut body);
-    prepare_with_payload(op, parent, &body)
+    let payload = vec![
+        u8::try_from(op).unwrap();
+        OWNED_BATCH_BYTES - BATCH_HEADER_SIZE - BATCH_MESSAGE_HEADER_SIZE
+    ];
+    let mut messages = IggyMessages::with_capacity(1);
+    messages.push(IggyMessage {
+        header: IggyMessageHeader {
+            id: u128::from(op),
+            payload_length: u32::try_from(payload.len()).unwrap(),
+            ..Default::default()
+        },
+        payload: payload.into(),
+        user_headers: None,
+    });
+    let namespace = IggyNamespace::new(0, 0, 42);
+    assert_eq!(namespace.inner(), 42);
+    let mut batch = SendMessagesOwned::from_messages(namespace, &messages).unwrap();
+    batch.header.base_offset = offset;
+    batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+    let mut body = vec![0; BATCH_HEADER_SIZE + batch.blob.len()];
+    batch.header.encode_into(&mut body[..BATCH_HEADER_SIZE]);
+    body[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+    assert_eq!(body.len(), OWNED_BATCH_BYTES);
+    prepare_with_payload(op, parent, &body).transmute_header(
+        |original, header: &mut PrepareHeader| {
+            *header = original;
+            header.checksum_body = 0;
+            header.checksum = header.identity_checksum();
+        },
+    )
 }
 
 async fn referenced_baseline() -> (SimStorage, PartitionPrepareJournal<SimStorage>) {

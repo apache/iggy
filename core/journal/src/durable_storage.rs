@@ -101,6 +101,24 @@ pub trait DurableFile {
     ) -> impl Future<Output = io::Result<()>> {
         async move { self.write(offset, bytes.as_slice().to_vec()).await }
     }
+    /// Write adjacent immutable extents in order.
+    /// Callers must limit the buffer count to [`server_common::iobuf::IOV_MAX`].
+    ///
+    /// # Errors
+    /// Returns an error if any extent cannot be written completely.
+    fn write_frozen_vectored(
+        &mut self,
+        offset: u64,
+        buffers: Vec<Frozen<4096>>,
+    ) -> impl Future<Output = io::Result<()>> {
+        async move {
+            let mut bytes = Vec::with_capacity(buffers.iter().map(Frozen::len).sum());
+            for buffer in buffers {
+                bytes.extend_from_slice(buffer.as_slice());
+            }
+            self.write(offset, bytes).await
+        }
+    }
     /// # Errors
     /// Returns an error if the aligned extent cannot be written completely.
     fn write_aligned(
@@ -275,6 +293,14 @@ impl DurableFile for File {
 
     async fn write_frozen(&mut self, offset: u64, bytes: Frozen<4096>) -> io::Result<()> {
         self.write_all_at(bytes, offset).await.0
+    }
+
+    async fn write_frozen_vectored(
+        &mut self,
+        offset: u64,
+        buffers: Vec<Frozen<4096>>,
+    ) -> io::Result<()> {
+        self.write_vectored_all_at(buffers, offset).await.0
     }
 
     async fn write_aligned(&mut self, offset: u64, bytes: Owned<4096>) -> io::Result<()> {

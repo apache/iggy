@@ -366,13 +366,15 @@ async fn load_partition_consumer_group_offsets(
 pub async fn ensure_initial_segment(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
+    namespace: IggyNamespace,
+    wal_owned_messages: bool,
 ) -> Result<(), ServerError> {
     if partition.log.has_segments() {
         return Ok(());
     }
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
 
     // At the RESTORED FRONTIER, not always 0: after a crash inside the install's
     // swap window the chain is empty while the recorded frontier is N, and a
@@ -385,30 +387,34 @@ pub async fn ensure_initial_segment(
         config.get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
     let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
     let runtime = partition.runtime_options();
-    let segment_size = runtime
-        .segment_size
-        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let segment_size = runtime.effective_segment_size();
     let persisted = runtime.durability.is_persisted();
     let preallocate_segments = runtime
         .preallocate_segments
         .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS);
-    // `file_exists = false` TRUNCATES both files, which is load-bearing here: a
-    // fenced-and-rebuilt partition (or one whose quarantine failed) can reach
-    // this with a stale `.index` at offset 0 on disk. The `partitions`-side
-    // writers with the same names do NOT truncate, so opening them directly
-    // instead would read index entries from a previous generation.
-    let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+    // Recreate stale indexes, but preserve any physical tail retained by the WAL.
+    let storage = if wal_owned_messages {
+        SegmentStorage::with_read_only_messages(
+            &messages_path,
+            &index_path,
+            0,
+            false,
+            preallocate_segments.then_some(segment_size.as_bytes_u64()),
+        )
         .await
-        .map_err(|source| {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                error = %source,
-                "failed to create initial segment storage"
-            );
-            source
-        })?;
+    } else {
+        SegmentStorage::new(&messages_path, &index_path, 0, 0, false).await
+    }
+    .map_err(|source| {
+        error!(
+            stream_id,
+            topic_id,
+            partition_id,
+            error = %source,
+            "failed to create initial segment storage"
+        );
+        source
+    })?;
     // Share the storage's size counters: they are the write cursors. A private
     // counter would let the append position diverge from the segment
     // bookkeeping that index entries and poll bounds rely on.
@@ -422,9 +428,9 @@ pub async fn ensure_initial_segment(
         .as_ref()
         .map(|writer| writer.size_counter())
         .unwrap_or_default();
-    partition.log.add_persisted_segment(
-        Segment::new(start_offset, segment_size),
-        storage,
+    let messages_writer = if wal_owned_messages {
+        None
+    } else {
         Some(Rc::new(
             MessagesWriter::new(
                 &messages_path,
@@ -445,7 +451,12 @@ pub async fn ensure_initial_segment(
                 );
                 source
             })?,
-        )),
+        ))
+    };
+    partition.log.add_persisted_segment(
+        Segment::new(start_offset, segment_size),
+        storage,
+        messages_writer,
         Some(Rc::new(
             IggyIndexWriter::new(&index_path, index_size_counter, persisted, false)
                 .await
@@ -922,7 +933,13 @@ async fn load_partition(
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset).await?;
-    ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
+    ensure_initial_segment(
+        &mut partition,
+        config,
+        namespace,
+        segment_checkpoint.is_some(),
+    )
+    .await?;
 
     partition
         .open_persistence_with_recovered(
@@ -1022,7 +1039,7 @@ async fn restore_partition_offsets(
 
 /// Recover this partition's persisted segment chain, stamping each segment
 /// with the topic's effective segment size (the per-topic value when the
-/// topic was created with one, else the shard-wide configured size).
+/// topic was created with one, else the shared segment-size default).
 ///
 /// The topic's effective `persisted` goes in for the same reason: it is
 /// what tells recovery whether a durable index entry the log cannot back is a
@@ -1037,9 +1054,7 @@ async fn recover_partition_segments(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    let segment_size = runtime_options
-        .segment_size
-        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let segment_size = runtime_options.effective_segment_size();
     let persisted = runtime_options.durability.is_persisted();
     let recovered = if checkpoint.is_some() {
         load_persisted_segments_with_checkpoint(
@@ -1084,9 +1099,7 @@ async fn hydrate_partition_log(
     // silently drop back to the node defaults.
     let runtime = partition.runtime_options();
     let persisted = runtime.durability.is_persisted();
-    let segment_size = runtime
-        .segment_size
-        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let segment_size = runtime.effective_segment_size();
     let preallocate_segments = runtime
         .preallocate_segments
         .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS);
@@ -1426,7 +1439,7 @@ pub async fn build_partition_fresh(
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset).await?;
-    ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
+    ensure_initial_segment(&mut partition, config, namespace, false).await?;
 
     // Claim the first offset-reservation block HERE so no send ever pays the
     // create, write, file fsync, rename and directory fsync of a first claim
@@ -1564,14 +1577,123 @@ pub async fn delete_partitions_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use configs::server::ServerConfig;
+    use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
+    use iggy_binary_protocol::{Command, Operation, PrepareHeader};
+    use journal::DurableAppend;
     use journal::superblock::SuperblockStore;
     use partitions::PartitionPathLayout;
+    use server_common::Message;
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    };
     use server_common::sharding::ShardId;
 
     const CLUSTER: u128 = 7;
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
+
+    #[compio::test]
+    async fn loading_after_retention_preserves_the_wal_owned_tail_when_the_logical_chain_is_empty()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader::default(),
+            payload: Bytes::from_static(b"retained-tail"),
+            user_headers: None,
+        });
+        let mut batch = SendMessagesOwned::from_messages(namespace, &messages).unwrap();
+        let segment_size = IggyByteSize::from(batch.header.total_size() as u64);
+        let runtime = TopicRuntimeOptions {
+            durability: iggy_common::Durability::Persisted,
+            segment_size: Some(segment_size),
+            preallocate_segments: Some(false),
+            ..Default::default()
+        };
+        drop(
+            build_partition_fresh(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                0,
+                runtime,
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                0,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap(),
+        );
+        let wal = Path::new(&config.get_partition_path(1, 1, 0)).join("prepares-0");
+        let mut journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+            .await
+            .unwrap();
+        let mut parent = 0;
+        let mut tail_body = Vec::new();
+        for offset in 0..2 {
+            batch.header.base_offset = offset;
+            batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+            let total = size_of::<PrepareHeader>() + batch.header.total_size();
+            let mut prepare = Message::<PrepareHeader>::new(total);
+            let body = &mut prepare.as_mut_slice()[size_of::<PrepareHeader>()..];
+            batch.header.encode_into(body);
+            body[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+            tail_body = body.to_vec();
+            let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::SendMessages;
+                header.cluster = CLUSTER;
+                header.group = namespace.inner();
+                header.op = offset + 1;
+                header.parent = parent;
+                header.size = u32::try_from(total).unwrap();
+                header.checksum = header.identity_checksum();
+            });
+            parent = prepare.header().checksum;
+            journal.append(prepare.into_frozen()).await.unwrap();
+        }
+        journal.checkpoint(1).await.unwrap();
+        drop(journal);
+        std::fs::remove_file(config.get_messages_file_path(1, 1, 0, 0)).unwrap();
+        std::fs::remove_file(config.get_index_path(1, 1, 0, 0)).unwrap();
+        let partitions = solo_partitions();
+        let partition = load_partition(
+            &config,
+            partitions.config(),
+            namespace,
+            Arc::new(PartitionStats::default()),
+            &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+            runtime,
+            CLUSTER,
+            REPLICA,
+            REPLICAS,
+            Rc::new(IggyMessageBus::new(0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(partition.log.active_segment().start_offset, 1);
+        assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
+        assert!(partition.log.messages_writers().last().unwrap().is_none());
+        assert_eq!(
+            std::fs::read(config.get_messages_file_path(1, 1, 0, 1)).unwrap(),
+            tail_body
+        );
+        drop(partition);
+        let recovered = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+            .await
+            .unwrap();
+        assert_eq!(recovered.head(), 2);
+        assert_eq!(
+            recovered.prepares().await.unwrap()[1].as_slice()[size_of::<PrepareHeader>()..],
+            tail_body
+        );
+    }
 
     fn recorded_state(view: u32, log_view: u32) -> VsrState {
         VsrState {

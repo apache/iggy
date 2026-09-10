@@ -20,6 +20,7 @@
 #![allow(clippy::future_not_send)]
 
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode, StorageEntry};
+use server_common::iobuf::Frozen;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -389,21 +390,22 @@ impl DurableFile for SimFile {
     }
 
     async fn write(&mut self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
-        self.storage.wait_for_write().await;
-        self.storage
-            .perform(StorageOperation::Write, |state, torn| {
-                let buffered = state.file_mut(self.inode, self.epoch)?;
-                let offset = usize::try_from(offset).map_err(|_| invalid("offset overflow"))?;
-                let length = if torn { bytes.len() / 2 } else { bytes.len() };
-                let end = offset
-                    .checked_add(length)
-                    .ok_or_else(|| invalid("write overflow"))?;
-                if end > buffered.len() {
-                    buffered.resize(end, 0);
-                }
-                buffered[offset..end].copy_from_slice(&bytes[..length]);
-                Ok(())
-            })
+        self.write_chunks(offset, std::iter::once(bytes.as_slice()))
+            .await
+    }
+
+    async fn write_frozen(&mut self, offset: u64, bytes: Frozen<4096>) -> io::Result<()> {
+        self.write_chunks(offset, std::iter::once(bytes.as_slice()))
+            .await
+    }
+
+    async fn write_frozen_vectored(
+        &mut self,
+        offset: u64,
+        buffers: Vec<Frozen<4096>>,
+    ) -> io::Result<()> {
+        self.write_chunks(offset, buffers.iter().map(Frozen::as_slice))
+            .await
     }
 
     async fn length(&self) -> io::Result<u64> {
@@ -427,6 +429,43 @@ impl DurableFile for SimFile {
                 state.file(self.inode, self.epoch)?;
                 if let Inode::File { buffered, stable } = &mut state.inodes[self.inode] {
                     stable.clone_from(buffered);
+                }
+                Ok(())
+            })
+    }
+}
+
+impl SimFile {
+    async fn write_chunks<'a>(
+        &self,
+        offset: u64,
+        chunks: impl Iterator<Item = &'a [u8]> + Clone,
+    ) -> io::Result<()> {
+        let length = chunks.clone().try_fold(0usize, |length, chunk| {
+            length
+                .checked_add(chunk.len())
+                .ok_or_else(|| invalid("write overflow"))
+        })?;
+        self.storage.wait_for_write().await;
+        self.storage
+            .perform(StorageOperation::Write, |state, torn| {
+                let buffered = state.file_mut(self.inode, self.epoch)?;
+                let offset = usize::try_from(offset).map_err(|_| invalid("offset overflow"))?;
+                let length = if torn { length / 2 } else { length };
+                let end = offset
+                    .checked_add(length)
+                    .ok_or_else(|| invalid("write overflow"))?;
+                if end > buffered.len() {
+                    buffered.resize(end, 0);
+                }
+                let mut position = offset;
+                for chunk in chunks {
+                    let written = chunk.len().min(end - position);
+                    buffered[position..position + written].copy_from_slice(&chunk[..written]);
+                    position += written;
+                    if position == end {
+                        break;
+                    }
                 }
                 Ok(())
             })

@@ -223,6 +223,7 @@ const fn consumer_kind_index(kind: ConsumerKind) -> usize {
 #[derive(Clone)]
 pub struct ShardMetrics {
     partition_wal_disk_bytes: Gauge,
+    partition_wal_retained_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
     partition_wal_in_flight_bytes: Gauge,
     partition_wal_checkpoints_pending: Gauge,
@@ -291,6 +292,7 @@ impl ShardMetrics {
         let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
             partition_wal_disk_bytes: Gauge::default(),
+            partition_wal_retained_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
             partition_wal_in_flight_bytes: Gauge::default(),
             partition_wal_checkpoints_pending: Gauge::default(),
@@ -323,6 +325,8 @@ impl ShardMetrics {
     pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
         self.partition_wal_disk_bytes
             .set(i64::try_from(metrics.disk_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_retained_bytes
+            .set(i64::try_from(metrics.retained_bytes).unwrap_or(i64::MAX));
         self.partition_wal_queued_bytes
             .set(i64::try_from(metrics.queued_bytes).unwrap_or(i64::MAX));
         self.partition_wal_in_flight_bytes
@@ -341,6 +345,11 @@ impl ShardMetrics {
             "partition_wal_disk_bytes",
             "active partition WAL bytes",
             self.partition_wal_disk_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_retained_bytes",
+            "retained partition prepare bytes charged to the WAL budget",
+            self.partition_wal_retained_bytes.clone(),
         );
         registry.register(
             "partition_wal_queued_bytes",
@@ -830,6 +839,30 @@ mod tests {
             ),
             1,
             "a distinct reason gets its own counter",
+        );
+    }
+
+    #[test]
+    fn persistence_scrape_distinguishes_retained_budget_from_wal_file_bytes() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_persistence(&partitions::PersistenceMetrics {
+            disk_bytes: 4096,
+            retained_bytes: 65536,
+            ..Default::default()
+        });
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_disk_bytes 4096")
+        );
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_retained_bytes 65536")
         );
     }
 

@@ -43,14 +43,14 @@ use consensus::state_manifest::artifact_kind;
 use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
-use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
 use server_common::iobuf::Owned;
-use server_common::send_messages::decode_batch_slice;
+use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -2261,7 +2261,7 @@ where
             self.log
                 .journal()
                 .inner
-                .header_by_op(commit_op)
+                .repair_header(commit_op)
                 .map(|header| header.checksum)
                 .or_else(|| {
                     self.persistence
@@ -2596,6 +2596,9 @@ where
                         != u128::from(iggy_common::calculate_checksum(
                             &offsets_wire.checkpoint_prepare[size_of::<PrepareHeader>()..],
                         )))
+                || (header.operation == Operation::SendMessages
+                    && header.checksum_body == 0
+                    && decode_prepare_slice(prepare.as_slice()).is_err())
             {
                 return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum.into());
             }
@@ -3005,8 +3008,21 @@ where
             // sweep itself is right (a chain the live state does not know
             // about would resurrect at boot), so one retry against a
             // transient open failure is the only cheap save available.
-            let open =
-                || SegmentStorage::new(&log_final, &index_final, meta.size, meta.index_size, true);
+            let open = || async {
+                if self.persistence.is_some() && self.durability().is_persisted() {
+                    SegmentStorage::with_read_only_messages(
+                        &log_final,
+                        &index_final,
+                        meta.index_size,
+                        true,
+                        None,
+                    )
+                    .await
+                } else {
+                    SegmentStorage::new(&log_final, &index_final, meta.size, meta.index_size, true)
+                        .await
+                }
+            };
             let storage = match open().await {
                 Ok(storage) => storage,
                 Err(_) => open()
@@ -3016,7 +3032,7 @@ where
                         source,
                     })?,
             };
-            let mut segment = Segment::new(meta.start_offset, self.effective_segment_size(config));
+            let mut segment = Segment::new(meta.start_offset, self.effective_segment_size());
             segment.sealed = true;
             segment.start_timestamp = meta.start_timestamp;
             segment.end_timestamp = meta.end_timestamp;
@@ -3052,15 +3068,13 @@ where
                 })?;
         } else {
             let persisted = self.durability().is_persisted();
-            let segment_size = self.effective_segment_size(config);
+            let segment_size = self.effective_segment_size();
             let preallocate_segments = self.effective_preallocate_segments(config);
             let last = self.log.segments().len() - 1;
             let storage = self.log.storages()[last].clone();
-            if let (Some(messages_reader), Some(index_reader), Some(messages_w), Some(index_w)) = (
+            if let (Some(messages_reader), Some(messages_w)) = (
                 storage.messages_reader.as_ref(),
-                storage.index_reader.as_ref(),
                 storage.messages_writer.as_ref(),
-                storage.index_writer.as_ref(),
             ) {
                 let messages_writer = MessagesWriter::new(
                     &messages_reader.path(),
@@ -3074,6 +3088,11 @@ where
                     path: messages_reader.path(),
                     source,
                 })?;
+                self.log.messages_writers_mut()[last] = Some(Rc::new(messages_writer));
+            }
+            if let (Some(index_reader), Some(index_w)) =
+                (storage.index_reader.as_ref(), storage.index_writer.as_ref())
+            {
                 let index_writer = IggyIndexWriter::new(
                     &index_reader.path(),
                     index_w.size_counter(),
@@ -3085,7 +3104,6 @@ where
                     path: index_reader.path(),
                     source,
                 })?;
-                self.log.messages_writers_mut()[last] = Some(Rc::new(messages_writer));
                 self.log.index_writers_mut()[last] = Some(Rc::new(index_writer));
             }
             self.log.segments_mut()[last].sealed = false;

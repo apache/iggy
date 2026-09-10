@@ -855,8 +855,8 @@ clients_table_max = 8192
 # Topic durability and flush scheduling are set at creation and returned by GetTopic.
 # durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
 # Both independently default to "replicated". Neither inherits the other.
-# In replicated groups, either persisted policy enables the prepare WAL for full message bodies.
-# Persisted offsets with replicated messages still consume wal_bytes_max for message payloads.
+# In replicated groups, persisted messages use WAL references to segment bodies, retained by hard link until reclamation.
+# Persisted offsets with replicated messages use inline WAL bodies. Both layouts charge full message payloads to wal_bytes_max.
 # Their barriers can also persist co-batched messages. Only replicated/replicated stays off this WAL.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
@@ -901,6 +901,8 @@ clients_table_max = 8192
 # partitions continue while this partition defers materialized commit application.
 # The HTTP metrics endpoint exposes per-shard partition_wal_* byte gauges and
 # completed batch, prepare, checkpoint and error counters.
+# partition_wal_retained_bytes plus queued_bytes and in_flight_bytes measures budget usage;
+# partition_wal_disk_bytes measures WAL file length, excluding referenced segment bodies.
 wal_bytes_max = "256 MiB"
 
 # Verify the checksum of batches read from segment storage. A mismatch is reported rather than served.

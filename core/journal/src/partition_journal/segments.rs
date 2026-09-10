@@ -21,17 +21,21 @@ use std::path::{Path, PathBuf};
 
 use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::{Operation, PrepareHeader};
-use server_common::iobuf::Frozen;
+use iggy_common::MAX_TOPIC_SEGMENT_SIZE;
+use server_common::iobuf::{Frozen, IOV_MAX};
 
-use super::{JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, invalid};
+use super::{
+    JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, invalid, segment_path,
+};
 use crate::durable_storage::{DurableFile, DurableStorage, OpenMode};
 
 pub(super) const SEGMENT_STATE_FLAG: usize = 99;
 pub(super) const SEGMENT_STATE_OFFSET: usize = 128;
 pub(super) const SEGMENT_STATE_BYTES: usize = 10 * size_of::<u64>();
 
+const SEGMENT_RECOVERY_EXTENSION: &str = "log.tmp";
+
 /// A whole-batch boundary. `next_offset` is the first offset after this prefix.
-/// Physical tails may exceed the checkpoint boundary but cannot be polled yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SegmentPosition {
     pub start_offset: u64,
@@ -45,6 +49,8 @@ pub(super) struct SegmentCursor {
     pub position: SegmentPosition,
 }
 
+/// Recovery materialization ends at `checkpoint`; live polls use the partition's
+/// committed segment size, which can advance beyond it within the durable tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SegmentState {
     pub max_size: u64,
@@ -71,7 +77,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             }
             return Ok(());
         }
-        if max_size == 0 || !initial.valid() {
+        if !valid_segment_size(max_size) || !initial.valid() {
             return Err(invalid("invalid initial segment boundary"));
         }
         let generation = self
@@ -99,10 +105,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             segment_storage: Some(segments),
             ..self.state
         };
+        let migrate = self.segment_migration_needed(segments).await?;
         self.poisoned = true;
         if initial.length > 0 {
-            self.open_segment_file(cursor, self.preallocate_segments.then_some(max_size))
-                .await?;
+            self.open_segment_file(
+                generation,
+                initial.start_offset,
+                initial.length,
+                self.preallocate_segments.then_some(max_size),
+            )
+            .await?;
             self.sync_segment_files().await?;
         }
         self.file.sync().await?;
@@ -111,7 +123,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.state = state;
         self.durable_head = state.head;
         self.poisoned = false;
-        self.migrate_segment_prepares().await
+        if migrate {
+            self.rewrite(
+                self.state.checkpoint,
+                self.state.checkpoint_checksum,
+                None,
+                None,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub const fn segment_checkpoint(&self) -> Option<SegmentPosition> {
@@ -130,6 +151,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .and_then(|entry| entry.reference)
     }
 
+    /// Published body references at or above `from_op`, in operation order.
+    pub fn durable_segment_references(
+        &self,
+        from_op: u64,
+    ) -> impl Iterator<Item = (u64, SegmentReference)> + '_ {
+        self.entries
+            .range(from_op..)
+            .take_while(|(op, _)| **op <= self.durable_head)
+            .filter_map(|(&op, entry)| entry.reference.map(|reference| (op, reference)))
+    }
+
     /// Install a transferred checkpoint after all replacement segment files are durable.
     ///
     /// # Errors
@@ -144,7 +176,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         max_size: u64,
     ) -> io::Result<()> {
         self.ensure_healthy()?;
-        if !initial.valid() || max_size == 0 {
+        if !initial.valid() || !valid_segment_size(max_size) {
             return Err(invalid("invalid installed segment boundary"));
         }
         if let Some(prepare) = &prepare {
@@ -169,21 +201,35 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             tail: cursor,
             checkpoint: cursor,
         };
+        let public = self
+            .segment_directory()?
+            .join(format!("{:020}.log", initial.start_offset));
+        match self.storage.open(&public, OpenMode::Read).await {
+            Ok(file) if file.length().await? != initial.length => {
+                return Err(invalid(
+                    "installed segment size differs from its checkpoint",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound && initial.length == 0 => {}
+            Err(error) => return Err(error),
+        }
         self.poisoned = true;
+        // Every body write is synchronized before its WAL record is appended.
         self.segment_files.clear();
-        self.open_segment_file(cursor, self.preallocate_segments.then_some(max_size))
+        self.open_segment_file(generation, initial.start_offset, initial.length, None)
             .await?;
-        if self
+        let installed_file = self
             .segment_files
             .get(&(generation, initial.start_offset))
-            .ok_or_else(|| invalid("installed segment handle is absent"))?
-            .length()
-            .await?
-            != initial.length
-        {
+            .ok_or_else(|| invalid("installed segment handle is absent"))?;
+        if installed_file.length().await? != initial.length {
             return Err(invalid(
                 "installed segment size differs from its checkpoint",
             ));
+        }
+        if self.preallocate_segments {
+            installed_file.preallocate(&cursor.path(&self.directory), max_size);
         }
         let checkpoint_prepare = if let Some(prepare) = prepare {
             let header = self.validate_checkpoint_prepare(&prepare)?;
@@ -262,11 +308,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     }
 
     pub(super) async fn migrate_segment_prepares(&mut self) -> io::Result<()> {
-        if self.state.segment_storage.is_some()
-            && self
+        if let Some(segments) = self.state.segment_storage
+            && (self
                 .entries
-                .range(self.state.purge_floor.saturating_add(1)..)
-                .any(|(_, entry)| entry.reference.is_none())
+                .range(..=self.state.purge_floor)
+                .any(|(_, entry)| entry.reference.is_some())
+                || self.segment_migration_needed(segments).await?)
         {
             self.rewrite(
                 self.state.checkpoint,
@@ -279,6 +326,28 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
+    async fn segment_migration_needed(&self, mut segments: SegmentState) -> io::Result<bool> {
+        let mut convertible = false;
+        for (_, entry) in self
+            .entries
+            .range(self.state.purge_floor.saturating_add(1)..)
+        {
+            if entry.reference.is_some() {
+                continue;
+            }
+            let (header, _, prepare, _) = self.read_record(entry.position).await?;
+            if header.operation == Operation::SendMessages
+                && decode_batch(prepare.as_slice())?.base_offset
+                    >= segments.tail.position.next_offset
+            {
+                // Validate the complete migration before rewrite can modify files.
+                segments.reserve(&header, prepare.as_slice())?;
+                convertible = true;
+            }
+        }
+        Ok(convertible)
+    }
+
     pub(super) async fn write_segment_bodies(
         &mut self,
         prepares: &[Frozen<4096>],
@@ -287,11 +356,35 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if self.state.segment_storage.is_none() {
             return Ok(());
         }
-        for (_, record, index) in records {
-            if let Some(reference) = record.reference {
-                self.write_segment_body(reference, &prepares[*index])
-                    .await?;
+        let mut bodies = records
+            .iter()
+            .filter_map(|(_, record, index)| record.reference.map(|reference| (reference, *index)))
+            .peekable();
+        if bodies.peek().is_none() {
+            return Ok(());
+        }
+        while let Some((first, index)) = bodies.next() {
+            let mut buffers = Vec::with_capacity(records.len().min(IOV_MAX));
+            buffers.push(prepares[index].slice(size_of::<PrepareHeader>()..));
+            let mut end = first.position + first.length;
+            while buffers.len() < IOV_MAX {
+                let Some(&(reference, index)) = bodies.peek() else {
+                    break;
+                };
+                if reference.generation != first.generation
+                    || reference.start_offset != first.start_offset
+                    || reference.position != end
+                {
+                    break;
+                }
+                end += reference.length;
+                buffers.push(prepares[index].slice(size_of::<PrepareHeader>()..));
+                bodies.next();
             }
+            self.segment_writing_file(first)
+                .await?
+                .write_frozen_vectored(first.position, buffers)
+                .await?;
         }
         self.sync_segment_files().await
     }
@@ -301,28 +394,34 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         reference: SegmentReference,
         prepare: &Frozen<4096>,
     ) -> io::Result<()> {
-        let cursor = SegmentCursor {
-            generation: reference.generation,
-            position: SegmentPosition {
-                start_offset: reference.start_offset,
-                length: reference.position,
-                next_offset: reference.start_offset,
-            },
-        };
-        let preallocate_size = self
-            .state
-            .segment_storage
-            .filter(|_| self.preallocate_segments)
-            .map(|segments| segments.max_size);
-        self.open_segment_file(cursor, preallocate_size).await?;
-        self.segment_files
-            .get_mut(&(reference.generation, reference.start_offset))
-            .ok_or_else(|| invalid("segment writing handle is absent"))?
+        self.segment_writing_file(reference)
+            .await?
             .write_frozen(
                 reference.position,
                 prepare.slice(size_of::<PrepareHeader>()..),
             )
             .await
+    }
+
+    async fn segment_writing_file(
+        &mut self,
+        reference: SegmentReference,
+    ) -> io::Result<&mut S::File> {
+        let preallocate_size = self
+            .state
+            .segment_storage
+            .filter(|_| self.preallocate_segments)
+            .map(|segments| segments.max_size);
+        self.open_segment_file(
+            reference.generation,
+            reference.start_offset,
+            reference.position,
+            preallocate_size,
+        )
+        .await?;
+        self.segment_files
+            .get_mut(&(reference.generation, reference.start_offset))
+            .ok_or_else(|| invalid("segment writing handle is absent"))
     }
 
     pub(super) async fn sync_segment_files(&self) -> io::Result<()> {
@@ -394,23 +493,38 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             || cursor.position.next_offset > segments.checkpoint.position.next_offset
             || self.storage.exists(&public).await?;
         if restore {
-            self.open_segment_file(cursor, None).await?;
+            self.open_segment_file(
+                cursor.generation,
+                cursor.position.start_offset,
+                cursor.position.length,
+                self.preallocate_segments.then_some(segments.max_size),
+            )
+            .await?;
             let file = self
                 .segment_files
                 .get(&(cursor.generation, cursor.position.start_offset))
                 .ok_or_else(|| invalid("segment rollback handle is absent"))?;
-            if file.length().await? < cursor.position.length {
+            let length = file.length().await?;
+            if length < cursor.position.length {
                 return Err(invalid("segment lost durably published bytes"));
             }
-            file.truncate(cursor.position.length).await?;
-            if self.preallocate_segments {
-                file.preallocate(&public, segments.max_size);
+            if length > cursor.position.length {
+                file.truncate(cursor.position.length).await?;
+                if self.preallocate_segments {
+                    file.preallocate(&cursor.path(&self.directory), segments.max_size);
+                }
             }
             file.sync().await?;
-            self.remove_segment_name(&public).await?;
+            // Keep the public name present across recovery crashes. Its absence
+            // on a fully checkpointed sealed tail means retention removed it.
+            let temporary = public.with_extension(SEGMENT_RECOVERY_EXTENSION);
+            self.remove_segment_name(&temporary).await?;
             self.storage
-                .hard_link(&cursor.path(&self.directory), &public)
+                .hard_link(&cursor.path(&self.directory), &temporary)
                 .await?;
+            self.storage.rename(&temporary, &public).await?;
+            // Renaming two links to the same inode leaves both names intact.
+            self.remove_segment_name(&temporary).await?;
         }
         for entry in self.storage.entries(&parent).await? {
             let Some(name) = entry.name.to_str() else {
@@ -434,21 +548,60 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
+    pub(super) async fn truncate_segment_tail(&mut self) -> io::Result<()> {
+        let Some(segments) = self.state.segment_storage else {
+            return Ok(());
+        };
+        self.poisoned = true;
+        let cursor = segments.tail;
+        let key = (cursor.generation, cursor.position.start_offset);
+        if !self.segment_files.contains_key(&key) {
+            let path = cursor.path(&self.directory);
+            match self.storage.open(&path, OpenMode::ReadWrite).await {
+                Ok(file) => {
+                    self.segment_files.insert(key, file);
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound && cursor.position.length == 0 =>
+                {
+                    self.poisoned = false;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Live partitions own the public log/index names and may still hold their
+        // descriptors. Namespace reconciliation belongs to startup recovery.
+        let file = self
+            .segment_files
+            .get(&key)
+            .ok_or_else(|| invalid("segment rollback handle is absent"))?;
+        if file.length().await? < cursor.position.length {
+            return Err(invalid("segment lost durably published bytes"));
+        }
+        file.truncate(cursor.position.length).await?;
+        file.sync().await?;
+        self.poisoned = false;
+        Ok(())
+    }
+
     async fn open_segment_file(
         &mut self,
-        cursor: SegmentCursor,
+        generation: u64,
+        start_offset: u64,
+        length: u64,
         preallocate_size: Option<u64>,
     ) -> io::Result<()> {
-        let key = (cursor.generation, cursor.position.start_offset);
+        let key = (generation, start_offset);
         if self.segment_files.contains_key(&key) {
             return Ok(());
         }
         let parent = self.segment_directory()?.to_path_buf();
-        let retained = cursor.path(&self.directory);
-        let public = parent.join(format!("{:020}.log", cursor.position.start_offset));
+        let retained = segment_path(&self.directory, generation, start_offset);
+        let public = parent.join(format!("{start_offset:020}.log"));
         let file = if self.storage.exists(&retained).await? {
             self.storage.open(&retained, OpenMode::ReadWrite).await?
-        } else if cursor.position.length > 0
+        } else if length > 0
             || (self.storage.exists(&public).await?
                 && self
                     .storage
@@ -466,11 +619,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             // prepares. Unlink before reuse; never truncate that inode in place.
             self.remove_segment_name(&public).await?;
             self.storage.hard_link(&retained, &public).await?;
+            if let Some(size) = preallocate_size {
+                file.preallocate(&retained, size);
+            }
             file
         };
-        if let Some(size) = preallocate_size {
-            file.preallocate(&public, size);
-        }
         self.storage.sync_directory(&self.directory).await?;
         self.storage.sync_directory(&parent).await?;
         self.segment_files.insert(key, file);
@@ -501,17 +654,20 @@ impl SegmentPosition {
 
 impl SegmentCursor {
     fn path(self, directory: &Path) -> PathBuf {
-        SegmentReference {
-            generation: self.generation,
-            start_offset: self.position.start_offset,
-            position: 0,
-            length: self.position.length,
-        }
-        .path(directory)
+        segment_path(directory, self.generation, self.position.start_offset)
     }
 }
 
 impl SegmentState {
+    pub(super) fn valid(self) -> bool {
+        valid_segment_size(self.max_size)
+            && self.tail.generation < self.next_generation
+            && self.checkpoint.generation < self.next_generation
+            && self.tail.position.valid()
+            && self.checkpoint.position.valid()
+            && self.tail.position.next_offset >= self.checkpoint.position.next_offset
+    }
+
     pub(super) fn reserve(
         &mut self,
         header: &PrepareHeader,
@@ -630,17 +786,17 @@ impl SegmentState {
                 },
             },
         };
-        if max_size == 0
-            || tail_generation >= next_generation
-            || checkpoint_generation >= next_generation
-            || !state.tail.position.valid()
-            || !state.checkpoint.position.valid()
-            || tail_next < checkpoint_next
-        {
+        if !state.valid() {
             return Err(invalid("invalid durable segment boundaries"));
         }
         Ok(state)
     }
+}
+
+fn valid_segment_size(max_size: u64) -> bool {
+    // The journal supports small test layouts; real topics validate their lower
+    // bound and alignment at admission. Recovery must still cap allocation.
+    (1..=MAX_TOPIC_SEGMENT_SIZE).contains(&max_size)
 }
 
 pub(super) fn batch_next_offset(prepare: &[u8]) -> io::Result<u64> {

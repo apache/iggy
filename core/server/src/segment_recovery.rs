@@ -245,6 +245,8 @@ pub async fn load_persisted_segments_with_checkpoint(
         let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
 
         let raw_messages_size = file_len(&messages_path)?;
+        let checkpoint_segment =
+            checkpoint.is_some_and(|checkpoint| checkpoint.start_offset == start_offset);
         let messages_size = checkpoint
             .filter(|checkpoint| checkpoint.start_offset == start_offset)
             .map_or(raw_messages_size, |checkpoint| checkpoint.length);
@@ -257,7 +259,7 @@ pub async fn load_persisted_segments_with_checkpoint(
                 }),
             );
         }
-        let bounds = if checkpoint.is_some() {
+        let bounds = if checkpoint_segment {
             let messages = open_messages_file(identity, &messages_path)?;
             let mut scanner = FileScanner::new(&messages, messages_size, &mut scratch);
             recover_by_walking_log(
@@ -280,7 +282,7 @@ pub async fn load_persisted_segments_with_checkpoint(
             )
             .await?
         };
-        if checkpoint.is_some()
+        if checkpoint_segment
             && bounds.as_ref().map_or(0, |bounds| bounds.messages_size) != messages_size
         {
             return Err(
@@ -303,7 +305,7 @@ pub async fn load_persisted_segments_with_checkpoint(
         // tail-only -- the log and the index persist concurrently under
         // every config, so a torn index is reachable mid-chain, which is why
         // the walk exists rather than refusing the partition.
-        let recovered_empty = bounds.is_none() && checkpoint.is_none();
+        let recovered_empty = bounds.is_none() && !checkpoint_segment;
         let bounds = bounds.unwrap_or_else(|| {
             if raw_messages_size > 0 {
                 warn!(
@@ -389,7 +391,8 @@ pub async fn load_persisted_segments_with_checkpoint(
         // index over the shortened log; the next boot re-discards it and
         // rebuilds from the log again, and truncation is monotone, so the
         // pair converges.
-        if checkpoint.is_none() {
+        if checkpoint.is_none_or(|checkpoint| checkpoint.start_offset != plan.segment.start_offset)
+        {
             truncate_to(&plan.messages_path, messages_size)?;
         }
         if let Some(staging_path) = &plan.rebuilt_index_staging {
@@ -3371,10 +3374,60 @@ mod tests {
         );
     }
 
-    /// No re-anchor plants a segment whose range a predecessor already covers, so
-    /// an anchor must not launder an overlap either. Reachable because each end
-    /// offset is walked from its own file with nothing clamping it against the
-    /// next start.
+    #[compio::test]
+    async fn given_a_later_checkpoint_when_recovering_should_preserve_sealed_index_evidence() {
+        for damaged in [false, true] {
+            let directory = tempdir().unwrap();
+            let config = test_config(&directory);
+            prepare_partition_dir(&config);
+            let first = encoded_batch(0, 1);
+            let mut sealed = first.clone();
+            sealed.extend(encoded_batch(1, 1));
+            let mut index = index_entry(0, 0);
+            index.extend(index_entry(1, first.len() as u64));
+            if damaged {
+                index.extend(index_entry(2, sealed.len() as u64 + 8));
+                index.extend(index_entry(3, sealed.len() as u64 + 128));
+            }
+            let (messages_path, index_path) = write_segment(&config, 0, &sealed, &index);
+            let tail = encoded_batch(2, 1);
+            write_segment(&config, 2, &tail, &index_entry(2, 0));
+            let checkpoint = journal::partition_journal::SegmentPosition {
+                start_offset: 2,
+                length: tail.len() as u64,
+                next_offset: 3,
+            };
+            let result = load_persisted_segments_with_checkpoint(
+                &config,
+                IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
+                IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+                true,
+                &PartitionStats::default(),
+                Some(checkpoint),
+            )
+            .await;
+            if damaged {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ServerError::PartitionRecoveryRefused {
+                            reason: PartitionRecoveryRefusal::FsyncedLogLoss { .. },
+                            ..
+                        })
+                    ),
+                    "sealed index evidence must not be erased by an unrelated checkpoint"
+                );
+            } else {
+                let recovered = result.unwrap();
+                assert_eq!(recovered.len(), 2);
+                assert_eq!(recovered[0].segment.end_offset, 1);
+                assert!(recovered[0].storage.messages_writer.is_none());
+            }
+            assert_eq!(bytes_of(&messages_path), sealed);
+            assert_eq!(bytes_of(&index_path), index);
+        }
+    }
+
     #[compio::test]
     async fn given_checkpointed_prefix_when_recovering_should_hide_tails_and_refuse_overlaps() {
         let tmp = tempdir().unwrap();
@@ -3428,6 +3481,10 @@ mod tests {
         assert_eq!(bytes_of(&messages_path), physical);
     }
 
+    /// No re-anchor plants a segment whose range a predecessor already covers, so
+    /// an anchor must not launder an overlap either. Reachable because each end
+    /// offset is walked from its own file with nothing clamping it against the
+    /// next start.
     #[compio::test]
     async fn given_overlapping_segments_when_recovering_should_refuse_even_when_anchored() {
         let tmp = tempdir().expect("tempdir");

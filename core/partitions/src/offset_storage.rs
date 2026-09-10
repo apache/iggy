@@ -20,7 +20,7 @@ use compio::{
     io::{AsyncReadAt, AsyncReadAtExt, AsyncWriteAtExt},
 };
 use iggy_common::{IggyError, calculate_checksum};
-use std::path::Path;
+use std::{io, path::Path};
 use tracing::warn;
 
 const OFFSET_SIZE: usize = core::mem::size_of::<u64>();
@@ -130,15 +130,16 @@ pub async fn persist_offset(path: &str, offset: u64, persisted: bool) -> Result<
     }
 }
 
-/// Keep the original writer open so checkpoint observes its writeback errors.
+/// Return the write result with its original descriptor so checkpoint observes
+/// writeback errors even after an unsuccessful write.
 ///
 /// # Errors
-/// Returns an error if the file cannot be opened or written.
+/// The outer error reports directory/open failures before writing begins.
 pub async fn persist_offset_retained(
     path: &str,
     offset: u64,
     existing: Option<compio::fs::File>,
-) -> Result<compio::fs::File, IggyError> {
+) -> Result<(io::Result<()>, compio::fs::File), IggyError> {
     let mut file = if let Some(file) = existing {
         file
     } else {
@@ -151,11 +152,8 @@ pub async fn persist_offset_retained(
             .await
             .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?
     };
-    file.write_all_at(encode_offset_record(offset), 0)
-        .await
-        .0
-        .map_err(|_| IggyError::CannotWriteToFile)?;
-    Ok(file)
+    let result = file.write_all_at(encode_offset_record(offset), 0).await.0;
+    Ok((result, file))
 }
 
 async fn write_in_place<const N: usize>(path: &str, record: [u8; N]) -> Result<(), IggyError> {

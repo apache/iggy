@@ -23,6 +23,9 @@ use tracing::warn;
 #[cfg(target_os = "linux")]
 use nix::fcntl::{FallocateFlags, fallocate};
 
+#[cfg(not(target_os = "linux"))]
+static PREALLOCATION_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub path: PathBuf,
@@ -93,11 +96,13 @@ pub fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
 /// Reserve segment space when supported, without changing its logical length.
 #[cfg(not(target_os = "linux"))]
 pub fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) {
-    warn!(
-        target: "iggy.partitions.storage",
-        file = %file_path.display(),
-        "file preallocation is unavailable on this platform, using buffered allocation"
-    );
+    PREALLOCATION_UNAVAILABLE.call_once(|| {
+        warn!(
+            target: "iggy.partitions.storage",
+            file = %file_path.display(),
+            "file preallocation is unavailable on this platform, using buffered allocation"
+        );
+    });
 }
 
 /// Asynchronously walks a directory tree iteratively (without recursion).

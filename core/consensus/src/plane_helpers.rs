@@ -561,7 +561,7 @@ where
 /// `debug`, not `warn`, matching `tick_partitions` / `tick_metadata`: a hold is the
 /// steady state for a whole rejoin, so `warn` is one line per group per tick. A
 /// hold that never clears is caught by a simulator invariant, not by this line.
-fn report_uncommittable_head(
+pub fn report_uncommittable_head(
     replica: u8,
     head_op: u64,
     commit_min: u64,
