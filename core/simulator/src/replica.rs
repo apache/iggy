@@ -407,7 +407,6 @@ pub fn new_shard(
         on_client_request,
         on_metadata_submit,
         on_list_clients,
-        on_partition_read,
         // Step 6 keeps this to register client sessions; unused shell-off.
         sessions: _,
     } = if shell {
@@ -431,7 +430,6 @@ pub fn new_shard(
             on_client_request,
             on_metadata_submit,
             on_list_clients,
-            on_partition_read,
             metadata,
             partitions,
             senders,

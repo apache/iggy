@@ -19,10 +19,12 @@ pub mod builder;
 pub mod config;
 pub mod coordinator;
 pub mod metrics;
+mod poll;
 mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
+pub use poll::PollCompleted;
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
@@ -366,15 +368,12 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
-    /// The read was refused and returns no messages, even where fragments were
-    /// already gathered. For a poll with `auto_commit`, `TooManyConsumerOffsets`
-    /// when the poll needed a new offset key past `[partition]
-    /// consumer_offsets_max`, and `TransientNotAccepted` when the auto-commit
-    /// could not be submitted: the owning shard's inbox was full, or the
-    /// partition changed primary or incarnation during the read. Transient
-    /// refusal also covers any read while the partition requires state transfer,
-    /// and permits retrying. A capacity refusal needs a slot reclaimed
-    /// or a higher configured limit before a new key can succeed.
+    /// The read was refused and returns no messages. A poll that needs a new
+    /// consumer offset key beyond the configured limit returns
+    /// `TooManyConsumerOffsets`. A completion whose history changed, whose owner
+    /// inbox is unavailable, or whose automatic commit cannot be admitted returns
+    /// `TransientNotAccepted`, allowing the client to retry. Reads also return
+    /// `TransientNotAccepted` while the partition requires state transfer.
     Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
     /// committed offsets on this partition (each `None` if absent).
@@ -401,12 +400,6 @@ pub enum PartitionReadReply {
     /// instead of an empty result.
     NotFound,
 }
-
-/// Handler the owning shard runs for an inbound
-/// [`LifecycleFrame::PartitionRead`]. The server wires it to its partitions
-/// plane; the handler pushes the result back over the carried reply sender.
-pub type PartitionReadHandler =
-    Rc<dyn Fn(IggyNamespace, PartitionRead, Sender<PartitionReadReply>)>;
 
 /// Reply budget for a cross-shard [`IggyShard::partition_read`]. Bounds a
 /// wedged owning shard; the caller maps expiry to a client-visible error.
@@ -772,12 +765,8 @@ pub enum LifecycleFrame {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
     },
-    /// Local auto-commit submission. The guard travels with the frame so an
-    /// inbox drop or admission refusal releases its provisional key directly.
-    AutoCommitSubmit {
-        request: Message<RoutedRequestHeader>,
-        reservation: partitions::AutoCommitReservation,
-    },
+    /// Return a disk read to the owner before any consumer progress changes.
+    PollCompleted(Box<PollCompleted>),
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
@@ -1441,11 +1430,6 @@ where
     /// the simulator stub ctor.
     on_list_clients: ListClientsHandler,
 
-    /// Handler for inbound [`LifecycleFrame::PartitionRead`] queries.
-    /// The server wires it to this shard's partitions plane. Defaults to a
-    /// no-op for the simulator stub ctor.
-    on_partition_read: PartitionReadHandler,
-
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
     /// same channel path as remote routing.
@@ -1726,7 +1710,6 @@ where
         on_client_request: RequestHandler,
         on_metadata_submit: MetadataSubmitHandler,
         on_list_clients: ListClientsHandler,
-        on_partition_read: PartitionReadHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
@@ -1754,7 +1737,6 @@ where
             on_client_request,
             on_metadata_submit,
             on_list_clients,
-            on_partition_read,
             senders,
             shard_count,
             inbox,
@@ -2107,32 +2089,6 @@ where
         })
     }
 
-    /// Submit an auto-commit back to the partition-owning shard's pump.
-    ///
-    /// # Errors
-    /// Returns a refusal if the local inbox cannot accept the frame.
-    pub fn submit_auto_commit_offset(
-        &self,
-        request: Message<RoutedRequestHeader>,
-        reservation: partitions::AutoCommitReservation,
-    ) -> Result<(), PartitionSubmitRefused> {
-        let frame = ShardFrame::lifecycle(LifecycleFrame::AutoCommitSubmit {
-            request,
-            reservation,
-        });
-        let sender = self
-            .senders
-            .get(usize::from(self.id))
-            .ok_or(PartitionSubmitRefused)?;
-        sender.try_send(frame).map_err(|error| {
-            self.metrics.record_frame_drop(
-                crate::metrics::frame_drop_variant::PARTITION_AUTO_COMMIT,
-                crate::coordinator::classify_try_send_err(&error),
-            );
-            PartitionSubmitRefused
-        })
-    }
-
     /// Wait out a submitted write's committed reply.
     ///
     /// `None` = reply channel dropped before a reply (view-change reset, park
@@ -2234,7 +2190,6 @@ where
             on_client_request: std::rc::Rc::new(|_, _| {}),
             on_metadata_submit: std::rc::Rc::new(|_| {}),
             on_list_clients: std::rc::Rc::new(|_| {}),
-            on_partition_read: std::rc::Rc::new(|_, _, _| {}),
             plane,
             coordinator: None,
             senders: Vec::new(),

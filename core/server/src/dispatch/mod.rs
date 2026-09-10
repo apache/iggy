@@ -921,7 +921,6 @@ mod tests {
             Rc::new(|_, _| {}),
             Rc::new(|_| {}),
             Rc::new(|_| {}),
-            Rc::new(|_, _, _| {}),
             metadata,
             partitions,
             vec![sender],

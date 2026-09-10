@@ -2891,6 +2891,7 @@ where
         // on a receiver that missed the purge. Same hazard and same fix as
         // `purge`: wipe the shared read-state slots first, so suspended walks
         // re-resolve by path and see the fresh files.
+        self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
         self.segment_checksum_cache.borrow_mut().clear();
         // Every staging file this install does not rename away is gone by the
@@ -3255,7 +3256,7 @@ where
         }
         self.durable_consumer_offsets.clear();
         self.pending_consumer_offset_commits.clear();
-        self.queued_auto_commit_reservations.borrow_mut().clear();
+
         self.consumer_offset_capacity
             .rebuild(&self.durable_consumer_offsets, std::iter::empty());
         self.consumer_group_offset_capacity
@@ -3507,6 +3508,7 @@ where
         // The empty plant below can land on a base offset this sweep unlinks,
         // so an in-flight poll's cached read fd would keep serving the retired
         // inodes as live data. Same hazard and same fix as `purge`.
+        self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
         while let Some((_, mut storage)) = self.log.retire_front() {
             let _ = storage.shutdown();
@@ -3518,7 +3520,7 @@ where
         self.last_polled_offsets.pin().clear();
         self.durable_consumer_offsets.clear();
         self.pending_consumer_offset_commits.clear();
-        self.queued_auto_commit_reservations.borrow_mut().clear();
+
         for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
             self.consumer_offset_capacity_for(kind)
                 .rebuild(&self.durable_consumer_offsets, std::iter::empty());

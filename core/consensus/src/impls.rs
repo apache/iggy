@@ -36,6 +36,7 @@ use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::poll::{AutoCommitReservation, PollHistoryId};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -268,9 +269,17 @@ impl PipelineEntry {
     }
 }
 
+/// Identity and capacity held by a pending automatic commit.
+#[derive(Debug)]
+pub struct AutoCommitRequestContext {
+    pub history: PollHistoryId,
+    pub reservation: AutoCommitReservation,
+}
+
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
+    auto_commit: Option<AutoCommitRequestContext>,
     pub message: Message<RoutedRequestHeader>,
     /// When the request was parked, in microseconds from the consensus-injected
     /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
@@ -294,6 +303,25 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    #[must_use]
+    pub fn with_auto_commit(
+        message: Message<RoutedRequestHeader>,
+        context: AutoCommitRequestContext,
+    ) -> Self {
+        let mut entry = Self::new(message);
+        entry.auto_commit = Some(context);
+        entry
+    }
+
+    pub const fn take_auto_commit(&mut self) -> Option<AutoCommitRequestContext> {
+        self.auto_commit.take()
+    }
+
+    #[must_use]
+    pub const fn auto_commit(&self) -> Option<&AutoCommitRequestContext> {
+        self.auto_commit.as_ref()
+    }
+
     /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
@@ -322,6 +350,7 @@ impl RequestEntry {
         reply_sender: Option<Sender<Message<ReplyHeader>>>,
     ) -> Self {
         Self {
+            auto_commit: None,
             message,
             received_at: 0,
             reply_sender,
@@ -728,6 +757,11 @@ impl LocalPipeline {
         for entry in &mut self.prepare_queue {
             entry.reply_sender.take();
         }
+    }
+
+    /// Remove pending requests while preserving the order of those retained.
+    pub fn retain_requests(&mut self, mut keep: impl FnMut(&RequestEntry) -> bool) {
+        self.request_queue.retain(|request| keep(request));
     }
 
     /// Drop `request_queue` only; preserve `prepare_queue`. View-change reset.
@@ -4193,6 +4227,10 @@ mod fresh_group_start_tests {
 mod request_queue_tests {
     use super::*;
     use iggy_binary_protocol::{Command, Operation};
+    use iggy_common::ConsumerKind;
+    use server_common::poll::AutoCommitReservationToken;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
@@ -4210,6 +4248,39 @@ mod request_queue_tests {
             ..RoutedRequestHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn queued_contexts_keep_each_reservation_until_their_own_removal() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let keys = Arc::new(AtomicUsize::new(0));
+        let token = Arc::new(AutoCommitReservationToken::new(epoch, Arc::clone(&keys)));
+        let history = PollHistoryId::default();
+        let mut pipeline = LocalPipeline::new();
+        for request in 1..=2 {
+            let context = AutoCommitRequestContext {
+                history: history.clone(),
+                reservation: token.acquire(ConsumerKind::Consumer, 7),
+            };
+            pipeline
+                .push_request(RequestEntry::with_auto_commit(
+                    make_request(1, request),
+                    context,
+                ))
+                .unwrap();
+        }
+        let mut first = pipeline.pop_request().expect("first queued request");
+        let context = first
+            .take_auto_commit()
+            .expect("context follows first request");
+        assert_eq!(first.message.header().request, 1);
+        assert_eq!(context.history, history);
+        drop(context);
+        assert_eq!(token.active_count(), 1);
+        assert_eq!(keys.load(Ordering::Relaxed), 1);
+        pipeline.clear_request_queue();
+        assert_eq!(token.active_count(), 0);
+        assert_eq!(keys.load(Ordering::Relaxed), 0);
     }
 
     #[test]

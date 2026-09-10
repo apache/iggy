@@ -1407,12 +1407,16 @@ impl Simulator {
                 "partition not found for namespace {namespace:?} on replica {replica_idx}"
             )));
         };
-        // Partitions are driven directly, so a poll's auto-commit is never
-        // replicated (the serving shard's job in the real server). Offset discarded.
-        let (fragments, _commit_offset, auto_commit) = futures::executor::block_on(plan.execute())?;
-        if let Some(applied) = auto_commit {
-            applied.admit(|_| Ok::<(), IggyError>(()))?;
+        let partitions = shard.plane.partitions();
+        let completion =
+            partitions.complete_poll(&namespace, futures::executor::block_on(plan.execute()))?;
+        if let Some(replication) = completion.replication {
+            // SimOutbox sends enqueue immediately, so replication cannot suspend.
+            futures::executor::block_on(
+                partitions.replicate_poll_completion(&namespace, replication),
+            );
         }
+        let fragments = completion.fragments;
         Ok(fragments)
     }
 
@@ -1677,6 +1681,7 @@ mod tests {
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
     use consensus::Status;
+    use futures::FutureExt;
     use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
     use iggy_common::ConsumerKind;
     use server_common::sharding::IggyNamespace;
@@ -1699,6 +1704,87 @@ mod tests {
             }
         }
         panic!("request {request_id} did not receive a reply");
+    }
+
+    #[test]
+    fn given_admitted_resident_poll_when_replica_send_stalls_should_reply_before_replication() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let client_id = 1u128;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let mut sim = Simulator::new(
+            3,
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: 0xC011_EC71,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        sim.init_partition(namespace);
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+        let produced = submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            0,
+            client.send_messages(
+                namespace,
+                &[Bytes::from_static(b"reply-before-replication")],
+            ),
+        );
+        assert_eq!(produced.header().status, 0);
+        sim.run_pumps();
+
+        let owner = Rc::clone(sim.replicas[0].partition_shard(namespace));
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let args = PollingArgs::new(iggy_common::PollingStrategy::next(), 1, true);
+        let plan = owner
+            .plane
+            .partitions()
+            .build_poll_snapshot(&namespace, consumer, &args)
+            .expect("poll snapshot");
+        assert!(
+            !plan.needs_off_pump_io(),
+            "fixture must exercise inline resident completion"
+        );
+        drop(plan);
+        let resume_replication = owner.bus.delay_next_replica_send();
+        let (reply, replies) = shard::channel(1);
+        let polling_owner = Rc::clone(&owner);
+        sim.executor.spawn(async move {
+            let result = polling_owner
+                .partition_read(namespace, shard::PartitionRead::Poll { consumer, args })
+                .await;
+            let _ = reply.try_send(result);
+        });
+        sim.executor.run_until_stalled(POLL_BUDGET);
+
+        let result = replies
+            .recv()
+            .now_or_never()
+            .expect("admitted poll replies while replication remains suspended")
+            .expect("reply channel is open")
+            .expect("owning shard answered");
+        let shard::PartitionReadReply::Poll { fragments, .. } = result else {
+            panic!("expected admitted poll reply, got {result:?}");
+        };
+        assert!(!fragments.is_empty());
+        assert!(
+            resume_replication.send(()).is_ok(),
+            "replication must still be waiting after the poll reply"
+        );
+        sim.run_pumps();
+        let progress = owner
+            .plane
+            .partitions()
+            .consumer_offset_read(&namespace, consumer)
+            .expect("partition exists");
+        assert_eq!(progress.0, Some(0), "admission records the served cursor");
     }
 
     #[test]
@@ -2740,7 +2826,7 @@ mod tests {
         }
 
         // Poll through the dispatch shell (`on_client_request`, drain,
-        // `handle_poll_messages`, `partition_read`, `on_partition_read`), running as a
+        // `handle_poll_messages`, `partition_read`, the owning shard), running as a
         // task the executor interleaves with the pump.
         let poll = client.poll_messages(ns, 10);
         sim.submit_request(client_id, 0, poll.into_generic());
@@ -2757,7 +2843,7 @@ mod tests {
 
     /// A `SimClient` poll returns the produced messages through the real dispatch
     /// read path (`on_client_request`, `handle_poll_messages`, `partition_read`,
-    /// `on_partition_read`), running as a task the executor interleaves with the pump,
+    /// the owning shard), running as a task the executor interleaves with the pump,
     /// and the whole login/produce/poll round-trip replays byte-for-byte on one seed.
     #[test]
     fn shell_poll_returns_produced_messages_deterministically() {
@@ -3036,8 +3122,8 @@ mod tests {
     /// Injected through the synthetic `hold_borrow_across_await` rather than the real
     /// read, because the production read has no borrow-holding suspension to seed: the
     /// journal read is a synchronous memory copy, and `with_partition` returns an owned
-    /// `PollPlan` before the only awaits (disk read, offset persist) run off the borrow
-    /// in `spawn_poll_io`.
+    /// `PollPlan` before disk reads run off the borrow. Completion returns to the owner
+    /// before consumer progress changes.
     ///
     /// TODO: once storage faults are modelled, the disk-tier read
     /// (`PollPlan::execute`, `read_disk`) becomes a real seedable await in the read

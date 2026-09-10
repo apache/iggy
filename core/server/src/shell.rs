@@ -39,7 +39,7 @@ use metadata::stm::mux::WithFactory;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use shard::shards_table::PapayaShardsTable;
-use shard::{IggyShard, ListClientsHandler, MetadataSubmitHandler, PartitionReadHandler};
+use shard::{IggyShard, ListClientsHandler, MetadataSubmitHandler};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -90,7 +90,6 @@ pub struct ShellHandlers {
     pub on_client_request: RequestHandler,
     pub on_metadata_submit: MetadataSubmitHandler,
     pub on_list_clients: ListClientsHandler,
-    pub on_partition_read: PartitionReadHandler,
     /// Bound by the client-request handler, read by the get-clients
     /// handler; the caller keeps it to reach locally-homed sessions.
     pub sessions: Rc<RefCell<SessionManager>>,
@@ -108,7 +107,6 @@ impl ShellHandlers {
             on_client_request: Rc::new(|_, _| {}),
             on_metadata_submit: Rc::new(|_| {}),
             on_list_clients: Rc::new(|_| {}),
-            on_partition_read: Rc::new(|_, _, _| {}),
             sessions: Rc::new(RefCell::new(SessionManager::new())),
         }
     }

@@ -16,6 +16,8 @@
 // under the License.
 
 use iggy_common::ConsumerKind;
+pub use server_common::poll::AutoCommitReservation;
+use server_common::poll::AutoCommitReservationToken;
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -172,7 +174,7 @@ pub struct ConsumerOffsetCapacity {
     kind: ConsumerKind,
     limit: Cell<usize>,
     pending: RefCell<HashMap<u32, usize>>,
-    provisional: RefCell<HashMap<u32, Arc<ProvisionalToken>>>,
+    provisional: RefCell<HashMap<u32, Arc<AutoCommitReservationToken>>>,
     active_provisional_keys: Arc<AtomicUsize>,
     stranded: RefCell<HashSet<u32>>,
     uncertain: Cell<bool>,
@@ -263,32 +265,24 @@ impl ConsumerOffsetCapacity {
         self.check(id, durable)?;
         let mut provisional = self.provisional.borrow_mut();
         if provisional.len() >= self.limit.get() && !provisional.contains_key(&id) {
-            provisional.retain(|_, token| token.active.load(Ordering::Relaxed) > 0);
+            provisional.retain(|_, token| token.active_count() > 0);
         }
         let token = Arc::clone(provisional.entry(id).or_insert_with(|| {
-            Arc::new(ProvisionalToken {
-                reclaim_epoch: Arc::clone(&self.reclaim_epoch),
-                active_keys: Arc::clone(&self.active_provisional_keys),
-                active: AtomicUsize::new(0),
-            })
+            Arc::new(AutoCommitReservationToken::new(
+                Arc::clone(&self.reclaim_epoch),
+                Arc::clone(&self.active_provisional_keys),
+            ))
         }));
-        if token.active.fetch_add(1, Ordering::Relaxed) == 0 {
-            token.active_keys.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(AutoCommitReservation {
-            token,
-            kind: self.kind,
-            consumer_id: id,
-        })
+        Ok(token.acquire(self.kind, id))
     }
 
     pub(crate) fn owns(&self, reservation: &AutoCommitReservation) -> bool {
-        reservation.kind == self.kind
+        reservation.kind() == self.kind
             && self
                 .provisional
                 .borrow()
-                .get(&reservation.consumer_id)
-                .is_some_and(|token| Arc::ptr_eq(token, &reservation.token))
+                .get(&reservation.consumer_id())
+                .is_some_and(|token| token.owns(reservation))
     }
 
     pub(crate) fn holds(&self, id: u32, durable: &DurableConsumerOffsets) -> bool {
@@ -298,7 +292,7 @@ impl ConsumerOffsetCapacity {
                 .provisional
                 .borrow()
                 .get(&id)
-                .is_some_and(|token| token.active.load(Ordering::Relaxed) > 0)
+                .is_some_and(|token| token.active_count() > 0)
     }
 
     /// Assigns the pending count outright while [`Self::release_reservation`]
@@ -414,7 +408,7 @@ impl ConsumerOffsetCapacity {
         let mut provisional = self.provisional.borrow_mut();
         if provisional
             .get(&id)
-            .is_some_and(|token| token.active.load(Ordering::Relaxed) == 0)
+            .is_some_and(|token| token.active_count() == 0)
         {
             provisional.remove(&id);
         }
@@ -441,7 +435,7 @@ impl ConsumerOffsetCapacity {
         local.extend(
             provisional
                 .iter()
-                .filter(|(_, token)| token.active.load(Ordering::Relaxed) > 0)
+                .filter(|(_, token)| token.active_count() > 0)
                 .map(|(id, _)| *id),
         );
         local.extend(stranded.iter().copied());
@@ -450,30 +444,6 @@ impl ConsumerOffsetCapacity {
                 .into_iter()
                 .filter(|id| !durable.contains(self.kind, *id))
                 .count()
-    }
-}
-
-/// Keeps a provisional key occupied until the pump admits or drops its request.
-#[derive(Debug)]
-pub struct AutoCommitReservation {
-    token: Arc<ProvisionalToken>,
-    pub(crate) kind: ConsumerKind,
-    pub(crate) consumer_id: u32,
-}
-
-#[derive(Debug)]
-struct ProvisionalToken {
-    reclaim_epoch: Arc<AtomicU64>,
-    active_keys: Arc<AtomicUsize>,
-    active: AtomicUsize,
-}
-
-impl Drop for AutoCommitReservation {
-    fn drop(&mut self) {
-        if self.token.active.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.token.active_keys.fetch_sub(1, Ordering::Relaxed);
-            self.token.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
-        }
     }
 }
 
@@ -543,12 +513,12 @@ mod tests {
         let durable = Rc::new(DurableConsumerOffsets::default());
         let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
         let first = capacity.reserve_provisional(7, &durable).unwrap();
-        let token = Arc::clone(&first.token);
+        let token = Arc::clone(capacity.provisional.borrow().get(&7).unwrap());
         drop(first);
         drop(capacity.reserve_provisional(8, &durable).unwrap());
         assert_eq!(capacity.provisional.borrow().len(), 2);
         let second = capacity.reserve_provisional(7, &durable).unwrap();
-        assert!(Arc::ptr_eq(&token, &second.token));
+        assert!(token.owns(&second));
     }
 
     #[test]

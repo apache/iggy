@@ -736,13 +736,10 @@ where
                 read,
                 reply,
             } => {
-                // Addressed to the shard owning `namespace` (the sender
-                // resolved it via the shards table). The handler (wired by
-                // the server) runs the read against this shard's partitions
-                // plane and pushes the result over `reply`; a dropped
-                // sender means the read is skipped and the gather side
-                // times out.
-                (self.on_partition_read)(namespace, read, reply);
+                self.on_partition_read(namespace, read, reply).await;
+            }
+            LifecycleFrame::PollCompleted(completion) => {
+                self.on_poll_completed(*completion).await;
             }
             LifecycleFrame::PartitionSubmit { request, reply } => {
                 // Addressed to the shard owning the request's namespace (the
@@ -751,15 +748,6 @@ where
                 // awaiting shard never waits out its budget on a decision
                 // already made.
                 self.on_partition_submit(request, reply).await;
-            }
-            LifecycleFrame::AutoCommitSubmit {
-                request,
-                reservation,
-            } => {
-                self.plane
-                    .partitions()
-                    .on_auto_commit_request(request, reservation)
-                    .await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
