@@ -211,7 +211,7 @@ Fatal errors propagate to `main` and exit. Per-connector / per-message errors ar
 
 All families labeled by `connector_key` + `connector_type` (histogram adds `stage`):
 
-- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered}_total` and `iggy_connector_errors_total`. These are the *rendered* names; each is registered without the `_total`, which the OpenMetrics encoder appends.
+- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered,errors}_total`.
   - `messages_filtered_total` - intentional drops via transform `Ok(None)`.
   - `errors_total` - unexpected drops (decode/encode/build failure, missing field, ...) + batch-level failures.
 - **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. Scraped at `/metrics` when `[http.metrics] enabled = true`.
@@ -221,7 +221,7 @@ All families labeled by `connector_key` + `connector_type` (histogram adds `stag
 
 When adding a metric:
 
-- Add family to `Metrics` struct + `init`, register with name + help text. Never end a `Counter` family's registered name in `_total`: the encoder appends it and the series renders `_total_total`. Gauges get no suffix, so a gauge name may end in `_total` literally.
+- Add family to `Metrics` struct + `init`, register with name + help text.
 - New label sets define `EncodeLabelSet` struct + label enum (hand-impl `EncodeLabelValue` for snake_case values - the derive emits PascalCase).
 - Histograms: pass `fn() -> Histogram` to `Family::new_with_constructor`.
 - Add unit tests under `mod tests` with `given_*_when_*_should_*` BDD names.
