@@ -48,6 +48,19 @@ key = "message"
 value.static = "hello"
 ```
 
+## Retry helpers
+
+`retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.
+
+Two items changed in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
+
+| Removed | Replacement |
+| --- | --- |
+| `ConnectivityConfig` | `RetryPolicy`. `max_open_retries` becomes `max_attempts`, `retry_delay` becomes `base_delay`, and `open_retry_max_delay` becomes `max_delay`. |
+| `jitter` (was public) | `retry_backoff`, which applies the jitter itself. |
+
+Both types carry `(u32, Duration, Duration)` and the two delay roles cross over, so a field-by-field rename compiles and swaps the base delay for the cap. Map the fields by name.
+
 ## Protocol Buffers Support
 
 The SDK includes support for Protocol Buffers (protobuf) format with both encoding and decoding capabilities. Protocol Buffers provide efficient serialization and are particularly useful for high-performance data streaming scenarios.

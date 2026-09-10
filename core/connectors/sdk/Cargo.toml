@@ -68,5 +68,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+# `test-util` is not part of `full`; the retry tests need its paused time.
+tokio = { workspace = true, features = ["full", "test-util"] }
+wiremock = { workspace = true }
+
 [lints]
 workspace = true
