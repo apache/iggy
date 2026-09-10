@@ -1,0 +1,1072 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use async_trait::async_trait;
+use iggy::prelude::{
+    Client, CompressionAlgorithm, Consumer, Identifier, IggyClient, IggyError, IggyMessage,
+    MessageClient, PollingStrategy, StreamClient, TopicClient, TopicCreateOptions,
+};
+use iggy_connector_sdk::{
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    retry::{exponential_backoff, jitter, parse_duration},
+    source::SourceBatchResult,
+    source_connector,
+};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fmt,
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+use tokio::{sync::Mutex, time::sleep};
+use tracing::{debug, error, info, warn};
+
+source_connector!(IggySource);
+
+const CONNECTOR_NAME: &str = "Iggy source";
+const DEFAULT_POLL_INTERVAL: &str = "2s";
+const DEFAULT_RETRY_INTERVAL: &str = "1s";
+const DEFAULT_MAX_RETRY_INTERVAL: &str = "60s";
+const DEFAULT_BATCH_SIZE: u32 = 100;
+const MAX_BATCH_SIZE: u32 = 10_000;
+const AUTO_CREATED_PARTITIONS_COUNT: u32 = 1;
+
+/// Configuration for the Iggy source connector, replicating a topic from an
+/// upstream Iggy cluster. `connection_string` points at the upstream cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IggySourceConfig {
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
+    pub connection_string: SecretString,
+    pub upstream_stream: String,
+    pub upstream_topic: String,
+    pub poll_interval: Option<String>,
+    pub batch_size: Option<u32>,
+    pub initial_offset: Option<String>,
+    pub include_user_headers: Option<bool>,
+    #[serde(default)]
+    pub malformed_message_policy: MalformedMessagePolicy,
+    pub retry_interval: Option<String>,
+    pub max_retry_interval: Option<String>,
+    pub verbose_logging: Option<bool>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MalformedMessagePolicy {
+    #[default]
+    Block,
+    DropHeaders,
+}
+
+impl fmt::Display for MalformedMessagePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Block => formatter.write_str("block"),
+            Self::DropHeaders => formatter.write_str("drop_headers"),
+        }
+    }
+}
+
+/// Starting point for a partition that has no saved offset in the state yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialOffset {
+    Earliest,
+    Latest,
+    Offset(u64),
+}
+
+impl FromStr for InitialOffset {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "earliest" => Ok(Self::Earliest),
+            "latest" => Ok(Self::Latest),
+            other => other.parse::<u64>().map(Self::Offset).map_err(|_| ()),
+        }
+    }
+}
+
+/// Committed state. `offsets` maps each upstream partition to the offset of
+/// the last message confirmed by the runtime after both the downstream send
+/// and checkpoint save succeeded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct State {
+    offsets: HashMap<u32, u64>,
+    messages_synced: u64,
+    errors_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct PollCycleCounts {
+    successful_upstream_polls: u64,
+    upstream_poll_errors: u64,
+    conversion_errors: u64,
+}
+
+impl PollCycleCounts {
+    fn total_errors(&self) -> u64 {
+        self.upstream_poll_errors + self.conversion_errors
+    }
+
+    fn requires_backoff(&self) -> bool {
+        self.upstream_poll_errors > 0 && self.successful_upstream_polls == 0
+    }
+}
+
+#[derive(Debug)]
+pub struct IggySource {
+    id: u32,
+    config: IggySourceConfig,
+    client: Option<IggyClient>,
+    state: Mutex<State>,
+    pending_state: Mutex<Option<State>>,
+    partitions: Vec<u32>,
+    stream_id: Option<Identifier>,
+    topic_id: Option<Identifier>,
+    poll_interval: Duration,
+    retry_interval: Duration,
+    max_retry_interval: Duration,
+    consecutive_failed_poll_cycles: AtomicU64,
+    initial_offset: InitialOffset,
+    batch_size: u32,
+    include_user_headers: bool,
+    malformed_message_policy: MalformedMessagePolicy,
+    verbose: bool,
+}
+
+impl IggySource {
+    pub fn new(id: u32, config: IggySourceConfig, state: Option<ConnectorState>) -> Self {
+        let verbose = config.verbose_logging.unwrap_or(false);
+        let restored_state = state
+            .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
+            .inspect(|s| {
+                info!(
+                    "Restored state for {CONNECTOR_NAME} connector ID: {id}. \
+                     Offsets: {:?}, messages synced: {}, errors: {}",
+                    s.offsets, s.messages_synced, s.errors_count
+                );
+            });
+
+        let poll_interval = parse_duration(config.poll_interval.as_deref(), DEFAULT_POLL_INTERVAL);
+        let retry_interval =
+            parse_duration(config.retry_interval.as_deref(), DEFAULT_RETRY_INTERVAL);
+        let max_retry_interval = parse_duration(
+            config.max_retry_interval.as_deref(),
+            DEFAULT_MAX_RETRY_INTERVAL,
+        );
+
+        let initial_offset = config
+            .initial_offset
+            .as_deref()
+            .map(InitialOffset::from_str)
+            .and_then(Result::ok)
+            .unwrap_or_else(|| {
+                warn!(
+                    "Invalid initial offset {:?} for {CONNECTOR_NAME} connector ID: {id}, \
+                     defaulting to earliest",
+                    config.initial_offset
+                );
+                InitialOffset::Earliest
+            });
+
+        let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        let include_user_headers = config.include_user_headers.unwrap_or(true);
+        let malformed_message_policy = config.malformed_message_policy;
+
+        IggySource {
+            id,
+            config,
+            client: None,
+            state: Mutex::new(restored_state.unwrap_or(State {
+                offsets: HashMap::new(),
+                messages_synced: 0,
+                errors_count: 0,
+            })),
+            pending_state: Mutex::new(None),
+            partitions: Vec::new(),
+            stream_id: None,
+            topic_id: None,
+            poll_interval,
+            retry_interval,
+            max_retry_interval,
+            consecutive_failed_poll_cycles: AtomicU64::new(0),
+            initial_offset,
+            batch_size,
+            include_user_headers,
+            malformed_message_policy,
+            verbose,
+        }
+    }
+
+    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
+        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
+    }
+
+    async fn ensure_stream_and_topic(
+        &self,
+        client: &IggyClient,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<(), Error> {
+        match client.get_stream(stream_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                warn!(
+                    "Upstream stream '{}' does not exist, creating it for {CONNECTOR_NAME} \
+                     connector ID: {}",
+                    self.config.upstream_stream, self.id
+                );
+                client
+                    .create_stream(&self.config.upstream_stream)
+                    .await
+                    .map_err(|e| {
+                        Error::InitError(format!(
+                            "Failed to create upstream stream '{}': {e}",
+                            self.config.upstream_stream
+                        ))
+                    })?;
+            }
+            Err(e) => {
+                return Err(Error::InitError(format!(
+                    "Failed to check upstream stream '{}': {e}",
+                    self.config.upstream_stream
+                )));
+            }
+        }
+
+        match client.get_topic(stream_id, topic_id).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                warn!(
+                    "Upstream topic '{}' does not exist, creating it with \
+                     {AUTO_CREATED_PARTITIONS_COUNT} partition(s) for {CONNECTOR_NAME} \
+                     connector ID: {}",
+                    self.config.upstream_topic, self.id
+                );
+                client
+                    .create_topic(
+                        stream_id,
+                        &self.config.upstream_topic,
+                        &TopicCreateOptions {
+                            partitions_count: Some(AUTO_CREATED_PARTITIONS_COUNT),
+                            compression_algorithm: Some(CompressionAlgorithm::None),
+                            ..TopicCreateOptions::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::InitError(format!(
+                            "Failed to create upstream topic '{}': {e}",
+                            self.config.upstream_topic
+                        ))
+                    })?;
+                Ok(())
+            }
+            Err(e) => Err(Error::InitError(format!(
+                "Failed to check upstream topic '{}': {e}",
+                self.config.upstream_topic
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl Source for IggySource {
+    async fn open(&mut self) -> Result<(), Error> {
+        validate_batch_size(self.batch_size)?;
+
+        let redacted = redact_connection_string(self.config.connection_string.expose_secret());
+        info!(
+            "Opening {CONNECTOR_NAME} connector ID: {}, upstream: {}/{} at {}",
+            self.id, self.config.upstream_stream, self.config.upstream_topic, redacted
+        );
+
+        let client =
+            IggyClient::from_connection_string(self.config.connection_string.expose_secret())
+                .map_err(|e| {
+                    Error::InitError(format!("Failed to parse upstream connection string: {e}"))
+                })?;
+
+        client.connect().await.map_err(|e| {
+            Error::InitError(format!("Failed to connect to upstream Iggy cluster: {e}"))
+        })?;
+
+        let stream_id = Identifier::named(&self.config.upstream_stream).map_err(|_| {
+            Error::InvalidConfigValue(format!(
+                "Invalid upstream stream name '{}'",
+                self.config.upstream_stream
+            ))
+        })?;
+        let topic_id = Identifier::named(&self.config.upstream_topic).map_err(|_| {
+            Error::InvalidConfigValue(format!(
+                "Invalid upstream topic name '{}'",
+                self.config.upstream_topic
+            ))
+        })?;
+
+        self.stream_id = Some(stream_id.clone());
+        self.topic_id = Some(topic_id.clone());
+
+        self.ensure_stream_and_topic(&client, &stream_id, &topic_id)
+            .await?;
+
+        let topic = client
+            .get_topic(&stream_id, &topic_id)
+            .await
+            .map_err(|e| Error::InitError(format!("Failed to fetch upstream topic details: {e}")))?
+            .ok_or_else(|| {
+                Error::InitError(format!(
+                    "Upstream topic '{}/{}' not found after creation",
+                    self.config.upstream_stream, self.config.upstream_topic
+                ))
+            })?;
+        self.partitions = topic
+            .partitions
+            .iter()
+            .map(|partition| partition.id)
+            .collect();
+
+        self.client = Some(client);
+        info!(
+            "Opened {CONNECTOR_NAME} connector ID: {}, partitions: {}, initial offset: {:?}, \
+             poll interval: {:?}, batch size: {}, malformed message policy: {}",
+            self.id,
+            self.partitions.len(),
+            self.initial_offset,
+            self.poll_interval,
+            self.batch_size,
+            self.malformed_message_policy
+        );
+        Ok(())
+    }
+
+    async fn poll(&self) -> Result<ProducedMessages, Error> {
+        sleep(self.poll_interval).await;
+
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| Error::InitError("Upstream client not connected".to_string()))?;
+        let stream_id = self
+            .stream_id
+            .as_ref()
+            .ok_or_else(|| Error::InitError("Upstream stream not initialized".to_string()))?;
+        let topic_id = self
+            .topic_id
+            .as_ref()
+            .ok_or_else(|| Error::InitError("Upstream topic not initialized".to_string()))?;
+
+        let failed_cycles = self.consecutive_failed_poll_cycles.load(Ordering::Relaxed);
+        if failed_cycles > 0 {
+            let delay = jitter(exponential_backoff(
+                self.retry_interval,
+                failed_cycles as u32,
+                self.max_retry_interval,
+            ));
+            debug!(
+                "Backing off for {delay:?} after {failed_cycles} consecutive poll cycles with no \
+                 successful partitions for \
+                 {CONNECTOR_NAME} connector ID: {}",
+                self.id
+            );
+            sleep(delay).await;
+        }
+
+        let consumer = Consumer::default();
+
+        let mut candidate_state = self.state.lock().await.clone();
+
+        let mut messages = Vec::with_capacity(self.batch_size as usize);
+        let mut cycle_counts = PollCycleCounts::default();
+
+        for &partition_id in &self.partitions {
+            let strategy = next_strategy(
+                self.initial_offset,
+                candidate_state.offsets.get(&partition_id).copied(),
+            );
+            let polled = client
+                .poll_messages(
+                    stream_id,
+                    topic_id,
+                    Some(partition_id),
+                    &consumer,
+                    &strategy,
+                    self.batch_size,
+                    false,
+                )
+                .await;
+
+            match polled {
+                Ok(polled) => {
+                    cycle_counts.successful_upstream_polls += 1;
+                    if polled.messages.is_empty() {
+                        continue;
+                    }
+                    let PartitionBuildOutcome {
+                        messages: partition_messages,
+                        last_produced_offset,
+                        errors: conversion_errors,
+                    } = build_produced_messages(
+                        &polled.messages,
+                        self.include_user_headers,
+                        self.malformed_message_policy,
+                    );
+
+                    cycle_counts.conversion_errors += conversion_errors.len() as u64;
+                    for conversion_error in conversion_errors {
+                        error!(
+                            "Failed to convert upstream message at offset {} on partition \
+                             {partition_id} for {CONNECTOR_NAME} connector ID: {}. \
+                             Malformed message policy: {}. {}",
+                            conversion_error.offset,
+                            self.id,
+                            self.malformed_message_policy,
+                            conversion_error.error
+                        );
+                    }
+
+                    messages.extend(partition_messages);
+                    if let Some(last_produced_offset) = last_produced_offset {
+                        candidate_state
+                            .offsets
+                            .insert(partition_id, last_produced_offset);
+                    }
+                }
+                Err(IggyError::InvalidOffset(offset)) => {
+                    cycle_counts.upstream_poll_errors += 1;
+                    warn!(
+                        "Saved offset {offset} for partition {partition_id} no longer valid \
+                         for {CONNECTOR_NAME} connector ID: {}, resetting to initial offset",
+                        self.id
+                    );
+                    candidate_state.offsets.remove(&partition_id);
+                }
+                Err(poll_error) => {
+                    cycle_counts.upstream_poll_errors += 1;
+                    error!(
+                        "Failed to poll partition {partition_id} for {CONNECTOR_NAME} \
+                         connector ID: {}: {poll_error}",
+                        self.id
+                    );
+                }
+            }
+        }
+
+        candidate_state.messages_synced += messages.len() as u64;
+        candidate_state.errors_count += cycle_counts.total_errors();
+        let total_synced = candidate_state.messages_synced;
+        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
+            Error::Serialization("failed to serialize Iggy source state".to_string())
+        })?;
+        *self.pending_state.lock().await = Some(candidate_state);
+
+        if cycle_counts.requires_backoff() {
+            self.consecutive_failed_poll_cycles
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.consecutive_failed_poll_cycles
+                .store(0, Ordering::Relaxed);
+        }
+
+        if self.verbose {
+            info!(
+                "{CONNECTOR_NAME} connector ID: {} polled {} messages from {} partition(s). \
+                 Total synced: {}, poll errors in cycle: {}, conversion errors in cycle: {}",
+                self.id,
+                messages.len(),
+                self.partitions.len(),
+                total_synced,
+                cycle_counts.upstream_poll_errors,
+                cycle_counts.conversion_errors
+            );
+        } else {
+            debug!(
+                "{CONNECTOR_NAME} connector ID: {} polled {} messages from {} partition(s). \
+                 Total synced: {}, poll errors in cycle: {}, conversion errors in cycle: {}",
+                self.id,
+                messages.len(),
+                self.partitions.len(),
+                total_synced,
+                cycle_counts.upstream_poll_errors,
+                cycle_counts.conversion_errors
+            );
+        }
+
+        Ok(ProducedMessages {
+            schema: Schema::Raw,
+            messages,
+            state: Some(persisted_state),
+        })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate_state = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(candidate_state) = candidate_state
+        {
+            *self.state.lock().await = candidate_state;
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        if let Some(client) = self.client.take()
+            && let Err(e) = client.disconnect().await
+        {
+            warn!(
+                "Failed to disconnect from upstream cluster for {CONNECTOR_NAME} \
+                 connector ID: {}: {e}",
+                self.id
+            );
+        }
+
+        let state = self.state.lock().await;
+        info!(
+            "{CONNECTOR_NAME} connector ID: {} closed. Total messages synced: {}, total errors: {}",
+            self.id, state.messages_synced, state.errors_count
+        );
+        Ok(())
+    }
+}
+
+fn validate_batch_size(batch_size: u32) -> Result<(), Error> {
+    if !(1..=MAX_BATCH_SIZE).contains(&batch_size) {
+        return Err(Error::InvalidConfigValue(format!(
+            "batch_size must be between 1 and {MAX_BATCH_SIZE}, got {batch_size}"
+        )));
+    }
+    Ok(())
+}
+
+fn next_strategy(initial: InitialOffset, saved_offset: Option<u64>) -> PollingStrategy {
+    match saved_offset {
+        Some(offset) => PollingStrategy::offset(offset.saturating_add(1)),
+        None => match initial {
+            InitialOffset::Earliest => PollingStrategy::first(),
+            InitialOffset::Latest => PollingStrategy::last(),
+            InitialOffset::Offset(offset) => PollingStrategy::offset(offset),
+        },
+    }
+}
+
+#[derive(Debug)]
+struct PartitionBuildOutcome {
+    messages: Vec<ProducedMessage>,
+    last_produced_offset: Option<u64>,
+    errors: Vec<MessageBuildError>,
+}
+
+#[derive(Debug)]
+struct MessageBuildError {
+    offset: u64,
+    error: Error,
+}
+
+fn build_produced_messages(
+    messages: &[IggyMessage],
+    include_user_headers: bool,
+    malformed_message_policy: MalformedMessagePolicy,
+) -> PartitionBuildOutcome {
+    let mut produced_messages = Vec::with_capacity(messages.len());
+    let mut last_produced_offset = None;
+    let mut errors = Vec::new();
+
+    for message in messages {
+        let headers = if include_user_headers {
+            match message.user_headers_map() {
+                Ok(headers) => headers,
+                Err(error) => {
+                    errors.push(MessageBuildError {
+                        offset: message.header.offset,
+                        error: Error::InvalidRecordValue(format!(
+                            "Failed to parse upstream user headers: {error}"
+                        )),
+                    });
+                    if malformed_message_policy == MalformedMessagePolicy::Block {
+                        break;
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        last_produced_offset = Some(message.header.offset);
+        produced_messages.push(ProducedMessage {
+            id: (message.header.id != 0).then_some(message.header.id),
+            headers,
+            checksum: None,
+            timestamp: None,
+            origin_timestamp: (message.header.origin_timestamp != 0)
+                .then_some(message.header.origin_timestamp),
+            payload: message.payload.to_vec(),
+        });
+    }
+
+    PartitionBuildOutcome {
+        messages: produced_messages,
+        last_produced_offset,
+        errors,
+    }
+}
+
+fn redact_connection_string(connection_string: &str) -> String {
+    let Some(scheme_end) = connection_string.find("://") else {
+        return "***".to_string();
+    };
+    let Some(rest) = connection_string.get(scheme_end + 3..) else {
+        return "***".to_string();
+    };
+    let Some(at_offset) = rest.find('@') else {
+        return "***".to_string();
+    };
+    let userinfo_end = scheme_end + 3 + at_offset;
+    let userinfo = &connection_string[scheme_end + 3..userinfo_end];
+    let redact_from = match userinfo.find(':') {
+        Some(colon) => scheme_end + 3 + colon + 1,
+        None => scheme_end + 3,
+    };
+    let mut redacted = connection_string.to_string();
+    redacted.replace_range(redact_from..userinfo_end, "***");
+    redacted
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use iggy::prelude::{HeaderKey, HeaderValue};
+
+    use super::*;
+
+    fn test_config() -> IggySourceConfig {
+        IggySourceConfig {
+            connection_string: SecretString::from(
+                "iggy+tcp://iggy:iggy@127.0.0.1:8090".to_string(),
+            ),
+            upstream_stream: "upstream_stream".to_string(),
+            upstream_topic: "upstream_topic".to_string(),
+            poll_interval: Some("100ms".to_string()),
+            batch_size: Some(50),
+            initial_offset: Some("0".to_string()),
+            include_user_headers: Some(true),
+            malformed_message_policy: MalformedMessagePolicy::Block,
+            retry_interval: Some("100ms".to_string()),
+            max_retry_interval: Some("5s".to_string()),
+            verbose_logging: Some(false),
+        }
+    }
+
+    fn test_message(offset: u64) -> IggyMessage {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::try_from("key").expect("test header key should be valid"),
+            HeaderValue::try_from("value").expect("test header value should be valid"),
+        );
+        let mut message = IggyMessage::builder()
+            .payload("test payload".into())
+            .user_headers(headers)
+            .build()
+            .expect("test message should be valid");
+        message.header.offset = offset;
+        message
+    }
+
+    fn test_message_with_unknown_header_kind(offset: u64) -> IggyMessage {
+        let mut user_headers = vec![0xFF];
+        user_headers.extend_from_slice(&3u32.to_le_bytes());
+        user_headers.extend_from_slice(b"key");
+        user_headers.push(0xFF);
+        user_headers.extend_from_slice(&5u32.to_le_bytes());
+        user_headers.extend_from_slice(b"value");
+
+        let mut message = test_message(offset);
+        message.header.user_headers_length =
+            u32::try_from(user_headers.len()).expect("test user headers should fit in u32");
+        message.user_headers = Some(user_headers.into());
+        message
+    }
+
+    #[test]
+    fn given_persisted_state_should_restore_offsets_and_counts() {
+        let state = State {
+            offsets: HashMap::from([(0, 42), (1, 7)]),
+            messages_synced: 500,
+            errors_count: 3,
+        };
+
+        let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
+        let connector_state = ConnectorState(serialized);
+
+        let source = IggySource::new(1, test_config(), Some(connector_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let restored = source.state.lock().await;
+            assert_eq!(restored.offsets.get(&0), Some(&42));
+            assert_eq!(restored.offsets.get(&1), Some(&7));
+            assert_eq!(restored.messages_synced, 500);
+            assert_eq!(restored.errors_count, 3);
+        });
+    }
+
+    #[test]
+    fn given_no_state_should_start_fresh() {
+        let source = IggySource::new(1, test_config(), None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = source.state.lock().await;
+            assert!(state.offsets.is_empty());
+            assert_eq!(state.messages_synced, 0);
+            assert_eq!(state.errors_count, 0);
+        });
+    }
+
+    #[test]
+    fn given_invalid_state_should_start_fresh() {
+        let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
+        let source = IggySource::new(1, test_config(), Some(invalid_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = source.state.lock().await;
+            assert!(state.offsets.is_empty());
+            assert_eq!(state.messages_synced, 0);
+            assert_eq!(state.errors_count, 0);
+        });
+    }
+
+    #[test]
+    fn state_should_be_serializable_and_deserializable() {
+        let original = State {
+            offsets: HashMap::from([(2, 1000)]),
+            messages_synced: 1000,
+            errors_count: 5,
+        };
+
+        let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
+        let deserialized: State =
+            rmp_serde::from_slice(&serialized).expect("Failed to deserialize");
+
+        assert_eq!(original.offsets, deserialized.offsets);
+        assert_eq!(original.messages_synced, deserialized.messages_synced);
+        assert_eq!(original.errors_count, deserialized.errors_count);
+    }
+
+    #[test]
+    fn given_only_conversion_errors_should_count_without_requiring_backoff() {
+        let cycle_counts = PollCycleCounts {
+            conversion_errors: 2,
+            ..PollCycleCounts::default()
+        };
+
+        assert_eq!(cycle_counts.total_errors(), 2);
+        assert!(!cycle_counts.requires_backoff());
+    }
+
+    #[test]
+    fn given_all_upstream_polls_failed_should_require_backoff() {
+        let cycle_counts = PollCycleCounts {
+            upstream_poll_errors: 1,
+            ..PollCycleCounts::default()
+        };
+
+        assert_eq!(cycle_counts.total_errors(), 1);
+        assert!(cycle_counts.requires_backoff());
+    }
+
+    #[test]
+    fn given_partial_upstream_poll_success_should_not_require_backoff() {
+        let cycle_counts = PollCycleCounts {
+            successful_upstream_polls: 2,
+            upstream_poll_errors: 1,
+            conversion_errors: 1,
+        };
+
+        assert_eq!(cycle_counts.total_errors(), 2);
+        assert!(!cycle_counts.requires_backoff());
+    }
+
+    #[test]
+    fn serialize_state_helper_should_produce_valid_connector_state() {
+        let source = IggySource::new(1, test_config(), None);
+        let state = State {
+            offsets: HashMap::from([(0, 42)]),
+            messages_synced: 42,
+            errors_count: 0,
+        };
+
+        let connector_state = source.serialize_state(&state);
+        assert!(connector_state.is_some());
+
+        let bytes = connector_state.unwrap().0;
+        let restored: State = rmp_serde::from_slice(&bytes).expect("Failed to deserialize state");
+        assert_eq!(restored.messages_synced, 42);
+    }
+
+    #[test]
+    fn given_nack_when_state_is_staged_should_keep_committed_state() {
+        let source = IggySource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = State {
+                offsets: HashMap::from([(0, 9)]),
+                messages_synced: 10,
+                errors_count: 1,
+            };
+            *source.pending_state.lock().await = Some(State {
+                offsets: HashMap::from([(0, 19)]),
+                messages_synced: 20,
+                errors_count: 2,
+            });
+
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+
+            let committed = source.state.lock().await;
+            assert_eq!(committed.offsets, HashMap::from([(0, 9)]));
+            assert_eq!(committed.messages_synced, 10);
+            assert_eq!(committed.errors_count, 1);
+            drop(committed);
+            assert!(source.pending_state.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn given_ack_when_state_is_staged_should_commit_candidate_state() {
+        let source = IggySource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = State {
+                offsets: HashMap::from([(0, 9)]),
+                messages_synced: 10,
+                errors_count: 1,
+            };
+            *source.pending_state.lock().await = Some(State {
+                offsets: HashMap::from([(0, 19)]),
+                messages_synced: 20,
+                errors_count: 2,
+            });
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+
+            let committed = source.state.lock().await;
+            assert_eq!(committed.offsets, HashMap::from([(0, 19)]));
+            assert_eq!(committed.messages_synced, 20);
+            assert_eq!(committed.errors_count, 2);
+            drop(committed);
+            assert!(source.pending_state.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn config_should_deserialize_from_json_with_defaults() {
+        let json = r#"{
+            "connection_string": "iggy+tcp://iggy:iggy@127.0.0.1:8090",
+            "upstream_stream": "stream",
+            "upstream_topic": "topic"
+        }"#;
+
+        let config: IggySourceConfig = serde_json::from_str(json).expect("Failed to parse config");
+
+        assert_eq!(config.upstream_stream, "stream");
+        assert_eq!(config.upstream_topic, "topic");
+        assert!(config.poll_interval.is_none());
+        assert!(config.initial_offset.is_none());
+        assert_eq!(
+            config.malformed_message_policy,
+            MalformedMessagePolicy::Block
+        );
+    }
+
+    #[test]
+    fn config_should_apply_defaults_in_new() {
+        let json = r#"{
+            "connection_string": "iggy+tcp://iggy:iggy@127.0.0.1:8090",
+            "upstream_stream": "stream",
+            "upstream_topic": "topic"
+        }"#;
+
+        let config: IggySourceConfig = serde_json::from_str(json).expect("Failed to parse config");
+        let source = IggySource::new(1, config, None);
+
+        assert_eq!(source.poll_interval, Duration::from_secs(2));
+        assert_eq!(source.retry_interval, Duration::from_secs(1));
+        assert_eq!(source.max_retry_interval, Duration::from_secs(60));
+        assert_eq!(source.batch_size, DEFAULT_BATCH_SIZE);
+        assert!(source.include_user_headers);
+        assert_eq!(
+            source.malformed_message_policy,
+            MalformedMessagePolicy::Block
+        );
+        assert_eq!(source.initial_offset, InitialOffset::Earliest);
+        assert!(!source.verbose);
+    }
+
+    #[test]
+    fn configured_drop_headers_policy_should_be_applied() {
+        let json = r#"{
+            "connection_string": "iggy+tcp://iggy:iggy@127.0.0.1:8090",
+            "upstream_stream": "stream",
+            "upstream_topic": "topic",
+            "malformed_message_policy": "drop_headers"
+        }"#;
+
+        let config: IggySourceConfig = serde_json::from_str(json).expect("Failed to parse config");
+        let source = IggySource::new(1, config, None);
+
+        assert_eq!(
+            source.malformed_message_policy,
+            MalformedMessagePolicy::DropHeaders
+        );
+    }
+
+    #[test]
+    fn given_invalid_initial_offset_should_default_to_earliest() {
+        let config = IggySourceConfig {
+            initial_offset: Some("not-an-offset".to_string()),
+            ..test_config()
+        };
+
+        let source = IggySource::new(1, config, None);
+        assert_eq!(source.initial_offset, InitialOffset::Earliest);
+    }
+
+    #[test]
+    fn given_out_of_range_batch_size_when_opening_should_reject_config() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for batch_size in [0, MAX_BATCH_SIZE + 1, u32::MAX] {
+                let config = IggySourceConfig {
+                    batch_size: Some(batch_size),
+                    ..test_config()
+                };
+                let mut source = IggySource::new(1, config, None);
+
+                let error = source
+                    .open()
+                    .await
+                    .expect_err("out-of-range batch_size should be rejected");
+
+                assert!(matches!(error, Error::InvalidConfigValue(_)));
+            }
+        });
+    }
+
+    #[test]
+    fn batch_size_at_supported_boundaries_should_be_valid() {
+        assert!(validate_batch_size(1).is_ok());
+        assert!(validate_batch_size(MAX_BATCH_SIZE).is_ok());
+    }
+
+    #[test]
+    fn initial_offset_should_parse_semantics() {
+        assert_eq!(
+            "earliest".parse::<InitialOffset>(),
+            Ok(InitialOffset::Earliest)
+        );
+        assert_eq!("Latest".parse::<InitialOffset>(), Ok(InitialOffset::Latest));
+        assert_eq!("42".parse::<InitialOffset>(), Ok(InitialOffset::Offset(42)));
+        assert!("invalid".parse::<InitialOffset>().is_err());
+    }
+
+    #[test]
+    fn next_strategy_should_jump_after_saved_offset() {
+        assert_eq!(
+            next_strategy(InitialOffset::Earliest, Some(41)),
+            PollingStrategy::offset(42)
+        );
+        assert_eq!(
+            next_strategy(InitialOffset::Earliest, None),
+            PollingStrategy::first()
+        );
+        assert_eq!(
+            next_strategy(InitialOffset::Latest, None),
+            PollingStrategy::last()
+        );
+        assert_eq!(
+            next_strategy(InitialOffset::Offset(7), None),
+            PollingStrategy::offset(7)
+        );
+    }
+
+    #[test]
+    fn given_malformed_message_with_block_policy_should_return_successful_prefix() {
+        let messages = [
+            test_message(10),
+            test_message_with_unknown_header_kind(11),
+            test_message(12),
+        ];
+
+        let result = build_produced_messages(&messages, true, MalformedMessagePolicy::Block);
+
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.last_produced_offset, Some(10));
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].offset, 11);
+        assert!(matches!(
+            &result.errors[0].error,
+            Error::InvalidRecordValue(_)
+        ));
+    }
+
+    #[test]
+    fn given_malformed_message_with_drop_headers_policy_should_forward_entire_batch() {
+        let messages = [
+            test_message(10),
+            test_message_with_unknown_header_kind(11),
+            test_message(12),
+        ];
+
+        let result = build_produced_messages(&messages, true, MalformedMessagePolicy::DropHeaders);
+
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.last_produced_offset, Some(12));
+        assert!(result.messages[0].headers.is_some());
+        assert!(result.messages[1].headers.is_none());
+        assert!(result.messages[2].headers.is_some());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].offset, 11);
+        assert!(matches!(
+            &result.errors[0].error,
+            Error::InvalidRecordValue(_)
+        ));
+    }
+
+    #[test]
+    fn redact_connection_string_should_hide_credentials() {
+        let redacted = redact_connection_string("iggy+tcp://iggy:password@127.0.0.1:8090");
+        assert_eq!(redacted, "iggy+tcp://iggy:***@127.0.0.1:8090");
+        assert!(!redacted.contains("password"));
+
+        let token_redacted = redact_connection_string("iggy+tcp://iggypat-abc123@127.0.0.1:8090");
+        assert_eq!(token_redacted, "iggy+tcp://***@127.0.0.1:8090");
+        assert!(!token_redacted.contains("abc123"));
+
+        assert_eq!(redact_connection_string("not-a-url"), "***");
+    }
+}
