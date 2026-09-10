@@ -39,7 +39,7 @@ pub mod reads;
 pub mod session_ops;
 pub mod submit;
 #[cfg(test)]
-mod test_support;
+pub mod test_support;
 
 use crate::consumer_group::maybe_rewrite_consumer_group_request;
 use crate::dispatch::failure::{
@@ -759,12 +759,8 @@ async fn handle_client_request<B, MJ, S, SB>(
             let request = match maybe_rewrite_consumer_group_request(shard, request).await {
                 Ok(rewritten) => rewritten,
                 Err(error) => {
-                    // Both of the rewrite's own failures are `InvalidCommand`
-                    // decode errors, so a replay cannot help: deny typed
-                    // instead of leaving the lockstep connection to its read
-                    // timeout. (Its third error path needs a body past
-                    // `u32::MAX` against a 64 MiB message cap, so no client
-                    // frame reaches it; the deny is correct there too.)
+                    // Preserve transient recovery rejection so the client can
+                    // retry the join once partition state is available.
                     send_pre_consensus_deny(
                         shard,
                         transport_client_id,

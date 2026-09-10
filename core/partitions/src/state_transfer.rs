@@ -1181,15 +1181,16 @@ pub enum PartitionArtifactSource<'a> {
 }
 
 /// A built partition state-transfer offer: everything at `commit_op`, with
-/// segment payloads addressed by path and only the (small) offsets artifact
-/// resident.
+/// segment payloads addressed by path and the offsets artifact resident.
+///
+/// The offsets artifact can include a full checkpoint prepare.
 #[derive(Debug)]
 pub struct PartitionStateTransferOffer {
     /// `== commit_min == commit_max` at build (caught-up primary gate).
     pub commit_op: u64,
     /// Ascending base offset; one artifact per non-empty retained segment.
     pub segments: Vec<SegmentArtifactSource>,
-    /// The consumer-offsets artifact, resident (a few KB at most).
+    /// Resident consumer offsets, dedup state, and an optional checkpoint prepare.
     pub offsets: (consensus::StateArtifact, std::rc::Rc<Vec<u8>>),
 }
 
@@ -1891,7 +1892,8 @@ where
     /// state the artifacts represent. Segment bytes are NOT loaded here: the
     /// offer records `(entry, path)` and the serving side loads one artifact
     /// at a time, so building costs one streaming checksum pass per segment
-    /// and the resident footprint is just the offsets table.
+    /// and the resident footprint is the offsets artifact, including the
+    /// checkpoint prepare.
     ///
     /// # Errors
     /// [`PartitionTransferUnavailable`]; the requester falls back to journal

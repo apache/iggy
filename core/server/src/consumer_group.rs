@@ -107,11 +107,11 @@ where
 
 /// Gather the group's in-flight partitions (`last_polled` present and
 /// `committed < last_polled`) for the cooperative-rebalance classification. A
-/// not-yet-created group, an unresolved topic, or a partition that does not
-/// answer is treated as not-in-flight (eager handoff). An eager handoff leaves
-/// no `PendingRevocation` record, so the reconciler never revisits it -- a
-/// misclassification here just redelivers the uncommitted range to the new
-/// owner, which is correct under at-least-once.
+/// not-yet-created group, an unresolved topic, or an absent partition reply
+/// is treated as not-in-flight (eager handoff, allowing at-least-once replay).
+/// An explicit rejection aborts the join before replication: missing local
+/// materialization cannot establish whether an existing owner has drained.
+/// A retry gathers ownership and offsets again before clearing stale marks.
 async fn gather_in_flight<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
@@ -260,4 +260,624 @@ where
     };
 
     rewrite_request_body(&request, &rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use consensus::{Consensus, LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
+    use futures::future::{Either, select};
+    use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
+    use iggy_binary_protocol::primitives::ack_level::AckLevel;
+    use iggy_binary_protocol::primitives::consumer::WireConsumer;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::{WireName, WireOptions};
+    use iggy_common::{
+        ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
+        PartitionStats,
+    };
+    use metadata::stm::StateMachine;
+    use partitions::state_transfer::mark_materialization_missing;
+    use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig};
+    use server_common::SegmentStorage;
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    };
+    use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+    use shard::shards_table::ShardsTable;
+    use shard::{LifecycleFrame, Receiver, ShardFrame, shard_channel};
+
+    use super::*;
+    use crate::dispatch::partition::make_partition_read_handler;
+    use crate::dispatch::test_support::{
+        SpyBus, TestShard, prepare_message, request_message, test_shard,
+    };
+
+    const STREAM_ID: WireIdentifier = WireIdentifier::Numeric(0);
+    const TOPIC_ID: WireIdentifier = WireIdentifier::Numeric(0);
+    const GROUP_ID: WireIdentifier = WireIdentifier::Numeric(0);
+    const FIRST_CLIENT: u128 = 11;
+    const SECOND_CLIENT: u128 = 22;
+    const STALE_PARTITION: u32 = 0;
+    const RECOVERING_PARTITION: u32 = 1;
+    const PARTITION_COUNT: u32 = 2;
+    const INBOX_CAPACITY: usize = 16;
+    const LAST_POLLED_OFFSET: u64 = 10;
+    const COMMITTED_OFFSET: u64 = 5;
+
+    #[compio::test]
+    async fn given_rejected_join_when_recovered_should_retry_without_stale_revocations() {
+        let (shard, inbox) = group_shard();
+        let directory = tempfile::tempdir().unwrap();
+        let stale_namespace = namespace(&shard, STALE_PARTITION);
+        let recovering_namespace = namespace(&shard, RECOVERING_PARTITION);
+        let stale = partition(&shard, STALE_PARTITION, &directory.path().join("stale"));
+        record_last_polled(&stale);
+        shard.plane.partitions().insert(stale_namespace, stale);
+        let recovering_dir = directory.path().join("recovering");
+        let mut recovering = partition(&shard, RECOVERING_PARTITION, &recovering_dir);
+        mark_materialization_missing(recovering_dir.to_str().unwrap(), 0)
+            .await
+            .unwrap();
+        recovering.open_persistence().await.unwrap();
+        assert!(recovering.requires_state_transfer());
+        shard
+            .plane
+            .partitions()
+            .insert(recovering_namespace, recovering);
+
+        let streams = shard.plane.metadata().mux_stm.streams();
+        let before = streams
+            .consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID)
+            .unwrap();
+        let rejected = with_partition_reads(
+            &shard,
+            &inbox,
+            maybe_rewrite_consumer_group_request(&shard, join_request(FIRST_CLIENT)),
+        )
+        .await;
+        assert!(matches!(rejected, Err(IggyError::TransientNotAccepted)));
+        assert_eq!(
+            streams.consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID),
+            Some(before)
+        );
+        assert_eq!(
+            shard
+                .plane
+                .partitions()
+                .group_offset_state(&stale_namespace, 0),
+            Some((Some(LAST_POLLED_OFFSET), None)),
+            "rejected join must not execute queued stale clears"
+        );
+
+        recover_partition(&shard, &directory.path().join("donor")).await;
+        let accepted = with_partition_reads(
+            &shard,
+            &inbox,
+            maybe_rewrite_consumer_group_request(&shard, join_request(FIRST_CLIENT)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&accepted))
+                .unwrap()
+                .in_flight
+                .is_empty()
+        );
+        apply_join(&shard, &accepted);
+        assert_eq!(
+            shard
+                .plane
+                .partitions()
+                .group_offset_state(&stale_namespace, 0),
+            Some((None, None)),
+            "successful retry clears the orphan's last-polled mark"
+        );
+        assert_eq!(
+            streams
+                .consumer_group_member_assignment(&STREAM_ID, &TOPIC_ID, &GROUP_ID, FIRST_CLIENT)
+                .unwrap()
+                .1,
+            vec![STALE_PARTITION, RECOVERING_PARTITION]
+        );
+
+        let next_join = with_partition_reads(
+            &shard,
+            &inbox,
+            maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&next_join))
+                .unwrap()
+                .in_flight
+                .is_empty(),
+            "the next join must not misclassify the previously orphaned partition"
+        );
+        apply_join(&shard, &next_join);
+        assert!(!streams.has_pending_revocations());
+        assert_eq!(
+            streams
+                .consumer_group_member_assignment(&STREAM_ID, &TOPIC_ID, &GROUP_ID, SECOND_CLIENT)
+                .unwrap()
+                .1,
+            vec![RECOVERING_PARTITION]
+        );
+    }
+
+    #[compio::test]
+    async fn given_transferring_partition_when_joining_should_preserve_commit_ownership() {
+        for missing in [true, false] {
+            let (shard, inbox) = group_shard();
+            apply_initial_join(&shard);
+            let directory = tempfile::tempdir().unwrap();
+            let mut recovering = partition(&shard, RECOVERING_PARTITION, directory.path());
+            record_last_polled(&recovering);
+            recovering.consumer_group_offsets.pin().insert(
+                ConsumerGroupId(0),
+                ConsumerOffset::new(
+                    ConsumerKind::ConsumerGroup,
+                    0,
+                    COMMITTED_OFFSET,
+                    String::new(),
+                ),
+            );
+            if missing {
+                mark_materialization_missing(directory.path().to_str().unwrap(), 0)
+                    .await
+                    .unwrap();
+                recovering.open_persistence().await.unwrap();
+            } else {
+                recovering.consensus().begin_state_transfer_await();
+            }
+            assert!(recovering.consensus().is_transferring());
+            assert_eq!(recovering.requires_state_transfer(), missing);
+            shard
+                .plane
+                .partitions()
+                .insert(namespace(&shard, RECOVERING_PARTITION), recovering);
+            let streams = shard.plane.metadata().mux_stm.streams();
+            let before = streams
+                .consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID)
+                .unwrap();
+            let assignment = streams
+                .consumer_group_member_assignment(&STREAM_ID, &TOPIC_ID, &GROUP_ID, FIRST_CLIENT)
+                .unwrap();
+
+            let rewritten = with_partition_reads(
+                &shard,
+                &inbox,
+                maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
+            )
+            .await;
+            if missing {
+                assert!(matches!(rewritten, Err(IggyError::TransientNotAccepted)));
+                assert_eq!(
+                    streams.consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID),
+                    Some(before)
+                );
+                assert_eq!(
+                    streams.consumer_group_member_assignment(
+                        &STREAM_ID,
+                        &TOPIC_ID,
+                        &GROUP_ID,
+                        FIRST_CLIENT
+                    ),
+                    Some(assignment),
+                    "rejection must preserve generation and the existing owner's assignment"
+                );
+                assert!(
+                    streams
+                        .consumer_group_member_assignment(
+                            &STREAM_ID,
+                            &TOPIC_ID,
+                            &GROUP_ID,
+                            SECOND_CLIENT
+                        )
+                        .is_none()
+                );
+                assert!(!streams.has_pending_revocations());
+            } else {
+                let rewritten = rewritten.unwrap();
+                assert_eq!(
+                    ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&rewritten))
+                        .unwrap()
+                        .in_flight,
+                    vec![RECOVERING_PARTITION]
+                );
+                apply_join(&shard, &rewritten);
+                assert!(streams.has_pending_revocations());
+                assert_eq!(
+                    streams.consumer_group_fence(
+                        &STREAM_ID,
+                        &TOPIC_ID,
+                        &GROUP_ID,
+                        FIRST_CLIENT,
+                        RECOVERING_PARTITION,
+                        true
+                    ),
+                    None,
+                    "cooperative revocation stops new polls while the owner drains"
+                );
+            }
+            assert_eq!(
+                streams.consumer_group_fence(
+                    &STREAM_ID,
+                    &TOPIC_ID,
+                    &GROUP_ID,
+                    FIRST_CLIENT,
+                    RECOVERING_PARTITION,
+                    false
+                ),
+                Some(0),
+                "the existing owner must retain permission to commit its in-flight batch"
+            );
+            assert_eq!(
+                streams.consumer_group_fence(
+                    &STREAM_ID,
+                    &TOPIC_ID,
+                    &GROUP_ID,
+                    SECOND_CLIENT,
+                    RECOVERING_PARTITION,
+                    false
+                ),
+                None
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_unanswered_or_missing_partitions_when_joining_should_allow_eager_handoff() {
+        let (shard, inbox) = group_shard();
+        apply_initial_join(&shard);
+        let unanswered = namespace(&shard, STALE_PARTITION);
+        shard.shards_table().remove(&unanswered);
+        assert!(
+            shard
+                .partition_read(unanswered, PartitionRead::GroupOffsetState { group_id: 0 })
+                .await
+                .is_none()
+        );
+        let not_found = with_partition_reads(
+            &shard,
+            &inbox,
+            shard.partition_read(
+                namespace(&shard, RECOVERING_PARTITION),
+                PartitionRead::GroupOffsetState { group_id: 0 },
+            ),
+        )
+        .await;
+        assert!(matches!(not_found, Some(PartitionReadReply::NotFound)));
+
+        let rewritten = with_partition_reads(
+            &shard,
+            &inbox,
+            maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&rewritten))
+                .unwrap()
+                .in_flight
+                .is_empty()
+        );
+        apply_join(&shard, &rewritten);
+        let streams = shard.plane.metadata().mux_stm.streams();
+        assert!(!streams.has_pending_revocations());
+        assert_eq!(
+            streams
+                .consumer_group_member_assignment(&STREAM_ID, &TOPIC_ID, &GROUP_ID, SECOND_CLIENT)
+                .unwrap()
+                .1,
+            vec![RECOVERING_PARTITION]
+        );
+    }
+
+    fn group_shard() -> (Rc<TestShard>, Receiver<ShardFrame>) {
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 3, 1);
+        let (sender, inbox, _replies) = shard_channel(0, INBOX_CAPACITY, INBOX_CAPACITY);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let mux = &shard.plane.metadata().mux_stm;
+        mux.update(prepare_message(
+            Operation::CreateStream,
+            FIRST_CLIENT,
+            1,
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes(),
+        ))
+        .unwrap();
+        mux.update(prepare_message(
+            Operation::CreateTopicWithAssignments,
+            FIRST_CLIENT,
+            2,
+            &CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: STREAM_ID,
+                    partitions_count: PARTITION_COUNT,
+                    name: WireName::new("topic").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: (0..PARTITION_COUNT)
+                    .map(|partition_id| CreatedPartitionAssignment {
+                        partition_id,
+                        consensus_group_id: u64::from(partition_id) + 1,
+                    })
+                    .collect(),
+                created_view: 0,
+            }
+            .to_bytes(),
+        ))
+        .unwrap();
+        mux.update(prepare_message(
+            Operation::CreateConsumerGroup,
+            FIRST_CLIENT,
+            3,
+            &CreateConsumerGroupRequest {
+                stream_id: STREAM_ID,
+                topic_id: TOPIC_ID,
+                name: WireName::new("group").unwrap(),
+            }
+            .to_bytes(),
+        ))
+        .unwrap();
+        for partition_id in 0..PARTITION_COUNT {
+            shard.shards_table().insert(
+                namespace(&shard, partition_id),
+                PartitionLocation::new(ShardId::new(0), 0),
+            );
+        }
+        (shard, inbox)
+    }
+
+    fn namespace(shard: &Rc<TestShard>, partition_id: u32) -> IggyNamespace {
+        resolve_partition_namespace(shard, &STREAM_ID, &TOPIC_ID, Some(partition_id)).unwrap()
+    }
+
+    fn partition(
+        shard: &Rc<TestShard>,
+        partition_id: u32,
+        directory: &Path,
+    ) -> IggyPartition<SpyBus> {
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            namespace(shard, partition_id).inner(),
+            SpyBus::default(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            shard.plane.partitions().config().segment_size,
+        );
+        let consumers = directory.join("offsets/consumers");
+        let groups = directory.join("offsets/groups");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::create_dir_all(&groups).unwrap();
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.configure_consumer_offset_storage(
+            consumers.to_string_lossy().into_owned(),
+            groups.to_string_lossy().into_owned(),
+            ConsumerOffsets::with_capacity(0),
+            ConsumerGroupOffsets::with_capacity(1),
+        );
+        partition
+    }
+
+    fn record_last_polled(partition: &IggyPartition<SpyBus>) {
+        partition.last_polled_offsets.pin().insert(
+            ConsumerGroupId(0),
+            ConsumerOffset::new(
+                ConsumerKind::ConsumerGroup,
+                0,
+                LAST_POLLED_OFFSET,
+                String::new(),
+            ),
+        );
+    }
+
+    fn join_request(client: u128) -> Message<RoutedRequestHeader> {
+        request_message(
+            Operation::JoinConsumerGroup,
+            client,
+            1,
+            1,
+            &WireJoinConsumerGroupRequest {
+                stream_id: STREAM_ID,
+                topic_id: TOPIC_ID,
+                group_id: GROUP_ID,
+            }
+            .to_bytes(),
+        )
+    }
+
+    fn apply_initial_join(shard: &Rc<TestShard>) {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::JoinConsumerGroup,
+                FIRST_CLIENT,
+                4,
+                &ReplicatedJoinConsumerGroupRequest {
+                    stream_id: STREAM_ID,
+                    topic_id: TOPIC_ID,
+                    group_id: GROUP_ID,
+                    client_id: FIRST_CLIENT,
+                    in_flight: Vec::new(),
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+    }
+
+    fn apply_join(shard: &Rc<TestShard>, request: &Message<RoutedRequestHeader>) {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::JoinConsumerGroup,
+                request.header().client,
+                request.header().request,
+                request_body(request),
+            ))
+            .unwrap();
+    }
+
+    async fn with_partition_reads<T>(
+        shard: &Rc<TestShard>,
+        inbox: &Receiver<ShardFrame>,
+        operation: impl Future<Output = T>,
+    ) -> T {
+        let handle = Rc::new(RefCell::new(Some(Rc::downgrade(shard))));
+        let handler = make_partition_read_handler(&handle);
+        let serve = async {
+            loop {
+                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    namespace,
+                    read,
+                    reply,
+                }) = inbox.recv().await.unwrap()
+                else {
+                    panic!("unexpected frame while serving the join's partition reads");
+                };
+                handler(namespace, read, reply);
+            }
+        };
+        match select(Box::pin(operation), Box::pin(serve)).await {
+            Either::Left((result, _)) => result,
+            Either::Right(_) => {
+                unreachable!("partition read service runs until the request completes")
+            }
+        }
+    }
+
+    async fn recover_partition(shard: &Rc<TestShard>, donor_dir: &Path) {
+        let mut donor = partition(shard, RECOVERING_PARTITION, donor_dir);
+        attach_segment_files(&mut donor, donor_dir).await;
+        let body = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer_group(GROUP_ID),
+            stream_id: STREAM_ID,
+            topic_id: TOPIC_ID,
+            partition_id: Some(RECOVERING_PARTITION),
+            offset: COMMITTED_OFFSET,
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        let config = shard.plane.partitions().config();
+        commit_donor_prepare(&mut donor, config, Operation::StoreConsumerOffset, &body).await;
+        let mut messages =
+            IggyMessages::with_capacity(usize::try_from(COMMITTED_OFFSET + 1).unwrap());
+        for _ in 0..=COMMITTED_OFFSET {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader::default(),
+                payload: Bytes::from_static(b"recovered"),
+                user_headers: None,
+            });
+        }
+        let batch =
+            SendMessagesOwned::from_messages(namespace(shard, RECOVERING_PARTITION), &messages)
+                .unwrap();
+        let mut body = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut body);
+        body[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        commit_donor_prepare(&mut donor, config, Operation::SendMessages, &body).await;
+        assert_eq!(donor.group_offset_state(0).1, Some(COMMITTED_OFFSET));
+        let offer = donor.state_transfer_offer(config).await.unwrap();
+        assert_eq!(offer.segments.len(), 1);
+        let recovering_namespace = namespace(shard, RECOVERING_PARTITION);
+        let recovering = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&recovering_namespace)
+            .unwrap();
+        let segment = &offer.segments[0];
+        let staged = recovering
+            .spill_transfer_segment(&segment.entry, std::fs::read(&segment.log_path).unwrap())
+            .await
+            .unwrap();
+        recovering
+            .install_state_transfer(config, offer.commit_op, vec![staged], &offer.offsets.1, 0)
+            .await
+            .unwrap();
+        assert!(!recovering.requires_state_transfer());
+        assert_eq!(recovering.group_offset_state(0).1, Some(COMMITTED_OFFSET));
+    }
+
+    async fn commit_donor_prepare(
+        donor: &mut IggyPartition<SpyBus>,
+        config: &PartitionsConfig,
+        operation: Operation,
+        body: &[u8],
+    ) {
+        let op = donor.consensus().sequencer().current_sequence() + 1;
+        let prepare = prepare_message(operation, FIRST_CLIENT, op, body).transmute_header(
+            |original, header: &mut PrepareHeader| {
+                *header = original;
+                header.cluster = 1;
+                header.group = donor.consensus().group();
+                header.op = op;
+                header.parent = donor.consensus().last_prepare_checksum();
+            },
+        );
+        let prepare = consensus::seal_prepare_checksum(prepare);
+        donor.consensus().sequencer().set_sequence(op);
+        donor
+            .consensus()
+            .set_last_prepare_checksum(prepare.header().checksum);
+        donor.on_replicate(prepare).await;
+        donor.consensus().advance_commit_max(op);
+        donor.commit_journal(config).await;
+        assert_eq!(donor.consensus().commit_min(), op);
+    }
+
+    async fn attach_segment_files(partition: &mut IggyPartition<SpyBus>, directory: &Path) {
+        let start_offset = partition.log.active_segment().start_offset;
+        let messages_path = directory
+            .join(format!("{start_offset:020}.log"))
+            .to_string_lossy()
+            .into_owned();
+        let index_path = directory
+            .join(format!("{start_offset:020}.index"))
+            .to_string_lossy()
+            .into_owned();
+        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+            .await
+            .unwrap();
+        let messages_size = storage.messages_writer.as_ref().unwrap().size_counter();
+        let index_size = storage.index_writer.as_ref().unwrap().size_counter();
+        partition.log.messages_writers_mut()[0] = Some(Rc::new(
+            MessagesWriter::new(&messages_path, messages_size, false, false, None)
+                .await
+                .unwrap(),
+        ));
+        partition.log.index_writers_mut()[0] = Some(Rc::new(
+            IggyIndexWriter::new(&index_path, index_size, false, false)
+                .await
+                .unwrap(),
+        ));
+        *partition.log.active_storage_mut() = storage;
+    }
 }
