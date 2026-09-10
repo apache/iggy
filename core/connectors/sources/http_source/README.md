@@ -349,6 +349,8 @@ The registry is capped at `MAX_ENDPOINTS` (10000) per instance. At the cap the o
 
 Recovering a revoked static endpoint means giving it a **new** `endpoint_id`. Editing `auth_secret` in TOML does nothing, because the tombstone outranks the file by design, and deleting the state file to clear one tombstone also drops every dynamic endpoint and every other revocation with it.
 
+Truncating the state file is the same act as deleting it, not a gentler one. The runtime reports an empty file as no state at all, which this connector cannot tell from a first boot, so it starts on the TOML alone and every revoked static endpoint serves again. It says so at startup: an instance that begins with static endpoints and no persisted registry logs a warning naming that outcome. A file that is corrupt rather than empty is refused instead, and the instance does not start.
+
 **`dropped_on_close` disappears with its listener.** The counter lives on the shared listener's registry, so it survives one instance of several leaving, but when the *last* instance closes, the listener and its metrics go with it. In a single-instance deployment the `warn!` log line is the only surviving record of messages lost at shutdown.
 
 **Sampled gauges are dropped when an instance leaves**, so `buffer_used` and `endpoints_active` do not linger at a stale value for an instance that no longer exists. The counters persist, as counters should.

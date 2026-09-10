@@ -47,6 +47,7 @@ iggy_connector_sdk = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 ring = { workspace = true }
+rmp-serde = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 subtle = { workspace = true }
@@ -55,7 +56,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
-rmp-serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 

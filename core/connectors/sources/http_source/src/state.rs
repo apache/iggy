@@ -34,7 +34,8 @@ use crate::auth::{Admission, admit_endpoint};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use tracing::{info, warn};
+use std::io::Cursor;
+use tracing::{error, info, warn};
 
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
 use crate::types::{EndpointId, unix_now_seconds};
@@ -46,6 +47,16 @@ use crate::{CONNECTOR_NAME, EndpointAuthType, StaticEndpointConfig};
 /// who can register but never has to stop. Far above any real deployment: the
 /// README sizes this connector at hundreds of endpoints.
 pub const MAX_ENDPOINTS: usize = 10_000;
+
+/// Shape of the persisted state, written into every state file and checked on
+/// the way back in.
+///
+/// This is the migration path, replacing the append-a-defaulted-field trick
+/// the endpoint records still use. That trick cannot be applied to the frame:
+/// a defaulted field is exactly what lets a shortened blob decode as an empty
+/// registry, which is the hole this framing closes. A file carrying any other
+/// version is refused rather than guessed at.
+const STATE_VERSION: u16 = 1;
 
 /// Why a registration was accepted or refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +76,11 @@ pub enum InsertOutcome {
 /// different bytes for an identical registry.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EndpointRegistry {
-    #[serde(default)]
+    // No `#[serde(default)]`. It is the in-memory type's `Default` that gives
+    // an empty registry, never a decode: a blob that cannot supply this field
+    // is a blob that has lost every revocation tombstone, and defaulting it
+    // put the revoked endpoints back on the wire from TOML. The state file
+    // goes through `StateFrame`, which refuses that blob outright.
     endpoints: BTreeMap<EndpointId, Endpoint>,
 }
 
@@ -94,26 +109,44 @@ impl EndpointRegistry {
             .collect();
         let static_count = endpoints.len();
 
-        let had_state = state.is_some();
-        let Some(persisted) = state
-            .and_then(|state| state.deserialize::<EndpointRegistry>(CONNECTOR_NAME, connector_id))
-        else {
-            if had_state {
-                return Err(Error::InitError(format!(
-                    "Cannot decode the persisted registry for {CONNECTOR_NAME} connector ID: {connector_id}. Refusing to serve {static_count} static endpoints without its revocation tombstones"
-                )));
+        let Some(ConnectorState(blob)) = state else {
+            // No state presented, and this arm cannot tell why. The runtime
+            // maps a zero-length state file to no state at all, so a genuine
+            // first boot and a truncated file arrive here identically, and a
+            // truncation means every revocation tombstone is gone while the
+            // TOML endpoints below go straight back on the wire with their
+            // secrets. That is the fail-open the decode guard exists to
+            // refuse, reached without corrupting a single byte, so the one
+            // thing this can do is say so where an operator will see it.
+            if static_count > 0 {
+                warn!(
+                    "Started {CONNECTOR_NAME} connector ID: {connector_id} with {static_count} static endpoint(s) and no persisted registry. An empty state file is indistinguishable from a first boot here, so if this instance ever had revocations they are gone and every revoked static endpoint is serving again"
+                );
+            } else {
+                info!(
+                    "Started {CONNECTOR_NAME} connector ID: {connector_id} with no persisted registry, static endpoints: {static_count}"
+                );
             }
-            info!(
-                "Started {CONNECTOR_NAME} connector ID: {connector_id} with no persisted registry, static endpoints: {static_count}"
-            );
             return Ok(EndpointRegistry { endpoints });
         };
+
+        // Logged here, not only returned. `InitError` is substituted by the
+        // runtime before it reaches `last_error`, so without this line the
+        // reason a registry was refused never leaves the process.
+        let persisted = decode_state_frame(&blob).map_err(|reason| {
+            error!(
+                "Cannot decode the persisted registry for {CONNECTOR_NAME} connector ID: {connector_id}: {reason}. Refusing to serve {static_count} static endpoint(s) without its revocation tombstones"
+            );
+            Error::InitError(format!(
+                "Cannot decode the persisted registry for {CONNECTOR_NAME} connector ID: {connector_id}: {reason}. Refusing to serve {static_count} static endpoints without its revocation tombstones"
+            ))
+        })?;
 
         let now_seconds = unix_now_seconds();
         let mut restored = 0;
         let mut tombstones = 0;
         let mut dropped_static = 0;
-        for (endpoint_id, mut endpoint) in persisted.endpoints {
+        for (endpoint_id, mut endpoint) in persisted {
             // The id is both the map key and a field, and both are written out.
             // A hand-edited state file could disagree between them, which would
             // split `owner_of`, keyed off the map, from `lookup_secret_path`,
@@ -385,8 +418,71 @@ impl EndpointRegistry {
     }
 
     pub fn to_connector_state(&self, connector_id: u32) -> Option<ConnectorState> {
-        ConnectorState::serialize(self, CONNECTOR_NAME, connector_id)
+        let frame = StateFrame {
+            version: STATE_VERSION,
+            endpoint_count: self.endpoints.len() as u32,
+            endpoints: &self.endpoints,
+        };
+        ConnectorState::serialize(&frame, CONNECTOR_NAME, connector_id)
     }
+}
+
+/// The state file's outer frame, and the only shape this connector decodes.
+///
+/// Generic over the endpoint map so the write side can borrow the live one
+/// while the read side owns what it decoded, which keeps a flush from copying
+/// the whole registry. MessagePack writes a struct positionally, so both sides
+/// agree on a three element shape without the field names reaching the wire.
+///
+/// `endpoint_count` is redundant with `endpoints.len()` on purpose. It is the
+/// only one of the three checks that rejects a blob which is both structurally
+/// valid and fully consumed: the registry used to encode as a one element
+/// array, so an array holding an empty map decoded as a perfectly good empty
+/// registry and no amount of framing arithmetic would have noticed.
+#[derive(Serialize, Deserialize)]
+struct StateFrame<E> {
+    version: u16,
+    endpoint_count: u32,
+    endpoints: E,
+}
+
+/// Decodes a state blob, refusing anything that is not exactly one frame.
+///
+/// `rmp_serde::from_slice` stops at the end of the first value and never
+/// checks that it consumed the input, so a shortened blob decodes `Ok` and
+/// quietly loses whatever the missing bytes carried. Reading through a
+/// `Cursor` is what makes the consumed length observable at all: `position()`
+/// exists only on that flavour of the deserializer, which is why this cannot
+/// be done by patching the call in the SDK helper.
+///
+/// Fail closed, always. Every revocation tombstone lives in this blob, so a
+/// decode that guesses is one that puts a compromised endpoint back in service
+/// with its secret.
+fn decode_state_frame(blob: &[u8]) -> Result<BTreeMap<EndpointId, Endpoint>, String> {
+    let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(blob));
+    let frame = StateFrame::<BTreeMap<EndpointId, Endpoint>>::deserialize(&mut deserializer)
+        .map_err(|error| format!("the frame does not decode ({error})"))?;
+    let consumed = deserializer.position();
+    if consumed != blob.len() as u64 {
+        return Err(format!(
+            "the frame ends after {consumed} of {} bytes",
+            blob.len()
+        ));
+    }
+    if frame.version != STATE_VERSION {
+        return Err(format!(
+            "the frame is version {}, and this connector writes version {STATE_VERSION}",
+            frame.version
+        ));
+    }
+    if frame.endpoint_count as usize != frame.endpoints.len() {
+        return Err(format!(
+            "the frame declares {} endpoint(s) and carries {}",
+            frame.endpoint_count,
+            frame.endpoints.len()
+        ));
+    }
+    Ok(frame.endpoints)
 }
 
 /// Writes an endpoint secret in the clear, for `ConnectorState` only.
@@ -533,18 +629,153 @@ mod tests {
     }
 
     #[test]
-    fn serialize_state_helper_should_produce_valid_connector_state() {
+    fn given_a_registry_when_written_to_state_should_read_back_through_the_frame() {
         let mut registry = EndpointRegistry::default();
         assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
 
-        let bytes = registry
+        let ConnectorState(bytes) = registry
             .to_connector_state(1)
-            .expect("registry must serialize")
-            .0;
+            .expect("registry must serialize");
 
-        let restored: EndpointRegistry =
-            rmp_serde::from_slice(&bytes).expect("registry must deserialize");
-        assert!(restored.endpoint(ENDPOINT_ONE).is_some());
+        let decoded = decode_state_frame(&bytes).expect("what this connector writes must decode");
+        assert!(decoded.contains_key(ENDPOINT_ONE));
+    }
+
+    /// The four refusals below are one finding: a state blob that has lost its
+    /// endpoints must never decode as an empty registry. Every revocation
+    /// tombstone lives in that blob, so an empty one puts each revoked
+    /// endpoint back on the wire from TOML with its secret. Each test names
+    /// which of the three checks is the one doing the work, because no single
+    /// check covers all four inputs.
+    #[test]
+    fn given_the_historic_registry_shape_when_decoded_should_refuse() {
+        // What the registry encoded as before the frame existed: a one element
+        // array holding the endpoint map. Caught on arity, since the frame is
+        // three elements and the first of them is not a map.
+        assert!(decode_state_frame(&[0x91, 0x80]).is_err());
+        assert!(decode_state_frame(&[0x90]).is_err());
+    }
+
+    #[test]
+    fn given_a_state_blob_with_bytes_appended_when_decoded_should_refuse() {
+        // Caught on the consumed length. The frame in front of the extra byte
+        // is perfectly valid, and `rmp_serde::from_slice` would return it.
+        let mut registry = EndpointRegistry::default();
+        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
+        let ConnectorState(mut bytes) = registry
+            .to_connector_state(1)
+            .expect("registry must serialize");
+        assert!(decode_state_frame(&bytes).is_ok());
+
+        bytes.push(0xc0);
+
+        assert!(
+            decode_state_frame(&bytes).is_err(),
+            "a blob carrying more than one frame is not a state file this connector wrote"
+        );
+    }
+
+    #[test]
+    fn given_a_frame_whose_count_disagrees_with_its_map_when_decoded_should_refuse() {
+        // Caught on the declared count, and nothing else can catch it. This is
+        // the successor of the shape that used to survive: the frame is the
+        // right arity, every field is present, and the whole blob is consumed.
+        // Only the count says the map was replaced with a smaller one.
+        let lying = StateFrame {
+            version: STATE_VERSION,
+            endpoint_count: 2,
+            endpoints: BTreeMap::<EndpointId, Endpoint>::new(),
+        };
+        let bytes = rmp_serde::to_vec(&lying).expect("the shadow must serialize");
+
+        assert!(decode_state_frame(&bytes).is_err());
+    }
+
+    /// The property the framing is for, swept rather than sampled: no edit to
+    /// a state blob may leave it decoding as a registry with fewer endpoints
+    /// than it was written with, and no prefix of it may decode at all. That
+    /// is the fail-open, since a tombstone that vanishes puts its endpoint
+    /// back on the wire from TOML with its secret.
+    ///
+    /// It deliberately does not claim more than that. Editing a byte inside an
+    /// endpoint id produces a frame that is entirely well formed and still
+    /// carries its tombstone, under a different id, so the original id would
+    /// serve again. Nothing here authenticates the file's contents, and this
+    /// framing was never going to: that is an integrity property and wants a
+    /// different mechanism.
+    #[test]
+    fn given_a_mutated_state_blob_when_decoded_should_never_lose_an_endpoint() {
+        let mut registry = EndpointRegistry::default();
+        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
+        assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
+        let ConnectorState(bytes) = registry
+            .to_connector_state(1)
+            .expect("registry must serialize");
+        let baseline = decode_state_frame(&bytes).expect("the baseline must decode");
+
+        for index in 0..bytes.len() {
+            for value in 0..=u8::MAX {
+                if bytes[index] == value {
+                    continue;
+                }
+                let mut mutated = bytes.clone();
+                mutated[index] = value;
+                if let Ok(decoded) = decode_state_frame(&mutated) {
+                    assert_eq!(
+                        decoded.len(),
+                        baseline.len(),
+                        "byte {index} set to {value:#04x} decoded with {} endpoint(s)",
+                        decoded.len()
+                    );
+                }
+            }
+        }
+        for len in 0..bytes.len() {
+            assert!(
+                decode_state_frame(&bytes[..len]).is_err(),
+                "a blob cut at {len} of {} bytes must not decode",
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_frame_from_an_unknown_version_when_decoded_should_refuse() {
+        let future = StateFrame {
+            version: STATE_VERSION + 1,
+            endpoint_count: 0,
+            endpoints: BTreeMap::<EndpointId, Endpoint>::new(),
+        };
+        let bytes = rmp_serde::to_vec(&future).expect("the shadow must serialize");
+
+        assert!(
+            decode_state_frame(&bytes).is_err(),
+            "a shape this connector does not know is refused, not guessed at"
+        );
+    }
+
+    #[test]
+    fn given_a_shortened_state_blob_when_restored_should_refuse_to_serve_static_config() {
+        // The end the refusal exists for. The blob carries the tombstone for an
+        // endpoint the TOML still declares, so decoding it as empty is what
+        // puts that endpoint back in service.
+        let mut registry = EndpointRegistry::default();
+        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
+        assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
+        let ConnectorState(bytes) = registry
+            .to_connector_state(1)
+            .expect("registry must serialize");
+
+        let restored = EndpointRegistry::restore(
+            &[static_endpoint(ENDPOINT_ONE)],
+            Some(ConnectorState(bytes[..bytes.len() - 1].to_vec())),
+            1,
+        );
+
+        assert!(
+            restored.is_err(),
+            "a registry that cannot be decoded must not be served as its static twin"
+        );
     }
 
     /// Mirrors `Endpoint`'s wire shape minus the trailing `state`, i.e. what a
