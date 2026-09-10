@@ -207,6 +207,14 @@ impl EndpointRegistry {
         // instance is running keeps its stored secret until the next restart,
         // because clearing it then would need a clock-driven sweep mutating the
         // registry from `poll()`. `revoke` is what clears it immediately.
+        //
+        // This clears the in-memory registry and nothing else. It arms no
+        // flush, so the state file keeps its copy of the secret until an
+        // unrelated mutation writes the registry out, and on an instance that
+        // sees none it stays there. Arming the flag here would not fix that
+        // either: without a permit a quiet gateway still never flushes, and
+        // arming plus notifying would break the contract that a static-only
+        // instance writes no state file.
         let mut expired_secrets = 0;
         for endpoint in endpoints.values_mut() {
             if endpoint.is_active()

@@ -135,11 +135,13 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `auth_secret` | string | none | Required unless `auth_type` is `none`. |
 | `hmac_header` | string | `X-Hub-Signature-256` | Header carrying the signature. |
 | `hmac_prefix` | string | `sha256=` | Prefix stripped before hex-decoding. Use `""` for a bare hex signature. |
-| `expires_at` | u64 | none | Unix seconds. Requests arriving at or after this answer 404. The endpoint keeps its slot, and its stored secret is dropped on the next restart. |
+| `expires_at` | u64 | none | Unix seconds. Requests arriving at or after this answer 404. The endpoint keeps its slot, and revoking it is what clears its stored secret. |
 
 An expired endpoint is not reclaimed. It keeps its `max_endpoints` slot and answers 404, and only revoking it frees the slot.
 
-Its stored secret is a different matter. The connector drops that from the registry on the next restart, because the endpoint is refused before any credential is checked and keeping it would write a credential nobody can use back to the state file on every later flush. That happens at restore only, so an endpoint that expires while the instance is running keeps its secret on disk until it restarts. Revoke it to clear the secret immediately.
+Its stored secret is a different matter. Restore drops it from the registry the instance serves from, because the endpoint is refused before any credential is checked and keeping it would write a credential nobody can use back to the state file on every later flush.
+
+That drop is in memory only, and it arms no flush. The state file keeps its copy of the secret until an unrelated registration or revocation writes the registry out, so an instance that sees no further mutation keeps it on disk indefinitely. Revoking the endpoint is what clears it from disk: a revocation is itself a mutation, so it drops the secret and persists that removal in one step.
 
 Env overrides reach top-level fields only, and only under the local config provider. `IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_<FIELD>` sets one field of this table; the suffix is taken whole, so a nested attempt such as `..._ENDPOINTS_0_AUTH_SECRET` becomes the flat key `endpoints_0_auth_secret` and is ignored. Endpoint secrets therefore stay in TOML or go through the management API.
 
