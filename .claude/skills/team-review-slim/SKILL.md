@@ -1,27 +1,25 @@
 ---
-name: team-review
+name: team-review-slim
 description: |
- Adversarial 4-expert review (storage, perf, distsys, ecosystem) of a PR, branch, or ref range, with clean-room
- validation of every finding. Experts work alone, no peer debate. Expensive, one run spawns ~10 subagents.
+ Team-review without the verification chain. Reviews a PR, the current branch against master, or of a ref range.
 argument-hint: "[PR number | branch | ref range]"
 disable-model-invocation: true
 ---
 
-# Apache Iggy Team Review
+# Apache Iggy Team Review (slim version)
 
 `<TARGET>` = `$ARGUMENTS`: a PR number, a branch, or a ref range. Empty means `origin/master..HEAD`. Mission critical
 code.
 
 You = **moderator**. You never open the diff or a source file: you route paths, merge claims, synthesize. Every token
-you load rides along every later turn. Reviewers and validators are one-shot agents that deliver by writing a file;
-nobody chats.
+you load rides along every later turn. Reviewers are one-shot agents that deliver by writing a file, they do not chat.
 
-## Charter (paste VERBATIM into every expert, validator, and tiebreak prompt)
+## Charter (paste VERBATIM into every expert prompt)
 
 > You think deep. You write plain. Keep the two apart.
 >
 > **Thinking, unchanged.** Read the diff, then every changed file in full from the local checkout, then whatever call
-> sites you need. Trace call chains. Verify invariants. Prove findings, do not guess. Cite exact `file:line`. Running
+> sites you need. Trace call chains. Verify invariants. Prove findings, don't guess. Cite exact `file:line`. Running
 > tests or builds needs a stated justification: reading and tracing settles most claims, and parallel cargo runs block
 > on one target-dir lock.
 >
@@ -86,18 +84,38 @@ nobody chats.
 > - These writing rules govern your own output only. Never review the code, the comments, or the commit messages against
 >   them.
 >
-> **Finding format.**
+> **Finding format.** One entry per finding:
 >
-> - Finding, one line each: `[sev] file:line - problem. Fix: action. (origin, conf:H|M|L)`
-> - `sev`: `critical` = correctness/safety/data-loss/security, blocks merge; `warning` = real defect, perf hit, API
->   issue; `nit` = style/naming; `simplify` = complexity/dead-code reduction, format
->   `[simplify] file:line - what's complex. Simpler: alternative. Saves: ~N lines / removes indirection. (origin, conf)`.
-> - `origin`: `intro` (PR introduced), `pre-surfaced` (existed, exposed by PR), `pre-untouched` (existed, not touched).
-> - Never flag em dashes or other punctuation style as a finding.
-> - Simplification mandate: less code > more code. Per changed file ask whether ~30% smaller keeps correctness: dead
->   fields/params/branches/imports, duplication of an existing helper (cite it), single-impl traits, premature generics,
->   checks for impossible states. Do not propose simplifications that change semantics or break public API. If nothing
->   qualifies, write `Simplifications: none`.
+> ```text
+> [sev] file:line - problem. Fix: action. (origin, conf:H|M|L)
+>   Evidence: the traced path or the line that proves the finding.
+> ```
+>
+> The `Evidence:` line is required for every `critical` only. Not for `warning`, `nit` and `simplify`.
+>
+> - `sev`: `critical` = correctness, safety, data loss, or security, and it blocks the merge. `warning` = a real defect,
+>   a performance hit, or an API problem. `nit` = style or naming. `simplify` = less complexity or dead code, in the
+>   format
+>   `[simplify] file:line - the current shape. Simpler: alternative. Saves: about N lines, or removes indirection. (origin, conf)`.
+> - `origin`: `intro` (the change introduced it), `pre-surfaced` (it existed, and the change exposed it),
+>   `pre-untouched` (it existed, and the change did not touch it).
+> - `conf`: `H` = a traced call path proves it. `M` = a strong reading, but one gap remains. `L` = a suspicion, and the
+>   reader must check it.
+> - Never flag em dashes or other punctuation style in the reviewed code as a finding.
+> - Simplification mandate: less code beats more code. For each changed file, ask whether a 30% smaller file keeps the
+>   same behavior. Look for dead fields, dead parameters, dead branches, dead imports, duplication of an existing helper
+>   (cite the helper), single-implementation traits, premature generics, and checks for impossible states. Do not
+>   propose a simplification that changes the semantics or that breaks the public API. If nothing qualifies, write
+>   `Simplifications: none`.
+>
+> **Self-verification, before you write the file.** Run this pass:
+>
+> 1. Re-open every cited `file:line`. Make sure that the anchor still names the code that you describe.
+> 2. Trace one reachable call path for each `critical` and `warning`. Record that path for `critical` in the `Evidence:`
+>    line.
+> 3. Delete every finding that you cannot prove from the code that you read. An unreachable concern is not a finding.
+> 4. Set the confidence label from the evidence that you hold, not from how much the defect worries you.
+> 5. Ask once whether the severity is calibrated. A cold-path clone is never `critical`.
 >
 > Deep analysis, plain words. Dig deep. Write short and clear.
 
@@ -120,7 +138,7 @@ nobody chats.
 
 Do not `cat` any of the files you just wrote. `wc -l <DIR>/diff.patch` is the only look you take.
 
-## Step 2: Round 1, four one-shot experts (one message, parallel)
+## Step 2: Four one-shot experts (one message, parallel)
 
 Spawn 4 `Agent` calls in a single message: `subagent_type: general-purpose`, `name: <role>-<TOPIC>` (bare role names
 collide with concurrent sessions: one shared agent namespace), no `model` (inherits). Prompt = role block + Charter +
@@ -132,7 +150,8 @@ this brief, with `<DIR>`, `<TARGET>`, `<SHORTCOMMIT>` filled in:
 > BEFORE you end your turn: findings in Charter format, then `Simplifications: ...`, then
 > `Verdict: APPROVE | REQUEST CHANGES - reason`. A previous worker finished reading and then idled without delivering;
 > the Write call IS the delivery, your final message is just the path. Budget 3/4 reading, 1/4 writing; partial beats
-> unshipped. You work alone: no teammates, no SendMessage, no questions back.
+> unshipped. Run the self-verification pass of the Charter before you write. No validator follows you, and an unproven
+> `critical` finding costs the user. You work alone: no teammates, no SendMessage, no questions back.
 
 Role blocks:
 
@@ -157,77 +176,55 @@ Collect: wait for the completion notifications, then `ls <DIR>/*.md`. A role wit
 to `<role>-<TOPIC>` ("Write `<DIR>/<role>.md` now, then stop."); still missing after that, respawn the role once with
 the same prompt. Never open a subagent transcript via `TaskOutput` (it is the whole JSONL).
 
-## Step 3: Merge into neutral claims (moderator)
+## Step 3: Merge the role files (moderator, no agents)
 
-Read the 4 role files. Write `<DIR>/claims.md`, one line per claim:
-`C<N> [sev] file:line - claim. Fix: action. (origin)`. Strip role names, confidence, and argument. Same anchor + same
-defect from several roles = one claim at the highest severity; keep a private raised-by map for the report. Simplify
-items are claims too.
+Read the 4 role files. Merge them straight into the report sections of Step 4, and write no intermediate file.
 
-No claims at all: skip Steps 4 and 5, go to Step 6 with empty sections and `Verdict: APPROVE`. The report file still
-gets written.
+- The same anchor and the same defect from several roles = one entry, at the highest severity of the group. Record the
+  roles that raised it, and keep the strongest `Evidence:` line of the group.
+- When two roles disagree on the severity of one anchor, keep the higher severity and add
+  `(disputed: <role> rates it <sev>)`. You do not adjudicate, and the user decides at the cited line.
+- Keep the confidence label of every entry. It is the reader's map for the manual verification.
+- Simplify items are entries too, and they go into their own section.
+- Rewrite nothing. Keep the plain English of the experts, and fix a sentence only when it breaks a Charter rule.
 
-## Step 4: Clean-room validation (one message, parallel)
+No findings at all: go to Step 4 with empty sections and `Verdict: APPROVE`. The report file still gets written.
 
-Shard claims ~5 per validator. Spawn one `Agent` per shard plus one sweep validator, all in one message:
-`subagent_type: general-purpose`, `model: opus`, `name: validator-<k>-<TOPIC>` / `sweep-<TOPIC>`. Each gets ONLY: its
-claims verbatim, `<DIR>/files.txt`, `<DIR>/diff.patch`, the target identity, the Charter. Not the role files, not
-raised-by, not your reasoning; the missing context is what removes the anchoring bias.
+## Step 4: Write the report, then stop
 
-Validator mandate (adversarial): for each claim open the cited `file:line`, trace call sites, then rate
-`C<N>: PASS | FIX: <correction, correct line, correct severity> | REMOVE: <why false or unverifiable>`; judge whether
-the severity is calibrated; re-check the anchor. Deliverable `<DIR>/validate-<k>.md` via Write, same idle rule as Step
-2\.
-
-Sweep mandate: all claims + the diff. Two questions only: which real defects in the diff are missing from the list, and
-which listed items wrongly clear a bug. Deliverable `<DIR>/sweep.md`, additions in Charter format tagged `(sweep)`.
-
-Apply: drop REMOVE, apply FIX (wording, line, severity), fold sweep additions in as `(sweep, unvalidated)`. A `critical`
-sweep addition gets one extra validator before it may block the verdict.
-
-## Step 5: Contested items (only when triggered)
-
-Contested = a validator REMOVEs or downgrades a `critical` or `warning`, or a sweep addition contradicts a PASS. Per
-item spawn one `Agent` (`model: opus`) with the claim, the validator's verdict text, the expert's original line, and the
-paths; it writes `UPHELD | OVERTURNED - reason (cite path)` to `<DIR>/contested-<N>.md`. Cap 5 per run; past the cap you
-adjudicate and mark `(moderator call)`.
-
-## Step 6: Synthesize, write, done
-
-Output in the simple English of the Charter. The Charter binds you too:
+Output:
 
 ```text
-## Review: [change desc]
+## Review: <change description>
 
-### Confirmed (expert + clean-room validator)
-- [sev] file:line - problem. Fix: action. (raised: role[, role]; validated: PASS|FIX)
+### Findings
+- [sev] file:line - problem. Fix: action. (raised: role[, role]; conf:H|M|L)
+  Evidence: the traced path or the line that proves the finding.
 
-### Contested
-- file:line - problem.
-  Expert: position. Validator: counter. **Tiebreak**: UPHELD|OVERTURNED - why.
+### Unconfirmed (conf:L, check these first)
+- [sev] file:line - problem. Open question: what the reader must check.
 
-### Retracted (validator REMOVE)
-- finding - why.
+### Pre-existing (origin pre-*, does not block the merge)
+- file:line - problem. The code follows the pattern in <ref>.
 
-### Pre-existing (origin pre-*, not blocking)
-- file:line - follows pattern in [ref].
-
-### Simplification opportunities (non-blocking)
-- file:line - current shape. Simpler: alternative. Saves: ~N lines / removes indirection.
+### Simplification opportunities (does not block the merge)
+- file:line - the current shape. Simpler: alternative. Saves: about N lines, or removes indirection.
 
 ### Verdict: APPROVE | REQUEST CHANGES
-Confirmed critical + warning only. Simplifications informational. Reason: one line.
+Reason: one sentence. Only `critical` and `warning` entries with conf:H or conf:M decide the verdict.
+Simplifications are informational.
 
-Counts: critical N, warning N, nit N, simplify N (Confirmed + Simplification sections)
+Counts: critical N, warning N, nit N, simplify N
+Verification: none ran. Open each cited line and confirm the finding before you change the code.
 ```
 
 Then write `<DIR>/report.md` with:
 
-1. H1 `# Iggy Team Review - <change desc> (<SHORTCOMMIT>)`.
-2. Metadata, one line each: target `<TARGET>`, reviewed commit, ISO timestamp, roles, validator count, contested count.
+1. H1 `# Iggy Team Review (small) - <change description> (<SHORTCOMMIT>)`.
+2. Metadata, one line each: target `<TARGET>`, reviewed commit, ISO timestamp, roles, expert count,
+   `validation: none (manual)`.
 3. The report above, verbatim.
-4. Appendix `## Raw findings per expert`: each role file verbatim in a fenced block.
-5. `## Validation record`: counts of PASS / FIX / REMOVE, sweep additions, contested outcomes.
+4. Appendix `## Raw findings per expert`: each role file verbatim, in a fenced block.
 
-Last user-facing line: `Findings written: <DIR>/report.md`. No cleanup: one-shot agents end themselves, `<DIR>` stays in
-the scratchpad.
+Last user-facing line: `Findings written: <DIR>/report.md`. Then name the highest-severity entry in one sentence, and
+stop. There is no cleanup: the one-shot agents end themselves, and `<DIR>` stays in the scratchpad.
