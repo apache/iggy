@@ -4229,8 +4229,8 @@ mod request_queue_tests {
     use iggy_binary_protocol::{Command, Operation};
     use iggy_common::ConsumerKind;
     use server_common::poll::AutoCommitReservationToken;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
@@ -4252,15 +4252,20 @@ mod request_queue_tests {
 
     #[test]
     fn queued_contexts_keep_each_reservation_until_their_own_removal() {
-        let epoch = Arc::new(AtomicU64::new(0));
-        let keys = Arc::new(AtomicUsize::new(0));
-        let token = Arc::new(AutoCommitReservationToken::new(epoch, Arc::clone(&keys)));
+        let epoch = Rc::new(Cell::new(0));
+        let keys = Rc::new(Cell::new(0));
+        let token = Rc::new(AutoCommitReservationToken::new(
+            ConsumerKind::Consumer,
+            7,
+            epoch,
+            Rc::clone(&keys),
+        ));
         let history = PollHistoryId::default();
         let mut pipeline = LocalPipeline::new();
         for request in 1..=2 {
             let context = AutoCommitRequestContext {
                 history: history.clone(),
-                reservation: token.acquire(ConsumerKind::Consumer, 7),
+                reservation: token.acquire(),
             };
             pipeline
                 .push_request(RequestEntry::with_auto_commit(
@@ -4277,10 +4282,10 @@ mod request_queue_tests {
         assert_eq!(context.history, history);
         drop(context);
         assert_eq!(token.active_count(), 1);
-        assert_eq!(keys.load(Ordering::Relaxed), 1);
+        assert_eq!(keys.get(), 1);
         pipeline.clear_request_queue();
         assert_eq!(token.active_count(), 0);
-        assert_eq!(keys.load(Ordering::Relaxed), 0);
+        assert_eq!(keys.get(), 0);
     }
 
     #[test]

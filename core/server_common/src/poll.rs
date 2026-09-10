@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::ConsumerKind;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use iggy_common::ConsumerKind;
 
 /// Identity of one serviceable message history. It is never serialized.
 #[derive(Clone, Debug, Default)]
@@ -34,73 +36,82 @@ impl Eq for PollHistoryId {}
 /// Lifetime accounting for one provisional consumer key.
 #[derive(Debug)]
 pub struct AutoCommitReservationToken {
-    reclaim_epoch: Arc<AtomicU64>,
-    active_keys: Arc<AtomicUsize>,
-    active: AtomicUsize,
+    kind: ConsumerKind,
+    consumer_id: u32,
+    reclaim_epoch: Rc<Cell<u64>>,
+    active_keys: Rc<Cell<usize>>,
+    active: Cell<usize>,
 }
 
 impl AutoCommitReservationToken {
     #[must_use]
-    pub fn new(reclaim_epoch: Arc<AtomicU64>, active_keys: Arc<AtomicUsize>) -> Self {
+    pub fn new(
+        kind: ConsumerKind,
+        consumer_id: u32,
+        reclaim_epoch: Rc<Cell<u64>>,
+        active_keys: Rc<Cell<usize>>,
+    ) -> Self {
         Self {
+            kind,
+            consumer_id,
             reclaim_epoch,
             active_keys,
-            active: AtomicUsize::new(0),
+            active: Cell::new(0),
         }
     }
 
     #[must_use]
-    pub fn acquire(
-        self: &Arc<Self>,
-        kind: ConsumerKind,
-        consumer_id: u32,
-    ) -> AutoCommitReservation {
-        if self.active.fetch_add(1, Ordering::Relaxed) == 0 {
-            self.active_keys.fetch_add(1, Ordering::Relaxed);
+    pub fn acquire(self: &Rc<Self>) -> AutoCommitReservation {
+        let active = self.active.get();
+        self.active.set(active.wrapping_add(1));
+        if active == 0 {
+            self.active_keys.set(self.active_keys.get().wrapping_add(1));
         }
         AutoCommitReservation {
-            token: Arc::clone(self),
-            kind,
-            consumer_id,
+            token: Rc::clone(self),
         }
     }
 
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.active.load(Ordering::Relaxed)
+        self.active.get()
     }
 
     #[must_use]
-    pub fn owns(self: &Arc<Self>, reservation: &AutoCommitReservation) -> bool {
-        Arc::ptr_eq(self, &reservation.token)
+    pub fn owns(self: &Rc<Self>, reservation: &AutoCommitReservation) -> bool {
+        Rc::ptr_eq(self, &reservation.token)
     }
 }
 
 /// Holds a provisional key until its request is admitted or dropped.
 #[derive(Debug)]
 pub struct AutoCommitReservation {
-    token: Arc<AutoCommitReservationToken>,
-    kind: ConsumerKind,
-    consumer_id: u32,
+    token: Rc<AutoCommitReservationToken>,
 }
 
 impl AutoCommitReservation {
     #[must_use]
-    pub const fn kind(&self) -> ConsumerKind {
-        self.kind
+    pub fn kind(&self) -> ConsumerKind {
+        self.token.kind
     }
 
     #[must_use]
-    pub const fn consumer_id(&self) -> u32 {
-        self.consumer_id
+    pub fn consumer_id(&self) -> u32 {
+        self.token.consumer_id
     }
 }
 
 impl Drop for AutoCommitReservation {
     fn drop(&mut self) {
-        if self.token.active.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.token.active_keys.fetch_sub(1, Ordering::Relaxed);
-            self.token.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
+        let active = self.token.active.get();
+        self.token.active.set(active.wrapping_sub(1));
+        if active == 1 {
+            self.token
+                .active_keys
+                .set(self.token.active_keys.get().wrapping_sub(1));
+            self.token
+                .reclaim_epoch
+                .set(self.token.reclaim_epoch.get().wrapping_add(1));
         }
     }
 }
@@ -118,19 +129,42 @@ mod tests {
 
     #[test]
     fn last_reservation_releases_the_key() {
-        let epoch = Arc::new(AtomicU64::new(0));
-        let keys = Arc::new(AtomicUsize::new(0));
-        let token = Arc::new(AutoCommitReservationToken::new(
-            Arc::clone(&epoch),
-            Arc::clone(&keys),
+        let epoch = Rc::new(Cell::new(0));
+        let keys = Rc::new(Cell::new(0));
+        let token = Rc::new(AutoCommitReservationToken::new(
+            ConsumerKind::Consumer,
+            7,
+            Rc::clone(&epoch),
+            Rc::clone(&keys),
         ));
-        let first = token.acquire(ConsumerKind::Consumer, 7);
-        let second = token.acquire(ConsumerKind::Consumer, 7);
-        assert_eq!(keys.load(Ordering::Relaxed), 1);
+        let first = token.acquire();
+        let second = token.acquire();
+        assert_eq!(first.kind(), ConsumerKind::Consumer);
+        assert_eq!(first.consumer_id(), 7);
+        assert_eq!(keys.get(), 1);
         drop(first);
-        assert_eq!(keys.load(Ordering::Relaxed), 1);
+        assert_eq!(keys.get(), 1);
         drop(second);
-        assert_eq!(keys.load(Ordering::Relaxed), 0);
-        assert_eq!(epoch.load(Ordering::Relaxed), 1);
+        assert_eq!(keys.get(), 0);
+        assert_eq!(epoch.get(), 1);
+    }
+
+    #[test]
+    fn last_reservation_wraps_reclaim_epoch() {
+        let epoch = Rc::new(Cell::new(u64::MAX));
+        let keys = Rc::new(Cell::new(0));
+        let token = Rc::new(AutoCommitReservationToken::new(
+            ConsumerKind::ConsumerGroup,
+            7,
+            Rc::clone(&epoch),
+            Rc::clone(&keys),
+        ));
+        let reservation = token.acquire();
+        assert_eq!(reservation.kind(), ConsumerKind::ConsumerGroup);
+        assert_eq!(reservation.consumer_id(), 7);
+        drop(token);
+        drop(reservation);
+        assert_eq!(keys.get(), 0);
+        assert_eq!(epoch.get(), 0);
     }
 }

@@ -2882,49 +2882,7 @@ where
                 )?;
                 let kind = pending.kind;
                 let consumer_id = pending.consumer_id;
-                if !self.auto_commit_admission_ready(kind, consumer_id) {
-                    return Err(IggyError::TransientNotAccepted);
-                }
-                self.check_local_poll_key(kind, consumer_id)
-                    .map_err(|error| self.poll_capacity_error(error))?;
-                let consensus = self.consensus();
-                if consensus.is_primary()
-                    && consensus.is_normal()
-                    && !consensus.is_transferring()
-                    && !self
-                        .durable_consumer_offsets
-                        .covers(kind, consumer_id, offset)
-                {
-                    let capacity = match kind {
-                        ConsumerKind::Consumer => &self.consumer_offset_capacity,
-                        ConsumerKind::ConsumerGroup => &self.consumer_group_offset_capacity,
-                    };
-                    let reservation = capacity
-                        .reserve_provisional(consumer_id, &self.durable_consumer_offsets)
-                        .map_err(|error| self.poll_capacity_error(error))?;
-                    let request = self.build_poll_auto_commit_request(kind, consumer_id, offset)?;
-                    if self.consensus.pipeline_is_full() {
-                        let context = AutoCommitRequestContext {
-                            history: self.poll_history.clone(),
-                            reservation,
-                        };
-                        self.consensus
-                            .push_queued_request(consensus::RequestEntry::with_auto_commit(
-                                request, context,
-                            ))
-                            .map_err(|_| IggyError::TransientNotAccepted)?;
-                    } else {
-                        self.reserve_consumer_offset(kind, consumer_id)
-                            .map_err(|error| self.poll_capacity_error(error))?;
-                        let prepare = request.project(self.consensus());
-                        self.consensus
-                            .pipeline_message(PlaneKind::Partitions, &prepare);
-                        replication = Some(PollReplication {
-                            prepare,
-                            reservation,
-                        });
-                    }
-                }
+                replication = self.admit_poll_auto_commit(kind, consumer_id, offset)?;
                 self.apply_local_poll_offset(kind, consumer_id, offset);
             }
             if let PollingConsumer::ConsumerGroup(group_id, _) = result.context.consumer {
@@ -2961,9 +2919,62 @@ where
 
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.poll_history = PollHistoryId::default();
+        self.discard_queued_auto_commits();
+    }
+
+    fn discard_queued_auto_commits(&self) {
         self.consensus.with_pipeline_mut(|pipeline| {
             pipeline.retain_requests(|request| request.auto_commit().is_none());
         });
+    }
+
+    fn admit_poll_auto_commit(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: u64,
+    ) -> Result<Option<PollReplication>, IggyError> {
+        if !self.auto_commit_admission_ready(kind, consumer_id) {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        self.check_local_poll_key(kind, consumer_id)
+            .map_err(|error| self.poll_capacity_error(error))?;
+        let consensus = self.consensus();
+        if !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || self
+                .durable_consumer_offsets
+                .covers(kind, consumer_id, offset)
+        {
+            return Ok(None);
+        }
+
+        let reservation = self
+            .consumer_offset_capacity_for(kind)
+            .reserve_provisional(consumer_id, &self.durable_consumer_offsets)
+            .map_err(|error| self.poll_capacity_error(error))?;
+        let request = self.build_poll_auto_commit_request(kind, consumer_id, offset)?;
+        if self.consensus.pipeline_is_full() {
+            let context = AutoCommitRequestContext {
+                history: self.poll_history.clone(),
+                reservation,
+            };
+            self.consensus
+                .push_queued_request(consensus::RequestEntry::with_auto_commit(request, context))
+                .map_err(|_| IggyError::TransientNotAccepted)?;
+            Ok(None)
+        } else {
+            self.reserve_consumer_offset(kind, consumer_id)
+                .map_err(|error| self.poll_capacity_error(error))?;
+            let prepare = request.project(self.consensus());
+            self.consensus
+                .pipeline_message(PlaneKind::Partitions, &prepare);
+            Ok(Some(PollReplication {
+                prepare,
+                reservation,
+            }))
+        }
     }
 
     fn auto_commit_admission_ready(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
@@ -3548,9 +3559,7 @@ where
         }
 
         if current_view != self.observed_view {
-            self.consensus.with_pipeline_mut(|pipeline| {
-                pipeline.retain_requests(|request| request.auto_commit().is_none());
-            });
+            self.discard_queued_auto_commits();
             self.mark_consumer_group_offsets_need_reconcile();
         }
 

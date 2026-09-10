@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::ConsumerKind;
-pub use server_common::poll::AutoCommitReservation;
-use server_common::poll::AutoCommitReservationToken;
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use iggy_common::ConsumerKind;
+pub use server_common::poll::AutoCommitReservation;
+use server_common::poll::AutoCommitReservationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableOffsetState {
@@ -174,13 +173,13 @@ pub struct ConsumerOffsetCapacity {
     kind: ConsumerKind,
     limit: Cell<usize>,
     pending: RefCell<HashMap<u32, usize>>,
-    provisional: RefCell<HashMap<u32, Arc<AutoCommitReservationToken>>>,
-    active_provisional_keys: Arc<AtomicUsize>,
+    provisional: RefCell<HashMap<u32, Rc<AutoCommitReservationToken>>>,
+    active_provisional_keys: Rc<Cell<usize>>,
     stranded: RefCell<HashSet<u32>>,
     uncertain: Cell<bool>,
     durable_warned: Cell<bool>,
     map_warned: Cell<bool>,
-    reclaim_epoch: Arc<AtomicU64>,
+    reclaim_epoch: Rc<Cell<u64>>,
     last_reclaim: Cell<Option<(u64, u64)>>,
 }
 
@@ -191,12 +190,12 @@ impl ConsumerOffsetCapacity {
             limit: Cell::new(limit),
             pending: RefCell::new(HashMap::new()),
             provisional: RefCell::new(HashMap::new()),
-            active_provisional_keys: Arc::new(AtomicUsize::new(0)),
+            active_provisional_keys: Rc::new(Cell::new(0)),
             stranded: RefCell::new(HashSet::new()),
             uncertain: Cell::new(false),
             durable_warned: Cell::new(false),
             map_warned: Cell::new(false),
-            reclaim_epoch: Arc::new(AtomicU64::new(0)),
+            reclaim_epoch: Rc::new(Cell::new(0)),
             last_reclaim: Cell::new(None),
         }
     }
@@ -232,7 +231,7 @@ impl ConsumerOffsetCapacity {
         let fixed = durable_count
             .saturating_add(self.pending.borrow().len())
             .saturating_add(self.stranded.borrow().len());
-        let provisional_len = self.active_provisional_keys.load(Ordering::Relaxed);
+        let provisional_len = self.active_provisional_keys.get();
         let upper_bound = fixed.saturating_add(provisional_len);
         if !self.uncertain.get() && upper_bound < limit {
             self.durable_warned.set(false);
@@ -258,22 +257,24 @@ impl ConsumerOffsetCapacity {
     }
 
     pub(crate) fn reserve_provisional(
-        self: &Rc<Self>,
+        &self,
         id: u32,
-        durable: &Rc<DurableConsumerOffsets>,
+        durable: &DurableConsumerOffsets,
     ) -> Result<AutoCommitReservation, ConsumerOffsetCapacityError> {
         self.check(id, durable)?;
         let mut provisional = self.provisional.borrow_mut();
         if provisional.len() >= self.limit.get() && !provisional.contains_key(&id) {
             provisional.retain(|_, token| token.active_count() > 0);
         }
-        let token = Arc::clone(provisional.entry(id).or_insert_with(|| {
-            Arc::new(AutoCommitReservationToken::new(
-                Arc::clone(&self.reclaim_epoch),
-                Arc::clone(&self.active_provisional_keys),
+        let token = provisional.entry(id).or_insert_with(|| {
+            Rc::new(AutoCommitReservationToken::new(
+                self.kind,
+                id,
+                Rc::clone(&self.reclaim_epoch),
+                Rc::clone(&self.active_provisional_keys),
             ))
-        }));
-        Ok(token.acquire(self.kind, id))
+        });
+        Ok(token.acquire())
     }
 
     pub(crate) fn owns(&self, reservation: &AutoCommitReservation) -> bool {
@@ -401,7 +402,8 @@ impl ConsumerOffsetCapacity {
     }
 
     pub(crate) fn note_local_key_change(&self) {
-        self.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
+        self.reclaim_epoch
+            .set(self.reclaim_epoch.get().wrapping_add(1));
     }
 
     pub(crate) fn forget_inactive_provisional(&self, id: u32) {
@@ -418,10 +420,7 @@ impl ConsumerOffsetCapacity {
         if self.uncertain.get() {
             return false;
         }
-        let epoch = (
-            self.reclaim_epoch.load(Ordering::Relaxed),
-            durable.membership_epoch.get(),
-        );
+        let epoch = (self.reclaim_epoch.get(), durable.membership_epoch.get());
         self.last_reclaim.replace(Some(epoch)) != Some(epoch)
     }
 
@@ -453,22 +452,22 @@ mod tests {
 
     #[test]
     fn given_cached_inactive_tokens_when_admitting_should_count_only_active_keys() {
-        let durable = Rc::new(DurableConsumerOffsets::default());
-        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let durable = DurableConsumerOffsets::default();
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2);
         let first = capacity.reserve_provisional(1, &durable).unwrap();
         let repeated = capacity.reserve_provisional(1, &durable).unwrap();
-        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 1);
+        assert_eq!(capacity.active_provisional_keys.get(), 1);
         drop(first);
-        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 1);
+        assert_eq!(capacity.active_provisional_keys.get(), 1);
         drop(repeated);
-        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 0);
+        assert_eq!(capacity.active_provisional_keys.get(), 0);
         assert_eq!(capacity.provisional.borrow().len(), 1);
         capacity.check(2, &durable).unwrap();
         let second = capacity.reserve_provisional(2, &durable).unwrap();
-        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 1);
+        assert_eq!(capacity.active_provisional_keys.get(), 1);
         drop(second);
         capacity.check(3, &durable).unwrap();
-        assert_eq!(capacity.active_provisional_keys.load(Ordering::Relaxed), 0);
+        assert_eq!(capacity.active_provisional_keys.get(), 0);
     }
 
     #[test]
@@ -494,8 +493,8 @@ mod tests {
 
     #[test]
     fn given_unchanged_protection_when_reclaim_repeats_should_skip_until_guard_drops() {
-        let durable = Rc::new(DurableConsumerOffsets::default());
-        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let durable = DurableConsumerOffsets::default();
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2);
         let held = capacity.reserve_provisional(7, &durable).unwrap();
         assert!(capacity.should_reclaim(&durable));
         for _ in 0..100 {
@@ -510,10 +509,10 @@ mod tests {
 
     #[test]
     fn given_repeated_reservation_for_same_key_should_reuse_token_allocation() {
-        let durable = Rc::new(DurableConsumerOffsets::default());
-        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let durable = DurableConsumerOffsets::default();
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2);
         let first = capacity.reserve_provisional(7, &durable).unwrap();
-        let token = Arc::clone(capacity.provisional.borrow().get(&7).unwrap());
+        let token = Rc::clone(capacity.provisional.borrow().get(&7).unwrap());
         drop(first);
         drop(capacity.reserve_provisional(8, &durable).unwrap());
         assert_eq!(capacity.provisional.borrow().len(), 2);
@@ -523,8 +522,8 @@ mod tests {
 
     #[test]
     fn given_inactive_token_cache_at_limit_when_new_key_arrives_should_prune_it() {
-        let durable = Rc::new(DurableConsumerOffsets::default());
-        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let durable = DurableConsumerOffsets::default();
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2);
         drop(capacity.reserve_provisional(7, &durable).unwrap());
         drop(capacity.reserve_provisional(8, &durable).unwrap());
         assert_eq!(capacity.provisional.borrow().len(), 2);
@@ -549,8 +548,8 @@ mod tests {
     #[test]
     fn given_provisional_and_journal_reservations_when_rebuilt_and_canceled_should_preserve_journal_slot()
      {
-        let durable = Rc::new(DurableConsumerOffsets::default());
-        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 1));
+        let durable = DurableConsumerOffsets::default();
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 1);
         let provisional = capacity
             .reserve_provisional(7, &durable)
             .expect("reserve poll");
@@ -563,8 +562,8 @@ mod tests {
 
     #[test]
     fn given_dropped_submit_when_guard_leaves_scope_should_release_only_its_key() {
-        let durable = Rc::new(DurableConsumerOffsets::default());
-        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let durable = DurableConsumerOffsets::default();
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2);
         let first = capacity
             .reserve_provisional(7, &durable)
             .expect("reserve first poll");
