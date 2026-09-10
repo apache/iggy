@@ -381,7 +381,7 @@ pub fn new_shard(
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
 
         validate_checksum: true,
-        segment_size: IggyByteSize::from(1024 * 1024 * 1024),
+        segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
         preallocate_segments: false,
         encryptor: None,
         path_layout: PartitionPathLayout::default(),

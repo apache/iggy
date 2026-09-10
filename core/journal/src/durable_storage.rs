@@ -32,6 +32,8 @@ pub enum OpenMode {
     Read,
     ReadWrite,
     Create,
+    /// Create a file if absent, preserving the inode and bytes if it exists.
+    CreateOrOpen,
 }
 
 pub struct StorageEntry {
@@ -190,8 +192,8 @@ impl DurableStorage for DiskStorage {
     async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<File> {
         let mut options = OpenOptions::new();
         options.read(true).write(mode != OpenMode::Read);
-        if mode == OpenMode::Create {
-            options.create(true).truncate(true);
+        if matches!(mode, OpenMode::Create | OpenMode::CreateOrOpen) {
+            options.create(true).truncate(mode == OpenMode::Create);
         }
         options.open(path).await
     }

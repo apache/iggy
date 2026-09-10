@@ -41,6 +41,9 @@ twox-hash = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { workspace = true }
+
 [lints.clippy]
 enum_glob_use = "deny"
 pedantic = "deny"

@@ -7608,6 +7608,12 @@ where
                         walk_cursor.get_or_insert(namespace);
                     }
                 }
+                if let Some(fault) = partition.fatal() {
+                    if fatal.is_none() {
+                        fatal = Some(fault.clone());
+                    }
+                    continue;
+                }
                 let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
                 let cluster = partition.consensus().cluster();

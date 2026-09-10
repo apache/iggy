@@ -34,7 +34,7 @@
 //! compio reactor contexts. Each shard owns its own instance, and the server
 //! exposes every shard's instance through the `[http.metrics]` scrape
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
-//! sub-registry per shard); every drop site also logs via `tracing`.
+//! sub-registry per shard). Drop-site tracing supplements the counters.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -113,6 +113,7 @@ pub mod frame_drop_variant {
     /// status and no frame of the client's was dropped, so counting it with
     /// shed frames would read as a routing loss.
     pub const PARTITION_AUTO_COMMIT: &str = "partition_auto_commit";
+    pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -161,7 +162,7 @@ pub mod frame_drop_reason {
 // pair enters the `Family` (and therefore the scrape) the first time a drop
 // site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 8;
+const VARIANT_COUNT: usize = 9;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -173,6 +174,7 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::METADATA_COMMIT_TICK,
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
     frame_drop_variant::PARTITION_AUTO_COMMIT,
+    frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [

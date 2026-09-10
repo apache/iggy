@@ -161,6 +161,12 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to recover partition prepare WAL at {dir}: {source}")]
+    PartitionPrepareWalIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's
     // `RecoveryError::SuperblockUnreadable` policy, minus the boot refusal,
@@ -212,7 +218,7 @@ pub enum ServerError {
     // catch this error, and only they log it -- a claim here would render
     // beside theirs and contradict one branch or the other.
     #[error(
-        "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused segment \
+        "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused storage \
          recovery: {reason}"
     )]
     PartitionRecoveryRefused {
@@ -466,8 +472,16 @@ pub enum PartitionRecoveryRefusal {
         walked_position: u64,
         durable_position: u64,
     },
-    /// A writer reopening over recovered bounds found the on-disk length
-    /// diverging from the size recovery just validated and truncated to.
+    PrepareWal {
+        directory: PathBuf,
+        source: std::io::Error,
+    },
+    CheckpointSizeMismatch {
+        start_offset: u64,
+        validated_bytes: u64,
+        expected_bytes: u64,
+    },
+    /// The physical file length differs from the required recovered boundary.
     StorageSizeMismatch {
         start_offset: u64,
         on_disk_bytes: u64,
@@ -579,6 +593,20 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                  the log has lost previously durable bytes mid-chunk, so rebuilding \
                  would re-mint their offsets"
             ),
+            Self::PrepareWal { directory, source } => write!(
+                f,
+                "prepare WAL at {} cannot be recovered: {source}",
+                directory.display()
+            ),
+            Self::CheckpointSizeMismatch {
+                start_offset,
+                validated_bytes,
+                expected_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} validated prefix has {validated_bytes} bytes, \
+                 but the WAL checkpoint requires {expected_bytes}"
+            ),
             Self::StorageSizeMismatch {
                 start_offset,
                 on_disk_bytes,
@@ -586,7 +614,7 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
             } => write!(
                 f,
                 "segment {start_offset} file length {on_disk_bytes} diverged from \
-                 its recovered size {expected_bytes} at writer open"
+                 its required recovered size {expected_bytes}"
             ),
         }
     }

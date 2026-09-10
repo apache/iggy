@@ -64,7 +64,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// The initial boundary must describe durable materialized messages only.
     ///
     /// # Errors
-    /// Returns an error for inconsistent boundaries or a failed storage barrier.
+    /// Returns an error for inconsistent boundaries, a `max_size` differing from an
+    /// already enabled layout, or a failed storage barrier.
     pub async fn enable_segment_storage(
         &mut self,
         initial: SegmentPosition,
@@ -163,6 +164,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     }
 
     /// Install a transferred checkpoint after all replacement segment files are durable.
+    /// The replacement establishes its own segment size; it does not extend the old layout.
     ///
     /// # Errors
     /// Returns an error if the checkpoint contradicts the installed bytes or a barrier fails.
@@ -516,7 +518,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 .ok_or_else(|| invalid("segment rollback handle is absent"))?;
             let length = file.length().await?;
             if length < cursor.position.length {
-                return Err(invalid("segment lost durably published bytes"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "segment {} (generation {}, start offset {}) lost durably published bytes: expected at least {}, found {}",
+                        cursor.path(&self.directory).display(),
+                        cursor.generation,
+                        cursor.position.start_offset,
+                        cursor.position.length,
+                        length,
+                    ),
+                ));
             }
             if length > cursor.position.length {
                 file.truncate(cursor.position.length).await?;
@@ -611,25 +623,32 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         let public = parent.join(format!("{start_offset:020}.log"));
         let file = if self.storage.exists(&retained).await? {
             self.storage.open(&retained, OpenMode::ReadWrite).await?
-        } else if length > 0
-            || (self.storage.exists(&public).await?
+        } else {
+            if length == 0
+                && self.storage.exists(&public).await?
                 && self
                     .storage
                     .open(&public, OpenMode::Read)
                     .await?
                     .length()
                     .await?
-                    == 0)
-        {
+                    > 0
+            {
+                // A purged inode can still be retained by older prepares.
+                self.remove_segment_name(&public).await?;
+            }
+            // Segment roll can create the public name during any await. Both
+            // creators must open that inode without truncation, then retain it.
+            let mode = if length == 0 {
+                OpenMode::CreateOrOpen
+            } else {
+                OpenMode::ReadWrite
+            };
+            let file = self.storage.open(&public, mode).await?;
             self.storage.hard_link(&public, &retained).await?;
-            self.storage.open(&retained, OpenMode::ReadWrite).await?
-        } else {
-            let file = self.storage.open(&retained, OpenMode::Create).await?;
-            // Offset names can still point at a purged inode retained by older
-            // prepares. Unlink before reuse; never truncate that inode in place.
-            self.remove_segment_name(&public).await?;
-            self.storage.hard_link(&retained, &public).await?;
-            if let Some(size) = preallocate_size {
+            if length == 0
+                && let Some(size) = preallocate_size
+            {
                 file.preallocate(&retained, size);
             }
             file

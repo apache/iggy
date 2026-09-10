@@ -8000,6 +8000,7 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "nix",
  "server_common",
  "tempfile",
  "tracing",

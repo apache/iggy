@@ -206,17 +206,23 @@ impl DurableStorage for SimStorage {
     type File = SimFile;
 
     async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<SimFile> {
-        let operation = if mode == OpenMode::Create {
+        let creates = matches!(mode, OpenMode::Create | OpenMode::CreateOrOpen);
+        let operation = if creates {
             StorageOperation::Create
         } else {
             StorageOperation::Open
         };
+        self.wait_for(operation).await;
         let (inode, epoch) = self.perform(operation, |state, _| {
-            let inode = if mode == OpenMode::Create {
+            let inode = if creates {
                 let (parent, name) = state.parent(path)?;
                 if let Some(&inode) = state.directory(parent)?.get(&name) {
                     match &mut state.inodes[inode] {
-                        Inode::File { buffered, .. } => buffered.clear(),
+                        Inode::File { buffered, .. } => {
+                            if mode == OpenMode::Create {
+                                buffered.clear();
+                            }
+                        }
                         Inode::Directory { .. } => {
                             return Err(invalid("cannot truncate directory"));
                         }
@@ -316,6 +322,7 @@ impl DurableStorage for SimStorage {
     }
 
     async fn hard_link(&self, source: &Path, target: &Path) -> io::Result<()> {
+        self.wait_for(StorageOperation::Link).await;
         self.perform(StorageOperation::Link, |state, _| {
             let inode = state.lookup(source)?;
             let (parent, name) = state.parent(target)?;

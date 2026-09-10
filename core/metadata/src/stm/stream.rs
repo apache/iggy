@@ -2801,7 +2801,9 @@ mod tests {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
                 name: WireName::new("t").unwrap(),
-                options: explicit.to_wire().unwrap(),
+                options: explicit
+                    .to_explicit_wire(|key| key == topic_option_keys::MESSAGE_EXPIRY)
+                    .unwrap(),
             },
             derived_options: derived.to_wire().unwrap(),
             partitions: vec![CreatedPartitionAssignment {
@@ -2830,7 +2832,10 @@ mod tests {
         ] {
             let key = HeaderKey::from_str(policy).unwrap();
             let option = topic.options.get(&key).unwrap();
-            assert!(option.explicit);
+            assert!(
+                !option.explicit,
+                "unsupplied durability comes from admission defaults"
+            );
             assert_eq!(option.value.kind(), HeaderKind::String);
             assert_eq!(option.value.as_str().unwrap(), "replicated");
         }

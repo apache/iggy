@@ -947,6 +947,9 @@ where
     }
 
     pub async fn checkpoint_persistence(&mut self, config: &PartitionsConfig) {
+        if self.fatal.is_some() {
+            return;
+        }
         let Some(persistence) = self
             .persistence
             .as_ref()
@@ -1066,6 +1069,9 @@ where
     }
 
     pub async fn drive_persistence(&mut self) {
+        if self.fatal.is_some() {
+            return;
+        }
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
@@ -2700,9 +2706,11 @@ where
     ) -> Result<(u64, bool), IggyError> {
         if self.persistence.is_some() {
             let result = crate::offset_storage::read_offset_max(path, offset).await?;
-            self.write_consumer_offset(path, result.offset, false)
-                .await?;
-            Ok((result.offset, true))
+            if result.written {
+                self.write_consumer_offset(path, result.offset, false)
+                    .await?;
+            }
+            Ok((result.offset, result.written))
         } else {
             let result = persist_offset_max(path, offset, persisted).await?;
             Ok((result.offset, result.written))
@@ -2713,7 +2721,8 @@ where
         &self,
         pending: PendingConsumerOffsetCommit,
     ) -> Result<(), IggyError> {
-        // The replicated WAL already protects these cursor updates until checkpoint.
+        // For either offset policy, the WAL protects these updates until checkpoint
+        // syncs their retained writers and directories before reclaiming history.
         let persisted =
             self.consumer_offset_durability().is_persisted() && self.persistence.is_none();
         let path = self.persisted_offset_path(pending.kind, pending.consumer_id);
@@ -8027,7 +8036,7 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
-        if self.materialization_missing {
+        if self.fatal.is_some() || self.materialization_missing {
             return false;
         }
         // Durable-before-send: a PrepareOk implies this replica's
@@ -8062,8 +8071,7 @@ where
         // that reaches here is journal-backed and ACKs as durable.
         // (`header_by_op` is a linear scan, so re-proving that here would
         // put O(journal) on every ack; the call-order invariant stands in.)
-        send_prepare_ok_common(self.consensus(), header, true).await;
-        true
+        send_prepare_ok_common(self.consensus(), header, true).await
     }
 }
 
@@ -8988,6 +8996,17 @@ mod tests {
 
         for preallocate in [false, true] {
             let directory = tempfile::tempdir().unwrap();
+            let probe = tempfile::tempfile_in(directory.path()).unwrap();
+            let preallocation_supported = match nix::fcntl::fallocate(
+                &probe,
+                nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                0,
+                i64::try_from(SEGMENT_BYTES).unwrap(),
+            ) {
+                Ok(()) => true,
+                Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => false,
+                Err(error) => panic!("preallocation probe failed: {error}"),
+            };
             let mut partition = partition_at_view(0, 0);
             partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
             partition.runtime_options.durability = iggy_common::Durability::Persisted;
@@ -9002,11 +9021,13 @@ mod tests {
             let empty =
                 std::fs::metadata(directory.path().join("00000000000000000000.log")).unwrap();
             assert_eq!(empty.len(), 0);
-            assert_eq!(
-                empty.blocks() * BLOCK_BYTES >= SEGMENT_BYTES,
-                preallocate,
-                "empty active segment allocation must follow preallocate_segments={preallocate}"
-            );
+            if preallocation_supported {
+                assert_eq!(
+                    empty.blocks() * BLOCK_BYTES >= SEGMENT_BYTES,
+                    preallocate,
+                    "empty active segment allocation must follow preallocate_segments={preallocate}"
+                );
+            }
             let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
             let namespace = partition.namespace();
             let bodies = [
@@ -9043,11 +9064,13 @@ mod tests {
             let metadata = std::fs::metadata(&rotated).unwrap();
             assert_eq!(std::fs::read(&rotated).unwrap(), bodies[1]);
             assert_eq!(metadata.len(), bodies[1].len() as u64);
-            assert_eq!(
-                metadata.blocks() * BLOCK_BYTES >= SEGMENT_BYTES,
-                preallocate,
-                "rotated segment allocation must follow preallocate_segments={preallocate}"
-            );
+            if preallocation_supported {
+                assert_eq!(
+                    metadata.blocks() * BLOCK_BYTES >= SEGMENT_BYTES,
+                    preallocate,
+                    "rotated segment allocation must follow preallocate_segments={preallocate}"
+                );
+            }
             assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
         }
     }
@@ -9240,8 +9263,11 @@ mod tests {
         assert_eq!(partition.mint_frontier(), 1);
     }
 
-    #[compio::test]
-    async fn deferred_purge_preserves_a_durable_primary_self_ack_until_it_can_be_sent() {
+    async fn partition_with_pending_durable_ack() -> (
+        tempfile::TempDir,
+        IggyPartition<RecordingBus>,
+        PrepareHeader,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition_at(0, 3);
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
@@ -9265,6 +9291,83 @@ mod tests {
         assert!(!partition.register_rebuilt_ack(&header));
         partition.start_persistence();
         persistence.drain_with_timeout().await.unwrap();
+
+        (directory, partition, header)
+    }
+
+    #[compio::test]
+    async fn persisted_ack_survives_recovery_transfer_and_a_rewound_head() {
+        let (_directory, mut partition, header) = partition_with_pending_durable_ack().await;
+        partition.consensus().begin_view_probe();
+        partition.drive_persistence().await;
+        assert_eq!(partition.pending_persisted_acks.borrow().len(), 1);
+
+        partition.consensus().init();
+        partition.consensus().begin_state_transfer_await();
+        partition.drive_persistence().await;
+        assert_eq!(partition.pending_persisted_acks.borrow().len(), 1);
+
+        partition
+            .consensus()
+            .set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        partition
+            .consensus()
+            .sequencer()
+            .set_sequence(header.op - 1);
+        partition.drive_persistence().await;
+        assert_eq!(partition.pending_persisted_acks.borrow().len(), 1);
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert!(acknowledgments.is_empty());
+
+        partition.consensus().sequencer().set_sequence(header.op);
+        partition.drive_persistence().await;
+        partition.drive_persistence().await;
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert!(partition.pending_persisted_acks.borrow().is_empty());
+        assert_eq!(acknowledgments.len(), 1);
+        let ack = bytemuck::checked::from_bytes::<PrepareOkHeader>(acknowledgments[0].as_slice());
+        assert_eq!(ack.op, header.op);
+        assert_eq!(ack.prepare_checksum, header.checksum);
+    }
+
+    #[compio::test]
+    async fn persisted_ack_remains_fenced_after_a_local_commit_failure() {
+        let (_directory, mut partition, header) = partition_with_pending_durable_ack().await;
+        partition.fatal = Some(FatalCommit {
+            namespace_raw: partition.namespace().inner(),
+            op: header.op,
+            operation: Operation::StoreConsumerOffset,
+        });
+        partition.persistence.as_ref().unwrap().request_checkpoint();
+        partition
+            .consensus()
+            .restore_commit_state(header.op, header.op);
+        partition.checkpoint_persistence(&repair_config()).await;
+        partition.drive_persistence().await;
+        partition.acknowledge_prepare(header.op).await;
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert!(
+            acknowledgments.is_empty(),
+            "a fenced partition must never acknowledge"
+        );
+        assert_eq!(partition.pending_persisted_acks.borrow().len(), 1);
+        assert_eq!(
+            partition.fatal().unwrap().operation,
+            Operation::StoreConsumerOffset
+        );
+    }
+
+    #[compio::test]
+    async fn deferred_purge_preserves_a_durable_primary_self_ack_until_it_can_be_sent() {
+        let (_directory, mut partition, header) = partition_with_pending_durable_ack().await;
 
         partition.purge_deferred = true;
         let mut acknowledgments = Vec::new();
@@ -12022,6 +12125,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn wal_backed_cold_offsets_skip_covered_values_and_write_advances() {
+        let (directory, partition, _) = partition_with_pending_durable_ack().await;
+        let path = directory.path().join("offset");
+        let path = path.to_str().unwrap();
+        persist_offset(path, 114, false).await.unwrap();
+        assert_eq!(
+            partition
+                .write_cold_consumer_offset(path, 109, true)
+                .await
+                .unwrap(),
+            (114, false)
+        );
+        assert_eq!(
+            partition
+                .write_cold_consumer_offset(path, 114, true)
+                .await
+                .unwrap(),
+            (114, false)
+        );
+        assert!(
+            partition
+                .persistence
+                .as_ref()
+                .unwrap()
+                .take_offset_file(path)
+                .is_none()
+        );
+        assert_eq!(
+            partition
+                .write_cold_consumer_offset(path, 115, true)
+                .await
+                .unwrap(),
+            (115, true)
+        );
+        assert_eq!(
+            crate::offset_storage::read_offset_max(path, 0)
+                .await
+                .unwrap()
+                .offset,
+            115
+        );
     }
 
     /// The persisted-offset tracker is cold after a restart; the first

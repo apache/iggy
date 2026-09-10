@@ -300,7 +300,8 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     let default_streams = match args.benchmark_kind.as_simple_kind() {
         BenchmarkKind::BalancedProducerAndConsumerGroup
         | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_STREAMS.get(),
+        | BenchmarkKind::BalancedProducer
+        | BenchmarkKind::EndToEndProducingConsumerGroup => DEFAULT_BALANCED_NUMBER_OF_STREAMS.get(),
         _ => DEFAULT_PINNED_NUMBER_OF_STREAMS.get(),
     };
     if streams != default_streams {
@@ -311,10 +312,13 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     let default_partitions = match args.benchmark_kind.as_simple_kind() {
         BenchmarkKind::BalancedProducerAndConsumerGroup
         | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_PARTITIONS.get(),
+        | BenchmarkKind::BalancedProducer
+        | BenchmarkKind::EndToEndProducingConsumerGroup => {
+            DEFAULT_BALANCED_NUMBER_OF_PARTITIONS.get()
+        }
         _ => DEFAULT_PINNED_NUMBER_OF_PARTITIONS.get(),
     };
-    if partitions != default_partitions {
+    if partitions != 0 && partitions != default_partitions {
         parts.push(format!("--partitions {partitions}"));
     }
 
@@ -361,6 +365,46 @@ mod tests {
     use super::recreate_bench_command;
     use crate::args::common::IggyBenchArgs;
     use clap::Parser;
+
+    #[test]
+    fn reproduced_commands_preserve_consumer_only_and_end_to_end_topologies() {
+        for arguments in [
+            vec!["iggy-bench", "pinned-consumer", "tcp"],
+            vec!["iggy-bench", "balanced-consumer-group", "tcp"],
+            vec!["iggy-bench", "end-to-end-producing-consumer-group", "tcp"],
+            vec![
+                "iggy-bench",
+                "end-to-end-producing-consumer-group",
+                "--streams",
+                "6",
+                "--consumer-groups",
+                "6",
+                "--partitions",
+                "1",
+                "tcp",
+            ],
+        ] {
+            let mut original = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            original.validate();
+            let command = recreate_bench_command(&original);
+            let arguments = command
+                .split_ascii_whitespace()
+                .skip_while(|argument| *argument != "iggy-bench");
+            let mut reproduced = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            reproduced.validate();
+            assert_eq!(reproduced.streams(), original.streams(), "{command}");
+            assert_eq!(
+                reproduced.number_of_partitions(),
+                original.number_of_partitions(),
+                "{command}"
+            );
+            assert_eq!(
+                reproduced.number_of_consumer_groups(),
+                original.number_of_consumer_groups(),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn reproduced_websocket_commands_preserve_independent_topic_policies() {

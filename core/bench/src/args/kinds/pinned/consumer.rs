@@ -74,7 +74,7 @@ impl BenchmarkKindProps for PinnedConsumerArgs {
         if streams > consumers {
             cmd.error(
                 ErrorKind::ArgumentConflict,
-                format!("For pinned consumer, number of streams ({streams}) must be equal to the number of consumers ({consumers}).",
+                format!("For pinned consumer, number of streams ({streams}) must be less than or equal to the number of consumers ({consumers}).",
             ))
             .exit();
         }

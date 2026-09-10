@@ -1630,6 +1630,9 @@ async fn clear_materialization_missing(directory: &str) -> std::io::Result<()> {
 /// Move every segment file in `partition_dir` aside into `<dir>.fenced.<n>/`,
 /// returning the directory used.
 ///
+/// Boot recovery also supplies `wal_revision` to
+/// move the refused prepare WAL. Live callers leave it unset to retain open writers.
+///
 /// The partition directory itself STAYS, and so do its two superblock slots:
 /// they hold the group's only durable `(view, log_view)`, and moving them would
 /// make the rebuild read an empty directory -- no `restore_partition_view`,
@@ -1648,7 +1651,10 @@ async fn clear_materialization_missing(directory: &str) -> std::io::Result<()> {
 /// the rebuild plants segment 0 with `file_exists = false` and truncates
 /// whatever the failed quarantine left, so callers tombstone the partition and
 /// leave the bytes for an operator.
-pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<String> {
+pub async fn quarantine_partition_files(
+    partition_dir: &str,
+    wal_revision: Option<u64>,
+) -> std::io::Result<String> {
     // `create_dir`, not stat-then-create: one syscall per attempt instead of
     // two, and race-free. Deliberately NOT `create_dir_all`, which succeeds on
     // an existing directory and would silently merge this fence into an earlier
@@ -1685,6 +1691,19 @@ pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<St
             continue;
         };
         compio::fs::rename(&path, &PathBuf::from(&target).join(name)).await?;
+    }
+    if let Some(revision) = wal_revision {
+        let name = format!("prepares-{revision}");
+        match compio::fs::rename(
+            &Path::new(partition_dir).join(&name),
+            &Path::new(&target).join(&name),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     // All three touched directories: the target (its new dirents), the source
     // (the removals), and the source's parent (the target directory itself is a
@@ -2185,13 +2204,13 @@ where
         Ok(checksum)
     }
 
-    /// [`quarantine_segment_files`] over this partition's directory, for the
+    /// [`quarantine_partition_files`] over this partition's directory, for the
     /// shard's `ConvergeFailed` fence -- the safety argument (segment files
     /// move, superblock slots STAY, copies are unreclaimed operator evidence)
     /// lives on the free function. `None` for an in-memory partition.
     ///
     /// # Errors
-    /// The underlying `std::io::Error`; see [`quarantine_segment_files`] for why
+    /// The underlying `std::io::Error`; see [`quarantine_partition_files`] for why
     /// a failure is not something the rebuild can absorb.
     pub async fn quarantine_partition_dir(&self) -> std::io::Result<Option<String>> {
         let Some(dir) = self.partition_dir.clone() else {
@@ -2204,7 +2223,7 @@ where
         if self.consensus().replica_count() > 1 {
             mark_materialization_missing(&dir, self.created_revision).await?;
         }
-        quarantine_segment_files(&dir).await.map(Some)
+        quarantine_partition_files(&dir, None).await.map(Some)
     }
 
     /// Release the cached offer once no requester holds one (the shard's
@@ -3483,9 +3502,6 @@ where
         minted_next_offset: u64,
         staged_was_empty: bool,
     ) -> Result<(), iggy_common::IggyError> {
-        if let Some(persistence) = &self.persistence {
-            persistence.retire_offset_files();
-        }
         // The empty plant below can land on a base offset this sweep unlinks,
         // so an in-flight poll's cached read fd would keep serving the retired
         // inodes as live data. Same hazard and same fix as `purge`.

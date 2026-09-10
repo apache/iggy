@@ -286,9 +286,9 @@ pub async fn load_persisted_segments_with_checkpoint(
             && bounds.as_ref().map_or(0, |bounds| bounds.messages_size) != messages_size
         {
             return Err(
-                identity.refusal(PartitionRecoveryRefusal::StorageSizeMismatch {
+                identity.refusal(PartitionRecoveryRefusal::CheckpointSizeMismatch {
                     start_offset,
-                    on_disk_bytes: bounds.as_ref().map_or(0, |bounds| bounds.messages_size),
+                    validated_bytes: bounds.as_ref().map_or(0, |bounds| bounds.messages_size),
                     expected_bytes: messages_size,
                 }),
             );

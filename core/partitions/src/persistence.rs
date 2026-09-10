@@ -727,9 +727,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     ///
     /// # Errors
     /// Returns a barrier error that the caller must fence like a failed write.
-    ///
-    /// # Panics
-    /// Panics if the previous writer was not taken before replacement.
     pub async fn retain_offset_file(&self, path: String, file: S::File) -> io::Result<()> {
         let retained_count =
             self.offset_files.borrow().len() + self.retired_offset_files.borrow().len();
@@ -739,18 +736,15 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         let Some(permit) = OffsetFilePermit::acquire() else {
             return file.sync().await;
         };
-        assert!(
-            self.offset_files
-                .borrow_mut()
-                .insert(
-                    path,
-                    RetainedOffsetFile {
-                        file,
-                        _permit: permit
-                    }
-                )
-                .is_none()
-        );
+        if let Some(previous) = self.offset_files.borrow_mut().insert(
+            path,
+            RetainedOffsetFile {
+                file,
+                _permit: permit,
+            },
+        ) {
+            self.retired_offset_files.borrow_mut().push(previous);
+        }
         Ok(())
     }
 

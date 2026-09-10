@@ -701,7 +701,12 @@ pub async fn load_partition_or_fence(
                     ServerError::Iggy(Box::new(IggyError::CannotSyncFile))
                 })?;
             }
-            match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
+            match partitions::state_transfer::quarantine_partition_files(
+                &partition_dir,
+                (replica_count > 1).then_some(partition_metadata.created_revision),
+            )
+            .await
+            {
                 Ok(fenced_dir) => error!(
                     stream_id,
                     topic_id,
@@ -877,9 +882,20 @@ async fn load_partition(
                     .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
             )
             .await
-            .map_err(|error| {
-                warn!(%error, "cannot recover partition prepare WAL before segment recovery");
-                ServerError::from(IggyError::CannotReadFile)
+            .map_err(|source| match source.kind() {
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
+                    ServerError::PartitionRecoveryRefused {
+                        dir: PathBuf::from(&partition_dir),
+                        stream_id: namespace.stream_id(),
+                        topic_id: namespace.topic_id(),
+                        partition_id: namespace.partition_id(),
+                        reason: PartitionRecoveryRefusal::PrepareWal { directory, source },
+                    }
+                }
+                _ => ServerError::PartitionPrepareWalIo {
+                    dir: directory,
+                    source,
+                },
             })?,
         )
     } else {
@@ -1695,6 +1711,75 @@ mod tests {
         assert_eq!(
             recovered.prepares().await.unwrap()[1].as_slice()[size_of::<PrepareHeader>()..],
             tail_body
+        );
+    }
+
+    #[compio::test]
+    async fn corrupt_prepare_wal_is_quarantined_without_losing_the_recovery_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let runtime = TopicRuntimeOptions {
+            durability: iggy_common::Durability::Persisted,
+            preallocate_segments: Some(false),
+            ..Default::default()
+        };
+        drop(
+            build_partition_fresh(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                0,
+                runtime,
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                0,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap(),
+        );
+        let directory = config.get_partition_path(1, 1, 0);
+        let (store, _) = open_partition_superblock(&directory, test_identity())
+            .await
+            .unwrap();
+        let state = recorded_state(3, 2);
+        store.write(&state.to_bytes()).await.unwrap();
+        drop(store);
+        let frontier = Path::new(&directory).join("prepares-0/frontier");
+        let mut corrupt = std::fs::read(&frontier).unwrap();
+        corrupt[0] ^= u8::MAX;
+        std::fs::write(&frontier, &corrupt).unwrap();
+        let partitions = solo_partitions();
+        let metadata = Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0);
+
+        for _ in 0..2 {
+            let partition = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &metadata,
+                runtime,
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(partition.requires_state_transfer());
+            assert!(partition.consensus().view() >= state.view);
+            let (_, recovered) = open_partition_superblock(&directory, test_identity())
+                .await
+                .unwrap();
+            assert_eq!(recovered, Some(state));
+        }
+        assert_eq!(
+            std::fs::read(format!("{directory}.fenced.0/prepares-0/frontier")).unwrap(),
+            corrupt,
         );
     }
 

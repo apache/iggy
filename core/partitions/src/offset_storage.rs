@@ -133,6 +133,10 @@ pub async fn persist_offset(path: &str, offset: u64, persisted: bool) -> Result<
 /// Return the write result with its original descriptor so checkpoint observes
 /// writeback errors even after an unsuccessful write.
 ///
+/// No barrier runs here. For either offset durability policy, the caller must
+/// retain the writer and sync it and its directory before reclaiming the WAL
+/// history that protects the update.
+///
 /// # Errors
 /// The outer error reports directory/open failures before writing begins.
 pub async fn persist_offset_retained(

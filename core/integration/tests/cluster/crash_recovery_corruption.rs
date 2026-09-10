@@ -25,8 +25,8 @@
 //! - Interior damage to the metadata WAL or a superblock slot can only be
 //!   bit-rot or operator error, never a torn append, so boot must refuse
 //!   loudly and the node heals by rejoining from a clean slate.
-//! - Losing a persisted segment body named by the durable WAL also requires
-//!   refusal and a clean-slate rejoin; rebuilding an index cannot restore it.
+//! - Losing a persisted body named by the durable WAL quarantines the partition
+//!   for peer recovery while preserving the damaged files for inspection.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,7 +76,7 @@ const INDEX_AHEAD_BATCHES: u32 = 30;
 /// real surviving prefix behind the one entry it strands past the log end.
 const MIN_INDEX_ENTRIES: usize = 4;
 /// Infix of the directory the refusal path renames a partition's segment files
-/// into (`partitions::state_transfer::quarantine_segment_files`).
+/// into (`partitions::state_transfer::quarantine_partition_files`).
 const FENCED_DIR_MARKER: &str = ".fenced.";
 /// Boot log line recovery emits when the log cannot back the last entry of an
 /// index (`server::segment_recovery::recover_segment_bounds`): the positive
@@ -84,8 +84,7 @@ const FENCED_DIR_MARKER: &str = ".fenced.";
 /// Distinct from the line the self-contradicting-index check emits, which ends
 /// "rebuilding it from the log".
 const INDEX_REBUILD_MARKER: &str = "discarding the index and rebuilding it from a byte-0 walk";
-const PARTITION_WAL_REFUSAL_MARKER: &str =
-    "cannot recover partition prepare WAL before segment recovery";
+const PARTITION_WAL_REFUSAL_MARKER: &str = "prepare WAL at";
 
 async fn create_stream_and_topic(client: &IggyClient, durability: Durability) {
     client
@@ -574,8 +573,8 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
 
 /// Replicated storage rebuilds a stale index from the surviving log and refills
 /// the tail from peers. Persisted storage syncs bodies before publishing WAL
-/// references, so deleting that tail loses durable bytes and must refuse boot.
-/// A clean-slate state transfer must restore every acknowledged message.
+/// references, so deleting that tail must quarantine the damaged partition.
+/// Peer recovery must restore every acknowledged message without wiping the node.
 #[iggy_harness(cluster_nodes = 3)]
 #[test_matrix([Durability::Replicated, Durability::Persisted])]
 async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_preserve_acked_messages(
@@ -641,20 +640,26 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
     );
 
     if durability == Durability::Persisted {
-        let error = harness
+        harness
             .restart_node(backup)
-            .expect_err("boot must refuse a persisted body missing from the durable WAL");
+            .expect("boot must quarantine the damaged partition for peer recovery");
         if stderr_is_captured() {
-            let diagnostics = error.to_string();
             assert!(
-                diagnostics.contains(PARTITION_WAL_REFUSAL_MARKER),
-                "boot must refuse the damaged partition WAL, got: {diagnostics}"
+                harness
+                    .node(backup)
+                    .stdout_contains(PARTITION_WAL_REFUSAL_MARKER),
+                "boot must diagnose the damaged partition WAL"
             );
         }
+        let fenced = fenced_segment_paths(&backup_data);
+        let refused_log = fenced
+            .iter()
+            .find(|path| path.file_name() == log_path.file_name())
+            .expect("the damaged public segment must be quarantined");
         assert_eq!(
-            fs::read(&log_path).expect("read the refused segment"),
+            fs::read(refused_log).expect("read the quarantined segment"),
             truncated,
-            "refusal must preserve the damaged segment for diagnosis"
+            "quarantine must preserve the damaged segment for diagnosis"
         );
         let survivors: Vec<usize> = (0..harness.cluster_size())
             .filter(|node| *node != backup)
@@ -665,9 +670,6 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
             .unwrap_or_else(|state| {
                 panic!("the surviving quorum must preserve every ack: {state}")
             });
-        harness
-            .restart_node_from_clean_slate(backup)
-            .expect("a clean-slate rejoin must restore the missing persisted bodies");
     } else {
         harness.restart_node(backup).unwrap_or_else(|error| {
             panic!(

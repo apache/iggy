@@ -1072,7 +1072,7 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             key: WireName::new(topic_option_keys::CONSUMER_OFFSET_DURABILITY).map_err(|_| IggyError::InvalidFormat)?,
             kind: HeaderKind::String.as_code(),
             default_value: Bytes::from_static(b"replicated"),
-            description: "Explicit offset completion: replicated or persisted. Independently defaults to replicated. Poll auto-commit remains asynchronous. In replicated groups, persisted offsets also journal full message bodies, even with replicated message durability, and spend partition.wal_bytes_max on them.".to_string(),
+            description: "Explicit offset completion: replicated or persisted. Independently defaults to replicated. Poll auto-commit remains asynchronous. In replicated groups, persisted offsets also enable WAL references to segment bodies, retaining their inodes by hard link until reclamation, even with replicated message durability. Full body sizes count against partition.wal_bytes_max.".to_string(),
         },
         OptionDescriptor {
             key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)

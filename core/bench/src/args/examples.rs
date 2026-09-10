@@ -144,7 +144,7 @@ pub fn print_examples() {
 mod tests {
     use super::EXAMPLES;
     use crate::args::common::IggyBenchArgs;
-    use clap::{CommandFactory, Parser, error::ErrorKind};
+    use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind};
     use iggy::prelude::Durability;
     use std::collections::BTreeSet;
 
@@ -162,6 +162,9 @@ mod tests {
                     let (kind, options) = matches.subcommand().unwrap();
                     kinds.insert(kind.to_owned());
                     transports.insert(options.subcommand_name().unwrap().to_owned());
+                    IggyBenchArgs::from_arg_matches(&matches)
+                        .unwrap()
+                        .validate();
                 }
                 Err(error) => {
                     assert_eq!(error.kind(), ErrorKind::DisplayHelp, "{command}: {error}");

@@ -1506,6 +1506,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     const FILE_BLOCK_BYTES: u64 = 512;
 
+    #[cfg(target_os = "linux")]
+    fn supports_preallocation(directory: &Path, length: u64) -> bool {
+        let probe = tempfile::tempfile_in(directory).unwrap();
+        match nix::fcntl::fallocate(
+            &probe,
+            nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            0,
+            i64::try_from(length).unwrap(),
+        ) {
+            Ok(()) => true,
+            Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => false,
+            Err(error) => panic!("preallocation probe failed: {error}"),
+        }
+    }
+
     #[compio::test]
     async fn referenced_bodies_survive_retention_and_checkpoint_without_wal_copies() {
         let partition = tempdir().unwrap();
@@ -2397,6 +2412,91 @@ mod tests {
     }
 
     #[compio::test]
+    async fn malformed_durable_segment_boundaries_are_refused_on_reopen() {
+        for invalid in [
+            "zero size",
+            "tail generation",
+            "checkpoint generation",
+            "tail ordering",
+            "empty tail bytes",
+            "empty tail offsets",
+            "checkpoint ordering",
+            "empty checkpoint bytes",
+            "empty checkpoint offsets",
+            "rewound tail",
+        ] {
+            let partition = tempdir().unwrap();
+            let directory = partition.path().join("prepares-7");
+            let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+                .await
+                .unwrap();
+            journal
+                .enable_segment_storage(SegmentPosition::default(), PARTITION_WAL_BLOCK_SIZE as u64)
+                .await
+                .unwrap();
+            let mut state = journal.state;
+            let segments = state.segment_storage.as_mut().unwrap();
+            match invalid {
+                "zero size" => segments.max_size = 0,
+                "tail generation" => segments.tail.generation = segments.next_generation,
+                "checkpoint generation" => {
+                    segments.checkpoint.generation = segments.next_generation;
+                }
+                "tail ordering" => segments.tail.position.start_offset = 1,
+                "empty tail bytes" => segments.tail.position.next_offset = 1,
+                "empty tail offsets" => segments.tail.position.length = 1,
+                "checkpoint ordering" => segments.checkpoint.position.start_offset = 1,
+                "empty checkpoint bytes" => segments.checkpoint.position.next_offset = 1,
+                "empty checkpoint offsets" => segments.checkpoint.position.length = 1,
+                "rewound tail" => {
+                    segments.checkpoint.position = SegmentPosition {
+                        length: 1,
+                        next_offset: 1,
+                        ..Default::default()
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let encoded = state.encode();
+            assert!(JournalState::decode(&encoded).is_err(), "{invalid}");
+            std::fs::write(directory.join("frontier"), encoded).unwrap();
+            drop(journal);
+            let error = PartitionPrepareJournal::open(&directory, 42, 7)
+                .await
+                .err()
+                .expect(invalid);
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "{invalid}: {error}"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn a_segment_candidate_below_the_checkpoint_cannot_rewind_its_boundary() {
+        const BODY_BYTES: usize = 4096;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let second = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.append(second.into_frozen()).await.unwrap();
+        journal.checkpoint(1).await.unwrap();
+        let checkpoint = journal.state.segment_storage.unwrap().checkpoint;
+        assert_eq!(journal.segment_boundary(2).unwrap().position.next_offset, 2);
+        journal.entries.get_mut(&2).unwrap().next_offset = Some(0);
+        assert_eq!(journal.segment_boundary(2), Some(checkpoint));
+    }
+
+    #[compio::test]
     async fn oversized_durable_segment_layout_is_refused_before_recovery_allocation() {
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
@@ -2571,6 +2671,7 @@ mod tests {
 
         for preallocate in [false, true] {
             let partition = tempdir().unwrap();
+            let preallocation_supported = supports_preallocation(partition.path(), SEGMENT_BYTES);
             let directory = partition.path().join("prepares-7");
             let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
                 &directory,
@@ -2612,11 +2713,13 @@ mod tests {
             .unwrap();
             let metadata = std::fs::metadata(&active).unwrap();
             assert_eq!(metadata.len(), BODY_BYTES as u64);
-            assert_eq!(
-                metadata.blocks() * FILE_BLOCK_BYTES >= SEGMENT_BYTES,
-                preallocate,
-                "recovery must preserve the reservation after trimming unpublished bytes"
-            );
+            if preallocation_supported {
+                assert_eq!(
+                    metadata.blocks() * FILE_BLOCK_BYTES >= SEGMENT_BYTES,
+                    preallocate,
+                    "recovery must preserve the reservation after trimming unpublished bytes"
+                );
+            }
             assert_eq!(
                 std::fs::read(&active).unwrap(),
                 second.as_slice()[size_of::<PrepareHeader>()..]
@@ -2633,11 +2736,13 @@ mod tests {
                 .unwrap();
             let metadata = std::fs::metadata(&active).unwrap();
             assert_eq!(metadata.len(), (2 * BODY_BYTES) as u64);
-            assert_eq!(
-                metadata.blocks() * FILE_BLOCK_BYTES >= SEGMENT_BYTES,
-                preallocate,
-                "replacement segment must follow the preallocation policy"
-            );
+            if preallocation_supported {
+                assert_eq!(
+                    metadata.blocks() * FILE_BLOCK_BYTES >= SEGMENT_BYTES,
+                    preallocate,
+                    "replacement segment must follow the preallocation policy"
+                );
+            }
             assert_eq!(
                 std::fs::read(&active).unwrap(),
                 replacement.as_slice()[size_of::<PrepareHeader>()..]
@@ -2704,7 +2809,9 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(installed.len(), initial.length);
-                assert!(installed.blocks() * FILE_BLOCK_BYTES >= (4 * BODY_BYTES) as u64);
+                if supports_preallocation(partition.path(), (4 * BODY_BYTES) as u64) {
+                    assert!(installed.blocks() * FILE_BLOCK_BYTES >= (4 * BODY_BYTES) as u64);
+                }
             }
             let checkpoint_reference = journal.segment_reference(checkpoint.header()).unwrap();
             if !materialized {
@@ -2783,6 +2890,7 @@ mod tests {
 
     #[compio::test]
     async fn owned_segments_migrate_only_unmaterialized_legacy_prepares() {
+        const EXISTING_GENERATION: u64 = 41;
         const BODY_BYTES: usize = 8192;
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
@@ -2791,9 +2899,17 @@ mod tests {
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
         let second = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
-        journal.append(first.clone().into_frozen()).await.unwrap();
+        let existing_reference =
+            write_segment(partition.path(), EXISTING_GENERATION, 0, &first).await;
+        journal
+            .append_batch_referenced_buffered(
+                &[first.clone().into_frozen()],
+                &[Some(existing_reference)],
+            )
+            .await
+            .unwrap();
+        journal.sync().await.unwrap();
         journal.append(second.clone().into_frozen()).await.unwrap();
-        write_segment(partition.path(), 0, 0, &first).await;
         let checkpoint = SegmentPosition {
             start_offset: 0,
             length: BODY_BYTES as u64,
@@ -2803,8 +2919,17 @@ mod tests {
             .enable_segment_storage(checkpoint, (4 * BODY_BYTES) as u64)
             .await
             .unwrap();
-        assert!(journal.segment_reference(first.header()).is_none());
-        assert!(journal.segment_reference(second.header()).is_some());
+        assert_eq!(
+            journal.segment_reference(first.header()),
+            Some(existing_reference)
+        );
+        assert!(
+            journal
+                .segment_reference(second.header())
+                .unwrap()
+                .generation
+                > EXISTING_GENERATION
+        );
         drop(journal);
         let journal = PartitionPrepareJournal::open(&directory, 42, 7)
             .await

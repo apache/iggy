@@ -287,12 +287,17 @@ where
         M: RestorableMetadataStm,
     {
         if let Some(sender) = self.senders.get(self.id as usize).cloned() {
+            let metrics = self.metrics.clone();
             self.plane
                 .partitions()
                 .set_persistence_notifier(Rc::new(move |completion| {
-                    let _ = sender.try_send(ShardFrame::lifecycle(
-                        LifecycleFrame::PartitionPersistenceCompleted(completion),
-                    ));
+                    let frame = LifecycleFrame::PartitionPersistenceCompleted(completion);
+                    if let Err(error) = sender.try_send(ShardFrame::lifecycle(frame)) {
+                        metrics.record_frame_drop(
+                            frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
+                            crate::coordinator::classify_try_send_err(&error),
+                        );
+                    }
                 }));
         }
         // Reused across every pump iteration; pre-size to skip the

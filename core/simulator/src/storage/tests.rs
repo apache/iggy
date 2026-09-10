@@ -617,6 +617,46 @@ fn metadata_only_append_skips_segment_barriers_after_durable_bodies() {
 }
 
 #[test]
+fn replacing_a_retained_offset_writer_keeps_both_inodes_until_checkpoint() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(1).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let path = Path::new("/partition/offset");
+        let original = Path::new("/partition/original-offset");
+        let mut file = storage.open(path, OpenMode::Create).await.unwrap();
+        file.write(0, b"original".to_vec()).await.unwrap();
+        storage.hard_link(path, original).await.unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), file)
+            .await
+            .unwrap();
+        storage.remove_file(path).await.unwrap();
+        let mut replacement = storage.open(path, OpenMode::Create).await.unwrap();
+        replacement.write(0, b"replaced".to_vec()).await.unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), replacement)
+            .await
+            .unwrap();
+
+        persistence.checkpoint_files(
+            1,
+            vec![path.to_path_buf()],
+            vec![Path::new(DIRECTORY).to_path_buf()],
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.failure().is_none());
+        assert_eq!(persistence.checkpoint_op(), 1);
+        storage.crash(Crash::PowerLoss);
+        let file = storage.open(original, OpenMode::Read).await.unwrap();
+        assert_eq!(file.read(0, 8).await.unwrap(), b"original");
+        let file = storage.open(path, OpenMode::Read).await.unwrap();
+        assert_eq!(file.read(0, 8).await.unwrap(), b"replaced");
+    });
+}
+
+#[test]
 fn a_full_offset_writer_cache_synchronizes_overflow_and_reports_barrier_failure() {
     const OFFSET_KEYS: usize = 128;
     block_on(async {
@@ -1258,6 +1298,74 @@ async fn baseline() -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
         .unwrap();
     storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
     (storage, journal)
+}
+
+#[test]
+fn segment_roll_during_wal_create_keeps_the_same_inode() {
+    block_on(segment_roll_during_wal_open(StorageOperation::Create));
+}
+
+#[test]
+fn segment_roll_during_wal_link_keeps_the_same_inode() {
+    block_on(segment_roll_during_wal_open(StorageOperation::Link));
+}
+
+async fn segment_roll_during_wal_open(operation: StorageOperation) {
+    let storage = storage_for_partition().await;
+    let mut journal =
+        PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    journal
+        .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64)
+        .await
+        .unwrap();
+    let first = owned_prepare(1, 0, 0);
+    journal.append(first.clone().into_frozen()).await.unwrap();
+    let second = owned_prepare(2, first.header().checksum, 1);
+    let public = Path::new(DIRECTORY).join(format!("{:020}.log", 1));
+    let retained = Path::new(WAL).join("segment-1-1.log");
+    storage.state.borrow_mut().paused = Some(operation);
+    let mut append = Box::pin(journal.append(second.clone().into_frozen()));
+    assert!(poll!(&mut append).is_pending());
+    storage.resume();
+    let roll_reader = storage.open(&public, OpenMode::CreateOrOpen).await.unwrap();
+    append
+        .await
+        .expect("a concurrent segment roll must not fail the WAL append");
+    {
+        let state = storage.state.borrow();
+        assert_eq!(
+            state.lookup(&public).unwrap(),
+            state.lookup(&retained).unwrap()
+        );
+        assert_eq!(
+            roll_reader.inode,
+            state.lookup(&public).unwrap(),
+            "the WAL must retain the inode opened by the segment roll"
+        );
+    }
+    assert_eq!(
+        roll_reader.read(0, OWNED_BATCH_BYTES).await.unwrap(),
+        second.as_slice()[size_of::<PrepareHeader>()..]
+    );
+    drop(journal);
+    storage.crash(Crash::PowerLoss);
+    let recovered =
+        PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    assert_eq!(recovered.durable_op(), 2);
+    let actual = recovered.prepares().await.unwrap();
+    for (actual, expected) in actual.iter().zip([first, second]) {
+        assert_eq!(actual.as_slice(), expected.as_slice());
+    }
+    assert_eq!(actual.len(), 2);
+    let state = storage.state.borrow();
+    assert_eq!(
+        state.lookup(&public).unwrap(),
+        state.lookup(&retained).unwrap()
+    );
 }
 
 #[test]

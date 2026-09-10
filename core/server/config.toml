@@ -849,14 +849,16 @@ clients_table_max = 8192
 #                      ("unlimited" when unset)
 #   message_expiry   - delete sealed segments older than this ("none" when unset)
 # Both policies can be active at once. The active segment is never touched.
+# WAL-backed partitions request a checkpoint before deleting referenced segments;
+# retention waits for that checkpoint, even below the usual WAL capacity trigger.
 # Call GET /options/topic (or the SDK's describe_options) for the full catalog
 # with this server's defaults.
 
 # Topic durability and flush scheduling are set at creation and returned by GetTopic.
 # durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
 # Both independently default to "replicated". Neither inherits the other.
-# In replicated groups, persisted messages use WAL references to segment bodies, retained by hard link until reclamation.
-# Persisted offsets with replicated messages use inline WAL bodies. Both layouts charge full message payloads to wal_bytes_max.
+# In replicated groups, either persisted policy enables WAL references to segment bodies, retained by hard link until reclamation.
+# This includes replicated messages with persisted offsets. Full message payloads count against wal_bytes_max.
 # Their barriers can also persist co-batched messages. Only replicated/replicated stays off this WAL.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
