@@ -6305,6 +6305,17 @@ mod partition_repair_driver_tests {
              below would have nothing to lose"
         );
         let counted = gap_drops(&sim, LAGGING, namespace);
+        let partition_stats = sim.replicas[LAGGING as usize]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("partition exists before ConfirmRemove")
+            .stats
+            .clone();
+        let topic_stats = partition_stats.parent();
+        let stream_stats = topic_stats.parent();
+        assert!(partition_stats.messages_count_inconsistent() > 0);
 
         // The reconciler's teardown order: the tombstone lands first and the
         // disk delete runs before `ConfirmRemove`, so from here `get_mut_by_ns`
@@ -6327,6 +6338,15 @@ mod partition_repair_driver_tests {
             "the {buffered} prepare(s) buffered on the partition went to the floor \
              with it; the drops are the only record those frames existed"
         );
+        assert_eq!(partition_stats.messages_count_inconsistent(), 0);
+        assert_eq!(partition_stats.size_bytes_inconsistent(), 0);
+        assert_eq!(partition_stats.segments_count_inconsistent(), 0);
+        assert_eq!(topic_stats.messages_count_inconsistent(), 0);
+        assert_eq!(topic_stats.size_bytes_inconsistent(), 0);
+        assert_eq!(topic_stats.segments_count_inconsistent(), 0);
+        assert_eq!(stream_stats.messages_count_inconsistent(), 0);
+        assert_eq!(stream_stats.size_bytes_inconsistent(), 0);
+        assert_eq!(stream_stats.segments_count_inconsistent(), 0);
     }
 }
 
