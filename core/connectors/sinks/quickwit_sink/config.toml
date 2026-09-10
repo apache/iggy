@@ -34,3 +34,12 @@ consumer_group = "quickwit_sink"
 [plugin_config]
 url = ""
 index = ""
+verbose_logging = true
+# Total attempts including the first; 1 disables retries.
+max_retries = 2
+retry_delay = "250ms"
+retry_max_delay = "2s"
+# Total readiness probes including the first; 1 disables retries.
+max_open_retries = 8
+open_retry_max_delay = "10s"
+timeout = "10s"
