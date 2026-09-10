@@ -29,6 +29,12 @@ type Client interface {
 	// GetConnectionInfo returns the current connection information including protocol and server address
 	GetConnectionInfo() *ConnectionInfo
 
+	// SubscribeEvents returns an independent channel of client lifecycle events
+	// and an unsubscribe function that removes the subscription and closes the
+	// channel. The channel is also closed on shutdown, after the final
+	// DiagnosticEventShutdown.
+	SubscribeEvents() (<-chan DiagnosticEvent, func())
+
 	// GetClusterMetadata get the metadata of the cluster including node information, roles, and status.
 	// Authentication is required.
 	GetClusterMetadata(ctx context.Context) (*ClusterMetadata, error)

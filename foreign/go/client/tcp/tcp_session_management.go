@@ -128,6 +128,7 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 	if err == nil {
 		c.sessionState = iggcon.SessionStateAuthenticated
 		c.loggedOut = false
+		c.events.publish(iggcon.DiagnosticEventSignedIn)
 	} else {
 		// The server committed a Register this client failed to adopt, so the
 		// connection carries a session the local state does not track. It is
@@ -251,6 +252,7 @@ func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
 	c.loggedOut = true
 	c.groups.clear()
 	c.topics.clearCounts()
+	c.events.publish(iggcon.DiagnosticEventSignedOut)
 	c.mtx.Unlock()
 	c.forgetLogin()
 	return nil
@@ -327,6 +329,10 @@ func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64)
 	c.connectedAt = time.Time{}
 	c.currentServerAddress = leaderAddress
 	c.mtx.Unlock()
+
+	// Published after the teardown so a subscriber sees the redirect on the
+	// same connection generation it decided on.
+	c.events.publish(iggcon.DiagnosticEventRedirected)
 
 	return true, nil
 }
