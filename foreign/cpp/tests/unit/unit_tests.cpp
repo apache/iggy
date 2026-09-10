@@ -68,8 +68,7 @@ TEST(MaxTopicSizeTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::MaxTopicSize::ServerDefault().Value(), "server_default");
     EXPECT_EQ(iggy::MaxTopicSize::Unlimited().Value(), "unlimited");
     EXPECT_EQ(iggy::MaxTopicSize::FromBytes(0).Value(), "server_default");
-    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(std::numeric_limits<std::uint64_t>::max()).Value(),
-              "unlimited");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(std::numeric_limits<std::uint64_t>::max()).Value(), "unlimited");
     EXPECT_EQ(iggy::MaxTopicSize::FromBytes(1024).Value(), "1024");
 }
 
