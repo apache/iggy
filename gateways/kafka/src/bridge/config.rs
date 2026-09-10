@@ -168,8 +168,9 @@ mod tests {
     #[test]
     #[serial]
     fn from_env_uses_documented_defaults_when_only_password_is_set() {
-        // Safety: single-threaded within this function; no other test in this crate touches
-        // these four vars.
+        // Safety: process-wide, not per-variable - env::set_var/remove_var race any concurrent
+        // env read or write on another thread, not just ones touching these same vars.
+        // #[serial] (this test's own attribute) is what prevents that.
         unsafe {
             std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::remove_var("IGGY_KAFKA_IGGY_ADDR");
@@ -192,8 +193,8 @@ mod tests {
     #[test]
     #[serial]
     fn from_env_rejects_missing_password() {
-        // Safety: single-threaded within this function; no other test in this crate touches
-        // IGGY_KAFKA_IGGY_PASSWORD.
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
         unsafe {
             std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
         }
@@ -207,8 +208,8 @@ mod tests {
     #[test]
     #[serial]
     fn from_env_rejects_missing_topic_map_file() {
-        // Safety: single-threaded within this function; no other test in this crate touches
-        // these three vars.
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
         unsafe {
             std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::set_var("IGGY_KAFKA_TOPIC_MAP_PATH", "/nonexistent/topic_map.toml");
@@ -227,8 +228,8 @@ mod tests {
         let file = tempfile::NamedTempFile::new().expect("create temp file");
         std::fs::write(file.path(), "default_stream = \"from-toml\"\n").expect("write temp file");
 
-        // Safety: single-threaded within this function; no other test in this crate touches
-        // these three vars.
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
         unsafe {
             std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::set_var("IGGY_KAFKA_IGGY_STREAM", "from-env");
@@ -250,8 +251,8 @@ mod tests {
     #[test]
     #[serial]
     fn from_env_rejects_empty_stream_env_var() {
-        // Safety: single-threaded within this function; no other test in this crate touches
-        // these two vars.
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
         unsafe {
             std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::set_var("IGGY_KAFKA_IGGY_STREAM", "");
@@ -267,8 +268,8 @@ mod tests {
     #[test]
     #[serial]
     fn from_env_rejects_stream_env_var_with_whitespace_instead_of_trimming_it() {
-        // Safety: single-threaded within this function; no other test in this crate touches
-        // these two vars.
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
         unsafe {
             std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
             std::env::set_var("IGGY_KAFKA_IGGY_STREAM", " kafka ");

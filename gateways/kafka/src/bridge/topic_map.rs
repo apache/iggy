@@ -110,7 +110,7 @@ impl TopicMapping {
     /// unrecognized field - e.g. a `[topic.x]` typo for `[topics.x]` - is rejected here rather
     /// than silently parsing to an empty override map), if `default_stream` or any override's
     /// `stream`/`topic` is empty, has leading/trailing whitespace, or exceeds
-    /// [`MAX_IDENTIFIER_LEN`], or if two override entries are not injective (see
+    /// `MAX_IDENTIFIER_LEN`, or if two override entries are not injective (see
     /// [`resolve`](Self::resolve)) - in every validation case, letting it through here would
     /// otherwise fail much later, deep in `IggyBridge::ensure_stream`/`ensure_topic`, with no link
     /// back to the config entry at fault.

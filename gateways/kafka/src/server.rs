@@ -567,6 +567,8 @@ pub fn init_tracing() -> WorkerGuard {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
@@ -888,7 +890,13 @@ mod tests {
         assert_eq!(&payload[4..], &body);
     }
 
+    /// `#[serial]`, unkeyed (shares `bridge::config`'s and `main`'s default group, the whole
+    /// binary's implicit lock): `init_tracing` reads `RUST_LOG` via `EnvFilter::try_from_default_env`,
+    /// and edition 2024's `env::set_var`/`remove_var` are unsound against *any* concurrent env
+    /// read in another thread, not just a write to the same key - a set/remove elsewhere in this
+    /// binary racing this read is exactly the hazard, regardless of which var either side touches.
     #[test]
+    #[serial]
     fn init_tracing_is_idempotent() {
         let _first_guard = init_tracing();
         let _second_guard = init_tracing();

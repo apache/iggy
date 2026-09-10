@@ -77,7 +77,7 @@ impl IggyBridge {
     ///
     /// Returns [`BridgeError::InvalidConfig`] if `config.address` is empty. Returns
     /// [`BridgeError::Iggy`] if the address is malformed, the TCP connection fails, connecting
-    /// takes longer than [`CONNECT_TIMEOUT`] (an unreachable-and-silently-dropping address, not
+    /// takes longer than `CONNECT_TIMEOUT` (an unreachable-and-silently-dropping address, not
     /// just a refused one, is covered - see that constant's doc), or authentication is rejected -
     /// this is the boundary [`BridgeError::to_kafka_error_code`] exists for: a handler calling
     /// this must map the error to a wire response, never panic or unwrap, since an unreachable
@@ -236,6 +236,12 @@ impl IggyBridge {
             return Ok(());
         }
 
+        // message_expiry left at TopicCreateOptions::default() (None -> ServerDefault) means
+        // never-expire (segment_cleaner.rs treats ServerDefault the same as NeverExpire), not
+        // Kafka's own 7-day default - deliberate for now (imposing a retention policy is a product
+        // decision this bridge shouldn't make unasked), but a real surprise for anyone repointing
+        // a Kafka app that assumes bounded retention. Flagged in the README; revisit once there's
+        // a way to configure it (env var, topic-mapping field) rather than hardcoding a number.
         let options = TopicCreateOptions {
             partitions_count: Some(partition_count),
             ..TopicCreateOptions::default()
@@ -306,13 +312,18 @@ impl IggyBridge {
     /// fresh partition's default value, indistinguishable from "one message at offset 0").
     ///
     /// That empty case is `messages_count == 0 && current_offset == 0`, not `messages_count == 0`
-    /// alone: retention cleanup decrements `messages_count` as segments are dropped
-    /// (`core/partitions/src/iggy_partition.rs::decrement_messages_count`) but never rewinds
-    /// `current_offset` - a fully-retention-purged partition that has produced messages reports
-    /// `messages_count == 0` with `current_offset` still at its high value. Treating that as
-    /// "empty" would report high watermark `0` for a partition that has, in fact, produced past
-    /// offset `0`; a future `ListOffsets` (`#3537`) LATEST built on this would rewind instead of
-    /// pointing at the true next-write position.
+    /// alone: retention cleanup decrements `messages_count`
+    /// (`iggy_partition.rs::decrement_messages_count`) without rewinding `current_offset`, so a
+    /// fully-purged but previously-produced-to partition would otherwise read as empty.
+    ///
+    /// Known remaining gap, not fixable client-side: `(0, 0)` is also what a stats-registry MISS
+    /// reports (`responses.rs`'s `PartitionResponse` builder), indistinguishable on the wire from
+    /// a genuinely empty partition. Narrow and self-healing - `partition_reconciler.rs`'s
+    /// `settle_partition_stats` opens this only on the teardown-for-rebuild path, closing once the
+    /// rebuild completes; deletes never open it. The real answer (`Partition::offset_frontier`)
+    /// stays server-side and isn't in this response. The check matches the server's own
+    /// `PartitionState::store_offset_range_error` condition, so it's not an invented heuristic - a
+    /// future `ListOffsets` (`#3537`) built on this inherits the same blind spot.
     ///
     /// # Errors
     ///

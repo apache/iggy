@@ -117,6 +117,11 @@ call created it." A *different* `partition_count` against an already-existing to
 `BridgeError::PartitionCountMismatch` rather than silently keeping the old count or growing it -
 two concurrent callers requesting different counts for the same topic must not both see success.
 
+Topics created this way have **no message expiry** - Iggy's own server default, not Kafka's 7-day
+default. Nothing is bounding retention until it's configured explicitly (Iggy's own topic options,
+outside this bridge today); repointing a Kafka app that assumes bounded retention onto this bridge
+will accumulate data indefinitely unless you set that up yourself.
+
 ### Error mapping
 
 `BridgeError::to_kafka_error_code()` maps Iggy failures to Kafka wire error codes - stream/topic

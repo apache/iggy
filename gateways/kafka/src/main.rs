@@ -222,15 +222,22 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::{parse_positive, reject_unknown_kafka_env_vars};
 
-    /// Sequential (not two separate `#[test]` fns) so the two env-var mutations can't race
-    /// against each other under the test harness's default parallel execution - env vars are
-    /// process-global state.
+    /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - the whole binary's
+    /// default group, shared with `bridge::config`'s and `server`'s env-touching tests).
     ///
     /// # Safety
-    /// Single-threaded within this function; no other test in this crate touches `IGGY_KAFKA_*`.
+    /// Edition 2024's `env::set_var`/`remove_var` are unsound against *any* concurrent env read
+    /// or write on another thread, not merely one touching this same key - env vars are
+    /// process-wide C `environ` state, and the race is at that level. `#[serial]` is what makes
+    /// this sound, by excluding every other `#[serial]`-tagged test in this binary while this one
+    /// runs; being single-threaded within this function is necessary but not sufficient on its
+    /// own.
     #[test]
+    #[serial]
     fn reject_unknown_kafka_env_vars_flags_typo_but_accepts_known_keys() {
         unsafe {
             std::env::set_var("IGGY_KAFKA_BIN_ADDR", "127.0.0.1:9093"); // typo: missing D
