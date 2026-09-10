@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::{future::Future, sync::Arc};
+
+use bench_report::individual_metrics::BenchmarkIndividualMetrics;
+use iggy::prelude::*;
+use tracing::{error, info};
+
 use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
 use crate::utils::ClientFactory;
 use crate::{
@@ -23,13 +29,9 @@ use crate::{
         producer::typed_benchmark_producer::TypedBenchmarkProducer,
         producing_consumer::typed_benchmark_producing_consumer::TypedBenchmarkProducingConsumer,
     },
-    args::common::IggyBenchArgs,
+    args::{common::IggyBenchArgs, polling::LatencyKind},
     utils::finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},
 };
-use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
-use iggy::prelude::*;
-use std::{future::Future, sync::Arc};
-use tracing::{error, info};
 
 pub async fn create_consumer(
     client: &IggyClient,
@@ -131,6 +133,7 @@ pub fn build_producer_futures(
             let stream_idx = 1 + ((producer_id - 1) % streams);
             let stream_id = format!("bench-stream-{stream_idx}");
 
+            let poll_artifacts = args.poll_artifacts.clone();
             async move {
                 let producer = TypedBenchmarkProducer::new(
                     use_high_level_api,
@@ -146,6 +149,7 @@ pub fn build_producer_futures(
                     sampling_time,
                     moving_average_window,
                     rate_limit,
+                    poll_artifacts,
                     pretty,
                 );
                 producer.run().await
@@ -167,25 +171,17 @@ pub fn build_consumer_futures(
     let moving_average_window = args.moving_average_window();
     let kind = args.kind();
     let pretty = args.pretty;
-    let polling_kind = if cg_count > 0 {
-        PollingKind::Next
-    } else {
-        PollingKind::Offset
-    };
-    let origin_timestamp_latency_calculation = match args.kind() {
-        BenchmarkKind::PinnedConsumer | BenchmarkKind::BalancedConsumerGroup => false,
-        BenchmarkKind::PinnedProducerAndConsumer
-        | BenchmarkKind::BalancedProducerAndConsumerGroup => true,
-        _ => unreachable!(),
-    };
+    let polling_kind = args.resolved_polling_kind().into();
+    let origin_timestamp_latency_calculation =
+        args.resolved_latency_kind() == LatencyKind::OriginTimestamp;
+    let poll_artifacts = args.poll_artifacts.clone();
 
     let global_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
-    // When measuring true E2E latency, apply read_amplification multiplier to consumer rate
-    // to ensure they can keep up with producers and not inflate latency due to queue buildup
+    // Keep consumer capacity independent of the selected latency measurement.
     let read_amplification = args.read_amplification().unwrap_or(1.0);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors).map(|rl| {
-        if origin_timestamp_latency_calculation {
+        if args.read_amplification().is_some() {
             #[allow(
                 clippy::cast_sign_loss,
                 clippy::cast_possible_truncation,
@@ -221,6 +217,7 @@ pub fn build_consumer_futures(
                 None
             };
 
+            let poll_artifacts = poll_artifacts.clone();
             async move {
                 let consumer = TypedBenchmarkConsumer::new(
                     use_high_level_api,
@@ -237,6 +234,7 @@ pub fn build_consumer_futures(
                     polling_kind,
                     rate_limit,
                     origin_timestamp_latency_calculation,
+                    poll_artifacts,
                     pretty,
                 );
                 consumer.run().await
@@ -256,7 +254,7 @@ pub fn build_producing_consumers_futures(
     let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
-    let polling_kind = PollingKind::Offset;
+    let polling_kind = args.resolved_polling_kind().into();
 
     (1..=producing_consumers)
         .map(|actor_id| {
@@ -273,7 +271,8 @@ pub fn build_producing_consumers_futures(
                 &args,
                 BenchmarkFinishConditionMode::PerProducingConsumer,
             );
-            let origin_timestamp_latency_calculation = true;
+            let origin_timestamp_latency_calculation =
+                args.resolved_latency_kind() == LatencyKind::OriginTimestamp;
             let use_high_level_api = args.high_level_api();
             let rate_limit = rate_limit_per_actor(args.rate_limit(), producing_consumers);
 
@@ -300,6 +299,7 @@ pub fn build_producing_consumers_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    args_clone.poll_artifacts.clone(),
                     args_clone.pretty,
                 );
                 actor.run().await
@@ -322,7 +322,7 @@ pub fn build_producing_consumer_groups_futures(
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
     let start_consumer_group_id = CONSUMER_GROUP_BASE_ID;
-    let polling_kind = PollingKind::Next;
+    let polling_kind = args.resolved_polling_kind().into();
     let use_high_level_api = args.high_level_api();
     let shared_send_finish_condition =
         BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf);
@@ -364,7 +364,8 @@ pub fn build_producing_consumer_groups_futures(
             } else {
                 None
             };
-            let origin_timestamp_latency_calculation = true;
+            let origin_timestamp_latency_calculation =
+                args.resolved_latency_kind() == LatencyKind::OriginTimestamp;
 
             async move {
                 let actor_type = match (should_produce, should_consume) {
@@ -403,6 +404,7 @@ pub fn build_producing_consumer_groups_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    args_clone.poll_artifacts.clone(),
                     args_clone.pretty,
                 );
 

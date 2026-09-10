@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
+use bench_report::numeric_parameter::BenchmarkNumericParameter;
+use iggy::prelude::*;
+
+use crate::poll_artifacts::PollArtifacts;
 use crate::{
     actors::{ApiLabel, BatchMetrics, BenchmarkInit},
     utils::batch_generator::BenchmarkBatchGenerator,
 };
-use bench_report::numeric_parameter::BenchmarkNumericParameter;
-use iggy::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkProducerConfig {
@@ -30,6 +34,7 @@ pub struct BenchmarkProducerConfig {
     pub messages_per_batch: BenchmarkNumericParameter,
     pub message_size: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
+    pub poll_artifacts: Option<Arc<PollArtifacts>>,
     pub pretty: bool,
 }
 

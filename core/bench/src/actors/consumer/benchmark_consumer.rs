@@ -15,12 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::actors::consumer::client::BenchmarkConsumerClient;
-use crate::actors::consumer::client::interface::BenchmarkConsumerConfig;
-use crate::analytics::metrics::individual::from_records;
-use crate::analytics::record::BenchmarkRecord;
-use crate::utils::finish_condition::BenchmarkFinishCondition;
-use crate::utils::rate_limiter::BenchmarkRateLimiter;
+use std::sync::Arc;
+use std::time::Duration;
+
 use bench_report::actor_kind::ActorKind;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -30,10 +27,15 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::{ContentArrangement, Table};
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::Instant;
 use tracing::info;
+
+use crate::actors::consumer::client::BenchmarkConsumerClient;
+use crate::actors::consumer::client::interface::BenchmarkConsumerConfig;
+use crate::analytics::metrics::individual::from_records;
+use crate::analytics::record::BenchmarkRecord;
+use crate::utils::finish_condition::BenchmarkFinishCondition;
+use crate::utils::rate_limiter::BenchmarkRateLimiter;
 
 pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
     pub client: C,
@@ -83,6 +85,7 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
 
         let max_capacity = self.finish_condition.max_capacity();
         let mut records = Vec::with_capacity(max_capacity);
+        self.client.start_measurement(max_capacity);
         let mut messages_processed = 0;
         let mut batches_processed = 0;
         let mut bytes_processed = 0;

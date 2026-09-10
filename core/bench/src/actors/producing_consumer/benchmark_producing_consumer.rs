@@ -17,17 +17,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::{
-    actors::{
-        consumer::client::{BenchmarkConsumerClient, interface::BenchmarkConsumerConfig},
-        producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
-    },
-    analytics::{metrics::individual::from_records, record::BenchmarkRecord},
-    utils::{
-        batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
-        rate_limiter::BenchmarkRateLimiter,
-    },
-};
 use bench_report::{
     actor_kind::ActorKind,
     benchmark_kind::BenchmarkKind,
@@ -40,6 +29,19 @@ use human_repr::HumanCount;
 use iggy::prelude::*;
 use tokio::time::Instant;
 use tracing::info;
+
+use crate::poll_artifacts::ProducerRecorder;
+use crate::{
+    actors::{
+        consumer::client::{BenchmarkConsumerClient, interface::BenchmarkConsumerConfig},
+        producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
+    },
+    analytics::{metrics::individual::from_records, record::BenchmarkRecord},
+    utils::{
+        batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
+        rate_limiter::BenchmarkRateLimiter,
+    },
+};
 
 pub struct BenchmarkProducingConsumer<P, C>
 where
@@ -124,6 +126,7 @@ where
             .max_capacity()
             .max(self.poll_finish_condition.max_capacity());
         let mut records = Vec::with_capacity(max_capacity);
+        self.consumer.start_measurement(max_capacity);
 
         let mut rl_value = 0;
         let mut sent_user_bytes = 0;
@@ -143,6 +146,14 @@ where
             is_producer && is_consumer && self.consumer_config.consumer_group_id.is_none();
         let mut awaiting_reply = false;
 
+        let mut producer_recorder = self
+            .producer_config
+            .poll_artifacts
+            .as_ref()
+            .filter(|_| is_producer)
+            .map(|artifacts| {
+                ProducerRecorder::new(self.producer_config.producer_id, artifacts.clone())
+            });
         let start = Instant::now();
 
         while !(self.send_finish_condition.is_done() && self.poll_finish_condition.is_done()) {
@@ -151,6 +162,9 @@ where
                 && (!require_reply || !awaiting_reply)
                 && let Some(batch) = self.producer.produce_batch(&mut batch_generator).await?
             {
+                if let Some(recorder) = &mut producer_recorder {
+                    recorder.record_batch(&batch);
+                }
                 rl_value += batch.user_data_bytes;
                 sent_user_bytes += batch.user_data_bytes;
                 sent_total_bytes += batch.total_bytes;
@@ -210,6 +224,7 @@ where
             }
         }
 
+        drop(producer_recorder);
         let metrics = from_records(
             &records,
             self.benchmark_kind,

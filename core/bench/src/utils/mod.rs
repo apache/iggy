@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::{fs, path::Path};
+
 use bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
     numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
     transport::BenchmarkTransport,
 };
 use iggy::prelude::*;
-use std::{fs, path::Path};
 use tracing::{error, info};
 
 use crate::args::{
@@ -140,7 +141,11 @@ pub fn params_from_args_and_metrics(
         consumer_groups.to_string(),
     ];
 
-    let params_identifier = params_identifier.join("_");
+    let params_identifier = format!(
+        "{}{}",
+        params_identifier.join("_"),
+        args.poll_selector_suffix()
+    );
 
     BenchmarkParams {
         benchmark_kind,
@@ -172,6 +177,12 @@ fn recreate_bench_command(args: &IggyBenchArgs) -> String {
     parts.push("iggy-bench".to_string());
 
     add_basic_arguments(&mut parts, args);
+    if let Some(polling) = args.polling_kind {
+        parts.push(format!("--polling-kind {polling}"));
+    }
+    if let Some(latency) = args.latency_kind {
+        parts.push(format!("--latency-kind {latency}"));
+    }
     add_benchmark_kind_arguments(&mut parts, args);
     add_infrastructure_arguments(&mut parts, args);
     add_output_arguments(&mut parts, args);

@@ -17,6 +17,13 @@
 
 use std::sync::Arc;
 
+use bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+    numeric_parameter::BenchmarkNumericParameter,
+};
+use iggy::prelude::*;
+
+use crate::poll_artifacts::PollArtifacts;
 use crate::utils::ClientFactory;
 use crate::{
     actors::consumer::{
@@ -28,11 +35,6 @@ use crate::{
     },
     utils::finish_condition::BenchmarkFinishCondition,
 };
-use bench_report::{
-    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
-    numeric_parameter::BenchmarkNumericParameter,
-};
-use iggy::prelude::*;
 
 pub enum TypedBenchmarkConsumer {
     High(Box<BenchmarkConsumer<HighLevelConsumerClient>>),
@@ -56,6 +58,7 @@ impl TypedBenchmarkConsumer {
         polling_kind: PollingKind,
         limit_bytes_per_second: Option<IggyByteSize>,
         origin_timestamp_latency_calculation: bool,
+        poll_artifacts: Option<Arc<PollArtifacts>>,
         pretty: bool,
     ) -> Self {
         let config = BenchmarkConsumerConfig {
@@ -66,6 +69,7 @@ impl TypedBenchmarkConsumer {
             warmup_time,
             polling_kind,
             origin_timestamp_latency_calculation,
+            poll_artifacts,
             pretty,
         };
 

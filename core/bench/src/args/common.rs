@@ -15,16 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::kind::BenchmarkKindCommand;
-use super::output::BenchmarkOutputCommand;
-use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
-use super::{
-    defaults::{
-        DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
-        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_SAMPLING_TIME, DEFAULT_WARMUP_TIME,
-    },
-    transport::BenchmarkTransportCommand,
-};
+use std::num::NonZeroU32;
+use std::str::FromStr;
+use std::sync::Arc;
+
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
@@ -33,8 +27,19 @@ use iggy::prelude::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize, IggyDuration, IggyExpiry,
     TransportProtocol,
 };
-use std::num::NonZeroU32;
-use std::str::FromStr;
+
+use super::kind::BenchmarkKindCommand;
+use super::output::BenchmarkOutputCommand;
+use super::polling::{LatencyKind, PollingMode};
+use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
+use super::{
+    defaults::{
+        DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
+        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_SAMPLING_TIME, DEFAULT_WARMUP_TIME,
+    },
+    transport::BenchmarkTransportCommand,
+};
+use crate::poll_artifacts::PollArtifacts;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -78,6 +83,17 @@ pub struct IggyBenchArgs {
     /// Window size for moving average calculations in time series data
     #[arg(long, short = 'W', default_value_t = DEFAULT_MOVING_AVERAGE_WINDOW)]
     pub moving_average_window: u32,
+
+    /// Polling strategy. Next enables automatic offset commit; offset disables it.
+    #[arg(long, global = true, value_enum)]
+    pub polling_kind: Option<PollingMode>,
+
+    /// Consumer latency measurement, either the poll request or message origin timestamp.
+    #[arg(long, global = true, value_enum)]
+    pub latency_kind: Option<LatencyKind>,
+
+    #[arg(skip)]
+    pub poll_artifacts: Option<Arc<PollArtifacts>>,
 
     /// Use high-level API for actors
     #[arg(long, short = 'H', default_value_t = false)]
@@ -173,6 +189,12 @@ impl IggyBenchArgs {
                     ErrorKind::ArgumentConflict,
                     "High-level consumer API (--high-level-api) requires fixed batch size, but random batch size was specified. Use a single value instead of a range for --messages-per-batch.",
                 )
+                .exit();
+        }
+
+        if let Err(message) = self.validate_poll_selectors() {
+            Self::command()
+                .error(ErrorKind::ArgumentConflict, message)
                 .exit();
         }
 
@@ -422,7 +444,7 @@ impl IggyBenchArgs {
             parts.push(identifier.clone());
         }
 
-        parts.join("_")
+        format!("{}{}", parts.join("_"), self.poll_selector_suffix())
     }
 
     /// Generates a human-readable pretty name for the benchmark

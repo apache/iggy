@@ -20,17 +20,22 @@ mod analytics;
 mod args;
 mod benchmarks;
 mod plot;
+mod poll_artifacts;
 mod runner;
 mod utils;
 
-use crate::{args::common::IggyBenchArgs, runner::BenchmarkRunner};
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+
 use clap::Parser;
 use figlet_rs::FIGlet;
 use iggy::prelude::IggyError;
-use std::fs;
-use std::path::Path;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::{args::common::IggyBenchArgs, runner::BenchmarkRunner};
+use poll_artifacts::{PollArtifacts, RunStatus};
 use utils::cpu_name::append_cpu_name_lowercase;
 
 /// Which SDK framing this binary speaks, printed in the always-on banner so a
@@ -83,30 +88,34 @@ async fn main() -> Result<(), IggyError> {
             .init();
     }
 
-    let benchmark_runner = BenchmarkRunner::new(args);
-
-    info!("Starting the benchmarks...");
-    let ctrl_c = tokio::signal::ctrl_c();
-    let benchmark_future = benchmark_runner.run();
-
-    tokio::select! {
-        _ = ctrl_c => {
-            info!("Received Ctrl-C, exiting...");
-            // Clean up unfinished benchmark directory on manual interruption
-            if let Some(ref benchmark_dir) = benchmark_dir {
-                info!("Cleaning up unfinished benchmark directory...");
-                if let Err(e) = std::fs::remove_dir_all(benchmark_dir) {
-                    error!("Failed to clean up benchmark directory: {}", e);
-                }
-            }
-        }
-        result = benchmark_future => {
-            if let Err(e) = result {
-                error!("Benchmark failed with error: {:?}", e);
-                return Err(e);
-            }
-        }
+    let poll_artifacts = benchmark_dir
+        .as_ref()
+        .map(|_| Arc::new(PollArtifacts::new(&args)));
+    args.poll_artifacts = poll_artifacts.clone();
+    if let (Some(directory), Some(artifacts)) = (&benchmark_dir, &poll_artifacts) {
+        artifacts
+            .write(directory, RunStatus::Running)
+            .map_err(|error| {
+                error!("Failed to initialize poll artifacts: {error}");
+                IggyError::CannotWriteToFile
+            })?;
     }
-
-    Ok(())
+    let benchmark_runner = BenchmarkRunner::new(args);
+    info!("Starting the benchmarks...");
+    let result = benchmark_runner.run().await;
+    let status = match &result {
+        Ok(status) => *status,
+        Err(error) => {
+            error!("Benchmark failed with error: {error:?}");
+            RunStatus::Failed
+        }
+    };
+    if let (Some(directory), Some(artifacts)) = (&benchmark_dir, &poll_artifacts) {
+        artifacts.write(directory, status).map_err(|error| {
+            error!("Failed to write poll artifacts: {error}");
+            IggyError::CannotWriteToFile
+        })?;
+        info!("Preserved benchmark artifacts in {}", directory.display());
+    }
+    result.map(|_| ())
 }

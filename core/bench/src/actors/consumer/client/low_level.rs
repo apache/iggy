@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use iggy::prelude::*;
+use tokio::time::Instant;
+
 use crate::actors::consumer::client::BenchmarkConsumerClient;
 use crate::actors::consumer::client::interface::{BenchmarkConsumerConfig, ConsumerClient};
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 use crate::benchmarks::common::create_consumer;
+use crate::poll_artifacts::ActorPollRecorder;
 use crate::utils::ClientFactory;
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
-use iggy::prelude::*;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::Instant;
 
 pub struct LowLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
@@ -40,6 +43,7 @@ pub struct LowLevelConsumerClient {
     /// Where offset polling continues in each partition. A group member polls its partitions
     /// round-robin, so one shared cursor would skip the start of every partition but the first.
     next_offsets: HashMap<u32, u64>,
+    poll_recorder: Option<ActorPollRecorder>,
 }
 
 impl LowLevelConsumerClient {
@@ -55,11 +59,18 @@ impl LowLevelConsumerClient {
             polling_strategy: PollingStrategy::next(),
             auto_commit: true,
             next_offsets: HashMap::new(),
+            poll_recorder: None,
         }
     }
 }
 
 impl ConsumerClient for LowLevelConsumerClient {
+    fn start_measurement(&mut self, capacity: usize) {
+        self.poll_recorder = self.config.poll_artifacts.as_ref().map(|artifacts| {
+            ActorPollRecorder::new(self.config.consumer_id, artifacts.clone(), capacity)
+        });
+    }
+
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
         let client = self.client.as_ref().expect("client not initialized");
         let consumer = self.consumer.as_ref().expect("consumer not initialized");
@@ -72,6 +83,9 @@ impl ConsumerClient for LowLevelConsumerClient {
                 .get(&partition_id)
                 .map_or(polling_strategy, |offset| PollingStrategy::offset(*offset))
         };
+        if let Some(recorder) = &mut self.poll_recorder {
+            recorder.begin_poll();
+        }
         let before_poll = Instant::now();
         let polled = client
             .poll_messages_with_strategy_for(
@@ -85,9 +99,14 @@ impl ConsumerClient for LowLevelConsumerClient {
             )
             .await;
 
+        let poll_latency = before_poll.elapsed();
+        let poll_latency_us = u64::try_from(poll_latency.as_micros()).unwrap_or(u64::MAX);
         let polled = match polled {
             Ok(p) => p,
             Err(e) => {
+                if let Some(recorder) = &mut self.poll_recorder {
+                    recorder.fail_poll(&e, poll_latency_us);
+                }
                 if matches!(e, IggyError::TopicIdNotFound(_, _)) {
                     return Ok(None);
                 }
@@ -95,19 +114,31 @@ impl ConsumerClient for LowLevelConsumerClient {
             }
         };
 
+        let origin_latency_us = polled.messages.first().map(|message| {
+            IggyTimestamp::now()
+                .as_micros()
+                .saturating_sub(message.header.origin_timestamp)
+        });
+        let messages_count = u32::try_from(polled.messages.len()).unwrap_or(u32::MAX);
+        let user_bytes = batch_user_size_bytes(&polled);
+        let total_bytes = batch_total_size_bytes(&polled);
+        if let Some(recorder) = &mut self.poll_recorder {
+            recorder.complete_poll(
+                poll_latency_us,
+                origin_latency_us,
+                polled.partition_id,
+                messages_count,
+                user_bytes,
+            );
+        }
         if polled.messages.is_empty() {
             return Ok(None);
         }
-        let messages_count = polled.messages.len() as u64;
         let latency = if self.config.origin_timestamp_latency_calculation {
-            let now = IggyTimestamp::now().as_micros();
-            Duration::from_micros(now - polled.messages[0].header.origin_timestamp)
+            Duration::from_micros(origin_latency_us.unwrap_or_default())
         } else {
-            before_poll.elapsed()
+            poll_latency
         };
-
-        let user_bytes = batch_user_size_bytes(&polled);
-        let total_bytes = batch_total_size_bytes(&polled);
 
         if self.polling_strategy.kind == PollingKind::Offset
             && let Some(last) = polled.messages.last()
@@ -117,7 +148,7 @@ impl ConsumerClient for LowLevelConsumerClient {
         }
 
         Ok(Some(BatchMetrics {
-            messages: messages_count.try_into().unwrap(),
+            messages: messages_count,
             user_data_bytes: user_bytes,
             total_bytes,
             latency,
