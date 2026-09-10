@@ -20,7 +20,7 @@ use crate::formatter;
 use crate::path::{PathContext, render_s3_key};
 use crate::{BufferKey, S3Sink};
 use async_trait::async_trait;
-use iggy_connector_sdk::retry::{exponential_backoff, jitter};
+use iggy_connector_sdk::retry::retry_backoff;
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
 use std::sync::Arc;
 use std::time::Duration;
@@ -392,9 +392,7 @@ impl S3Sink {
                     );
                 }
             }
-            // exponential_backoff expects a 0-based retry index
-            let retry_index = attempt - 1;
-            let delay = jitter(exponential_backoff(base_delay, retry_index, MAX_BACKOFF));
+            let delay = retry_backoff(base_delay, attempt, MAX_BACKOFF);
             tokio::time::sleep(delay).await;
         }
     }
