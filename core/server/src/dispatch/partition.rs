@@ -46,7 +46,9 @@ use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireDecode};
-use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
+use iggy_common::{
+    ConsumerKind, IggyError, Permissions, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::BusMessage;
@@ -87,7 +89,11 @@ use tracing::{debug, warn};
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 pub async fn dispatch_partition_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
@@ -96,6 +102,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     transport_client_id: u128,
     acting_user_id: Option<u32>,
     consumer_session: Option<(u128, SessionAttachment)>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -160,6 +167,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         acting_user_id,
         scope.stream_id(),
         scope.topic_id(),
+        session_perms,
     ) {
         warn!(
             transport_client_id,
@@ -403,6 +411,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     user_id: Option<u32>,
     consumer_client_id: u128,
     attachment: Option<SessionAttachment>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -446,6 +455,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.poll_messages(uid, stream_id, topic_id)
         },
+        session_perms,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -647,6 +657,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -676,6 +687,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.get_consumer_offset(uid, stream_id, topic_id)
         },
+        session_perms,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -1442,8 +1454,17 @@ mod tests {
         ));
         for (index, (operation, body, expected)) in cases.into_iter().enumerate() {
             let request = request_message(operation, 1, 1, index as u64 + 1, &body);
-            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID), None)
-                .await;
+            dispatch_partition_request(
+                &shard,
+                request,
+                1,
+                1,
+                91,
+                Some(DEFAULT_ROOT_USER_ID),
+                None,
+                None,
+            )
+            .await;
             let replies = bus.client_replies.borrow();
             assert_eq!(
                 replies.len(),
@@ -1490,6 +1511,7 @@ mod tests {
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
             None,
+            None,
         )
         .await;
 
@@ -1500,7 +1522,8 @@ mod tests {
             2,
             TRUNCATED_BODY,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID), None)
+            .await;
 
         let delete = request_message(
             Operation::DeleteSegments,
@@ -1569,6 +1592,7 @@ mod tests {
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
             None,
+            None,
         )
         .await;
 
@@ -1586,7 +1610,8 @@ mod tests {
             2,
             &offset_body,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID), None)
+            .await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -1810,6 +1835,7 @@ mod tests {
             Some(DEFAULT_ROOT_USER_ID),
             request.header().client,
             None,
+            None,
         )
         .await;
 
@@ -1951,6 +1977,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            None,
             None,
         )
         .await;

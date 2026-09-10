@@ -81,6 +81,10 @@ pub trait StreamsFrontend {
     fn users(&self) -> &Users;
     #[must_use]
     fn streams(&self) -> &Streams;
+    /// Reserved user ID for external auth inline-grant sessions. `None`
+    /// when external auth is disabled.
+    #[must_use]
+    fn external_auth_user_id(&self) -> Option<u32>;
 }
 
 impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
@@ -90,6 +94,10 @@ impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
 
     fn streams(&self) -> &Streams {
         &self.inner().1.0
+    }
+
+    fn external_auth_user_id(&self) -> Option<u32> {
+        self.external_auth_user_id()
     }
 }
 

@@ -30,7 +30,7 @@ use consensus::MetadataHandle;
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codes::GET_STATS_CODE;
 use iggy_common::wire_conversions::identifier_to_wire;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, Permissions};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use send_wrapper::SendWrapper;
@@ -55,20 +55,30 @@ use crate::responses::{
 /// Every read route reaches this through [`gate_local_read`], which is what
 /// pairs it with the two waits a local read must serve behind. Callable on its
 /// own only for a read that is NOT served from local state.
-fn authorize_read(
+pub(in crate::http) fn authorize_read(
     state: &HttpInner,
     identity: &Identity,
     consistency: Consistency,
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
+    inline_grant_check: impl Fn(&Permissions) -> bool,
 ) -> Result<(), ReadError> {
-    state
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .users()
-        .authorize(|permissioner| rule(permissioner, identity.user_id))
-        .map_err(ReadError::Rejected)?;
+    if state.external_auth.enabled && identity.user_id == state.external_auth.user_id {
+        let perms = state
+            .session_grant_permissions(&identity.session_key)
+            .ok_or(ReadError::Rejected(IggyError::Unauthorized))?;
+        if !inline_grant_check(&perms) {
+            return Err(ReadError::Rejected(IggyError::Unauthorized));
+        }
+    } else {
+        state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .authorize(|permissioner| rule(permissioner, identity.user_id))
+            .map_err(ReadError::Rejected)?;
+    }
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
         return Err(state.not_primary_read_error(&identity.path_and_query, identity.client_ip));
     }
@@ -95,8 +105,9 @@ pub(in crate::http) async fn read_local(
     code: u32,
     body: &[u8],
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
+    inline_grant_check: impl Fn(&Permissions) -> bool,
 ) -> Result<Bytes, ReadError> {
-    gate_local_read(state, identity, consistency, code, rule).await?;
+    gate_local_read(state, identity, consistency, code, rule, inline_grant_check).await?;
     let clients_count = if code == GET_STATS_CODE {
         u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
             .unwrap_or(u32::MAX)
@@ -150,13 +161,14 @@ pub(in crate::http) async fn gate_local_read(
     consistency: Consistency,
     code: u32,
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
+    inline_grant_check: impl Fn(&Permissions) -> bool,
 ) -> Result<(), ReadError> {
     await_recovery_barrier(&state.shard).await?;
-    authorize_read(state, identity, consistency, &rule)?;
+    authorize_read(state, identity, consistency, &rule, &inline_grant_check)?;
     if read_needs_metadata_frontier(code)
         && await_metadata_read_frontier(state, identity).await? == FrontierWait::CaughtUp
     {
-        authorize_read(state, identity, consistency, &rule)?;
+        authorize_read(state, identity, consistency, &rule, &inline_grant_check)?;
     }
     Ok(())
 }
@@ -383,10 +395,36 @@ pub(in crate::http) fn resolve_gate_topic_ids(
 pub(in crate::http) fn authorize_data_plane(
     state: &HttpInner,
     user_id: u32,
+    session_key: &str,
     stream_id: &Identifier,
     topic_id: &Identifier,
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+    inline_grant_check: impl FnOnce(&Permissions, usize, usize) -> bool,
 ) -> Result<(), IggyError> {
+    if state.external_auth.enabled && user_id == state.external_auth.user_id {
+        let sk = crate::http::extractor::SessionKey::from_table_key(session_key)
+            .ok_or(IggyError::Unauthorized)?;
+        let perms = state
+            .session_grant_permissions(&sk)
+            .ok_or(IggyError::Unauthorized)?;
+        // Fail-closed: for external auth users the session-scoped check below
+        // is the only topic-level gate (the STM authz gate allows all
+        // data-plane ops by op-code). A resolution miss must deny, not fall
+        // through to the handler's own not-found path.
+        let (Ok(wire_stream), Ok(wire_topic)) =
+            (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
+        else {
+            return Err(IggyError::Unauthorized);
+        };
+        let Some((sid, tid)) = resolve_gate_topic(state, &wire_stream, &wire_topic) else {
+            return Err(IggyError::Unauthorized);
+        };
+        return if inline_grant_check(&perms, sid, tid) {
+            Ok(())
+        } else {
+            Err(IggyError::Unauthorized)
+        };
+    }
     let (Ok(wire_stream), Ok(wire_topic)) =
         (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
     else {

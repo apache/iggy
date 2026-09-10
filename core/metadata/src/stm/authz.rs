@@ -77,7 +77,12 @@ where
     M: StreamsFrontend
         + StateMachine<Input = Message<PrepareHeader>, Output = ApplyReply, Error = IggyError>,
 {
-    if let Some(denied) = authorize(&prepare, mux.users(), mux.streams()) {
+    if let Some(denied) = authorize(
+        &prepare,
+        mux.users(),
+        mux.streams(),
+        mux.external_auth_user_id(),
+    ) {
         return Ok(denied);
     }
     mux.update(prepare)
@@ -129,6 +134,7 @@ pub(crate) fn authorize(
     prepare: &Message<PrepareHeader>,
     users: &Users,
     streams: &Streams,
+    external_auth_user_id: Option<u32>,
 ) -> Option<ApplyReply> {
     let header = prepare.header();
     let user_id = header.user_id;
@@ -136,7 +142,30 @@ pub(crate) fn authorize(
     if user_id == ROOT_USER_ID {
         return None;
     }
+
     let body = prepare.body();
+
+    // The external auth inline-grant user may execute the replicated
+    // data-plane ops listed below. Each is also gated at dispatch time by
+    // session-scoped permissions (authorize_partition_op for SendMessages
+    // and consumer offsets; authorize_consumer_group_op for CG join/leave).
+    // Non-replicated reads (PollMessages, GetConsumerOffset) never reach
+    // the STM and are gated only at dispatch time.
+    // SYNC: if a new REPLICATED data-plane operation is added, add it
+    // here AND add a dispatch-time session-scoped permission check in
+    // dispatch/authz.rs or dispatch/mod.rs.
+    if external_auth_user_id.is_some_and(|id| user_id == id) {
+        return match header.operation {
+            Operation::Register
+            | Operation::Logout
+            | Operation::SendMessages
+            | Operation::StoreConsumerOffset
+            | Operation::DeleteConsumerOffset
+            | Operation::JoinConsumerGroup
+            | Operation::LeaveConsumerGroup => None,
+            _ => Some(ApplyReply::err(IggyError::Unauthorized.as_code())),
+        };
+    }
 
     match header.operation {
         // Streams. `create_stream` is unscoped; the rest resolve the stream id.
@@ -417,11 +446,16 @@ mod tests {
     const ROOT: u32 = 0;
     const ALICE: u32 = 1;
 
+    /// External auth user ID used by tests that exercise the inline-grant gate.
+    const EXT_AUTH_USER_ID: u32 = 99_999;
+
     fn mux() -> MuxStateMachine<variadic!(Users, Streams)> {
         let users = Users::default();
         users.ensure_root_user("iggy", "hash");
         let streams = Streams::default();
-        MuxStateMachine::new(variadic!(users, streams))
+        let m = MuxStateMachine::new(variadic!(users, streams));
+        m.set_external_auth_user_id(EXT_AUTH_USER_ID);
+        m
     }
 
     fn make_prepare(
@@ -685,7 +719,13 @@ mod tests {
         let mux = mux();
         let prepare = make_prepare(1, Operation::CompleteConsumerGroupRevocation, ROOT, &[]);
         assert!(
-            authorize(&prepare, mux.users(), mux.streams()).is_none(),
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
             "server-originated revocation must not be gated"
         );
     }
@@ -703,7 +743,13 @@ mod tests {
 
         let prepare = make_prepare(2, Operation::CreatePersonalAccessToken, ALICE, &[]);
         assert!(
-            authorize(&prepare, mux.users(), mux.streams()).is_none(),
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
             "PAT ops are self-scoped (parity: no legacy RBAC)"
         );
     }
@@ -754,5 +800,153 @@ mod tests {
         assert_eq!(primary_codes[2], UNAUTHORIZED, "alice's create is denied");
         assert_eq!(primary.streams().read(|inner| inner.items.len()), 1);
         assert_eq!(replay.streams().read(|inner| inner.items.len()), 1);
+    }
+
+    #[test]
+    fn given_external_auth_user_when_register_should_allow() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::Register, EXT_AUTH_USER_ID, &[]);
+        assert!(
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
+            "external auth user must be allowed to Register"
+        );
+    }
+
+    #[test]
+    fn given_external_auth_user_when_send_messages_should_allow() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::SendMessages, EXT_AUTH_USER_ID, &[]);
+        assert!(
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
+            "external auth user must be allowed to SendMessages"
+        );
+    }
+
+    #[test]
+    fn given_external_auth_user_when_join_consumer_group_should_allow() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::JoinConsumerGroup, EXT_AUTH_USER_ID, &[]);
+        assert!(
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
+            "external auth user must be allowed to JoinConsumerGroup"
+        );
+    }
+
+    #[test]
+    fn given_external_auth_user_when_create_stream_should_deny() {
+        let mux = mux();
+        let prepare = make_prepare(
+            1,
+            Operation::CreateStream,
+            EXT_AUTH_USER_ID,
+            &create_stream_body("s"),
+        );
+        let reply = authorize(
+            &prepare,
+            mux.users(),
+            mux.streams(),
+            mux.external_auth_user_id(),
+        );
+        assert!(
+            reply.is_some(),
+            "external auth user must not create streams"
+        );
+        assert_eq!(reply.unwrap().code, UNAUTHORIZED);
+    }
+
+    #[test]
+    fn given_external_auth_user_when_create_user_should_deny() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::CreateUser, EXT_AUTH_USER_ID, &[]);
+        let reply = authorize(
+            &prepare,
+            mux.users(),
+            mux.streams(),
+            mux.external_auth_user_id(),
+        );
+        assert!(reply.is_some(), "external auth user must not create users");
+        assert_eq!(reply.unwrap().code, UNAUTHORIZED);
+    }
+
+    #[test]
+    fn given_external_auth_user_when_logout_should_allow() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::Logout, EXT_AUTH_USER_ID, &[]);
+        assert!(
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
+            "external auth user must be allowed to Logout"
+        );
+    }
+
+    #[test]
+    fn given_external_auth_user_when_store_consumer_offset_should_allow() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::StoreConsumerOffset, EXT_AUTH_USER_ID, &[]);
+        assert!(
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
+            "external auth user must be allowed to StoreConsumerOffset"
+        );
+    }
+
+    #[test]
+    fn given_external_auth_user_when_delete_consumer_offset_should_allow() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::DeleteConsumerOffset, EXT_AUTH_USER_ID, &[]);
+        assert!(
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
+            "external auth user must be allowed to DeleteConsumerOffset"
+        );
+    }
+
+    #[test]
+    fn given_external_auth_user_when_leave_consumer_group_should_allow() {
+        let mux = mux();
+        let prepare = make_prepare(1, Operation::LeaveConsumerGroup, EXT_AUTH_USER_ID, &[]);
+        assert!(
+            authorize(
+                &prepare,
+                mux.users(),
+                mux.streams(),
+                mux.external_auth_user_id()
+            )
+            .is_none(),
+            "external auth user must be allowed to LeaveConsumerGroup"
+        );
     }
 }
