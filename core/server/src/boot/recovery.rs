@@ -79,6 +79,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     roster_cells: &RosterCells,
+    external_auth: Arc<configs::external_auth::ExternalAuthConfig>,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
@@ -244,6 +245,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         &shard_handle,
         Arc::clone(&config.system),
         config.personal_access_token.max_tokens_per_user,
+        external_auth,
     );
     sessions
         .borrow_mut()

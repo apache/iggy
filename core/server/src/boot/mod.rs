@@ -107,6 +107,7 @@ pub fn wire_shell_handlers<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<configs::external_auth::ExternalAuthConfig>,
 ) -> ShellHandlers
 where
     B: ShellBus,
@@ -124,6 +125,7 @@ where
             &sessions,
             system_config,
             max_tokens_per_user,
+            external_auth,
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
         on_list_clients: make_list_clients_handler(&sessions),
@@ -255,6 +257,22 @@ pub fn bootstrap(
     // run this bootstrap; after this line those are no-ops.
     install_default_crypto_provider();
     validate_root_credentials_env(&config)?;
+    crate::external_auth::validate_config(&config.external_auth)?;
+    if config.external_auth.enabled {
+        for issuer in config.http.jwt.trusted_issuers.iter().flatten() {
+            if issuer.user_id == config.external_auth.user_id {
+                return Err(
+                    crate::server_error::ServerError::InvalidExternalAuthConfig {
+                        reason: format!(
+                            "trusted issuer '{}' user_id {} collides with external_auth.user_id",
+                            issuer.issuer, issuer.user_id
+                        ),
+                    },
+                );
+            }
+        }
+    }
+    crate::external_auth::warn_insecure_url(&config.external_auth);
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
@@ -531,6 +549,9 @@ async fn shard_main(
                 config.metadata.clients_table_max,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
+                    if config.external_auth.enabled {
+                        mux_stm.set_external_auth_user_id(config.external_auth.user_id);
+                    }
                 },
                 |mux_stm, client, stamp| {
                     mux_stm
@@ -627,6 +648,29 @@ async fn shard_main(
     } else {
         (None, None, None, None, (0, 0), None)
     };
+    // Peer shards (Waiter path) and snapshot-restored mux_stm need the
+    // external auth user_id too. The Owner path sets it in seed_baseline
+    // (before WAL replay); the Waiter path gets it here after the bundle.
+    // set_external_auth_user_id is idempotent for the same value, so the
+    // Owner path's earlier set is a no-op here.
+    if config.external_auth.enabled {
+        mux_stm.set_external_auth_user_id(config.external_auth.user_id);
+        // The reserved user_id must not collide with a real user, or the
+        // authz gate would block that user from all metadata operations.
+        let uid = config.external_auth.user_id;
+        let collides = mux_stm
+            .users()
+            .read(|users| users.items.contains(uid as usize));
+        if collides {
+            return Err(ServerError::InvalidExternalAuthConfig {
+                reason: format!(
+                    "external_auth.user_id {uid} collides with an existing user in the slab; \
+                     pick a user_id that is not assigned to any Iggy user (default: {})",
+                    u32::MAX
+                ),
+            });
+        }
+    }
     let metadata = ServerMetadata::new(
         metadata_consensus,
         journal_for_metadata,
@@ -668,6 +712,7 @@ async fn shard_main(
     // Heap-pin like `run_shard_thread` pins `shard_main`: the builder future
     // carries the whole shard construction state machine and outgrew clippy's
     // `large_futures` cap; one allocation per shard startup.
+    let external_auth_config = Arc::new(config.external_auth.clone());
     let ShardBuild {
         shard,
         sessions,
@@ -685,6 +730,7 @@ async fn shard_main(
         reply_inbox,
         shard_metrics,
         &roster_cells,
+        Arc::clone(&external_auth_config),
     ))
     .await?;
 
@@ -964,6 +1010,7 @@ async fn shard_main(
             dialed_replica,
             accepted_client,
             &shard_metrics_all,
+            external_auth_config,
         )
         .await
         {

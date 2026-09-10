@@ -59,7 +59,9 @@ use iggy_binary_protocol::{
     AckLevel, Command, KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireDecode, WireEncode,
     WireIdentifier,
 };
-use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
+use iggy_common::{
+    ConsumerKind, IggyError, Permissions, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{AUTO_COMMIT_CLIENT_ID, BusMessage};
@@ -427,6 +429,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     bound_session: u64,
     transport_client_id: u128,
     acting_user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -489,6 +492,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         acting_user_id,
         scope.stream_id(),
         scope.topic_id(),
+        session_perms,
     ) {
         warn!(
             transport_client_id,
@@ -682,6 +686,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -715,6 +720,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.poll_messages(uid, stream_id, topic_id)
         },
+        session_perms,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -868,6 +874,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -897,6 +904,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.get_consumer_offset(uid, stream_id, topic_id)
         },
+        session_perms,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -1542,7 +1550,8 @@ mod tests {
         ));
         for (index, (operation, body, expected)) in cases.into_iter().enumerate() {
             let request = request_message(operation, 1, 1, index as u64 + 1, &body);
-            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID)).await;
+            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID), None)
+                .await;
             let replies = bus.client_replies.borrow();
             assert_eq!(
                 replies.len(),
@@ -1582,7 +1591,7 @@ mod tests {
             1,
             TRUNCATED_BODY,
         );
-        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID), None).await;
 
         let offset = request_message(
             Operation::NonReplicated,
@@ -1591,7 +1600,8 @@ mod tests {
             2,
             TRUNCATED_BODY,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID), None)
+            .await;
 
         let delete = request_message(
             Operation::DeleteSegments,
@@ -1653,7 +1663,7 @@ mod tests {
         }
         .to_bytes();
         let poll = request_message(Operation::NonReplicated, VSR_CLIENT, SESSION, 1, &poll_body);
-        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID), None).await;
 
         let offset_body = GetConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(1)),
@@ -1669,7 +1679,8 @@ mod tests {
             2,
             &offset_body,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID), None)
+            .await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -1805,6 +1816,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            None,
         )
         .await;
 

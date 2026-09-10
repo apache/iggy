@@ -59,7 +59,7 @@ use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{IggyError, Permissions, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::framing::MAX_MESSAGE_SIZE;
@@ -342,6 +342,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<ServerSystemConfig>,
+    external_auth: &Arc<configs::external_auth::ExternalAuthConfig>,
     transport_client_id: u128,
     request: Message<RoutedRequestHeader>,
     // Acting user, peer address and read-your-writes floor for the read gates
@@ -360,6 +361,14 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
+    let session_perms = user_id
+        .filter(|&uid| external_auth.enabled && uid == external_auth.user_id)
+        .and_then(|_| {
+            let now_secs = iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
+            sessions
+                .borrow_mut()
+                .session_permissions_for_connection(transport_client_id, now_secs)
+        });
     match code {
         PING_CODE => {
             // No `record_heartbeat` here: the funnel records one for EVERY
@@ -401,7 +410,13 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         }
         GET_CLIENTS_CODE => {
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-                authorize_uid(shard, user_id, Permissioner::get_clients)
+                authorize_uid(
+                    shard,
+                    user_id,
+                    Permissioner::get_clients,
+                    session_perms.as_deref(),
+                    |p| p.global.manage_servers || p.global.read_servers,
+                )
             })
             .await
             {
@@ -430,7 +445,13 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         }
         GET_CLIENT_CODE => {
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-                authorize_uid(shard, user_id, Permissioner::get_client)
+                authorize_uid(
+                    shard,
+                    user_id,
+                    Permissioner::get_client,
+                    session_perms.as_deref(),
+                    |p| p.global.manage_servers || p.global.read_servers,
+                )
             })
             .await
             {
@@ -483,13 +504,35 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_SNAPSHOT_FILE_CODE => {
-            handle_get_snapshot(shard, system_config, transport_client_id, &request, user_id).await;
+            handle_get_snapshot(
+                shard,
+                system_config,
+                transport_client_id,
+                &request,
+                user_id,
+                session_perms.as_deref(),
+            )
+            .await;
         }
         POLL_MESSAGES_CODE => {
-            handle_poll_messages(shard, transport_client_id, &request, user_id).await;
+            handle_poll_messages(
+                shard,
+                transport_client_id,
+                &request,
+                user_id,
+                session_perms.as_deref(),
+            )
+            .await;
         }
         GET_CONSUMER_OFFSET_CODE => {
-            handle_get_consumer_offset(shard, transport_client_id, &request, user_id).await;
+            handle_get_consumer_offset(
+                shard,
+                transport_client_id,
+                &request,
+                user_id,
+                session_perms.as_deref(),
+            )
+            .await;
         }
         SYNC_CONSUMER_GROUP_CODE => {
             // Self-scoped: serves the caller's own assignment keyed by the
@@ -521,6 +564,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 watermark,
                 &roster,
                 client_ip,
+                session_perms.as_deref(),
             )
             .await;
         }
@@ -537,6 +581,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     watermark: u64,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -550,7 +595,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     // read-your-writes hold sits INSIDE the same call, behind that denial: an
     // unauthorized read must fail now, not after the whole poll budget.
     if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-        authorize_default_read(shard, code, request_body(request), user_id)
+        authorize_default_read(shard, code, request_body(request), user_id, session_perms)
     })
     .await
     {
@@ -638,6 +683,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -645,7 +691,13 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot) {
+    if let Err(error) = authorize_uid(
+        shard,
+        user_id,
+        Permissioner::get_snapshot,
+        session_perms,
+        |p| p.global.manage_servers || p.global.read_servers,
+    ) {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
