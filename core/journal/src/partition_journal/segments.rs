@@ -151,14 +151,14 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .and_then(|entry| entry.reference)
     }
 
-    /// Published body references at or above `from_op`, in operation order.
-    pub fn durable_segment_references(
+    /// Completed body writes at or above `from_op`, in operation order.
+    /// These references can precede durable publication.
+    pub fn written_segment_references(
         &self,
         from_op: u64,
     ) -> impl Iterator<Item = (u64, SegmentReference)> + '_ {
         self.entries
             .range(from_op..)
-            .take_while(|(op, _)| **op <= self.durable_head)
             .filter_map(|(&op, entry)| entry.reference.map(|reference| (op, reference)))
     }
 
@@ -215,8 +215,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             Err(error) => return Err(error),
         }
         self.poisoned = true;
-        // Every body write is synchronized before its WAL record is appended.
-        self.segment_files.clear();
         self.open_segment_file(generation, initial.start_offset, initial.length, None)
             .await?;
         let installed_file = self
@@ -386,7 +384,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 .write_frozen_vectored(first.position, buffers)
                 .await?;
         }
-        self.sync_segment_files().await
+        Ok(())
     }
 
     pub(super) async fn write_segment_body(
@@ -419,21 +417,33 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             preallocate_size,
         )
         .await?;
+        self.segment_files_dirty = true;
         self.segment_files
             .get_mut(&(reference.generation, reference.start_offset))
             .ok_or_else(|| invalid("segment writing handle is absent"))
     }
 
-    pub(super) async fn sync_segment_files(&self) -> io::Result<()> {
-        for file in self.segment_files.values() {
-            // Keep the writing handle: reopening after an errseq writeback error
-            // could turn a failed body barrier into a successful acknowledgment.
-            file.sync().await?;
+    pub(super) async fn sync_segment_files(&mut self) -> io::Result<()> {
+        if self.segment_files_dirty {
+            for file in self.segment_files.values() {
+                // Keep the writing handle: reopening after an errseq writeback error
+                // could turn a failed body barrier into a successful acknowledgment.
+                file.sync().await?;
+            }
+            self.segment_files_dirty = false;
+        }
+        if self.segment_links_dirty {
+            self.storage.sync_directory(&self.directory).await?;
+            self.storage
+                .sync_directory(self.segment_directory()?)
+                .await?;
+            self.segment_links_dirty = false;
         }
         Ok(())
     }
 
     pub(super) fn retain_active_segment_file(&mut self) {
+        // Buffered rotations must retain their original writers until publication.
         if let Some(segments) = self.state.segment_storage {
             let active = (
                 segments.tail.generation,
@@ -514,7 +524,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     file.preallocate(&cursor.path(&self.directory), segments.max_size);
                 }
             }
-            file.sync().await?;
+            self.sync_segment_files().await?;
             // Keep the public name present across recovery crashes. Its absence
             // on a fully checkpointed sealed tail means retention removed it.
             let temporary = public.with_extension(SEGMENT_RECOVERY_EXTENSION);
@@ -624,8 +634,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             }
             file
         };
-        self.storage.sync_directory(&self.directory).await?;
-        self.storage.sync_directory(&parent).await?;
+        self.segment_files_dirty = true;
+        self.segment_links_dirty = true;
         self.segment_files.insert(key, file);
         Ok(())
     }

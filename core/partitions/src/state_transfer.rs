@@ -3009,7 +3009,7 @@ where
             // about would resurrect at boot), so one retry against a
             // transient open failure is the only cheap save available.
             let open = || async {
-                if self.persistence.is_some() && self.durability().is_persisted() {
+                if self.persistence.is_some() {
                     SegmentStorage::with_read_only_messages(
                         &log_final,
                         &index_final,
@@ -3384,7 +3384,7 @@ where
         if let Some(persistence) = &self.persistence {
             let prepare = (!offsets_wire.checkpoint_prepare.is_empty())
                 .then(|| Owned::<4096>::copy_from_slice(&offsets_wire.checkpoint_prepare).into());
-            let segments = self.durability().is_persisted().then(|| {
+            let segments = Some({
                 let segment = self.log.active_segment();
                 (
                     journal::partition_journal::SegmentPosition {

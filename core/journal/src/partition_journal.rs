@@ -73,6 +73,7 @@ pub trait DurableAppend {
     fn append(&mut self, prepare: Frozen<4096>) -> impl Future<Output = io::Result<()>>;
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     directory: PathBuf,
     file: S::File,
@@ -86,6 +87,8 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     cleanup_directory_dirty: bool,
     recovered_prepares: Vec<Message<PrepareHeader>>,
     segment_files: BTreeMap<(u64, u64), S::File>,
+    segment_files_dirty: bool,
+    segment_links_dirty: bool,
     preallocate_segments: bool,
     retained_bytes: u64,
 }
@@ -226,6 +229,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             cleanup_directory_dirty: false,
             recovered_prepares: Vec::new(),
             segment_files: BTreeMap::new(),
+            segment_files_dirty: false,
+            segment_links_dirty: false,
             preallocate_segments,
             retained_bytes: 0,
         };
@@ -271,6 +276,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Err(invalid("view certificate does not match WAL history"));
         }
         self.poisoned = true;
+        self.sync_segment_files().await?;
         self.file.sync().await?;
         let state = JournalState {
             certified_log_view: Some(view),
@@ -279,6 +285,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.publish(state).await?;
         self.state = state;
         self.durable_head = state.head;
+        self.retain_active_segment_file();
         self.poisoned = false;
         Ok(())
     }
@@ -503,6 +510,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Err(invalid("purge must cover the owned segment history"));
         }
         self.poisoned = true;
+        self.sync_segment_files().await?;
         self.file.sync().await?;
         let mut state = JournalState {
             purge_generation: generation,
@@ -515,7 +523,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.publish(state).await?;
         self.state = state;
         self.durable_head = state.head;
-        // Body-carrying appends synchronize their original handles before return.
+        // The barrier above covers every original writer before purge releases it.
         self.segment_files.clear();
         self.poisoned = false;
         if self.state.segment_storage.is_some() {
@@ -534,9 +542,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Ok(());
         }
         self.poisoned = true;
+        self.sync_segment_files().await?;
         self.file.sync().await?;
         self.publish(self.state).await?;
         self.durable_head = self.state.head;
+        self.retain_active_segment_file();
         self.poisoned = false;
         Ok(())
     }
@@ -694,7 +704,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
         self.state = state;
         self.retained_bytes = retained_bytes;
-        self.retain_active_segment_file();
         self.poisoned = false;
         Ok(())
     }

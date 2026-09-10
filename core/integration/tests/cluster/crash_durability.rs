@@ -529,17 +529,24 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
 async fn given_persisted_topic_when_killed_below_flush_threshold_should_recover_acked_messages(
     harness: &mut TestHarness,
 ) {
-    verify_persisted_restart(harness).await;
+    verify_persisted_restart(harness, Durability::Persisted).await;
 }
 
 #[iggy_harness(cluster_nodes = 1)]
 async fn given_persisted_singleton_when_killed_below_flush_threshold_should_recover_acked_messages(
     harness: &mut TestHarness,
 ) {
-    verify_persisted_restart(harness).await;
+    verify_persisted_restart(harness, Durability::Persisted).await;
 }
 
-async fn verify_persisted_restart(harness: &mut TestHarness) {
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_mixed_durability_when_killed_below_flush_threshold_should_recover_offset_predecessors(
+    harness: &mut TestHarness,
+) {
+    verify_persisted_restart(harness, Durability::Replicated).await;
+}
+
+async fn verify_persisted_restart(harness: &mut TestHarness, durability: Durability) {
     let client = harness.tcp_root_client().await.unwrap();
     client.create_stream(STREAM_NAME).await.unwrap();
     let stream = Identifier::named(STREAM_NAME).unwrap();
@@ -549,27 +556,30 @@ async fn verify_persisted_restart(harness: &mut TestHarness) {
             TOPIC_NAME,
             &TopicCreateOptions {
                 partitions_count: Some(1),
-                durability: Durability::Persisted,
+                durability,
                 consumer_offset_durability: Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
         .await
         .unwrap();
-    let acked = produce_acked(&client, "durable-prepare", 12).await;
     let topic = Identifier::named(TOPIC_NAME).unwrap();
     let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let mut acked = Vec::new();
+    for group in 0..3 {
+        acked.extend(produce_acked(&client, &format!("durable-prepare-{group}"), 4).await);
+        client
+            .store_consumer_offset(
+                &consumer,
+                &stream,
+                &topic,
+                Some(PARTITION_ID),
+                acked.last().unwrap().0,
+            )
+            .await
+            .unwrap();
+    }
     let stored_offset = acked.last().unwrap().0;
-    client
-        .store_consumer_offset(
-            &consumer,
-            &stream,
-            &topic,
-            Some(PARTITION_ID),
-            stored_offset,
-        )
-        .await
-        .unwrap();
     harness.kill_cluster().unwrap();
     harness.restart_cluster().await.unwrap();
     let nodes: Vec<usize> = (0..harness.cluster_size()).collect();

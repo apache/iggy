@@ -859,7 +859,10 @@ async fn load_partition(
     // recovered message timestamp here, or an NTP rewind across a restart could
     // regress persisted `base_timestamp`.
 
-    let recovered_persistence = if replica_count > 1 && runtime_options.durability.is_persisted() {
+    let recovered_persistence = if replica_count > 1
+        && (runtime_options.durability.is_persisted()
+            || runtime_options.consumer_offset_durability.is_persisted())
+    {
         let directory = Path::new(&partition_dir)
             .join(format!("prepares-{}", partition_metadata.created_revision));
         Some(

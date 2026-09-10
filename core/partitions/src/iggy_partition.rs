@@ -795,7 +795,7 @@ where
                 IggyError::CannotReadFile
             })?
         };
-        if self.durability().is_persisted() && !self.materialization_missing {
+        if !self.materialization_missing {
             let segment = self.log.active_segment();
             let length = segment.size.as_bytes_u64();
             let initial = journal::partition_journal::SegmentPosition {
@@ -4896,7 +4896,7 @@ where
             return;
         }
 
-        let drained = self.drain_persistable_commits();
+        let drained = self.drain_persistable_commits(config);
         if drained.is_empty() {
             return;
         }
@@ -4950,10 +4950,10 @@ where
         // tail still finds its headers here (no wedge). Pipeline-first keeps a
         // freshly promoted primary (rebuilt pipeline) draining there, avoiding a
         // double-count against `advance_commit_min`.
-        let mut drained = self.drain_persistable_commits();
+        let mut drained = self.drain_persistable_commits(config);
         let send_client_replies = !drained.is_empty() && self.consensus.is_primary();
         if drained.is_empty() {
-            drained = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX);
+            drained = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, config);
         }
         if drained.is_empty() {
             return;
@@ -4972,12 +4972,13 @@ where
         }
     }
 
-    fn drain_persistable_commits(&self) -> Vec<PipelineEntry> {
+    fn drain_persistable_commits(&self, config: &PartitionsConfig) -> Vec<PipelineEntry> {
         let Some(persistence) = &self.persistence else {
             return drain_committable_prefix(self.consensus());
         };
         self.persist_repaired_prefix();
         let through = self.consensus.commit_max().min(persistence.head());
+        let materialize = self.should_persist_messages(config);
         let mut drained = Vec::new();
         self.consensus.with_pipeline_mut(|pipeline| {
             let mut next = self.consensus.commit_min() + 1;
@@ -4995,7 +4996,7 @@ where
                     );
                     break;
                 }
-                if !self.prepare_body_is_durable(&entry.header) {
+                if !self.prepare_body_is_ready(&entry.header, materialize) {
                     break;
                 }
                 drained.push(pipeline.pop().expect("pipeline head exists"));
@@ -5008,14 +5009,21 @@ where
         drained
     }
 
-    fn prepare_body_is_durable(&self, header: &PrepareHeader) -> bool {
+    fn prepare_body_is_ready(&self, header: &PrepareHeader, materialize: bool) -> bool {
         header.operation != Operation::SendMessages
             || header.op <= self.purge_floor_op
+            || (!self.durability().is_persisted() && !materialize)
             || self
                 .persistence
                 .as_ref()
                 .filter(|persistence| persistence.segment_checkpoint().is_some())
-                .is_none_or(|persistence| persistence.is_durable(header))
+                .is_none_or(|persistence| {
+                    if self.durability().is_persisted() {
+                        persistence.is_durable(header)
+                    } else {
+                        persistence.is_written(header)
+                    }
+                })
     }
 
     /// Committable entries (ops `commit_min+1 ..= commit_max`) read from the
@@ -5032,7 +5040,11 @@ where
     /// directly, but not as a one-line swap: the apply path needs batch bytes and
     /// the ring is capacity-bounded, so headers it cannot back with bytes would
     /// fence the partition instead of stalling it.
-    fn collect_committable_from_journal(&self, max_ops: usize) -> Vec<PipelineEntry> {
+    fn collect_committable_from_journal(
+        &self,
+        max_ops: usize,
+        config: &PartitionsConfig,
+    ) -> Vec<PipelineEntry> {
         let from_op = self.consensus.commit_min() + 1;
         // Stop below the pipeline head. The drain above holds rather than pops
         // when the head is not the op owed next; walking that op out of the
@@ -5052,12 +5064,13 @@ where
             .pipeline_head_header()
             .filter(|head| head.op >= from_op)
             .map_or(commit_max, |head| commit_max.min(head.op - 1));
+        let materialize = self.should_persist_messages(config);
         self.log
             .journal()
             .inner
             .committed_headers_from(from_op, commit_max, max_ops)
             .into_iter()
-            .take_while(|header| self.prepare_body_is_durable(header))
+            .take_while(|header| self.prepare_body_is_ready(header, materialize))
             .map(PipelineEntry::new)
             .collect()
     }
@@ -5432,6 +5445,16 @@ where
         }
     }
 
+    fn should_persist_messages(&self, config: &PartitionsConfig) -> bool {
+        let journal_info = self.log.journal().info;
+        // The existing thresholds include both committed and uncommitted batches.
+        journal_info.messages_count > 0
+            && (self.log.active_segment().is_full()
+                || journal_info.messages_count >= self.effective_messages_required_to_save(config)
+                || journal_info.size.as_bytes_u64()
+                    >= self.effective_size_of_messages_required_to_save(config))
+    }
+
     /// Returns false while the requested physical prefix is still pending in the WAL.
     #[allow(clippy::too_many_lines)]
     async fn commit_messages_inner(
@@ -5455,19 +5478,7 @@ where
             return Ok(true);
         }
 
-        // `journal_info` counts the committed prefix PLUS the uncommitted tail
-        // still resident in the journal, yet only the committed prefix is
-        // flushed below. With `messages_required_to_save > 1` the tail bytes
-        // count toward the trigger, so this threshold is not "committed bytes
-        // only" - safe, since the flush still writes only committed bytes.
-        let is_full = self.log.active_segment().is_full();
-        let unsaved_messages_count_exceeded =
-            journal_info.messages_count >= self.effective_messages_required_to_save(config);
-        let unsaved_messages_size_exceeded = journal_info.size.as_bytes_u64()
-            >= self.effective_size_of_messages_required_to_save(config);
-        let should_persist =
-            is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
-        if !force && !should_persist {
+        if !force && !self.should_persist_messages(config) {
             return Ok(true);
         }
 
@@ -5514,7 +5525,13 @@ where
                     peek_operation(entry) == Operation::SendMessages
                         && peek_op(entry) > self.purge_floor_op
                 })
-                .is_some_and(|entry| !persistence.is_durable_through(peek_op(entry)))
+                .is_some_and(|entry| {
+                    if self.durability().is_persisted() {
+                        !persistence.is_durable_through(peek_op(entry))
+                    } else {
+                        !persistence.is_written_through(peek_op(entry))
+                    }
+                })
             {
                 return Ok(false);
             }
@@ -5808,7 +5825,14 @@ where
         // ring at all. A miss degrades to a successful send carrying no
         // confirmation, a legal answer no client can tell from a real one.
         let committed_batch_stats = self.resolve_committed_visible_offsets(&drained);
-        let mut messages_committed = false;
+        // Keep the threshold decision used before draining. An append during an
+        // offset write or lock wait must not require an unchecked body mid-walk.
+        let mut messages_committed = !self.durability().is_persisted()
+            && self
+                .persistence
+                .as_ref()
+                .is_some_and(|persistence| persistence.segment_checkpoint().is_some())
+            && !self.should_persist_messages(config);
 
         // Apply the drained batch before advancing any op because directory
         // durability is shared by every delete in the batch. Until the sync
@@ -6525,9 +6549,10 @@ where
                     &frozen_batches,
                     segment.start_offset,
                     segment.size.as_bytes_u64(),
+                    self.durability().is_persisted(),
                 )
                 .map_err(|error| {
-                    warn!(%error, "cannot expose a non-durable segment prefix");
+                    warn!(%error, "cannot expose the segment prefix");
                     IggyError::CannotSyncFile
                 })?;
             let index_writer = self
@@ -6955,7 +6980,7 @@ where
         let segment = Segment::new(start_offset, segment_size);
         // Transfer can install the empty segment before its WAL reset enables
         // body ownership. Its storage must already match the resulting layout.
-        let segment_bodies = self.persistence.is_some() && self.durability().is_persisted();
+        let segment_bodies = self.persistence.is_some();
         let storage = if segment_bodies {
             SegmentStorage::with_read_only_messages(
                 &messages_path,
@@ -8544,76 +8569,85 @@ mod tests {
 
     #[compio::test]
     async fn transfer_establishes_wal_body_ownership_without_losing_the_active_index_writer() {
-        for materialized in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let (mut partition, _) = recording_partition_at(1, 3);
-            let partition_dir = directory.path().to_string_lossy().into_owned();
-            partition.set_partition_dir(partition_dir.clone());
-            partition.runtime_options.durability = iggy_common::Durability::Persisted;
-            for kind in ["consumers", "groups"] {
-                std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
-            }
-            partition.consumer_offsets_path = Some(format!("{partition_dir}/offsets/consumers"));
-            partition.consumer_group_offsets_path = Some(format!("{partition_dir}/offsets/groups"));
-            crate::state_transfer::mark_materialization_missing(&partition_dir, 0)
-                .await
-                .unwrap();
-            partition.open_persistence().await.unwrap();
-            assert!(
-                partition
-                    .persistence
-                    .as_ref()
-                    .unwrap()
-                    .segment_checkpoint()
-                    .is_none()
-            );
-            let prepare = checksummed_segment_prepare(1, 0, 0, b"transferred");
-            let mut staged = Vec::new();
-            if materialized {
-                let body = prepare.as_slice()[size_of::<PrepareHeader>()..].to_vec();
-                let artifact = consensus::StateArtifact::for_bytes(
-                    consensus::state_manifest::artifact_kind::SEGMENT_LOG,
-                    0,
-                    &body,
-                );
-                staged.push(
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            for materialized in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut partition, _) = recording_partition_at(1, 3);
+                let partition_dir = directory.path().to_string_lossy().into_owned();
+                partition.set_partition_dir(partition_dir.clone());
+                partition.runtime_options.durability = durability;
+                partition.runtime_options.consumer_offset_durability =
+                    iggy_common::Durability::Persisted;
+                for kind in ["consumers", "groups"] {
+                    std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
+                }
+                partition.consumer_offsets_path =
+                    Some(format!("{partition_dir}/offsets/consumers"));
+                partition.consumer_group_offsets_path =
+                    Some(format!("{partition_dir}/offsets/groups"));
+                crate::state_transfer::mark_materialization_missing(&partition_dir, 0)
+                    .await
+                    .unwrap();
+                partition.open_persistence().await.unwrap();
+                assert!(
                     partition
-                        .spill_transfer_segment(&artifact, body)
-                        .await
-                        .unwrap(),
+                        .persistence
+                        .as_ref()
+                        .unwrap()
+                        .segment_checkpoint()
+                        .is_none()
                 );
+                let prepare = checksummed_segment_prepare(1, 0, 0, b"transferred");
+                let mut staged = Vec::new();
+                if materialized {
+                    let body = prepare.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+                    let artifact = consensus::StateArtifact::for_bytes(
+                        consensus::state_manifest::artifact_kind::SEGMENT_LOG,
+                        0,
+                        &body,
+                    );
+                    staged.push(
+                        partition
+                            .spill_transfer_segment(&artifact, body)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                let offsets = crate::state_transfer::ConsumerOffsetsWire {
+                    prepare_checksum: Some(prepare.header().checksum),
+                    checkpoint_prepare: prepare.as_slice().to_vec(),
+                    purge_generation: 0,
+                    next_offset: 1,
+                    consumers: Vec::new(),
+                    groups: Vec::new(),
+                    dedup: Vec::new(),
+                };
+                partition
+                    .install_state_transfer(&repair_config(), 1, staged, &offsets.encode(), 0)
+                    .await
+                    .unwrap();
+                assert!(
+                    partition
+                        .persistence
+                        .as_ref()
+                        .unwrap()
+                        .segment_checkpoint()
+                        .is_some()
+                );
+                assert!(
+                    partition
+                        .log
+                        .storages()
+                        .iter()
+                        .all(|storage| storage.messages_writer.is_none())
+                );
+                assert!(partition.log.messages_writers().iter().all(Option::is_none));
+                assert!(partition.log.index_writers().last().unwrap().is_some());
+                assert_eq!(partition.consensus().commit_min(), 1);
             }
-            let offsets = crate::state_transfer::ConsumerOffsetsWire {
-                prepare_checksum: Some(prepare.header().checksum),
-                checkpoint_prepare: prepare.as_slice().to_vec(),
-                purge_generation: 0,
-                next_offset: 1,
-                consumers: Vec::new(),
-                groups: Vec::new(),
-                dedup: Vec::new(),
-            };
-            partition
-                .install_state_transfer(&repair_config(), 1, staged, &offsets.encode(), 0)
-                .await
-                .unwrap();
-            assert!(
-                partition
-                    .persistence
-                    .as_ref()
-                    .unwrap()
-                    .segment_checkpoint()
-                    .is_some()
-            );
-            assert!(
-                partition
-                    .log
-                    .storages()
-                    .iter()
-                    .all(|storage| storage.messages_writer.is_none())
-            );
-            assert!(partition.log.messages_writers().iter().all(Option::is_none));
-            assert!(partition.log.index_writers().last().unwrap().is_some());
-            assert_eq!(partition.consensus().commit_min(), 1);
         }
     }
 
@@ -8649,44 +8683,133 @@ mod tests {
 
     #[compio::test]
     async fn pending_wal_prefix_keeps_pipeline_replies_and_does_not_partially_flush() {
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut partition, replies) = recording_partition_at(0, 3);
+            partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            partition.runtime_options.durability = durability;
+            partition.runtime_options.consumer_offset_durability =
+                iggy_common::Durability::Persisted;
+            let first = checksummed_segment_prepare(1, 0, 0, b"first");
+            let second = checksummed_segment_prepare(2, first.header().checksum, 1, b"second");
+            let segment_size =
+                IggyByteSize::from((first.as_slice().len() - size_of::<PrepareHeader>()) as u64);
+            partition.runtime_options.segment_size = Some(segment_size);
+            partition.log.active_segment_mut().max_size = segment_size;
+            partition.open_persistence().await.unwrap();
+            partition.log.retire_front().unwrap();
+            partition
+                .install_empty_segment(&repair_config(), 0)
+                .await
+                .unwrap();
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            persistence
+                .append(first.clone().into_frozen(), durability.is_persisted())
+                .unwrap();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            persistence
+                .append(second.clone().into_frozen(), durability.is_persisted())
+                .unwrap();
+            assert!(persistence.start());
+            let writer = Rc::clone(&persistence).run();
+            for prepare in [first, second] {
+                partition.consensus.with_pipeline_mut(|pipeline| {
+                    pipeline.push(PipelineEntry::new(*prepare.header()));
+                });
+                partition
+                    .append_repaired_send_messages(prepare)
+                    .await
+                    .unwrap();
+            }
+            partition.consensus.restore_commit_state(0, 2);
+            let config = repair_config();
+            {
+                let mut flush = Box::pin(partition.commit_messages_inner(&config, true, 2));
+                assert!(matches!(
+                    futures::poll!(&mut flush),
+                    std::task::Poll::Ready(Ok(false))
+                ));
+            }
+            assert_eq!(partition.log.journal().inner.resident_count(), 2);
+            assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
+            assert_eq!(partition.stats.messages_count_inconsistent(), 0);
+            partition.commit_journal(&config).await;
+            assert!(partition.fatal().is_none());
+            assert_eq!(partition.consensus.commit_min(), 1);
+            assert_eq!(partition.consensus.pipeline_head_header().unwrap().op, 2);
+            assert_eq!(replies.borrow().len(), 1);
+            writer.await;
+            partition.commit_journal(&config).await;
+            assert!(partition.fatal().is_none());
+            assert_eq!(partition.consensus.commit_min(), 2);
+            assert_eq!(partition.consensus.pipeline_len(), 0);
+            assert_eq!(partition.stats.messages_count_inconsistent(), 2);
+            assert_eq!(replies.borrow().len(), 2);
+        }
+    }
+
+    #[compio::test]
+    async fn mixed_durability_replies_before_body_writes_below_the_flush_threshold() {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, replies) = recording_partition_at(0, 3);
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.runtime_options.durability = iggy_common::Durability::Replicated;
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let mut config = repair_config();
+        config.messages_required_to_save = 2;
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
         let first = checksummed_segment_prepare(1, 0, 0, b"first");
         let second = checksummed_segment_prepare(2, first.header().checksum, 1, b"second");
-        let segment_size =
-            IggyByteSize::from((first.as_slice().len() - size_of::<PrepareHeader>()) as u64);
-        partition.runtime_options.segment_size = Some(segment_size);
-        partition.log.active_segment_mut().max_size = segment_size;
-        partition.open_persistence().await.unwrap();
-        partition.log.retire_front().unwrap();
-        partition
-            .install_empty_segment(&repair_config(), 0)
-            .await
-            .unwrap();
-        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
         persistence
-            .append(first.clone().into_frozen(), true)
-            .unwrap();
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-        persistence
-            .append(second.clone().into_frozen(), true)
+            .append(first.clone().into_frozen(), false)
             .unwrap();
         assert!(persistence.start());
         let writer = Rc::clone(&persistence).run();
-        for prepare in [first, second] {
-            partition
-                .consensus
-                .with_pipeline_mut(|pipeline| pipeline.push(PipelineEntry::new(*prepare.header())));
+        for (index, prepare) in [first, second].into_iter().enumerate() {
+            let header = *prepare.header();
+            if index > 0 {
+                persistence
+                    .append(prepare.clone().into_frozen(), false)
+                    .unwrap();
+            }
+            partition.consensus.with_pipeline_mut(|pipeline| {
+                pipeline.push(PipelineEntry::new(header));
+            });
             partition
                 .append_repaired_send_messages(prepare)
                 .await
                 .unwrap();
+            partition.consensus.advance_commit_max(header.op);
+            if index == 0 {
+                let write_lock = partition.write_lock.clone();
+                let _guard = write_lock.lock().await;
+                let mut commit = Box::pin(partition.commit_journal(&config));
+                assert!(
+                    futures::poll!(&mut commit).is_ready(),
+                    "a below-threshold reply must not acquire a later materialization requirement while waiting for the append lock"
+                );
+            } else {
+                partition.commit_journal(&config).await;
+            }
+            assert!(partition.fatal().is_none());
+            assert_eq!(partition.consensus.commit_min(), 1);
+            assert_eq!(
+                replies.borrow().len(),
+                1,
+                "only the below-threshold send can reply"
+            );
+            assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
+            assert_eq!(partition.log.journal().inner.resident_count(), index + 1);
+            assert!(!persistence.is_written(&header));
         }
-        partition.consensus.restore_commit_state(0, 2);
-        let config = repair_config();
+        assert_eq!(partition.consensus.pipeline_head_header().unwrap().op, 2);
         {
             let mut flush = Box::pin(partition.commit_messages_inner(&config, true, 2));
             assert!(matches!(
@@ -8694,21 +8817,15 @@ mod tests {
                 std::task::Poll::Ready(Ok(false))
             ));
         }
-        assert_eq!(partition.log.journal().inner.resident_count(), 2);
-        assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
-        assert_eq!(partition.stats.messages_count_inconsistent(), 0);
-        partition.commit_journal(&config).await;
-        assert!(partition.fatal().is_none());
-        assert_eq!(partition.consensus.commit_min(), 1);
-        assert_eq!(partition.consensus.pipeline_head_header().unwrap().op, 2);
-        assert_eq!(replies.borrow().len(), 1);
         writer.await;
+        assert_eq!(persistence.durable_op(), 0);
         partition.commit_journal(&config).await;
         assert!(partition.fatal().is_none());
         assert_eq!(partition.consensus.commit_min(), 2);
         assert_eq!(partition.consensus.pipeline_len(), 0);
-        assert_eq!(partition.stats.messages_count_inconsistent(), 2);
         assert_eq!(replies.borrow().len(), 2);
+        assert_eq!(partition.log.journal().inner.resident_count(), 0);
+        assert_eq!(partition.stats.messages_count_inconsistent(), 2);
     }
 
     #[compio::test]
@@ -10608,6 +10725,147 @@ mod tests {
                 .expect("durable snapshot"),
             vec![(7, 1), (8, 2)]
         );
+    }
+
+    #[compio::test]
+    async fn durability_combinations_share_body_ownership_and_keep_materialization_thresholds() {
+        const SEGMENT_BYTES: u64 = 1024;
+        for replicas in [1, 3] {
+            for durability in [
+                iggy_common::Durability::Replicated,
+                iggy_common::Durability::Persisted,
+            ] {
+                for offset_durability in [
+                    iggy_common::Durability::Replicated,
+                    iggy_common::Durability::Persisted,
+                ] {
+                    for byte_threshold in [false, true] {
+                        let directory = tempfile::tempdir().unwrap();
+                        let (mut partition, _) = recording_partition_at(0, replicas);
+                        partition
+                            .set_partition_dir(directory.path().to_string_lossy().into_owned());
+                        partition.runtime_options.durability = durability;
+                        partition.runtime_options.consumer_offset_durability = offset_durability;
+                        partition.runtime_options.preallocate_segments = Some(false);
+                        partition.runtime_options.segment_size =
+                            Some(IggyByteSize::from(SEGMENT_BYTES));
+                        partition.log.segments_mut()[0].max_size =
+                            IggyByteSize::from(SEGMENT_BYTES);
+                        partition.open_persistence().await.unwrap();
+                        let persistence = partition.persistence.clone();
+                        let owned = replicas > 1
+                            && (durability.is_persisted() || offset_durability.is_persisted());
+                        assert_eq!(persistence.is_some(), owned);
+                        let mut config = repair_config();
+                        config.messages_required_to_save =
+                            if byte_threshold { u32::MAX } else { 2 };
+                        partition.log.retire_front().unwrap();
+                        partition.install_empty_segment(&config, 0).await.unwrap();
+                        assert_eq!(partition.log.messages_writers()[0].is_none(), owned);
+                        let mut expected = Vec::new();
+                        let mut parent = 0;
+                        for op in 1..=3 {
+                            let namespace = partition.namespace();
+                            let request = checksumless_send_request(namespace, 1);
+                            let prepare =
+                                request.transmute_header(|old, header: &mut PrepareHeader| {
+                                    header.command = Command::Prepare;
+                                    header.operation = Operation::SendMessages;
+                                    header.cluster = TEST_CLUSTER;
+                                    header.group = namespace.inner();
+                                    header.op = op;
+                                    header.parent = parent;
+                                    header.timestamp = op;
+                                    header.size = old.size;
+                                });
+                            let prepare = partition
+                                .stamp_and_append_messages(prepare)
+                                .await
+                                .unwrap()
+                                .prepare;
+                            let header = *bytemuck::checked::from_bytes::<PrepareHeader>(
+                                &prepare.as_slice()[..size_of::<PrepareHeader>()],
+                            );
+                            parent = header.checksum;
+                            expected.extend_from_slice(
+                                &prepare.as_slice()[size_of::<PrepareHeader>()..],
+                            );
+                            partition.consensus().sequencer().set_sequence(op);
+                            assert!(
+                                partition
+                                    .submit_prepare_persistence(prepare, Operation::SendMessages)
+                            );
+                            if replicas > 1 {
+                                assert_eq!(
+                                    partition.send_prepare_ok(&header).await,
+                                    !durability.is_persisted()
+                                );
+                            }
+                            if let Some(persistence) = &persistence {
+                                persistence.drain_with_timeout().await.unwrap();
+                                assert!(partition.send_prepare_ok(&header).await);
+                            }
+                            partition.consensus().advance_commit_max(op);
+                            if op == 1 && byte_threshold {
+                                config.size_of_messages_required_to_save = IggyByteSize::from(
+                                    2 * partition.log.journal().info.size.as_bytes_u64(),
+                                );
+                            }
+                            partition.commit_messages(&config, op).await.unwrap();
+                            if op == 1 {
+                                assert_eq!(
+                                    partition
+                                        .log
+                                        .segments()
+                                        .iter()
+                                        .any(|segment| segment.size.as_bytes_u64() > 0),
+                                    replicas == 1 && durability.is_persisted(),
+                                    "replicas={replicas} durability={durability:?} offsets={offset_durability:?} byte_threshold={byte_threshold}",
+                                );
+                            } else if op == 2 {
+                                assert_eq!(partition.log.journal().info.messages_count, 0);
+                            }
+                        }
+                        partition.flush_committed_messages(&config).await.unwrap();
+                        let mut actual = Vec::new();
+                        for segment in partition.log.segments() {
+                            let public = directory
+                                .path()
+                                .join(format!("{:020}.log", segment.start_offset));
+                            actual.extend(std::fs::read(&public).unwrap());
+                            let metadata = std::fs::metadata(public).unwrap();
+                            assert_eq!(metadata.len(), segment.size.as_bytes_u64());
+                            #[cfg(target_os = "linux")]
+                            if owned && metadata.len() > 0 {
+                                let wal = directory
+                                    .path()
+                                    .join(format!("prepares-{}", partition.created_revision));
+                                assert!(
+                                    std::fs::read_dir(wal).unwrap().any(|entry| entry
+                                        .unwrap()
+                                        .metadata()
+                                        .unwrap()
+                                        .ino()
+                                        == metadata.ino())
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            actual, expected,
+                            "replicas={replicas} durability={durability:?} offsets={offset_durability:?} byte_threshold={byte_threshold}"
+                        );
+                        assert_eq!(partition.log.journal().info.messages_count, 0);
+                        if let Some(persistence) = persistence {
+                            assert!(persistence.segment_checkpoint().is_some());
+                            assert_eq!(
+                                persistence.durable_op(),
+                                if durability.is_persisted() { 3 } else { 0 }
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[compio::test]
@@ -13093,7 +13351,7 @@ mod tests {
         );
 
         let ops: Vec<u64> = partition
-            .collect_committable_from_journal(COMMIT_WALK_OPS_MAX)
+            .collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config())
             .into_iter()
             .map(|entry| entry.header.op)
             .collect();
@@ -13117,7 +13375,7 @@ mod tests {
         assert!(partition.consensus.pipeline_head_header().is_none());
 
         let ops: Vec<u64> = partition
-            .collect_committable_from_journal(COMMIT_WALK_OPS_MAX)
+            .collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config())
             .into_iter()
             .map(|entry| entry.header.op)
             .collect();
@@ -13153,8 +13411,13 @@ mod tests {
         persistence.exhaust_capacity_for_test();
         partition.consensus.restore_commit_state(0, 4);
 
-        assert!(partition.drain_persistable_commits().is_empty());
-        let journaled = partition.collect_committable_from_journal(COMMIT_WALK_OPS_MAX);
+        assert!(
+            partition
+                .drain_persistable_commits(&repair_config())
+                .is_empty()
+        );
+        let journaled =
+            partition.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config());
         assert_eq!(
             journaled
                 .iter()
@@ -13164,7 +13427,7 @@ mod tests {
         );
         partition.consensus.advance_commit_min(1);
         partition.consensus.advance_commit_min(2);
-        let drained = partition.drain_persistable_commits();
+        let drained = partition.drain_persistable_commits(&repair_config());
         assert_eq!(
             drained
                 .iter()
@@ -13173,11 +13436,15 @@ mod tests {
             vec![3]
         );
         partition.consensus.advance_commit_min(3);
-        assert!(partition.drain_persistable_commits().is_empty());
+        assert!(
+            partition
+                .drain_persistable_commits(&repair_config())
+                .is_empty()
+        );
         assert_eq!(partition.consensus.pipeline_head_header().unwrap().op, 4);
         assert!(
             partition
-                .collect_committable_from_journal(COMMIT_WALK_OPS_MAX)
+                .collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config())
                 .is_empty()
         );
         persistence.retire();
@@ -15108,7 +15375,7 @@ mod purge_floor_tests {
         );
         assert_eq!(
             partition
-                .collect_committable_from_journal(COMMIT_WALK_OPS_MAX)
+                .collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config())
                 .iter()
                 .map(|entry| entry.header.op)
                 .collect::<Vec<_>>(),

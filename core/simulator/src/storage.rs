@@ -88,8 +88,9 @@ struct State {
     inodes: Vec<Inode>,
     epoch: u64,
     trace: Vec<StorageOperation>,
+    written_bytes: BTreeMap<usize, usize>,
     fault: Option<(usize, FaultMode)>,
-    paused: bool,
+    paused: Option<StorageOperation>,
     waiters: Vec<std::task::Waker>,
 }
 
@@ -139,13 +140,17 @@ impl SimStorage {
     }
 
     pub fn pause_writes(&self) {
-        self.state.borrow_mut().paused = true;
+        self.state.borrow_mut().paused = Some(StorageOperation::Write);
     }
 
-    pub fn resume_writes(&self) {
+    pub fn pause_file_syncs(&self) {
+        self.state.borrow_mut().paused = Some(StorageOperation::FileSync);
+    }
+
+    pub fn resume(&self) {
         let waiters = {
             let mut state = self.state.borrow_mut();
-            state.paused = false;
+            state.paused = None;
             std::mem::take(&mut state.waiters)
         };
         for waiter in waiters {
@@ -153,10 +158,10 @@ impl SimStorage {
         }
     }
 
-    async fn wait_for_write(&self) {
+    async fn wait_for(&self, operation: StorageOperation) {
         futures::future::poll_fn(|context| {
             let mut state = self.state.borrow_mut();
-            if !state.paused {
+            if state.paused != Some(operation) {
                 return std::task::Poll::Ready(());
             }
             if !state
@@ -424,6 +429,7 @@ impl DurableFile for SimFile {
     }
 
     async fn sync(&self) -> io::Result<()> {
+        self.storage.wait_for(StorageOperation::FileSync).await;
         self.storage
             .perform(StorageOperation::FileSync, |state, _| {
                 state.file(self.inode, self.epoch)?;
@@ -446,7 +452,7 @@ impl SimFile {
                 .checked_add(chunk.len())
                 .ok_or_else(|| invalid("write overflow"))
         })?;
-        self.storage.wait_for_write().await;
+        self.storage.wait_for(StorageOperation::Write).await;
         self.storage
             .perform(StorageOperation::Write, |state, torn| {
                 let buffered = state.file_mut(self.inode, self.epoch)?;
@@ -467,6 +473,7 @@ impl SimFile {
                         break;
                     }
                 }
+                *state.written_bytes.entry(self.inode).or_default() += length;
                 Ok(())
             })
     }
@@ -478,8 +485,9 @@ impl Default for State {
             inodes: vec![Inode::directory()],
             epoch: 0,
             trace: Vec::new(),
+            written_bytes: BTreeMap::new(),
             fault: None,
-            paused: false,
+            paused: None,
             waiters: Vec::new(),
         }
     }

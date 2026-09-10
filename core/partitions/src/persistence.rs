@@ -117,9 +117,10 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     offset_files: RefCell<HashMap<String, RetainedOffsetFile<S::File>>>,
     retired_offset_files: RefCell<Vec<RetainedOffsetFile<S::File>>>,
     accepted: RefCell<AcceptedPrepares>,
-    // Published with durable_head so readers never borrow the journal across writer I/O.
+    // Published with written_head so readers never borrow the journal across writer I/O.
     segment_references: RefCell<BTreeMap<u64, SegmentReference>>,
     accepted_head: Cell<u64>,
+    written_head: Cell<u64>,
     durable_head: Cell<u64>,
     checkpoint: Cell<u64>,
     checkpoint_checksum: Cell<Option<u128>>,
@@ -494,6 +495,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             lease,
             epoch: Cell::new(0),
             accepted_head: Cell::new(journal.head()),
+            written_head: Cell::new(journal.head()),
             durable_head: Cell::new(journal.head()),
             checkpoint: Cell::new(journal.checkpoint_op()),
             checkpoint_checksum: Cell::new(journal.checkpoint_checksum()),
@@ -510,7 +512,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             disk_bytes: Cell::new(journal.size_bytes()),
             retained_bytes: Cell::new(journal.retained_bytes()),
             segment_checkpoint: Cell::new(journal.segment_checkpoint()),
-            segment_references: RefCell::new(journal.durable_segment_references(0).collect()),
+            segment_references: RefCell::new(journal.written_segment_references(0).collect()),
             journal: RefCell::new(Some(journal)),
             queue: RefCell::new(VecDeque::new()),
             offset_files: RefCell::new(HashMap::new()),
@@ -588,10 +590,15 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn is_durable(&self, header: &PrepareHeader) -> bool {
-        !self.retired.get()
-            && self.failure.borrow().is_none()
-            && header.op <= self.durable_head.get()
-            && self.checksum(header.op) == Some(header.checksum)
+        self.is_written(header) && header.op <= self.durable_head.get()
+    }
+
+    pub fn is_written(&self, header: &PrepareHeader) -> bool {
+        self.is_written_through(header.op) && self.checksum(header.op) == Some(header.checksum)
+    }
+
+    pub fn is_written_through(&self, op: u64) -> bool {
+        !self.retired.get() && self.failure.borrow().is_none() && op <= self.written_head.get()
     }
 
     pub const fn segment_checkpoint(&self) -> Option<SegmentPosition> {
@@ -609,12 +616,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     /// Verify the physical prefix before making its indexes and logical sizes visible.
     ///
     /// # Errors
-    /// Returns an error for a failed barrier or a body outside the durable segment range.
+    /// Returns an error for an incomplete write or an unmet durability requirement.
     pub fn validate_segment_prefix(
         &self,
         prepares: &[Frozen<4096>],
         start_offset: u64,
         mut position: u64,
+        durable: bool,
     ) -> io::Result<u64> {
         let references = self.segment_references.borrow();
         let initial = position;
@@ -622,8 +630,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             let header = prepare_header(prepare)?;
             let reference = references
                 .get(&header.op)
-                .filter(|_| self.is_durable(header))
-                .ok_or_else(|| io::Error::other("committed prepare has no durable segment body"))?;
+                .filter(|_| {
+                    if durable {
+                        self.is_durable(header)
+                    } else {
+                        self.is_written(header)
+                    }
+                })
+                .ok_or_else(|| io::Error::other("committed segment body is not ready"))?;
             if reference.start_offset != start_offset
                 || reference.position != position
                 || reference.length != (prepare.len() - size_of::<PrepareHeader>()) as u64
@@ -644,7 +658,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn is_durable_through(&self, op: u64) -> bool {
-        !self.retired.get() && self.failure.borrow().is_none() && op <= self.durable_head.get()
+        self.is_written_through(op) && op <= self.durable_head.get()
     }
 
     pub fn has_capacity(&self, frame_bytes: usize) -> bool {
@@ -854,6 +868,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.accepted.borrow_mut().truncate_from(from_op);
         self.segment_references.borrow_mut().split_off(&from_op);
         self.accepted_head.set(from_op.saturating_sub(1));
+        self.written_head
+            .set(self.written_head.get().min(from_op.saturating_sub(1)));
         self.durable_head
             .set(self.durable_head.get().min(from_op.saturating_sub(1)));
         self.queue
@@ -895,6 +911,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             checksums: VecDeque::new(),
         };
         self.accepted_head.set(op);
+        self.written_head.set(0);
         self.durable_head.set(0);
         self.segment_references.borrow_mut().clear();
         self.queue.borrow_mut().push_back(Mutation::Reset {
@@ -1104,9 +1121,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 let mut references = self.segment_references.borrow_mut();
                 if rebuild_references {
                     references.clear();
-                    references.extend(journal.durable_segment_references(0));
-                } else if let Some(from_op) = self.durable_head.get().checked_add(1) {
-                    references.extend(journal.durable_segment_references(from_op));
+                    references.extend(journal.written_segment_references(0));
+                } else if let Some(from_op) = self.written_head.get().checked_add(1) {
+                    references.extend(journal.written_segment_references(from_op));
                 }
                 drop(references);
                 self.disk_bytes.set(journal.size_bytes());
@@ -1114,7 +1131,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 self.segment_checkpoint.set(journal.segment_checkpoint());
                 let advanced = journal.durable_op() != self.durable_head.get()
                     || journal.checkpoint_op() != self.checkpoint.get()
-                    || journal.certified_log_view() != self.certified_log_view.get();
+                    || journal.certified_log_view() != self.certified_log_view.get()
+                    || (journal.segment_checkpoint().is_some()
+                        && journal.head() != self.written_head.get());
                 self.certified_log_view.set(journal.certified_log_view());
                 if self
                     .requested_log_view
@@ -1123,6 +1142,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 {
                     self.requested_log_view.set(None);
                 }
+                self.written_head.set(journal.head());
                 self.durable_head.set(journal.durable_op());
                 if journal.checkpoint_op() > self.checkpoint.get() {
                     self.accepted
