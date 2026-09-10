@@ -150,7 +150,7 @@ Plugin authors call this on every consumed message. The implementation in `lib.r
 
 - `CircuitBreaker`: threshold + cooldown, `try_lock()` on the success path to avoid hot-path contention.
 - `retry_async(policy, context, should_retry, op)`: the retry loop for anything failing as `Err`. Owns attempt counting, backoff and the per-retry log; returns `RetryFailure { error, attempts, exhausted }` so callers write their own terminal log.
-- `retry_backoff(base, retry, max)`: backoff only, for loops that cannot return `Result`. `retry` is 1-based; `exponential_backoff` is the 0-based primitive and passing a 1-based counter to it doubles the first delay.
+- `retry_backoff(base, retry, max)`: backoff only, for loops that cannot return `Result`. `retry` is 1-based; `exponential_backoff` is the 0-based primitive underneath, used directly only where a 0-based index is already in hand (`source.rs::nack_retry_delay`), since a 1-based counter doubles the first delay.
 - `HttpRetryMiddleware`: integrates with `reqwest-middleware`. Retries 429 + 5xx + network errors. Honors `Retry-After`.
 - `max_retries` = **total attempts** including the first try, not extra retries. Document if you change this convention. `meilisearch_sink` is the standing exception: its `max_retries` / `max_open_retries` count retries *after* the first, as its README states.
 - New helpers must take `Duration` (not `u64 millis`) on the public API. Internal computation uses `humantime` parsing of `String`.

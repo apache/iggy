@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
-use iggy_connector_sdk::retry::{RetryFailure, RetryPolicy, retry_async};
+use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -385,8 +385,8 @@ impl DorisSink {
                     "Doris sink ID {} stream load returned HTTP {status}: {response_for_log}",
                     self.id
                 );
-                // Per-attempt detail only: `retry_async` logs each attempt and
-                // the terminal outcome, and `msg` travels in the returned error.
+                // Per-attempt detail only: `retry_async` logs every attempt and
+                // `consume` logs the terminal error, in which `msg` travels.
                 warn!("{msg}");
                 // 408/429 are 4xx but transient, so include them in the bounded
                 // in-request retry path.
@@ -435,9 +435,15 @@ impl DorisSink {
             }
         })
         .await
-        // `consume` already logs the terminal error for the batch, so the
-        // attempt bookkeeping is dropped here rather than logged twice.
-        .map_err(RetryFailure::into_error)
+        .map_err(|failure| {
+            // The only place the attempt count and the reason survive:
+            // `consume` logs the error itself, which carries neither.
+            warn!(
+                "Doris sink ID {} Stream Load (label={label}) {failure}",
+                self.id
+            );
+            failure.into_error()
+        })
     }
 }
 

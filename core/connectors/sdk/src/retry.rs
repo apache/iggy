@@ -178,8 +178,6 @@ pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) ->
     Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
-/// Ceiling for a server-supplied `Retry-After`.
-///
 /// Parse a `Retry-After` header value (integer seconds).
 /// Returns `None` for HTTP-date values — callers should fall back to their
 /// own backoff strategy.
@@ -255,6 +253,15 @@ impl<E> RetryFailure<E> {
     }
 }
 
+impl<E> std::error::Error for RetryFailure<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 impl<E: fmt::Display> fmt::Display for RetryFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = if self.exhausted {
@@ -286,13 +293,14 @@ impl<E: fmt::Display> fmt::Display for RetryFailure<E> {
 /// [`RetryFailure`] carries the attempt count and which condition ended the
 /// loop, so a caller logs the terminal failure at the level and wording that
 /// suit it. The error itself is returned unchanged.
-pub async fn retry_async<T, E, Op, Fut>(
+pub async fn retry_async<T, E, S, Op, Fut>(
     policy: RetryPolicy,
     context: &str,
-    should_retry: impl Fn(&E) -> bool,
+    should_retry: S,
     mut operation: Op,
 ) -> Result<T, RetryFailure<E>>
 where
+    S: Fn(&E) -> bool,
     Op: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
     E: fmt::Display,
@@ -313,12 +321,14 @@ where
 
         attempt += 1;
         let retryable = should_retry(&error);
-        let exhausted = attempt >= max_attempts;
-        if exhausted || !retryable {
+        let budget_spent = attempt >= max_attempts;
+        if !retryable || budget_spent {
             return Err(RetryFailure {
                 error,
                 attempts: attempt,
-                exhausted,
+                // A non-retryable error is the reason we stopped even when the
+                // budget happened to run out on the same attempt.
+                exhausted: retryable && budget_spent,
             });
         }
 
@@ -658,6 +668,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_permanent_failure_on_the_last_attempt_should_not_report_exhaustion() {
+        // Budget of 1 makes the last attempt also the first, so both stop
+        // conditions fire at once; the non-retryable one is the real reason.
+        let calls = Cell::new(0);
+        let result = retry_async(
+            policy(1),
+            "test",
+            should_retry,
+            failing_times(&calls, u32::MAX, TestError::Permanent),
+        )
+        .await;
+
+        let failure = result.expect_err("permanent error should fail");
+        assert!(
+            !failure.exhausted,
+            "reported exhaustion for an error that was never retryable"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_an_exhausted_budget_should_return_the_last_error() {
         let calls = Cell::new(0);
         // Distinct error per attempt, so "last" is actually discriminated.
@@ -722,11 +752,9 @@ mod tests {
         );
     }
 
-    /// The regression test for the convention this helper exists to unify: the
-    /// first retry waits the configured base delay, not twice it.
-    // `HttpRetryMiddleware` is the path every HTTP connector rides, and the
-    // behaviours it covers are the ones that regressed unnoticed: the bound on
-    // `Retry-After`, the statuses the header is read on, and the first delay.
+    // `HttpRetryMiddleware` is the path every HTTP connector rides, and nothing
+    // covered it before: these cases pin the first delay and that a server's
+    // `Retry-After` outranks the computed backoff.
     fn retry_client(max_attempts: u32, base: Duration, max: Duration) -> ClientWithMiddleware {
         build_retry_client(reqwest::Client::new(), max_attempts, base, max, "test")
     }
@@ -764,6 +792,11 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(response.status(), 200);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "expected exactly one retry"
+        );
         assert!(
             elapsed >= base.mul_f64(JITTER_LOW),
             "first retry waited {elapsed:?}, expected roughly {base:?}"
@@ -771,8 +804,11 @@ mod tests {
         // Guards the middleware's own `policy.backoff(attempts)` wiring, which
         // the pure `retry_backoff` tests do not reach: feeding a 1-based
         // counter to the 0-based `exponential_backoff` doubles this delay.
+        // A correct run tops out at 1.2 x base and the bug starts at 1.6 x, so
+        // 1.5 x leaves the widest margin for loopback round trips on a loaded
+        // runner while still failing on the bug.
         assert!(
-            elapsed < base.mul_f64(1.4),
+            elapsed < base.mul_f64(1.5),
             "first retry waited {elapsed:?}, past the {base:?} the config asks for"
         );
     }
