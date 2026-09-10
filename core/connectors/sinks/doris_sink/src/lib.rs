@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
-use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
+use iggy_connector_sdk::retry::{RetryFailure, RetryPolicy, retry_async};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -435,6 +435,9 @@ impl DorisSink {
             }
         })
         .await
+        // `consume` already logs the terminal error for the batch, so the
+        // attempt bookkeeping is dropped here rather than logged twice.
+        .map_err(RetryFailure::into_error)
     }
 }
 

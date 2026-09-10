@@ -25,10 +25,10 @@
 //! - [`check_connectivity`] — single health-check probe (GET /health)
 //! - [`check_connectivity_with_retry`] — startup probe with exponential backoff
 //! - [`retry_async`] — generic retry loop for fallible async operations
+//! - [`RetryFailure`] — terminal outcome of [`retry_async`], with attempt count
 //! - [`RetryPolicy`] — attempt budget and backoff bounds for [`retry_async`]
 //! - [`is_transient_status`] — transient HTTP status predicate
 //! - [`parse_duration`] — humantime duration parsing with fallback
-//! - [`jitter`] — ±20 % random jitter for retry delays
 //! - [`exponential_backoff`] — capped exponential backoff
 //! - [`retry_backoff`] — jittered backoff for a 1-based retry number
 //! - [`parse_retry_after`] — HTTP `Retry-After` header parsing
@@ -154,7 +154,7 @@ pub fn parse_duration(value: Option<&str>, default_value: &str) -> Duration {
 }
 
 /// Apply ±20 % random jitter to `base` to spread retry storms.
-pub fn jitter(base: Duration) -> Duration {
+pub(crate) fn jitter(base: Duration) -> Duration {
     let millis = base.as_millis() as u64;
     let jitter_range = millis / 5; // 20% of base
     if jitter_range == 0 {
@@ -219,7 +219,7 @@ impl RetryPolicy {
 /// retry waits `base_delay`, the second `2 × base_delay`, and so on, which is
 /// the convention the `retry_delay` config fields document.
 ///
-/// The cap is re-applied after [`jitter`], because ±20 % jitter on an
+/// The cap is re-applied after jittering, because ±20 % jitter on an
 /// already-capped delay can otherwise land above `max_delay`, which the config
 /// fields document as a strict upper bound.
 ///
@@ -233,7 +233,44 @@ pub fn retry_backoff(base_delay: Duration, retry: u32, max_delay: Duration) -> D
     ))
     .min(max_delay)
 }
-/// Run `operation`, retrying while it fails with an error `is_transient`
+
+/// Why [`retry_async`] stopped.
+///
+/// Carries the attempt count so a caller can write its own terminal log: the
+/// helper owns the per-retry line, giving up is the caller's to report.
+#[derive(Debug)]
+pub struct RetryFailure<E> {
+    pub error: E,
+    /// Attempts actually made, including the first.
+    pub attempts: u32,
+    /// `true` when the attempt budget ran out, `false` when `should_retry`
+    /// rejected the error and no further attempt was made.
+    pub exhausted: bool,
+}
+
+impl<E> RetryFailure<E> {
+    /// Discard the attempt bookkeeping and keep the underlying error.
+    pub fn into_error(self) -> E {
+        self.error
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for RetryFailure<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = if self.exhausted {
+            "ran out of attempts"
+        } else {
+            "hit a non-retryable error"
+        };
+        write!(
+            f,
+            "{reason} after {} attempts: {}",
+            self.attempts, self.error
+        )
+    }
+}
+
+/// Run `operation`, retrying while it fails with an error `should_retry`
 /// accepts and the attempt budget in `policy` is not exhausted.
 ///
 /// This is the retry skeleton for connectors whose failures surface as `Err`,
@@ -245,15 +282,16 @@ pub fn retry_backoff(base_delay: Duration, retry: u32, max_delay: Duration) -> D
 /// emits, e.g. `"Doris sink ID 3 Stream Load (label=abc)"`. Callers build it
 /// before the first attempt, so keep it off per-message paths.
 ///
-/// Retries, recovery and giving up are all logged here, with the attempt
-/// counts callers would otherwise each have to track. The last error is
-/// returned unchanged so callers keep their own error classification.
+/// The per-retry line is logged here. Giving up is not: the returned
+/// [`RetryFailure`] carries the attempt count and which condition ended the
+/// loop, so a caller logs the terminal failure at the level and wording that
+/// suit it. The error itself is returned unchanged.
 pub async fn retry_async<T, E, Op, Fut>(
     policy: RetryPolicy,
     context: &str,
-    is_transient: impl Fn(&E) -> bool,
+    should_retry: impl Fn(&E) -> bool,
     mut operation: Op,
-) -> Result<T, E>
+) -> Result<T, RetryFailure<E>>
 where
     Op: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -274,19 +312,14 @@ where
         };
 
         attempt += 1;
-        let retryable = is_transient(&error);
-        let budget_exhausted = attempt >= max_attempts;
-        if budget_exhausted || !retryable {
-            let reason = if retryable {
-                "ran out of attempts"
-            } else {
-                "hit a non-retryable error"
-            };
-            // Both arms are terminal for the operation, so both log at error!.
-            // A caller that aborts on the `Err` (an `open()` probe) drops it at
-            // the FFI boundary, leaving this as the only record of the cause.
-            error!("{context} {reason} after {attempt} attempts: {error}");
-            return Err(error);
+        let retryable = should_retry(&error);
+        let exhausted = attempt >= max_attempts;
+        if exhausted || !retryable {
+            return Err(RetryFailure {
+                error,
+                attempts: attempt,
+                exhausted,
+            });
         }
 
         let delay = policy.backoff(attempt);
@@ -519,6 +552,12 @@ pub async fn check_connectivity_with_retry(
         || check_connectivity(client, url.clone(), connector_label),
     )
     .await
+    .map_err(|failure| {
+        // Sole record of the cause: `open()`'s Err is dropped at the FFI
+        // boundary and the runtime logs only "Plugin initialization failed".
+        error!("{context} {failure}");
+        failure.into_error()
+    })
 }
 
 #[cfg(test)]
@@ -552,7 +591,7 @@ mod tests {
         }
     }
 
-    fn is_transient(error: &TestError) -> bool {
+    fn should_retry(error: &TestError) -> bool {
         matches!(error, TestError::Transient)
     }
 
@@ -588,12 +627,12 @@ mod tests {
         let result = retry_async(
             policy(4),
             "test",
-            is_transient,
+            should_retry,
             failing_times(&calls, 2, TestError::Transient),
         )
         .await;
 
-        assert_eq!(result, Ok(3));
+        assert_eq!(result.map_err(RetryFailure::into_error), Ok(3));
         assert_eq!(calls.get(), 3);
     }
 
@@ -603,12 +642,18 @@ mod tests {
         let result = retry_async(
             policy(4),
             "test",
-            is_transient,
+            should_retry,
             failing_times(&calls, 2, TestError::Permanent),
         )
         .await;
 
-        assert_eq!(result, Err(TestError::Permanent));
+        let failure = result.expect_err("permanent error should not retry");
+        assert_eq!(failure.error, TestError::Permanent);
+        assert_eq!(failure.attempts, 1);
+        assert!(
+            !failure.exhausted,
+            "should_retry rejected it, budget untouched"
+        );
         assert_eq!(calls.get(), 1);
     }
 
@@ -616,7 +661,7 @@ mod tests {
     async fn given_an_exhausted_budget_should_return_the_last_error() {
         let calls = Cell::new(0);
         // Distinct error per attempt, so "last" is actually discriminated.
-        let result: Result<u32, u32> = retry_async(
+        let result: Result<u32, RetryFailure<u32>> = retry_async(
             policy(3),
             "test",
             |_| true,
@@ -628,7 +673,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(3), "should surface the final attempt's error");
+        let failure = result.expect_err("budget should be exhausted");
+        assert_eq!(failure.error, 3, "should surface the final attempt's error");
+        assert_eq!(failure.attempts, 3);
+        assert!(failure.exhausted);
         assert_eq!(calls.get(), 3, "max_attempts is a total attempt count");
     }
 
@@ -639,12 +687,14 @@ mod tests {
             let result = retry_async(
                 policy(max_attempts),
                 "test",
-                is_transient,
+                should_retry,
                 failing_times(&calls, u32::MAX, TestError::Transient),
             )
             .await;
 
-            assert_eq!(result, Err(TestError::Transient));
+            let failure = result.expect_err("single attempt should fail");
+            assert_eq!(failure.error, TestError::Transient);
+            assert!(failure.exhausted, "max_attempts = {max_attempts}");
             assert_eq!(calls.get(), 1, "max_attempts = {max_attempts}");
         }
     }
@@ -656,13 +706,13 @@ mod tests {
         let result = retry_async(
             policy(3),
             "test",
-            is_transient,
+            should_retry,
             failing_times(&calls, 2, TestError::Transient),
         )
         .await;
         let elapsed = started.elapsed();
 
-        assert_eq!(result, Ok(3));
+        assert_eq!(result.map_err(RetryFailure::into_error), Ok(3));
         // base + 2 × base, each independently jittered. Passing the retry
         // number straight to `exponential_backoff` would give 2 + 4 × base.
         let nominal = BASE * 3;
@@ -724,6 +774,23 @@ mod tests {
         assert!(
             elapsed < base.mul_f64(1.4),
             "first retry waited {elapsed:?}, past the {base:?} the config asks for"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_retry_after_should_take_precedence_over_the_computed_backoff() {
+        let server = mock_then_ok(429, &[("Retry-After", "1")]).await;
+        // Backoff bounded far below the header, so honoring it is visible.
+        let client = retry_client(3, Duration::from_millis(10), Duration::from_millis(50));
+
+        let started = Instant::now();
+        let response = client.get(server.uri()).send().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), 200);
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "used the computed backoff instead of Retry-After: waited {elapsed:?}"
         );
     }
 
