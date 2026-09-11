@@ -92,14 +92,10 @@ class LoginInfo final {
 
     /**
      * @brief Returns the HTTP access token when the login returned one.
-     * @return Empty when the selected transport does not use an access token.
+     * @return Reference to the owning optional token. Empty when the selected
+     *         transport does not use an access token.
      */
-    [[nodiscard]] std::optional<std::string_view> AccessToken() const noexcept {
-        if (!access_token_) {
-            return std::nullopt;
-        }
-        return *access_token_;
-    }
+    [[nodiscard]] const std::optional<std::string> &AccessToken() const noexcept { return access_token_; }
 
     /**
      * @brief Returns the access-token expiry when a token was returned.
@@ -162,15 +158,11 @@ class Identifier final {
 
     /**
      * @brief Returns the identifier payload.
-     * @return Numeric ID for Kind::Numeric, or a view of the name for
-     *         Kind::String.
+     * @return Reference to the owning payload containing the numeric ID for
+     *         Kind::Numeric or the name for Kind::String. The reference
+     *         remains valid while this Identifier remains alive.
      */
-    [[nodiscard]] std::variant<std::uint32_t, std::string_view> Value() const noexcept {
-        if (kind_ == Kind::Numeric) {
-            return std::get<std::uint32_t>(value_);
-        }
-        return std::string_view(std::get<std::string>(value_));
-    }
+    [[nodiscard]] const std::variant<std::uint32_t, std::string> &Value() const noexcept { return value_; }
 
   private:
     Identifier(Kind kind, std::variant<std::uint32_t, std::string> value) : kind_(kind), value_(std::move(value)) {}
@@ -243,7 +235,6 @@ class HeaderField final {
     HeaderField(HeaderKind kind, std::vector<std::uint8_t> value) : kind_(kind), value_(std::move(value)) {}
 
     static HeaderField FromFfi(ffi::HeaderField field);
-    static ffi::HeaderField ToFfi(HeaderField field);
 
     friend class HeaderEntry;
 
@@ -284,7 +275,6 @@ class HeaderEntry final {
     HeaderEntry(HeaderField key, HeaderField value) : key_(std::move(key)), value_(std::move(value)) {}
 
     static HeaderEntry FromFfi(ffi::HeaderEntry entry);
-    static ffi::HeaderEntry ToFfi(HeaderEntry entry);
 
     friend class ResourceOptions;
 
@@ -293,39 +283,18 @@ class HeaderEntry final {
 };
 
 /**
- * @brief Creation options attached to a stream or topic.
+ * @brief Options recorded for a stream or topic.
  *
  * Explicit() contains values supplied when the resource was created. Derived()
  * contains values resolved from the server configuration at that time. Derived
  * values describe the resource's creation settings and can differ when the
  * resource is recreated with a different server configuration.
  *
- * When submitting creation options, only explicit entries are sent. Derived
- * values returned by Options() are informational and are not resubmitted. Use
- * TopicCreateOptions to configure a new topic.
+ * This is a response-only model returned by Options(). Use TopicCreateOptions
+ * to configure a new topic. Stream creation currently accepts only a name.
  */
 class ResourceOptions final {
   public:
-    /**
-     * @brief Creates an empty option collection.
-     * @return Resource options with no explicit or derived entries.
-     */
-    static ResourceOptions Empty() { return ResourceOptions({}); }
-
-    /**
-     * @brief Creates request options from entries selected by the caller.
-     * @param entries Explicit option entries.
-     * @return Resource options that will submit @p entries.
-     */
-    static ResourceOptions Explicit(std::vector<HeaderEntry> entries);
-
-    /**
-     * @brief Creates request options from explicit map.
-     * @param entries Explicit option map keyed by option name.
-     * @return Resource options that will submit @p entries.
-     */
-    static ResourceOptions Explicit(std::map<std::string, HeaderField> entries);
-
     /**
      * @brief Returns entries supplied explicitly at resource creation.
      * @return Explicit entries as map from option name to typed value.
@@ -341,15 +310,12 @@ class ResourceOptions final {
     [[nodiscard]] const std::map<std::string, HeaderField> &Derived() const noexcept { return derived_; }
 
   private:
-    explicit ResourceOptions(std::map<std::string, HeaderField> explicit_entries)
-        : explicit_(std::move(explicit_entries)) {}
     ResourceOptions(std::map<std::string, HeaderField> explicit_entries,
                     std::map<std::string, HeaderField> derived_entries)
         : explicit_(std::move(explicit_entries)), derived_(std::move(derived_entries)) {}
 
     static ResourceOptions FromFfi(rust::Vec<ffi::HeaderEntry> explicit_entries,
                                    rust::Vec<ffi::HeaderEntry> derived_entries);
-    static rust::Vec<ffi::HeaderEntry> ToFfi(ResourceOptions options);
 
     friend class IggyBlockingClient;
     friend class Topic;
@@ -1096,7 +1062,7 @@ class TopicCreateOptions final {
      * @return Configured compression algorithm, or `std::nullopt` to use the
      *         server default.
      */
-    [[nodiscard]] std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept {
+    [[nodiscard]] const std::optional<::iggy::CompressionAlgorithm> &CompressionAlgorithm() const noexcept {
         return compression_algorithm_;
     }
 
@@ -1115,7 +1081,7 @@ class TopicCreateOptions final {
      * @return Configured expiry policy, or `std::nullopt` to use the server
      *         default.
      */
-    [[nodiscard]] std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+    [[nodiscard]] const std::optional<::iggy::Expiry> &MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
      * @brief Sets the message retention policy.
@@ -1137,7 +1103,7 @@ class TopicCreateOptions final {
      * @return Configured size limit, or `std::nullopt` to use the server
      *         default.
      */
-    [[nodiscard]] std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
      * @brief Sets the maximum retained topic size.
@@ -1283,8 +1249,10 @@ class TopicCreateOptions final {
      * @see SetRawEntries(const std::map<std::string, std::string>&)
      */
     TopicCreateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
-        for (auto &entry : entries) {
-            raw_.insert_or_assign(std::move(entry.first), std::move(entry.second));
+        while (!entries.empty()) {
+            auto node = entries.extract(entries.begin());
+            raw_.erase(node.key());
+            raw_.insert(std::move(node));
         }
         return *this;
     }
@@ -1324,7 +1292,7 @@ class TopicUpdateOptions final {
      * @return Compression algorithm to apply, or `std::nullopt` when this
      *         update leaves compression unchanged.
      */
-    [[nodiscard]] std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept {
+    [[nodiscard]] const std::optional<::iggy::CompressionAlgorithm> &CompressionAlgorithm() const noexcept {
         return compression_algorithm_;
     }
 
@@ -1343,7 +1311,7 @@ class TopicUpdateOptions final {
      * @return Expiry policy to apply, or `std::nullopt` when this update leaves
      *         retention unchanged.
      */
-    [[nodiscard]] std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+    [[nodiscard]] const std::optional<::iggy::Expiry> &MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
      * @brief Sets the message retention policy.
@@ -1365,7 +1333,7 @@ class TopicUpdateOptions final {
      * @return Size limit to apply, or `std::nullopt` when this update leaves
      *         the limit unchanged.
      */
-    [[nodiscard]] std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
      * @brief Sets the maximum retained topic size.
@@ -1412,8 +1380,10 @@ class TopicUpdateOptions final {
      * @see SetRawEntries(const std::map<std::string, std::string>&)
      */
     TopicUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
-        for (auto &entry : entries) {
-            raw_.insert_or_assign(std::move(entry.first), std::move(entry.second));
+        while (!entries.empty()) {
+            auto node = entries.extract(entries.begin());
+            raw_.erase(node.key());
+            raw_.insert(std::move(node));
         }
         return *this;
     }
@@ -1466,8 +1436,10 @@ class StreamUpdateOptions final {
      * @note The server currently rejects all stream settings.
      */
     StreamUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
-        for (auto &entry : entries) {
-            raw_.insert_or_assign(std::move(entry.first), std::move(entry.second));
+        while (!entries.empty()) {
+            auto node = entries.extract(entries.begin());
+            raw_.erase(node.key());
+            raw_.insert(std::move(node));
         }
         return *this;
     }

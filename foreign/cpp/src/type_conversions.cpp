@@ -68,39 +68,8 @@ HeaderField HeaderField::FromFfi(ffi::HeaderField field) {
                        std::vector<std::uint8_t>(field.value.begin(), field.value.end()));
 }
 
-ffi::HeaderField HeaderField::ToFfi(HeaderField field) {
-    ffi::HeaderField ffi_field{};
-    ffi_field.kind = static_cast<std::uint8_t>(field.kind_);
-    ffi_field.value.reserve(field.value_.size());
-    for (const auto byte : field.value_) {
-        ffi_field.value.push_back(byte);
-    }
-    return ffi_field;
-}
-
 HeaderEntry HeaderEntry::FromFfi(ffi::HeaderEntry entry) {
     return HeaderEntry(HeaderField::FromFfi(std::move(entry.key)), HeaderField::FromFfi(std::move(entry.value)));
-}
-
-ffi::HeaderEntry HeaderEntry::ToFfi(HeaderEntry entry) {
-    ffi::HeaderEntry ffi_entry{};
-    ffi_entry.key   = HeaderField::ToFfi(std::move(entry.key_));
-    ffi_entry.value = HeaderField::ToFfi(std::move(entry.value_));
-    return ffi_entry;
-}
-
-ResourceOptions ResourceOptions::Explicit(std::vector<HeaderEntry> entries) {
-    std::map<std::string, HeaderField> explicit_map;
-    for (auto &entry : entries) {
-        const auto &key_bytes = entry.Key().Value();
-        std::string key(key_bytes.begin(), key_bytes.end());
-        explicit_map.emplace(std::move(key), entry.Value());
-    }
-    return ResourceOptions(std::move(explicit_map));
-}
-
-ResourceOptions ResourceOptions::Explicit(std::map<std::string, HeaderField> entries) {
-    return ResourceOptions(std::move(entries));
 }
 
 ResourceOptions ResourceOptions::FromFfi(rust::Vec<ffi::HeaderEntry> explicit_entries,
@@ -110,29 +79,16 @@ ResourceOptions ResourceOptions::FromFfi(rust::Vec<ffi::HeaderEntry> explicit_en
         HeaderEntry header_entry = HeaderEntry::FromFfi(std::move(entry));
         const auto &key_bytes    = header_entry.Key().Value();
         std::string key(key_bytes.begin(), key_bytes.end());
-        explicit_options.emplace(std::move(key), header_entry.Value());
+        explicit_options.emplace(std::move(key), std::move(header_entry.value_));
     }
     std::map<std::string, HeaderField> derived_options;
     for (auto &entry : derived_entries) {
         HeaderEntry header_entry = HeaderEntry::FromFfi(std::move(entry));
         const auto &key_bytes    = header_entry.Key().Value();
         std::string key(key_bytes.begin(), key_bytes.end());
-        derived_options.emplace(std::move(key), header_entry.Value());
+        derived_options.emplace(std::move(key), std::move(header_entry.value_));
     }
     return ResourceOptions(std::move(explicit_options), std::move(derived_options));
-}
-
-rust::Vec<ffi::HeaderEntry> ResourceOptions::ToFfi(ResourceOptions options) {
-    rust::Vec<ffi::HeaderEntry> headers{};
-    headers.reserve(options.explicit_.size());
-    for (auto &entry : options.explicit_) {
-        const std::string &key   = entry.first;
-        const HeaderField &value = entry.second;
-        std::vector<std::uint8_t> key_bytes(key.begin(), key.end());
-        headers.push_back(HeaderEntry::ToFfi(
-            HeaderEntry::Create(HeaderField::Create(HeaderKind::String, std::move(key_bytes)), value)));
-    }
-    return headers;
 }
 
 Topic Topic::FromFfi(ffi::Topic topic) {
