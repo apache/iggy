@@ -59,32 +59,11 @@ source "$(dirname "$0")/utils.sh"
 trap on_exit_bench SIGINT
 trap on_exit_bench EXIT
 
-# Function to get environment variables based on benchmark type
+# Cache and no_wait names below are historical scenario labels. They do not
+# change server storage settings and must not be compared as cache policies.
+# Each scenario uses the same explicit server credentials.
 get_env_vars() {
-    local bench_type="$1"
-    local env_vars=()
-
-    env_vars+=("IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy")
-
-    # Specific env vars based on bench type
-    case "$bench_type" in
-    # fsync is a topic creation option (`enforce_fsync`) now, not server config,
-    # so the bench command carries `--enforce-fsync` (added by
-    # `construct_bench_command` off the same remark) and only the cache setting
-    # is left to the server environment.
-    *"no_cache_fsync"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false")
-        ;;
-    *"only_cache"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_SIZE=9GB")
-        ;;
-    *"no_cache"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false")
-        ;;
-    *"no_wait"*)
-        env_vars+=("IGGY_SYSTEM_SEGMENT_SERVER_CONFIRMATION=no_wait")
-        ;;
-    esac
+    local env_vars=("IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy")
 
     # Convert array to env var string
     local env_string=""
@@ -106,34 +85,34 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ##############################
 
 # Large batch tests with cache enabled
-NORMAL_BATCH_ONLY_CACHE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 8 8 1000 1000 1000 tcp "send_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with forced cache
-NORMAL_BATCH_ONLY_CACHE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 8 8 1000 1000 1000 tcp "poll_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with forced cache
+NORMAL_BATCH_ONLY_CACHE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 8 8 1000 1000 1000 tcp "send_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with default storage settings
+NORMAL_BATCH_ONLY_CACHE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 8 8 1000 1000 1000 tcp "poll_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with default storage settings
 
 # Large batch tests with cache disabled
-NORMAL_BATCH_NO_CACHE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 8 8 1000 1000 1000 tcp "send_no_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with disabled cache
-NORMAL_BATCH_NO_CACHE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 8 8 1000 1000 1000 tcp "send_no_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with disabled cache
+NORMAL_BATCH_NO_CACHE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 8 8 1000 1000 1000 tcp "send_no_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with default storage settings
+NORMAL_BATCH_NO_CACHE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 8 8 1000 1000 1000 tcp "send_no_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with default storage settings
 
 # Large batch tests with no wait and with cache configuration
-NORMAL_BATCH_NO_WAIT_ONLY_CACHE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 8 8 1000 1000 1000 tcp "send_no_wait_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with no_wait config
-NORMAL_BATCH_NO_WAIT_ONLY_CACHE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 8 8 1000 1000 1000 tcp "send_no_wait_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with no_wait config
+NORMAL_BATCH_NO_WAIT_ONLY_CACHE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 8 8 1000 1000 1000 tcp "send_no_wait_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with default storage settings
+NORMAL_BATCH_NO_WAIT_ONLY_CACHE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 8 8 1000 1000 1000 tcp "send_no_wait_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with default storage settings
 
 # Single actor tests with cache disabled
 # shellcheck disable=SC2034
-NO_CACHE_SINGLE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 1 1 1000 1000 5000 tcp "1_producer_no_cache" "$IDENTIFIER") # 5GB data, 1KB messages, 100 msgs/batch with forced cache
+NO_CACHE_SINGLE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 1 1 1000 1000 5000 tcp "1_producer_no_cache" "$IDENTIFIER") # 5GB data, 1KB messages, 100 msgs/batch with default storage settings
 # shellcheck disable=SC2034
-NO_CACHE_SINGLE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 1 1 1000 1000 5000 tcp "1_consumer_no_cache" "$IDENTIFIER") # 5GB data, 1KB messages, 100 msgs/batch with forced cache
+NO_CACHE_SINGLE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 1 1 1000 1000 5000 tcp "1_consumer_no_cache" "$IDENTIFIER") # 5GB data, 1KB messages, 100 msgs/batch with default storage settings
 
 # Consumer group tests with cache enabled
 BALANCED_ONLY_CACHE_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "balanced-producer" 1 8 1000 1000 1000 tcp "only_cache" "$IDENTIFIER")             # Balanced producer benchmark
 BALANCED_ONLY_CACHE_CONSUMER_GROUP=$(construct_bench_command "$IGGY_BENCH_CMD" "balanced-consumer-group" 1 8 1000 1000 1000 tcp "only_cache" "$IDENTIFIER") # Consumer group benchmark
 
 # Single actor tests with cache disabled and rate limit 100 MB/s
-NO_CACHE_RL_SINGLE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 1 1 1000 1000 2000 tcp "1_producer_no_cache_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with forced cache
-NO_CACHE_RL_SINGLE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 1 1 1000 1000 2000 tcp "1_consumer_no_cache_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with forced cache
+NO_CACHE_RL_SINGLE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 1 1 1000 1000 2000 tcp "1_producer_no_cache_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with default storage settings
+NO_CACHE_RL_SINGLE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 1 1 1000 1000 2000 tcp "1_consumer_no_cache_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with default storage settings
 
 # Single actor tests with cache disabled, fsync enabled and rate limit 100 MB/s
-NO_CACHE_FSYNC_RL_SINGLE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 1 1 1000 1000 2000 tcp "1_producer_no_cache_fsync_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with forced cache
-NO_CACHE_FSYNC_RL_SINGLE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 1 1 1000 1000 2000 tcp "1_consumer_no_cache_fsync_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with forced cache
+NO_CACHE_FSYNC_RL_SINGLE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 1 1 1000 1000 2000 tcp "1_producer_no_cache_fsync_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with default storage settings
+NO_CACHE_FSYNC_RL_SINGLE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 1 1 1000 1000 2000 tcp "1_consumer_no_cache_fsync_rl_100MB" "$IDENTIFIER" "100MB") # 2GB data, 1KB messages, 100 msgs/batch with default storage settings
 
 ###############################
 #      Single benchmarks      #

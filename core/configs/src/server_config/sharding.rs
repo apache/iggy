@@ -63,10 +63,10 @@ pub const SHUTDOWN_JOIN_TIMEOUT_MAX: Duration = Duration::from_secs(900);
 pub const RECONCILE_PERIODIC_INTERVAL_MAX: Duration = Duration::from_secs(30);
 
 // Every omitted field falls back to the frozen `Default`, so a partial
-// `[system.sharding]` table resolves each key independently instead of
+// `[sharding]` table resolves each key independently instead of
 // failing on the first missing one (parity with the legacy type).
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(default)]
 pub struct ShardingConfig {
     #[serde(default)]
@@ -139,29 +139,25 @@ impl Default for ShardingConfig {
     fn default() -> Self {
         Self {
             cpu_allocation: CpuAllocation::default(),
-            pin_cores: SERVER_CONFIG.system.sharding.pin_cores,
-            inbox_capacity: SERVER_CONFIG.system.sharding.inbox_capacity as usize,
-            reply_inbox_capacity: SERVER_CONFIG.system.sharding.reply_inbox_capacity as usize,
+            pin_cores: SERVER_CONFIG.sharding.pin_cores,
+            inbox_capacity: SERVER_CONFIG.sharding.inbox_capacity as usize,
+            reply_inbox_capacity: SERVER_CONFIG.sharding.reply_inbox_capacity as usize,
             shutdown_drain_timeout: SERVER_CONFIG
-                .system
                 .sharding
                 .shutdown_drain_timeout
                 .parse()
                 .unwrap(),
             shutdown_poll_interval: SERVER_CONFIG
-                .system
                 .sharding
                 .shutdown_poll_interval
                 .parse()
                 .unwrap(),
             shutdown_join_timeout: SERVER_CONFIG
-                .system
                 .sharding
                 .shutdown_join_timeout
                 .parse()
                 .unwrap(),
             reconcile_periodic_interval: SERVER_CONFIG
-                .system
                 .sharding
                 .reconcile_periodic_interval
                 .parse()
@@ -395,7 +391,7 @@ mod tests {
             .expect("embedded TOML deserializes");
         config.validate().expect("embedded config validates");
 
-        let sharding = &config.system.sharding;
+        let sharding = &config.sharding;
         assert!(sharding.pin_cores);
         assert_eq!(sharding.inbox_capacity, 1024);
         assert_eq!(sharding.reply_inbox_capacity, 1024);

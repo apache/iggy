@@ -59,9 +59,8 @@ export type SendMessagesConfirmation = {
    *
    * Delivery is at-least-once, so an earlier retry of the same batch may
    * already have committed at a lower offset: this never identifies a batch
-   * uniquely. A batch is confirmed once it is committed in memory, not once it
-   * is fsynced, so a crash-restart can stamp a later batch with an offset a
-   * client has already recorded.
+   * uniquely. Confirmation follows VSR quorum commit. Persisted message
+   * durability also requires recoverable stable-storage copies on the quorum.
    */
   baseOffset: bigint,
 };

@@ -31,24 +31,22 @@ namespace Apache.Iggy.Tests.MapperTests;
 ///     about interoperability; these bytes are the contract, and a change to the TLV layout has to
 ///     break every copy of them together.
 ///
-///     enforce_fsync (a one-byte Bool) and segment_size (an eight-byte Uint64) cover both value
-///     widths. What the vector pins is the per-entry byte layout, not a key order: these two land
-///     sorted only because the Rust core holds options in a BTreeMap, and the server accepts the
-///     insertion order this SDK emits.
+///     The vector covers Bool, Uint64 and String values in insertion order. It deliberately
+///     differs from Rust's sorted map order. Decoders accept either order.
 /// </summary>
 public sealed class OptionsBlockGoldenVectorTests
 {
     private static readonly byte[] GoldenOptionsBlock =
     [
-        2, 13, 0, 0, 0,
-        (byte)'e', (byte)'n', (byte)'f', (byte)'o', (byte)'r', (byte)'c', (byte)'e', (byte)'_', (byte)'f', (byte)'s',
-        (byte)'y', (byte)'n', (byte)'c',
+        2, 20, 0, 0, 0,
+        (byte)'p', (byte)'r', (byte)'e', (byte)'a', (byte)'l', (byte)'l', (byte)'o', (byte)'c', (byte)'a', (byte)'t', (byte)'e', (byte)'_', (byte)'s', (byte)'e', (byte)'g', (byte)'m', (byte)'e', (byte)'n', (byte)'t', (byte)'s',
         3, 1, 0, 0, 0, 1,
         2, 12, 0, 0, 0,
         (byte)'s', (byte)'e', (byte)'g', (byte)'m', (byte)'e', (byte)'n', (byte)'t', (byte)'_', (byte)'s', (byte)'i',
         (byte)'z', (byte)'e',
         12, 8, 0, 0, 0,
-        0, 0, 0, 64, 0, 0, 0, 0
+        0, 0, 0, 64, 0, 0, 0, 0,
+        2, 10, 0, 0, 0, 100, 117, 114, 97, 98, 105, 108, 105, 116, 121, 2, 9, 0, 0, 0, 112, 101, 114, 115, 105, 115, 116, 101, 100
     ];
 
     [Fact]
@@ -56,8 +54,9 @@ public sealed class OptionsBlockGoldenVectorTests
     {
         var options = new Dictionary<HeaderKey, HeaderValue>
         {
-            [HeaderKey.FromString("enforce_fsync")] = HeaderValue.FromBool(true),
-            [HeaderKey.FromString("segment_size")] = HeaderValue.FromUInt64(1_073_741_824)
+            [HeaderKey.FromString("preallocate_segments")] = HeaderValue.FromBool(true),
+            [HeaderKey.FromString("segment_size")] = HeaderValue.FromUInt64(1_073_741_824),
+            [HeaderKey.FromString("durability")] = HeaderValue.FromString("persisted")
         };
 
         var encoded = new byte[TcpContracts.HeadersByteLength(options)];
@@ -72,10 +71,11 @@ public sealed class OptionsBlockGoldenVectorTests
         var topic = Mappers.BinaryMapper.MapTopic(TopicPayloadWithOptions(GoldenOptionsBlock));
 
         Assert.NotNull(topic.Options);
-        Assert.Equal(2, topic.Options.Count);
-        Assert.True(topic.Options[HeaderKey.FromString("enforce_fsync")].ToBool());
+        Assert.Equal(3, topic.Options.Count);
+        Assert.Equal("persisted", topic.Options[HeaderKey.FromString("durability")].ToString());
+        Assert.True(topic.Options[HeaderKey.FromString("preallocate_segments")].ToBool());
         Assert.Equal(1_073_741_824UL, topic.Options[HeaderKey.FromString("segment_size")].ToUInt64());
-        Assert.Equal(HeaderKind.Bool, topic.Options[HeaderKey.FromString("enforce_fsync")].Kind);
+        Assert.Equal(HeaderKind.Bool, topic.Options[HeaderKey.FromString("preallocate_segments")].Kind);
         Assert.Equal(HeaderKind.Uint64, topic.Options[HeaderKey.FromString("segment_size")].Kind);
         Assert.Empty(topic.DerivedOptions!);
     }

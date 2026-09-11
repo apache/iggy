@@ -40,7 +40,7 @@
 //! Three things are asserted, and they fail separately:
 //!
 //! - The path was entered on a backup. `redispatch_parked_frames` logs at
-//!   `debug`, hence the `system.logging.level` override; the marker on a node
+//!   `debug`, hence the `logging.level` override; the marker on a node
 //!   that is not the leader is proof, because a fresh partition group seeds its
 //!   view from the metadata plane, so every partition primary here is the
 //!   metadata leader and no client request lands anywhere else.
@@ -113,7 +113,7 @@ fn topic_name(index: u32) -> String {
     format!("parked-redispatch-topic-{index}")
 }
 
-#[iggy_harness(cluster_nodes = 3, server(system.logging.level = "info,shard=debug"))]
+#[iggy_harness(cluster_nodes = 3, server(logging.level = "info,shard=debug"))]
 async fn given_a_produce_burst_right_after_create_topic_when_backups_park_the_prepares_should_re_dispatch_them_in_order(
     harness: &mut TestHarness,
 ) {
@@ -176,7 +176,7 @@ async fn given_a_produce_burst_right_after_create_topic_when_backups_park_the_pr
     disk::assert_replica_data_identical(&data_paths, false);
 }
 
-/// `messages_required_to_save` + `enforce_fsync` persist every committed batch
+/// `messages_required_to_save` + `durability=persisted` persist every committed batch
 /// on every replica, which is what makes the on-disk assertions mean anything
 /// on a run this small; the default thresholds would ack from RAM alone.
 async fn create_topic(client: &IggyClient, stream: &Identifier, name: &str) {
@@ -188,7 +188,7 @@ async fn create_topic(client: &IggyClient, stream: &Identifier, name: &str) {
                 partitions_count: Some(PARTITIONS),
                 message_expiry: Some(IggyExpiry::NeverExpire),
                 messages_required_to_save: Some(1),
-                enforce_fsync: Some(true),
+                durability: iggy_common::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

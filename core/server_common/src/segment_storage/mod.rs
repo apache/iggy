@@ -21,7 +21,10 @@ mod messages_reader;
 mod messages_writer;
 
 use iggy_common::IggyError;
+use std::path::Path;
 use std::rc::Rc;
+
+use crate::fs_utils::preallocate_file;
 
 pub use index_reader::IndexReader;
 pub use index_writer::IndexWriter;
@@ -39,6 +42,58 @@ pub struct SegmentStorage {
 }
 
 impl SegmentStorage {
+    /// The WAL owns message writes; this storage exposes only their committed prefix.
+    pub async fn with_read_only_messages(
+        messages_path: &str,
+        index_path: &str,
+        indexes_size: u64,
+        file_exists: bool,
+        preallocate_size: Option<u64>,
+    ) -> Result<Self, IggyError> {
+        let messages_reader = if file_exists && preallocate_size.is_none() {
+            MessagesReader::new(messages_path).await?
+        } else {
+            let messages_file = compio::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(!file_exists)
+                .truncate(false)
+                .open(messages_path)
+                .await
+                .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.to_owned()))?;
+            let mut changed = !file_exists;
+            if let Some(size) = preallocate_size
+                && messages_file
+                    .metadata()
+                    .await
+                    .map_err(|_| IggyError::CannotReadFileMetadata)?
+                    .len()
+                    == 0
+            {
+                preallocate_file(&messages_file, Path::new(messages_path), size);
+                changed = true;
+            }
+            if changed {
+                messages_file
+                    .sync_all()
+                    .await
+                    .map_err(|_| IggyError::CannotSyncFile)?;
+            }
+            MessagesReader::from_validated_path(messages_path)
+        };
+        let indexes_size = Rc::new(std::sync::atomic::AtomicU64::new(indexes_size));
+        let index_writer = Rc::new(IndexWriter::new(index_path, indexes_size, file_exists).await?);
+        if file_exists {
+            index_writer.fsync().await?;
+        }
+        Ok(Self {
+            messages_writer: None,
+            messages_reader: Some(Rc::new(messages_reader)),
+            index_writer: Some(index_writer),
+            index_reader: Some(Rc::new(IndexReader::new(index_path).await?)),
+        })
+    }
+
     pub async fn new(
         messages_path: &str,
         index_path: &str,

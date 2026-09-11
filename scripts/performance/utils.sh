@@ -148,12 +148,11 @@ function construct_bench_command() {
         ;;
     esac
 
-    # fsync is a per-topic option now, not server config, so the fsync variants
-    # have to ask for it on the bench command line rather than via server env.
-    local fsync_arg=""
+    # The persisted variants select the topic policy at creation.
+    local durability_arg=""
     case "$remark" in
     *"no_cache_fsync"*)
-        fsync_arg="--enforce-fsync"
+        durability_arg="--durability persisted"
         ;;
     esac
 
@@ -168,7 +167,7 @@ function construct_bench_command() {
         exit 1
     }
 
-    echo "$bench_command ${rate_limit:+ --rate-limit ${rate_limit}} ${fsync_arg} \
+    echo "$bench_command ${rate_limit:+ --rate-limit ${rate_limit}} ${durability_arg} \
 --message-size ${message_size} \
 --messages-per-batch ${messages_per_batch} \
 --message-batches ${message_batches} \
