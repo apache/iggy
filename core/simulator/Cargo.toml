@@ -56,6 +56,7 @@ tracing-subscriber = { workspace = true }
 # ships. See `partitions/Cargo.toml`.
 partitions = { workspace = true, features = ["fault-injection"] }
 tempfile = { workspace = true }
+twox-hash = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"

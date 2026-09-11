@@ -41,8 +41,7 @@ const WS_DEFAULT_WRITE_BUFFER_SIZE: u64 = 128 * 1024;
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        self.system
-            .memory_pool
+        self.memory_pool
             .validate()
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate memory pool config")
@@ -59,21 +58,12 @@ impl Validatable<ConfigurationError> for ServerConfig {
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
-        self.system
-            .segment
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate segment config")
-            })?;
         self.telemetry.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate telemetry config")
         })?;
-        self.system
-            .sharding
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate sharding config")
-            })?;
+        self.sharding.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate sharding config")
+        })?;
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
         })?;
@@ -88,12 +78,9 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.partition.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate partition config")
         })?;
-        self.system
-            .logging
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate logging config")
-            })?;
+        self.logging.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate logging config")
+        })?;
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
@@ -376,8 +363,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        reject_unsupported(self)?;
-
         Ok(())
     }
 }
@@ -412,22 +397,6 @@ fn served_transfer_slots(config: &ServerConfig) -> (u64, u64) {
         / resident_len)
         .max(1);
     (resident_len, slots)
-}
-
-/// The server parses the whole config surface but does not yet honor every
-/// knob. Make the still-inert ones loud at boot rather than silently ignored.
-/// All are off by default, so only a deliberate opt-in trips this.
-fn reject_unsupported(config: &ServerConfig) -> Result<(), ConfigurationError> {
-    if config.system.segment.archive_expired {
-        eprintln!("system.segment.archive_expired is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
-    }
-    if config.system.recovery.recreate_missing_state {
-        eprintln!("system.recovery.recreate_missing_state is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
-    }
-
-    Ok(())
 }
 
 impl ServerConfig {
@@ -618,18 +587,6 @@ mod tests {
         config
             .validate()
             .expect("web_ui is served by the server and must validate");
-    }
-
-    #[test]
-    fn given_archive_expired_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.segment]\narchive_expired = true\n");
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn given_recreate_missing_state_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.recovery]\nrecreate_missing_state = true\n");
-        assert!(config.validate().is_err());
     }
 
     #[test]

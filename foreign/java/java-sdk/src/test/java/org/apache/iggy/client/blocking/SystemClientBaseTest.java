@@ -49,7 +49,7 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
 
         // then
         var byKey = specs.stream().collect(Collectors.toMap(OptionSpec::key, spec -> spec));
-        assertThat(byKey).containsKeys("segment_size", "enforce_fsync");
+        assertThat(byKey).containsKeys("segment_size", "durability");
         var segmentSize = byKey.get("segment_size");
         assertThat(segmentSize.defaultValue().kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(segmentSize.defaultValue().value()).isNotEmpty();

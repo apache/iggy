@@ -26,7 +26,7 @@ use server_common::log::{TelemetryEndpointSettings, TelemetrySettings};
 pub use server_common::log::TelemetryTransport;
 
 /// Configuration for the memory pool.
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct MemoryPoolConfig {
     pub enabled: bool,
     #[config_env(leaf)]

@@ -278,7 +278,7 @@ public sealed class BinaryMapper
         var options = new List<byte>();
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "segment_size", stringKind, "1GB"u8.ToArray()));
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "future_option", unknownKind, [0xAA, 0xBB]));
-        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "enforce_fsync", 3, [1]));
+        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "preallocate_segments", 3, [1]));
         var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
             sizeBytes, messagesCount, createdAt, maxTopicSize, 1, options.ToArray());
 
@@ -290,7 +290,7 @@ public sealed class BinaryMapper
         Assert.NotNull(response.Options);
         Assert.Equal(2, response.Options.Count);
         Assert.Equal("1GB", response.Options[HeaderKey.FromString("segment_size")].ToString());
-        Assert.Equal(HeaderKind.Bool, response.Options[HeaderKey.FromString("enforce_fsync")].Kind);
+        Assert.Equal(HeaderKind.Bool, response.Options[HeaderKey.FromString("preallocate_segments")].Kind);
         Assert.False(response.Options.ContainsKey(HeaderKey.FromString("future_option")));
         Assert.NotNull(response.DerivedOptions);
         Assert.Empty(response.DerivedOptions);

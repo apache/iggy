@@ -322,7 +322,7 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	for _, spec := range specs {
 		byKey[spec.Key] = spec
 	}
-	require.Contains(t, byKey, "enforce_fsync", "the catalog lists the keys create accepts")
+	require.Contains(t, byKey, "durability", "the catalog lists the keys create accepts")
 	require.Contains(t, byKey, "segment_size")
 	assert.NotEmpty(t, byKey["segment_size"].Description)
 	assert.Equal(t, iggcon.Uint64, byKey["segment_size"].DefaultValue.Kind)
@@ -343,8 +343,8 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	created, err := connected.CreateTopic(ctx, streamId, name, 1,
 		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
 		iggcon.HeaderEntry{
-			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("enforce_fsync")},
-			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("true")},
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("durability")},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("persisted")},
 		})
 	require.NoError(t, err)
 
@@ -353,16 +353,16 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	topic, err := connected.GetTopic(ctx, streamId, topicId)
 	require.NoError(t, err)
 
-	fsync, ok := topic.Options["enforce_fsync"]
+	durability, ok := topic.Options["durability"]
 	require.True(t, ok, "an explicitly set key is reported as explicit, got %v", topic.Options)
 	// Create admission re-encodes the block from its own parse, so the stored
 	// value carries the key's canonical kind whatever kind the client sent it
-	// as: this string "true" comes back as a Bool.
-	assert.Equal(t, iggcon.Bool, fsync.Kind)
-	assert.Equal(t, []byte{1}, fsync.Value)
+	// as: durability is a canonical String token.
+	assert.Equal(t, iggcon.String, durability.Kind)
+	assert.Equal(t, []byte("persisted"), durability.Value)
 	// Keys the client left alone are resolved by admission and reported apart.
 	require.Contains(t, topic.DerivedOptions, "max_topic_size")
-	assert.NotContains(t, topic.DerivedOptions, "enforce_fsync")
+	assert.NotContains(t, topic.DerivedOptions, "durability")
 
 	// A key outside the catalog is refused by name.
 	_, err = connected.CreateTopic(ctx, streamId, name+"-bad", 1,
@@ -383,7 +383,7 @@ func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
 	// nothing is reserved on disk.
 	typed := []iggcon.HeaderEntry{
 		iggcon.SegmentSizeOption(1024 * 1024),
-		iggcon.EnforceFsyncOption(true),
+		iggcon.DurabilityOption(iggcon.DurabilityPersisted),
 		iggcon.MessagesRequiredToSaveOption(7),
 		iggcon.SizeOfMessagesRequiredToSaveOption(4096),
 		iggcon.PreallocateSegmentsOption(false),

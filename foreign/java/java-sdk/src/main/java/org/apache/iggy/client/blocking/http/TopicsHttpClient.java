@@ -77,7 +77,7 @@ class TopicsHttpClient implements TopicsClient {
                         messageExpiry,
                         maxTopicSize,
                         name,
-                        toStringOptions(options)));
+                        toStringOptions(org.apache.iggy.topic.TopicOptions.withDurabilityDefaults(options))));
         return httpClient.execute(request, HttpTopicDetails.class).toTopicDetails();
     }
 
