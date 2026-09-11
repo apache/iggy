@@ -204,3 +204,58 @@ impl TestFixture for PostgresSourceCdcFixture {
         envs
     }
 }
+
+/// The longer poll interval leaves time to restart Iggy before the SDK's
+/// consecutive-NACK limit stops the source.
+pub struct PostgresSourceCdcSlowPollFixture {
+    inner: PostgresSourceCdcFixture,
+}
+
+impl PostgresOps for PostgresSourceCdcSlowPollFixture {
+    fn container(&self) -> &PostgresContainer {
+        self.inner.container()
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceCdcSlowPollFixture {
+    fn table_name(&self) -> &str {
+        self.inner.table_name()
+    }
+}
+
+impl PostgresSourceCdcSlowPollFixture {
+    pub async fn create_table(&self, pool: &Pool<Postgres>) {
+        self.inner.create_table(pool).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_row(
+        &self,
+        pool: &Pool<Postgres>,
+        id: i32,
+        name: &str,
+        count: i32,
+        amount: f64,
+        active: bool,
+        timestamp: i64,
+    ) {
+        self.inner
+            .insert_row(pool, id, name, count, amount, active, timestamp)
+            .await;
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceCdcSlowPollFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: PostgresSourceCdcFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "5s".to_string());
+        envs
+    }
+}

@@ -51,10 +51,12 @@ pub type SendCallback = extern "C" fn(
 
 pub type BatchResultCallback = extern "C" fn(plugin_id: u32, batch_id: u64, result: u8) -> i32;
 
-const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time a source batch may remain pending before it is rejected.
+pub const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const NACK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_NACK_RETRY_DELAY: Duration = Duration::from_secs(5);
-const MAX_CONSECUTIVE_NACKS: u32 = 5;
+/// Number of consecutive rejected batches after which a source is stopped.
+pub const MAX_CONSECUTIVE_NACKS: u32 = 5;
 
 /// Delivery result for the single batch currently in flight from a source plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

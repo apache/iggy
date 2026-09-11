@@ -79,8 +79,9 @@ pub use mongodb::{
 };
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceDeleteFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
+    PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture,
+    PostgresSourceDeleteFixture, PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture,
+    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceNumericTrackingFixture,
     PostgresSourceOps,
 };
 pub use quickwit::{

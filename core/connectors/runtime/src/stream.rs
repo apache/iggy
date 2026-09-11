@@ -24,6 +24,11 @@ use crate::error::RuntimeError;
 
 const TOKEN_FILE_PREFIX: &str = "file:";
 
+fn append_query_parameters(connection_string: &str, address: &str, parameters: &str) -> String {
+    let separator = if address.contains('?') { '&' } else { '?' };
+    format!("{connection_string}{separator}{parameters}")
+}
+
 fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -133,8 +138,10 @@ fn connection_string_with_token(
             .filter(|domain| !domain.is_empty())
             .map(|domain| format!("&tls_domain={domain}"))
             .unwrap_or_default();
-        Ok(format!(
-            "{connection_string}?tls=true&tls_ca_file={ca_file}{domain}"
+        Ok(append_query_parameters(
+            &connection_string,
+            &config.address,
+            &format!("tls=true&tls_ca_file={ca_file}{domain}"),
         ))
     } else {
         Ok(connection_string)
@@ -190,6 +197,39 @@ mod tests {
         let path = "relative/path";
         let result = expand_home(path);
         assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn given_existing_query_when_appending_parameters_should_use_ampersand() {
+        let connection_string = "iggy://user:password@127.0.0.1:8090?reconnection_retries=0";
+        let address = "127.0.0.1:8090?reconnection_retries=0";
+
+        let result = append_query_parameters(connection_string, address, "tls=true");
+
+        assert_eq!(
+            result,
+            "iggy://user:password@127.0.0.1:8090?reconnection_retries=0&tls=true"
+        );
+    }
+
+    #[test]
+    fn given_no_query_when_appending_parameters_should_use_question_mark() {
+        let connection_string = "iggy://user:password@127.0.0.1:8090";
+        let address = "127.0.0.1:8090";
+
+        let result = append_query_parameters(connection_string, address, "tls=true");
+
+        assert_eq!(result, "iggy://user:password@127.0.0.1:8090?tls=true");
+    }
+
+    #[test]
+    fn given_question_mark_in_credentials_should_use_address_separator() {
+        let connection_string = "iggy://user:pass?word@127.0.0.1:8090";
+        let address = "127.0.0.1:8090";
+
+        let result = append_query_parameters(connection_string, address, "tls=true");
+
+        assert_eq!(result, "iggy://user:pass?word@127.0.0.1:8090?tls=true");
     }
 
     #[test]

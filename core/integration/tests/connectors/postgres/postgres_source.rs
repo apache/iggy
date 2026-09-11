@@ -15,19 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
+use std::time::Duration;
+
+use iggy_common::MessageClient;
+use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_connector_sdk::api::ConnectorStatus;
+use integration::harness::seeds;
+use integration::iggy_harness;
+use reqwest::Client;
+use tokio::time::sleep;
+
+use super::{
+    DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT, source_stats,
+    wait_for_source_errors,
+};
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     PostgresOps, PostgresSourceByteaFixture, PostgresSourceDeleteFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceOps,
+    PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture, PostgresSourceJsonbFixture,
+    PostgresSourceMarkFixture, PostgresSourceNumericTrackingFixture, PostgresSourceOps,
 };
-use iggy_common::MessageClient;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
-use integration::harness::seeds;
-use integration::iggy_harness;
-use std::time::Duration;
-use tokio::time::sleep;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
@@ -125,6 +132,232 @@ async fn json_rows_source_produces_messages_to_iggy(
             "BPCHAR tag mismatch at record {i}"
         );
     }
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_delete_after_read_when_iggy_crashes_should_delete_only_after_redelivery(
+    harness: &mut TestHarness,
+    fixture: PostgresSourceDeleteFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        // Keep a failed send bounded instead of waiting indefinitely for Iggy to return.
+        .set_iggy_connection_options("reconnection_retries=0");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+    let errors_before_failure = source_stats(&http, &api_url)
+        .await
+        .expect("PostgreSQL source stats should be present")
+        .errors;
+
+    harness.kill_node(0).expect("Failed to kill Iggy server");
+
+    for index in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_row(&pool, &format!("row_{index}"), index as i32)
+            .await;
+    }
+
+    let failed_source = wait_for_source_errors(&http, &api_url, errors_before_failure + 2).await;
+    assert_eq!(failed_source.status, ConnectorStatus::Error);
+    assert_eq!(
+        fixture.count_rows(&pool).await,
+        TEST_MESSAGE_COUNT as i64,
+        "NACKed rows must not be deleted"
+    );
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .restart_node(0)
+        .expect("Failed to restart Iggy server");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .clear_iggy_connection_options();
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "send_failure_consumer".try_into().unwrap();
+    let mut received = 0;
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+            if received >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert_eq!(
+        received, TEST_MESSAGE_COUNT,
+        "Rows polled during the failed send should be delivered after restart"
+    );
+
+    let mut remaining_rows = fixture.count_rows(&pool).await;
+    for _ in 0..POLL_ATTEMPTS {
+        if remaining_rows == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        remaining_rows = fixture.count_rows(&pool).await;
+    }
+    assert_eq!(remaining_rows, 0, "ACKed rows should be deleted");
+
+    pool.close().await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_delivery_failure_when_iggy_restarts_should_redeliver_without_runtime_restart(
+    harness: &mut TestHarness,
+    fixture: PostgresSourceDeleteSlowPollFixture,
+) {
+    const REDELIVERY_ATTEMPTS: usize = POLL_ATTEMPTS * 3;
+
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .set_iggy_connection_options("reconnection_retries=0");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+    let errors_before_failure = source_stats(&http, &api_url)
+        .await
+        .expect("PostgreSQL source stats should be present")
+        .errors;
+
+    harness.kill_node(0).expect("Failed to kill Iggy server");
+    fixture.insert_row(&pool, "single_nack", 1).await;
+
+    let failed_source = wait_for_source_errors(&http, &api_url, errors_before_failure + 1).await;
+    assert_eq!(failed_source.status, ConnectorStatus::Error);
+    assert_eq!(
+        fixture.count_rows(&pool).await,
+        1,
+        "NACKed row must not be deleted"
+    );
+
+    harness
+        .restart_node(0)
+        .expect("Failed to restart only the Iggy server");
+
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "nack_survival_consumer".try_into().unwrap();
+    let mut received = 0;
+
+    for _ in 0..REDELIVERY_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+            if received == 1 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert_eq!(received, 1, "NACKed row should be redelivered");
+
+    let mut remaining_rows = fixture.count_rows(&pool).await;
+    for _ in 0..REDELIVERY_ATTEMPTS {
+        if remaining_rows == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        remaining_rows = fixture.count_rows(&pool).await;
+    }
+    assert_eq!(remaining_rows, 0, "ACKed row should be deleted");
+    wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
+
+    pool.close().await;
+}
+
+async fn wait_for_source_status(http: &Client, api_url: &str, expected: ConnectorStatus) {
+    for _ in 0..POLL_ATTEMPTS {
+        if let Some(source) = source_stats(http, api_url).await
+            && source.status == expected
+        {
+            return;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    panic!("Source connector did not reach {expected:?} status in time");
 }
 
 #[iggy_harness(
@@ -322,6 +555,75 @@ async fn delete_after_read_source_removes_rows_after_producing(
     assert_eq!(
         final_count, 0,
         "Expected 0 rows after delete_after_read, got {final_count}"
+    );
+
+    pool.close().await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn numeric_tracking_source_preserves_exact_ack_boundary(
+    harness: &TestHarness,
+    fixture: PostgresSourceNumericTrackingFixture,
+) {
+    const TRACKING_VALUE: &str = "9007199254740993.25";
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+    fixture.insert_row(&pool, TRACKING_VALUE).await;
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "numeric_tracking_consumer".try_into().unwrap();
+    let mut received = None;
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                1,
+                true,
+            )
+            .await
+        {
+            for message in polled.messages {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&message.payload) {
+                    received = Some(record);
+                    break;
+                }
+            }
+            if received.is_some() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    let received = received.expect("NUMERIC tracking row should be delivered");
+    assert_eq!(
+        received["data"]["tracking_value"],
+        serde_json::json!(TRACKING_VALUE),
+        "NUMERIC payload should preserve its exact decimal representation"
+    );
+
+    let mut remaining_rows = fixture.count_rows(&pool).await;
+    for _ in 0..POLL_ATTEMPTS {
+        if remaining_rows == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        remaining_rows = fixture.count_rows(&pool).await;
+    }
+    assert_eq!(
+        remaining_rows, 0,
+        "Exact NUMERIC tracking boundary should allow ACK cleanup"
     );
 
     pool.close().await;
