@@ -2718,6 +2718,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_first_poll_cancelled_on_the_lock_should_not_claim_the_instance() {
+        // What moving the claim out of `poll()` and into `serve_routes` buys,
+        // and it was invisible to this suite until now: with the caller
+        // claiming, a poll dropped while parked on the registry lock left the
+        // flag set with nothing published. `PollGuard::drop` then stamped
+        // `last_poll_at` on the way out, so the instance read as one whose
+        // poll task had stopped rather than one that never started, and the
+        // readiness gate took its healthy siblings to 503 for it.
+        //
+        // `timeout` dropping the future is the cancellation; the SDK drops it
+        // the same way on shutdown.
+        let mut source = HttpSource::new(1, config(free_port(), free_port(), &[]), None);
+        source.open().await.expect("open must succeed");
+
+        let held = SERVERS.lock().await;
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), source.poll()).await;
+        drop(held);
+
+        assert!(
+            cancelled.is_err(),
+            "the poll must still have been parked on the registry lock"
+        );
+        assert!(
+            !source.shared.has_polled(),
+            "a poll dropped before it could publish must not leave the instance claimed"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
     async fn given_an_opened_instance_when_it_polls_should_publish_its_own_routes() {
         // The production line, driven by `poll()` rather than by a test calling
         // `serve_routes` itself. Every other request test in this crate reaches

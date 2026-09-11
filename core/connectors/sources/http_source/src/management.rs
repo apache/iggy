@@ -458,22 +458,31 @@ fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> 
 /// the poll task after five consecutive NACKs without calling `close()`, so an
 /// instance can stay registered and keep answering 201 and 202 for changes
 /// nothing will ever carry to the runtime. `/admin/health` reports the same
-/// signal as `poll_is_live`. See #3941.
+/// pair, as `poll_is_live` and `has_polled`. See #3941.
 fn warn_if_poll_stopped(instance: &Arc<SharedState>, action: &str, endpoint_id: &str) {
-    // An instance that has not polled yet is not one whose poll task stopped,
-    // and saying so would be a false alarm on ordinary startup timing:
-    // `poll_is_live` is false for the whole window between `open` and the
-    // first `poll`, which is when a management call is most likely to arrive
-    // as an operator brings a new instance up. The mutation is carried by that
-    // first poll like any other.
-    if !instance.has_polled() || instance.poll_is_live(unix_now_seconds()) {
+    if instance.poll_is_live(unix_now_seconds()) {
         return;
     }
-    warn!(
-        "{action} endpoint {} on {CONNECTOR_NAME} connector ID: {} while its poll task looks stopped; the change is in memory but nothing is carrying it to the runtime",
-        EndpointId::log_prefix_of(endpoint_id),
-        instance.id
-    );
+    let endpoint = EndpointId::log_prefix_of(endpoint_id);
+    // Two ways to be not live, and they want different words rather than one
+    // message or none. Saying "stopped" for an instance that has not started
+    // was a false alarm on ordinary startup timing, but staying silent about
+    // it was worse: the runtime brings every source up, then every sink, then
+    // the poll tasks, all in series, so one slow sink holds every instance
+    // here for an unbounded time, and on a listener with a polled sibling the
+    // readiness gate filters the waiting instance out and answers green.
+    // Without this line nothing at all reports that.
+    if instance.has_polled() {
+        warn!(
+            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while its poll task looks stopped; the change is in memory but nothing is carrying it to the runtime",
+            instance.id
+        );
+    } else {
+        warn!(
+            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} before its poll task has started; its first poll will carry the change, but an instance that stays here is one whose producer setup has not finished",
+            instance.id
+        );
+    }
 }
 
 /// Whether the instance a handler resolved earlier is still the one joined
