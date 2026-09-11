@@ -1279,6 +1279,21 @@ fn parse_compression(
 mod tests {
     use super::*;
 
+    /// `boot/recovery.rs` refuses to start when any stored topic carries
+    /// `enforce_fsync = true`, and the fence clears only when that value stops
+    /// being `true`. An update patches the option map (`stream.rs` applies a
+    /// `BTreeMap::extend`, with no removal arm), so the only way out is a key the
+    /// update path accepts. It accepts none of them, and the server will not boot
+    /// to take the request anyway.
+    #[test]
+    #[ignore = "PR #4092 review: no update can clear a stored `enforce_fsync=true`, making it a one-way upgrade gate with no online escape"]
+    fn given_a_topic_stored_with_enforce_fsync_when_upgrading_then_an_update_should_retire_it() {
+        assert!(
+            UPDATABLE_TOPIC_OPTION_KEYS.contains(&"enforce_fsync"),
+            "no update can clear a stored enforce_fsync, so a data directory written by an older build is a one-way upgrade gate with no online escape: {UPDATABLE_TOPIC_OPTION_KEYS:?}"
+        );
+    }
+
     #[test]
     fn to_wire_parse_roundtrip_preserves_typed_fields() {
         let options = TopicCreateOptions {
