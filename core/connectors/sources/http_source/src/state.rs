@@ -451,7 +451,7 @@ impl EndpointRegistry {
 /// agree on a three element shape without the field names reaching the wire.
 ///
 /// `endpoint_count` is redundant with `endpoints.len()` on purpose. It is the
-/// only one of the three checks that rejects a blob which is both structurally
+/// only one of the four checks that rejects a blob which is both structurally
 /// valid and fully consumed: the registry used to encode as a one element
 /// array, so an array holding an empty map decoded as a perfectly good empty
 /// registry and no amount of framing arithmetic would have noticed.
@@ -465,11 +465,16 @@ struct StateFrame<E> {
 /// Decodes a state blob, refusing anything that is not exactly one frame.
 ///
 /// `rmp_serde::from_slice` stops at the end of the first value and never
-/// checks that it consumed the input, so a shortened blob decodes `Ok` and
-/// quietly loses whatever the missing bytes carried. Reading through a
-/// `Cursor` is what makes the consumed length observable at all: `position()`
-/// exists only on that flavour of the deserializer, which is why this cannot
-/// be done by patching the call in the SDK helper.
+/// checks that it consumed the input. Truncation was never the problem there:
+/// a cut blob fails on EOF with or without this, which is why a test built on
+/// one proves nothing. The two shapes that did get through were a structurally
+/// valid shortening, where the old single-field registry read an empty array
+/// as a registry with no endpoints, and an edit that rewrites a value into a
+/// smaller one and leaves the rest of the blob unread behind it.
+///
+/// Reading through a `Cursor` is what makes the consumed length observable at
+/// all: `position()` exists only on that flavour of the deserializer, which is
+/// why this cannot be done by patching the call in the SDK helper.
 ///
 /// Fail closed, always. Every revocation tombstone lives in this blob, so a
 /// decode that guesses is one that puts a compromised endpoint back in service
@@ -698,8 +703,8 @@ mod tests {
     /// endpoints must never decode as an empty registry. Every revocation
     /// tombstone lives in that blob, so an empty one puts each revoked
     /// endpoint back on the wire from TOML with its secret. Each test names
-    /// which of the three checks is the one doing the work, because no single
-    /// check covers all four inputs.
+    /// which of the four checks is the one doing the work, because no single
+    /// check covers every input.
     #[test]
     fn given_the_historic_registry_shape_when_decoded_should_refuse() {
         // What the registry encoded as before the frame existed: a one element
@@ -841,10 +846,36 @@ mod tests {
     }
 
     #[test]
-    fn given_a_shortened_state_blob_when_restored_should_refuse_to_serve_static_config() {
-        // The end the refusal exists for. The blob carries the tombstone for an
-        // endpoint the TOML still declares, so decoding it as empty is what
-        // puts that endpoint back in service.
+    fn given_the_old_empty_registry_shape_when_restored_should_refuse_to_serve_static_config() {
+        // The end the refusal exists for, driven by the shape that actually
+        // used to fail open. `[0x90]` is an empty array, which the registry's
+        // old single-field struct read as "no endpoints" through
+        // `#[serde(default)]`: a valid decode carrying zero tombstones. The
+        // TOML below still declares the endpoint the lost tombstone revoked,
+        // so serving it is what puts a compromised endpoint back on the wire.
+        //
+        // Deliberately not a truncated blob. Truncation was always an EOF
+        // error, before this framing as well as after, so a test built on one
+        // passes at the parent commit and proves nothing.
+        let restored = EndpointRegistry::restore(
+            &[static_endpoint(ENDPOINT_ONE)],
+            Some(ConnectorState(vec![0x90])),
+            1,
+        );
+
+        assert!(
+            restored.is_err(),
+            "a registry that cannot be decoded must not be served as its static twin"
+        );
+    }
+
+    #[test]
+    fn given_a_tombstone_flipped_active_when_decoded_should_refuse() {
+        // What the consumed-length check is actually for, and the only one of
+        // the four that catches this. Rewriting the byte that opens the
+        // `state` map turns `Revoked` into `Active`, which is a resurrected
+        // endpoint serving with its secret, and leaves the bytes that used to
+        // describe the revocation unread behind the frame.
         let mut registry = EndpointRegistry::default();
         assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
         assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
@@ -852,15 +883,22 @@ mod tests {
             .to_connector_state(1)
             .expect("registry must serialize");
 
-        let restored = EndpointRegistry::restore(
-            &[static_endpoint(ENDPOINT_ONE)],
-            Some(ConnectorState(bytes[..bytes.len() - 1].to_vec())),
-            1,
-        );
+        let flipped: Vec<Vec<u8>> = (0..bytes.len())
+            .filter_map(|index| {
+                let mut mutated = bytes.clone();
+                mutated[index] = 0x00;
+                let decoded = decode_state_frame(&mutated).ok()?;
+                decoded
+                    .get(ENDPOINT_ONE)
+                    .is_some_and(Endpoint::is_active)
+                    .then_some(mutated)
+            })
+            .collect();
 
         assert!(
-            restored.is_err(),
-            "a registry that cannot be decoded must not be served as its static twin"
+            flipped.is_empty(),
+            "{} mutation(s) decoded with the revoked endpoint active again",
+            flipped.len()
         );
     }
 
