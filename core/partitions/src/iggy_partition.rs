@@ -5128,12 +5128,7 @@ where
                 // batches for segment-commit thresholds, which do not
                 // apply to offset ops.
                 let frozen = message.into_frozen();
-                self.log
-                    .journal()
-                    .inner
-                    .append(frozen.clone())
-                    .await
-                    .map_err(|_| IggyError::CannotAppendMessage)?;
+                self.journal_append(frozen.clone()).await?;
 
                 match header.operation {
                     Operation::StoreConsumerOffset => {
@@ -5178,6 +5173,21 @@ where
                 Err(IggyError::InvalidCommand)
             }
         }
+    }
+
+    /// Journal one prepare and record the mutation.
+    ///
+    /// Every partition-plane append goes through here. The DVC suffix snapshot is
+    /// tagged by the head and the commit point, and a repair filling a body under
+    /// a `StartView` this replica already adopted moves neither: the head is the
+    /// announced one and the op is not committed yet. An append that skipped the
+    /// counter would leave the header-only snapshot reading as current, and the
+    /// merge takes a header no sender can serve as proof that sender never
+    /// journaled the op.
+    async fn journal_append(&self, entry: Frozen<4096>) -> Result<(), IggyError> {
+        let appended = self.log.journal().inner.append(entry).await;
+        self.consensus.note_journal_mutation();
+        appended.map_err(|_| IggyError::CannotAppendMessage)
     }
 
     async fn append_send_messages_to_journal(
@@ -5278,12 +5288,7 @@ where
         journal_info.max_timestamp = journal_info.max_timestamp.max(batch.base_timestamp);
 
         let frozen = message.into_frozen();
-        self.log
-            .journal()
-            .inner
-            .append(frozen.clone())
-            .await
-            .map_err(|_| IggyError::CannotAppendMessage)?;
+        self.journal_append(frozen.clone()).await?;
 
         self.note_append_live();
         self.dirty_offset
@@ -5394,7 +5399,7 @@ where
                 self.offset_space.committed_seeded = false;
             }
         }
-        self.consensus.invalidate_local_dvc_suffix();
+        self.consensus.note_journal_mutation();
         let commit_max = self.consensus.commit_max();
         self.pending_consumer_offset_commits
             .retain(|op, _| *op < from_op || *op <= commit_max);
@@ -5785,6 +5790,10 @@ where
             return;
         }
         let retained = self.log.journal().inner.evict_prefix(count).await;
+        // Eviction drains the ring and re-appends the retained tail, so the slots
+        // a suffix snapshot describes move under it without the head or the
+        // commit point changing.
+        self.consensus.note_journal_mutation();
         let mut retained_info = JournalInfo::default();
         for (entry, meta) in &retained {
             // Purge floor: a retained pre-purge batch must not fold its
@@ -7984,12 +7993,7 @@ where
         // `first_batch_offset`: that anchors the floor-connect check, and
         // purged bytes cannot stand in for durable state.
         if op <= self.purge_floor_op {
-            self.log
-                .journal()
-                .inner
-                .append(message.into_frozen())
-                .await
-                .map_err(|_| IggyError::CannotAppendMessage)?;
+            self.journal_append(message.into_frozen()).await?;
             return Ok(None);
         }
 
@@ -8024,12 +8028,7 @@ where
         journal_info.max_timestamp = journal_info.max_timestamp.max(base_timestamp);
 
         let frozen = message.into_frozen();
-        self.log
-            .journal()
-            .inner
-            .append(frozen)
-            .await
-            .map_err(|_| IggyError::CannotAppendMessage)?;
+        self.journal_append(frozen).await?;
 
         self.note_append_live();
         self.dirty_offset
@@ -8450,7 +8449,7 @@ mod tests {
 
     const TEST_CLUSTER: u128 = 1;
 
-    fn checksummed_segment_prepare(
+    pub(super) fn checksummed_segment_prepare(
         op: u64,
         parent: u128,
         offset: u64,
@@ -10660,7 +10659,7 @@ mod tests {
     /// can assert on reply bytes without a connection registry (whose slot
     /// guard would borrow the partition across `on_request(&mut self)`).
     #[derive(Debug, Default)]
-    struct RecordingBus {
+    pub(super) struct RecordingBus {
         sent_to_clients: Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>,
         sent_to_replicas: Rc<RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>>,
     }
@@ -10693,13 +10692,13 @@ mod tests {
         fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
-    type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
+    pub(super) type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
 
     fn recording_partition() -> (IggyPartition<RecordingBus>, SentFrames) {
         recording_partition_at(0, 1)
     }
 
-    fn recording_partition_at(
+    pub(super) fn recording_partition_at(
         replica: u8,
         replica_count: u8,
     ) -> (IggyPartition<RecordingBus>, SentFrames) {
@@ -15146,6 +15145,71 @@ mod retention_tests {
             "a run that ends on the budget has nothing left to re-stage"
         );
         assert_eq!(segments_len(&exact), 1, "only the active segment survives");
+    }
+}
+
+#[cfg(test)]
+mod review_4092_tests {
+    use super::tests::{checksummed_segment_prepare, recording_partition_at};
+    use super::*;
+
+    /// ENOSPC on 28 is the raw errno; `io::ErrorKind::StorageFull` is unstable.
+    const ENOSPC: i32 = 28;
+
+    /// `tick_partitions` turns a partition's `fatal()` into a server shutdown
+    /// (`shard/src/lib.rs:7378-7382`). A refused offset write leaves prior bytes
+    /// intact and nothing undefined, so it should fence the partition at worst,
+    /// the way `mark_materialization_missing` and `partitions.tombstone` already
+    /// do for an unserviceable namespace.
+    #[compio::test]
+    #[ignore = "PR #4092 review: a refused consumer-offset write raises `FatalCommit`, which the shard pump converts into a whole-node shutdown"]
+    async fn given_a_full_disk_when_driving_persistence_then_only_the_partition_should_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies) = recording_partition_at(0, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+
+        persistence.fail_operation(
+            std::io::Error::from_raw_os_error(ENOSPC),
+            Operation::StoreConsumerOffset,
+        );
+        partition.drive_persistence().await;
+
+        assert!(
+            partition.fatal().is_none(),
+            "a refused consumer-offset write raised FatalCommit, which the shard pump converts into a whole-node shutdown; every other partition on the core is taken down with it, including topics with no persisted policy"
+        );
+    }
+
+    /// Contested between reviewers: distsys argued the pre-checks leave only a
+    /// genuinely divergent prepare here, where fail-closed is defensible; storage
+    /// argued the same errno classification fix covers both call sites. Recorded
+    /// so the decision is explicit rather than implied by a missing test.
+    #[compio::test]
+    #[ignore = "PR #4092 review: CONTESTED between reviewers -- whether a divergent prepare at an already-accepted op should latch the whole partition"]
+    async fn given_a_divergent_prepare_when_submitting_then_the_partition_should_not_latch() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies) = recording_partition_at(0, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+
+        let first = checksummed_segment_prepare(1, 0, 0, b"first");
+        assert!(partition.submit_prepare_persistence(first.into_frozen(), Operation::SendMessages));
+
+        // Same op, different bytes: `append` answers InvalidData, which is not
+        // `WouldBlock`, so `:1192-1193` latches the whole partition.
+        let divergent = checksummed_segment_prepare(1, 0, 0, b"divergent");
+        assert!(
+            !partition.submit_prepare_persistence(divergent.into_frozen(), Operation::SendMessages)
+        );
+        assert!(
+            persistence.failure().is_none(),
+            "a single refused prepare latched the partition permanently; `failure` has no clearing path, so every later durability query answers false"
+        );
     }
 }
 

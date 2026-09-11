@@ -23,7 +23,9 @@ use consensus::MetadataHandle;
 use futures::{executor::block_on, poll};
 use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
-use journal::partition_journal::{PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference};
+use journal::partition_journal::{
+    PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference, record_length,
+};
 use journal::{DurableAppend, PartitionPrepareJournal};
 use partitions::{PartitionPersistence, install_backup};
 use server_common::send_messages::{
@@ -848,6 +850,7 @@ fn first_open_recovers_after_each_initialization_fault() {
 }
 
 #[test]
+#[ignore = "PR #4092 review: PRE-EXISTING test. It passed vacuously while `SimStorage::writer_identity` returned `None` and never took a lease; now that the lease is real it is blocked on the compio-bound drain wait"]
 fn deleting_and_recreating_a_partition_fences_an_old_writer_completion() {
     block_on(async {
         let storage = storage_for_partition().await;
@@ -2516,4 +2519,331 @@ fn prepare_with_payload(op: u64, parent: u128, payload: &[u8]) -> Message<Prepar
     header.checksum_body = u128::from(XxHash3_64::oneshot(payload));
     header.checksum = header.identity_checksum();
     Message::try_from(buffer).unwrap()
+}
+
+// Regressions for PR #4092 review findings. Each one fails on the current tree
+// and names the defect it pins.
+
+const LARGE_BATCH_BYTES: usize = 1024 * 1024;
+
+#[test]
+fn given_tail_pages_reached_disk_when_power_loss_then_recovery_should_not_surface_a_holed_record() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let mut journal =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        let second = prepare(2, first.header().checksum);
+        journal
+            .append_buffered(second.clone().into_frozen())
+            .await
+            .unwrap();
+        drop(journal);
+
+        // The durable first record fills the blocks below `header_page`; the
+        // buffered second one starts there and runs to the end of the file.
+        let header_page = record_blocks(&first);
+        let data = Path::new("/partition/wal/prepares-0.wal");
+        let cached = read_all(&storage, data).await;
+        assert_eq!(
+            cached.len(),
+            (header_page + record_blocks(&second)) * PARTITION_WAL_BLOCK_SIZE
+        );
+        let hole =
+            header_page * PARTITION_WAL_BLOCK_SIZE..(header_page + 1) * PARTITION_WAL_BLOCK_SIZE;
+        assert!(cached[hole.clone()].iter().any(|byte| *byte != 0));
+
+        // Background writeback preserved the later pages of the buffered record
+        // and left its first page dirty. `writeback()` cannot express this,
+        // which is why `segment_recovery.rs` documents a byte-zero walk that
+        // nothing exercises.
+        storage.writeback_from_page(PARTITION_WAL_BLOCK_SIZE, header_page + 1);
+        storage.crash(Crash::PowerLoss);
+
+        let survived = read_all(&storage, data).await;
+        assert_eq!(survived.len(), cached.len());
+        assert!(
+            survived[hole.clone()].iter().all(|byte| *byte == 0),
+            "the record's first page reached stable storage, so there is no hole to recover across"
+        );
+        assert_eq!(
+            survived[hole.end..],
+            cached[hole.end..],
+            "the record's later pages were lost too, so this is a short tail rather than a hole"
+        );
+
+        let recovered =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        assert!(
+            !recovered.contains(second.header()),
+            "a record whose first page never reached stable storage was surfaced as recovered"
+        );
+        assert_eq!(
+            recovered.head(),
+            1,
+            "recovery advanced its head over a page-level hole"
+        );
+    });
+}
+
+#[test]
+fn given_a_silent_short_write_when_recovering_then_the_record_should_be_refused() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let mut journal =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+
+        let second = prepare(2, first.header().checksum);
+        storage.clear_trace();
+        // The device completes a half-written record and reports success. Only
+        // the record checksum can refuse it; `TornWrite` always returns an
+        // error, so no existing case reaches this path.
+        storage.fail_at(0, FaultMode::SilentTornWrite);
+        journal
+            .append(second.clone().into_frozen())
+            .await
+            .expect("a silent short write is reported as success");
+        drop(journal);
+        storage.crash(Crash::PowerLoss);
+
+        // The record was acknowledged before its bytes were lost, so refusing to
+        // open is the correct answer. Nothing could assert that before, because
+        // `TornWrite` reports the short write and the append fails instead.
+        let Err(error) =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage).await
+        else {
+            panic!("a WAL missing acknowledged bytes opened successfully");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("lost acknowledged bytes"),
+            "unexpected refusal: {error}"
+        );
+        let _ = first;
+    });
+}
+
+#[test]
+#[ignore = "PR #4092 review: `checkpoint_files` syncs materialized files through a descriptor opened after the writeback failure, which samples errseq too late and reports success over lost bytes; it must sync through the writer that issued them"]
+fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_reclaimed() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(4).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let path = Path::new("/partition/materialized");
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"committed".to_vec()).await.unwrap();
+
+        // The device drops the dirty pages before the checkpoint's barrier. The
+        // writer that issued them is the only handle told; the descriptor
+        // `checkpoint_files` opens afterwards samples errseq past the failure
+        // and reports a successful barrier over bytes that are already gone.
+        storage.fail_writeback(path).unwrap();
+        persistence.checkpoint_files(
+            4,
+            vec![path.to_path_buf()],
+            vec![Path::new(DIRECTORY).to_path_buf()],
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+
+        assert!(
+            persistence.failure().is_some(),
+            "a checkpoint reported success over materialized bytes the device dropped"
+        );
+        assert_eq!(persistence.checkpoint_op(), 0);
+        storage.crash(Crash::PowerLoss);
+        let recovered =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        assert_eq!(
+            recovered.checkpoint_op(),
+            0,
+            "WAL history was reclaimed although its materialization never reached stable storage"
+        );
+        assert_eq!(recovered.head(), 4);
+    });
+}
+
+#[test]
+fn given_sim_storage_when_opening_persistence_then_the_writer_lease_should_be_taken() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        // Without a `writer_identity`, `PartitionPersistence::open_with_capacity`
+        // sets `lease = None`, so WRITERS, the interrupted fence and the drain
+        // timeout have no coverage in any simulator test.
+        assert!(
+            DurableStorage::writer_identity(&storage, Path::new(DIRECTORY))
+                .unwrap()
+                .is_some(),
+            "simulator storage reports no writer identity, so every fault test runs without a lease"
+        );
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        persistence.retire();
+    });
+}
+
+#[test]
+fn given_an_interrupted_writer_when_the_process_restarts_then_the_partition_should_reopen() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(1).await;
+        storage.pause_writes();
+        assert!(persistence.start());
+        let mut writer = Box::pin(Rc::clone(&persistence).run());
+        assert!(poll!(&mut writer).is_pending());
+        // Cancelling the writer mid-mutation leaves its lease interrupted, a
+        // fence only the death of the process holding it may lift.
+        drop(writer);
+        storage.resume();
+        drop(persistence);
+        let fenced =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone()).await;
+        assert!(
+            fenced.is_err_and(|error| error.to_string().contains("requires process restart")),
+            "an interrupted writer did not fence the partition within the same process"
+        );
+
+        storage.crash(Crash::Process);
+        let reopened =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone()).await;
+        assert!(
+            reopened.is_ok(),
+            "the simulated restart kept the interrupted writer's identity, so the partition can never reopen: {:?}",
+            reopened.err()
+        );
+    });
+}
+
+#[test]
+#[ignore = "PR #4092 review: append coalescing is gated on message-body bytes, not the WAL extent, so batching is inert at the benchmarked batch sizes"]
+fn given_large_bodies_when_appending_then_wal_records_should_coalesce_into_one_barrier_group() {
+    block_on(async {
+        const PREPARES: u64 = 8;
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        persistence.enable_segment_storage(
+            SegmentPosition::default(),
+            PREPARES * LARGE_BATCH_BYTES as u64,
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.take_metrics();
+
+        let mut parent = 0;
+        for offset in 0..PREPARES {
+            let prepare = owned_prepare_sized(offset + 1, parent, offset, LARGE_BATCH_BYTES);
+            parent = prepare.header().checksum;
+            persistence.append(prepare.into_frozen(), true).unwrap();
+        }
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+
+        let metrics = persistence.take_metrics();
+        assert_eq!(metrics.batched_prepares, PREPARES);
+        // Under segment references a record occupies one 4 KiB extent, so all
+        // eight fit far inside APPEND_BATCH_BYTES_MAX. The gate measures the
+        // message body instead, so each prepare takes its own barrier group.
+        assert_eq!(
+            metrics.completed_batches,
+            1,
+            "coalescing is gated on body bytes, so {PREPARES} prepares paid {} barrier groups for {} bytes of WAL extent",
+            metrics.completed_batches,
+            PREPARES * PARTITION_WAL_BLOCK_SIZE as u64
+        );
+    });
+}
+
+fn owned_prepare_sized(
+    op: u64,
+    parent: u128,
+    offset: u64,
+    batch_bytes: usize,
+) -> Message<PrepareHeader> {
+    let payload = vec![
+        u8::try_from(op % 251).unwrap();
+        batch_bytes - BATCH_HEADER_SIZE - BATCH_MESSAGE_HEADER_SIZE
+    ];
+    let mut messages = IggyMessages::with_capacity(1);
+    messages.push(IggyMessage {
+        header: IggyMessageHeader {
+            id: u128::from(op),
+            payload_length: u32::try_from(payload.len()).unwrap(),
+            ..Default::default()
+        },
+        payload: payload.into(),
+        user_headers: None,
+    });
+    let mut batch =
+        SendMessagesOwned::from_messages(IggyNamespace::new(0, 0, 42), &messages).unwrap();
+    batch.header.base_offset = offset;
+    batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+    let mut body = vec![0; BATCH_HEADER_SIZE + batch.blob.len()];
+    batch.header.encode_into(&mut body[..BATCH_HEADER_SIZE]);
+    body[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+    assert_eq!(body.len(), batch_bytes);
+    prepare_with_payload(op, parent, &body).transmute_header(
+        |original, header: &mut PrepareHeader| {
+            *header = original;
+            header.checksum_body = 0;
+            header.checksum = header.identity_checksum();
+        },
+    )
+}
+
+fn record_blocks(prepare: &Message<PrepareHeader>) -> usize {
+    record_length(usize::try_from(prepare.header().size).unwrap()).unwrap()
+        / PARTITION_WAL_BLOCK_SIZE
+}
+
+async fn read_all(storage: &SimStorage, path: &Path) -> Vec<u8> {
+    let file = storage.open(path, OpenMode::Read).await.unwrap();
+    let length = usize::try_from(file.length().await.unwrap()).unwrap();
+    file.read(0, length).await.unwrap()
+}
+
+#[test]
+#[ignore = "PR #4092 review: `WriterLease::acquire` drains through `compio::runtime::time::timeout`, so the writer fence cannot be driven by the deterministic executor"]
+fn given_a_retired_writer_when_reacquiring_then_the_drain_wait_should_be_executor_agnostic() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (first, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        first.append(prepare(1, 0).into_frozen(), true).unwrap();
+        storage.pause_writes();
+        assert!(first.start());
+        let mut writer = Box::pin(Rc::clone(&first).run());
+        assert!(poll!(&mut writer).is_pending());
+        first.retire();
+
+        // `WriterLease::acquire` waits for the previous writer to drain through
+        // `compio::runtime::time::timeout` (`persistence.rs:220`), so the fence
+        // cannot be driven by the deterministic executor at all. Every
+        // simulator fault case runs with `lease = None` for this reason.
+        let reacquired =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 8, storage.clone()).await;
+        storage.resume();
+        writer.await;
+        assert!(
+            reacquired.is_ok(),
+            "retired writer could not be replaced under the deterministic executor"
+        );
+    });
 }
