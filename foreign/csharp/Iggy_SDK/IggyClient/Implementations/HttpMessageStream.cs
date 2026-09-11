@@ -161,6 +161,8 @@ public class HttpMessageStream : IIggyClient
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
         IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
     {
+
+        options = TopicOptions.WithDurabilityDefaults(options);
         var json = JsonSerializer.Serialize(new CreateTopicRequest
         {
             Name = name,

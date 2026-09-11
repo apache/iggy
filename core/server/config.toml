@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Root directory for server data. Environment override: IGGY_PATH.
+path = "local_data"
+
 # Configuration for consumer group cooperative partition rebalancing.
 [consumer_group]
 # Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
@@ -27,16 +30,6 @@ cleaner_enabled = true
 
 # Interval for running the message cleaner.
 interval = "1 m"
-
-# This node's own client-facing identity, used when 'cluster.enabled' is false.
-[node]
-# A literal IP or a DNS hostname, without a port. Named to match its roster
-# counterpart 'cluster.nodes.advertised_address', which answers the same
-# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
-# is the bind address's answer to a question clients are not asking. Commented
-# out here because the shipped 'tcp.address' binds a concrete address and needs
-# no declaration.
-#advertised_address = "broker-1.example.com"
 
 # HTTP server configuration
 [http]
@@ -362,18 +355,13 @@ transport = "grpc"
 endpoint = "http://localhost:7281/v1/traces"
 
 # System configuration.
-[system]
-# Base path for system data storage.
-path = "local_data"
-
-# Runtime configuration.
-[system.runtime]
+[runtime]
 # Path for storing runtime data.
-# Specifies the directory where any runtime data is stored, relative to `system.path`.
+# Specifies the directory where any runtime data is stored, relative to `path`.
 path = "runtime"
 
 # Logging configuration.
-[system.logging]
+[logging]
 # Path for storing log files.
 path = "logs"
 
@@ -384,7 +372,7 @@ path = "logs"
 level = "info"
 
 # Whether to write logs to file. When false, logs are only written to stdout.
-# When enabled, logs are stored in {system.path}/{system.logging.path} (default: local_data/logs).
+# When enabled, logs are stored in {path}/{logging.path} (default: local_data/logs).
 file_enabled = true
 
 # Maximum size of a single log file before rotation occurs. When a log
@@ -408,7 +396,7 @@ rotation_check_interval = "1 h"
 retention = "7 days"
 
 # Encryption configuration
-[system.encryption]
+[encryption]
 # Determines whether server-side data encryption for the messages payloads and state commands is enabled (boolean).
 # `true` enables encryption for stored data using AES-256-GCM.
 # `false` means data is stored without encryption.
@@ -419,157 +407,8 @@ enabled = false
 # This key is required and used only if encryption is enabled.
 key = ""
 
-# Stream configuration
-[system.stream]
-# Path for storing stream-related data (string).
-# Specifies the directory where stream data is stored, relative to `system.path`.
-path = "streams"
-
-# Topic configuration
-[system.topic]
-# Path for storing topic-related data, relative to `stream.path`.
-path = "topics"
-
-# Retention is per topic, set at CreateTopic and readable on GetTopic:
-#   max_topic_size   - delete oldest sealed segments past this size
-#                      ("unlimited" when unset)
-#   message_expiry   - delete sealed segments older than this ("none" when unset)
-# Both policies can be active at once; the active segment is never touched.
-# Call GET /options/topic (or the SDK's describe_options) for the full catalog
-# with this server's defaults.
-
-# Partition configuration
-[system.partition]
-# Path for storing partition-related data (string).
-# Specifies the directory where partition data is stored, relative to `topic.path`.
-path = "partitions"
-
-# Enables checksum validation for data integrity (boolean).
-# `true` re-hashes every batch a disk poll reads and fails the poll closed on a
-# mismatch, so a segment damaged at rest is reported instead of served.
-# `false` skips the re-hash and serves whatever decodes, which hands a consumer
-# bytes provably not the ones written. Only turn it off with a corruption guard
-# somewhere else in the stack.
-validate_checksum = true
-
-# Durability and flush cadence are per topic, set at CreateTopic:
-#   enforce_fsync                     - fdatasync each flush (false when unset)
-#   messages_required_to_save         - flush after this many messages (1024)
-#   size_of_messages_required_to_save - flush after this many bytes (1 MiB)
-# enforce_fsync decides whether a flush syncs, never whether one happens. A
-# write is acknowledged when it commits, which precedes its flush unless that
-# commit trips a threshold, and the partition journal holding the unflushed
-# remainder is in memory and is not replayed at boot. Acks are therefore
-# durability-gated only at messages_required_to_save = 1.
-
-# Segment configuration
-[system.segment]
-# Segment size is per topic, set at CreateTopic as `segment_size` (1 GiB when
-# unset). It is a soft limit: a segment may close one whole batch past it.
-# Bounds are enforced at creation - a 512 B multiple, at least 1 MiB, and no
-# larger than 1 GiB.
-#
-# `preallocate_segments` is per topic too: it reserves exactly `segment_size`
-# up front where the filesystem supports it. Off unless a topic asks for it --
-# with the default 1 GiB segment size it costs 1 GiB of real disk per
-# partition at creation.
-
-# Configures whether expired segments are archived (boolean) or just deleted without archiving.
-# Unsupported: setting this to `true` aborts boot.
-archive_expired = false
-
-# Recovery configuration in case of lost data
-[system.recovery]
-# Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
-# Unsupported: setting this to `true` aborts boot.
-recreate_missing_state = false
-
-# At boot, segment recovery walks each partition's segments: bytes after the
-# last decodable batch of a genuinely torn tail are physically truncated from
-# the .log/.index files. Every index entry is derived from a batch the log
-# already held, so an index is never evidence about the log: one the log
-# contradicts is repaired, not believed. It is DROPPED whole and rebuilt from
-# a byte-0 walk when it holds no whole 24-byte entry, when its entries
-# regress in offset or position, when an entry does not match the log batch's
-# offset, timestamp, partition and position, when its first entry is not the
-# segment's own start offset at position 0, or when the log cannot back its
-# LAST entry. Only an index whose
-# last entry the log proves anchors a walk, which then runs from that entry
-# to the file end. Under the topic's enforce_fsync = true an index the log
-# cannot back is measured against the log first: a gap of more than ONE entry
-# refuses the partition instead of rebuilding, because fsync lets the index
-# outrun the log by at most the chunk in flight at the crash, so a wider gap
-# is previously durable data the log lost.
-#
-# The byte-0 walk is deliberately not narrowed to the entries the log still
-# proves. An anchor picked that way can sit ABOVE damage, and the residue
-# probe only ever looks forward from where a walk stopped, so a hole under
-# the anchor would go unread while end_offset still advertised the offsets
-# over it. Reaching that branch means the index and the log already disagree,
-# so the extra bytes read are bounded by the segments a crash actually tore.
-#
-# Every batch a walk accepts passes its own checksum. With enforce_fsync =
-# false, the index only locates data because page-cache writeback can preserve
-# a later log page while losing an earlier one, so recovery walks every segment
-# from byte 0. A clean walk preserves the existing index and performs no disk
-# mutation. With enforce_fsync = true, completed serialized log fdatasyncs
-# prove the prefix before the last index entry, so a healthy boot starts at
-# that last entry and leaves earlier at-rest damage to the read path's
-# validate_checksum. Wherever a recovery walk finds damage, it truncates only
-# when nothing decodable follows and refuses when something does.
-#
-# The non-fsync verification pass therefore reads and checksums every log byte
-# at boot, although it keeps a clean index in place. A byte-0 repair walk also
-# rebuilds a missing or contradicted index durably, adding two fsyncs per
-# repaired segment. Either path can take minutes over thousands of segments.
-# A restore that dropped every .index repairs every segment; an ordinary
-# fsynced crash usually repairs only its tail segment. A slow boot is therefore
-# not by itself evidence of a stall. Before, the repair shapes refused boot.
-#
-# Either walk refuses a verifying batch whose base offset does not continue
-# the chain, or whose partition_id stamp is not this partition's. The one
-# exception is the first batch at an index-derived anchor: the offset it
-# fails to match is the ENTRY's, not the log's, so a mismatch there breaks
-# the walk as a stale entry, leaving the verdict to the byte-0 rebuild. A
-# batch that fails its own checksum is damage rather than data
-# whatever its fields claim: the walk stops there and the residue goes
-# through the damage probe like any other torn tail, so a bit flip in a tail
-# batch's offset truncates instead of refusing the partition, regardless of
-# the flip's direction.
-#
-# Damage in the middle of a segment is never silently truncated: the
-# partition is refused, as is trailing residue whose verification cost
-# exhausts the probe's residue-derived work budgets while walked batches
-# exist (residue after a walk that proved nothing recovers the segment as
-# empty instead, fencing the file pair aside whole). With peer replicas the
-# refused files are moved to a .fenced.N directory beside the partition,
-# which is rebuilt empty and refilled from a peer. With replica_count = 1
-# there is no peer, so nothing is moved and nothing is rebuilt: the refused
-# files stay at their original paths, the partition is tombstoned (unrouted,
-# clients get the retriable transient status, never an empty poll that would
-# read as a healthy empty partition), and the same refusal is re-derived and
-# re-logged on every boot. The tombstone lifts in exactly two ways: a
-# chain-shape refusal whose planned chain provably holds ZERO recoverable
-# bytes rebuilds through .fenced.N at boot, and deleting the
-# stream/topic/partition removes the refused files and clears the fence, so
-# a recreate of the same ids starts clean. One refusal is not durable: a
-# length divergence found when a writer reopens a file recovery just
-# truncated clears on the next boot, so that tombstone lasts only for the
-# life of the process.
-#
-# .fenced.N has a second producer, on a partition that recovers FINE: a tail
-# segment holding bytes that decode to nothing anywhere is moved there and
-# the segment recovered empty, so the partition serves without those bytes.
-# One fresh directory per such segment, so .fenced.0, .fenced.1, ... can
-# accumulate under a healthy partition. .fenced.N alone therefore does not
-# mean a partition was refused -- grep the boot log for "refusing the
-# recovered segment chain", which names the directory and the reason.
-#
-# The metadata WAL truncates genuinely torn tails too; interior WAL damage
-# or oversized trailing bytes refuse boot instead.
-
 # Memory pool configuration
-[system.memory_pool]
+[memory_pool]
 # Enables or disables the memory pool (boolean).
 # `true` enables the memory pool.
 # `false` disables the memory pool.
@@ -861,7 +700,7 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # ports = { tcp = 8095, quic = 8082, http = 3002, websocket = 8094, tcp_replica = 9092 }
 
 # Sharding configuration
-[system.sharding]
+[sharding]
 # CPU allocation - controls the number of shards and their CPU affinity.
 # Possible values:
 # - "all": Use all available CPU cores (default)
@@ -900,7 +739,7 @@ reply_inbox_capacity = 1024
 # the per-shard watchdog and the parallel-join survivor path; sized
 # larger than typical TCP RTT times in-flight write-batch so writers
 # receive their full last `write_vectored_all` budget before the
-# connection registry force-tears the bus. Slow-fsync hosts may need
+# connection registry force-tears the bus. Hosts with slow durable writes may need
 # to extend this past the default.
 shutdown_drain_timeout = "10 s"
 
@@ -1005,6 +844,72 @@ clients_table_max = 8192
 # plane), a pipeline exists per partition, so raising this multiplies pinned
 # request-buffer memory by the partition count. Keep it modest.
 [partition]
+# Retention is per topic, set at CreateTopic and readable on GetTopic:
+#   max_topic_size   - delete oldest sealed segments past this size
+#                      ("unlimited" when unset)
+#   message_expiry   - delete sealed segments older than this ("none" when unset)
+# Both policies can be active at once. The active segment is never touched.
+# WAL-backed partitions request a checkpoint before deleting referenced segments;
+# retention waits for that checkpoint, even below the usual WAL capacity trigger.
+# Call GET /options/topic (or the SDK's describe_options) for the full catalog
+# with this server's defaults.
+
+# Topic durability and flush scheduling are set at creation and returned by GetTopic.
+# durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
+# Both independently default to "replicated". Neither inherits the other.
+# In replicated groups, either persisted policy enables WAL references to segment bodies, retained by hard link until reclamation.
+# This includes replicated messages with persisted offsets. Full message payloads count against wal_bytes_max.
+# Their barriers can also persist co-batched messages. Only replicated/replicated stays off this WAL.
+# Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
+# Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
+# "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
+# A singleton quorum is one replica. Its persisted completion follows recoverable local persistence.
+# Poll auto-commit remains asynchronous. A successful poll does not confirm that its submitted offset operation committed or became durable.
+# HTTP ack=none returns dispatch acceptance with Iggy-Durability: none, even for persisted topics.
+# messages_required_to_save defaults to 1024 and size_of_messages_required_to_save defaults to 1 MiB.
+# These thresholds schedule ordinary segment writes. Required persistence, capacity pressure and lifecycle operations can flush sooner.
+
+# Segment storage
+# Segment size is per topic, set at CreateTopic as `segment_size` (1 GiB when
+# unset). It is a soft limit: a segment may close one whole batch past it.
+# Bounds are enforced at creation - a 512 B multiple, at least 1 MiB, and no
+# larger than 1 GiB.
+#
+# `preallocate_segments` is per topic too: it reserves exactly `segment_size`
+# up front where the filesystem supports it. Off unless a topic asks for it --
+# with the default 1 GiB segment size it costs 1 GiB of real disk per
+# partition at creation.
+
+# Recovery behavior
+# Recovery validates message batches against their checksums and partition identity before serving data.
+# A genuinely incomplete tail can be truncated. Interior damage or valid records after a damaged range require refusal or repair, never blind truncation.
+# A sparse index that contradicts the message log is rebuilt only when the discrepancy fits the storage guarantee.
+# With message durability = "replicated", background writeback can preserve later pages before earlier ones, so recovery checks the log from byte zero.
+# With message durability = "persisted", completed durable segment flushes constrain the incomplete tail and permit the established index-anchored recovery path.
+# Durable prepares can still reside in the partition WAL rather than segments. Recovery reconciles that history with the materialized state before serving.
+# Index reconstruction and validation can take time across many segments. A slow recovery is not by itself evidence of a stalled server.
+# Unrecoverable local segment data is fenced and repaired from peers when available. A singleton cannot fetch a missing copy from another replica.
+# Fenced files remain available for diagnosis. Recovery must not replace an acknowledged durable history with an empty healthy partition.
+# Metadata and partition journals verify their own integrity and recovery frontiers independently of sparse indexes.
+
+# Per-partition active WAL and queued/in-flight prepare budget when either
+# topic policy is persisted. A 4 KiB multiple, from 128 MiB + 8 KiB to 4 GiB.
+# The minimum accommodates the retained commit-point prepare and a maximum-size successor.
+# Checkpointing begins at half the byte budget or 1024 dirty files.
+# File barriers run with at most 16 concurrent operations. Temporary rewrites need extra disk
+# space. Lowering this budget preserves existing history and blocks new writes
+# until recovery and checkpointing reclaim enough space.
+# Checkpoints synchronize changed files through the partition writer. Other
+# partitions continue while this partition defers materialized commit application.
+# The HTTP metrics endpoint exposes per-shard partition_wal_* byte gauges and
+# completed batch, prepare, checkpoint and error counters.
+# partition_wal_retained_bytes plus queued_bytes and in_flight_bytes measures budget usage;
+# partition_wal_disk_bytes measures WAL file length, excluding referenced segment bodies.
+wal_bytes_max = "256 MiB"
+
+# Verify the checksum of batches read from segment storage. A mismatch is reported rather than served.
+validate_checksum = true
+
 # Depth of a partition's prepare queue: how many uncommitted produce /
 # consumer-offset ops may be in flight at once for that partition. Submits past
 # it spill into a request queue of twice this depth; once both are full the
@@ -1044,22 +949,16 @@ dedup_clients_max = 4096
 # Must be > 0 and <= 262144.
 consumer_offsets_max = 4096
 
-# Whether consumer-offset files are written crash-safe. On, every committed
-# offset store writes a sibling file, fdatasyncs it and renames it over the
-# prior cursor, and the offsets directory is fsynced once per commit walk before
-# any reply in that walk is sent. Independent of the topic's enforce_fsync,
-# which governs message and index files. Off, the file is rewritten in place
-# with no sync. A lost or torn cursor can cause replay from the earliest retained
-# data. On, the filesystem must support both file and directory sync. A failed
-# required barrier is reported as a failure, even if the mutation is visible.
-# The environment override is IGGY_PARTITION_CONSUMER_OFFSET_ENFORCE_FSYNC.
-consumer_offset_enforce_fsync = false
+# Consumer-offset durability is selected per topic by consumer_offset_durability.
+# It independently defaults to replicated, just like message durability.
+# Poll auto-commit submits an offset write asynchronously. A poll response does
+# not confirm that this write committed or became durable.
 
 # How many offsets a partition claims in its superblock ahead of the mint
 # counter before it will append, so a crash-restarted replica resumes above
 # every offset it confirmed to a client instead of re-minting it for a different
-# message. One superblock write (two fsyncs) per block: lowering it raises the
-# fsync rate on the write path, raising it wastes at most one block of the u64
+# message. One durable superblock update per block: lowering it raises the
+# durable-write rate on the write path, raising it wastes at most one block of the u64
 # offset space per crash. Must be > 0 and <= 16777216.
 #
 # SINGLE-REPLICA groups only. A replicated group acks a send once a quorum has
@@ -1159,3 +1058,13 @@ close_grace = "2 s"
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
 handshake_grace = "10 s"
+
+# This node's own client-facing identity, used when 'cluster.enabled' is false.
+[node]
+# A literal IP or a DNS hostname, without a port. Named to match its roster
+# counterpart 'cluster.nodes.advertised_address', which answers the same
+# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
+# is the bind address's answer to a question clients are not asking. Commented
+# out here because the shipped 'tcp.address' binds a concrete address and needs
+# no declaration.
+#advertised_address = "broker-1.example.com"

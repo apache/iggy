@@ -276,17 +276,23 @@ pub(in crate::http) async fn await_recovery_barrier(
     let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
         return Ok(());
     };
-    let barrier = consensus.recovery_barrier();
     // Gate on commit_MIN (locally applied), not commit_max (known committed):
     // a StartView adoption advances commit_max first and only then walks the
     // journal applying ops, and this task interleaves with that walk at its
     // await points -- a commit_max gate would serve state from before the
     // suffix applied (e.g. a pre-restart password change not yet visible).
-    if barrier_state(barrier, consensus.commit_min(), false) == BarrierWait::Ready {
+    if barrier_state(consensus.recovery_barrier(), consensus.commit_min(), false)
+        == BarrierWait::Ready
+    {
         return Ok(());
     }
     let deadline = std::time::Instant::now() + consensus.recovery_deadline();
     loop {
+        // Re-read per poll, like `commit_min`. `redecide_recovery_barrier` lowers
+        // the barrier when a view change settles the recovered suffix, so a reader
+        // holding the value it captured on entry waits out a barrier that no longer
+        // exists and then 503s on a replica that is serving.
+        let barrier = consensus.recovery_barrier();
         let expired = std::time::Instant::now() >= deadline;
         match barrier_state(barrier, consensus.commit_min(), expired) {
             BarrierWait::Ready => return Ok(()),
@@ -398,6 +404,87 @@ pub(in crate::http) fn authorize_data_plane(
         .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
 }
 
+static DURABILITY_KEY: std::sync::LazyLock<iggy_common::HeaderKey> =
+    std::sync::LazyLock::new(|| "durability".parse().expect("catalog key is valid"));
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::http) struct TopicDurability {
+    stream_id: usize,
+    topic_id: usize,
+    created_revision: u64,
+    pub durability: iggy_common::Durability,
+}
+
+impl TopicDurability {
+    pub fn identifiers(self) -> Result<(Identifier, Identifier), IggyError> {
+        let stream_id = u32::try_from(self.stream_id).map_err(|_| IggyError::InvalidIdentifier)?;
+        let topic_id = u32::try_from(self.topic_id).map_err(|_| IggyError::InvalidIdentifier)?;
+        Ok((
+            Identifier::numeric(stream_id)?,
+            Identifier::numeric(topic_id)?,
+        ))
+    }
+
+    pub fn confirmed_policy(self, state: &HttpInner) -> iggy_common::Durability {
+        state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| self.confirmed_policy_in(inner))
+    }
+
+    fn confirmed_policy_in(
+        self,
+        inner: &metadata::stm::stream::StreamsInner,
+    ) -> iggy_common::Durability {
+        let unchanged = inner
+            .items
+            .get(self.stream_id)
+            .and_then(|stream| stream.topics.get(self.topic_id))
+            .and_then(|topic| topic.partitions.first())
+            .is_some_and(|partition| partition.created_revision == self.created_revision);
+        if unchanged {
+            self.durability
+        } else {
+            iggy_common::Durability::Replicated
+        }
+    }
+}
+
+pub(in crate::http) fn topic_durability(
+    state: &HttpInner,
+    stream: &Identifier,
+    topic: &Identifier,
+) -> Option<TopicDurability> {
+    let stream = identifier_to_wire(stream).ok()?;
+    let topic = identifier_to_wire(topic).ok()?;
+    state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|inner| {
+            let stream_id = resolve_stream_id(inner, &stream)?;
+            let topic_id = resolve_topic_id(inner, stream_id, &topic)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let created_revision = topic.partitions.first()?.created_revision;
+            Some(TopicDurability {
+                stream_id,
+                topic_id,
+                created_revision,
+                durability: topic
+                    .options
+                    .get(&DURABILITY_KEY)
+                    .and_then(|option| std::str::from_utf8(option.value.as_bytes()).ok())
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default(),
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -405,14 +492,154 @@ mod tests {
         read_needs_metadata_frontier,
     };
     use crate::http::state::MetadataWatermarks;
+    use crate::http::wire::encode_send_messages;
+    use crate::responses::{resolve_stream_id, resolve_topic_id};
     use iggy_binary_protocol::codes::{
         DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
         GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
         GET_USER_CODE, GET_USERS_CODE,
     };
+    use iggy_binary_protocol::requests::messages::SendMessagesHeader;
+    use iggy_binary_protocol::{WireDecode, WireIdentifier};
     use metadata::AppliedFrontier;
     use std::future::pending;
     use std::sync::Arc;
+
+    #[test]
+    fn produce_routing_keeps_the_attested_topic_when_names_are_reused() {
+        for rename_stream in [false, true] {
+            let mut inner = metadata::stm::stream::StreamsInner::default();
+            let mut stream = metadata::stm::stream::Stream::default();
+            let topic_id = stream.topics.insert(metadata::stm::stream::Topic {
+                name: "orders".into(),
+                partitions: vec![metadata::stm::stream::Partition::new(
+                    0,
+                    1,
+                    iggy_common::IggyTimestamp::default(),
+                    3,
+                    0,
+                )],
+                ..Default::default()
+            });
+            stream.topic_index.insert("orders".into(), topic_id);
+            let stream_id = inner.items.insert(stream);
+            inner.index.insert("events".into(), stream_id);
+            let original = super::TopicDurability {
+                stream_id,
+                topic_id,
+                created_revision: 3,
+                durability: iggy_common::Durability::Persisted,
+            };
+            let (stream, topic) = original.identifiers().unwrap();
+            let message = iggy_common::IggyMessage::builder()
+                .payload(bytes::Bytes::from_static(b"payload"))
+                .build()
+                .unwrap();
+            let command = iggy_common::SendMessages {
+                batch: iggy_common::IggyMessagesBatch::from(&vec![message]),
+                ..Default::default()
+            };
+            let body = encode_send_messages(&stream, &topic, &command).unwrap();
+            let metadata_length = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+            let (request, _) = SendMessagesHeader::decode(&body[4..4 + metadata_length]).unwrap();
+
+            let stream = inner.items.get_mut(stream_id).unwrap();
+            stream.topics.get_mut(topic_id).unwrap().name = "renamed".into();
+            stream.topic_index.insert("renamed".into(), topic_id);
+            let replacement_topic = stream
+                .topics
+                .insert(metadata::stm::stream::Topic::default());
+            stream
+                .topic_index
+                .insert("orders".into(), replacement_topic);
+            assert_eq!(
+                resolve_topic_id(&inner, stream_id, &WireIdentifier::named("orders").unwrap()),
+                Some(replacement_topic)
+            );
+            if rename_stream {
+                inner.items.get_mut(stream_id).unwrap().name = "renamed-stream".into();
+                inner.index.insert("renamed-stream".into(), stream_id);
+                let replacement_stream =
+                    inner.items.insert(metadata::stm::stream::Stream::default());
+                inner.index.insert("events".into(), replacement_stream);
+                assert_eq!(
+                    resolve_stream_id(&inner, &WireIdentifier::named("events").unwrap()),
+                    Some(replacement_stream)
+                );
+            }
+
+            assert_eq!(
+                resolve_stream_id(&inner, &request.stream_id),
+                Some(stream_id)
+            );
+            assert_eq!(
+                resolve_topic_id(&inner, stream_id, &request.topic_id),
+                Some(topic_id)
+            );
+            assert_eq!(
+                original.confirmed_policy_in(&inner),
+                iggy_common::Durability::Persisted
+            );
+        }
+    }
+
+    #[test]
+    fn completed_produce_checks_the_stored_topic_incarnation() {
+        let mut inner = metadata::stm::stream::StreamsInner::default();
+        let mut stream = metadata::stm::stream::Stream::default();
+        let topic = metadata::stm::stream::Topic {
+            partitions: vec![metadata::stm::stream::Partition::new(
+                0,
+                1,
+                iggy_common::IggyTimestamp::default(),
+                3,
+                0,
+            )],
+            ..Default::default()
+        };
+        let topic_id = stream.topics.insert(topic);
+        let stream_id = inner.items.insert(stream);
+        let original = super::TopicDurability {
+            stream_id,
+            topic_id,
+            created_revision: 3,
+            durability: iggy_common::Durability::Persisted,
+        };
+        assert_eq!(
+            original.confirmed_policy_in(&inner),
+            iggy_common::Durability::Persisted
+        );
+        inner
+            .items
+            .get_mut(stream_id)
+            .unwrap()
+            .topics
+            .get_mut(topic_id)
+            .unwrap()
+            .name = "renamed".into();
+        assert_eq!(
+            original.confirmed_policy_in(&inner),
+            iggy_common::Durability::Persisted
+        );
+        inner
+            .items
+            .get_mut(stream_id)
+            .unwrap()
+            .topics
+            .get_mut(topic_id)
+            .unwrap()
+            .partitions[0]
+            .created_revision = 4;
+        assert_eq!(
+            original.confirmed_policy_in(&inner),
+            iggy_common::Durability::Replicated
+        );
+        inner.items.remove(stream_id);
+        assert_eq!(
+            original.confirmed_policy_in(&inner),
+            iggy_common::Durability::Replicated
+        );
+    }
 
     /// Root's user id, the caller every fixture below writes and reads as.
     const USER: u32 = 0;

@@ -221,7 +221,11 @@ stored values.
   cluster: a node that authenticates cannot talk to one that does not.
 * **`server.encryption`** encrypts message payloads and state commands at rest
   with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
-  cannot read what its peers wrote.
+  cannot read what its peers wrote. The chart selects the legacy configuration
+  for versioned images through `0.9.0-edge.7`, including its pinned image.
+  For newer builds with `[encryption]`, set `server.encryption.configVersion=flat`.
+  Custom tags require an explicit `flat` or `legacy` layout; `legacy` uses
+  `[system.encryption]`.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that
@@ -322,7 +326,7 @@ On Apple Silicon hosts, the released `arm64` server image may still fail during 
 HELM_SMOKE_KIND_PLATFORM=linux/amd64 scripts/ci/setup-helm-smoke-cluster.sh
 ```
 
-The smoke script defaults `IGGY_SYSTEM_SHARDING_CPU_ALLOCATION=1` for the server pod so the local kind path avoids the chart's `numa:auto` default and keeps the local runtime to a single shard, which has been more reliable on containerized local nodes. If you need a different local override, set `HELM_SMOKE_SERVER_CPU_ALLOCATION` before running `scripts/ci/test-helm.sh smoke`. Pass `--cleanup` to remove the smoke namespace after a successful run; omit it if you want to inspect the deployed resources.
+The smoke script defaults `IGGY_SHARDING_CPU_ALLOCATION=1` for the server pod so the local kind path avoids the chart's `numa:auto` default and keeps the local runtime to a single shard, which has been more reliable on containerized local nodes. If you need a different local override, set `HELM_SMOKE_SERVER_CPU_ALLOCATION` before running `scripts/ci/test-helm.sh smoke`. Pass `--cleanup` to remove the smoke namespace after a successful run; omit it if you want to inspect the deployed resources.
 
 On smoke-test failures you can collect the same diagnostics as CI with:
 

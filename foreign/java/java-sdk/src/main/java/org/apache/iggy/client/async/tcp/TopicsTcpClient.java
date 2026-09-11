@@ -110,7 +110,13 @@ public class TopicsTcpClient implements TopicsClient {
             Map<String, HeaderValue> options) {
 
         var payload = createTopicPayload(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, options);
+                streamId,
+                partitionsCount,
+                compressionAlgorithm,
+                messageExpiry,
+                maxTopicSize,
+                name,
+                org.apache.iggy.topic.TopicOptions.withDurabilityDefaults(options));
 
         return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
             try {
@@ -134,7 +140,7 @@ public class TopicsTcpClient implements TopicsClient {
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
         payload.writeIntLE(partitionsCount.intValue());
-        payload.writeBytes(BytesSerializer.toBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name, "name"));
         payload.writeBytes(BytesSerializer.toBytes(
                 createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize, options)));
         return payload;
@@ -181,7 +187,7 @@ public class TopicsTcpClient implements TopicsClient {
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(BytesSerializer.toBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name, "name"));
         // Settings ride the options block. A default value means the caller did
         // not set the key, so it is omitted and the server leaves the topic's
         // current value alone.

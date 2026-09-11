@@ -1365,6 +1365,12 @@ where
             return;
         }
 
+        // Paired with the append, not with the sequencer advance below: a backup
+        // repairing under a `StartView` it already adopted is at the announced head
+        // already, so the entry arriving moves neither number the suffix snapshot
+        // is otherwise tagged by.
+        consensus.note_journal_mutation();
+
         // Journal mutation done; wire traffic below must not hold the gate.
         drop(journal_gate);
 
@@ -1853,10 +1859,10 @@ where
                 .await
                 .map_err(SnapshotError::Io)?;
             if removed > 0 {
-                // The DVC snapshot's `(op, commit)` tag does not move when
-                // entries are removed under it; left stale it would advertise
+                // The DVC snapshot's head and commit point do not move when
+                // entries are removed under them; left stale it would advertise
                 // headers this replica can no longer serve.
-                consensus.invalidate_local_dvc_suffix();
+                consensus.note_journal_mutation();
                 tracing::warn!(
                     snapshot_seq,
                     removed,
@@ -3354,7 +3360,12 @@ where
             }
         }
 
-        if let Err(e) = coordinator.drain(journal, snap_op).await {
+        let drained = coordinator.drain(journal, snap_op).await;
+        // On the error path too: a drain that fails part-way still removed
+        // whatever it reached, and a snapshot left offering those bodies strands
+        // the peer that picks this replica as a repair source.
+        consensus.note_journal_mutation();
+        if let Err(e) = drained {
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -3465,7 +3476,12 @@ where
                 // node default is by then, not the value resolved at creation.
                 // Re-encoding also canonicalizes kinds (a `"128MiB"` string
                 // becomes `Uint64`), so the stored map reads back uniformly.
-                request.options = explicit.to_wire()?;
+                let supplied_options = request.options.clone();
+                request.options = explicit.to_explicit_wire(|key| {
+                    supplied_options
+                        .into_iter()
+                        .any(|entry| entry.key == key.as_bytes())
+                })?;
                 let resolved_segment_size = explicit
                     .segment_size
                     .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
@@ -3494,9 +3510,8 @@ where
                     resolved_max_topic_size,
                     TopicRuntimeDefaults {
                         segment_size: resolved_segment_size,
-                        enforce_fsync: explicit
-                            .enforce_fsync
-                            .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC),
+                        durability: iggy_common::Durability::default(),
+                        consumer_offset_durability: iggy_common::Durability::default(),
                         messages_required_to_save: explicit
                             .messages_required_to_save
                             .unwrap_or(iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE),
@@ -3511,6 +3526,7 @@ where
                             .preallocate_segments
                             .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
                     },
+                    &supplied_options,
                 )?;
                 let partitions = self
                     .allocator
@@ -3652,6 +3668,24 @@ where
             }
             applied += 1;
             let op = consensus.commit_min() + 1;
+
+            // Never apply the op the pipeline holds: `on_ack` pops that entry
+            // and advances past it, so applying it here strands it below
+            // `peek_committable_head`'s floor. Nothing pops it after that (the
+            // only `pop_committed_prepare` sits inside that loop), so its wire
+            // reply is never built and its `reply_sender` neither fires nor drops.
+            //
+            // Compared per op, not hoisted: the body read below awaits and a
+            // sibling driver can move the head. Comparing against `op` also gets
+            // the two edge cases right for free -- an absent head is a backup's
+            // empty pipeline and caps nothing, and a head at or below `commit_min`
+            // is already stranded and must not freeze the walk on top of that.
+            if consensus
+                .pipeline_head_header()
+                .is_some_and(|head| head.op == op)
+            {
+                break;
+            }
 
             let Some(header) = journal.handle().header(op as usize) else {
                 // Gap-stop: the walk halts at the first missing prepare and

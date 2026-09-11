@@ -27,7 +27,6 @@ under the License.
         <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.11" />
         <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
-        <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.108" />
         <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.10.0" />
         <PackageVersion Include="Microsoft.Testing.Extensions.Retry" Version="2.3.3" />
         <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.3.3" />
@@ -36,7 +35,7 @@ under the License.
         <PackageVersion Include="Shouldly" Version="4.3.0" />
         <PackageVersion Include="System.IO.Hashing" Version="10.0.0" />
         <PackageVersion Include="Testcontainers" Version="4.14.0" />
-        <PackageVersion Include="TUnit" Version="1.65.51" />
+        <PackageVersion Include="TUnit" Version="1.65.68" />
         <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

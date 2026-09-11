@@ -27,8 +27,11 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ConnectTimeoutException;
+import io.netty.channel.EventLoop;
 import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.pool.AbstractChannelPoolHandler;
 import io.netty.channel.pool.ChannelHealthChecker;
@@ -37,7 +40,10 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
@@ -91,6 +97,8 @@ public class AsyncTcpConnection {
     // and a transient one is not a rejected credential.
     static final int TRANSIENT_NOT_COMMITTED = 57;
     static final int TRANSIENT_NOT_ACCEPTED = 58;
+    // The pool holds one channel, and one channel lives on one loop.
+    static final int DEFAULT_IO_THREADS = 1;
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
     // A missing reply must not hold the single VSR-pinned channel forever.
@@ -98,9 +106,13 @@ public class AsyncTcpConnection {
     private static final long TRANSIENT_RETRY_INTERVAL_MS = 50;
     private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
     private static final Duration NOT_ACCEPTED_RETRY_BUDGET = Duration.ofSeconds(2);
+    private static final String EVENT_LOOP_THREAD_PREFIX = "iggy-tcp-io";
 
     private final IoEventLoopGroup eventLoopGroup;
+    private final boolean ownsEventLoopGroup;
+    private final EventLoop eventLoop;
     private final FixedChannelPool channelPool;
+    private final ChannelGroup channels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE, true);
     private final AtomicBoolean isClosed = new AtomicBoolean(false);
     private final AtomicLong authGeneration = new AtomicLong(0);
     private final VsrRequestEncoder vsrEncoder;
@@ -130,6 +142,8 @@ public class AsyncTcpConnection {
                 enableTls,
                 tlsCertificate,
                 poolConfig,
+                Optional.empty(),
+                DEFAULT_IO_THREADS,
                 connectionTimeout,
                 Optional.empty(),
                 Duration.ofSeconds(5),
@@ -146,6 +160,8 @@ public class AsyncTcpConnection {
             boolean enableTls,
             Optional<File> tlsCertificate,
             TcpConnectionPoolConfig poolConfig,
+            Optional<IoEventLoopGroup> sharedEventLoopGroup,
+            int ioThreads,
             Optional<Duration> connectionTimeout,
             Optional<Duration> requestTimeout,
             Duration heartbeatInterval,
@@ -171,12 +187,17 @@ public class AsyncTcpConnection {
 
         ConsensusSession consensusSession = new ConsensusSession();
         this.vsrEncoder = new VsrRequestEncoder(consensusSession);
-        this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        this.ownsEventLoopGroup = sharedEventLoopGroup.isEmpty();
+        this.eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> new MultiThreadIoEventLoopGroup(
+                ioThreads,
+                new DefaultThreadFactory(EVENT_LOOP_THREAD_PREFIX, false, Thread.MAX_PRIORITY),
+                NioIoHandler.newFactory()));
+        this.eventLoop = eventLoopGroup.next();
 
         long dialTimeoutMillis =
                 connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis();
         var bootstrap = new Bootstrap()
-                .group(eventLoopGroup)
+                .group(eventLoop)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) dialTimeoutMillis)
@@ -196,7 +217,8 @@ public class AsyncTcpConnection {
                         dialTimeoutMillis,
                         consensusSession,
                         maxVsrFrameSize,
-                        this::onSessionEvicted),
+                        this::onSessionEvicted,
+                        channels::add),
                 ChannelHealthChecker.ACTIVE,
                 FixedChannelPool.AcquireTimeoutAction.FAIL,
                 poolConfig.getAcquireTimeoutMillis(),
@@ -248,8 +270,13 @@ public class AsyncTcpConnection {
             if (!heartbeatRunning || isClosed.get()) {
                 return;
             }
-            heartbeatTask =
-                    eventLoopGroup.next().schedule(this::sendHeartbeat, heartbeatIntervalNanos, TimeUnit.NANOSECONDS);
+            try {
+                heartbeatTask = eventLoop.schedule(this::sendHeartbeat, heartbeatIntervalNanos, TimeUnit.NANOSECONDS);
+            } catch (RejectedExecutionException loopGone) {
+                // Only a caller-owned group shuts down under a live connection.
+                heartbeatRunning = false;
+                log.warn("Event loop rejected the heartbeat, stopping it: {}", loopGone.getMessage());
+            }
         }
     }
 
@@ -287,6 +314,16 @@ public class AsyncTcpConnection {
                 heartbeatTask = null;
             }
         }
+    }
+
+    boolean heartbeatScheduled() {
+        synchronized (heartbeatLock) {
+            return heartbeatTask != null;
+        }
+    }
+
+    EventLoop eventLoop() {
+        return eventLoop;
     }
 
     public <T> CompletableFuture<T> exchangeForEntity(
@@ -920,16 +957,33 @@ public class AsyncTcpConnection {
         stopHeartbeat();
         releaseLoginPayload();
         CompletableFuture<Void> shutdownFuture = new CompletableFuture<>();
-        channelPool
-                .closeAsync()
-                .addListener(f -> eventLoopGroup.shutdownGracefully().addListener(sf -> {
-                    if (sf.isSuccess()) {
-                        shutdownFuture.complete(null);
-                    } else {
-                        shutdownFuture.completeExceptionally(sf.cause());
-                    }
-                }));
+        channels.close().addListener(channelsClosed -> closePool(shutdownFuture));
         return shutdownFuture;
+    }
+
+    private void closePool(CompletableFuture<Void> shutdownFuture) {
+        try {
+            channelPool.closeAsync().addListener(poolClosed -> {
+                if (!ownsEventLoopGroup) {
+                    completeShutdown(shutdownFuture, poolClosed);
+                    return;
+                }
+                eventLoopGroup
+                        .shutdownGracefully()
+                        .addListener(groupClosed -> completeShutdown(shutdownFuture, groupClosed));
+            });
+        } catch (RejectedExecutionException loopGone) {
+            log.warn("Event loop rejected the pool close, channel already gone: {}", loopGone.getMessage());
+            shutdownFuture.complete(null);
+        }
+    }
+
+    private static void completeShutdown(CompletableFuture<Void> shutdownFuture, Future<?> step) {
+        if (step.isSuccess()) {
+            shutdownFuture.complete(null);
+        } else {
+            shutdownFuture.completeExceptionally(step.cause());
+        }
     }
 
     private static final class PoolChannelHandler extends AbstractChannelPoolHandler {
@@ -941,6 +995,7 @@ public class AsyncTcpConnection {
         private final ConsensusSession consensusSession;
         private final int maxVsrFrameSize;
         private final IntConsumer onEviction;
+        private final Consumer<Channel> onChannelCreated;
 
         @SuppressWarnings("checkstyle:ParameterNumber")
         PoolChannelHandler(
@@ -951,7 +1006,8 @@ public class AsyncTcpConnection {
                 long dialTimeoutMillis,
                 ConsensusSession consensusSession,
                 int maxVsrFrameSize,
-                IntConsumer onEviction) {
+                IntConsumer onEviction,
+                Consumer<Channel> onChannelCreated) {
             this.host = host;
             this.port = port;
             this.enableTls = enableTls;
@@ -960,10 +1016,12 @@ public class AsyncTcpConnection {
             this.consensusSession = consensusSession;
             this.maxVsrFrameSize = maxVsrFrameSize;
             this.onEviction = onEviction;
+            this.onChannelCreated = onChannelCreated;
         }
 
         @Override
         public void channelCreated(Channel ch) {
+            onChannelCreated.accept(ch);
             ChannelPipeline pipeline = ch.pipeline();
             if (enableTls) {
                 SslHandler ssl = sslContext.newHandler(ch.alloc(), host, port);

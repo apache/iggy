@@ -57,15 +57,17 @@ func TestCompressionAlgorithm_StringNamesUnknownCode(t *testing.T) {
 //
 // Rust pins the identical bytes in core/binary_protocol/src/primitives/options.rs,
 // as do the Node and Java SDKs. Round-tripping through this SDK's own decoder
-// proves nothing about interoperability; these bytes are the contract.
+// proves nothing about interoperability. This insertion-order vector covers Bool,
+// Uint64 and String values, independently of Rust's sorted map order.
 var goldenOptionsBlock = []byte{
-	2, 13, 0, 0, 0,
-	'e', 'n', 'f', 'o', 'r', 'c', 'e', '_', 'f', 's', 'y', 'n', 'c',
+	2, 20, 0, 0, 0,
+	'p', 'r', 'e', 'a', 'l', 'l', 'o', 'c', 'a', 't', 'e', '_', 's', 'e', 'g', 'm', 'e', 'n', 't', 's',
 	3, 1, 0, 0, 0, 1,
 	2, 12, 0, 0, 0,
 	's', 'e', 'g', 'm', 'e', 'n', 't', '_', 's', 'i', 'z', 'e',
 	12, 8, 0, 0, 0,
 	0, 0, 0, 64, 0, 0, 0, 0,
+	2, 10, 0, 0, 0, 100, 117, 114, 97, 98, 105, 108, 105, 116, 121, 2, 9, 0, 0, 0, 112, 101, 114, 115, 105, 115, 116, 101, 100,
 }
 
 func TestGetHeadersBytes_MatchesTheCrossSdkGoldenVector(t *testing.T) {
@@ -73,7 +75,7 @@ func TestGetHeadersBytes_MatchesTheCrossSdkGoldenVector(t *testing.T) {
 	binary.LittleEndian.PutUint64(segmentSize, 1073741824)
 	entries := []HeaderEntry{
 		{
-			Key:   HeaderKey{Kind: String, Value: []byte("enforce_fsync")},
+			Key:   HeaderKey{Kind: String, Value: []byte("preallocate_segments")},
 			Value: HeaderValue{Kind: Bool, Value: []byte{1}},
 		},
 		{
@@ -82,6 +84,10 @@ func TestGetHeadersBytes_MatchesTheCrossSdkGoldenVector(t *testing.T) {
 		},
 	}
 
+	entries = append(entries, HeaderEntry{
+		Key:   HeaderKey{Kind: String, Value: []byte("durability")},
+		Value: HeaderValue{Kind: String, Value: []byte("persisted")},
+	})
 	got := GetHeadersBytes(entries)
 
 	if !bytes.Equal(got, goldenOptionsBlock) {

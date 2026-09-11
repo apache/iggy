@@ -53,10 +53,10 @@ struct TestServer {
 
 impl TestServer {
     fn start() -> Self {
-        let data_dir = TempDir::new().expect("tempdir for system.path");
+        let data_dir = TempDir::new().expect("tempdir for path");
         let mut cmd = Command::cargo_bin("iggy-server")
             .expect("iggy-server binary must be built by the test runner");
-        cmd.env("IGGY_SYSTEM_PATH", data_dir.path())
+        cmd.env("IGGY_PATH", data_dir.path())
             // Ephemeral port; the actual bound port is read back from
             // `runtime/current_config.toml` after the listener binds.
             .env("IGGY_TCP_ADDRESS", "127.0.0.1:0")

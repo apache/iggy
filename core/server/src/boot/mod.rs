@@ -69,7 +69,7 @@ use crate::shell::{
     ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellBus, ShellHandlers,
     ShellShardHandle,
 };
-use configs::server::{ServerConfig, ServerSystemConfig};
+use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
@@ -105,7 +105,7 @@ use tracing::{error, info, warn};
 pub fn wire_shell_handlers<B, MJ, S, SB>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
-    system_config: Arc<ServerSystemConfig>,
+    server_config: Arc<ServerConfig>,
     max_tokens_per_user: u32,
 ) -> ShellHandlers
 where
@@ -122,7 +122,7 @@ where
             bus,
             shard_handle,
             &sessions,
-            system_config,
+            server_config,
             max_tokens_per_user,
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
@@ -161,9 +161,9 @@ pub async fn prepare_runtime_dirs(
     if fresh {
         wipe_system_path(config).await?;
     }
-    create_directories(&config.system).await.map_err(|source| {
+    create_directories(config).await.map_err(|source| {
         error!(
-            system_path = %config.system.get_system_path(),
+            system_path = %config.get_system_path(),
             error = %source,
             "failed to prepare server directories"
         );
@@ -171,8 +171,8 @@ pub async fn prepare_runtime_dirs(
     })?;
     logging
         .late_init(
-            config.system.get_system_path(),
-            &LoggingSettings::from(&config.system.logging),
+            config.get_system_path(),
+            &LoggingSettings::from(&config.logging),
             &TelemetrySettings::from(&config.telemetry),
         )
         .map_err(ServerError::Logging)?;
@@ -182,8 +182,8 @@ pub async fn prepare_runtime_dirs(
 
 /// Delete the configured system path so the server boots on empty state.
 async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
-    let path = config.system.get_system_path();
-    // `system.path` is relative by default and IGGY_SYSTEM_PATH-overridable,
+    let path = config.get_system_path();
+    // `path` is relative by default and IGGY_PATH-overridable,
     // so report what is actually about to be deleted, not what was configured.
     let resolved = std::path::absolute(&path).unwrap_or_else(|_| PathBuf::from(&path));
 
@@ -216,7 +216,7 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
 /// Spawn the multi-shard `server` runtime.
 ///
 /// Resolves shard count + CPU affinities from
-/// `system.sharding.cpu_allocation`, builds canonical-ordered
+/// `sharding.cpu_allocation`, builds canonical-ordered
 /// `(senders, inboxes)` channels, and spawns one OS thread per shard.
 ///
 /// Each thread pins itself (`nix::sched::sched_setaffinity` on Linux via
@@ -258,8 +258,8 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
-    crate::responses::init_stats_data_path(config.system.get_system_path().into());
-    let (assignments, total_shards) = resolve_shard_assignments(&config.system.sharding)?;
+    crate::responses::init_stats_data_path(config.get_system_path().into());
+    let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 
     // Re-check the full valid range, not just the zero floor: a caller
@@ -267,9 +267,9 @@ pub fn bootstrap(
     // would otherwise OOM at boot allocating an oversized inbox channel,
     // busy-loop every shutdown watchdog on a zero poll cadence, or wedge
     // process exit on an unbounded drain budget.
-    let inbox_capacity = config.system.sharding.inbox_capacity;
-    let reply_inbox_capacity = config.system.sharding.reply_inbox_capacity;
-    validate_sharding_runtime_knobs(&config.system.sharding)?;
+    let inbox_capacity = config.sharding.inbox_capacity;
+    let reply_inbox_capacity = config.sharding.reply_inbox_capacity;
+    validate_sharding_runtime_knobs(&config.sharding)?;
 
     let (senders, mut inboxes, mut reply_inboxes) =
         shard_mesh_channels(total_shards, inbox_capacity, reply_inbox_capacity);
@@ -287,13 +287,12 @@ pub fn bootstrap(
     // the drain alone is short by a poll interval, and
     // `shutdown_join_timeout == shutdown_drain_timeout` is a legal config.
     let shutdown_deadline = Arc::new(ShutdownDeadline::new(
-        config.system.sharding.shutdown_join_timeout.get_duration(),
+        config.sharding.shutdown_join_timeout.get_duration(),
         config
-            .system
             .sharding
             .shutdown_drain_timeout
             .get_duration()
-            .saturating_add(config.system.sharding.shutdown_poll_interval.get_duration()),
+            .saturating_add(config.sharding.shutdown_poll_interval.get_duration()),
     ));
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
@@ -491,8 +490,8 @@ async fn shard_main(
         tls: load_replica_tls_ctx(config, &topology)?.map(Rc::new),
     });
 
-    let drain_timeout = config.system.sharding.shutdown_drain_timeout.get_duration();
-    let poll_interval = config.system.sharding.shutdown_poll_interval.get_duration();
+    let drain_timeout = config.sharding.shutdown_drain_timeout.get_duration();
+    let poll_interval = config.sharding.shutdown_poll_interval.get_duration();
 
     let shutdown_flag_for_handoff = Arc::clone(&shutdown_flag);
     let mut shutdown_watchdog = Some(spawn_shutdown_watchdog(
@@ -509,7 +508,7 @@ async fn shard_main(
     // WAL access, no replay. Writes still funnel through shard 0's
     // metadata VSR; per-commit `publish()` (in `WriteCell::apply`)
     // bounds reader staleness to one op.
-    let data_dir = Path::new(&config.system.path);
+    let data_dir = Path::new(&config.path);
     // The bundle broadcast is deliberately NOT inside the owner arm: it is
     // the first moment a peer can hold a read handle over shard 0's writer,
     // so the writer must first be parked in a binding that outlives the peer
@@ -541,22 +540,6 @@ async fn shard_main(
             .await
             .map_err(ServerError::MetadataRecovery)?;
             ensure_default_root_user(&recovered.mux_stm);
-            // The factory bundle hands every peer a read handle over the
-            // same `Inner`, so `Arc<TopicStats>` (and the parent
-            // `Arc<StreamStats>`) is shared across all shards. Zero the
-            // snapshot totals here, once, before any peer can observe the
-            // bundle. Per-shard `load_partition` deltas in
-            // `build_shard_for_thread` then race only against other
-            // atomic adds, never against a concurrent `swap(0)` that
-            // would mistake an in-flight delta for the snapshot total
-            // and decrement the parent `StreamStats` by it.
-            let () = recovered.mux_stm.streams().read(|inner| {
-                for (_, stream) in &inner.items {
-                    for (_, topic) in &stream.topics {
-                        topic.stats.zero_out_all();
-                    }
-                }
-            });
             (
                 Rc::new(recovered.mux_stm),
                 Some(bundle_tx),
@@ -649,7 +632,7 @@ async fn shard_main(
         snapshot_for_metadata,
         superblock_for_metadata,
         Rc::clone(&mux_stm),
-        Some(PathBuf::from(&config.system.path)),
+        Some(PathBuf::from(&config.path)),
     )
     .with_applied_frontier(metadata_applied_frontier);
     metadata.seed_applied_frontier_from_consensus();
@@ -807,11 +790,7 @@ async fn shard_main(
         topology.self_replica_id,
         topology.replica_count,
     ));
-    let reconcile_periodic = config
-        .system
-        .sharding
-        .reconcile_periodic_interval
-        .get_duration();
+    let reconcile_periodic = config.sharding.reconcile_periodic_interval.get_duration();
     let reconciler_handle = compio::runtime::spawn({
         let ctx = Rc::clone(&reconciler_ctx);
         async move {

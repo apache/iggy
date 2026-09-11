@@ -22,6 +22,7 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ConnectTimeoutException;
+import io.netty.channel.IoEventLoopGroup;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
@@ -108,8 +109,12 @@ import java.util.stream.Stream;
  * response handling is performed asynchronously.
  *
  * <h2>Resource Management</h2>
- * <p>Always call {@link #close()} when the client is no longer needed. This shuts down
- * the Netty event loop group and releases all associated resources.
+ * <p>When the client is no longer needed, call {@link #close()}. This closes the
+ * connection and shuts down the event loop group that the client created for itself. A
+ * group supplied through {@link AsyncIggyTcpClientBuilder#eventLoopGroup(IoEventLoopGroup)}
+ * stays up. The caller owns that group. After every client on the group is closed, the
+ * caller shuts the group down. Do not block in a completion callback. Callbacks run on
+ * that group's loops, so a blocked callback stalls every client that shares the group.
  *
  * @see AsyncIggyTcpClientBuilder
  * @see org.apache.iggy.Iggy#tcpClientBuilder()
@@ -141,6 +146,8 @@ public class AsyncIggyTcpClient {
     private final Optional<RetryPolicy> retryPolicy;
     private final boolean enableTls;
     private final Optional<File> tlsCertificate;
+    private final Optional<IoEventLoopGroup> sharedEventLoopGroup;
+    private final int ioThreads;
     private final TcpConnectionPoolConfig poolConfig;
     private final ClientRoutingState routingState = new ClientRoutingState();
     private final LoginRoutingHook loginRoutingHook = new LoginRoutingHook() {
@@ -207,7 +214,9 @@ public class AsyncIggyTcpClient {
                 VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE,
                 null,
                 false,
-                Optional.empty());
+                Optional.empty(),
+                Optional.empty(),
+                AsyncTcpConnection.DEFAULT_IO_THREADS);
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -223,7 +232,9 @@ public class AsyncIggyTcpClient {
             int maxVsrFrameSize,
             RetryPolicy retryPolicy,
             boolean enableTls,
-            Optional<File> tlsCertificate) {
+            Optional<File> tlsCertificate,
+            Optional<IoEventLoopGroup> sharedEventLoopGroup,
+            int ioThreads) {
         this.connectionInfo = new ConnectionInfo(host, port);
         this.seedConnectionInfo = this.connectionInfo;
         this.username = Optional.ofNullable(username);
@@ -236,6 +247,8 @@ public class AsyncIggyTcpClient {
         this.retryPolicy = Optional.ofNullable(retryPolicy);
         this.enableTls = enableTls;
         this.tlsCertificate = tlsCertificate;
+        this.sharedEventLoopGroup = sharedEventLoopGroup;
+        this.ioThreads = ioThreads;
 
         var poolConfigBuilder = TcpConnectionPoolConfig.builder();
         this.acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
@@ -460,10 +473,13 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Closes the TCP connection and releases all Netty resources.
+     * Closes the TCP connection and releases the Netty resources that this client owns.
      *
-     * <p>This shuts down the event loop group gracefully. After calling this method,
-     * the client cannot be reused — create a new instance if needed.
+     * <p>If the client created its own event loop group, it shuts that group down gracefully.
+     * The client does not shut down a group supplied through
+     * {@link AsyncIggyTcpClientBuilder#eventLoopGroup(IoEventLoopGroup)}. The caller shuts
+     * that group down. After you call this method, you cannot reuse the client. If you need
+     * a client again, create a new instance.
      *
      * @return a {@link CompletableFuture} that completes when all resources are released
      */
@@ -498,6 +514,8 @@ public class AsyncIggyTcpClient {
                 enableTls,
                 tlsCertificate,
                 poolConfig,
+                sharedEventLoopGroup,
+                ioThreads,
                 dialTimeout(),
                 requestTimeout,
                 heartbeatInterval,
