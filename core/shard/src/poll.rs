@@ -40,6 +40,11 @@ use server_common::sharding::IggyNamespace;
 /// A read result awaiting acceptance by its partition owner.
 /// Disk tasks send it through the inbox. Resident reads pass it directly to
 /// the same completion handler.
+///
+/// The inbox requires `Send` even for messages addressed to this same shard.
+/// The owner acquires any capacity reservation while accepting the result.
+/// Guards stay in its local request queue or replication state, outside this
+/// channel's `Send` boundary.
 pub struct PollCompleted {
     /// Namespace whose current partition must validate the captured history.
     namespace: IggyNamespace,

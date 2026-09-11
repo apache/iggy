@@ -43,6 +43,10 @@ impl Eq for PollHistoryId {}
 ///
 /// Requests for the same key hold separate guards, so dropping one request
 /// cannot release capacity still held by another.
+///
+/// Shared only on the owning shard thread. Acquisition and release update
+/// the current counters without yielding or reentering task execution, so
+/// `Rc` and `Cell` suffice even when guards outlive an async suspension.
 #[derive(Debug)]
 pub struct AutoCommitReservationToken {
     kind: ConsumerKind,
@@ -78,7 +82,7 @@ impl AutoCommitReservationToken {
 
     /// Hold this key until the returned guard is dropped.
     /// The first guard increments the shared key count. Capacity admission must
-    /// already have succeeded before this call.
+    /// already have succeeded, without yielding between that check and this call.
     #[must_use]
     pub fn acquire(self: &Rc<Self>) -> AutoCommitReservation {
         let active = self.active.get();
@@ -108,6 +112,10 @@ impl AutoCommitReservationToken {
 /// Dropping the last guard releases the key's provisional occupancy and enables
 /// reclamation retries. Durable membership and pending prepare reservations
 /// for the same key remain unchanged.
+///
+/// The owner creates this guard when accepting a poll result, after any disk
+/// completion has crossed the inbox. Local request entries or replication
+/// continuations retain it. It never enters a shard channel.
 #[derive(Debug)]
 pub struct AutoCommitReservation {
     token: Rc<AutoCommitReservationToken>,

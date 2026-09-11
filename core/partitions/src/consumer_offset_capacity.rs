@@ -260,6 +260,10 @@ impl ConsumerOffsetCapacity {
 
     /// Check capacity and hold a provisional claim for one automatic commit.
     /// Requests sharing a key share occupancy but retain independent guards.
+    ///
+    /// Keep the capacity check and token acquisition in one owner operation.
+    /// Splitting them across owner turns could let two new keys claim the last
+    /// available slot, even with atomic counters.
     pub(crate) fn reserve_provisional(
         &self,
         id: u32,
