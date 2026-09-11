@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_sdk"
-version = "0.4.0-edge.4"
+version = "0.4.0-edge.5"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 license = "Apache-2.0"
@@ -67,6 +67,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# `test-util` is not part of `full`; the retry tests need its paused time.
+tokio = { workspace = true, features = ["full", "test-util"] }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

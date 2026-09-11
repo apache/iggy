@@ -203,6 +203,14 @@ impl Operation {
         self.is_metadata() || matches!(self, Self::Register | Self::Logout)
     }
 
+    /// Whether a consensus plane claims this operation. Anything else the plane
+    /// chain drops in its `()` terminator, so entry paths must refuse it first.
+    #[must_use]
+    #[inline]
+    pub const fn is_plane_routable(&self) -> bool {
+        self.is_metadata_plane() || self.is_partition()
+    }
+
     /// Operations clients are allowed to send directly.
     #[must_use]
     #[inline]
@@ -367,5 +375,37 @@ mod tests {
         assert!(!Operation::TruncatePartition.is_client_allowed());
         assert!(Operation::StoreConsumerOffset.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
+    }
+
+    /// Every operation belongs to exactly one plane, or to the short list
+    /// answered before the chain. Walks `is_known_code` so a new variant fails
+    /// here rather than on the first frame carrying it.
+    #[test]
+    fn unroutable_operations_are_listed() {
+        // Answered earlier: `Reserved` by `validate_request_fields`,
+        // `NonReplicated` by the reads router, `DeleteSegments` by resolution to
+        // `TruncatePartition` (`server::dispatch::classify`).
+        const UNROUTABLE: [Operation; 3] = [
+            Operation::Reserved,
+            Operation::NonReplicated,
+            Operation::DeleteSegments,
+        ];
+
+        for code in 0..=u8::MAX {
+            if !Operation::is_known_code(code) {
+                continue;
+            }
+            let operation: Operation = bytemuck::checked::cast(code);
+            assert!(
+                !(operation.is_metadata_plane() && operation.is_partition()),
+                "{operation:?} is claimed by both planes; the chain takes the first"
+            );
+            assert_eq!(
+                operation.is_plane_routable(),
+                !UNROUTABLE.contains(&operation),
+                "{operation:?}: is_plane_routable={} disagrees with the unroutable list",
+                operation.is_plane_routable(),
+            );
+        }
     }
 }

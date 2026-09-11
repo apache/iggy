@@ -104,6 +104,16 @@ where
             return;
         };
         let partitions = shard.plane.partitions();
+        if partitions.with_partition(
+            &namespace,
+            partitions::IggyPartition::requires_state_transfer,
+        ) == Some(true)
+        {
+            let _ = reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+            return;
+        }
         match read {
             PartitionRead::Poll { consumer, args } => {
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {
@@ -911,6 +921,11 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                     stored: Some(stored_offset),
                     current_offset,
                 }) => build_consumer_offset_body(partition_id, current_offset, stored_offset),
+                Some(PartitionReadReply::Rejected(error)) => {
+                    send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                        .await;
+                    return;
+                }
                 _ => Bytes::new(),
             }
         }
@@ -1366,6 +1381,7 @@ where
             );
             return Err(IggyError::TransientNotAccepted);
         }
+        Some(PartitionReadReply::Rejected(error)) => return Err(error),
         other => {
             debug!(
                 client_id,
@@ -1393,7 +1409,8 @@ mod tests {
     use crate::dispatch::test_support::{
         SpyBus, TestMux, TestShard, prepare_message, request_message, test_shard,
     };
-    use iggy_binary_protocol::ReplyHeader;
+    #[cfg(target_os = "linux")]
+    use consensus::Sequencer;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
@@ -1401,6 +1418,7 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
+    use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader};
     use iggy_binary_protocol::{WireName, WireOptions, WirePartitioning};
     use iggy_common::Identifier;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
@@ -1409,12 +1427,118 @@ mod tests {
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
     use server_common::sharding::ShardId;
-    use shard::metrics::ShardMetrics;
+    use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
     use shard::shards_table::PapayaShardsTable;
     use shard::{
         LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology, ShardFrame,
         ShardIdentity, shard_channel,
     };
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn checkpoint_index_failure_is_returned_by_the_same_partition_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = SpyBus::default();
+        let shard = test_shard(&bus, 0, 3, 1);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = consensus::VsrConsensus::new(
+            1,
+            0,
+            3,
+            namespace.inner(),
+            bus,
+            consensus::LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = partitions::IggyPartition::with_in_memory_storage(
+            std::sync::Arc::new(iggy_common::PartitionStats::default()),
+            consensus,
+            shard.plane.partitions().config().segment_size,
+        );
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            durability: iggy_common::Durability::Persisted,
+            preallocate_segments: Some(false),
+            ..Default::default()
+        });
+        partition.set_partition_dir(root.path().to_string_lossy().into_owned());
+        let capacity = journal::partition_journal::PARTITION_WAL_BYTES_MAX;
+        let (persistence, prepares) = partitions::PartitionPersistence::open_with_capacity(
+            &root.path().join("prepares-0"),
+            namespace.inner(),
+            0,
+            journal::durable_storage::DiskStorage,
+            capacity,
+            false,
+        )
+        .await
+        .unwrap();
+        partition
+            .open_persistence_with_recovered(capacity, Some((Rc::clone(&persistence), prepares)))
+            .await
+            .unwrap();
+
+        let mut messages = server_common::send_messages::IggyMessages::with_capacity(1);
+        messages.push(server_common::send_messages::IggyMessage {
+            header: server_common::send_messages::IggyMessageHeader::default(),
+            payload: Bytes::from_static(b"checkpoint"),
+            user_headers: None,
+        });
+        let batch =
+            server_common::send_messages::SendMessagesOwned::from_messages(namespace, &messages)
+                .unwrap();
+        let mut body = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut body);
+        body[iggy_binary_protocol::batch::BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let prepare = prepare_message(Operation::SendMessages, 1, 1, &body).transmute_header(
+            |original, header: &mut PrepareHeader| {
+                *header = original;
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.checksum = header.identity_checksum();
+            },
+        );
+        let checksum = prepare.header().checksum;
+        persistence
+            .append(prepare.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .unwrap();
+        partition.log.journal_mut().info.messages_count = 1;
+        partition.log.journal_mut().info.size = iggy_common::IggyByteSize::from(body.len() as u64);
+        partition.consensus().sequencer().set_sequence(1);
+        partition.consensus().set_last_prepare_checksum(checksum);
+        partition.consensus().restore_commit_state(1, 1);
+        partition.log.index_writers_mut()[0] = Some(Rc::new(
+            partitions::IggyIndexWriter::new(
+                "/dev/full",
+                Rc::new(std::sync::atomic::AtomicU64::new(0)),
+                false,
+                false,
+            )
+            .await
+            .unwrap(),
+        ));
+        persistence.request_checkpoint();
+        assert!(partition.needs_persistence_checkpoint());
+        assert!(partition.fatal().is_none());
+        shard.plane.partitions().insert(namespace, partition);
+
+        let fault = shard
+            .tick_partitions(&mut Vec::new())
+            .await
+            .expect("the checkpoint fault must be returned in its originating sweep");
+        assert_eq!(fault.namespace_raw, namespace.inner());
+        assert_eq!(fault.op, 1);
+        assert_eq!(fault.operation, Operation::SendMessages);
+        assert_eq!(persistence.checkpoint_op(), 0);
+    }
 
     #[compio::test]
     async fn given_invalid_partition_writes_when_resolving_should_preserve_offset_error_codes() {
@@ -1715,8 +1839,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -1842,8 +1965,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -1889,6 +2011,120 @@ mod tests {
         );
     }
 
+    /// A request no plane claims must be denied at the shard boundary, not left
+    /// to the chain terminator and the client's read-timeout. `DeleteSegments`
+    /// is the live example: dispatch resolves it to `TruncatePartition`, so it
+    /// satisfies neither plane predicate. The deny is permanent -- a transient
+    /// code is what the SDK replays.
+    #[compio::test]
+    async fn unroutable_operation_must_reply_denied_not_silence() {
+        const TRANSPORT: u128 = 91;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let shard = Rc::new(TestShard::without_inbox(
+            ShardIdentity::new(0, "unroutable-operation-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+        ));
+
+        let request = request_message(Operation::DeleteSegments, TRANSPORT, SESSION, 1, &[]);
+        shard.on_message(MessageBag::Request(request)).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            1,
+            "a request no plane claims must be answered, not absorbed in silence"
+        );
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT, "reply must target the request's client");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::InvalidCommand.as_code(),
+            "the deny must be permanent; a transient status has the SDK replay it"
+        );
+    }
+
+    /// The replicated halves of the same hole. A prepare or an ack whose
+    /// operation no plane claims reaches the same terminator, and there is no
+    /// client to answer, so the counter and the log are the only record. Dropping
+    /// it is the only option: nothing journals or acks an operation no plane
+    /// owns.
+    #[compio::test]
+    async fn unroutable_replicated_frames_must_be_dropped_and_counted() {
+        const TRANSPORT: u128 = 91;
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let unroutable_drops = || {
+            shard
+                .metrics()
+                .frame_drop_count(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE)
+        };
+
+        let prepare = prepare_message(Operation::DeleteSegments, TRANSPORT, 1, &[]);
+        shard.on_message(MessageBag::Prepare(prepare)).await;
+        assert_eq!(
+            unroutable_drops(),
+            1,
+            "a prepare no plane claims must be counted, not absorbed by the chain"
+        );
+
+        shard
+            .on_message(MessageBag::PrepareOk(prepare_ok_message(
+                Operation::DeleteSegments,
+                1,
+            )))
+            .await;
+        assert_eq!(
+            unroutable_drops(),
+            2,
+            "an ack no plane claims must be counted, not absorbed by the chain"
+        );
+
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "replicated frames answer nobody on this node"
+        );
+    }
+
+    /// Bare `PrepareOk` for the routing guard: only `operation`, `group` and `op`
+    /// are read before the plane chain, so the rest stays zeroed.
+    fn prepare_ok_message(operation: Operation, op: u64) -> Message<PrepareOkHeader> {
+        let header_size = size_of::<PrepareOkHeader>();
+        let mut msg = Message::<PrepareOkHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<PrepareOkHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes form a valid PrepareOkHeader");
+        header.command = Command::PrepareOk;
+        header.size = u32::try_from(header_size).expect("ack size fits u32");
+        header.operation = operation;
+        header.op = op;
+        header.group = server_common::sharding::METADATA_GROUP;
+        msg
+    }
+
     /// A send parked for a namespace that is torn down before materialising
     /// (create -> delete before the reconciler's `InsertOwned`) is discarded
     /// on `ConfirmRemove`. The discard must stage the same retriable
@@ -1908,8 +2144,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,

@@ -45,6 +45,7 @@ members = [
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
+    "core/connectors/sinks/rabbitmq_sink",
     "core/connectors/sinks/redshift_sink",
     "core/connectors/sinks/s3_sink",
     "core/connectors/sinks/stdout_sink",
@@ -201,13 +202,13 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
 iceberg-storage-opendal = "0.10.1"
-iggy = { path = "core/sdk", version = "0.11.0-edge.7" }
-iggy-cli = { path = "core/cli", version = "0.14.0-edge.7" }
+iggy = { path = "core/sdk", version = "0.11.0-edge.8" }
+iggy-cli = { path = "core/cli", version = "0.14.0-edge.8" }
 iggy-gateway-kafka = { path = "gateways/kafka" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.7" }
-iggy_common = { path = "core/common", version = "0.11.0-edge.7" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.8" }
+iggy_common = { path = "core/common", version = "0.11.0-edge.8" }
 iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.4" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.5" }
 indexmap = "2.14.1"
 integration = { path = "core/integration" }
 ipnet = "2.12.1"
@@ -216,6 +217,7 @@ js-sys = "0.3"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 kafka-protocol = { version = "0.18.0", default-features = false, features = ["broker"] }
 keyring-core = "1.0.0"
+lapin = "2.5.1"
 lazy_static = "1.5.0"
 # Pinned exactly: `metadata::stm::stream`'s keyed stats evictions lean on
 # left-right draining the previous batch's `absorb_second` before the current

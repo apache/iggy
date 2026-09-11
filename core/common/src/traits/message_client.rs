@@ -100,9 +100,9 @@ pub trait MessageClient {
     /// A reported `base_offset` is where the batch's first message landed, with
     /// two limits. Delivery is at-least-once, so an earlier retry may already
     /// have committed the same batch at a lower offset and the value never
-    /// implies uniqueness. A batch is confirmed once it is committed in memory,
-    /// not once it is fsynced, so a crash-restart can stamp a later batch with
-    /// an offset a client has already recorded.
+    /// implies uniqueness. Confirmation follows VSR quorum commit. Persisted
+    /// message durability also requires recoverable stable-storage copies on
+    /// the quorum.
     async fn send_messages(
         &self,
         stream_id: &Identifier,

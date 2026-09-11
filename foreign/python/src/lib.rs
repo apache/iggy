@@ -18,6 +18,7 @@
 pub mod client;
 mod config;
 mod consumer;
+mod durability;
 mod duration;
 mod identifier;
 mod options;
@@ -54,7 +55,8 @@ use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 
 /// Python client for Apache Iggy, the persistent message streaming platform.
 #[pymodule]
-fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    durability::Durability::register(py, m)?;
     m.add_class::<SendMessage>()?;
     m.add_class::<SendMessagesResponse>()?;
     m.add_class::<SendMessagesConfirmation>()?;

@@ -31,6 +31,7 @@ use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
 use std::future::poll_fn;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
@@ -285,6 +286,20 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
+        if let Some(sender) = self.senders.get(self.id as usize).cloned() {
+            let metrics = self.metrics.clone();
+            self.plane
+                .partitions()
+                .set_persistence_notifier(Rc::new(move |completion| {
+                    let frame = LifecycleFrame::PartitionPersistenceCompleted(completion);
+                    if let Err(error) = sender.try_send(ShardFrame::lifecycle(frame)) {
+                        metrics.record_frame_drop(
+                            frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
+                            crate::coordinator::classify_try_send_err(&error),
+                        );
+                    }
+                }));
+        }
         // Reused across every pump iteration; pre-size to skip the
         // first-drain reallocation.
         let mut loopback_buf = Vec::with_capacity(64);
@@ -532,6 +547,15 @@ where
         })
     }
 
+    /// `first_partition_commit_fault` for the simulator's lost-wakeup
+    /// tripwire: a fenced pump and a missed wake both leave frames undrained, and
+    /// only the second is a channel bug. Test/simulator only, like `inbox_len`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fenced_partition_fault(&self) -> Option<FatalCommit> {
+        self.first_partition_commit_fault()
+    }
+
     /// Sanity check at pump entry: every Consensus frame routed through
     /// [`Self::dispatch`] must land on the shard whose `id` matches the
     /// `target_shard` the sender stamped on the frame. The ctor
@@ -752,6 +776,12 @@ where
                         shard = self.id,
                         "metadata commit tick received before reconciler handler installed; dropping"
                     );
+                }
+            }
+            LifecycleFrame::PartitionPersistenceCompleted(completion) => {
+                let namespace = IggyNamespace::from_raw(completion.group);
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    partition.on_persistence_completed(completion).await;
                 }
             }
             LifecycleFrame::ReconcileApply => {

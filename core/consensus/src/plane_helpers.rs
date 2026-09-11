@@ -129,7 +129,7 @@ where
     header.op <= consensus.commit_min()
 }
 
-/// Shared chain-replication forwarding to the next replica.
+/// Shared chain-replication forwarding, skipping disconnected replicas.
 ///
 /// Borrows the message, makes a deep copy for the wire, and lets the caller
 /// retain ownership for journal append.
@@ -137,8 +137,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the prepare cannot be routed or the bus cannot deliver
-/// it to the next replica.
-/// Callers decide error policy (VSR retransmits from WAL via prepare timeout).
+/// it to a connected replica before the end of the chain.
+/// Other transport errors remain covered by VSR prepare retransmission.
 #[allow(clippy::future_not_send)]
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
@@ -152,20 +152,22 @@ where
         return Ok(());
     };
     let frozen = message.deep_copy().into_generic().into_frozen();
-    consensus
-        .message_bus()
-        .send_to_replica(next, frozen)
-        .await
-        .map_err(Into::into)
+    forward_to_connected_replica(
+        consensus,
+        frozen,
+        next,
+        consensus.primary_index(message.header().view),
+    )
+    .await
 }
 
 /// Forward an already validated frozen prepare to the next replica without
-/// copying its payload.
+/// copying its payload, skipping disconnected replicas.
 ///
 /// # Errors
 ///
 /// Returns an error if the frame is malformed, cannot be routed, or the bus
-/// cannot deliver it to the next replica.
+/// cannot deliver it to a connected replica before the end of the chain.
 #[allow(clippy::future_not_send)]
 pub async fn replicate_frozen_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
@@ -179,11 +181,42 @@ where
     let Some(next) = replication_target(consensus, &header)? else {
         return Ok(());
     };
-    consensus
-        .message_bus()
-        .send_to_replica(next, message)
-        .await
-        .map_err(Into::into)
+    forward_to_connected_replica(
+        consensus,
+        message,
+        next,
+        consensus.primary_index(header.view),
+    )
+    .await
+}
+
+#[allow(clippy::future_not_send)]
+async fn forward_to_connected_replica<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    message: Frozen<MESSAGE_ALIGN>,
+    mut next: u8,
+    primary: u8,
+) -> Result<(), ChainReplicationError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    loop {
+        match consensus
+            .message_bus()
+            .send_to_replica(next, message.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error @ (SendError::ReplicaNotConnected(_) | SendError::ConnectionClosed)) => {
+                next = (next + 1) % consensus.replica_count();
+                if next == primary {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn frozen_prepare_header(
@@ -433,10 +466,48 @@ where
     false
 }
 
+/// Whether a repair session may still run.
+///
+/// `Normal` is the ordinary case. The exception is a primary-elect that parked a
+/// merged log: its repair runs in `ViewChange` by design, because the log it is
+/// repairing toward is one nobody has started yet. Reading `is_normal` alone at an
+/// ingest site drops the frame AND the session, so the coverage scan re-arms every
+/// tick and nothing it fetches can ever land.
+///
+/// Every site that fences a repair session on status must use this, so the arming
+/// side and the ingest side cannot drift apart.
+pub fn repair_session_live<B, P>(consensus: &VsrConsensus<B, P>) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    consensus.is_normal()
+        || (consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view()))
+}
+
 /// Drain and return committable prepares from the pipeline head.
 ///
-/// Entries are drained only from the head and only while their op is covered
-/// by the current commit frontier.
+/// Entries are drained from the head, while covered by the commit frontier, and
+/// only as a contiguous run starting at the next op owed to the state machine.
+///
+/// Callers `advance_commit_min` per entry, so a run starting above
+/// `commit_min + 1` or breaking partway hits that counter's sequential-advance
+/// assert. Pipeline-side twin of `commit_journal`'s gap-stop.
+///
+/// Reported, not asserted: a promoted partition primary reaches it legitimately
+/// while its journal walk clears the apply backlog. Repair arms on the level, and
+/// a hold that never clears fails the simulator's contiguity invariant.
+///
+/// Do NOT read that as "the journal walk always finishes". It can stall on the
+/// partition plane: `committed_headers_from` reads resident headers only, while
+/// `commit_messages` evicts up to `commit_max` (the cluster frontier), so ops past
+/// the per-call cap can be flushed out from under the walk. Pre-existing; see
+/// `IggyPartition::collect_committable_from_journal`.
+///
+/// A head at or below `commit_min` is the other shape: applied already, no repair
+/// owed, only a pop that can no longer happen. The journal walks stop below the
+/// head so they cannot create it, but a `set_commit_floor` jump past a live
+/// pipeline still can, so it is logged apart rather than treated as impossible.
 ///
 /// # Panics
 /// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
@@ -446,11 +517,23 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
+    let commit_min = consensus.commit_min();
     let mut drained = Vec::new();
 
     consensus.with_pipeline_mut(|pipeline| {
+        let mut next = commit_min + 1;
         while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
             if head_op > commit {
+                break;
+            }
+            if head_op != next {
+                report_uncommittable_head(
+                    consensus.replica(),
+                    head_op,
+                    commit_min,
+                    commit,
+                    drained.len(),
+                );
                 break;
             }
 
@@ -458,6 +541,7 @@ where
                 .pop()
                 .expect("drain_committable_prefix: head exists");
             drained.push(entry);
+            next += 1;
         }
     });
 
@@ -473,7 +557,8 @@ where
     drained
 }
 
-/// Header of the pipeline head, iff its op is covered by the commit frontier.
+/// Header of the pipeline head, iff its op is the next one this replica owes its
+/// state machine and is covered by the commit frontier.
 ///
 /// Peek-only counterpart of [`drain_committable_prefix`] for commit paths that
 /// must survive their driving future being canceled between "committable" and
@@ -482,15 +567,68 @@ where
 /// revalidates that the head is still this exact entry before popping and
 /// applying it. A driver dropped at an await strands nothing; a sibling driver
 /// that committed the op first fails the caller's revalidation and re-peeks.
+///
+/// Bounded below for the reason [`drain_committable_prefix`] is, and reported
+/// rather than asserted for the same one. Holding is safe: a shard pump's panic is
+/// swallowed by `compio::runtime::spawn`, while `tick_metadata` re-arms repair on
+/// the level.
 pub fn peek_committable_head<B, P>(consensus: &VsrConsensus<B, P>) -> Option<PrepareHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
-    consensus
+    let commit_min = consensus.commit_min();
+    let head = consensus
         .pipeline_head_header()
-        .filter(|header| header.op <= commit)
+        .filter(|header| header.op <= commit)?;
+    if head.op != commit_min + 1 {
+        report_uncommittable_head(consensus.replica(), head.op, commit_min, commit, 0);
+        return None;
+    }
+    Some(head)
+}
+
+/// Log a held pipeline head, with the remedy for the arm it is in.
+///
+/// `debug`, not `warn`, matching `tick_partitions` / `tick_metadata`: a hold is the
+/// steady state for a whole rejoin, so `warn` is one line per group per tick. A
+/// hold that never clears is caught by a simulator invariant, not by this line.
+pub fn report_uncommittable_head(
+    replica: u8,
+    head_op: u64,
+    commit_min: u64,
+    commit_max: u64,
+    drained: usize,
+) {
+    if head_op > commit_min {
+        tracing::debug!(
+            replica,
+            head_op,
+            expected_op = commit_min + 1,
+            commit_min,
+            commit_max,
+            drained,
+            "committable head sits above a hole in the committed prefix; holding the commit \
+             walk until the ops below it are journaled"
+        );
+    } else {
+        // Reported, not called a defect: a commit-floor jump reaches this state
+        // legitimately. `IggyMetadata`'s state-transfer install and
+        // `IggyPartition::complete_repair` both raise `commit_min` past a live
+        // pipeline via `set_commit_floor` without the `clear_pipeline` the
+        // partition transfer path pairs with it. Nothing pops a head below the
+        // floor, so it holds until a view change clears the pipeline.
+        tracing::warn!(
+            replica,
+            head_op,
+            commit_min,
+            commit_max,
+            drained,
+            "committable head sits at or below the applied commit point; nothing can pop \
+             or answer this entry until a view change clears the pipeline"
+        );
+    }
 }
 
 /// Build reply for a committed prepare.
@@ -800,7 +938,8 @@ pub fn repaired_frontier_update(
 /// consensus is sans-io and cannot consult the journal itself, so the plane
 /// that owns the journal must vouch that this exact prepare is durable before
 /// the ack leaves. `false` withholds the ack; the primary's retransmit
-/// re-drives it once a later persist succeeds.
+/// re-drives it once a later persist succeeds. Returns `true` only after the
+/// acknowledgment is queued for delivery.
 ///
 /// # Panics
 /// - If `header.command` is not `Command::Prepare`.
@@ -810,22 +949,23 @@ pub async fn send_prepare_ok<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
     is_persisted: bool,
-) where
+) -> bool
+where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     assert_eq!(header.command, Command::Prepare);
 
     if consensus.status() != Status::Normal {
-        return;
+        return false;
     }
 
     if consensus.is_transferring() {
-        return;
+        return false;
     }
 
     if !is_persisted {
-        return;
+        return false;
     }
 
     assert!(
@@ -836,7 +976,7 @@ pub async fn send_prepare_ok<B, P>(
     );
 
     if header.op > consensus.sequencer().current_sequence() {
-        return;
+        return false;
     }
 
     let prepare_ok_header = PrepareOkHeader {
@@ -867,7 +1007,7 @@ pub async fn send_prepare_ok<B, P>(
 
     consensus
         .send_or_loopback(primary, message.into_generic())
-        .await;
+        .await
 }
 
 #[cfg(test)]
@@ -1168,6 +1308,118 @@ mod tests {
     }
 
     #[test]
+    fn given_disconnected_chain_peers_when_forwarding_should_reach_the_next_peer_immediately() {
+        for frozen in [false, true] {
+            for (replica, count, view, disconnected, expected) in [
+                (0, 3, 0, vec![1], 2),
+                (1, 3, 1, vec![2], 0),
+                (2, 5, 1, vec![3, 4], 0),
+            ] {
+                let consensus =
+                    VsrConsensus::new(1, replica, count, 0, SpyBus::new(), LocalPipeline::new());
+                consensus.init();
+                let bus = consensus.message_bus();
+                for peer in &disconnected {
+                    bus.failures
+                        .borrow_mut()
+                        .insert(*peer, SendError::ReplicaNotConnected(*peer));
+                }
+                let message = prepare_message(1, 0, 42).transmute_header(
+                    |old, header: &mut PrepareHeader| {
+                        *header = old;
+                        header.view = view;
+                    },
+                );
+                let result = if frozen {
+                    let prepare = message.deep_copy().into_frozen();
+                    let pointer = prepare.as_slice().as_ptr();
+                    let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+                        &consensus, prepare,
+                    ));
+                    if let Some((_, sent)) = bus.sent.borrow().first() {
+                        assert_eq!(
+                            sent.as_slice().as_ptr(),
+                            pointer,
+                            "forwarding must not copy the payload"
+                        );
+                    }
+                    result
+                } else {
+                    futures::executor::block_on(replicate_to_next_in_chain(&consensus, &message))
+                };
+                result.expect("a disconnected peer must not delay forwarding to the live suffix");
+                assert_eq!(
+                    bus.attempts.borrow().as_slice(),
+                    [disconnected, vec![expected]].concat()
+                );
+                let sent = bus.sent.borrow();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].0, expected);
+                assert_eq!(sent[0].1.as_slice(), message.as_slice());
+                assert_eq!(
+                    consensus.commit_max(),
+                    0,
+                    "forwarding is not an acknowledgement"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_chain_boundary_when_forwarding_should_never_wrap_to_the_primary() {
+        for (replica, count, connected, expected_attempts) in [
+            (0, 3, true, vec![1]),
+            (0, 3, false, vec![1, 2]),
+            (1, 3, false, vec![2]),
+            (2, 3, false, vec![]),
+            (0, 1, false, vec![]),
+        ] {
+            let consensus =
+                VsrConsensus::new(1, replica, count, 0, SpyBus::new(), LocalPipeline::new());
+            consensus.init();
+            consensus.message_bus().reject_sends.set(!connected);
+            let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+                &consensus,
+                prepare_message(1, 0, 42).into_frozen(),
+            ));
+            assert_eq!(result.is_ok(), connected || expected_attempts.is_empty());
+            assert_eq!(
+                *consensus.message_bus().attempts.borrow(),
+                expected_attempts
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_transport_error_when_forwarding_should_skip_only_disconnected_peers() {
+        for error in [
+            SendError::ConnectionClosed,
+            SendError::Backpressure,
+            SendError::ReplicaRouteMissing(1),
+            SendError::ReplicaForwardFailed(1),
+            SendError::BusShuttingDown,
+        ] {
+            let skip = matches!(error, SendError::ConnectionClosed);
+            let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
+            consensus.init();
+            consensus
+                .message_bus()
+                .failures
+                .borrow_mut()
+                .insert(1, error);
+            let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+                &consensus,
+                prepare_message(1, 0, 42).into_frozen(),
+            ));
+            assert_eq!(result.is_ok(), skip);
+            assert_eq!(
+                consensus.message_bus().attempts.borrow().as_slice(),
+                if skip { &[1, 2][..] } else { &[1][..] },
+            );
+        }
+    }
+
+    #[test]
     fn given_committed_prepare_when_selecting_replication_target_should_reject() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
@@ -1332,6 +1584,41 @@ mod tests {
         (header, body)
     }
 
+    /// A DVC carrying `op` and `commit` only. Abstention: counts toward the
+    /// view-change quorum, says nothing about any op.
+    fn dvc_numbers_only(
+        replica: u8,
+        view: u32,
+        log_view: u32,
+        op: u64,
+        commit: u64,
+    ) -> (iggy_binary_protocol::DoViewChangeHeader, Body) {
+        use iggy_binary_protocol::DoViewChangeHeader;
+
+        let headers: Vec<PrepareHeader> = Vec::new();
+        let body = encode_body(&headers);
+        let header = DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: u32::try_from(std::mem::size_of::<DoViewChangeHeader>() + body.len())
+                .expect("synthetic DVC frame fits u32"),
+            view,
+            release: 0,
+            command: Command::DoViewChange,
+            replica,
+            reserved_frame: [0; 66],
+            op,
+            commit,
+            group: 0,
+            log_view,
+            reserved: [0; 68],
+            nack_bitset: 0,
+            present_bitset: 0,
+        };
+        (header, body)
+    }
+
     /// Headers for `low..=high`, high-to-low as a suffix requires, sealed and
     /// chained the way a real producer writes them.
     ///
@@ -1395,6 +1682,116 @@ mod tests {
         consensus.set_local_dvc_suffix(crate::dvc_merge::suffix_all_present(headers));
     }
 
+    /// The replica that prepared the head is gone for good, one survivor holds its
+    /// header without the body and the other never had it. Both survivors are
+    /// outside the ack set, so the op is truncated and the view starts. Counting the
+    /// header-only sender as neither copy nor nack instead waits for the crashed
+    /// replica forever.
+    #[test]
+    fn given_a_crashed_body_holder_when_merging_should_truncate_and_start_the_view() {
+        // View 3 of 3 replicas elects this one.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        // Bit 0 is op 4: its header, never journaled.
+        let local = suffix_headers(2, 4, 0);
+        consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(local, 0, 0b110));
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
+
+        // Replica 1 stops at op 3. Replica 2 held the only body and never reports.
+        let (dvc, body) = dvc_with_suffix(1, 3, 0, 3, 2, None);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        let pending = consensus
+            .pending_view_log()
+            .expect("two senders outside op 4's ack set decide it without replica 2");
+        assert_eq!(
+            pending.op_head, 3,
+            "op 4 never committed, so it is truncated"
+        );
+        assert_eq!(pending.commit_max, 2);
+    }
+
+    /// The shard's refresh, gate included: it re-reads the journal only when the
+    /// snapshot no longer describes it (`refresh_metadata_dvc_suffix`).
+    fn refresh_local_suffix_if_stale(
+        consensus: &VsrConsensus<NoopBus, LocalPipeline>,
+        journal: crate::view_change_quorum::DvcSuffix,
+    ) {
+        if consensus.local_dvc_suffix_stale() {
+            consensus.set_local_dvc_suffix(journal);
+        }
+    }
+
+    /// A backup that adopted a `StartView` sits at the announced head with the
+    /// bodies still missing, so repair filling one moves neither the head nor the
+    /// commit point. Tag the snapshot by those two alone and it keeps reading as
+    /// current, which the merge takes as proof this replica never journaled the op.
+    #[test]
+    fn given_a_repaired_body_under_an_unmoved_head_when_tagging_should_read_the_snapshot_stale() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        let headers = suffix_headers(2, 4, 0);
+        consensus
+            .set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(headers, 0, 0b110));
+        assert!(!consensus.local_dvc_suffix_stale());
+
+        consensus.note_journal_mutation();
+
+        assert!(
+            consensus.local_dvc_suffix_stale(),
+            "the head and the commit point did not move, so only the journal counter \
+             can report the body landing"
+        );
+        assert!(
+            consensus.local_dvc_suffix().is_empty(),
+            "a snapshot that no longer describes the log must nack nothing"
+        );
+    }
+
+    /// The same op, carried through the merge: once the refresh is allowed to run,
+    /// this replica offers op 4's body and the peer that never prepared it is one
+    /// nack short of the quorum, so the view starts keeping the op it acked.
+    #[test]
+    fn given_a_repaired_body_under_an_unmoved_head_when_merging_should_keep_the_acked_op() {
+        // View 3 of 3 replicas elects this one.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        // Adopted the view's header for op 4, body still being repaired.
+        let headers = suffix_headers(2, 4, 0);
+        consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(
+            headers.clone(),
+            0,
+            0b110,
+        ));
+        // Repair journals the body and this replica acks it: a replication quorum
+        // with the primary, so op 4 is committed even though nobody's commit point
+        // has caught up yet.
+        consensus.note_journal_mutation();
+        refresh_local_suffix_if_stale(&consensus, crate::dvc_merge::suffix_all_present(headers));
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
+
+        // Replica 1's log stops at op 3, an explicit nack for op 4. Replica 2 is the
+        // crashed primary and never reports.
+        let (dvc, body) = dvc_with_suffix(1, 3, 0, 3, 2, None);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        let pending = consensus
+            .pending_view_log()
+            .expect("op 4 is servable from this replica, so the view can start");
+        assert_eq!(
+            pending.op_head, 4,
+            "one nack cannot discard an op this replica journaled and acked"
+        );
+    }
+
     #[test]
     fn given_an_undecidable_quorum_when_a_later_dvc_decides_it_should_start_the_view() {
         // Reaching a view-change quorum is not the same as deciding a log. Latching
@@ -1414,10 +1811,9 @@ mod tests {
 
         let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 5));
 
-        // Two peers report, reaching the quorum of 3. All three hold op 4's header,
-        // none can serve its body, and two replicas have yet to report.
+        // Two peers abstain, reaching the quorum of 3 and leaving op 4 one nack short.
         for replica in [1u8, 2] {
-            let (dvc, body) = dvc_with_suffix(replica, 5, 0, 4, 2, Some(4));
+            let (dvc, body) = dvc_numbers_only(replica, 5, 0, 4, 2);
             let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
             assert!(actions.is_empty());
         }
@@ -1923,14 +2319,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn send_prepare_ok_reports_transport_failure_and_can_be_retried() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, SpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        let header = PrepareHeader {
+            command: Command::Prepare,
+            cluster: 1,
+            checksum: 42,
+            ..Default::default()
+        };
+        consensus.message_bus().reject_sends.set(true);
+        assert!(!futures::executor::block_on(send_prepare_ok(
+            &consensus, &header, true,
+        )));
+        assert!(consensus.message_bus().sent.borrow().is_empty());
+
+        consensus.message_bus().reject_sends.set(false);
+        assert!(futures::executor::block_on(send_prepare_ok(
+            &consensus, &header, true,
+        )));
+        assert_eq!(consensus.message_bus().sent.borrow().len(), 1);
+    }
+
     struct SpyBus {
         sent: std::cell::RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>,
+        reject_sends: std::cell::Cell<bool>,
+        failures: std::cell::RefCell<BTreeMap<u8, SendError>>,
+        attempts: std::cell::RefCell<Vec<u8>>,
     }
 
     impl SpyBus {
         fn new() -> Self {
             Self {
                 sent: std::cell::RefCell::new(Vec::new()),
+                reject_sends: std::cell::Cell::new(false),
+                failures: std::cell::RefCell::new(BTreeMap::new()),
+                attempts: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -1951,6 +2376,13 @@ mod tests {
             replica: u8,
             data: Frozen<MESSAGE_ALIGN>,
         ) -> Result<(), SendError> {
+            self.attempts.borrow_mut().push(replica);
+            if self.reject_sends.get() {
+                return Err(SendError::ReplicaNotConnected(replica));
+            }
+            if let Some(error) = self.failures.borrow_mut().remove(&replica) {
+                return Err(error);
+            }
             self.sent.borrow_mut().push((replica, data));
             Ok(())
         }
@@ -1991,10 +2423,64 @@ mod tests {
         assert_eq!(sent[0].0, 1);
     }
 
+    /// `advance_commit_min` is strictly sequential, so draining op 7 with 6 never
+    /// applied panics the shard pump. Both gates must hold instead.
+    #[test]
+    fn given_a_hole_below_the_head_when_committing_should_hold_both_gates() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(5, 5);
+
+        // Op 6 never arrived; 7 and 8 did, and the cluster committed through 8.
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(7, 0, 70));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(8, 70, 80));
+        consensus.advance_commit_max(8);
+
+        assert!(
+            peek_committable_head(&consensus).is_none(),
+            "the head is covered by the frontier but op 6 is not applied"
+        );
+        assert!(
+            drain_committable_prefix(&consensus).is_empty(),
+            "the drain must hold on the same hole the peek does"
+        );
+        assert_eq!(
+            consensus.pipeline_head_header().map(|header| header.op),
+            Some(7),
+            "holding must not consume the entry"
+        );
+    }
+
+    /// The shape the journal-walk caps prevent. Both gates must still refuse it:
+    /// re-applying an applied op panics `advance_commit_min`.
+    #[test]
+    fn given_an_applied_head_when_committing_should_refuse_it() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(4, 4);
+
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(5, 0, 50));
+        consensus.advance_commit_max(6);
+        // The journal walk got there first and applied 5 and 6 out of the WAL.
+        consensus.advance_commit_min(5);
+        consensus.advance_commit_min(6);
+
+        assert!(
+            peek_committable_head(&consensus).is_none(),
+            "op 5 is already applied; re-applying it panics advance_commit_min"
+        );
+        assert!(
+            drain_committable_prefix(&consensus).is_empty(),
+            "the drain must refuse an applied head too"
+        );
+    }
+
     #[test]
     fn drains_only_up_to_commit_frontier_even_without_quorum_flags() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
+        // Pipeline opens at op 5, so the state machine must already be through 4.
+        consensus.restore_commit_state(4, 4);
 
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(5, 0, 50));
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(6, 50, 60));
