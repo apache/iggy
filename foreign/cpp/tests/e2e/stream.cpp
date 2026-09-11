@@ -547,9 +547,9 @@ TEST_F(E2E_Stream, GetStreamsConsistentWithGetStream) {
     }
     ASSERT_FALSE(list_name.empty()) << "Stream '" << stream_name << "' not found in get_streams result";
 
-    auto single        = client.GetStream(iggy::Identifier::String(stream_name));
-    auto single_name   = single.Name();
-    auto single_topics = single.TopicsCount();
+    auto single             = client.GetStream(iggy::Identifier::String(stream_name));
+    const auto &single_name = single.Name();
+    auto single_topics      = single.TopicsCount();
 
     EXPECT_EQ(list_name, single_name);
     EXPECT_EQ(list_id, single.Id());
@@ -671,8 +671,8 @@ TEST_F(E2E_Stream, PurgeStreamPreservesStreamMetadata) {
     ASSERT_EQ(stream_after_purge.Topics().size(), stream_with_messages.Topics().size());
 
     for (const auto &topic : stream_after_purge.Topics()) {
-        const std::string topic_name = topic.Name();
-        const auto metadata_it       = topics_before_purge.find(topic_name);
+        const auto &topic_name = topic.Name();
+        const auto metadata_it = topics_before_purge.find(topic_name);
         ASSERT_NE(metadata_it, topics_before_purge.end());
         const auto &metadata = metadata_it->second;
         EXPECT_EQ(topic.Id(), metadata.id);
@@ -707,7 +707,7 @@ TEST_F(E2E_Stream, PurgeStreamRemovesMessagesAndPreservesTopics) {
     bool first_topic_found        = false;
     bool second_topic_found       = false;
     for (const auto &topic : created_stream.Topics()) {
-        const std::string topic_name = topic.Name();
+        const auto &topic_name = topic.Name();
         if (topic_name == first_topic_name) {
             first_topic_id    = topic.Id();
             first_topic_found = true;
@@ -810,7 +810,7 @@ TEST_F(E2E_Stream, PurgeStreamAcrossMultipleTopicsAndPartitionsClearsEverything)
     bool first_topic_found        = false;
     bool second_topic_found       = false;
     for (const auto &topic : created_stream.Topics()) {
-        const std::string topic_name = topic.Name();
+        const auto &topic_name = topic.Name();
         if (topic_name == first_topic_name) {
             first_topic_id    = topic.Id();
             first_topic_found = true;

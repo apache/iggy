@@ -384,8 +384,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
                                         make_numeric_identifier(1), "offset", 0, 100, false);
 
     ASSERT_EQ(polled.count, 3u);
-    for (std::size_t i = 0; i < polled.messages.size(); i++) {
-        EXPECT_EQ(polled.messages[i].id_lo, 99u);
+    for (const auto &message : polled.messages) {
+        EXPECT_EQ(message.id_lo, 99u);
     }
 }
 

@@ -1659,7 +1659,7 @@ TEST_F(LowLevelE2E_Client, ChangePasswordWithInvalidNewPasswordThrows) {
     iggy::ffi::Client *client      = GetLoggedInClient();
     const auto user_id             = make_string_identifier("iggy");
     const std::string old_password = "iggy";
-    const std::string too_short    = "";
+    const std::string too_short;
     const std::string too_long(256, 'a');
 
     ASSERT_THROW(client->change_password(user_id, old_password, too_short), std::exception);
