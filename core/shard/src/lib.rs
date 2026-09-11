@@ -1434,7 +1434,7 @@ where
     /// Includes a sender to self so that local routing goes through the
     /// same channel path as remote routing.
     ///
-    /// [`assert_sender_ordering`] is invoked in the ctor so `senders[i]`
+    /// [`validate_sender_ordering`] runs during construction so `senders[i]`
     /// is guaranteed to feed the shard whose `id == i`. Call sites can
     /// therefore index by `target_shard` without re-checking.
     senders: Vec<TaggedSender>,
@@ -8909,9 +8909,9 @@ where
     /// `Normal` because its window comes from the live commit frontier. This window
     /// comes from the parked merged log, so it runs in `ViewChange` for the replica
     /// that parked it. Without it the coverage scan in
-    /// [`Self::start_pending_partition_view`] reports an op nothing ever fetches --
-    /// the sweep's gap detector needs `probe.normal` too -- and only the
-    /// view-change timeout moves the replica.
+    /// [`Self::advance_pending_partition_view`] reports an op that nothing fetches.
+    /// The sweep's gap detector also requires `probe.normal`, so only the view
+    /// change timeout moves the replica.
     ///
     /// `avoid` is the peer a stall just gave up on, so rotation lands on a
     /// different sender instead of the head of the same list.
@@ -10310,7 +10310,7 @@ where
 
 /// Snapshot a partition's uncommitted suffix into its consensus.
 ///
-/// Same contract as [`Self::refresh_metadata_dvc_suffix`]. The partition journal
+/// Same contract as [`refresh_metadata_dvc_suffix`]. The partition journal
 /// is in-memory only, so after a restart it reads empty and this replica votes
 /// all-nack: correct, since the ops really are lost and the merge needs a peer
 /// that still holds them.

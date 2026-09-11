@@ -272,13 +272,16 @@ impl PipelineEntry {
 /// Identity and capacity held by a pending automatic commit.
 #[derive(Debug)]
 pub struct AutoCommitRequestContext {
+    /// History accepted with the poll, which must still match at promotion.
     pub history: PollHistoryId,
+    /// Keeps this request's consumer key occupied through promotion and staging.
     pub reservation: AutoCommitReservation,
 }
 
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
+    /// Automatic commit context owned by this entry until promotion or removal.
     auto_commit: Option<AutoCommitRequestContext>,
     pub message: Message<RoutedRequestHeader>,
     /// When the request was parked, in microseconds from the consensus-injected
@@ -303,6 +306,8 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    /// Build an automatic commit entry that owns its capacity guard.
+    /// The context must match the consumer key encoded in `message`.
     #[must_use]
     pub fn with_auto_commit(
         message: Message<RoutedRequestHeader>,
@@ -313,10 +318,13 @@ impl RequestEntry {
         entry
     }
 
+    /// Transfer the context without dropping its reservation.
+    /// Promotion must retain the returned context through replication staging.
     pub const fn take_auto_commit(&mut self) -> Option<AutoCommitRequestContext> {
         self.auto_commit.take()
     }
 
+    /// Inspect the context without acquiring another reservation.
     #[must_use]
     pub const fn auto_commit(&self) -> Option<&AutoCommitRequestContext> {
         self.auto_commit.as_ref()
@@ -760,6 +768,8 @@ impl LocalPipeline {
     }
 
     /// Remove pending requests while preserving the order of those retained.
+    /// Removed entries drop their reply senders and automatic commit reservations.
+    /// Prepare entries are unaffected.
     pub fn retain_requests(&mut self, mut keep: impl FnMut(&RequestEntry) -> bool) {
         self.request_queue.retain(|request| keep(request));
     }

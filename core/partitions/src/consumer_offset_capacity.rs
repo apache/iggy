@@ -173,7 +173,9 @@ pub struct ConsumerOffsetCapacity {
     kind: ConsumerKind,
     limit: Cell<usize>,
     pending: RefCell<HashMap<u32, usize>>,
+    /// Tokens cached by consumer key, which may outlive their last request guard.
     provisional: RefCell<HashMap<u32, Rc<AutoCommitReservationToken>>>,
+    /// Tokens that still have guards, excluding inactive entries in the cache.
     active_provisional_keys: Rc<Cell<usize>>,
     stranded: RefCell<HashSet<u32>>,
     uncertain: Cell<bool>,
@@ -256,6 +258,8 @@ impl ConsumerOffsetCapacity {
         Ok(())
     }
 
+    /// Check capacity and hold a provisional claim for one automatic commit.
+    /// Requests sharing a key share occupancy but retain independent guards.
     pub(crate) fn reserve_provisional(
         &self,
         id: u32,
@@ -277,6 +281,8 @@ impl ConsumerOffsetCapacity {
         Ok(token.acquire())
     }
 
+    /// Check that the guard belongs to this tracker's current token for its key.
+    /// Matching consumer identifiers cannot validate a guard from another tracker.
     pub(crate) fn owns(&self, reservation: &AutoCommitReservation) -> bool {
         reservation.kind() == self.kind
             && self

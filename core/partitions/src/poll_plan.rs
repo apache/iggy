@@ -153,19 +153,28 @@ pub struct DiskSegment {
     pub(crate) sealed: bool,
 }
 
+/// Admission inputs carried by a read without access to consumer progress maps.
 #[derive(Debug)]
 pub struct PollContext {
+    /// History captured at planning, which must still match at completion.
     pub(crate) history: PollHistoryId,
+    /// Consumer or group whose progress the owner may update after admission.
     pub(crate) consumer: PollingConsumer,
+    /// For nonempty results, whether to advance the stored offset locally.
+    /// Group `last_polled` progress also advances when this is false.
     pub(crate) auto_commit: bool,
 }
 
 /// An owned read result awaiting validation by the partition owner.
+/// Finishing I/O does not authorize a successful reply or a progress update.
 #[derive(Debug)]
 pub struct PollReadResult {
     pub(crate) context: PollContext,
+    /// Selected message bytes, which remain unaccepted until owner validation.
     pub(crate) fragments: PollFragments,
+    /// Partition message frontier captured at planning, not consumer progress.
     pub(crate) commit_offset: u64,
+    /// Inclusive offset of the last selected message, or `None` for no match.
     pub(crate) last_matching_offset: Option<u64>,
 }
 
@@ -210,8 +219,10 @@ impl ResidentTailSnapshot {
     }
 }
 
-/// Everything a poll needs, captured by `IggyPartition::build_poll_plan` (see
-/// module docs for the borrow contract).
+/// Owned read snapshot that may outlive the partition history it captured.
+///
+/// Execution yields a [`PollReadResult`] that the owner must accept through
+/// [`crate::IggyPartitions::complete_poll`] before replying or updating progress.
 pub struct PollPlan {
     /// Monotone high-water snapshot taken before the disk read, so it may lag a
     /// concurrent producer by the poll duration and self-corrects next poll.
@@ -229,6 +240,7 @@ impl PollPlan {
     }
 
     /// Read the captured snapshot without changing consumer progress.
+    /// The result still requires owner validation, including when it is empty.
     pub async fn execute(self) -> PollReadResult {
         let commit_offset = self.commit_offset;
         let (fragments, last_matching_offset) = match self.tier {
@@ -303,6 +315,10 @@ impl PollPlan {
     }
 
     /// Read a resident snapshot synchronously on the pump.
+    /// The returned result requires the same owner validation as a disk read.
+    ///
+    /// # Panics
+    /// Panics if [`Self::needs_off_pump_io`] is true.
     #[must_use]
     pub fn execute_resident(self) -> PollReadResult {
         let commit_offset = self.commit_offset;

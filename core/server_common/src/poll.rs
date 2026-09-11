@@ -22,6 +22,12 @@ use std::sync::Arc;
 use iggy_common::ConsumerKind;
 
 /// Identity of one serviceable message history. It is never serialized.
+///
+/// The allocation identifies the history even if a rebuilt partition reuses
+/// its namespace and offsets. Pending reads keep it alive, preventing address
+/// reuse while they can still complete. `Arc` also keeps completion frames
+/// `Send`, as required by the shard inbox.
+/// `Default` creates a fresh identity. Only clones compare equal.
 #[derive(Clone, Debug, Default)]
 pub struct PollHistoryId(Arc<()>);
 
@@ -34,16 +40,26 @@ impl PartialEq for PollHistoryId {
 impl Eq for PollHistoryId {}
 
 /// Lifetime accounting for one provisional consumer key.
+///
+/// Requests for the same key hold separate guards, so dropping one request
+/// cannot release capacity still held by another.
 #[derive(Debug)]
 pub struct AutoCommitReservationToken {
     kind: ConsumerKind,
     consumer_id: u32,
+    /// Shared change stamp advanced on the last guard drop to retry reclamation.
+    /// Wrapping is allowed.
     reclaim_epoch: Rc<Cell<u64>>,
+    /// Number of tokens with outstanding guards in this capacity tracker.
     active_keys: Rc<Cell<usize>>,
+    /// Outstanding guards for this key, excluding cached handles to the token.
     active: Cell<usize>,
 }
 
 impl AutoCommitReservationToken {
+    /// Create an inactive token using counters shared by one capacity tracker.
+    /// Reuse the token for concurrent reservations of the same key. Construction
+    /// neither checks the configured limit nor occupies capacity.
     #[must_use]
     pub fn new(
         kind: ConsumerKind,
@@ -60,6 +76,9 @@ impl AutoCommitReservationToken {
         }
     }
 
+    /// Hold this key until the returned guard is dropped.
+    /// The first guard increments the shared key count. Capacity admission must
+    /// already have succeeded before this call.
     #[must_use]
     pub fn acquire(self: &Rc<Self>) -> AutoCommitReservation {
         let active = self.active.get();
@@ -72,18 +91,23 @@ impl AutoCommitReservationToken {
         }
     }
 
+    /// Count outstanding guards, excluding cached handles to this token.
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.active.get()
     }
 
+    /// Test token identity, not just the consumer kind and ID.
     #[must_use]
     pub fn owns(self: &Rc<Self>, reservation: &AutoCommitReservation) -> bool {
         Rc::ptr_eq(self, &reservation.token)
     }
 }
 
-/// Holds a provisional key until its request is admitted or dropped.
+/// Guard for provisional capacity while a request waits or enters replication.
+/// Dropping the last guard releases the key's provisional occupancy and enables
+/// reclamation retries. Durable membership and pending prepare reservations
+/// for the same key remain unchanged.
 #[derive(Debug)]
 pub struct AutoCommitReservation {
     token: Rc<AutoCommitReservationToken>,

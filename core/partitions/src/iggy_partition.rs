@@ -217,6 +217,7 @@ where
     /// server down without the partition moving again in the meantime.
     fatal: Option<FatalCommit>,
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
+    /// Identity shared with pending polls and replaced when their history retires.
     poll_history: PollHistoryId,
     /// Committed consumer-offset membership and values. This is deliberately
     /// separate from the eager poll maps because follower-local and uncommitted
@@ -387,18 +388,25 @@ where
     }
 }
 
-/// Accepted data and work that the pump replicates after sending the reply.
+/// Read accepted by the owner, with any local progress updates already applied.
+/// Acceptance does not imply that its automatic offset commit is durable.
 #[derive(Debug)]
 pub struct PollCompletion {
+    /// Selected message bytes that the owner has authorized for the reply.
     pub fragments: PollFragments,
+    /// Partition message frontier from planning, which may now lag new commits.
     pub current_offset: u64,
+    /// Assigned prepare to replicate after releasing the reply. `None` can also
+    /// mean the automatic commit is queued and has no prepare slot yet.
     pub replication: Option<PollReplication>,
 }
 
 /// A prepare assigned by completion, with capacity held through journal staging.
 #[derive(Debug)]
 pub struct PollReplication {
+    /// Automatic offset commit with an operation number already assigned.
     prepare: Message<PrepareHeader>,
+    /// Keeps the consumer key reserved until replication stages the prepare.
     reservation: AutoCommitReservation,
 }
 
@@ -2611,7 +2619,7 @@ where
     /// must already have been appended to `self.log.journal` by the caller
     /// so `VsrAction::RetransmitPrepares` can recover it during a view
     /// change. The on-disk offset table is NOT touched here: persist runs
-    /// from [`apply_staged_consumer_offset_commit`] at commit-time so a
+    /// from [`Self::apply_staged_consumer_offset_commit`] at commit time so a
     /// view-change rollback of the in-memory pending entry also rolls
     /// back the disk write (by never having performed it).
     pub(crate) fn stage_consumer_offset_upsert(
@@ -2635,7 +2643,7 @@ where
     }
 
     /// Stage a consumer offset delete for the replicated op. See
-    /// [`stage_consumer_offset_upsert`] for the ordering contract.
+    /// [`Self::stage_consumer_offset_upsert`] for the ordering contract.
     ///
     /// Deliberately infallible: this runs on the replicated-apply path (every
     /// replica), where the offset may legitimately be absent (e.g. a backup
@@ -2859,11 +2867,17 @@ where
     }
 
     /// Accept a read only while its message history still belongs to this owner.
+    /// Validation, admission, and progress updates must stay in one synchronous
+    /// owner turn so purge or recovery cannot interleave between them.
+    /// Nonempty group reads update `last_polled` even without automatic commits.
+    /// Rejection leaves this read's progress unapplied.
     pub(crate) fn complete_poll(
         &mut self,
         result: PollReadResult,
     ) -> Result<PollCompletion, IggyError> {
         self.resynchronize_consumer_offset_reservations();
+        // Recovery can become necessary while disk I/O is pending, even if
+        // the history identity has not changed.
         if result.context.history != self.poll_history
             || self.fatal.is_some()
             || self.materialization_missing
@@ -2882,6 +2896,8 @@ where
                 )?;
                 let kind = pending.kind;
                 let consumer_id = pending.consumer_id;
+                // Admit before changing either progress map, or a rejected
+                // read could make the next poll skip its messages.
                 replication = self.admit_poll_auto_commit(kind, consumer_id, offset)?;
                 self.apply_local_poll_offset(kind, consumer_id, offset);
             }
@@ -2908,6 +2924,8 @@ where
         })
     }
 
+    /// Stage an assigned prepare and release its provisional capacity guard.
+    /// The owner releases the poll reply first because replica sends may wait.
     pub(crate) async fn replicate_poll_completion(&mut self, replication: PollReplication) {
         let PollReplication {
             prepare,
@@ -2917,6 +2935,10 @@ where
         drop(reservation);
     }
 
+    /// Invalidate after preflight, before replacing data or progress.
+    /// Preserve the identity when preflight leaves served state unchanged.
+    /// Queued automatic commits also belong to the old history, even when
+    /// their reads have already completed.
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.poll_history = PollHistoryId::default();
         self.discard_queued_auto_commits();
@@ -2928,6 +2950,10 @@ where
         });
     }
 
+    /// Admit an automatic commit without advancing this read's progress.
+    /// `Some` carries an assigned prepare. `None` means the request is queued,
+    /// the durable offset already covers it, or the current consensus role or
+    /// state cannot originate a prepare. Errors release any provisional guard.
     fn admit_poll_auto_commit(
         &self,
         kind: ConsumerKind,
@@ -2955,6 +2981,8 @@ where
             .reserve_provisional(consumer_id, &self.durable_consumer_offsets)
             .map_err(|error| self.poll_capacity_error(error))?;
         let request = self.build_poll_auto_commit_request(kind, consumer_id, offset)?;
+        // Automatic commits bypass the request handler, so check journal
+        // capacity here before queueing or assigning an operation.
         if self
             .persistence
             .as_ref()
@@ -3020,6 +3048,8 @@ where
         )
     }
 
+    /// Advance automatic progress without letting a slower read move it back.
+    /// Explicit offset stores retain their separate semantics and may rewind.
     fn apply_local_poll_offset(&self, kind: ConsumerKind, consumer_id: u32, offset: u64) {
         let existed = match kind {
             ConsumerKind::Consumer => self
@@ -4545,6 +4575,8 @@ where
                     )
                 });
             let context = req.take_auto_commit();
+            // History and capacity ownership can change while the request
+            // waits for a prepare slot, so admission alone is not sufficient.
             if context.as_ref().is_some_and(|context| {
                 context.history != self.poll_history
                     || !self

@@ -489,10 +489,14 @@ where
     }
 
     /// Validate and accept a poll synchronously on the owning pump.
+    /// Send the reply before driving any returned continuation through
+    /// [`Self::replicate_poll_completion`]. Success does not acknowledge a
+    /// durable offset commit.
     ///
     /// # Errors
-    /// Rejects a stale history, unavailable partition, exhausted consumer
-    /// capacity, or a full request queue without accepting consumer progress.
+    /// Rejects stale history, unavailable partition or admission state, invalid
+    /// consumer identifiers, and exhausted consumer, queue, or journal capacity.
+    /// Rejection does not accept progress from this read.
     pub fn complete_poll(
         &self,
         namespace: &IggyNamespace,
@@ -504,7 +508,10 @@ where
         partition.complete_poll(result)
     }
 
-    /// Continue an accepted poll's replication after its reply has been sent.
+    /// Drive an accepted poll's replication on the owning pump after its reply.
+    /// Use the continuation returned by [`Self::complete_poll`] for this namespace.
+    /// This call may suspend with a partition borrow, so it must remain on the
+    /// owning pump. A missing or tombstoned namespace drops the continuation.
     pub async fn replicate_poll_completion(
         &self,
         namespace: &IggyNamespace,

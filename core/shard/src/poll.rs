@@ -15,6 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Poll reads complete under the partition owner's control.
+//!
+//! 1. The owner snapshots the history identity and read resources.
+//! 2. Resident reads complete inline. Disk reads run in a detached task and
+//!    return their result through the owner's inbox.
+//! 3. The owner checks the history and recovery state, admits any automatic
+//!    commit, and updates consumer progress before releasing the reply.
+//!
+//! A disk read can yield while purge or state transfer replaces the history,
+//! even on the same shard thread. The detached task therefore cannot advance
+//! progress or authorize a successful reply. Completion validation and progress
+//! updates run synchronously on the owner, before any replication wait.
+
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::PartitionsHandle;
@@ -24,11 +37,17 @@ use message_bus::MessageBus;
 use partitions::{PollCompletion, PollPlan, PollReadResult};
 use server_common::sharding::IggyNamespace;
 
-/// A completed disk read awaiting validation by its partition owner.
+/// A read result awaiting acceptance by its partition owner.
+/// Disk tasks send it through the inbox. Resident reads pass it directly to
+/// the same completion handler.
 pub struct PollCompleted {
+    /// Namespace whose current partition must validate the captured history.
     namespace: IggyNamespace,
+    /// Snapshot facts that have not yet been accepted as consumer progress.
     result: PollReadResult,
+    /// Return path for the accepted read or a rejection.
     reply: Sender<PartitionReadReply>,
+    /// Inbox enqueue time for disk diagnostics, or `None` for resident completion.
     #[cfg(feature = "poll-diagnostics")]
     queued_at: Option<std::time::Instant>,
 }
@@ -39,6 +58,9 @@ where
     T: ShardsTable,
     SB: SuperblockStore,
 {
+    /// Execute a routed read on the partition owner's pump.
+    /// Partitions missing materialized data reject the read. Resident polls finish
+    /// inline. Disk polls return to the pump for acceptance after detached I/O.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_partition_read(
         &self,
@@ -131,6 +153,9 @@ where
         let _ = reply.try_send(result);
     }
 
+    /// Accept a read on the owner's pump, then attempt the reply before replication.
+    /// Replication may suspend. A closed reply channel does not cancel an
+    /// automatic commit that the owner has already admitted.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_poll_completed(&self, completion: PollCompleted) {
         let PollCompleted {
@@ -159,8 +184,9 @@ where
                 current_offset,
                 replication,
             }) => {
-                // Progress and operation assignment are settled before the reply;
-                // peer backpressure must not hold an admitted poll's reply hostage.
+                // The owner has admitted progress, but the offset may still be
+                // queued. Release the reply before waiting for replication.
+                // A poll reply does not acknowledge a durable offset commit.
                 let _ = reply.try_send(PartitionReadReply::Poll {
                     fragments,
                     current_offset,
@@ -181,6 +207,8 @@ where
     }
 }
 
+/// Read an owned snapshot without borrowing the partition or changing progress.
+/// The completion sender returns the result to the owner for acceptance.
 #[allow(clippy::future_not_send)]
 async fn read_poll(
     namespace: IggyNamespace,
@@ -212,13 +240,16 @@ mod completion {
     /// The read task can return bytes to the owner or reject a lost completion.
     /// The reply sender stays private so it cannot authorize successful reads.
     pub(super) struct PollCompletionSender {
+        /// Originating owner's inbox, whose absence causes a rejection.
         inbox: Option<TaggedSender>,
         namespace: IggyNamespace,
+        /// May be used here only to reject a result that cannot reach its owner.
         reply: Sender<PartitionReadReply>,
         metrics: ShardMetrics,
     }
 
     impl PollCompletionSender {
+        /// Bind the result and reply route to the shard that built the snapshot.
         pub(super) const fn new(
             inbox: Option<TaggedSender>,
             namespace: IggyNamespace,
@@ -233,6 +264,10 @@ mod completion {
             }
         }
 
+        /// Return the result to the owner without waiting for inbox capacity.
+        /// A missing, full, or disconnected inbox records a dropped completion
+        /// and attempts a `TransientNotAccepted` reply. Successful enqueueing
+        /// leaves the reply to the owner.
         pub(super) fn complete(self, result: PollReadResult) {
             let Some(inbox) = self.inbox else {
                 self.metrics.record_frame_drop(
