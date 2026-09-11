@@ -287,6 +287,51 @@ validate() {
   grep -q '^                  name: iggy-secrets$' "$HELM_RENDER_DIR/generated-secret.yaml"
   grep -q '^                  key: encryptionKey$' "$HELM_RENDER_DIR/generated-secret.yaml"
   test "$(grep -c '^kind: Secret$' "$HELM_RENDER_DIR/generated-secret.yaml")" -eq 2
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/generated-secret.yaml"
+  if grep -q 'name: IGGY_ENCRYPTION_' "$HELM_RENDER_DIR/generated-secret.yaml"; then
+    echo "Error: the pinned server image requires the legacy encryption variables" >&2
+    exit 1
+  fi
+
+  helm template iggy "$CHART_DIR" \
+    --set-string server.image.tag=0.9.0-edge.7 \
+    --set server.encryption.enabled=true \
+    --set server.encryption.existingSecret.name=shared-key \
+    > "$HELM_RENDER_DIR/legacy-encryption.yaml"
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/legacy-encryption.yaml"
+
+  helm template iggy "$CHART_DIR" \
+    --set-string server.image.tag=custom-flat \
+    --set server.encryption.enabled=true \
+    --set server.encryption.configVersion=flat \
+    --set server.encryption.existingSecret.name=shared-key \
+    > "$HELM_RENDER_DIR/flat-encryption.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/flat-encryption.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/flat-encryption.yaml"
+  if grep -q 'name: IGGY_SYSTEM_ENCRYPTION_' "$HELM_RENDER_DIR/flat-encryption.yaml"; then
+    echo "Error: a server with flat encryption config rejects legacy variables" >&2
+    exit 1
+  fi
+
+  helm template iggy "$CHART_DIR" \
+    --set-string server.image.tag=custom-legacy \
+    --set server.encryption.enabled=true \
+    --set server.encryption.configVersion=legacy \
+    --set server.encryption.existingSecret.name=shared-key \
+    > "$HELM_RENDER_DIR/custom-legacy-encryption.yaml"
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/custom-legacy-encryption.yaml"
+
+  for image_tag in custom-unknown 0.9.0-edge.8; do
+    assert_render_rejected "encryption config layout unknown for ${image_tag}" \
+      --set-string server.image.tag="$image_tag" \
+      --set server.encryption.enabled=true \
+      --set server.encryption.existingSecret.name=shared-key
+  done
+  assert_render_rejected "invalid encryption config layout" \
+    --set server.encryption.enabled=true \
+    --set server.encryption.configVersion=invalid \
+    --set server.encryption.existingSecret.name=shared-key
 
   assert_render_rejected "server.replicaCount=3" --set server.replicaCount=3
   assert_render_rejected "encryption without a key" --set server.encryption.enabled=true
@@ -455,7 +500,7 @@ server:
       value: "0.0.0.0:8080"
     - name: IGGY_WEBSOCKET_ADDRESS
       value: "0.0.0.0:8092"
-    - name: IGGY_SYSTEM_SHARDING_CPU_ALLOCATION
+    - name: IGGY_SHARDING_CPU_ALLOCATION
       value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
 ui:
   image:

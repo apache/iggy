@@ -26,7 +26,7 @@ Build and start a VSR server from a checkout of this repository:
 ```bash
 cargo build --bin iggy-server
 
-IGGY_SYSTEM_PATH=/tmp/iggy-go \
+IGGY_PATH=/tmp/iggy-go \
 IGGY_TCP_ADDRESS=127.0.0.1:8090 \
 IGGY_HTTP_ENABLED=false IGGY_QUIC_ENABLED=false IGGY_WEBSOCKET_ENABLED=false \
 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \

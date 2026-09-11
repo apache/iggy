@@ -20,7 +20,7 @@ use base64::{Engine as _, engine::general_purpose};
 use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    retry::{exponential_backoff, jitter, parse_duration},
+    retry::{parse_duration, retry_backoff},
     sink_connector,
 };
 use meilisearch_sdk::{
@@ -228,11 +228,7 @@ impl MeilisearchSink {
                         )));
                     }
                     retries += 1;
-                    let delay = jitter(exponential_backoff(
-                        self.config.retry_delay,
-                        retries,
-                        self.config.max_retry_delay,
-                    ));
+                    let delay = self.backoff(retries);
                     warn!(
                         "Meilisearch health check returned status '{}' (retry {}/{}). Retrying in {:?}...",
                         health.status, retries, self.config.max_open_retries, delay
@@ -246,11 +242,7 @@ impl MeilisearchSink {
                         return Err(map_sdk_error(error));
                     }
                     retries += 1;
-                    let delay = jitter(exponential_backoff(
-                        self.config.retry_delay,
-                        retries,
-                        self.config.max_retry_delay,
-                    ));
+                    let delay = self.backoff(retries);
                     warn!(
                         "Meilisearch health check failed (retry {}/{}): {}. Retrying in {:?}...",
                         retries, self.config.max_open_retries, error, delay
@@ -265,11 +257,7 @@ impl MeilisearchSink {
                         )));
                     }
                     retries += 1;
-                    let delay = jitter(exponential_backoff(
-                        self.config.retry_delay,
-                        retries,
-                        self.config.max_retry_delay,
-                    ));
+                    let delay = self.backoff(retries);
                     warn!(
                         "Meilisearch health check timed out after {:?} (retry {}/{}). Retrying in {:?}...",
                         self.config.timeout, retries, self.config.max_open_retries, delay
@@ -642,6 +630,16 @@ impl MeilisearchSink {
         )))
     }
 
+    /// Backoff before retry number `retry` (1-based), from the configured bounds.
+    ///
+    /// Only the delay is shared with the SDK. This connector's `max_retries` /
+    /// `max_open_retries` count retries *after* the first request, as the
+    /// README documents, unlike `RetryPolicy::max_attempts` which is a total.
+    /// Aligning them would silently cut every deployed budget by one.
+    fn backoff(&self, retry: u32) -> Duration {
+        retry_backoff(self.config.retry_delay, retry, self.config.max_retry_delay)
+    }
+
     async fn retry_sdk_operation<T, Fut, Op>(
         &self,
         operation: &str,
@@ -699,11 +697,7 @@ impl MeilisearchSink {
                         return Err(map_sdk_error(error));
                     }
                     retries += 1;
-                    let delay = jitter(exponential_backoff(
-                        self.config.retry_delay,
-                        retries,
-                        self.config.max_retry_delay,
-                    ));
+                    let delay = self.backoff(retries);
                     warn!(
                         "Meilisearch {operation} failed (retry {retries}/{max_retries}): {error}. Retrying in {delay:?}..."
                     );
@@ -721,11 +715,7 @@ impl MeilisearchSink {
                         )));
                     }
                     retries += 1;
-                    let delay = jitter(exponential_backoff(
-                        self.config.retry_delay,
-                        retries,
-                        self.config.max_retry_delay,
-                    ));
+                    let delay = self.backoff(retries);
                     warn!(
                         "Meilisearch {operation} timed out after {:?} (retry {retries}/{max_retries}). Retrying in {delay:?}...",
                         self.config.timeout

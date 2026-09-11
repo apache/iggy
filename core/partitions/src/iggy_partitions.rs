@@ -109,6 +109,7 @@ where
     /// suffice; callers must not hold a borrow across `.await`.
     tombstoned: RefCell<AHashSet<IggyNamespace>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
+    persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
     /// `insert` / `remove` can assert the partitions vec is never mutated
     /// while a sanctioned non-pump read borrow is outstanding. Cannot fire for
@@ -133,6 +134,7 @@ where
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            persistence_notifier: RefCell::new(None),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -148,9 +150,19 @@ where
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            persistence_notifier: RefCell::new(None),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
+    }
+
+    pub fn set_persistence_notifier(&self, notifier: crate::PersistenceNotifier) {
+        for namespace in self.namespaces() {
+            if let Some(partition) = self.get_by_ns(namespace) {
+                partition.set_persistence_notifier(Rc::clone(&notifier));
+            }
+        }
+        *self.persistence_notifier.borrow_mut() = Some(notifier);
     }
 
     pub const fn config(&self) -> &PartitionsConfig {
@@ -238,6 +250,9 @@ where
             0,
             "IggyPartitions::insert while a with_partition borrow is live"
         );
+        if let Some(notifier) = self.persistence_notifier.borrow().as_ref() {
+            partition.set_persistence_notifier(Rc::clone(notifier));
+        }
         partition.publish_current_offset();
         partition.set_consumer_group_offsets_reconcile_epoch(Rc::clone(
             &self.consumer_group_offsets_reconcile_epoch,
@@ -790,7 +805,6 @@ mod tests {
             Arc::new(PartitionStats::default()),
             consensus,
             IggyByteSize::from(1024 * 1024),
-            false,
         )
     }
 
@@ -812,7 +826,6 @@ mod tests {
             Arc::new(PartitionStats::default()),
             consensus,
             IggyByteSize::from(1024 * 1024),
-            false,
         )
     }
 

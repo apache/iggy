@@ -104,6 +104,16 @@ where
             return;
         };
         let partitions = shard.plane.partitions();
+        if partitions.with_partition(
+            &namespace,
+            partitions::IggyPartition::requires_state_transfer,
+        ) == Some(true)
+        {
+            let _ = reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+            return;
+        }
         match read {
             PartitionRead::Poll { consumer, args } => {
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {
@@ -911,6 +921,11 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                     stored: Some(stored_offset),
                     current_offset,
                 }) => build_consumer_offset_body(partition_id, current_offset, stored_offset),
+                Some(PartitionReadReply::Rejected(error)) => {
+                    send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                        .await;
+                    return;
+                }
                 _ => Bytes::new(),
             }
         }
@@ -1366,6 +1381,7 @@ where
             );
             return Err(IggyError::TransientNotAccepted);
         }
+        Some(PartitionReadReply::Rejected(error)) => return Err(error),
         other => {
             debug!(
                 client_id,
@@ -1393,6 +1409,8 @@ mod tests {
     use crate::dispatch::test_support::{
         SpyBus, TestMux, TestShard, prepare_message, request_message, test_shard,
     };
+    #[cfg(target_os = "linux")]
+    use consensus::Sequencer;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
@@ -1415,6 +1433,112 @@ mod tests {
         LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology, ShardFrame,
         ShardIdentity, shard_channel,
     };
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn checkpoint_index_failure_is_returned_by_the_same_partition_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = SpyBus::default();
+        let shard = test_shard(&bus, 0, 3, 1);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = consensus::VsrConsensus::new(
+            1,
+            0,
+            3,
+            namespace.inner(),
+            bus,
+            consensus::LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = partitions::IggyPartition::with_in_memory_storage(
+            std::sync::Arc::new(iggy_common::PartitionStats::default()),
+            consensus,
+            shard.plane.partitions().config().segment_size,
+        );
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            durability: iggy_common::Durability::Persisted,
+            preallocate_segments: Some(false),
+            ..Default::default()
+        });
+        partition.set_partition_dir(root.path().to_string_lossy().into_owned());
+        let capacity = journal::partition_journal::PARTITION_WAL_BYTES_MAX;
+        let (persistence, prepares) = partitions::PartitionPersistence::open_with_capacity(
+            &root.path().join("prepares-0"),
+            namespace.inner(),
+            0,
+            journal::durable_storage::DiskStorage,
+            capacity,
+            false,
+        )
+        .await
+        .unwrap();
+        partition
+            .open_persistence_with_recovered(capacity, Some((Rc::clone(&persistence), prepares)))
+            .await
+            .unwrap();
+
+        let mut messages = server_common::send_messages::IggyMessages::with_capacity(1);
+        messages.push(server_common::send_messages::IggyMessage {
+            header: server_common::send_messages::IggyMessageHeader::default(),
+            payload: Bytes::from_static(b"checkpoint"),
+            user_headers: None,
+        });
+        let batch =
+            server_common::send_messages::SendMessagesOwned::from_messages(namespace, &messages)
+                .unwrap();
+        let mut body = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut body);
+        body[iggy_binary_protocol::batch::BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let prepare = prepare_message(Operation::SendMessages, 1, 1, &body).transmute_header(
+            |original, header: &mut PrepareHeader| {
+                *header = original;
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.checksum = header.identity_checksum();
+            },
+        );
+        let checksum = prepare.header().checksum;
+        persistence
+            .append(prepare.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .unwrap();
+        partition.log.journal_mut().info.messages_count = 1;
+        partition.log.journal_mut().info.size = iggy_common::IggyByteSize::from(body.len() as u64);
+        partition.consensus().sequencer().set_sequence(1);
+        partition.consensus().set_last_prepare_checksum(checksum);
+        partition.consensus().restore_commit_state(1, 1);
+        partition.log.index_writers_mut()[0] = Some(Rc::new(
+            partitions::IggyIndexWriter::new(
+                "/dev/full",
+                Rc::new(std::sync::atomic::AtomicU64::new(0)),
+                false,
+                false,
+            )
+            .await
+            .unwrap(),
+        ));
+        persistence.request_checkpoint();
+        assert!(partition.needs_persistence_checkpoint());
+        assert!(partition.fatal().is_none());
+        shard.plane.partitions().insert(namespace, partition);
+
+        let fault = shard
+            .tick_partitions(&mut Vec::new())
+            .await
+            .expect("the checkpoint fault must be returned in its originating sweep");
+        assert_eq!(fault.namespace_raw, namespace.inner());
+        assert_eq!(fault.op, 1);
+        assert_eq!(fault.operation, Operation::SendMessages);
+        assert_eq!(persistence.checkpoint_op(), 0);
+    }
 
     #[compio::test]
     async fn given_invalid_partition_writes_when_resolving_should_preserve_offset_error_codes() {
@@ -1715,8 +1839,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -1842,8 +1965,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -1907,8 +2029,6 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -2024,8 +2144,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,

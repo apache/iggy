@@ -86,7 +86,7 @@ type ProfileMap = FigmentMap<Profile, Dict>;
 ///
 /// # Example
 /// ```ignore
-/// let provider = TypedEnvProvider::<ServerConfig>::new("IGGY_", &["IGGY_SYSTEM_ENCRYPTION_KEY"]);
+/// let provider = TypedEnvProvider::<ServerConfig>::new("IGGY_", &["IGGY_ENCRYPTION_KEY"]);
 /// ```
 #[derive(Debug, Clone)]
 pub struct TypedEnvProvider<T: ConfigEnvMappings> {

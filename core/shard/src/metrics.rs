@@ -34,7 +34,7 @@
 //! compio reactor contexts. Each shard owns its own instance, and the server
 //! exposes every shard's instance through the `[http.metrics]` scrape
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
-//! sub-registry per shard); every drop site also logs via `tracing`.
+//! sub-registry per shard). Drop-site tracing supplements the counters.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -113,6 +113,7 @@ pub mod frame_drop_variant {
     /// status and no frame of the client's was dropped, so counting it with
     /// shed frames would read as a routing loss.
     pub const PARTITION_AUTO_COMMIT: &str = "partition_auto_commit";
+    pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -161,7 +162,7 @@ pub mod frame_drop_reason {
 // pair enters the `Family` (and therefore the scrape) the first time a drop
 // site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 8;
+const VARIANT_COUNT: usize = 9;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -173,6 +174,7 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::METADATA_COMMIT_TICK,
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
     frame_drop_variant::PARTITION_AUTO_COMMIT,
+    frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
@@ -222,6 +224,15 @@ const fn consumer_kind_index(kind: ConsumerKind) -> usize {
 /// resolved at scrape time via the per-shard registry, not as a label.
 #[derive(Clone)]
 pub struct ShardMetrics {
+    partition_wal_disk_bytes: Gauge,
+    partition_wal_retained_bytes: Gauge,
+    partition_wal_queued_bytes: Gauge,
+    partition_wal_in_flight_bytes: Gauge,
+    partition_wal_checkpoints_pending: Gauge,
+    partition_wal_batches: Counter,
+    partition_wal_prepares: Counter,
+    partition_wal_checkpoints: Counter,
+    partition_wal_errors: Counter,
     frame_drops_total: Family<FrameDropLabel, Counter>,
     cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
     partitions_materialised_total: Counter,
@@ -282,6 +293,15 @@ impl ShardMetrics {
             .clone();
         let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
+            partition_wal_disk_bytes: Gauge::default(),
+            partition_wal_retained_bytes: Gauge::default(),
+            partition_wal_queued_bytes: Gauge::default(),
+            partition_wal_in_flight_bytes: Gauge::default(),
+            partition_wal_checkpoints_pending: Gauge::default(),
+            partition_wal_batches: Counter::default(),
+            partition_wal_prepares: Counter::default(),
+            partition_wal_checkpoints: Counter::default(),
+            partition_wal_errors: Counter::default(),
             frame_drops_total,
             cached_counters,
             partitions_materialised_total: Counter::default(),
@@ -302,6 +322,72 @@ impl ShardMetrics {
             partition_consumer_offsets_stranded,
             consumer_offset_stranded_gauges,
         }
+    }
+
+    pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
+        self.partition_wal_disk_bytes
+            .set(i64::try_from(metrics.disk_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_retained_bytes
+            .set(i64::try_from(metrics.retained_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_queued_bytes
+            .set(i64::try_from(metrics.queued_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_in_flight_bytes
+            .set(i64::try_from(metrics.in_flight_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_checkpoints_pending
+            .set(i64::try_from(metrics.checkpoints_pending).unwrap_or(i64::MAX));
+        self.partition_wal_batches.inc_by(metrics.completed_batches);
+        self.partition_wal_prepares.inc_by(metrics.batched_prepares);
+        self.partition_wal_checkpoints
+            .inc_by(metrics.completed_checkpoints);
+        self.partition_wal_errors.inc_by(metrics.failed_writes);
+    }
+
+    fn register_persistence(&self, registry: &mut Registry) {
+        registry.register(
+            "partition_wal_disk_bytes",
+            "active partition WAL bytes",
+            self.partition_wal_disk_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_retained_bytes",
+            "retained partition prepare bytes charged to the WAL budget",
+            self.partition_wal_retained_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_queued_bytes",
+            "queued partition WAL bytes",
+            self.partition_wal_queued_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_in_flight_bytes",
+            "partition WAL bytes being written",
+            self.partition_wal_in_flight_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_checkpoints_pending",
+            "partition checkpoints awaiting storage completion",
+            self.partition_wal_checkpoints_pending.clone(),
+        );
+        registry.register(
+            "partition_wal_batches",
+            "completed partition WAL durability batches",
+            self.partition_wal_batches.clone(),
+        );
+        registry.register(
+            "partition_wal_prepares",
+            "prepares covered by completed partition WAL batches",
+            self.partition_wal_prepares.clone(),
+        );
+        registry.register(
+            "partition_wal_checkpoints",
+            "completed partition WAL checkpoints",
+            self.partition_wal_checkpoints.clone(),
+        );
+        registry.register(
+            "partition_wal_errors",
+            "partition WAL writer failures",
+            self.partition_wal_errors.clone(),
+        );
     }
 
     /// Best effort: counts explicit client denials read off the reply status
@@ -655,6 +741,7 @@ impl ShardMetrics {
     /// `_total` suffix; the prometheus text exposition appends it for
     /// counters.
     pub fn register(&self, registry: &mut Registry) {
+        self.register_persistence(registry);
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",
@@ -797,6 +884,30 @@ mod tests {
             metrics.frame_drops_value(),
             3,
             "the per-reason view must not disturb the total",
+        );
+    }
+
+    #[test]
+    fn persistence_scrape_distinguishes_retained_budget_from_wal_file_bytes() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_persistence(&partitions::PersistenceMetrics {
+            disk_bytes: 4096,
+            retained_bytes: 65536,
+            ..Default::default()
+        });
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_disk_bytes 4096")
+        );
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_retained_bytes 65536")
         );
     }
 
