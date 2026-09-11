@@ -378,7 +378,7 @@ fn create_bucket(minio_endpoint: &str) -> Result<(), TestBinaryError> {
             "--network=host",
             "-e",
             &format!("MC_HOST_minio={}", mc_host),
-            "minio/mc",
+            "quay.io/minio/mc",
             "mb",
             "--ignore-existing",
             &format!("minio/{}", MINIO_BUCKET),
@@ -418,7 +418,7 @@ async fn bucket_empty(minio_endpoint: &str) -> Result<bool, TestBinaryError> {
                 "--network=host",
                 "-e",
                 &format!("MC_HOST_minio={}", mc_host),
-                "minio/mc",
+                "quay.io/minio/mc",
                 "ls",
                 &format!("minio/{}", MINIO_BUCKET),
             ])
