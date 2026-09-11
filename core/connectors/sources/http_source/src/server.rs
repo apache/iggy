@@ -450,6 +450,17 @@ pub(crate) async fn serve_routes(instance: &Arc<SharedState>) {
     let listen_addr = &instance.config.listen_addr;
     let servers = SERVERS.lock().await;
     let Some(server) = servers.get(listen_addr) else {
+        // Not reachable through the ordinary lifecycle: this instance joined
+        // during `open`, an entry only leaves `SERVERS` when its last instance
+        // does, and the SDK stops the poll task before `close`. Said out loud
+        // anyway, because the state it describes is an instance whose poll
+        // task is running against a listener that is no longer bound, and it
+        // will serve nothing for as long as it lives. Returning quietly would
+        // leave no trace of that at all.
+        warn!(
+            "The {CONNECTOR_NAME} listener on {listen_addr} was gone when connector ID: {} first polled, so it has no routes to serve",
+            instance.id
+        );
         return;
     };
     if let Err(error) = server.state.publish(server.state.instances()) {
