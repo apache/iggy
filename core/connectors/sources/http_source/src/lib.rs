@@ -46,7 +46,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::{Admission, admit_endpoint};
 use crate::server::{INSTANCE_HEADER, RECEIVED_AT_HEADER, REMOTE_ADDR_HEADER};
-use crate::state::EndpointRegistry;
+use crate::state::{EndpointRegistry, MAX_ENDPOINTS};
 use crate::types::{EndpointId, QueuedMessage, unix_now_seconds};
 
 pub const CONNECTOR_NAME: &str = "HTTP source";
@@ -683,6 +683,26 @@ impl HttpSourceConfig {
                     "{field} must not be empty; omit it entirely to disable that guard"
                 )));
             }
+        }
+        // The registry ceiling is documented as a per-instance property, and
+        // until this it bounded only dynamic registration. A TOML file could
+        // put the registry above it before a single call was made, and past
+        // the cap the eviction arithmetic compounds: `try_insert` reclaims
+        // `len - MAX_ENDPOINTS + 1` tombstones to make room for one endpoint,
+        // so a registry well over the cap discards thousands of revocation
+        // records in a single registration. Nothing is resurrected by that,
+        // since static tombstones are never reclaimable, but the audit trail
+        // for who was revoked and why goes with them.
+        //
+        // Refused here rather than warned about, because a TOML file is
+        // something the operator can edit before the instance starts.
+        // `restore` only warns about the same ceiling, since a state file is
+        // not.
+        if self.endpoints.len() > MAX_ENDPOINTS {
+            return Err(Error::InvalidConfigValue(format!(
+                "endpoints declares {} entries, more than the {MAX_ENDPOINTS} an instance holds",
+                self.endpoints.len()
+            )));
         }
         let mut seen: BTreeSet<&EndpointId> = BTreeSet::new();
         for endpoint in &self.endpoints {
@@ -2368,6 +2388,24 @@ mod tests {
                 .shared
                 .poll_is_live(returned_at + POLL_LIVENESS_SECONDS + 1),
             "but a poll task the SDK stopped after five NACKs eventually goes stale, which is what stops readiness reporting ok"
+        );
+    }
+
+    #[test]
+    fn given_more_toml_endpoints_than_the_ceiling_when_validated_should_reject() {
+        // The ceiling is documented as a per-instance property, and it used to
+        // bound dynamic registration alone, so a TOML file could start an
+        // instance above it. Past the cap `try_insert` reclaims
+        // `len - MAX_ENDPOINTS + 1` tombstones to fit one endpoint, so the
+        // first registration discards revocation records in bulk.
+        let mut config = test_support::config(None, &[]);
+        config.endpoints = (0..=MAX_ENDPOINTS)
+            .map(|index| test_support::static_endpoint(&format!("{index:032x}")))
+            .collect();
+
+        assert!(
+            matches!(config.validate(), Err(Error::InvalidConfigValue(_))),
+            "a config declaring more endpoints than an instance holds must be refused"
         );
     }
 

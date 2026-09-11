@@ -277,6 +277,21 @@ impl EndpointRegistry {
         info!(
             "Restored registry for {CONNECTOR_NAME} connector ID: {connector_id}, static endpoints: {static_count}, dynamic endpoints: {restored}, revoked: {tombstones}"
         );
+        // Warned about, not refused. `validate` rejects a TOML file over the
+        // ceiling because an operator can edit that before starting; a state
+        // file is not editable without losing every tombstone in it, so
+        // failing here would take the instance down over a condition it has no
+        // supported way to clear. It serves, and the next registration pays
+        // for it: `try_insert` reclaims `len - MAX_ENDPOINTS + 1` tombstones
+        // to make room for one endpoint, so an over-full registry discards
+        // revocation records in bulk.
+        if endpoints.len() > MAX_ENDPOINTS {
+            warn!(
+                "Restored registry for {CONNECTOR_NAME} connector ID: {connector_id} holds {} endpoints, over the {MAX_ENDPOINTS} ceiling; it serves, but the next registration will reclaim {} revoked entries at once to make room",
+                endpoints.len(),
+                endpoints.len() - MAX_ENDPOINTS + 1
+            );
+        }
 
         Ok(EndpointRegistry { endpoints })
     }
@@ -598,6 +613,23 @@ mod tests {
             Some("whsec_dynamic"),
             "a redacted secret would reject every request the sender signs"
         );
+    }
+
+    /// One ceiling, two answers, and the asymmetry is deliberate. TOML is
+    /// something an operator can edit before starting, so an over-full one is
+    /// refused. A state file is not editable without losing every tombstone in
+    /// it, so an over-full one serves and warns instead of taking the instance
+    /// down over a condition with no supported way to clear it.
+    #[test]
+    fn given_more_endpoints_than_the_ceiling_when_restored_should_serve_them_anyway() {
+        let statics: Vec<_> = (0..=MAX_ENDPOINTS)
+            .map(|index| static_endpoint(&format!("{index:032x}")))
+            .collect();
+
+        let restored = EndpointRegistry::restore(&statics, None, 1)
+            .expect("an over-full registry must still serve rather than fail the open");
+
+        assert_eq!(restored.endpoints().count(), MAX_ENDPOINTS + 1);
     }
 
     #[test]

@@ -347,6 +347,8 @@ That is fine at the hundreds of endpoints this connector is sized for. A deploym
 
 The registry is capped at `MAX_ENDPOINTS` (10000) per instance. At the cap the oldest revoked dynamic entries are reclaimed to make room; revoked static ones never are, because their tombstone is what outranks TOML. A registration that finds nothing reclaimable is refused with 507.
 
+The cap bounds the file as well as the API. An `endpoints` list declaring more than that fails `open()` naming the count, since a TOML file is something you can edit before starting. A state file already holding more only warns, because clearing it means losing every tombstone in it, and an instance in that state serves normally until the next registration: reclaiming room for one endpoint discards as many revoked entries as the registry is over by, in one step.
+
 Recovering a revoked static endpoint means giving it a **new** `endpoint_id`. Editing `auth_secret` in TOML does nothing, because the tombstone outranks the file by design, and deleting the state file to clear one tombstone also drops every dynamic endpoint and every other revocation with it.
 
 Truncating the state file is the same act as deleting it, not a gentler one. The runtime reports an empty file as no state at all, which this connector cannot tell from a first boot, so it starts on the TOML alone and every revoked static endpoint serves again. It says so at startup: an instance that begins with static endpoints and no persisted registry logs a warning naming that outcome. A file that is corrupt rather than empty is refused instead, and the instance does not start.

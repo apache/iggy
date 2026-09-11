@@ -48,7 +48,10 @@ use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::{is_usable_secret, secrets_match, validate_bearer, validate_hmac};
+use crate::auth::{
+    MAX_AUTH_SECRET_LEN, MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN, is_usable_secret, secrets_match,
+    validate_bearer, validate_hmac,
+};
 use crate::metrics::{Metrics, PathKind, UNROUTED};
 use crate::routes::{Endpoint, EndpointOrigin, RouteLookup, RouteTable};
 use crate::types::{QueuedMessage, clamp_header_value, unix_now_seconds};
@@ -68,6 +71,34 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// `Retry-After` on a 429, in seconds. Named because a test asserts it and a
 /// bare literal in two places drifts.
 const RETRY_AFTER_SECONDS: &str = "1";
+
+/// Iggy holds a header key to 255 bytes, and an instance name becomes one, so
+/// that is the ceiling on the `instance` field of a registration.
+const MAX_INSTANCE_NAME_BYTES: usize = 255;
+
+/// Worst case growth from JSON escaping, where one byte becomes `\u00XX`.
+///
+/// The field caps are on decoded bytes, so the JSON carrying a legal value can
+/// be this much larger than the value itself.
+const JSON_ESCAPE_EXPANSION: usize = 6;
+
+/// Largest body the admin listener will read.
+///
+/// Its own ceiling rather than `max_body_size_bytes`, which bounds an inbound
+/// webhook and has a floor of 1. Sharing it meant any small webhook cap made
+/// registration and rotation impossible, answering `invalid request body`
+/// while naming neither the field nor the cause, and `ensure_compatible`
+/// refuses a join that disagrees on that knob, so it could not be raised for
+/// one instance to get out of it either. Rotation is the one that matters:
+/// `RotateRequest` carries only `auth_secret`, so what a low cap blocked was
+/// replacing a secret that had leaked.
+///
+/// Derived rather than picked, so raising a field cap cannot quietly
+/// reintroduce that. A registration is the largest legal body, and the
+/// kilobyte on top covers field names and punctuation.
+const MAX_ADMIN_BODY_SIZE_BYTES: usize = JSON_ESCAPE_EXPANSION
+    * (MAX_AUTH_SECRET_LEN + MAX_HMAC_HEADER_LEN + MAX_HMAC_PREFIX_LEN + MAX_INSTANCE_NAME_BYTES)
+    + 1024;
 
 /// How long a `join()` waits for a draining listener to release its address.
 /// Longer than [`SHUTDOWN_TIMEOUT`], since the drain it is waiting on is
@@ -415,7 +446,7 @@ impl SharedServer {
             )),
             tokio::spawn(run(
                 admin,
-                admin_router(state.clone(), config.max_body_size_bytes),
+                admin_router(state.clone()),
                 shutdown.subscribe(),
                 "admin",
             )),
@@ -569,15 +600,16 @@ fn public_router(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
-fn admin_router(state: Arc<ServerState>, max_body_size_bytes: usize) -> Router {
+fn admin_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/admin/health", get(handle_admin_health))
         .route("/admin/metrics", get(handle_admin_metrics))
         .merge(management::router(Arc::clone(&state)))
-        // Without this the admin listener silently used axum's 2 MiB default
-        // instead of the operator's cap, so the two listeners disagreed about
-        // how large a body they would read.
-        .layer(DefaultBodyLimit::max(max_body_size_bytes))
+        // Explicit, because axum's 2 MiB default is not a decision anyone
+        // made. Its own ceiling rather than the webhook cap: see
+        // [`MAX_ADMIN_BODY_SIZE_BYTES`] for why sharing that one broke
+        // rotation.
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE_BYTES))
         .with_state(state)
 }
 

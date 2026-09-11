@@ -202,9 +202,13 @@ async fn register_endpoint(
             return error_response(StatusCode::CONFLICT, "endpoint id collision");
         }
         InsertOutcome::Full => {
+            // The real length, not the ceiling. A registry restored from TOML
+            // or a state file can sit above the cap, and reporting the cap
+            // told an operator the registry was a size it was not.
             warn!(
-                "Registry for {CONNECTOR_NAME} connector ID: {instance_id} holds {MAX_ENDPOINTS} endpoints with no reclaimable tombstones, refusing the registration",
-                instance_id = instance.id
+                "Registry for {CONNECTOR_NAME} connector ID: {instance_id} holds {held} endpoints against a {MAX_ENDPOINTS} ceiling with no reclaimable tombstones, refusing the registration",
+                instance_id = instance.id,
+                held = instance.registry().endpoints().count()
             );
             return error_response(
                 StatusCode::INSUFFICIENT_STORAGE,
@@ -877,6 +881,46 @@ mod tests {
             "a flush is still owed, so nothing may be reported durable"
         );
         fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_a_tiny_webhook_cap_when_registering_at_the_field_caps_should_accept() {
+        // The control plane used to be measured against the webhook cap, whose
+        // floor is 1, so an operator who bounded inbound webhooks tightly could
+        // not register or rotate at all. `ensure_compatible` refuses a join
+        // that disagrees on that knob, so it could not be raised for one
+        // instance to get out of it either, and what it blocked was replacing
+        // a secret that had leaked.
+        let mut config = crate::test_support::config(Some("github"), &[ENDPOINT_ONE]);
+        config.listen_addr = format!("127.0.0.1:{}", free_port());
+        config.admin_listen_addr = format!("127.0.0.1:{}", free_port());
+        config.instance_name = Some("http_github".to_string());
+        config.management_token = Some(SecretString::from(TOKEN));
+        config.max_body_size_bytes = 1;
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = HttpSource::new(1, config, None);
+        source.open().await.expect("open must succeed");
+
+        let response = client()
+            .post(format!("{admin}/admin/endpoints"))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .json(&json!({
+                "instance": "http_github",
+                "auth_type": "hmac-sha256",
+                "auth_secret": "x".repeat(MAX_AUTH_SECRET_LEN),
+                "hmac_header": "X".repeat(MAX_HMAC_HEADER_LEN),
+                "hmac_prefix": "y".repeat(MAX_HMAC_PREFIX_LEN),
+            }))
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "a registration at the field caps must not be measured against the webhook cap"
+        );
+        source.close().await.expect("close must succeed");
     }
 
     #[tokio::test]
