@@ -15843,81 +15843,118 @@ mod purge_poll_tests {
         }
     }
 
+    /// Accepted group polls with messages update `last_polled` even with
+    /// automatic commits disabled. Purge clears that progress, so a read started
+    /// before purge must not restore it when its result arrives afterward.
     #[compio::test]
-    async fn given_group_disk_poll_without_auto_commit_when_purged_should_preserve_group_progress()
+    async fn given_pending_group_poll_without_auto_commit_when_purged_should_not_restore_progress()
     {
         Box::pin(assert_delayed_group_poll_preserves_progress()).await;
     }
 
     async fn assert_delayed_group_poll_preserves_progress() {
+        let group_id = 7;
+        let member_id = 1;
+        let auto_commit = false;
+        let validate_checksum = true;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+
+        // 1. Put three messages on disk and establish the group's old progress.
+        // The save threshold of one makes commit_journal write these messages
+        // to disk.
         let config = repair_config();
         let (_directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
-        let consumer = PollingConsumer::ConsumerGroup(7, 1);
-        for op in 1..=3 {
-            journal_send_batch(&mut partition, op).await;
+        for operation_number in 1..=3 {
+            journal_send_batch(&mut partition, operation_number).await;
         }
         partition.consensus().advance_commit_max(3);
         partition.commit_journal(&config).await;
 
-        assert_old_disk_reads(&mut partition, consumer).await;
-        assert_eq!(partition.group_offset_state(7), (Some(2), None));
+        // These accepted reads cache the file descriptor and record progress
+        // through offset 2, without committing a consumer offset.
+        accept_initial_disk_polls(&mut partition, consumer).await;
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, Some(2));
+        assert_eq!(committed, None, "automatic commits are disabled");
+
+        // 2. Start another read against the old file, leaving its future pending.
+        // Using an unsealed segment with a cached descriptor makes the first
+        // suspension the message read. The read keeps the old file open even
+        // after purge removes it from the partition's directory.
         assert_eq!(partition.log.segments().len(), 1);
         assert!(!partition.log.active_segment().sealed);
-        let read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
-        assert!(read_state.fd.borrow().is_some());
+        let old_segment_read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
+        assert!(old_segment_read_state.fd.borrow().is_some());
 
-        let delayed = partition.build_poll_plan(
+        let old_poll_plan = partition.build_poll_plan(
             consumer,
-            &PollingArgs::new(PollingStrategy::offset(0), 3, false),
-            true,
+            &PollingArgs::new(PollingStrategy::offset(0), 3, auto_commit),
+            validate_checksum,
         );
-        assert!(delayed.needs_off_pump_io());
-        let mut delayed = std::pin::pin!(delayed.execute());
-        // With the active segment's descriptor cached, the first suspension is
-        // the disk read. Its file clone survives purge unlinking the old inode.
+        assert!(old_poll_plan.needs_off_pump_io());
+        let mut old_disk_read = std::pin::pin!(old_poll_plan.execute());
         assert!(
-            futures::poll!(delayed.as_mut()).is_pending(),
+            futures::poll!(old_disk_read.as_mut()).is_pending(),
             "the group disk poll must suspend before purge",
         );
 
-        partition.purge(&config, 1).await.expect("purge partition");
-        assert_eq!(partition.applied_purge_generation(), 1);
-        assert_eq!(partition.group_offset_state(7), (None, None));
-        assert!(read_state.fd.borrow().is_none());
+        // 3. Purge removes the messages and clears both kinds of group progress.
+        let purge_generation = 1;
+        partition
+            .purge(&config, purge_generation)
+            .await
+            .expect("purge partition");
+        assert_eq!(partition.applied_purge_generation(), purge_generation);
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, None, "purge must clear group progress");
+        assert_eq!(committed, None);
+        assert!(old_segment_read_state.fd.borrow().is_none());
 
-        // Fresh offsets 0-4 make the stale last polled offset 2 valid again.
-        // Leave the old read unpolled until the replacement history is ready.
-        for op in 4..=8 {
-            journal_send_batch(&mut partition, op).await;
+        // 4. Write five replacement messages while leaving the old read unpolled.
+        // Consensus operation numbers continue at 4, but message offsets restart
+        // at 0. The old offset 2 is now in range again, so a bounds check alone
+        // cannot tell that the old read belongs to the deleted history.
+        for operation_number in 4..=8 {
+            journal_send_batch(&mut partition, operation_number).await;
         }
         partition.consensus().advance_commit_max(8);
         partition.commit_journal(&config).await;
         assert_eq!(partition.offsets().commit_offset, 4);
 
-        let old_result = delayed.await;
+        // 5. The old read returns real messages, but accepting its result must
+        // fail without restoring the group's progress over the new history.
+        let old_result = old_disk_read.await;
         assert_eq!(polled_offsets(&old_result.fragments), [0, 1, 2]);
         assert_eq!(old_result.last_matching_offset, Some(2));
-        let completion = partition.complete_poll(old_result);
+        let old_completion = partition.complete_poll(old_result);
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
         assert_eq!(
-            partition.group_offset_state(7),
-            (None, None),
-            "the stale completion must not restore group progress after purge",
+            last_polled, None,
+            "the old read must not restore group progress after purge",
         );
-        assert!(matches!(completion, Err(IggyError::TransientNotAccepted)));
+        assert_eq!(committed, None, "the old read must not commit an offset");
+        assert!(matches!(
+            old_completion,
+            Err(IggyError::TransientNotAccepted)
+        ));
 
-        let fresh = partition.build_poll_plan(
+        // 6. A new poll reads all replacement messages and records last_polled.
+        // The committed offset stays unset because automatic commits are disabled.
+        let fresh_poll_plan = partition.build_poll_plan(
             consumer,
-            &PollingArgs::new(PollingStrategy::next(), 5, false),
-            true,
+            &PollingArgs::new(PollingStrategy::next(), 5, auto_commit),
+            validate_checksum,
         );
-        assert!(fresh.needs_off_pump_io());
-        let fresh_result = fresh.execute().await;
-        let fresh = partition
+        assert!(fresh_poll_plan.needs_off_pump_io());
+        let fresh_result = fresh_poll_plan.execute().await;
+        let fresh_completion = partition
             .complete_poll(fresh_result)
             .expect("accept fresh group read");
-        assert_eq!(polled_offsets(&fresh.fragments), [0, 1, 2, 3, 4]);
-        assert!(fresh.replication.is_none());
-        assert_eq!(partition.group_offset_state(7), (Some(4), None));
+        assert_eq!(polled_offsets(&fresh_completion.fragments), [0, 1, 2, 3, 4]);
+        assert!(fresh_completion.replication.is_none());
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, Some(4), "the fresh poll must record progress");
+        assert_eq!(committed, None, "automatic commits are disabled");
     }
 
     async fn assert_delayed_poll_preserves_fresh_progress(
@@ -15945,7 +15982,7 @@ mod purge_poll_tests {
                 .is_none()
         );
 
-        assert_old_disk_reads(&mut partition, consumer).await;
+        accept_initial_disk_polls(&mut partition, consumer).await;
         let read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
         assert!(read_state.fd.borrow().is_some());
 
@@ -16055,7 +16092,7 @@ mod purge_poll_tests {
         );
     }
 
-    async fn assert_old_disk_reads(
+    async fn accept_initial_disk_polls(
         partition: &mut IggyPartition<IggyMessageBus>,
         consumer: PollingConsumer,
     ) {
