@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Headers;
+using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 
 namespace Apache.Iggy.Contracts;
@@ -35,7 +36,8 @@ namespace Apache.Iggy.Contracts;
 public sealed class TopicOptions
 {
     private const string SegmentSizeKey = "segment_size";
-    private const string EnforceFsyncKey = "enforce_fsync";
+    private const string DurabilityKey = "durability";
+    private const string ConsumerOffsetDurabilityKey = "consumer_offset_durability";
     private const string MessagesRequiredToSaveKey = "messages_required_to_save";
     private const string SizeOfMessagesRequiredToSaveKey = "size_of_messages_required_to_save";
     private const string PreallocateSegmentsKey = "preallocate_segments";
@@ -47,9 +49,12 @@ public sealed class TopicOptions
     public ulong? SegmentSize { get; init; }
 
     /// <summary>
-    ///     Whether writes to this topic's partitions are fsynced.
+    ///     Message completion policy. Defaults to replicated independently of offset durability.
     /// </summary>
-    public bool? EnforceFsync { get; init; }
+    public Durability Durability { get; init; } = Durability.Replicated;
+
+    /// <summary>Explicit offset completion policy. Defaults to replicated independently of message durability.</summary>
+    public Durability ConsumerOffsetDurability { get; init; } = Durability.Replicated;
 
     /// <summary>
     ///     Flush the journal once it holds this many messages. Must be non-zero.
@@ -71,7 +76,7 @@ public sealed class TopicOptions
     /// <summary>
     ///     Renders the options that were set, each under the kind the server's catalog gives its key.
     /// </summary>
-    /// <returns>Option values keyed by option name, empty when nothing was set.</returns>
+    /// <returns>Option values keyed by option name, including both durability defaults.</returns>
     public Dictionary<string, HeaderValue> ToDictionary()
     {
         var options = new Dictionary<string, HeaderValue>();
@@ -81,10 +86,8 @@ public sealed class TopicOptions
             options[SegmentSizeKey] = HeaderValue.FromUInt64(segmentSize);
         }
 
-        if (EnforceFsync is { } enforceFsync)
-        {
-            options[EnforceFsyncKey] = HeaderValue.FromBool(enforceFsync);
-        }
+        options[DurabilityKey] = HeaderValue.FromString(EncodeDurability(Durability));
+        options[ConsumerOffsetDurabilityKey] = HeaderValue.FromString(EncodeDurability(ConsumerOffsetDurability));
 
         if (MessagesRequiredToSave is { } messagesRequiredToSave)
         {
@@ -103,4 +106,27 @@ public sealed class TopicOptions
 
         return options;
     }
+    internal static Dictionary<string, HeaderValue> WithDurabilityDefaults(IReadOnlyDictionary<string, HeaderValue>? source)
+    {
+        var options = source is null ? new Dictionary<string, HeaderValue>() : new Dictionary<string, HeaderValue>(source);
+        foreach (var key in new[] { DurabilityKey, ConsumerOffsetDurabilityKey })
+        {
+            if (!options.TryGetValue(key, out var value))
+            {
+                options[key] = HeaderValue.FromString("replicated");
+            }
+            else if (value.Kind != HeaderKind.String || value.ToString() is not ("replicated" or "persisted"))
+            {
+                throw new ArgumentException($"Invalid {key}", nameof(source));
+            }
+        }
+        return options;
+    }
+
+    private static string EncodeDurability(Durability value) => value switch
+    {
+        Durability.Replicated => "replicated",
+        Durability.Persisted => "persisted",
+        _ => throw new ArgumentOutOfRangeException(nameof(value), value, "Unknown durability")
+    };
 }

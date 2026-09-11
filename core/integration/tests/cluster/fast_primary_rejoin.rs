@@ -79,7 +79,7 @@ async fn create_stream_and_topic(harness: &TestHarness) {
         partitions_count: Some(1),
         message_expiry: Some(IggyExpiry::NeverExpire),
         messages_required_to_save: Some(1),
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         ..TopicCreateOptions::default()
     };
     setup_client

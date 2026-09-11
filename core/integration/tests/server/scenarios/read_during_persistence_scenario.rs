@@ -47,7 +47,7 @@ async fn should_read_messages_still_in_the_journal(harness: &integration::harnes
                 message_expiry: Some(IggyExpiry::NeverExpire),
                 messages_required_to_save: Some(100_000),
                 size_of_messages_required_to_save: Some(IggyByteSize::from(1024 * 1024 * 1024u64)),
-                enforce_fsync: Some(false),
+                durability: iggy_common::Durability::Replicated,
                 ..TopicCreateOptions::default()
             },
         )

@@ -152,7 +152,7 @@ pub(in crate::boot) async fn start_tcp_runtime(
             &config.http,
             config.metadata.clients_table_max,
             config.personal_access_token.max_tokens_per_user,
-            Arc::clone(&config.system),
+            Arc::new(config.clone()),
             roster,
             shard_metrics_all,
         )?;

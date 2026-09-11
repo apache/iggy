@@ -185,9 +185,8 @@ mod ffi {
         /// the same batch at a lower offset, so this never identifies a batch
         /// uniquely.
         ///
-        /// A batch is confirmed once it is committed in memory, not once it is
-        /// fsynced. A crash-restart can stamp a later batch with an offset a
-        /// client has already recorded.
+        /// Confirmation follows VSR quorum commit. Persisted message durability
+        /// also requires recoverable stable-storage copies on the quorum.
         base_offset: u64,
     }
 

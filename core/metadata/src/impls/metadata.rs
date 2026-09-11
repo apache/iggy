@@ -3476,7 +3476,12 @@ where
                 // node default is by then, not the value resolved at creation.
                 // Re-encoding also canonicalizes kinds (a `"128MiB"` string
                 // becomes `Uint64`), so the stored map reads back uniformly.
-                request.options = explicit.to_wire()?;
+                let supplied_options = request.options.clone();
+                request.options = explicit.to_explicit_wire(|key| {
+                    supplied_options
+                        .into_iter()
+                        .any(|entry| entry.key == key.as_bytes())
+                })?;
                 let resolved_segment_size = explicit
                     .segment_size
                     .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
@@ -3505,9 +3510,8 @@ where
                     resolved_max_topic_size,
                     TopicRuntimeDefaults {
                         segment_size: resolved_segment_size,
-                        enforce_fsync: explicit
-                            .enforce_fsync
-                            .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC),
+                        durability: iggy_common::Durability::default(),
+                        consumer_offset_durability: iggy_common::Durability::default(),
                         messages_required_to_save: explicit
                             .messages_required_to_save
                             .unwrap_or(iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE),
@@ -3522,6 +3526,7 @@ where
                             .preallocate_segments
                             .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
                     },
+                    &supplied_options,
                 )?;
                 let partitions = self
                     .allocator

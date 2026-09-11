@@ -129,7 +129,7 @@ where
     header.op <= consensus.commit_min()
 }
 
-/// Shared chain-replication forwarding to the next replica.
+/// Shared chain-replication forwarding, skipping disconnected replicas.
 ///
 /// Borrows the message, makes a deep copy for the wire, and lets the caller
 /// retain ownership for journal append.
@@ -137,8 +137,8 @@ where
 /// # Errors
 ///
 /// Returns an error if the prepare cannot be routed or the bus cannot deliver
-/// it to the next replica.
-/// Callers decide error policy (VSR retransmits from WAL via prepare timeout).
+/// it to a connected replica before the end of the chain.
+/// Other transport errors remain covered by VSR prepare retransmission.
 #[allow(clippy::future_not_send)]
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
@@ -152,20 +152,22 @@ where
         return Ok(());
     };
     let frozen = message.deep_copy().into_generic().into_frozen();
-    consensus
-        .message_bus()
-        .send_to_replica(next, frozen)
-        .await
-        .map_err(Into::into)
+    forward_to_connected_replica(
+        consensus,
+        frozen,
+        next,
+        consensus.primary_index(message.header().view),
+    )
+    .await
 }
 
 /// Forward an already validated frozen prepare to the next replica without
-/// copying its payload.
+/// copying its payload, skipping disconnected replicas.
 ///
 /// # Errors
 ///
 /// Returns an error if the frame is malformed, cannot be routed, or the bus
-/// cannot deliver it to the next replica.
+/// cannot deliver it to a connected replica before the end of the chain.
 #[allow(clippy::future_not_send)]
 pub async fn replicate_frozen_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
@@ -179,11 +181,42 @@ where
     let Some(next) = replication_target(consensus, &header)? else {
         return Ok(());
     };
-    consensus
-        .message_bus()
-        .send_to_replica(next, message)
-        .await
-        .map_err(Into::into)
+    forward_to_connected_replica(
+        consensus,
+        message,
+        next,
+        consensus.primary_index(header.view),
+    )
+    .await
+}
+
+#[allow(clippy::future_not_send)]
+async fn forward_to_connected_replica<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    message: Frozen<MESSAGE_ALIGN>,
+    mut next: u8,
+    primary: u8,
+) -> Result<(), ChainReplicationError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    loop {
+        match consensus
+            .message_bus()
+            .send_to_replica(next, message.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error @ (SendError::ReplicaNotConnected(_) | SendError::ConnectionClosed)) => {
+                next = (next + 1) % consensus.replica_count();
+                if next == primary {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn frozen_prepare_header(
@@ -561,7 +594,7 @@ where
 /// `debug`, not `warn`, matching `tick_partitions` / `tick_metadata`: a hold is the
 /// steady state for a whole rejoin, so `warn` is one line per group per tick. A
 /// hold that never clears is caught by a simulator invariant, not by this line.
-fn report_uncommittable_head(
+pub fn report_uncommittable_head(
     replica: u8,
     head_op: u64,
     commit_min: u64,
@@ -905,7 +938,8 @@ pub fn repaired_frontier_update(
 /// consensus is sans-io and cannot consult the journal itself, so the plane
 /// that owns the journal must vouch that this exact prepare is durable before
 /// the ack leaves. `false` withholds the ack; the primary's retransmit
-/// re-drives it once a later persist succeeds.
+/// re-drives it once a later persist succeeds. Returns `true` only after the
+/// acknowledgment is queued for delivery.
 ///
 /// # Panics
 /// - If `header.command` is not `Command::Prepare`.
@@ -915,22 +949,23 @@ pub async fn send_prepare_ok<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
     is_persisted: bool,
-) where
+) -> bool
+where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     assert_eq!(header.command, Command::Prepare);
 
     if consensus.status() != Status::Normal {
-        return;
+        return false;
     }
 
     if consensus.is_transferring() {
-        return;
+        return false;
     }
 
     if !is_persisted {
-        return;
+        return false;
     }
 
     assert!(
@@ -941,7 +976,7 @@ pub async fn send_prepare_ok<B, P>(
     );
 
     if header.op > consensus.sequencer().current_sequence() {
-        return;
+        return false;
     }
 
     let prepare_ok_header = PrepareOkHeader {
@@ -972,7 +1007,7 @@ pub async fn send_prepare_ok<B, P>(
 
     consensus
         .send_or_loopback(primary, message.into_generic())
-        .await;
+        .await
 }
 
 #[cfg(test)]
@@ -1270,6 +1305,118 @@ mod tests {
             frozen_prepare_header(&malformed),
             Err(ChainReplicationError::MalformedPrepare)
         ));
+    }
+
+    #[test]
+    fn given_disconnected_chain_peers_when_forwarding_should_reach_the_next_peer_immediately() {
+        for frozen in [false, true] {
+            for (replica, count, view, disconnected, expected) in [
+                (0, 3, 0, vec![1], 2),
+                (1, 3, 1, vec![2], 0),
+                (2, 5, 1, vec![3, 4], 0),
+            ] {
+                let consensus =
+                    VsrConsensus::new(1, replica, count, 0, SpyBus::new(), LocalPipeline::new());
+                consensus.init();
+                let bus = consensus.message_bus();
+                for peer in &disconnected {
+                    bus.failures
+                        .borrow_mut()
+                        .insert(*peer, SendError::ReplicaNotConnected(*peer));
+                }
+                let message = prepare_message(1, 0, 42).transmute_header(
+                    |old, header: &mut PrepareHeader| {
+                        *header = old;
+                        header.view = view;
+                    },
+                );
+                let result = if frozen {
+                    let prepare = message.deep_copy().into_frozen();
+                    let pointer = prepare.as_slice().as_ptr();
+                    let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+                        &consensus, prepare,
+                    ));
+                    if let Some((_, sent)) = bus.sent.borrow().first() {
+                        assert_eq!(
+                            sent.as_slice().as_ptr(),
+                            pointer,
+                            "forwarding must not copy the payload"
+                        );
+                    }
+                    result
+                } else {
+                    futures::executor::block_on(replicate_to_next_in_chain(&consensus, &message))
+                };
+                result.expect("a disconnected peer must not delay forwarding to the live suffix");
+                assert_eq!(
+                    bus.attempts.borrow().as_slice(),
+                    [disconnected, vec![expected]].concat()
+                );
+                let sent = bus.sent.borrow();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].0, expected);
+                assert_eq!(sent[0].1.as_slice(), message.as_slice());
+                assert_eq!(
+                    consensus.commit_max(),
+                    0,
+                    "forwarding is not an acknowledgement"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_chain_boundary_when_forwarding_should_never_wrap_to_the_primary() {
+        for (replica, count, connected, expected_attempts) in [
+            (0, 3, true, vec![1]),
+            (0, 3, false, vec![1, 2]),
+            (1, 3, false, vec![2]),
+            (2, 3, false, vec![]),
+            (0, 1, false, vec![]),
+        ] {
+            let consensus =
+                VsrConsensus::new(1, replica, count, 0, SpyBus::new(), LocalPipeline::new());
+            consensus.init();
+            consensus.message_bus().reject_sends.set(!connected);
+            let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+                &consensus,
+                prepare_message(1, 0, 42).into_frozen(),
+            ));
+            assert_eq!(result.is_ok(), connected || expected_attempts.is_empty());
+            assert_eq!(
+                *consensus.message_bus().attempts.borrow(),
+                expected_attempts
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_transport_error_when_forwarding_should_skip_only_disconnected_peers() {
+        for error in [
+            SendError::ConnectionClosed,
+            SendError::Backpressure,
+            SendError::ReplicaRouteMissing(1),
+            SendError::ReplicaForwardFailed(1),
+            SendError::BusShuttingDown,
+        ] {
+            let skip = matches!(error, SendError::ConnectionClosed);
+            let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
+            consensus.init();
+            consensus
+                .message_bus()
+                .failures
+                .borrow_mut()
+                .insert(1, error);
+            let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+                &consensus,
+                prepare_message(1, 0, 42).into_frozen(),
+            ));
+            assert_eq!(result.is_ok(), skip);
+            assert_eq!(
+                consensus.message_bus().attempts.borrow().as_slice(),
+                if skip { &[1, 2][..] } else { &[1][..] },
+            );
+        }
     }
 
     #[test]
@@ -2172,14 +2319,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn send_prepare_ok_reports_transport_failure_and_can_be_retried() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, SpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        let header = PrepareHeader {
+            command: Command::Prepare,
+            cluster: 1,
+            checksum: 42,
+            ..Default::default()
+        };
+        consensus.message_bus().reject_sends.set(true);
+        assert!(!futures::executor::block_on(send_prepare_ok(
+            &consensus, &header, true,
+        )));
+        assert!(consensus.message_bus().sent.borrow().is_empty());
+
+        consensus.message_bus().reject_sends.set(false);
+        assert!(futures::executor::block_on(send_prepare_ok(
+            &consensus, &header, true,
+        )));
+        assert_eq!(consensus.message_bus().sent.borrow().len(), 1);
+    }
+
     struct SpyBus {
         sent: std::cell::RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>,
+        reject_sends: std::cell::Cell<bool>,
+        failures: std::cell::RefCell<BTreeMap<u8, SendError>>,
+        attempts: std::cell::RefCell<Vec<u8>>,
     }
 
     impl SpyBus {
         fn new() -> Self {
             Self {
                 sent: std::cell::RefCell::new(Vec::new()),
+                reject_sends: std::cell::Cell::new(false),
+                failures: std::cell::RefCell::new(BTreeMap::new()),
+                attempts: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -2200,6 +2376,13 @@ mod tests {
             replica: u8,
             data: Frozen<MESSAGE_ALIGN>,
         ) -> Result<(), SendError> {
+            self.attempts.borrow_mut().push(replica);
+            if self.reject_sends.get() {
+                return Err(SendError::ReplicaNotConnected(replica));
+            }
+            if let Some(error) = self.failures.borrow_mut().remove(&replica) {
+                return Err(error);
+            }
             self.sent.borrow_mut().push((replica, data));
             Ok(())
         }

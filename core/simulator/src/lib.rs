@@ -24,6 +24,7 @@ pub mod packet;
 pub mod ready_queue;
 pub mod replica;
 pub mod seeds;
+pub mod storage;
 pub mod workload;
 
 use bus::SimOutbox;
@@ -1680,7 +1681,7 @@ mod tests {
     use iggy_common::ConsumerKind;
     use server_common::sharding::IggyNamespace;
 
-    fn submit_and_wait_for_reply(
+    pub fn submit_and_wait_for_reply(
         sim: &mut Simulator,
         client_id: u128,
         target: u8,
@@ -2794,7 +2795,7 @@ mod tests {
             .count()
     }
 
-    fn retained_prepare(
+    pub fn retained_prepare(
         sim: &Simulator,
         replica: usize,
         namespace: IggyNamespace,
@@ -5563,9 +5564,11 @@ mod partition_repair_driver_tests {
     use bytes::Bytes;
     use consensus::Status;
     use iggy_binary_protocol::{
-        CommitHeader, PrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader,
+        CommitHeader, ConsensusHeader, PrepareHeader, RepairRangeReplyHeader,
+        RequestPreparesHeader, StartViewHeader,
     };
     use packet::Packet;
+    use server_common::MessageBag;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Chain replication runs 0 -> 1 -> 2 and stops before the primary, so
@@ -5793,6 +5796,204 @@ mod partition_repair_driver_tests {
                     || partition.consensus().state_transfer_stage()
                         != consensus::StateTransferStage::Idle
             })
+    }
+
+    #[test]
+    fn given_a_resident_repair_window_when_commit_walk_is_bounded_should_drain_without_repair() {
+        const OPS: usize = partitions::COMMIT_WALK_OPS_MAX + 2;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = resident_repair_window(namespace, OPS, OPS);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+
+        deliver_commit(shard, namespace, OPS as u64);
+
+        let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(commit_min, partitions::COMMIT_WALK_OPS_MAX as u64);
+        assert_eq!(commit_max, OPS as u64);
+        for op in commit_min + 1..=commit_max {
+            assert!(journal_holds(&sim, LAGGING, namespace, op));
+        }
+        assert!(
+            shard
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .repair
+                .is_none(),
+            "resident operations must not consume a repair session while waiting for the next walk"
+        );
+        assert!(repair_requests(&sim).is_empty());
+
+        let mut namespace_scratch = Vec::new();
+        assert!(
+            futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch)).is_none()
+        );
+        assert_eq!(
+            group_state(&sim, LAGGING, namespace),
+            (Status::Normal, 0, OPS as u64, OPS as u64),
+            "the existing tick must finish the resident backlog without peer repair"
+        );
+        assert!(repair_requests(&sim).is_empty());
+    }
+
+    #[test]
+    fn given_a_resident_prefix_when_a_later_op_is_missing_should_repair_and_drain() {
+        const RESIDENT_OPS: usize = partitions::COMMIT_WALK_OPS_MAX + 1;
+        const OPS: usize = RESIDENT_OPS + 1;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = resident_repair_window(namespace, OPS, RESIDENT_OPS);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+
+        deliver_commit(shard, namespace, OPS as u64);
+
+        let (_, _, commit_min, _) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(commit_min, partitions::COMMIT_WALK_OPS_MAX as u64);
+        assert!(journal_holds(&sim, LAGGING, namespace, commit_min + 1));
+        assert!(!journal_holds(&sim, LAGGING, namespace, OPS as u64));
+        let requests = repair_requests(&sim);
+        assert_eq!(
+            requests.len(),
+            1,
+            "a later hole must still open peer repair"
+        );
+        assert_eq!(requests[0].from_op, commit_min + 1);
+        assert_eq!(requests[0].to_op, OPS as u64);
+
+        let prepare = tests::retained_prepare(&sim, 0, namespace, OPS as u64);
+        let partition = shard.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        futures::executor::block_on(partition.apply_repaired_prepare(prepare));
+        assert!(journal_holds(&sim, LAGGING, namespace, OPS as u64));
+        let mut namespace_scratch = Vec::new();
+        assert!(
+            futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch)).is_none()
+        );
+        assert_eq!(
+            group_state(&sim, LAGGING, namespace),
+            (Status::Normal, 0, OPS as u64, OPS as u64)
+        );
+    }
+
+    #[test]
+    fn given_a_resident_committed_window_when_an_adopted_suffix_is_missing_should_fetch_above_commit_max()
+     {
+        const COMMITTED_OPS: usize = partitions::COMMIT_WALK_OPS_MAX + 1;
+        const OPS: usize = COMMITTED_OPS + 1;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = resident_repair_window(namespace, OPS, COMMITTED_OPS);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+        let missing = tests::retained_prepare(&sim, 0, namespace, OPS as u64);
+        let header_size = size_of::<StartViewHeader>();
+        let total_size = header_size + size_of::<PrepareHeader>();
+        let mut start_view = Message::<StartViewHeader>::new(total_size);
+        start_view.as_mut_slice()[header_size..]
+            .copy_from_slice(bytemuck::bytes_of(missing.header()));
+        let body_checksum = u128::from(iggy_common::calculate_checksum(
+            &start_view.as_slice()[header_size..],
+        ));
+        let start_view = start_view.transmute_header(|_, header: &mut StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = 1;
+            header.replica = 0;
+            header.group = namespace.inner();
+            header.op = OPS as u64;
+            header.commit = COMMITTED_OPS as u64;
+            header.size = u32::try_from(total_size).unwrap();
+            header.checksum_body = body_checksum;
+            header.seal();
+        });
+        futures::executor::block_on(shard.on_message(MessageBag::StartView(start_view)));
+
+        let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(commit_min, partitions::COMMIT_WALK_OPS_MAX as u64);
+        assert_eq!(commit_max, COMMITTED_OPS as u64);
+        assert!(journal_holds(&sim, LAGGING, namespace, commit_min + 1));
+        let requests = repair_requests(&sim);
+        assert_eq!(
+            requests.len(),
+            1,
+            "adopted headers do not supply the missing body"
+        );
+        assert_eq!(requests[0].from_op, commit_min + 1);
+        assert_eq!(requests[0].to_op, OPS as u64);
+
+        let partition = shard.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        futures::executor::block_on(partition.apply_repaired_prepare(missing));
+        assert!(journal_holds(&sim, LAGGING, namespace, OPS as u64));
+        deliver_commit(shard, namespace, OPS as u64);
+        assert_eq!(
+            group_state(&sim, LAGGING, namespace),
+            (Status::Normal, 0, OPS as u64, OPS as u64)
+        );
+    }
+
+    fn resident_repair_window(
+        namespace: IggyNamespace,
+        total_ops: usize,
+        resident_ops: usize,
+    ) -> Simulator {
+        let (mut sim, client) = cluster(0x5EED_0240);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        sim.replica_crash(LAGGING);
+        for _ in 0..total_ops {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                CLIENT_ID,
+                0,
+                client.send_messages(namespace, &[Bytes::from_static(b"resident-repair")]),
+            );
+            assert_eq!(reply.header().status, 0);
+        }
+        assert_eq!(group_state(&sim, 0, namespace).2, total_ops as u64);
+
+        // Replay real prepares without running the crashed backup's pump so its
+        // resident backlog reaches the commit edge in one bounded walk.
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+        for op in 1..=resident_ops as u64 {
+            let prepare = tests::retained_prepare(&sim, 0, namespace, op);
+            let partition = shard.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+            futures::executor::block_on(partition.on_replicate(prepare));
+            assert!(journal_holds(&sim, LAGGING, namespace, op));
+        }
+        assert_eq!(group_state(&sim, LAGGING, namespace).2, 0);
+        sim.outboxes[usize::from(LAGGING)].drain();
+        sim
+    }
+
+    fn deliver_commit(shard: &Replica, namespace: IggyNamespace, commit: u64) {
+        let message = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
+            |_, header: &mut CommitHeader| {
+                header.command = Command::Commit;
+                header.cluster = 1;
+                header.replica = 0;
+                header.group = namespace.inner();
+                header.commit = commit;
+                header.timestamp_monotonic = commit;
+                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
+                header.seal();
+            },
+        );
+        futures::executor::block_on(shard.on_message(MessageBag::Commit(message)));
+    }
+
+    fn repair_requests(sim: &Simulator) -> Vec<RequestPreparesHeader> {
+        sim.outboxes[usize::from(LAGGING)]
+            .drain()
+            .into_iter()
+            .filter_map(|envelope| match envelope.payload {
+                bus::EnvelopePayload::Replica(message)
+                    if message.header().command == Command::RequestPrepares =>
+                {
+                    let header = *bytemuck::checked::from_bytes::<RequestPreparesHeader>(
+                        &message.as_slice()[..size_of::<RequestPreparesHeader>()],
+                    );
+                    assert_eq!(envelope.to_replica, Some(0));
+                    Some(header)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -6383,6 +6584,17 @@ mod partition_repair_driver_tests {
              below would have nothing to lose"
         );
         let counted = gap_drops(&sim, LAGGING, namespace);
+        let partition_stats = sim.replicas[LAGGING as usize]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("partition exists before ConfirmRemove")
+            .stats
+            .clone();
+        let topic_stats = partition_stats.parent();
+        let stream_stats = topic_stats.parent();
+        assert!(partition_stats.messages_count_inconsistent() > 0);
 
         // The reconciler's teardown order: the tombstone lands first and the
         // disk delete runs before `ConfirmRemove`, so from here `get_mut_by_ns`
@@ -6405,6 +6617,15 @@ mod partition_repair_driver_tests {
             "the {buffered} prepare(s) buffered on the partition went to the floor \
              with it; the drops are the only record those frames existed"
         );
+        assert_eq!(partition_stats.messages_count_inconsistent(), 0);
+        assert_eq!(partition_stats.size_bytes_inconsistent(), 0);
+        assert_eq!(partition_stats.segments_count_inconsistent(), 0);
+        assert_eq!(topic_stats.messages_count_inconsistent(), 0);
+        assert_eq!(topic_stats.size_bytes_inconsistent(), 0);
+        assert_eq!(topic_stats.segments_count_inconsistent(), 0);
+        assert_eq!(stream_stats.messages_count_inconsistent(), 0);
+        assert_eq!(stream_stats.size_bytes_inconsistent(), 0);
+        assert_eq!(stream_stats.segments_count_inconsistent(), 0);
     }
 }
 
