@@ -256,8 +256,7 @@ TEST_F(E2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRemainder)
     auto offset_it = explicit_options.find("consumer_offset_durability");
     ASSERT_NE(offset_it, explicit_options.end());
     EXPECT_EQ(offset_it->second.Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(offset_it->second.Value(),
-              (std::vector<std::uint8_t>{'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd'}));
+    EXPECT_EQ(offset_it->second.Value(), (std::vector<std::uint8_t>{'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd'}));
 
     EXPECT_FALSE(topic_details.Options().Derived().empty());
     const auto &derived_options = topic_details.Options().Derived();
