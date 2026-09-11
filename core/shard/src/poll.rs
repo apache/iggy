@@ -37,6 +37,9 @@ use message_bus::MessageBus;
 use partitions::{PollCompletion, PollPlan, PollReadResult};
 use server_common::sharding::IggyNamespace;
 
+#[cfg(test)]
+mod timeout_tests;
+
 /// A read result awaiting acceptance by its partition owner.
 /// Disk tasks send it through the inbox. Resident reads pass it directly to
 /// the same completion handler.
