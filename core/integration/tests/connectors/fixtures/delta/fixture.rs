@@ -43,7 +43,7 @@ const ENV_SINK_AWS_S3_ENDPOINT_URL: &str =
 const ENV_SINK_AWS_S3_ALLOW_HTTP: &str =
     "IGGY_CONNECTORS_SINK_DELTA_PLUGIN_CONFIG_AWS_S3_ALLOW_HTTP";
 
-const MINIO_IMAGE: &str = "docker.io/minio/minio";
+const MINIO_IMAGE: &str = "quay.io/minio/minio";
 const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 const MINIO_PORT: u16 = 9000;
 const MINIO_CONSOLE_PORT: u16 = 9001;
@@ -263,7 +263,7 @@ impl DeltaS3Fixture {
                 "--network=host",
                 "-e",
                 &format!("MC_HOST_minio={}", mc_host),
-                "minio/mc",
+                "quay.io/minio/mc",
                 "mb",
                 "--ignore-existing",
                 &format!("minio/{}", MINIO_BUCKET),
