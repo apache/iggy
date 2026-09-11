@@ -460,7 +460,13 @@ fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> 
 /// nothing will ever carry to the runtime. `/admin/health` reports the same
 /// signal as `poll_is_live`. See #3941.
 fn warn_if_poll_stopped(instance: &Arc<SharedState>, action: &str, endpoint_id: &str) {
-    if instance.poll_is_live(unix_now_seconds()) {
+    // An instance that has not polled yet is not one whose poll task stopped,
+    // and saying so would be a false alarm on ordinary startup timing:
+    // `poll_is_live` is false for the whole window between `open` and the
+    // first `poll`, which is when a management call is most likely to arrive
+    // as an operator brings a new instance up. The mutation is carried by that
+    // first poll like any other.
+    if !instance.has_polled() || instance.poll_is_live(unix_now_seconds()) {
         return;
     }
     warn!(
@@ -641,7 +647,7 @@ mod tests {
 
             let mut source = HttpSource::new(1, config, None);
             source.open().await.expect("open must succeed");
-            crate::test_support::start_serving(&source.shared).await;
+            crate::server::serve_routes(&source.shared).await;
             Fixture {
                 source,
                 public,

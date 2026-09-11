@@ -973,7 +973,7 @@ impl Source for HttpSource {
         //
         // Before the select, so the first request this unblocks is one this
         // poll can take.
-        if self.shared.claim_first_poll() {
+        if !self.shared.has_polled() {
             server::serve_routes(&self.shared).await;
         }
         // An unacknowledged batch outranks new traffic: replaying it in order
@@ -1227,20 +1227,6 @@ pub(crate) mod test_support {
                 .iter()
                 .map(|raw_id| static_endpoint(raw_id))
                 .collect(),
-        }
-    }
-
-    /// Marks an instance as polling and publishes its routes, which is what
-    /// the poll task does on its first run.
-    ///
-    /// Tests that open a source and then post to it need this, because the
-    /// runtime always starts a poll task after `open()` and an instance does
-    /// not serve before that. Calling `poll()` instead would block on an empty
-    /// bridge, which is the whole reason a request has to be able to arrive
-    /// first.
-    pub async fn start_serving(shared: &Arc<SharedState>) {
-        if shared.claim_first_poll() {
-            crate::server::serve_routes(shared).await;
         }
     }
 

@@ -449,6 +449,20 @@ impl ServerState {
 pub(crate) async fn serve_routes(instance: &Arc<SharedState>) {
     let listen_addr = &instance.config.listen_addr;
     let servers = SERVERS.lock().await;
+    // Claimed here, under the guard, rather than by the caller before it. The
+    // only suspension point on this path is the lock above, so a poll dropped
+    // while waiting for it leaves the flag false and the next poll retries.
+    // Claimed before the lock, a cancelled poll left the flag set with nothing
+    // published, and the sibling whose `publish` this call was queued behind
+    // read that flag and served the cancelled instance's routes on its behalf:
+    // `enqueue` then answers 200 into a bridge with no reader.
+    //
+    // It also puts the flip and the publish in one critical section, which is
+    // what lets `Published::is_ready` say without qualification that a route
+    // cannot exist before something can drain it.
+    if !instance.claim_first_poll() {
+        return;
+    }
     let Some(server) = servers.get(listen_addr) else {
         // Not reachable through the ordinary lifecycle: this instance joined
         // during `open`, an entry only leaves `SERVERS` when its last instance
@@ -989,6 +1003,7 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
                 endpoints_revoked: registry.revoked_count(),
                 named_path: instance.config.topic_path.is_some(),
                 poll_is_live: instance.poll_is_live(now),
+                has_polled: instance.has_polled(),
                 // The registry is handed over whole, so an owed flush is the
                 // whole answer. Still not `persisted`: the flag clears when the
                 // state leaves the plugin, and the runtime's write landing is
@@ -1302,7 +1317,13 @@ struct InstanceHealth {
     /// task after five consecutive NACKs without calling `close()`, so the
     /// instance stays registered and keeps accepting mutations that will never
     /// be persisted. See #3941.
+    ///
+    /// Read it with `has_polled`, which is what separates the two ways this
+    /// can be false. Both false is an instance still starting up, and the
+    /// listener is not held to it. True and false is a poll task that stopped,
+    /// which is what takes the whole listener out of rotation.
     poll_is_live: bool,
+    has_polled: bool,
     state_submitted: bool,
     /// Named to mirror the metric families exactly, so an operator reading
     /// `/admin/health` and a Prometheus scrape is not looking at two spellings
@@ -1343,7 +1364,7 @@ mod tests {
                 Ok(()) => {
                     // The runtime starts a poll task right after `open`, and
                     // an instance serves nothing until that runs.
-                    crate::test_support::start_serving(&source.shared).await;
+                    crate::server::serve_routes(&source.shared).await;
                     return source;
                 }
                 Err(error) if attempt < ATTEMPTS && is_address_in_use(&error) => {
@@ -2675,6 +2696,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_an_opened_instance_when_it_polls_should_publish_its_own_routes() {
+        // The production line, driven by `poll()` rather than by a test calling
+        // `serve_routes` itself. Every other request test in this crate reaches
+        // the listener through that helper call, so deleting the publish from
+        // `poll()` leaves all of them green; this one is what goes red.
+        //
+        // The permit is what lets the poll return at all: with an empty bridge
+        // and nothing dirty it would otherwise wait for traffic that cannot
+        // arrive until the routes it is about to publish exist.
+        let mut source = HttpSource::new(1, config(free_port(), free_port(), &[]), None);
+        source.open().await.expect("open must succeed");
+        let url = format!("{}/topics/github", base_url(&source));
+
+        let before = client()
+            .post(&url)
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            before.status(),
+            StatusCode::NOT_FOUND,
+            "an instance that has not polled serves nothing"
+        );
+
+        source.shared.state_flush.notify_one();
+        source.poll().await.expect("poll must succeed");
+
+        let after = client()
+            .post(&url)
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            after.status(),
+            StatusCode::OK,
+            "and polling is what publishes them"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
     async fn given_a_joining_instance_when_health_checked_should_keep_serving_its_siblings() {
         // The complement of the stopped-instance case above, and the two must
         // not be answered the same way. A poll task that has stopped has to
@@ -2723,7 +2787,7 @@ mod tests {
             "a route may not exist before something can drain it"
         );
 
-        crate::test_support::start_serving(&second.shared).await;
+        crate::server::serve_routes(&second.shared).await;
         let served = client()
             .post(format!("{}/topics/stripe", base_url(&first)))
             .body("{}")
