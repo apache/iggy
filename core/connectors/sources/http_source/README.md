@@ -203,6 +203,8 @@ An instance that has not polled yet is not counted, which is a different conditi
 
 Such an instance publishes no routes either, so its own paths answer 404 until its poll task runs and nothing is accepted that nothing would drain. A boot grace period would not do: it answers 200 while the bridge still has no reader.
 
+Registering against an instance in that window succeeds. The endpoint is created, `201` names its path, and that path answers 404 until the instance's first poll publishes it, so a sender configured immediately will see a gap. The management API logs the condition on every such call, which is also the line to watch for an instance that never leaves the window.
+
 HMAC signatures are validated over the raw request body exactly as received, never over a re-serialized form, and compared in constant time.
 
 The supported shape is a hex digest of the body behind a fixed prefix, which covers GitHub (`X-Hub-Signature-256: sha256=<hex>`) and most generic partner webhooks. Set `hmac_prefix = ""` for a bare hex signature.

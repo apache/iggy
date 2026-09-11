@@ -452,10 +452,11 @@ impl EndpointRegistry {
 /// agree on a three element shape without the field names reaching the wire.
 ///
 /// `endpoint_count` is redundant with `endpoints.len()` on purpose. It is the
-/// only one of the four checks that rejects a blob which is both structurally
-/// valid and fully consumed: the registry used to encode as a one element
-/// array, so an array holding an empty map decoded as a perfectly good empty
-/// registry and no amount of framing arithmetic would have noticed.
+/// there to catch a map somebody made smaller while the frame around it stayed
+/// intact. Version and the id agreement reject structurally valid, fully
+/// consumed blobs too, but neither looks at how many endpoints a frame claims
+/// to carry, and the registry used to encode as a one element array where an
+/// empty map read as a perfectly good empty registry.
 #[derive(Serialize, Deserialize)]
 struct StateFrame<E> {
     version: u16,
@@ -839,6 +840,12 @@ mod tests {
     /// honest about its count, carrying the tombstone under an id one
     /// character away from the real one.
     ///
+    /// The consumed length is what holds the other direction. Rewriting the
+    /// byte that opens the `state` map turns a tombstone back into an active
+    /// endpoint and leaves the bytes that described the revocation unread
+    /// behind the frame, and arity, version and the declared count all pass
+    /// that one.
+    ///
     /// What this still does not claim is authentication. Someone who can write
     /// the file can write a consistent one, and they could read every secret
     /// in it anyway. This catches corruption, not an author.
@@ -949,39 +956,6 @@ mod tests {
         assert!(
             restored.is_err(),
             "a registry that cannot be decoded must not be served as its static twin"
-        );
-    }
-
-    #[test]
-    fn given_a_tombstone_flipped_active_when_decoded_should_refuse() {
-        // What the consumed-length check is actually for, and the only one of
-        // the four that catches this. Rewriting the byte that opens the
-        // `state` map turns `Revoked` into `Active`, which is a resurrected
-        // endpoint serving with its secret, and leaves the bytes that used to
-        // describe the revocation unread behind the frame.
-        let mut registry = EndpointRegistry::default();
-        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
-        assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
-        let ConnectorState(bytes) = registry
-            .to_connector_state(1)
-            .expect("registry must serialize");
-
-        let flipped: Vec<Vec<u8>> = (0..bytes.len())
-            .filter_map(|index| {
-                let mut mutated = bytes.clone();
-                mutated[index] = 0x00;
-                let decoded = decode_state_frame(&mutated).ok()?;
-                decoded
-                    .get(ENDPOINT_ONE)
-                    .is_some_and(Endpoint::is_active)
-                    .then_some(mutated)
-            })
-            .collect();
-
-        assert!(
-            flipped.is_empty(),
-            "{} mutation(s) decoded with the revoked endpoint active again",
-            flipped.len()
         );
     }
 

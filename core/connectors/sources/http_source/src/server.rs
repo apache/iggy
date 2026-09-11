@@ -91,11 +91,12 @@ const JSON_ESCAPE_EXPANSION: usize = 6;
 /// replacing a secret that had leaked.
 ///
 /// Derived rather than picked, so raising a field cap cannot quietly
-/// reintroduce that. A registration is the largest legal body by roughly an
-/// order of magnitude, but every capped field the admin listener accepts is in
-/// the sum regardless, the revoke reason included, or raising that one cap
-/// would be exactly the gap this derivation exists to close. The kilobyte on
-/// top covers field names and punctuation.
+/// reintroduce that. A registration is the largest legal body, though not by
+/// much: a rotation carrying a maximal `auth_secret` is within a fifth of it.
+/// Every capped field the admin listener accepts is in the sum regardless, the
+/// revoke reason included, or raising that one cap would be exactly the gap
+/// this derivation exists to close. The kilobyte on top covers field names and
+/// punctuation.
 ///
 /// `instance` is bounded by the same 255 as any other Iggy header value, which
 /// is what it becomes: it travels under the fixed `iggy_source_instance` key.
@@ -461,16 +462,24 @@ pub(crate) async fn serve_routes(instance: &Arc<SharedState>) {
     let listen_addr = &instance.config.listen_addr;
     let servers = SERVERS.lock().await;
     // Claimed here, under the guard, rather than by the caller before it. The
-    // only suspension point on this path is the lock above, so a poll dropped
-    // while waiting for it leaves the flag false and the next poll retries.
-    // Claimed before the lock, a cancelled poll left the flag set with nothing
-    // published, and the sibling whose `publish` this call was queued behind
-    // read that flag and served the cancelled instance's routes on its behalf:
-    // `enqueue` then answers 200 into a bridge with no reader.
+    // only suspension point on this path is the lock above, so the flag cannot
+    // be set by a poll that never reached the publish.
     //
-    // It also puts the flip and the publish in one critical section, which is
-    // what lets `Published::is_ready` say without qualification that a route
-    // cannot exist before something can drain it.
+    // Claimed before the lock, a cancelled poll left it set with nothing
+    // published, and two things followed. The sibling whose `publish` this
+    // call was queued behind read the flag and served the cancelled instance's
+    // routes on its behalf, so `enqueue` answered 200 into a bridge with no
+    // reader. And `PollGuard::drop` stamped `last_poll_at` on the way out, so
+    // the instance then read as one whose poll task had stopped rather than
+    // one that never started, and the readiness gate took its healthy siblings
+    // to 503 for it. Not a retry: the only thing that drops this future is
+    // shutdown, and the SDK breaks its loop on the same branch.
+    //
+    // Putting the flip and the publish in one critical section is what lets
+    // `Published::is_ready` say without qualification that a route cannot
+    // exist before something can drain it. The other half of that gate, an
+    // instance never counting as live before it has polled, rests on
+    // `poll_active` being set before any of this rather than on the lock.
     if !instance.claim_first_poll() {
         return;
     }
@@ -1126,13 +1135,18 @@ fn enqueue(
     // is one no `poll()` will ever drain. 200 would be a lie the sender cannot
     // detect, and a 503 it retries.
     //
-    // The message stays in the channel, and `dropped_on_close` may not have
-    // counted it: `leave()` reads the bridge length after setting the flag, so
-    // a message accepted either side of that read can be missed. The
-    // diagnostic under-reports, it does not double count, because the SDK
-    // joins the poll task before `close()` runs. Either way it is preferable
-    // to the alternative, which is a sender that believes a lost request
-    // succeeded.
+    // The message stays in the channel, and `dropped_on_close` may already have
+    // counted it. `leave()` sets the departed flag and then reads
+    // `sender.len()`, so a message landing between those two is counted while
+    // its sender is being told 503. Against that counter's own description,
+    // accepted messages still queued, that is an over-report by one.
+    //
+    // It cannot go the other way, and the reasoning is written out because it
+    // is easy to get backwards: a message answered 200 was sent before the
+    // flag was set, so it was already in the channel when the length was read.
+    //
+    // Preferable either way to the alternative, which is a sender that
+    // believes a lost request succeeded.
     if instance.has_departed() {
         error!(
             "Refused a request for {CONNECTOR_NAME} connector ID: {}, it left the listener while the request was in flight",

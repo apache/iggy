@@ -940,6 +940,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_an_unpolled_instance_when_registered_should_create_a_path_that_waits() {
+        // The window nothing covered: every other fixture here serves routes
+        // straight after `open()`, so none of them registers against an
+        // instance that has not polled. The registration is real and the 201
+        // names a path, but that path is not published until the instance's
+        // first poll, and a sender pointed at it immediately sees the gap.
+        let mut config = crate::test_support::config(Some("github"), &[ENDPOINT_ONE]);
+        config.listen_addr = format!("127.0.0.1:{}", free_port());
+        config.admin_listen_addr = format!("127.0.0.1:{}", free_port());
+        config.instance_name = Some("http_github".to_string());
+        config.management_token = Some(SecretString::from(TOKEN));
+        let public = format!("http://{}", config.listen_addr);
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = HttpSource::new(1, config, None);
+        source.open().await.expect("open must succeed");
+
+        let created: Value = client()
+            .post(format!("{admin}/admin/endpoints"))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .json(&json!({"instance": "http_github"}))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .json()
+            .await
+            .expect("the response must be JSON");
+        let path = created["path"].as_str().expect("a path is returned");
+
+        let early = client()
+            .post(format!("{public}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            early.status(),
+            StatusCode::NOT_FOUND,
+            "the endpoint exists, but nothing can drain it until the instance polls"
+        );
+
+        crate::server::serve_routes(&source.shared).await;
+        let served = client()
+            .post(format!("{public}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "and the first poll is what makes the registration reachable"
+        );
+        source.close().await.expect("close must succeed");
+    }
+
+    #[tokio::test]
     async fn given_invalid_hmac_header_when_registered_should_reject() {
         // `HeaderMap::get` answers `None` for a name it cannot parse instead of
         // failing, so accepting one here mints an endpoint that 401s every
