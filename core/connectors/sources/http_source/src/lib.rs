@@ -952,29 +952,45 @@ impl Source for HttpSource {
         // flush on an idle bridge still has its wakeup; only first refusal
         // moves. Reading it clears it, so the flip lasts exactly one poll.
         let traffic_first = self.last_poll_was_state_only.swap(false, Ordering::AcqRel);
-        if traffic_first {
+        let flush_arm_won = if traffic_first {
             tokio::select! {
                 biased;
-                received = receiver.recv() => drain_bridge(&receiver, received, max_batch_size, &mut queued),
-                _ = self.shared.state_flush.notified() => {}
+                received = receiver.recv() => {
+                    drain_bridge(&receiver, received, max_batch_size, &mut queued);
+                    false
+                }
+                _ = self.shared.state_flush.notified() => true,
             }
         } else {
             tokio::select! {
                 biased;
-                _ = self.shared.state_flush.notified() => {}
-                received = receiver.recv() => drain_bridge(&receiver, received, max_batch_size, &mut queued),
+                _ = self.shared.state_flush.notified() => true,
+                received = receiver.recv() => {
+                    drain_bridge(&receiver, received, max_batch_size, &mut queued);
+                    false
+                }
             }
-        }
+        };
 
         // State rides an empty batch and nothing else, so no failed publish
         // can skip its save. Under traffic that means deferring to a later
         // poll; re-arming the notify stops it waiting on traffic to arrive.
         let state = if queued.is_empty() {
             let state = self.shared.take_dirty_state();
-            // Only a batch that carried state counts: an empty poll that found
-            // nothing to flush has not taken a turn away from traffic.
+            // Keyed on the arm that won, not on what it produced. A flush
+            // that wins and then declines has still spent this poll's turn:
+            // its permit was consumed and `recv()` never ran.
+            //
+            // Keyed on the state instead, the decline left the flip off and
+            // looped. `take_dirty_state` loses its `try_lock` to an ordinary
+            // `try_mutate_registry`, which holds the writer across a registry
+            // clone and a `validate`; the decline arm re-posts the permit, the
+            // next poll is flush-first again because nothing flipped, and it
+            // takes that permit straight back. An FFI round trip per iteration
+            // carrying nothing, with queued traffic undrained for as long as a
+            // control-plane caller keeps the lock warm.
             self.last_poll_was_state_only
-                .store(state.is_some(), Ordering::Release);
+                .store(flush_arm_won, Ordering::Release);
             state
         } else {
             if self.shared.has_pending_state() {
@@ -1007,7 +1023,24 @@ impl Source for HttpSource {
         match result {
             source::SourceBatchResult::Ack => {
                 self.lock_staged().take();
-                self.shared.clear_state_flush_backoff();
+                // Only the batch that carried the flush clears its backoff,
+                // the same rule `on_nack` already applies. Clearing on every
+                // Ack let traffic zero a counter that traffic knows nothing
+                // about, and since the delay for attempt zero is none, the
+                // documented doubling never engaged while requests were
+                // arriving. A state store that keeps refusing then costs one
+                // failed write per poll, indefinitely, because the alternating
+                // Ack and NACK also stop the SDK ever reaching its consecutive
+                // limit. This bites the default file backend too: its
+                // `is_latched` is always false, so a read-only mount or a full
+                // disk NACKs the state batch while traffic keeps being taken.
+                //
+                // Safe to gate the handed count with it: the SDK keeps one
+                // batch in flight, so an Ack for traffic cannot arrive while a
+                // flush is still outstanding.
+                if self.last_batch_carried_state.load(Ordering::Acquire) {
+                    self.shared.clear_state_flush_backoff();
+                }
                 Ok(())
             }
             source::SourceBatchResult::Nack => self.on_nack(),
@@ -1055,9 +1088,15 @@ impl Source for HttpSource {
 ///
 /// The first retry is immediate, so an isolated refusal costs nothing. Past
 /// that it doubles to an eight second ceiling, which is inside the SDK's
-/// result timeout, so a store that recovers is picked up promptly. A store
-/// that stays latched still ends in the SDK stopping the source; that is
-/// #3941's subject, not something this connector can fix from the inside.
+/// result timeout, so a store that recovers is picked up promptly.
+///
+/// What a store that never recovers costs depends on whether the gateway is
+/// busy, and only the idle case ends. Idle, every batch is the flush, so its
+/// refusals are consecutive and the SDK stops the source after five. Under
+/// traffic they are not consecutive: each traffic batch Acks and resets the
+/// SDK's counter, so the source runs on indefinitely, retrying at the ceiling.
+/// #3941 is the subject there, not something this connector can fix from the
+/// inside.
 fn state_flush_retry_delay(attempt: u32) -> Duration {
     match attempt {
         0 => Duration::ZERO,
@@ -2167,6 +2206,94 @@ mod tests {
             source.shared.pending_change_count(),
             0,
             "and close() must not report changes that were never made"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_declined_flush_when_polled_again_should_hand_the_turn_to_traffic() {
+        // The flush arm can win and still produce nothing, and that poll spent
+        // its turn all the same: the permit was consumed and `recv()` never
+        // ran. Keyed on the state rather than the arm, the flip did not
+        // happen, so the next poll took the flush arm first and found nothing
+        // again while the bridge sat full.
+        //
+        // Driven here by a surplus permit, which is the deterministic way in:
+        // several mutations post permits that one flush clears the flag for.
+        // The other way is a contended `try_lock`, where the decline re-posts
+        // the permit itself and the loop is self-sustaining for as long as a
+        // control-plane writer keeps the lock warm. Both reach this line.
+        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+        source
+            .shared
+            .sender
+            .try_send(queued("one"))
+            .expect("bridge must accept");
+
+        source.shared.state_flush.notify_one();
+        let declined = source.poll().await.expect("poll must succeed");
+        assert!(
+            declined.state.is_none(),
+            "nothing was dirty, so the flush must have declined"
+        );
+        assert!(
+            declined.messages.is_empty(),
+            "and the flush arm won, so no traffic was read"
+        );
+
+        source.shared.state_flush.notify_one();
+        let next = source.poll().await.expect("poll must succeed");
+
+        assert_eq!(
+            next.messages.first().map(|message| &message.payload),
+            Some(&b"one".to_vec()),
+            "a declined flush still took a turn, so the bridge is owed the next one"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_traffic_batch_when_acked_should_not_clear_the_flush_backoff() {
+        // The backoff counts refusals by the state store, so only the batch
+        // that carried the flush may reset it. Traffic clearing it held the
+        // delay at attempt zero, which is none, so the documented doubling
+        // never engaged on a gateway that was serving requests.
+        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
+
+        let flushed = source.poll().await.expect("poll must succeed");
+        assert!(flushed.state.is_some(), "the mutation must arm a flush");
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("nack must succeed");
+        assert_eq!(
+            source.shared.state_flush_nacks.load(Ordering::Acquire),
+            1,
+            "a refused flush must count against the backoff"
+        );
+
+        // A batch of ordinary traffic, acked. It knows nothing about the state
+        // store and must not speak for it.
+        source
+            .shared
+            .sender
+            .try_send(queued("one"))
+            .expect("bridge must accept");
+        let traffic = source.poll().await.expect("poll must succeed");
+        assert!(
+            traffic.state.is_none(),
+            "the flush is still owed, but traffic carries no state"
+        );
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ack must succeed");
+
+        assert_eq!(
+            source.shared.state_flush_nacks.load(Ordering::Acquire),
+            1,
+            "traffic succeeding says nothing about a state store that is still refusing"
         );
     }
 
