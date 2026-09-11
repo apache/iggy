@@ -117,7 +117,7 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `admin_listen_addr` | string | `127.0.0.1:9091` | Management API, admin health, and metrics. Never route this through a public load balancer. |
 | `instance_name` | string | runtime id | Identifies the instance in message headers and on the admin listener. The default is the plugin's numeric runtime id, assigned in load order and **not stable across restarts**, so set it explicitly in production. |
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
-| `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. |
+| `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. A misspelled key reads as unset, so it opens the path rather than failing; see the note on unknown keys below. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
 | `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 67108864**; a larger value fails `open()`. |
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
@@ -148,6 +148,10 @@ Env overrides reach top-level fields only, and only under the local config provi
 Values are coerced before they are deserialized: `true`/`false` become booleans and anything that parses as a number becomes one. So `..._INSTANCE_NAME=42` or a numeric `..._TOPIC_PATH` hands a JSON number to a string field and fails the whole configuration parse, with an error that does not name the field. Quote such values into non-numeric form, or set them in TOML.
 
 `HttpSourceConfig` deliberately does not implement `Serialize`, so this connector cannot write a credential out by accident. That does **not** protect the values in your TOML: the runtime keeps plugin configuration as raw JSON and serves it verbatim from `GET /sources/{key}/configs/plugin` (and inside `/configs` and `/configs/active`), so anyone who can reach the runtime's control API can read every secret configured here. Treat that API as privileged. (`/stats` carries no plugin configuration.)
+
+**An unknown key in `plugin_config` is ignored, not rejected.** It has to be: the runtime delivers env overrides as flat top-level keys, so refusing keys this table does not list would break a documented path. The cost is that a misspelling reads as "unset", and for `auth_bearer_token` and `management_token` unset is not a mild default. A typo in the first serves `POST /topics/{topic_path}` to anyone; a typo in the second silently removes the management API.
+
+Neither fails `open()`, and the two are not equally visible. The connector names its named-path auth posture on every open, so `grep` for `with NO authentication` catches the first one, and that is the check worth running after any configuration change. A `management_token` typo is logged nowhere: it fails closed, so what you see is `/admin/endpoints` answering 404 the next time you register.
 
 `http_sink` calls its equivalent knob `max_payload_size_bytes`. The names differ deliberately: the sink's bounds an outgoing payload, this one bounds an accepted request.
 
