@@ -15806,10 +15806,11 @@ mod retention_tests {
 
 #[cfg(test)]
 mod purge_poll_tests {
-    //! A disk poll with automatic commit starts reading messages at offsets 0-2.
+    //! A disk poll starts reading messages at offsets 0-2.
     //! Before it completes, purge removes those messages and clears consumer
     //! progress. Fresh messages are then appended starting at offset 0.
-    //! Completing the old poll must not advance progress over the fresh messages.
+    //! Completing the old poll must not advance progress over the fresh messages
+    //! or restore a group's last polled mark when automatic commits are disabled.
 
     use super::tests::{journal_send_batch, repair_config, test_partition};
     use super::*;
@@ -15840,6 +15841,83 @@ mod purge_poll_tests {
             ))
             .await;
         }
+    }
+
+    #[compio::test]
+    async fn given_group_disk_poll_without_auto_commit_when_purged_should_preserve_group_progress()
+    {
+        Box::pin(assert_delayed_group_poll_preserves_progress()).await;
+    }
+
+    async fn assert_delayed_group_poll_preserves_progress() {
+        let config = repair_config();
+        let (_directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
+        let consumer = PollingConsumer::ConsumerGroup(7, 1);
+        for op in 1..=3 {
+            journal_send_batch(&mut partition, op).await;
+        }
+        partition.consensus().advance_commit_max(3);
+        partition.commit_journal(&config).await;
+
+        assert_old_disk_reads(&mut partition, consumer).await;
+        assert_eq!(partition.group_offset_state(7), (Some(2), None));
+        assert_eq!(partition.log.segments().len(), 1);
+        assert!(!partition.log.active_segment().sealed);
+        let read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
+        assert!(read_state.fd.borrow().is_some());
+
+        let delayed = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(PollingStrategy::offset(0), 3, false),
+            true,
+        );
+        assert!(delayed.needs_off_pump_io());
+        let mut delayed = std::pin::pin!(delayed.execute());
+        // With the active segment's descriptor cached, the first suspension is
+        // the disk read. Its file clone survives purge unlinking the old inode.
+        assert!(
+            futures::poll!(delayed.as_mut()).is_pending(),
+            "the group disk poll must suspend before purge",
+        );
+
+        partition.purge(&config, 1).await.expect("purge partition");
+        assert_eq!(partition.applied_purge_generation(), 1);
+        assert_eq!(partition.group_offset_state(7), (None, None));
+        assert!(read_state.fd.borrow().is_none());
+
+        // Fresh offsets 0-4 make the stale last polled offset 2 valid again.
+        // Leave the old read unpolled until the replacement history is ready.
+        for op in 4..=8 {
+            journal_send_batch(&mut partition, op).await;
+        }
+        partition.consensus().advance_commit_max(8);
+        partition.commit_journal(&config).await;
+        assert_eq!(partition.offsets().commit_offset, 4);
+
+        let old_result = delayed.await;
+        assert_eq!(polled_offsets(&old_result.fragments), [0, 1, 2]);
+        assert_eq!(old_result.last_matching_offset, Some(2));
+        let completion = partition.complete_poll(old_result);
+        assert_eq!(
+            partition.group_offset_state(7),
+            (None, None),
+            "the stale completion must not restore group progress after purge",
+        );
+        assert!(matches!(completion, Err(IggyError::TransientNotAccepted)));
+
+        let fresh = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(PollingStrategy::next(), 5, false),
+            true,
+        );
+        assert!(fresh.needs_off_pump_io());
+        let fresh_result = fresh.execute().await;
+        let fresh = partition
+            .complete_poll(fresh_result)
+            .expect("accept fresh group read");
+        assert_eq!(polled_offsets(&fresh.fragments), [0, 1, 2, 3, 4]);
+        assert!(fresh.replication.is_none());
+        assert_eq!(partition.group_offset_state(7), (Some(4), None));
     }
 
     async fn assert_delayed_poll_preserves_fresh_progress(
