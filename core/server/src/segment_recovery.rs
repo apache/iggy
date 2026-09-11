@@ -76,7 +76,7 @@ const REBUILT_INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 /// -- for its whole length on every clean boot.
 const INDEX_SCAN_YIELD_STRIDE: u64 = 1024;
 
-/// Index entries the log may legitimately fail to back under `enforce_fsync`.
+/// Index entries the log may legitimately fail to back under `durable_segments`.
 /// Persistence writes exactly one entry per flush chunk and chunks never
 /// overlap. The two halves fdatasync concurrently WITHIN one flush, but
 /// flushes are serialized, and the log's fdatasync covers the whole file: an
@@ -171,7 +171,7 @@ pub struct RecoveredSegment {
 /// [`ServerError::PartitionRecoveryRefused`] so the caller can fence this one
 /// partition instead of taking the node down.
 ///
-/// `enforce_fsync` is the topic's own effective value, not a hint: it is what
+/// `durable_segments` is the topic's own effective value, not a hint: it is what
 /// makes a durable index entry evidence about the log (see
 /// [`PartitionRecoveryRefusal::FsyncedLogLoss`]), so passing it wrong either
 /// refuses healthy chains or hides previously durable data loss.
@@ -179,20 +179,37 @@ pub struct RecoveredSegment {
 /// Takes no offset ceiling. A legitimate gap is proved by the anchor the boot
 /// re-anchor writes beside the segment it plants, not inferred from how far the
 /// superblock's reservation happens to reach.
-#[allow(clippy::too_many_lines)]
 pub async fn load_persisted_segments(
     config: &ServerConfig,
     namespace: IggyNamespace,
     segment_size: IggyByteSize,
-    enforce_fsync: bool,
+    durable_segments: bool,
     stats: &PartitionStats,
+) -> Result<Vec<RecoveredSegment>, ServerError> {
+    load_persisted_segments_with_checkpoint(
+        config,
+        namespace,
+        segment_size,
+        durable_segments,
+        stats,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn load_persisted_segments_with_checkpoint(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    segment_size: IggyByteSize,
+    durable_segments: bool,
+    stats: &PartitionStats,
+    checkpoint: Option<journal::partition_journal::SegmentPosition>,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    let partition_path = config
-        .system
-        .get_partition_path(stream_id, topic_id, partition_id);
+    let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
     let identity = PartitionIdentity {
         partition_path: &partition_path,
         stream_id,
@@ -206,6 +223,11 @@ pub async fn load_persisted_segments(
     // sweep's silent return would swallow an EACCES that must not be ignored.
     let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path)?;
     start_offsets.sort_unstable();
+    if let Some(checkpoint) = checkpoint {
+        start_offsets.retain(|offset| {
+            *offset < checkpoint.next_offset || *offset == checkpoint.start_offset
+        });
+    }
 
     let max_size = segment_size;
     let mut scratch = ScanScratch::default();
@@ -219,26 +241,58 @@ pub async fn load_persisted_segments(
     let mut planned = Vec::with_capacity(start_offsets.len());
     for start_offset in start_offsets {
         let messages_path =
-            config
-                .system
-                .get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
-        let index_path =
-            config
-                .system
-                .get_index_path(stream_id, topic_id, partition_id, start_offset);
+            config.get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
+        let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
 
         let raw_messages_size = file_len(&messages_path)?;
-
-        let bounds = recover_segment_bounds(
-            identity,
-            &index_path,
-            &messages_path,
-            start_offset,
-            raw_messages_size,
-            enforce_fsync,
-            &mut scratch,
-        )
-        .await?;
+        let checkpoint_segment =
+            checkpoint.is_some_and(|checkpoint| checkpoint.start_offset == start_offset);
+        let messages_size = checkpoint
+            .filter(|checkpoint| checkpoint.start_offset == start_offset)
+            .map_or(raw_messages_size, |checkpoint| checkpoint.length);
+        if raw_messages_size < messages_size {
+            return Err(
+                identity.refusal(PartitionRecoveryRefusal::StorageSizeMismatch {
+                    start_offset,
+                    on_disk_bytes: raw_messages_size,
+                    expected_bytes: messages_size,
+                }),
+            );
+        }
+        let bounds = if checkpoint_segment {
+            let messages = open_messages_file(identity, &messages_path)?;
+            let mut scanner = FileScanner::new(&messages, messages_size, &mut scratch);
+            recover_by_walking_log(
+                identity,
+                &mut scanner,
+                &messages_path,
+                start_offset,
+                messages_size,
+            )
+            .await?
+        } else {
+            recover_segment_bounds(
+                identity,
+                &index_path,
+                &messages_path,
+                start_offset,
+                raw_messages_size,
+                durable_segments,
+                &mut scratch,
+            )
+            .await?
+        };
+        if checkpoint_segment
+            && bounds.as_ref().map_or(0, |bounds| bounds.messages_size) != messages_size
+        {
+            return Err(
+                identity.refusal(PartitionRecoveryRefusal::CheckpointSizeMismatch {
+                    start_offset,
+                    validated_bytes: bounds.as_ref().map_or(0, |bounds| bounds.messages_size),
+                    expected_bytes: messages_size,
+                }),
+            );
+        }
 
         // `bounds == None` means the log holds no whole batch ANYWHERE: the
         // index-less walk tried from byte 0 and the damage probe found no
@@ -251,7 +305,7 @@ pub async fn load_persisted_segments(
         // tail-only -- the log and the index persist concurrently under
         // every config, so a torn index is reachable mid-chain, which is why
         // the walk exists rather than refusing the partition.
-        let recovered_empty = bounds.is_none();
+        let recovered_empty = bounds.is_none() && !checkpoint_segment;
         let bounds = bounds.unwrap_or_else(|| {
             if raw_messages_size > 0 {
                 warn!(
@@ -337,21 +391,35 @@ pub async fn load_persisted_segments(
         // index over the shortened log; the next boot re-discards it and
         // rebuilds from the log again, and truncation is monotone, so the
         // pair converges.
-        truncate_to(&plan.messages_path, messages_size)?;
+        if checkpoint.is_none_or(|checkpoint| checkpoint.start_offset != plan.segment.start_offset)
+        {
+            truncate_to(&plan.messages_path, messages_size)?;
+        }
         if let Some(staging_path) = &plan.rebuilt_index_staging {
             install_rebuilt_index(staging_path, &plan.index_path, identity.partition_path)?;
         } else {
             truncate_to(&plan.index_path, plan.index_size)?;
         }
 
-        let storage = SegmentStorage::new(
-            &plan.messages_path,
-            &plan.index_path,
-            messages_size,
-            plan.index_size,
-            true,
-        )
-        .await
+        let storage = if checkpoint.is_some() {
+            SegmentStorage::with_read_only_messages(
+                &plan.messages_path,
+                &plan.index_path,
+                plan.index_size,
+                true,
+                None,
+            )
+            .await
+        } else {
+            SegmentStorage::new(
+                &plan.messages_path,
+                &plan.index_path,
+                messages_size,
+                plan.index_size,
+                true,
+            )
+            .await
+        }
         .map_err(|source| {
             error!(
                 stream_id,
@@ -1113,14 +1181,14 @@ async fn load_index_anchors(
 /// Derives a segment's readable bounds. `None` when the log holds no whole
 /// batch at all (the caller recovers the segment as empty).
 ///
-/// Without `enforce_fsync`, a consistent index locates batches but cannot prove
+/// Without `durable_segments`, a consistent index locates batches but cannot prove
 /// any log page reached disk: page-cache writeback may preserve a later chunk
 /// while losing an earlier one. Recovery therefore checksum-walks the log from
 /// byte 0. A clean walk preserves the existing index, while a break falls
 /// through to the rebuilding walk so every retained entry describes verified
 /// bytes.
 ///
-/// With `enforce_fsync`, completed serialized flushes prove the prefix before
+/// With `durable_segments`, completed serialized flushes prove the prefix before
 /// the final index entry, so the last entry's `position` anchors the walk that
 /// proves where the segment really ends. An index whose last entry the log
 /// cannot back, or whose entries contradict each other, is dropped whole: the
@@ -1137,7 +1205,7 @@ async fn recover_segment_bounds(
     messages_path: &str,
     start_offset: u64,
     messages_size: u64,
-    enforce_fsync: bool,
+    durable_segments: bool,
     scratch: &mut ScanScratch,
 ) -> Result<Option<WalkedBounds>, ServerError> {
     let (entry_count, first, last) = load_index_anchors(identity, index_path).await?;
@@ -1146,7 +1214,7 @@ async fn recover_segment_bounds(
         (Some(first), Some(last)) => {
             // A mis-strided or foreign index decodes to garbage entries that
             // binary searches would trust, so an index that contradicts itself
-            // is dropped whole and rebuilt from the log. No `enforce_fsync`
+            // is dropped whole and rebuilt from the log. No `durable_segments`
             // gate here, unlike the step-back below: the writer cannot emit a
             // non-ascending run, so this file is foreign or mis-strided and is
             // no witness to what the log once held.
@@ -1190,7 +1258,7 @@ async fn recover_segment_bounds(
             )
             .await?;
             if walk.start_timestamp.is_none() {
-                // Under `enforce_fsync` the DEPTH of the step-back that would
+                // Under `durable_segments` the DEPTH of the step-back that would
                 // find a usable non-empty anchor is evidence about the LOG.
                 // Flushes are serialized and each one fdatasyncs the whole log
                 // file before the next one writes, so an entry existing above
@@ -1201,7 +1269,7 @@ async fn recover_segment_bounds(
                 // this path too: it carries no message range recovery may
                 // advertise and the production writer never emits one.
                 // Refuse and keep every byte for the operator.
-                if enforce_fsync {
+                if durable_segments {
                     let search = find_provable_index_anchor(
                         identity,
                         index_path,
@@ -1231,7 +1299,7 @@ async fn recover_segment_bounds(
                 // stopped: a hole below the anchor would be invisible, while
                 // `end_offset` still advertised the offsets over it. That hole
                 // is exactly what the crash reaching this branch can leave --
-                // without `enforce_fsync` writeback order is arbitrary, so an
+                // without `durable_segments` writeback order is arbitrary, so an
                 // unprovable tail entry is equally a torn INDEX tail and
                 // evidence the LOG lost an interior page. Walk from byte 0
                 // instead: it reads the damage, finds the anchor's own batch
@@ -1259,7 +1327,7 @@ async fn recover_segment_bounds(
                     messages_size,
                 )
                 .await?;
-                if enforce_fsync {
+                if durable_segments {
                     ensure_fsynced_rebuild_reaches(
                         identity,
                         rebuilt.as_ref(),
@@ -1280,7 +1348,7 @@ async fn recover_segment_bounds(
                     messages_size,
                 )
                 .await?;
-                if enforce_fsync {
+                if durable_segments {
                     ensure_fsynced_rebuild_reaches(
                         identity,
                         rebuilt.as_ref(),
@@ -1292,7 +1360,7 @@ async fn recover_segment_bounds(
                 return Ok(rebuilt);
             }
 
-            if !enforce_fsync {
+            if !durable_segments {
                 // The last entry proved that the index still describes this
                 // log. It does not prove earlier log pages reached disk. The
                 // first entry is exactly `(start_offset, position 0)` by the
@@ -1757,7 +1825,7 @@ impl<'scan> IndexLogScanner<'scan> {
 /// reported as the number of entries at or below it plus that entry's
 /// position, alongside how deep the search went.
 ///
-/// Reached only under `enforce_fsync`, and only to measure how far the index
+/// Reached only under `durable_segments`, and only to measure how far the index
 /// has outrun the log: the index is dropped whole either way, so nothing is
 /// anchored on the entry this returns. What the DEPTH decides is whether the
 /// gap is the one chunk a crash can strand or previously durable data the log lost
@@ -2139,7 +2207,7 @@ fn scan_read_failure(
 /// into a log it has reason to distrust.
 ///
 /// The residue is deliberately NOT width-gated: a torn flush chunk is
-/// bounded by the CHUNK, not by one record, and with `enforce_fsync = false`
+/// bounded by the CHUNK, not by one record, and with `durable_segments = false`
 /// delayed allocation routinely extends a file far past its written-back
 /// pages, leaving hundreds of MiB of zeros behind one crash. That is the
 /// canonical torn tail this module exists to truncate, so every residue is
@@ -2481,14 +2549,13 @@ fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use configs::server::ServerSystemConfig;
+    use configs::server::ServerConfig;
     use partitions::segment_anchor::SegmentAnchor;
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, calculate_batch_checksum,
     };
     use server_common::sharding::IggyNamespace;
     use std::os::unix::fs::symlink;
-    use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
 
     const STREAM_ID: usize = 1;
@@ -2501,21 +2568,14 @@ mod tests {
     const GARBAGE: [u8; 384] = [0xAB; 384];
 
     fn test_config(tmp: &TempDir) -> ServerConfig {
-        let mut config = ServerConfig::default();
-        // `ServerSystemConfig` is not `Clone`; build a fresh value and swap
-        // the whole `Arc`.
-        let system = ServerSystemConfig {
+        ServerConfig {
             path: tmp.path().to_string_lossy().into_owned(),
-            ..ServerSystemConfig::default()
-        };
-        config.system = Arc::new(system);
-        config
+            ..ServerConfig::default()
+        }
     }
 
     fn prepare_partition_dir(config: &ServerConfig) -> String {
-        let partition_path = config
-            .system
-            .get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID);
+        let partition_path = config.get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID);
         fs::create_dir_all(&partition_path).expect("create partition dir");
         partition_path
     }
@@ -2629,13 +2689,8 @@ mod tests {
         index: &[u8],
     ) -> (String, String) {
         let messages_path =
-            config
-                .system
-                .get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
-        let index_path =
-            config
-                .system
-                .get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
+            config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
+        let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
         fs::write(&messages_path, log).expect("write log fixture");
         fs::write(&index_path, index).expect("write index fixture");
         (messages_path, index_path)
@@ -2644,9 +2699,7 @@ mod tests {
     /// Path of the anchor beside the segment planted at `start_offset`.
     fn anchor_fixture_path(config: &ServerConfig, start_offset: u64) -> String {
         partitions::segment_anchor::anchor_path(
-            &config
-                .system
-                .get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID),
+            &config.get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID),
             start_offset,
         )
     }
@@ -2703,20 +2756,20 @@ mod tests {
 
     async fn recover_under_fsync(
         config: &ServerConfig,
-        enforce_fsync: bool,
+        durable_segments: bool,
     ) -> Result<Vec<RecoveredSegment>, ServerError> {
-        recover_with(config, enforce_fsync).await
+        recover_with(config, durable_segments).await
     }
 
     async fn recover_with(
         config: &ServerConfig,
-        enforce_fsync: bool,
+        durable_segments: bool,
     ) -> Result<Vec<RecoveredSegment>, ServerError> {
         load_persisted_segments(
             config,
             IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
             IggyByteSize::from(SEGMENT_MAX_SIZE),
-            enforce_fsync,
+            durable_segments,
             &PartitionStats::default(),
         )
         .await
@@ -2830,13 +2883,8 @@ mod tests {
         prepare_partition_dir(&config);
         let mut log = encoded_batch(0, 1);
         log.extend_from_slice(&GARBAGE);
-        let messages_path =
-            config
-                .system
-                .get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
-        let index_path = config
-            .system
-            .get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let messages_path = config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         fs::write(&messages_path, &log).expect("write log fixture");
         // Self-referential symlink: every open or stat that follows it fails
         // with ELOOP, root or not (unlike permission bits, which root
@@ -2869,13 +2917,8 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        let messages_path =
-            config
-                .system
-                .get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
-        let index_path = config
-            .system
-            .get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let messages_path = config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         fs::write(&index_path, &GARBAGE[..10]).expect("write torn index fixture");
         // See the index variant above; the log stem is still collected by the
         // directory sweep, so recovery reaches the stat and must fail stop
@@ -3331,6 +3374,113 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_a_later_checkpoint_when_recovering_should_preserve_sealed_index_evidence() {
+        for damaged in [false, true] {
+            let directory = tempdir().unwrap();
+            let config = test_config(&directory);
+            prepare_partition_dir(&config);
+            let first = encoded_batch(0, 1);
+            let mut sealed = first.clone();
+            sealed.extend(encoded_batch(1, 1));
+            let mut index = index_entry(0, 0);
+            index.extend(index_entry(1, first.len() as u64));
+            if damaged {
+                index.extend(index_entry(2, sealed.len() as u64 + 8));
+                index.extend(index_entry(3, sealed.len() as u64 + 128));
+            }
+            let (messages_path, index_path) = write_segment(&config, 0, &sealed, &index);
+            let tail = encoded_batch(2, 1);
+            write_segment(&config, 2, &tail, &index_entry(2, 0));
+            let checkpoint = journal::partition_journal::SegmentPosition {
+                start_offset: 2,
+                length: tail.len() as u64,
+                next_offset: 3,
+            };
+            let result = load_persisted_segments_with_checkpoint(
+                &config,
+                IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
+                IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+                true,
+                &PartitionStats::default(),
+                Some(checkpoint),
+            )
+            .await;
+            if damaged {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ServerError::PartitionRecoveryRefused {
+                            reason: PartitionRecoveryRefusal::FsyncedLogLoss { .. },
+                            ..
+                        })
+                    ),
+                    "sealed index evidence must not be erased by an unrelated checkpoint"
+                );
+            } else {
+                let recovered = result.unwrap();
+                assert_eq!(recovered.len(), 2);
+                assert_eq!(recovered[0].segment.end_offset, 1);
+                assert!(recovered[0].storage.messages_writer.is_none());
+            }
+            assert_eq!(bytes_of(&messages_path), sealed);
+            assert_eq!(bytes_of(&index_path), index);
+        }
+    }
+
+    #[compio::test]
+    async fn given_checkpointed_prefix_when_recovering_should_hide_tails_and_refuse_overlaps() {
+        let tmp = tempdir().unwrap();
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let committed = encoded_batch(0, 3);
+        let mut physical = committed.clone();
+        physical.extend(encoded_batch(3, 3));
+        let (messages_path, _) = write_segment(&config, 0, &physical, &index_entry(0, 0));
+        let (uncommitted_path, _) = write_segment(&config, 6, &encoded_batch(6, 3), &[]);
+        let checkpoint = journal::partition_journal::SegmentPosition {
+            start_offset: 0,
+            length: committed.len() as u64,
+            next_offset: 3,
+        };
+        let namespace = IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID);
+        let recovered = load_persisted_segments_with_checkpoint(
+            &config,
+            namespace,
+            IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            true,
+            &PartitionStats::default(),
+            Some(checkpoint),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 2);
+        assert_eq!(recovered[0].segment.size.as_bytes_u64(), checkpoint.length);
+        assert_eq!(bytes_of(&messages_path), physical);
+        assert!(Path::new(&uncommitted_path).exists());
+        drop(recovered);
+        let (overlap, _) = write_segment(&config, 1, &[], &[]);
+        let result = load_persisted_segments_with_checkpoint(
+            &config,
+            namespace,
+            IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            true,
+            &PartitionStats::default(),
+            Some(checkpoint),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::PartitionRecoveryRefused {
+                reason: PartitionRecoveryRefusal::Hole { .. },
+                ..
+            })
+        ));
+        assert!(Path::new(&overlap).exists());
+        assert_eq!(bytes_of(&messages_path), physical);
+    }
+
     /// No re-anchor plants a segment whose range a predecessor already covers, so
     /// an anchor must not launder an overlap either. Reachable because each end
     /// offset is walked from its own file with nothing clamping it against the
@@ -3649,7 +3799,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        // The canonical torn flush chunk: a crash under `enforce_fsync =
+        // The canonical torn flush chunk: a crash under `durable_segments =
         // false` leaves the file extended far past its written-back pages,
         // reading as zeros -- residue bounded by the CHUNK (up to a whole
         // segment), not by one record. No survivor decodes anywhere in it,
@@ -4372,7 +4522,7 @@ mod tests {
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
         // The gap between the index and the log is exactly one entry here, so
-        // the `enforce_fsync` guard reads this as the benign in-flight chunk
+        // the `durable_segments` guard reads this as the benign in-flight chunk
         // and lets it through. That verdict is about the INDEX; the log is
         // still walked from byte 0, which is what catches the damage.
         let (log, index, damage_position, _) = segment_damaged_below_its_last_provable_entry();
@@ -4581,7 +4731,7 @@ mod tests {
         // Two unprovable entries for two different reasons: one lands
         // mid-batch inside the log, the next past its end. Neither the depth
         // of the gap nor the reason for it changes the verdict without
-        // `enforce_fsync`: the whole index goes and the log speaks for itself.
+        // `durable_segments`: the whole index goes and the log speaks for itself.
         let batch0 = encoded_batch(0, 1);
         let batch1 = encoded_batch(1, 1);
         let mut log = batch0.clone();
@@ -4612,7 +4762,7 @@ mod tests {
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
         // The same fixture the lenient rebuild above accepts. Under
-        // `enforce_fsync` the second-from-last entry was durable before its
+        // `durable_segments` the second-from-last entry was durable before its
         // chunk was acked, so a log that cannot back it lost acked bytes.
         let batch0 = encoded_batch(0, 1);
         let batch1 = encoded_batch(1, 1);
@@ -4627,7 +4777,7 @@ mod tests {
         let error = recover_under_fsync(&config, true)
             .await
             .err()
-            .expect("a multi-entry overshoot under enforce_fsync must refuse");
+            .expect("a multi-entry overshoot under durable_segments must refuse");
 
         assert!(
             matches!(
@@ -4653,7 +4803,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        // The crash window `enforce_fsync` cannot close: the entry for the
+        // The crash window `durable_segments` cannot close: the entry for the
         // chunk still in flight reached disk, its log bytes did not, and no
         // ack was ever sent for them. Exactly one entry deep, so it recovers.
         let batch0 = encoded_batch(0, 1);
@@ -4811,7 +4961,7 @@ mod tests {
         let error = recover_under_fsync(&config, true)
             .await
             .err()
-            .expect("an index backed nowhere under enforce_fsync must refuse, not rebuild");
+            .expect("an index backed nowhere under durable_segments must refuse, not rebuild");
 
         assert!(
             matches!(
@@ -4884,7 +5034,7 @@ mod tests {
         // The first flush into a fresh segment, crashed between the two
         // fsyncs: one entry and no log bytes. Whether any batches in that
         // flush were acknowledged depends on the flush thresholds, but only
-        // one entry can belong to the interrupted flush. `enforce_fsync` must
+        // one entry can belong to the interrupted flush. `durable_segments` must
         // not turn that shape into a tombstone.
         let index = index_entry(0, 0);
         let (messages_path, index_path) = write_segment(&config, 0, &[], &index);
@@ -4965,7 +5115,7 @@ mod tests {
         // costs a whole-batch verify that never passes. The claims overlap
         // many times over, so an unbudgeted search would hash close to
         // entries x claim bytes; it must give up and refuse instead, leaving
-        // the files byte-identical. Only `enforce_fsync` walks the index
+        // the files byte-identical. Only `durable_segments` walks the index
         // backward at all -- without it the gap is not measured, so there is
         // nothing here to bound.
         const CLAIMED_BATCH_BYTES: usize = 8 * 1024;
@@ -5211,13 +5361,8 @@ mod tests {
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
         let log = encoded_batch(0, 4);
-        let messages_path =
-            config
-                .system
-                .get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
-        let index_path = config
-            .system
-            .get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let messages_path = config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         fs::write(&messages_path, &log).expect("write log fixture");
 
         let recovered = recover(&config)

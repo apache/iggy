@@ -19,7 +19,7 @@ use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
@@ -379,10 +379,9 @@ pub fn new_shard(
     let partitions_config = PartitionsConfig {
         messages_required_to_save: 1000,
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
-        enforce_fsync: false, //Disable fsync for simulation
-        consumer_offset_enforce_fsync: false,
+
         validate_checksum: true,
-        segment_size: IggyByteSize::from(1024 * 1024 * 1024),
+        segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
         preallocate_segments: false,
         encryptor: None,
         path_layout: PartitionPathLayout::default(),
@@ -415,7 +414,7 @@ pub fn new_shard(
         wire_shell_handlers(
             &SharedSimOutbox(Rc::clone(bus)),
             &shard_handle,
-            Arc::new(ServerSystemConfig::default()),
+            Arc::new(ServerConfig::default()),
             // Default-config PAT cap, like the system config above, so sim
             // ingress admits exactly what a default-configured server does.
             PersonalAccessTokenConfig::default().max_tokens_per_user,

@@ -38,18 +38,20 @@ class TopicOptionsTest {
 
     @Test
     void shouldEmitOnlyTheKeysThatWereSet() {
-        var options = TopicOptions.builder().enforceFsync(true).build();
+        var options = TopicOptions.builder()
+                .durability(org.apache.iggy.topic.Durability.PERSISTED)
+                .build();
 
-        assertThat(options).containsOnlyKeys("enforce_fsync");
-        assertThat(options.get("enforce_fsync").kind()).isEqualTo(HeaderKind.Bool);
-        assertThat(options.get("enforce_fsync").value()).containsExactly(1);
+        assertThat(options).containsOnlyKeys("durability", "consumer_offset_durability");
+        assertThat(options.get("durability").kind()).isEqualTo(HeaderKind.String);
+        assertThat(options.get("durability").toStringValue()).isEqualTo("persisted");
     }
 
     @Test
     void shouldEncodeEveryKeyInItsCatalogKind() {
         var options = TopicOptions.builder()
                 .segmentSize(BigInteger.valueOf(134_217_728))
-                .enforceFsync(false)
+                .durability(org.apache.iggy.topic.Durability.REPLICATED)
                 .messagesRequiredToSave(1024)
                 .sizeOfMessagesRequiredToSave(BigInteger.valueOf(1_048_576))
                 .preallocateSegments(true)
@@ -58,7 +60,8 @@ class TopicOptionsTest {
         assertThat(options)
                 .containsOnlyKeys(
                         "segment_size",
-                        "enforce_fsync",
+                        "durability",
+                        "consumer_offset_durability",
                         "messages_required_to_save",
                         "size_of_messages_required_to_save",
                         "preallocate_segments");
@@ -75,10 +78,11 @@ class TopicOptionsTest {
         var options = TopicOptions.builder()
                 .preallocateSegments(true)
                 .segmentSize(BigInteger.valueOf(134_217_728))
-                .enforceFsync(false)
+                .durability(org.apache.iggy.topic.Durability.REPLICATED)
                 .build();
 
-        assertThat(options.keySet()).containsExactly("preallocate_segments", "segment_size", "enforce_fsync");
+        assertThat(options.keySet())
+                .containsExactly("durability", "consumer_offset_durability", "preallocate_segments", "segment_size");
     }
 
     @Test
