@@ -493,6 +493,12 @@ where
     /// [`Self::replicate_poll_completion`]. Success does not acknowledge a
     /// durable offset commit.
     ///
+    /// Acceptance is independent of reply delivery. A caller that stopped
+    /// waiting does not cancel completion: an accepted read can still advance
+    /// progress and admit an automatic commit even if its reply cannot be sent.
+    /// A history rejection accepts no progress from this read, but cannot
+    /// replace a response the transport already sent.
+    ///
     /// # Errors
     /// Rejects stale history, unavailable partition or admission state, invalid
     /// consumer identifiers, and exhausted consumer, queue, or journal capacity.

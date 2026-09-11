@@ -337,12 +337,12 @@ fn consumer_offset_kind(request: &Message<RoutedRequestHeader>) -> Option<Consum
 /// the owning shard ([`shard::IggyShard::partition_read`]), and re-encode
 /// the stored batches into the legacy wire `PolledMessages` body.
 ///
-/// A partition that cannot answer yet replies with the 16-byte empty poll,
-/// which the SDK reads as 0 messages and retries; a consumer-group poll the
-/// coordinator fenced replies with the same shape carrying the re-sync
-/// sentinel. Every permanent client error (undecodable body, authz, and every
-/// rejection the resolve raises) denies with a nonzero status instead, so none
-/// of them can be mistaken for an empty partition.
+/// Owner rejections and missing replies return a nonzero status. A missing
+/// reply leaves acceptance unknown: the owner may still advance progress, so
+/// it cannot carry a retry hint that promises the poll was not accepted.
+/// A consumer group poll fenced by the coordinator carries the resync sentinel.
+/// Other unexpected owner replies and encoding failures retain the empty poll
+/// fallback; these do not establish that the partition has no messages.
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -447,8 +447,10 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
 }
 
 /// Run the resolved poll on the owning shard and re-encode the stored
-/// batches into the wire `PolledMessages` reply. A failed read or re-encode
-/// hands back the fail-fast empty poll for the partition instead.
+/// batches into the wire `PolledMessages` reply. Owner rejections preserve
+/// their error; a missing reply reports a communication error without claiming
+/// that the owner rejected the read. Unexpected replies and encoding failures
+/// retain the empty poll fallback.
 #[allow(clippy::future_not_send)]
 async fn read_polled_messages<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -487,6 +489,19 @@ where
             ReadPolledMessagesError::Fallback(empty_poll_fallback(partition_id))
         }),
         Some(PartitionReadReply::Rejected(error)) => Err(ReadPolledMessagesError::Rejected(error)),
+        None => {
+            // A timeout drops the receiver without canceling the owner. Its
+            // eventual completion may still accept progress, so neither an
+            // empty success nor TransientNotAccepted describes this outcome.
+            warn!(
+                transport_client_id,
+                namespace = namespace.inner(),
+                "partition read reply unavailable; acceptance unknown"
+            );
+            Err(ReadPolledMessagesError::Rejected(
+                IggyError::ShardCommunicationError,
+            ))
+        }
         other => {
             warn!(
                 transport_client_id,
@@ -1086,7 +1101,7 @@ mod tests {
     use metadata::stm::StateMachine as _;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
-    use server_common::sharding::ShardId;
+    use server_common::sharding::{PartitionLocation, ShardId};
     use shard::metrics::ShardMetrics;
     use shard::shards_table::PapayaShardsTable;
     use shard::{
@@ -1477,6 +1492,103 @@ mod tests {
                 "{label} against a missing stream must carry the not-found status"
             );
         }
+    }
+
+    #[compio::test]
+    async fn given_pending_poll_when_owner_reply_times_out_should_report_unknown_acceptance() {
+        const TRANSPORT: u128 = 91;
+        const VSR_CLIENT: u128 = 1;
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let mut shard = test_shard(&bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+        metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateStream,
+                VSR_CLIENT,
+                1,
+                &CreateStreamRequest {
+                    name: WireName::new("stream").unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                VSR_CLIENT,
+                2,
+                &CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 1,
+                        name: WireName::new("topic").unwrap(),
+                        options: WireOptions::empty(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: vec![CreatedPartitionAssignment {
+                        partition_id: 0,
+                        consensus_group_id: 1,
+                    }],
+                    created_view: 0,
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        let namespace = metadata
+            .mux_stm
+            .streams()
+            .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
+            .unwrap();
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        let body = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            strategy: WirePollingStrategy::offset(0),
+            count: 10,
+            auto_commit: true,
+        }
+        .to_bytes();
+        let request = request_message(Operation::NonReplicated, VSR_CLIENT, 1, 1, &body);
+
+        // Keep the owner request queued so its live reply sender forces the
+        // timeout path, rather than an immediate channel disconnection.
+        handle_poll_messages(&shard, TRANSPORT, &request, Some(DEFAULT_ROOT_USER_ID)).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1);
+        let (client_id, frame) = &replies[0];
+        assert_eq!(*client_id, TRANSPORT);
+        assert_eq!(frame.len(), std::mem::size_of::<ReplyHeader>());
+        let status_start = std::mem::offset_of!(ReplyHeader, status);
+        let status = u32::from_le_bytes(frame[status_start..status_start + 4].try_into().unwrap());
+        assert_eq!(status, IggyError::ShardCommunicationError.as_code());
+        drop(replies);
+
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
+            owner_inbox.try_recv().unwrap()
+        else {
+            panic!("the timed out poll must remain queued for its owner");
+        };
+        assert!(
+            reply
+                .try_send(PartitionReadReply::Rejected(
+                    IggyError::TransientNotAccepted
+                ))
+                .is_err()
+        );
+        assert_eq!(bus.client_replies.borrow().len(), 1);
     }
 
     /// A partition write whose routable wait exhausts (namespace committed,

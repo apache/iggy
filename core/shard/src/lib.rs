@@ -1982,6 +1982,13 @@ where
     /// path). `None` = unroutable namespace, full owning-shard inbox,
     /// dropped reply sender, or `PARTITION_READ_TIMEOUT` expiry; the
     /// caller maps it to a client-visible error.
+    ///
+    /// `None` does not prove the owner rejected the read. A timeout drops the
+    /// reply receiver without canceling a queued request or detached poll.
+    /// Completion can still advance progress and admit an automatic commit;
+    /// a later owner rejection cannot be delivered to this receiver. Callers
+    /// must not treat a missing reply as an accepted empty poll or as evidence
+    /// that retrying cannot advance progress again.
     #[allow(clippy::future_not_send)]
     pub async fn partition_read(
         &self,
