@@ -737,14 +737,22 @@ where
     /// # Errors
     /// Returns an error if durable prepare history cannot be opened or replayed.
     pub async fn open_persistence(&mut self) -> Result<(), IggyError> {
-        self.open_persistence_with_capacity(journal::partition_journal::PARTITION_WAL_BYTES_MAX)
-            .await
+        self.open_persistence_with_capacity(
+            journal::partition_journal::PARTITION_WAL_BYTES_MAX,
+            std::time::Duration::ZERO,
+        )
+        .await
     }
 
     /// # Errors
     /// Returns an error if durable prepare history cannot be opened or replayed.
-    pub async fn open_persistence_with_capacity(&mut self, capacity: u64) -> Result<(), IggyError> {
-        self.open_persistence_with_recovered(capacity, None).await
+    pub async fn open_persistence_with_capacity(
+        &mut self,
+        capacity: u64,
+        group_commit_delay: std::time::Duration,
+    ) -> Result<(), IggyError> {
+        self.open_persistence_with_recovered(capacity, group_commit_delay, None)
+            .await
     }
 
     /// # Errors
@@ -753,6 +761,7 @@ where
     pub async fn open_persistence_with_recovered(
         &mut self,
         capacity: u64,
+        group_commit_delay: std::time::Duration,
         recovered: Option<(Rc<PartitionPersistence>, Vec<Message<PrepareHeader>>)>,
     ) -> Result<(), IggyError> {
         if self.consensus.replica_count() > 1
@@ -795,6 +804,7 @@ where
                 IggyError::CannotReadFile
             })?
         };
+        persistence.set_group_commit_delay(group_commit_delay);
         if !self.materialization_missing {
             let segment = self.log.active_segment();
             let length = segment.size.as_bytes_u64();

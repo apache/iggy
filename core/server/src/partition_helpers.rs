@@ -960,13 +960,7 @@ async fn load_partition(
     )
     .await?;
 
-    partition
-        .open_persistence_with_recovered(
-            config.partition.wal_bytes_max.as_bytes_u64(),
-            recovered_persistence,
-        )
-        .await
-        .map_err(|error| ServerError::Iggy(Box::new(error)))?;
+    open_partition_persistence(&mut partition, config, recovered_persistence).await?;
     Ok(partition)
 }
 
@@ -1507,11 +1501,28 @@ pub async fn build_partition_fresh(
         });
     }
 
-    partition
-        .open_persistence_with_capacity(config.partition.wal_bytes_max.as_bytes_u64())
-        .await
-        .map_err(|error| ServerError::Iggy(Box::new(error)))?;
+    open_partition_persistence(&mut partition, config, None).await?;
     Ok(partition)
+}
+
+/// Open a partition's prepare WAL with the budget and the group-commit delay
+/// this server was configured with.
+async fn open_partition_persistence(
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    config: &ServerConfig,
+    recovered: Option<(
+        Rc<PartitionPersistence>,
+        Vec<server_common::Message<iggy_binary_protocol::PrepareHeader>>,
+    )>,
+) -> Result<(), ServerError> {
+    partition
+        .open_persistence_with_recovered(
+            config.partition.wal_bytes_max.as_bytes_u64(),
+            std::time::Duration::from_micros(config.partition.wal_group_commit_delay_micros),
+            recovered,
+        )
+        .await
+        .map_err(|error| ServerError::Iggy(Box::new(error)))
 }
 
 async fn persist_partition_hierarchy(

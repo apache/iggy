@@ -1473,7 +1473,11 @@ mod tests {
         .await
         .unwrap();
         partition
-            .open_persistence_with_recovered(capacity, Some((Rc::clone(&persistence), prepares)))
+            .open_persistence_with_recovered(
+                capacity,
+                std::time::Duration::ZERO,
+                Some((Rc::clone(&persistence), prepares)),
+            )
             .await
             .unwrap();
 

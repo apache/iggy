@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use nix::sys::resource::{Resource, getrlimit};
@@ -153,6 +153,11 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     failure: RefCell<Option<Arc<io::Error>>>,
     failure_operation: Cell<Operation>,
     notifier: RefCell<Option<PersistenceNotifier>>,
+    group_commit_delay: Cell<Duration>,
+    /// Interval between the two most recent submissions. Decides whether a
+    /// group-commit wait would see another prepare before it expires.
+    append_gap: Cell<Duration>,
+    last_append: Cell<Option<Instant>>,
     completed_batches: Cell<u64>,
     batched_prepares: Cell<u64>,
     completed_checkpoints: Cell<u64>,
@@ -533,6 +538,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             failure: RefCell::new(None),
             failure_operation: Cell::new(Operation::SendMessages),
             notifier: RefCell::new(None),
+            group_commit_delay: Cell::new(Duration::ZERO),
+            append_gap: Cell::new(Duration::MAX),
+            last_append: Cell::new(None),
             completed_batches: Cell::new(0),
             batched_prepares: Cell::new(0),
             completed_checkpoints: Cell::new(0),
@@ -583,6 +591,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             });
         }
         false
+    }
+
+    /// Bound on the wait the writer may take before a barrier, to let more
+    /// prepares join the group. Zero keeps the writer's barrier-paced grouping.
+    pub fn set_group_commit_delay(&self, delay: Duration) {
+        self.group_commit_delay.set(delay);
     }
 
     pub fn set_notifier(&self, notifier: PersistenceNotifier) {
@@ -703,6 +717,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 "partition WAL submission is out of order",
             ));
         }
+        let now = Instant::now();
+        self.append_gap.set(
+            self.last_append
+                .replace(Some(now))
+                .map_or(Duration::MAX, |previous| {
+                    now.saturating_duration_since(previous)
+                }),
+        );
         self.queued_bytes.set(self.queued_bytes.get() + bytes);
         self.accepted
             .borrow_mut()
@@ -1234,46 +1256,28 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         &self,
         journal: &mut PartitionPrepareJournal<S>,
         first: Frozen<4096>,
-        mut durable: bool,
+        durable: bool,
         epoch: u64,
         first_bytes: u64,
     ) -> io::Result<()> {
         let mut batch = SmallVec::<[Frozen<4096>; 8]>::new();
         batch.push(first);
         let mut bytes = first_bytes;
-        {
-            let mut queue = self.queue.borrow_mut();
-            while batch.len() < APPEND_BATCH_OPS_MAX {
-                let Some(Mutation::Append {
-                    epoch: next_epoch,
-                    bytes: next_bytes,
-                    ..
-                }) = queue.front()
-                else {
-                    break;
-                };
-                if *next_epoch != epoch
-                    || bytes.saturating_add(*next_bytes) > APPEND_BATCH_BYTES_MAX
-                {
-                    break;
-                }
-                let Some(Mutation::Append {
-                    prepare,
-                    durable: requires_sync,
-                    bytes: record_bytes,
-                    ..
-                }) = queue.pop_front()
-                else {
-                    unreachable!("append prefix was checked");
-                };
-                bytes += record_bytes;
-                self.queued_bytes
-                    .set(self.queued_bytes.get().saturating_sub(record_bytes));
-                durable |= requires_sync;
-                batch.push(prepare);
-            }
-        }
+        let mut durable = durable;
+        self.collect_queued(&mut batch, &mut bytes, &mut durable, epoch);
+        // Charged before the wait: `collect_queued` took these bytes out of the
+        // queued total, and admission and checkpoint pacing sum queued and
+        // in-flight bytes against the budget, so a gap here would admit a full
+        // group past it.
         self.in_flight_bytes.set(bytes);
+        // The barrier is what groups prepares, so a barrier cheaper than the
+        // interval between arrivals groups nothing and every prepare pays its
+        // own writes. This wait puts that grouping back under operator control.
+        if durable && let Some(delay) = self.group_commit_wait(&batch, bytes) {
+            compio::runtime::time::sleep(delay).await;
+            self.collect_queued(&mut batch, &mut bytes, &mut durable, epoch);
+            self.in_flight_bytes.set(bytes);
+        }
         let count = batch.len() as u64;
         journal.append_batch_buffered(&batch).await?;
         if durable {
@@ -1283,6 +1287,58 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 .set(self.batched_prepares.get() + count);
         }
         Ok(())
+    }
+
+    /// Move every queued append that still fits into `batch`.
+    fn collect_queued(
+        &self,
+        batch: &mut SmallVec<[Frozen<4096>; 8]>,
+        bytes: &mut u64,
+        durable: &mut bool,
+        epoch: u64,
+    ) {
+        let mut queue = self.queue.borrow_mut();
+        while batch.len() < APPEND_BATCH_OPS_MAX {
+            let Some(Mutation::Append {
+                epoch: next_epoch,
+                bytes: next_bytes,
+                ..
+            }) = queue.front()
+            else {
+                break;
+            };
+            if *next_epoch != epoch || bytes.saturating_add(*next_bytes) > APPEND_BATCH_BYTES_MAX {
+                break;
+            }
+            let Some(Mutation::Append {
+                prepare,
+                durable: requires_sync,
+                bytes: record_bytes,
+                ..
+            }) = queue.pop_front()
+            else {
+                unreachable!("append prefix was checked");
+            };
+            *bytes += record_bytes;
+            self.queued_bytes
+                .set(self.queued_bytes.get().saturating_sub(record_bytes));
+            *durable |= requires_sync;
+            batch.push(prepare);
+        }
+    }
+
+    /// How long to wait for more prepares before the barrier, if at all.
+    ///
+    /// `None` for a disabled delay, a group already at its bounds, or arrivals
+    /// spaced wider than the delay, where the wait would expire before the next
+    /// prepare reached the queue.
+    fn group_commit_wait(&self, batch: &[Frozen<4096>], bytes: u64) -> Option<Duration> {
+        let delay = self.group_commit_delay.get();
+        if delay.is_zero() || batch.len() >= APPEND_BATCH_OPS_MAX || bytes >= APPEND_BATCH_BYTES_MAX
+        {
+            return None;
+        }
+        (self.append_gap.get() <= delay).then_some(delay)
     }
 
     fn notify(&self) {
@@ -1537,6 +1593,94 @@ mod tests {
         }
         assert!(persistence.needs_checkpoint());
         assert_eq!(persistence.disk_bytes.get(), 0);
+    }
+
+    /// The barrier is what groups prepares, so a barrier cheaper than the
+    /// interval between arrivals leaves every prepare paying its own writes.
+    /// The delay restores the grouping without changing what the barrier
+    /// covers, and it must not fire on a partition whose arrivals are spaced
+    /// wider than the wait.
+    #[compio::test]
+    async fn a_group_commit_delay_admits_prepares_that_arrive_during_the_wait() {
+        const DELAY: Duration = Duration::from_millis(200);
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        persistence.set_group_commit_delay(DELAY);
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        let third = prepare(3, second.header().checksum);
+        // Two back-to-back submissions put the arrival estimate under the delay.
+        persistence.append(first.into_frozen(), true).unwrap();
+        persistence.append(second.into_frozen(), true).unwrap();
+        assert!(persistence.start());
+        let writer = Rc::clone(&persistence);
+        let late = async {
+            compio::runtime::time::sleep(DELAY / 4).await;
+            // Collected bytes stay charged against the budget while the writer
+            // waits; they left the queue but have not reached the barrier.
+            let waiting = persistence.take_metrics();
+            assert_eq!(waiting.queued_bytes, 0);
+            assert_eq!(waiting.in_flight_bytes, 2 * 4096);
+            persistence.append(third.into_frozen(), true).unwrap();
+        };
+        futures::future::join(writer.run(), late).await;
+        assert!(persistence.failure().is_none());
+        assert!(persistence.is_durable_through(3));
+        let metrics = persistence.take_metrics();
+        assert_eq!(metrics.completed_batches, 1);
+        assert_eq!(metrics.batched_prepares, 3);
+        assert_eq!(metrics.in_flight_bytes, 0);
+    }
+
+    /// A group with no barrier to amortize gains nothing from waiting, and a
+    /// wait there would only delay the durable group queued behind it.
+    #[compio::test]
+    async fn a_group_commit_delay_is_skipped_for_a_group_without_a_barrier() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        // Wide apart on purpose: a taken wait is at least the delay, a slow
+        // append on a loaded runner is milliseconds, so the bound cannot be
+        // crossed by either for the wrong reason.
+        persistence.set_group_commit_delay(Duration::from_secs(2));
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), false).unwrap();
+        persistence.append(second.into_frozen(), false).unwrap();
+        assert!(persistence.start());
+        let started = Instant::now();
+        Rc::clone(&persistence).run().await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(persistence.is_written_through(2));
+        assert_eq!(persistence.take_metrics().completed_batches, 0);
+    }
+
+    /// A partition whose prepares arrive further apart than the delay would pay
+    /// the wait for nothing, so the estimate has to keep it off.
+    #[compio::test]
+    async fn a_group_commit_delay_is_skipped_when_arrivals_outlast_it() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        persistence.set_group_commit_delay(Duration::from_millis(1));
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), true).unwrap();
+        compio::runtime::time::sleep(Duration::from_millis(20)).await;
+        persistence.append(second.into_frozen(), true).unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_durable_through(2));
+        // Both were queued before the writer started, so they share one barrier
+        // regardless. What matters is that no wait was taken to get there.
+        assert_eq!(persistence.take_metrics().completed_batches, 1);
     }
 
     fn prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
