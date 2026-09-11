@@ -187,7 +187,7 @@ Content-Type: application/json
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 405 | A known path with the wrong method | `{"error":"method not allowed"}` |
 | 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |
-| 503 | `GET /health` when any instance on the listener has stopped polling; a named-path POST whose route changed hands while the body was still arriving; a POST whose instance left the listener mid-request; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"route unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |
+| 503 | `GET /health` when an instance on the listener has stopped polling, having previously polled; a named-path POST whose route changed hands while the body was still arriving; a POST whose instance left the listener mid-request; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"route unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |
 
 Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
 
@@ -198,6 +198,10 @@ A 404 there would tell a conventional client the resource is gone, and it would 
 The named path's 503 covers two conditions and says `route unavailable` for both: the path was withdrawn, or another instance on the same listener took it over. The caller retries either way, and the body deliberately does not say which, since that would describe the listener's topology to a sender that has no use for it.
 
 `GET /health` on the public listener answers 200 only while every instance on it is serving, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped would otherwise keep receiving traffic into a bridge nothing drains. Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
+
+An instance that has not polled yet is not counted, which is a different condition from one that has stopped. Between `open()` and the first `poll()` the runtime logs into Iggy and ensures the stream and topic, with retries; counting that window meant restarting one instance took every healthy sibling out of rotation for the length of it.
+
+Such an instance publishes no routes either, so its own paths answer 404 until its poll task runs and nothing is accepted that nothing would drain. A boot grace period would not do: it answers 200 while the bridge still has no reader.
 
 HMAC signatures are validated over the raw request body exactly as received, never over a re-serialized form, and compared in constant time.
 

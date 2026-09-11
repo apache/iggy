@@ -230,6 +230,14 @@ pub struct SharedState {
     /// bridge. Cleared by a guard, so a cancelled poll clears it too, which is
     /// what makes a stopped poll task observable.
     poll_active: AtomicBool,
+    /// Whether the poll task has ever run, which is not the same question as
+    /// whether it is running now.
+    ///
+    /// Set once and never cleared. `poll_is_live` answers `false` both for an
+    /// instance still setting up its producer and for one whose poll task has
+    /// stopped, and those need opposite answers: the first must not drag a
+    /// listener's healthy instances out of rotation, the second must.
+    has_polled: AtomicBool,
     /// Set by `leave()` before it counts what the bridge still holds.
     ///
     /// The re-resolve in the request path narrows the window where a handler
@@ -395,6 +403,18 @@ impl SharedState {
     pub(crate) fn enter_poll(&self) -> PollGuard<'_> {
         self.poll_active.store(true, Ordering::Release);
         PollGuard(self)
+    }
+
+    /// Records that the poll task has started, and says whether this was the
+    /// first time. The caller publishes the instance's routes on a `true`.
+    pub(crate) fn claim_first_poll(&self) -> bool {
+        !self.has_polled.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether this instance has ever polled, so its routes are worth serving
+    /// and its liveness is worth holding a listener to.
+    pub(crate) fn has_polled(&self) -> bool {
+        self.has_polled.load(Ordering::Acquire)
     }
 
     /// Re-arms a flush whose state was taken but never persisted.
@@ -796,6 +816,7 @@ impl HttpSource {
             pending_changes: AtomicUsize::new(0),
             handed_changes: AtomicUsize::new(0),
             poll_active: AtomicBool::new(false),
+            has_polled: AtomicBool::new(false),
             departed: AtomicBool::new(false),
             last_poll_at: AtomicU64::new(0),
             registry_writer: StdMutex::new(()),
@@ -941,6 +962,20 @@ impl Source for HttpSource {
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         let _polling = self.shared.enter_poll();
+        // Published here rather than in `join`, because this is the first
+        // moment anything can drain what the routes would let in. Between the
+        // two sits the whole of `setup_source_producer`: an Iggy login, then a
+        // stream and topic ensure with retries. Routes that exist across that
+        // window accept requests into a bridge with no reader, and an instance
+        // that had not polled yet also read as a stopped one to the readiness
+        // gate, so restarting one instance answered 503 for every healthy
+        // sibling on the listener until this call.
+        //
+        // Before the select, so the first request this unblocks is one this
+        // poll can take.
+        if self.shared.claim_first_poll() {
+            server::serve_routes(&self.shared).await;
+        }
         // An unacknowledged batch outranks new traffic: replaying it in order
         // is what turns the runtime's NACK into a retry instead of a gap.
         if let Some(staged) = self.staged_batch() {
@@ -1195,6 +1230,20 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Marks an instance as polling and publishes its routes, which is what
+    /// the poll task does on its first run.
+    ///
+    /// Tests that open a source and then post to it need this, because the
+    /// runtime always starts a poll task after `open()` and an instance does
+    /// not serve before that. Calling `poll()` instead would block on an empty
+    /// bridge, which is the whole reason a request has to be able to arrive
+    /// first.
+    pub async fn start_serving(shared: &Arc<SharedState>) {
+        if shared.claim_first_poll() {
+            crate::server::serve_routes(shared).await;
+        }
+    }
+
     /// Reserves an ephemeral port and hands it back. Every test that binds
     /// needs its own, because the listener registry is process-global and the
     /// test binary runs its cases in parallel.
@@ -1220,6 +1269,10 @@ pub(crate) mod test_support {
     /// and state tests resolve and mutate, they never send.
     pub fn instance(id: u32, topic_path: Option<&str>, endpoint_ids: &[&str]) -> Arc<SharedState> {
         let source = HttpSource::new(id, config(topic_path, endpoint_ids), None);
+        // Marked as having polled, because these fixtures exist to be
+        // projected into a route table and an instance that has never polled
+        // contributes none.
+        source.shared.claim_first_poll();
         Arc::clone(&source.shared)
     }
 
@@ -1235,6 +1288,7 @@ pub(crate) mod test_support {
         endpoint_ids: &[&str],
     ) -> (Arc<SharedState>, HttpSource) {
         let source = HttpSource::new(id, config(topic_path, endpoint_ids), None);
+        source.shared.claim_first_poll();
         let shared = Arc::clone(&source.shared);
         (shared, source)
     }

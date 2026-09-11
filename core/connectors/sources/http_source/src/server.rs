@@ -292,25 +292,39 @@ pub(crate) struct Published {
 }
 
 impl Published {
-    /// Whether this listener should be taking traffic: an instance exists, a
-    /// route can reach it, and every instance is still polling.
+    /// Whether this listener should be taking traffic: a route can reach an
+    /// instance, and every instance that has started polling still is.
     ///
-    /// Every instance, not any. One load balancer fronts the whole listener, so
-    /// it can only take all of them in or out together. If one instance's poll
-    /// task has stopped while a sibling's is alive, `any` keeps the address in
-    /// rotation and the dead one's webhooks are accepted into a bridge nobody
-    /// drains, which is the exact failure this gate exists to catch. Shedding
-    /// the healthy sibling's traffic too costs availability that senders recover
-    /// by retrying; the alternative loses data already answered 200.
+    /// Every such instance, not any. One load balancer fronts the whole
+    /// listener, so it can only take all of them in or out together. If one
+    /// instance's poll task has stopped while a sibling's is alive, `any` keeps
+    /// the address in rotation and the dead one's webhooks are accepted into a
+    /// bridge nobody drains, which is the exact failure this gate exists to
+    /// catch. Shedding the healthy sibling's traffic too costs availability
+    /// that senders recover by retrying; the alternative loses data already
+    /// answered 200.
+    ///
+    /// An instance that has never polled is not counted, because it is not the
+    /// same condition. `poll_is_live` is false both for a task that has stopped
+    /// and for one that has not started, and counting the second took every
+    /// healthy instance on a listener out of rotation for as long as one
+    /// restarting sibling spent setting up its producer. It contributes no
+    /// routes until it polls either, so nothing is accepted on its behalf in
+    /// the meantime, which is what makes ignoring it safe rather than merely
+    /// convenient.
+    ///
+    /// No separate emptiness check: routes are projected only from instances
+    /// that have polled, so `serves_anything` already answers false for a
+    /// listener where none has.
     ///
     /// Computed here so `/health` and `/admin/health` cannot answer differently
     /// about the same listener, which is the one moment an operator reads both.
     pub(crate) fn is_ready(&self, now_seconds: u64) -> bool {
         self.routes.serves_anything(now_seconds)
-            && !self.instances.is_empty()
             && self
                 .instances
                 .iter()
+                .filter(|instance| instance.has_polled())
                 .all(|instance| instance.poll_is_live(now_seconds))
     }
 }
@@ -399,13 +413,56 @@ impl ServerState {
 
     /// Swaps in a new instance set and the routes it projects to, or leaves
     /// both untouched if the instances collide on a path.
+    /// Validates across every joined instance and serves only those that can
+    /// drain.
+    ///
+    /// Two builds on purpose. The first is the check, and it has to see every
+    /// instance: a conflict between a joining instance and a sibling must
+    /// refuse the join, not lie dormant until the offender first polls and the
+    /// table suddenly fails to rebuild. The second is what gets served, and it
+    /// leaves out instances whose poll task has not started, because a route
+    /// to one of those accepts requests into a bridge with no reader. Neither
+    /// build is on a request path; both run on join, leave and registration.
     fn publish(&self, instances: Vec<Arc<SharedState>>) -> Result<(), Error> {
-        let routes = RouteTable::build(&instances)
+        RouteTable::build(&instances)
+            .map_err(|conflict| Error::InvalidConfigValue(conflict.to_string()))?;
+        let serving: Vec<Arc<SharedState>> = instances
+            .iter()
+            .filter(|instance| instance.has_polled())
+            .map(Arc::clone)
+            .collect();
+        let routes = RouteTable::build(&serving)
             .map_err(|conflict| Error::InvalidConfigValue(conflict.to_string()))?;
         self.published
             .store(Arc::new(Published { instances, routes }));
         Ok(())
     }
+}
+
+/// Publishes an instance's routes, once its poll task is running and there is
+/// something to drain them.
+///
+/// Separate from `join` deliberately: see the call site in `poll()`. Failure is
+/// logged rather than returned, because the caller is a poll that has already
+/// started and has no way to refuse. A conflict here cannot be new, since
+/// `join` validated the same instance set against the same siblings.
+pub(crate) async fn serve_routes(instance: &Arc<SharedState>) {
+    let listen_addr = &instance.config.listen_addr;
+    let servers = SERVERS.lock().await;
+    let Some(server) = servers.get(listen_addr) else {
+        return;
+    };
+    if let Err(error) = server.state.publish(server.state.instances()) {
+        error!(
+            "Could not publish the routes of {CONNECTOR_NAME} connector ID: {} on its first poll: {error}",
+            instance.id
+        );
+        return;
+    }
+    info!(
+        "Serving the routes of {CONNECTOR_NAME} connector ID: {} on {listen_addr}, its poll task is running",
+        instance.id
+    );
 }
 
 /// Reprojects a listener's route table after a management mutation.
@@ -1272,7 +1329,12 @@ mod tests {
         for attempt in 1..=ATTEMPTS {
             let mut source = HttpSource::new(id, config.clone(), None);
             match source.open().await {
-                Ok(()) => return source,
+                Ok(()) => {
+                    // The runtime starts a poll task right after `open`, and
+                    // an instance serves nothing until that runs.
+                    crate::test_support::start_serving(&source.shared).await;
+                    return source;
+                }
                 Err(error) if attempt < ATTEMPTS && is_address_in_use(&error) => {
                     config.listen_addr = format!("127.0.0.1:{}", free_port());
                     config.admin_listen_addr = format!("127.0.0.1:{}", free_port());
@@ -2597,6 +2659,72 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "one instance polling is not enough when the listener is shared"
         );
+        close(&mut second).await;
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_a_joining_instance_when_health_checked_should_keep_serving_its_siblings() {
+        // The complement of the stopped-instance case above, and the two must
+        // not be answered the same way. A poll task that has stopped has to
+        // take the listener out of rotation; one that has not started yet must
+        // not, or restarting a single instance drains every healthy sibling
+        // for the whole of its producer setup.
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.instance_name = Some("http_github".to_string());
+        let mut first = open(1, first_config).await;
+        let live = Arc::clone(&first.shared);
+        let _polling = live.enter_poll();
+
+        // Joined and not yet polling, which is where an instance sits for the
+        // whole of `setup_source_producer`. Built directly because the test
+        // helper stands in for the first poll.
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.instance_name = Some("http_partner".to_string());
+        second_config.topic_path = Some("stripe".to_string());
+        let mut second = HttpSource::new(2, second_config, None);
+        second.open().await.expect("the second instance must join");
+
+        let health = client()
+            .get(format!("{}/health", base_url(&first)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "an instance that has not polled must not take its healthy siblings out of rotation"
+        );
+
+        // And it is not quietly serving either, which is what would make the
+        // answer above a lie: its bridge has no reader yet.
+        let early = client()
+            .post(format!("{}/topics/stripe", base_url(&first)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            early.status(),
+            StatusCode::NOT_FOUND,
+            "a route may not exist before something can drain it"
+        );
+
+        crate::test_support::start_serving(&second.shared).await;
+        let served = client()
+            .post(format!("{}/topics/stripe", base_url(&first)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "and once its poll task runs, the route appears"
+        );
+
         close(&mut second).await;
         close(&mut first).await;
     }

@@ -641,6 +641,7 @@ mod tests {
 
             let mut source = HttpSource::new(1, config, None);
             source.open().await.expect("open must succeed");
+            crate::test_support::start_serving(&source.shared).await;
             Fixture {
                 source,
                 public,
