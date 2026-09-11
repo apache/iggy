@@ -94,45 +94,29 @@ TEST_F(E2E_Partition, CreatePartitionsOnNonExistentResourcesThrows) {
         iggy::IggyException);
 }
 
-TEST_F(E2E_Partition, CreatePartitionsWithInvalidIdentifiersThrows) {
-    RecordProperty("description", "Rejects create_partitions requests that use malformed stream or topic identifiers.");
+TEST_F(E2E_Partition, CreatePartitionsWithUnknownNumericIdentifiersThrows) {
+    RecordProperty("description",
+                   "Rejects create_partitions requests that use unknown numeric stream or topic identifiers.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    iggy::ffi::Identifier invalid_stream_kind;
-    invalid_stream_kind.kind   = "invalid";
-    invalid_stream_kind.length = 4;
-    invalid_stream_kind.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->create_partitions(std::move(invalid_stream_kind), make_string_identifier(topic_name), 1),
-                 std::exception);
+    const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    ASSERT_EQ(stream.Topics().size(), 1u);
+    const auto unknown_id = std::numeric_limits<std::uint32_t>::max();
 
-    iggy::ffi::Identifier invalid_stream_length;
-    invalid_stream_length.kind   = "numeric";
-    invalid_stream_length.length = 1;
-    invalid_stream_length.value.push_back(1);
-    ASSERT_THROW(client->create_partitions(std::move(invalid_stream_length), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_topic_kind;
-    invalid_topic_kind.kind   = "invalid";
-    invalid_topic_kind.length = 4;
-    invalid_topic_kind.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), std::move(invalid_topic_kind), 1),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_topic_length;
-    invalid_topic_length.kind   = "numeric";
-    invalid_topic_length.length = 1;
-    invalid_topic_length.value.push_back(1);
-    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), std::move(invalid_topic_length), 1),
-                 std::exception);
+    ASSERT_THROW(client.CreatePartitions(iggy::Identifier::Numeric(unknown_id),
+                                         iggy::Identifier::Numeric(stream.Topics().front().Id()), 1),
+                 iggy::IggyException);
+    ASSERT_THROW(
+        client.CreatePartitions(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(unknown_id), 1),
+        iggy::IggyException);
 }
 
 TEST_F(E2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues) {
@@ -398,45 +382,29 @@ TEST_F(E2E_Partition, DeletePartitionsOnNonExistentResourcesThrows) {
         iggy::IggyException);
 }
 
-TEST_F(E2E_Partition, DeletePartitionsWithInvalidIdentifiersThrows) {
-    RecordProperty("description", "Rejects delete_partitions requests that use malformed stream or topic identifiers.");
+TEST_F(E2E_Partition, DeletePartitionsWithUnknownNumericIdentifiersThrows) {
+    RecordProperty("description",
+                   "Rejects delete_partitions requests that use unknown numeric stream or topic identifiers.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(3, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
 
-    iggy::ffi::Identifier invalid_stream_kind;
-    invalid_stream_kind.kind   = "invalid";
-    invalid_stream_kind.length = 4;
-    invalid_stream_kind.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_partitions(std::move(invalid_stream_kind), make_string_identifier(topic_name), 1),
-                 std::exception);
+    const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    ASSERT_EQ(stream.Topics().size(), 1u);
+    const auto unknown_id = std::numeric_limits<std::uint32_t>::max();
 
-    iggy::ffi::Identifier invalid_stream_length;
-    invalid_stream_length.kind   = "numeric";
-    invalid_stream_length.length = 1;
-    invalid_stream_length.value.push_back(1);
-    ASSERT_THROW(client->delete_partitions(std::move(invalid_stream_length), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_topic_kind;
-    invalid_topic_kind.kind   = "invalid";
-    invalid_topic_kind.length = 4;
-    invalid_topic_kind.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), std::move(invalid_topic_kind), 1),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_topic_length;
-    invalid_topic_length.kind   = "numeric";
-    invalid_topic_length.length = 1;
-    invalid_topic_length.value.push_back(1);
-    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), std::move(invalid_topic_length), 1),
-                 std::exception);
+    ASSERT_THROW(client.DeletePartitions(iggy::Identifier::Numeric(unknown_id),
+                                         iggy::Identifier::Numeric(stream.Topics().front().Id()), 1),
+                 iggy::IggyException);
+    ASSERT_THROW(
+        client.DeletePartitions(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(unknown_id), 1),
+        iggy::IggyException);
 }
 
 TEST_F(E2E_Partition, DeletePartitionsTwiceForSameTopicSucceeds) {

@@ -644,13 +644,13 @@ TEST_F(E2E_Stream, PurgeStreamPreservesStreamMetadata) {
     EXPECT_GT(stream_with_messages.SizeBytes(), 0u);
 
     struct TopicMetadata {
-        std::uint32_t id;
-        std::uint64_t created_at;
+        std::uint32_t id{};
+        std::uint64_t created_at{};
         std::string name;
-        std::uint64_t message_expiry;
+        std::uint64_t message_expiry{};
         std::string compression_algorithm;
-        std::uint64_t max_topic_size;
-        std::uint32_t partitions_count;
+        std::uint64_t max_topic_size{};
+        std::uint32_t partitions_count{};
     };
     std::unordered_map<std::string, TopicMetadata> topics_before_purge;
     for (const auto &topic : stream_with_messages.Topics()) {

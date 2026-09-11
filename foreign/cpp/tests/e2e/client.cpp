@@ -1752,7 +1752,6 @@ TEST_F(LowLevelE2E_Client, ChangePasswordUpdatesCredentialsAndCanBeRestored) {
 
     if (password_changed) {
         EXPECT_NO_THROW(client->change_password(user_id, new_password, old_password));
-        password_changed = false;
     }
 
     EXPECT_NO_THROW(third_client->login_user("iggy", old_password));

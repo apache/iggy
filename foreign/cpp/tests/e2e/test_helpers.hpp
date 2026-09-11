@@ -63,7 +63,7 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
 
 inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
     rust::Vec<rust::String> snapshot_types;
-    for (const auto value : values) {
+    for (const auto *const value : values) {
         snapshot_types.push_back(value);
     }
     return snapshot_types;
@@ -128,7 +128,7 @@ struct TrackedConsumerGroup {
 
 class E2ETestFixture : public ::testing::Test {
   public:
-    ~E2ETestFixture() { CleanupBestEffort(); }
+    ~E2ETestFixture() override { CleanupBestEffort(); }
     void TearDown() override { Cleanup(); }
 
   protected:
@@ -404,7 +404,6 @@ class E2ETestFixture : public ::testing::Test {
                !tracked_user_names_.empty();
     }
 
-  private:
     std::vector<iggy::ffi::Client *> clients_;
     std::vector<std::string> tracked_user_names_;
     std::vector<std::string> tracked_stream_names_;

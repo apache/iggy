@@ -45,16 +45,16 @@ rust::Vec<ffi::HeaderEntry> ToFfiRawOptions(const std::map<std::string, std::str
 
 template <typename FfiOptions, typename Options>
 void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
-    if (const auto value = options.CompressionAlgorithm()) {
+    if (const auto &value = options.CompressionAlgorithm()) {
         ffi_options.has_compression_algorithm = true;
         ffi_options.compression_algorithm     = std::string(value->Value());
     }
-    if (const auto value = options.MessageExpiry()) {
+    if (const auto &value = options.MessageExpiry()) {
         ffi_options.has_message_expiry   = true;
         ffi_options.message_expiry_kind  = std::string(value->Kind());
         ffi_options.message_expiry_value = value->Value();
     }
-    if (const auto value = options.MaxTopicSize()) {
+    if (const auto &value = options.MaxTopicSize()) {
         ffi_options.has_max_topic_size = true;
         ffi_options.max_topic_size     = std::string(value->Value());
     }

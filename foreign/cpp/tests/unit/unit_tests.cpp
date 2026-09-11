@@ -346,6 +346,7 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     const auto stream = iggy::Identifier::String("stream");
     const auto topic  = iggy::Identifier::String("topic");
 
+    // Exercising the moved-from guard requires invoking every operation on the valid but empty source object.
     EXPECT_THROW(client.Connect(), iggy::IggyException);
     EXPECT_THROW(client.Disconnect(), iggy::IggyException);
     EXPECT_THROW(client.Shutdown(), iggy::IggyException);
