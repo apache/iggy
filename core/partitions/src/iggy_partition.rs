@@ -975,6 +975,17 @@ where
                 return;
             }
         }
+        if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref)
+            && let Err(error) = writer.fsync().await
+        {
+            error!(%error, namespace_raw = self.namespace().inner(), "partition checkpoint index sync failed");
+            self.fatal = Some(FatalCommit {
+                namespace_raw: self.namespace().inner(),
+                op: through_op,
+                operation: Operation::SendMessages,
+            });
+            return;
+        }
         let (files, directories) = self.persistence_checkpoint_files(config);
         persistence.checkpoint_files(through_op, files, directories);
         self.start_persistence();
@@ -6583,7 +6594,7 @@ where
                 .last()
                 .and_then(|writer| writer.as_ref())
                 .ok_or(IggyError::CannotWriteToFile)?;
-            let saved_indexes = index_writer.save_indexes(index_bytes).await?;
+            let saved_indexes = index_writer.save_indexes_buffered(index_bytes).await?;
             index_writer.advance(saved_indexes);
             if let Some(writer) = self
                 .log
@@ -6746,6 +6757,11 @@ where
                 ),
                 "a plant at {start_offset} leaves a gap past {sealed_end} with no anchor"
             );
+        }
+        if self.persistence.is_some()
+            && let Some(writer) = &self.log.index_writers()[sealed_index]
+        {
+            writer.fsync().await?;
         }
         self.log.active_segment_mut().sealed = true;
         self.install_empty_segment(config, start_offset).await?;
@@ -8692,6 +8708,34 @@ mod tests {
         ));
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(!directory.path().join("prepares-0").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn checkpoint_index_sync_failure_fences_before_reclaiming_wal_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"durable");
+        persistence.append(prepare.into_frozen(), true).unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_durable_through(1));
+        partition.consensus.restore_commit_state(1, 1);
+        let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
+            .await
+            .unwrap();
+        assert_eq!(writer.save_indexes_buffered(vec![1; 32]).await.unwrap(), 32);
+        let active = partition.log.index_writers().len() - 1;
+        partition.log.index_writers_mut()[active] = Some(Rc::new(writer));
+        persistence.request_checkpoint();
+        partition.checkpoint_persistence(&repair_config()).await;
+        assert!(partition.fatal().is_some());
+        assert!(!persistence.checkpoint_pending());
+        assert!(persistence.is_durable_through(1));
     }
 
     #[compio::test]

@@ -1749,7 +1749,12 @@ mod tests {
         drop(store);
         let frontier = Path::new(&directory).join("prepares-0/frontier");
         let mut corrupt = std::fs::read(&frontier).unwrap();
-        corrupt[0] ^= u8::MAX;
+        // Every slot: the frontier alternates between two of them, and one
+        // damaged copy is recoverable by design, so damaging a single slot
+        // would open the partition instead of fencing it.
+        for slot in corrupt.chunks_mut(journal::partition_journal::PARTITION_WAL_BLOCK_SIZE) {
+            slot[0] ^= u8::MAX;
+        }
         std::fs::write(&frontier, &corrupt).unwrap();
         let partitions = solo_partitions();
         let metadata = Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0);

@@ -35,8 +35,15 @@ use std::time::Duration;
 #[cfg(unix)]
 use nix::sys::resource::{Resource, getrlimit};
 
-const APPEND_BATCH_BYTES_MAX: u64 = 1024 * 1024;
-const APPEND_BATCH_OPS_MAX: usize = 64;
+// Group commit bounds, not throughput bounds. Every prepare in a group is
+// already queued and waiting, so widening the group moves work off the barrier
+// and onto a buffered memcpy: one body write and one durability barrier serve
+// the whole group instead of each prepare paying its own. The byte budget is
+// charged against the padded BODY size even when the WAL stores a segment
+// reference and writes 4096 bytes per record, so a tight budget caps grouping
+// far below what the write itself costs.
+const APPEND_BATCH_BYTES_MAX: u64 = 8 * 1024 * 1024;
+const APPEND_BATCH_OPS_MAX: usize = 256;
 const CHECKPOINT_DIRTY_FILES_MAX: usize = 1024;
 #[cfg(unix)]
 const OFFSET_FILES_TOTAL_MAX: usize = 1024;

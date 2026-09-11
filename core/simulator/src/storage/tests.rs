@@ -974,33 +974,88 @@ fn queued_prepares_share_a_barrier_and_survive_power_loss_together() {
         Rc::clone(&persistence).run().await;
         assert!(persistence.failure().is_none());
         let trace = storage.trace();
-        assert_eq!(
+        let count = |wanted: StorageOperation| {
             trace
                 .iter()
-                .filter(|operation| **operation == StorageOperation::FileSync)
-                .count(),
-            4
-        );
-        assert_eq!(
-            trace
-                .iter()
-                .filter(|operation| **operation == StorageOperation::DirectorySync)
-                .count(),
-            2
-        );
-        assert_eq!(
-            trace
-                .iter()
-                .filter(|operation| **operation == StorageOperation::Write)
-                .count(),
-            4
-        );
+                .filter(|operation| **operation == wanted)
+                .count()
+        };
+        // One group: the WAL extent and the frontier slot, one barrier each.
+        assert_eq!(count(StorageOperation::Write), 2);
+        assert_eq!(count(StorageOperation::FileSync), 2);
+        // Publication overwrites a pre-existing slot in place, so an
+        // acknowledgment creates no file, renames nothing and leaves no
+        // directory to make durable. Those are the filesystem metadata
+        // transactions this path must never pay per batch.
+        assert_eq!(count(StorageOperation::Create), 0);
+        assert_eq!(count(StorageOperation::Rename), 0);
+        assert_eq!(count(StorageOperation::DirectorySync), 0);
         assert!(persistence.is_durable_through(65));
         storage.crash(Crash::PowerLoss);
         let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
             .await
             .unwrap();
         assert_eq!(recovered.prepares().await.unwrap().len(), 65);
+    });
+}
+
+#[test]
+fn queued_owned_prepares_share_three_file_barriers_without_directory_mutations() {
+    block_on(async {
+        for count in [65, 256, 257] {
+            let storage = storage_for_partition().await;
+            let (persistence, _) =
+                PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                    .await
+                    .unwrap();
+            persistence.enable_segment_storage(SegmentPosition::default(), 64 * 1024 * 1024);
+            let first = owned_prepare(1, 0, 0);
+            let mut parent = first.header().checksum;
+            persistence.append(first.into_frozen(), true).unwrap();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            assert!(persistence.failure().is_none());
+            persistence.take_metrics();
+            for index in 1..=count {
+                let prepare = owned_prepare(1, parent, index).transmute_header(
+                    |original, header: &mut PrepareHeader| {
+                        *header = original;
+                        header.op = index + 1;
+                        header.checksum = header.identity_checksum();
+                    },
+                );
+                parent = prepare.header().checksum;
+                persistence.append(prepare.into_frozen(), true).unwrap();
+            }
+            storage.clear_trace();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            assert!(persistence.failure().is_none());
+            let trace = storage.trace();
+            let operations = |wanted: StorageOperation| {
+                trace
+                    .iter()
+                    .filter(|operation| **operation == wanted)
+                    .count() as u64
+            };
+            let groups = count.div_ceil(256);
+            assert_eq!(operations(StorageOperation::Write), 3 * groups);
+            assert_eq!(operations(StorageOperation::FileSync), 3 * groups);
+            assert_eq!(operations(StorageOperation::Create), 0);
+            assert_eq!(operations(StorageOperation::Rename), 0);
+            assert_eq!(operations(StorageOperation::DirectorySync), 0);
+            let metrics = persistence.take_metrics();
+            assert_eq!(metrics.completed_batches, groups);
+            assert_eq!(metrics.batched_prepares, count);
+            assert!(persistence.is_durable_through(count + 1));
+            storage.crash(Crash::PowerLoss);
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.head(), count + 1);
+            assert_eq!(recovered.prepares().await.unwrap().len() as u64, count + 1);
+        }
     });
 }
 
