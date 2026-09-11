@@ -22,7 +22,7 @@ use iggy_common::{HeaderKey, HeaderValue, IggyTimestamp, calculate_256};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
     convert::owned_value_to_serde_json,
-    retry::{exponential_backoff, is_transient_status, jitter, parse_duration},
+    retry::{is_transient_status, parse_duration, retry_backoff},
     sink_connector,
 };
 use opensearch::{
@@ -660,12 +660,11 @@ impl OpenSearchSink {
         max_retries: u32,
         failure: &str,
     ) {
-        let delay = jitter(exponential_backoff(
+        let delay = retry_backoff(
             self.config.retry_delay,
-            retries - 1,
+            retries,
             self.config.max_retry_delay,
-        ))
-        .min(self.config.max_retry_delay);
+        );
         warn!(
             "OpenSearch {} failed (retry {}/{}): {}. Retrying in {:?}...",
             operation, retries, max_retries, failure, delay
