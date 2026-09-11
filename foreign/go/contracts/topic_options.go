@@ -29,7 +29,8 @@ import "encoding/binary"
 // UpdateTopic refuses it by name.
 const (
 	topicOptionSegmentSize                  = "segment_size"
-	topicOptionEnforceFsync                 = "enforce_fsync"
+	topicOptionDurability                   = "durability"
+	topicOptionConsumerOffsetDurability     = "consumer_offset_durability"
 	topicOptionMessagesRequiredToSave       = "messages_required_to_save"
 	topicOptionSizeOfMessagesRequiredToSave = "size_of_messages_required_to_save"
 	topicOptionPreallocateSegments          = "preallocate_segments"
@@ -42,9 +43,19 @@ func SegmentSizeOption(bytes uint64) HeaderEntry {
 	return uint64Option(topicOptionSegmentSize, bytes)
 }
 
-// EnforceFsyncOption makes writes to the topic's partitions fsync.
-func EnforceFsyncOption(enabled bool) HeaderEntry {
-	return boolOption(topicOptionEnforceFsync, enabled)
+type Durability string
+
+const (
+	DurabilityReplicated Durability = "replicated"
+	DurabilityPersisted  Durability = "persisted"
+)
+
+func DurabilityOption(value Durability) HeaderEntry {
+	return HeaderEntry{Key: HeaderKey{Kind: String, Value: []byte(topicOptionDurability)}, Value: HeaderValue{Kind: String, Value: []byte(value)}}
+}
+
+func ConsumerOffsetDurabilityOption(value Durability) HeaderEntry {
+	return HeaderEntry{Key: HeaderKey{Kind: String, Value: []byte(topicOptionConsumerOffsetDurability)}, Value: HeaderValue{Kind: String, Value: []byte(value)}}
 }
 
 // MessagesRequiredToSaveOption flushes the journal once it holds this many
