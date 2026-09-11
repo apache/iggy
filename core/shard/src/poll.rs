@@ -38,6 +38,10 @@ use partitions::{PollCompletion, PollPlan, PollReadResult};
 use server_common::sharding::IggyNamespace;
 
 #[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod timeout_tests;
 
 /// A read result awaiting acceptance by its partition owner.

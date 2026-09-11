@@ -17,33 +17,24 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
-use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus, oneshot_channel};
-use futures::FutureExt;
+use consensus::PartitionsHandle;
 use futures::channel::oneshot;
-use iggy_binary_protocol::{Command, Operation, RoutedRequestHeader};
-use iggy_common::{IggyByteSize, PartitionStats, PollingStrategy, variadic};
+use iggy_common::PollingStrategy;
 use message_bus::{
     BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn,
     SendError,
 };
-use metadata::stm::stream::Streams;
-use metadata::stm::user::Users;
-use metadata::{IggyMetadata, MuxStateMachine};
-use partitions::{
-    IggyPartition, IggyPartitions, Partition, PartitionPathLayout, PartitionsConfig, PollFragments,
-    PollingArgs, PollingConsumer,
-};
+use metadata::IggyMetadata;
+use partitions::{IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::MESSAGE_ALIGN;
 use server_common::iobuf::Frozen;
-use server_common::send_messages::{
-    IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, decode_batch_slice,
-};
+use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
 use super::completion::PollCompletionSender;
+use super::test_support::{PollTestMetadata, partition_with_messages};
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
     IggyShard, LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig, PartitionRead,
@@ -215,7 +206,6 @@ fn message_offsets(fragments: &PollFragments) -> Vec<u64> {
         .collect()
 }
 
-type PollTestMetadata = MuxStateMachine<variadic!(Users, Streams)>;
 type PollTestShard = IggyShard<PollTimeoutBus, (), (), PollTestMetadata, PapayaShardsTable>;
 
 /// Commit four messages at offsets 0 through 3 while retaining their bytes in
@@ -224,72 +214,9 @@ type PollTestShard = IggyShard<PollTimeoutBus, (), (), PollTestMetadata, PapayaS
 #[allow(clippy::future_not_send)]
 async fn owner_with_messages(bus: &PollTimeoutBus, namespace: IggyNamespace) -> PollTestShard {
     let shard_id = ShardId::new(0);
-    let cluster_id = 1;
-    let replica_id = 0;
-    let replica_count = 3;
-    let segment_size = IggyByteSize::from(1_048_576_u64);
-    let config = PartitionsConfig {
-        messages_required_to_save: 100,
-        size_of_messages_required_to_save: segment_size,
-        validate_checksum: true,
-        segment_size,
-        preallocate_segments: false,
-        encryptor: None,
-        path_layout: PartitionPathLayout::default(),
-    };
-    let consensus = VsrConsensus::new(
-        cluster_id,
-        replica_id,
-        replica_count,
-        namespace.inner(),
-        bus.clone(),
-        LocalPipeline::new(),
-    );
-    consensus.init();
-    let mut partition = Box::new(IggyPartition::with_in_memory_storage(
-        Arc::new(PartitionStats::default()),
-        consensus,
-        segment_size,
-    ));
-
-    let mut messages = IggyMessages::with_capacity(4);
-    for message_id in 1_u128..=4 {
-        messages.push(IggyMessage {
-            header: IggyMessageHeader {
-                id: message_id,
-                payload_length: 1,
-                ..Default::default()
-            },
-            payload: "x".into(),
-            user_headers: None,
-        });
-    }
-    let append = SendMessagesOwned::from_messages(namespace, &messages)
-        .expect("encode four messages")
-        .encode_request(RoutedRequestHeader {
-            command: Command::Request,
-            operation: Operation::SendMessages,
-            client: 1,
-            session: 1,
-            request: 1,
-            group: namespace.inner(),
-            ..Default::default()
-        })
-        .expect("encode append request");
-    let (append_reply, append_result) = oneshot_channel();
-    partition.on_request(append, Some(append_reply)).await;
-    assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
-    partition.consensus().advance_commit_max(1);
-    partition.commit_journal(&config).await;
-    assert_eq!(partition.consensus().commit_min(), 1);
-    assert!(
-        matches!(append_result.now_or_never(), Some(Ok(_))),
-        "fixture append was committed"
-    );
-    assert_eq!(partition.offsets().commit_offset, 3);
-
+    let (partition, config) = partition_with_messages(bus, namespace, &["x"; 4]).await;
     let partitions = IggyPartitions::new(shard_id, config);
-    partitions.insert(namespace, *partition);
+    partitions.insert(namespace, partition);
     let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None);
     let routes = PapayaShardsTable::new();
     routes.insert(namespace, PartitionLocation::new(shard_id, 0));
@@ -299,11 +226,7 @@ async fn owner_with_messages(bus: &PollTimeoutBus, namespace: IggyNamespace) -> 
         metadata,
         partitions,
         routes,
-        PartitionConsensusConfig::new(
-            cluster_id,
-            ReplicaTopology::new(replica_id, replica_count),
-            bus.clone(),
-        ),
+        PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
     )
 }
 
