@@ -373,7 +373,8 @@ pub enum PartitionReadReply {
     /// `TooManyConsumerOffsets`. A completion whose history changed, whose owner
     /// inbox is unavailable, or whose automatic commit cannot be admitted returns
     /// `TransientNotAccepted`, allowing the client to retry. Reads also return
-    /// `TransientNotAccepted` while the partition requires state transfer.
+    /// `TransientNotAccepted` when submission fails before reaching the owner
+    /// or while the partition requires state transfer.
     Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
     /// committed offsets on this partition (each `None` if absent).
@@ -401,16 +402,14 @@ pub enum PartitionReadReply {
     NotFound,
 }
 
-/// Reply budget for a cross-shard [`IggyShard::partition_read`]. Bounds a
-/// wedged owning shard; the caller maps expiry to a client-visible error.
+/// Reply budget for [`IggyShard::partition_read`]. Bounds a wedged owning shard;
+/// the caller maps expiry to an error with unknown acceptance.
 ///
 /// 10s, not lower: a disk poll over tiny segments opens one file per
 /// segment, so a 1024-message read can legitimately take several seconds
-/// on an oversubscribed host (8 parallel test clusters). Expiry is masked
-/// as an empty poll downstream while the abandoned walk keeps running, so
-/// a too-small budget turns slow reads into missing data plus duplicated
-/// walks from client retries. Must stay below the SDK's 30s request
-/// deadline.
+/// on an oversubscribed host (8 parallel test clusters). Expiry leaves the
+/// read running and able to advance progress, so a short budget creates
+/// unnecessary unknown outcomes. Must stay below the SDK's 30s request deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Budget for a partition write's wait on its committed reply. Longer than a
@@ -1974,16 +1973,16 @@ where
         clients
     }
 
-    /// Run a partition read (message poll / consumer-offset lookup) on the
-    /// shard owning `namespace` and await the reply.
+    /// Run a partition read on the shard owning `namespace` and await the reply.
     ///
     /// Routes a [`LifecycleFrame::PartitionRead`] through the shards table
-    /// (self-sends included, so a locally-owned partition takes the same
-    /// path). `None` = unroutable namespace, full owning-shard inbox,
-    /// dropped reply sender, or `PARTITION_READ_TIMEOUT` expiry; the
-    /// caller maps it to a client-visible error.
+    /// (including sends to this shard). An unroutable namespace, missing sender,
+    /// or rejected inbox submission returns [`PartitionReadReply::Rejected`]
+    /// with [`IggyError::TransientNotAccepted`]: the owner never received the
+    /// request, so this read cannot advance progress and is safe to retry.
     ///
-    /// `None` does not prove the owner rejected the read. A timeout drops the
+    /// `None` means submission succeeded but the reply sender was dropped or
+    /// `PARTITION_READ_TIMEOUT` expired. A timeout drops the
     /// reply receiver without canceling a queued request or detached poll.
     /// Completion can still advance progress and admit an automatic commit;
     /// a later owner rejection cannot be delivered to this receiver. Callers
@@ -2001,7 +2000,9 @@ where
                 namespace_raw = namespace.inner(),
                 "partition_read: namespace not routable (not materialised yet or deleted)"
             );
-            return None;
+            return Some(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
         };
         let (reply_tx, reply_rx) = channel::<PartitionReadReply>(1);
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
@@ -2009,14 +2010,20 @@ where
             read,
             reply: reply_tx,
         });
-        let sender = self.senders.get(target as usize)?;
+        let Some(sender) = self.senders.get(target as usize) else {
+            return Some(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+        };
         if let Err(error) = sender.try_send(frame) {
             tracing::warn!(
                 shard = self.id,
                 target,
                 "partition_read: inbox rejected PartitionRead frame: {error:?}"
             );
-            return None;
+            return Some(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
         }
         match bus_timeout(&self.bus, PARTITION_READ_TIMEOUT, reply_rx.recv()).await {
             Some(Ok(reply)) => Some(reply),
@@ -3015,7 +3022,7 @@ where
     /// [`Self::on_message`] carrying the park provenance of a frame the pump is
     /// re-delivering, so a second park keeps the stamp and age the first one
     /// derived instead of deriving them again against newer committed state.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn dispatch_message(&self, message: MessageBag, provenance: Option<ParkProvenance>)
     where
         B: MessageBus + 'static,
@@ -3032,6 +3039,12 @@ where
                     let header = request.header();
                     (header.operation, header.group)
                 };
+                // Ahead of the park and the incarnation fence, which both read
+                // the frame as a partition request.
+                if !routing.0.is_plane_routable() {
+                    self.deny_unroutable_request(request.header()).await;
+                    return;
+                }
                 match self
                     .park_if_unmaterialised(request, routing.0, routing.1, provenance, &mut None)
                 {
@@ -3060,8 +3073,17 @@ where
             MessageBag::Prepare(prepare) => {
                 let routing = {
                     let header = prepare.header();
-                    (header.operation, header.group)
+                    (header.operation, header.group, header.op)
                 };
+                if !routing.0.is_plane_routable() {
+                    self.drop_unroutable_replicated(
+                        Command::Prepare,
+                        routing.0,
+                        routing.1,
+                        routing.2,
+                    );
+                    return;
+                }
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
@@ -3102,7 +3124,22 @@ where
                     ParkOutcome::Overflow(_) | ParkOutcome::Parked => {}
                 }
             }
-            MessageBag::PrepareOk(prepare_ok) => self.on_ack(prepare_ok).await,
+            MessageBag::PrepareOk(prepare_ok) => {
+                let routing = {
+                    let header = prepare_ok.header();
+                    (header.operation, header.group, header.op)
+                };
+                if !routing.0.is_plane_routable() {
+                    self.drop_unroutable_replicated(
+                        Command::PrepareOk,
+                        routing.0,
+                        routing.1,
+                        routing.2,
+                    );
+                    return;
+                }
+                self.on_ack(prepare_ok).await;
+            }
             MessageBag::StartViewChange(msg) => self.on_start_view_change(msg).await,
             MessageBag::DoViewChange(msg) => self.on_do_view_change(msg).await,
             MessageBag::StartView(msg) => self.on_start_view(msg).await,
@@ -3756,6 +3793,75 @@ where
             return;
         }
         self.metrics.record_partition_request_denied_transient();
+    }
+
+    /// Deny a request no consensus plane claims, and count the frame it drops.
+    /// `InvalidCommand` because no retry makes an operation routable. Counted as
+    /// a drop even though the client is answered: nothing was routed or
+    /// journaled, and `unroutable` is the counter a simulator run asserts on.
+    #[allow(clippy::future_not_send)]
+    async fn deny_unroutable_request(&self, request_header: &RoutedRequestHeader) {
+        self.metrics.record_frame_drop(
+            crate::metrics::frame_drop_variant::CONSENSUS,
+            crate::metrics::frame_drop_reason::UNROUTABLE,
+        );
+        tracing::error!(
+            shard = self.id,
+            client = request_header.client,
+            operation = ?request_header.operation,
+            namespace_raw = request_header.group,
+            "request operation is claimed by no consensus plane; denying it"
+        );
+        let reply = build_deny_reply_from_request_header(
+            request_header,
+            IggyError::InvalidCommand.as_code(),
+        );
+        if let Err(error) = self
+            .bus
+            .send_to_client(request_header.client, reply.into_generic().into_frozen())
+            .await
+        {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::CONSENSUS,
+                crate::metrics::frame_drop_reason::DELIVERY_FAILED,
+            );
+            tracing::warn!(
+                shard = self.id,
+                client = request_header.client,
+                operation = ?request_header.operation,
+                error = %error,
+                "failed to send deny for unroutable request"
+            );
+        }
+    }
+
+    /// Drop a replicated frame no consensus plane claims, and count it.
+    ///
+    /// No reply, unlike [`Self::deny_unroutable_request`]: a prepare or an ack
+    /// has no client waiting on this node. Terminal for the frame's group here,
+    /// as the unknown-discriminant drop in [`Self::dispatch`] is: nothing
+    /// journals or acks an operation no plane owns, so every later op in that
+    /// group waits behind the gap while quorum hides it. Nothing fences the
+    /// sending peer, so the counter and this log are the whole signal.
+    fn drop_unroutable_replicated(
+        &self,
+        command: Command,
+        operation: Operation,
+        namespace_raw: u64,
+        op: u64,
+    ) {
+        self.metrics.record_frame_drop(
+            crate::metrics::frame_drop_variant::CONSENSUS,
+            crate::metrics::frame_drop_reason::UNROUTABLE,
+        );
+        tracing::error!(
+            shard = self.id,
+            command = ?command,
+            operation = ?operation,
+            namespace_raw,
+            op,
+            "replicated frame operation is claimed by no consensus plane; dropping it"
+        );
     }
 
     /// [`Self::deny_partition_request_transient`] for synchronous callers:

@@ -7870,3 +7870,56 @@ mod metadata_read_frontier_tests {
             .commit_min()
     }
 }
+
+#[cfg(test)]
+mod review_4092_dst_tests {
+    //! The deterministic simulator is this repo's strongest correctness tool and
+    //! it is hard-asserted out of the feature this PR adds: `init_partition`
+    //! (`core/shard/src/lib.rs:4193-4198`) panics for any topic whose durability
+    //! or consumer-offset durability is persisted. So `PrepareOk` gating, log-view
+    //! certification, commit ordering and quorum durability have no fault
+    //! coverage at any granularity.
+
+    use super::*;
+
+    #[test]
+    #[ignore = "PR #4092 review: no simulator API can seed a persisted topic, and `init_partition` asserts them out of the cluster simulator entirely"]
+    fn given_the_cluster_simulator_when_seeding_a_topic_then_a_persisted_policy_should_be_expressible()
+     {
+        let replica_count = 3u8;
+        let client: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(replica_count as usize, [client].into_iter(), network_opts);
+        for _ in 0..100 {
+            sim.step();
+        }
+
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.seed_stream_topic_partition(namespace);
+
+        let options = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| {
+                inner
+                    .items
+                    .get(namespace.stream_id())
+                    .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                    .map(|topic| {
+                        iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                    })
+                    .unwrap_or_default()
+            });
+
+        assert!(
+            options.durability.is_persisted() || options.consumer_offset_durability.is_persisted(),
+            "no simulator API can seed a persisted topic, so the durability guarantee this PR adds is unreachable from the deterministic simulator and `init_partition` asserts it out anyway"
+        );
+    }
+}

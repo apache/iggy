@@ -300,7 +300,10 @@ mod tests {
     use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
     use shard::metrics::ShardMetrics;
     use shard::shards_table::{PapayaShardsTable, ShardsTable};
-    use shard::{PartitionConsensusConfig, ReplicaTopology, ShardIdentity, channel, shard_channel};
+    use shard::{
+        LifecycleFrame, PartitionConsensusConfig, ReplicaTopology, ShardFrame, ShardIdentity,
+        channel, shard_channel,
+    };
 
     use super::*;
     use crate::dispatch::test_support::{
@@ -538,17 +541,55 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_unanswered_or_missing_partitions_when_joining_should_allow_eager_handoff() {
+    async fn given_unroutable_partition_when_joining_should_preserve_ownership() {
         let shard = group_shard();
         apply_initial_join(&shard);
-        let unanswered = namespace(&shard, STALE_PARTITION);
-        shard.shards_table().remove(&unanswered);
-        assert!(
+        let streams = shard.plane.metadata().mux_stm.streams();
+        let before = streams
+            .consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID)
+            .unwrap();
+        let unroutable = namespace(&shard, RECOVERING_PARTITION);
+        shard.shards_table().remove(&unroutable);
+
+        assert!(matches!(
             shard
-                .partition_read(unanswered, PartitionRead::GroupOffsetState { group_id: 0 })
-                .await
-                .is_none()
+                .partition_read(unroutable, PartitionRead::GroupOffsetState { group_id: 0 })
+                .await,
+            Some(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted
+            ))
+        ));
+        let rewritten = with_partition_reads(
+            &shard,
+            maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
         );
+        assert!(matches!(
+            rewritten.await,
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(
+            streams.consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID),
+            Some(before)
+        );
+        assert_eq!(
+            streams.consumer_group_fence(
+                &STREAM_ID,
+                &TOPIC_ID,
+                &GROUP_ID,
+                FIRST_CLIENT,
+                RECOVERING_PARTITION,
+                false
+            ),
+            Some(0),
+            "the existing owner must retain permission to commit"
+        );
+        assert!(!streams.has_pending_revocations());
+    }
+
+    #[compio::test]
+    async fn given_unanswered_or_missing_partitions_when_joining_should_allow_eager_handoff() {
+        let mut shard = group_shard();
+        apply_initial_join(&shard);
         let not_found = with_partition_reads(
             &shard,
             shard.partition_read(
@@ -559,12 +600,42 @@ mod tests {
         .await;
         assert!(matches!(not_found, Some(PartitionReadReply::NotFound)));
 
-        let rewritten = with_partition_reads(
-            &shard,
-            maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
-        )
-        .await
-        .unwrap();
+        let (sender, owner_inbox, _owner_replies) =
+            shard_channel(0, INBOX_CAPACITY, INBOX_CAPACITY);
+        Rc::get_mut(&mut shard)
+            .unwrap()
+            .attach_senders(vec![sender]);
+        let unanswered = namespace(&shard, STALE_PARTITION);
+        let missing = namespace(&shard, RECOVERING_PARTITION);
+        let owner = compio::runtime::spawn(async move {
+            let mut dropped_reply = false;
+            let mut replied_not_found = false;
+            for _ in 0..PARTITION_COUNT {
+                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    namespace,
+                    read: PartitionRead::GroupOffsetState { group_id: 0 },
+                    reply,
+                }) = owner_inbox.recv().await.unwrap()
+                else {
+                    panic!("the group read must have reached the owner");
+                };
+                if namespace == unanswered {
+                    drop(reply);
+                    dropped_reply = true;
+                } else {
+                    assert_eq!(namespace, missing);
+                    reply.try_send(PartitionReadReply::NotFound).unwrap();
+                    replied_not_found = true;
+                }
+            }
+            assert!(dropped_reply);
+            assert!(replied_not_found);
+        });
+
+        let rewritten = maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT))
+            .await
+            .unwrap();
+        owner.await.expect("the owner task must finish");
         assert!(
             ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&rewritten))
                 .unwrap()

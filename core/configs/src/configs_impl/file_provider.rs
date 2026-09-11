@@ -402,6 +402,34 @@ mod tests {
         assert!(found.is_empty(), "unexpected matches: {found:?}");
     }
 
+    /// The allowlist is exact names but the filter is a bare `IGGY_` prefix, and
+    /// `IGGY_` prefixes every sibling binary's namespace. A shared container
+    /// environment, a shared `env_file`, or the `.env` that `main.rs` loads
+    /// through `dotenvy` before `load_config` runs will refuse server boot.
+    #[test]
+    #[ignore = "PR #4092 review: the `IGGY_` prefix fence refuses the repo's own `IGGY_CONNECTORS_*`, `IGGY_MCP_*` and CLI variables, with no opt-out"]
+    fn given_a_sibling_binarys_env_vars_when_rejecting_then_the_server_should_still_boot() {
+        let siblings = [
+            "IGGY_CONNECTORS_CONFIG_PATH",
+            "IGGY_CONNECTORS_STATE_PATH",
+            "IGGY_MCP_CONFIG_PATH",
+            "IGGY_MCP_TRANSPORT",
+            "IGGY_HOME",
+            "IGGY_USERNAME",
+            "IGGY_PASSWORD",
+        ];
+        let unknown = unknown_env_names(
+            names(&siblings).into_iter(),
+            "IGGY_",
+            crate::server_config::server::SERVER_PROCESS_ENV_VARS,
+        );
+
+        assert!(
+            unknown.is_empty(),
+            "the server refuses to boot when its own sibling products' variables are present: {unknown:?}"
+        );
+    }
+
     #[test]
     fn given_another_configs_prefix_when_matching_then_should_report_none() {
         let found = relocated_env_vars(
@@ -411,6 +439,38 @@ mod tests {
         );
 
         assert!(found.is_empty(), "unexpected matches: {found:?}");
+    }
+
+    /// `main.rs` loads a `.env` through `dotenvy` before `load_config` runs, and
+    /// `dotenvy` injects into the process environment that `reject_unknown_env_names`
+    /// scans with `env::vars_os()`. So the fence does not need a shared container
+    /// or a shared `env_file`: a `.env` in the working directory is enough.
+    ///
+    /// Mutates the process environment, so it must not run beside another test
+    /// that reads it.
+    #[test]
+    #[ignore = "PR #4092 review: a `.env` loaded by `dotenvy` before `load_config` refuses server boot; also mutates the process environment, so it must not run in parallel"]
+    fn given_a_dotenv_with_a_connectors_variable_when_loading_then_the_server_should_boot() {
+        // SAFETY: single-threaded assertion over a variable no other test reads.
+        unsafe { std::env::set_var("IGGY_CONNECTORS_CONFIG_PATH", "/etc/iggy/connectors.toml") };
+
+        let provider = FileConfigProvider::new(
+            "nonexistent-config.toml".to_string(),
+            Toml::string(""),
+            false,
+            None,
+        )
+        .with_relocated_keys("IGGY_", &[])
+        .with_known_env_names(crate::server_config::server::SERVER_PROCESS_ENV_VARS.to_vec());
+        let rejected = provider.reject_unknown_env_names();
+
+        // SAFETY: paired with the set above.
+        unsafe { std::env::remove_var("IGGY_CONNECTORS_CONFIG_PATH") };
+
+        assert!(
+            rejected.is_ok(),
+            "a .env naming the connectors runtime's own config path refuses server boot, with no opt-out and a message that names no remedy"
+        );
     }
 
     #[test]
