@@ -18,7 +18,8 @@
 use crate::ffi;
 use bytes::Bytes;
 use iggy::prelude::{
-    ConsumerGroupDetails as RustConsumerGroupDetails, IdKind, Identifier as RustIdentifier,
+    Consumer as RustConsumer, ConsumerGroupDetails as RustConsumerGroupDetails,
+    ConsumerKind as RustConsumerKind, IdKind, Identifier as RustIdentifier,
     IggyMessage as RustIggyMessage, OptionSpec as RustOptionSpec, Partition as RustPartition,
     PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
@@ -82,6 +83,29 @@ impl TryFrom<ffi::Identifier> for RustIdentifier {
             .map_err(|error| format!("invalid identifier: {error}"))?;
 
         Ok(rust_identifier)
+    }
+}
+
+impl TryFrom<ffi::ConsumerKind> for RustConsumerKind {
+    type Error = String;
+
+    fn try_from(kind: ffi::ConsumerKind) -> Result<Self, Self::Error> {
+        match kind {
+            ffi::ConsumerKind::Consumer => Ok(RustConsumerKind::Consumer),
+            ffi::ConsumerKind::ConsumerGroup => Ok(RustConsumerKind::ConsumerGroup),
+            _ => Err(format!("unsupported consumer kind '{}'", kind.repr)),
+        }
+    }
+}
+
+impl TryFrom<ffi::Consumer> for RustConsumer {
+    type Error = String;
+
+    fn try_from(consumer: ffi::Consumer) -> Result<Self, Self::Error> {
+        Ok(RustConsumer {
+            kind: RustConsumerKind::try_from(consumer.kind)?,
+            id: RustIdentifier::try_from(consumer.id)?,
+        })
     }
 }
 
