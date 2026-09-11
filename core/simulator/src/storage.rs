@@ -266,9 +266,13 @@ impl DurableStorage for SimStorage {
     type File = SimFile;
 
     fn writer_identity(&self, path: &Path) -> io::Result<Option<std::path::PathBuf>> {
-        let filesystem = format!("sim-{}", self.state.borrow().id);
+        // The epoch is the simulated process incarnation. A lease that a cancelled
+        // writer left interrupted is fenced until the process holding it dies, so
+        // an identity that survived `Crash::Process` could never reopen.
+        let state = self.state.borrow();
+        let process = format!("sim-{}-{}", state.id, state.epoch);
         Ok(Some(
-            std::path::PathBuf::from(filesystem).join(path.strip_prefix("/").unwrap_or(path)),
+            std::path::PathBuf::from(process).join(path.strip_prefix("/").unwrap_or(path)),
         ))
     }
 

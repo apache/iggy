@@ -23,7 +23,9 @@ use consensus::MetadataHandle;
 use futures::{executor::block_on, poll};
 use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
-use journal::partition_journal::{PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference};
+use journal::partition_journal::{
+    PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference, record_length,
+};
 use journal::{DurableAppend, PartitionPrepareJournal};
 use partitions::{PartitionPersistence, install_backup};
 use server_common::send_messages::{
@@ -2541,12 +2543,37 @@ fn given_tail_pages_reached_disk_when_power_loss_then_recovery_should_not_surfac
             .unwrap();
         drop(journal);
 
+        // The durable first record fills the blocks below `header_page`; the
+        // buffered second one starts there and runs to the end of the file.
+        let header_page = record_blocks(&first);
+        let data = Path::new("/partition/wal/prepares-0.wal");
+        let cached = read_all(&storage, data).await;
+        assert_eq!(
+            cached.len(),
+            (header_page + record_blocks(&second)) * PARTITION_WAL_BLOCK_SIZE
+        );
+        let hole =
+            header_page * PARTITION_WAL_BLOCK_SIZE..(header_page + 1) * PARTITION_WAL_BLOCK_SIZE;
+        assert!(cached[hole.clone()].iter().any(|byte| *byte != 0));
+
         // Background writeback preserved the later pages of the buffered record
         // and left its first page dirty. `writeback()` cannot express this,
         // which is why `segment_recovery.rs` documents a byte-zero walk that
         // nothing exercises.
-        storage.writeback_from_page(PARTITION_WAL_BLOCK_SIZE, 1);
+        storage.writeback_from_page(PARTITION_WAL_BLOCK_SIZE, header_page + 1);
         storage.crash(Crash::PowerLoss);
+
+        let survived = read_all(&storage, data).await;
+        assert_eq!(survived.len(), cached.len());
+        assert!(
+            survived[hole.clone()].iter().all(|byte| *byte == 0),
+            "the record's first page reached stable storage, so there is no hole to recover across"
+        );
+        assert_eq!(
+            survived[hole.end..],
+            cached[hole.end..],
+            "the record's later pages were lost too, so this is a short tail rather than a hole"
+        );
 
         let recovered =
             PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
@@ -2606,33 +2633,45 @@ fn given_a_silent_short_write_when_recovering_then_the_record_should_be_refused(
 }
 
 #[test]
-#[ignore = "PR #4092 review: a descriptor opened after a writeback failure reports a successful barrier over lost bytes; `checkpoint_files` must sync through the writer that issued them"]
-fn given_a_failed_writeback_when_a_fresh_handle_syncs_then_it_should_not_report_success() {
+#[ignore = "PR #4092 review: `checkpoint_files` syncs materialized files through a descriptor opened after the writeback failure, which samples errseq too late and reports success over lost bytes; it must sync through the writer that issued them"]
+fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_reclaimed() {
     block_on(async {
-        let storage = storage_for_partition().await;
-        let path = Path::new("/partition/0.index");
+        let (storage, persistence) = queued_batch(4).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let path = Path::new("/partition/materialized");
         let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
-        writer.write(0, b"committed-index".to_vec()).await.unwrap();
+        writer.write(0, b"committed".to_vec()).await.unwrap();
 
-        // The device drops the dirty pages. The writer that issued them is the
-        // only handle that can observe it.
+        // The device drops the dirty pages before the checkpoint's barrier. The
+        // writer that issued them is the only handle told; the descriptor
+        // `checkpoint_files` opens afterwards samples errseq past the failure
+        // and reports a successful barrier over bytes that are already gone.
         storage.fail_writeback(path).unwrap();
-
-        // `checkpoint_files` opens its own descriptor and syncs through that,
-        // so it samples errseq after the failure and sees success over bytes
-        // that are already gone.
-        let checkpoint_handle = storage.open(path, OpenMode::Read).await.unwrap();
-        let fresh = checkpoint_handle.sync().await;
-        let through_writer = writer.sync().await;
+        persistence.checkpoint_files(
+            4,
+            vec![path.to_path_buf()],
+            vec![Path::new(DIRECTORY).to_path_buf()],
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
 
         assert!(
-            through_writer.is_err(),
-            "the writer that issued the lost pages was not told"
+            persistence.failure().is_some(),
+            "a checkpoint reported success over materialized bytes the device dropped"
         );
-        assert!(
-            fresh.is_err(),
-            "a descriptor opened after the failure reported a successful barrier over lost bytes, so the WAL may reclaim history the index never received"
+        assert_eq!(persistence.checkpoint_op(), 0);
+        storage.crash(Crash::PowerLoss);
+        let recovered =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        assert_eq!(
+            recovered.checkpoint_op(),
+            0,
+            "WAL history was reclaimed although its materialization never reached stable storage"
         );
+        assert_eq!(recovered.head(), 4);
     });
 }
 
@@ -2654,6 +2693,37 @@ fn given_sim_storage_when_opening_persistence_then_the_writer_lease_should_be_ta
                 .await
                 .unwrap();
         persistence.retire();
+    });
+}
+
+#[test]
+fn given_an_interrupted_writer_when_the_process_restarts_then_the_partition_should_reopen() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(1).await;
+        storage.pause_writes();
+        assert!(persistence.start());
+        let mut writer = Box::pin(Rc::clone(&persistence).run());
+        assert!(poll!(&mut writer).is_pending());
+        // Cancelling the writer mid-mutation leaves its lease interrupted, a
+        // fence only the death of the process holding it may lift.
+        drop(writer);
+        storage.resume();
+        drop(persistence);
+        let fenced =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone()).await;
+        assert!(
+            fenced.is_err_and(|error| error.to_string().contains("requires process restart")),
+            "an interrupted writer did not fence the partition within the same process"
+        );
+
+        storage.crash(Crash::Process);
+        let reopened =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone()).await;
+        assert!(
+            reopened.is_ok(),
+            "the simulated restart kept the interrupted writer's identity, so the partition can never reopen: {:?}",
+            reopened.err()
+        );
     });
 }
 
@@ -2734,6 +2804,17 @@ fn owned_prepare_sized(
             header.checksum = header.identity_checksum();
         },
     )
+}
+
+fn record_blocks(prepare: &Message<PrepareHeader>) -> usize {
+    record_length(usize::try_from(prepare.header().size).unwrap()).unwrap()
+        / PARTITION_WAL_BLOCK_SIZE
+}
+
+async fn read_all(storage: &SimStorage, path: &Path) -> Vec<u8> {
+    let file = storage.open(path, OpenMode::Read).await.unwrap();
+    let length = usize::try_from(file.length().await.unwrap()).unwrap();
+    file.read(0, length).await.unwrap()
 }
 
 #[test]
