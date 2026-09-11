@@ -5128,12 +5128,7 @@ where
                 // batches for segment-commit thresholds, which do not
                 // apply to offset ops.
                 let frozen = message.into_frozen();
-                self.log
-                    .journal()
-                    .inner
-                    .append(frozen.clone())
-                    .await
-                    .map_err(|_| IggyError::CannotAppendMessage)?;
+                self.journal_append(frozen.clone()).await?;
 
                 match header.operation {
                     Operation::StoreConsumerOffset => {
@@ -5178,6 +5173,21 @@ where
                 Err(IggyError::InvalidCommand)
             }
         }
+    }
+
+    /// Journal one prepare and record the mutation.
+    ///
+    /// Every partition-plane append goes through here. The DVC suffix snapshot is
+    /// tagged by the head and the commit point, and a repair filling a body under
+    /// a `StartView` this replica already adopted moves neither: the head is the
+    /// announced one and the op is not committed yet. An append that skipped the
+    /// counter would leave the header-only snapshot reading as current, and the
+    /// merge takes a header no sender can serve as proof that sender never
+    /// journaled the op.
+    async fn journal_append(&self, entry: Frozen<4096>) -> Result<(), IggyError> {
+        let appended = self.log.journal().inner.append(entry).await;
+        self.consensus.note_journal_mutation();
+        appended.map_err(|_| IggyError::CannotAppendMessage)
     }
 
     async fn append_send_messages_to_journal(
@@ -5278,12 +5288,7 @@ where
         journal_info.max_timestamp = journal_info.max_timestamp.max(batch.base_timestamp);
 
         let frozen = message.into_frozen();
-        self.log
-            .journal()
-            .inner
-            .append(frozen.clone())
-            .await
-            .map_err(|_| IggyError::CannotAppendMessage)?;
+        self.journal_append(frozen.clone()).await?;
 
         self.note_append_live();
         self.dirty_offset
@@ -5394,7 +5399,7 @@ where
                 self.offset_space.committed_seeded = false;
             }
         }
-        self.consensus.invalidate_local_dvc_suffix();
+        self.consensus.note_journal_mutation();
         let commit_max = self.consensus.commit_max();
         self.pending_consumer_offset_commits
             .retain(|op, _| *op < from_op || *op <= commit_max);
@@ -5785,6 +5790,10 @@ where
             return;
         }
         let retained = self.log.journal().inner.evict_prefix(count).await;
+        // Eviction drains the ring and re-appends the retained tail, so the slots
+        // a suffix snapshot describes move under it without the head or the
+        // commit point changing.
+        self.consensus.note_journal_mutation();
         let mut retained_info = JournalInfo::default();
         for (entry, meta) in &retained {
             // Purge floor: a retained pre-purge batch must not fold its
@@ -7984,12 +7993,7 @@ where
         // `first_batch_offset`: that anchors the floor-connect check, and
         // purged bytes cannot stand in for durable state.
         if op <= self.purge_floor_op {
-            self.log
-                .journal()
-                .inner
-                .append(message.into_frozen())
-                .await
-                .map_err(|_| IggyError::CannotAppendMessage)?;
+            self.journal_append(message.into_frozen()).await?;
             return Ok(None);
         }
 
@@ -8024,12 +8028,7 @@ where
         journal_info.max_timestamp = journal_info.max_timestamp.max(base_timestamp);
 
         let frozen = message.into_frozen();
-        self.log
-            .journal()
-            .inner
-            .append(frozen)
-            .await
-            .map_err(|_| IggyError::CannotAppendMessage)?;
+        self.journal_append(frozen).await?;
 
         self.note_append_live();
         self.dirty_offset
