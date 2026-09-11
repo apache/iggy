@@ -1375,49 +1375,46 @@ impl Simulator {
         self.run_pumps();
     }
 
-    /// Poll messages directly from a replica's partition.
+    /// Poll messages through a replica's partition owner.
+    ///
+    /// The returned future owns its request and shard handle, so it can run on
+    /// the simulator executor while the caller advances the simulation or
+    /// releases paused work. The owner accepts the read and replies before
+    /// awaiting replication of an automatic commit.
     ///
     /// # Errors
-    /// `IggyError::ResourceNotFound` if the namespace is not on this replica.
+    /// Returns routing and owner rejections, `IggyError::ResourceNotFound` if
+    /// the owner reports a missing partition, or `IggyError::ShardCommunicationError`
+    /// if a submitted request times out or loses its reply.
+    ///
+    /// # Panics
+    /// If `replica_idx` is out of bounds or the owner replies for a different read type.
+    #[allow(clippy::future_not_send)]
     pub fn poll_messages(
         &self,
         replica_idx: usize,
         namespace: IggyNamespace,
         consumer: PollingConsumer,
         args: &PollingArgs,
-    ) -> Result<PollFragments<4096>, IggyError> {
-        let shard = self.replicas[replica_idx].partition_shard(namespace);
-        // Build the owned poll plan synchronously, then execute off the borrow.
-        //
-        // The one `block_on` allowed to stay, and only because `plan.execute()`
-        // cannot suspend here: the sim's partitions are in-memory (no
-        // `partition_dir`), so the plan serves the resident journal tier with no disk
-        // IO and no `bus.sleep`. A suspending await would fail two ways. On the
-        // virtual clock it would hang this thread forever, the clock advancing only
-        // through `advance_time`, which does not run during `block_on`. On the retry
-        // path it would panic on the compio timer outside a compio runtime. Safe only
-        // because it runs between `run_pumps` calls, with the executor quiescent and
-        // no pump holding the partition commit lock in a suspended frame.
-        let Some(plan) = shard
-            .plane
-            .partitions()
-            .build_poll_snapshot(&namespace, consumer, args)
-        else {
-            return Err(IggyError::ResourceNotFound(format!(
-                "partition not found for namespace {namespace:?} on replica {replica_idx}"
-            )));
-        };
-        let partitions = shard.plane.partitions();
-        let completion =
-            partitions.complete_poll(&namespace, futures::executor::block_on(plan.execute()))?;
-        if let Some(replication) = completion.replication {
-            // SimOutbox sends enqueue immediately, so replication cannot suspend.
-            futures::executor::block_on(
-                partitions.replicate_poll_completion(&namespace, replication),
-            );
+    ) -> impl Future<Output = Result<PollFragments<4096>, IggyError>> + use<> {
+        let owner = Rc::clone(self.replicas[replica_idx].partition_shard(namespace));
+        let args = args.clone();
+        async move {
+            match owner
+                .partition_read(namespace, shard::PartitionRead::Poll { consumer, args })
+                .await
+            {
+                Some(shard::PartitionReadReply::Poll { fragments, .. }) => Ok(fragments),
+                Some(shard::PartitionReadReply::Rejected(error)) => Err(error),
+                Some(shard::PartitionReadReply::NotFound) => {
+                    Err(IggyError::ResourceNotFound(format!(
+                        "partition not found for namespace {namespace:?} on replica {replica_idx}"
+                    )))
+                }
+                None => Err(IggyError::ShardCommunicationError),
+                Some(reply) => panic!("unexpected reply to a poll request: {reply:?}"),
+            }
         }
-        let fragments = completion.fragments;
-        Ok(fragments)
     }
 
     /// Partition offsets from a replica.
@@ -1706,10 +1703,12 @@ mod tests {
         panic!("request {request_id} did not receive a reply");
     }
 
-    /// An accepted resident poll can reply before sending its automatic commit
-    /// to replicas. Holding that send must not hold the caller's reply as well.
+    /// The simulator helper must yield while its owner runs, then return the
+    /// accepted resident read even if the automatic commit's replica send stalls.
+    /// Releasing that send must let the same commit reach the other replicas.
     #[test]
-    fn given_admitted_resident_poll_when_replica_send_stalls_should_reply_before_replication() {
+    #[allow(clippy::too_many_lines)]
+    fn given_simulator_poll_when_replica_send_stalls_should_reply_and_resume_replication() {
         // 1. Publish one message and let the cluster finish the initial work.
         // The pause installed later must affect the poll's automatic commit.
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
@@ -1771,38 +1770,63 @@ mod tests {
         // its replication continuation is still waiting for release.
         let resume_replication = owner.bus.delay_next_replica_send();
         let (poll_result_sender, poll_result_receiver) = shard::channel(1);
-        let polling_owner = Rc::clone(&owner);
+        let poll = simulator.poll_messages(
+            usize::from(primary_replica),
+            namespace,
+            consumer,
+            &poll_args,
+        );
         simulator.executor.spawn(async move {
-            let poll_result = polling_owner
-                .partition_read(
-                    namespace,
-                    shard::PartitionRead::Poll {
-                        consumer,
-                        args: poll_args,
-                    },
-                )
-                .await;
-            let _ = poll_result_sender.try_send(poll_result);
+            let _ = poll_result_sender.try_send(poll.await);
         });
-        simulator.executor.run_until_stalled(POLL_BUDGET);
+        simulator.run_pumps();
 
         // 4. The nonempty reply must already be available before releasing
         // replication. Waiting for it asynchronously here would hide a stall.
-        let poll_reply = poll_result_receiver
+        let fragments = poll_result_receiver
             .recv()
             .now_or_never()
             .expect("admitted poll replies while replication remains suspended")
             .expect("reply channel is open")
-            .expect("owning shard answered");
-        let shard::PartitionReadReply::Poll { fragments, .. } = poll_reply else {
-            panic!("expected admitted poll reply, got {poll_reply:?}");
-        };
+            .expect("owning shard accepted the poll");
         assert!(!fragments.is_empty());
+
+        // 5. Before release, neither backup has received the automatic commit.
+        // Inspect backups because the stalled owner still borrows its partition.
+        for backup in &simulator.replicas[1..] {
+            let (consumer_offset, _) = backup
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .consumer_offset_read(&namespace, consumer)
+                .expect("partition exists on the backup");
+            assert_eq!(consumer_offset, None);
+        }
         assert!(
             resume_replication.send(()).is_ok(),
             "replication must still be waiting after the poll reply"
         );
-        simulator.run_pumps();
+
+        // 6. Drive network delivery as well as the executor. A reply alone
+        // must not let the helper silently discard its replication continuation.
+        let replicated = (0..100).any(|_| {
+            simulator.step();
+            simulator.replicas.iter().all(|replica| {
+                replica
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .with_partition(&namespace, |partition| {
+                        partition.durable_consumer_offset_count(iggy_common::ConsumerKind::Consumer)
+                            == 1
+                    })
+                    == Some(true)
+            })
+        });
+        assert!(
+            replicated,
+            "automatic commit reaches every replica after release"
+        );
         let (consumer_offset, _partition_commit_offset) = owner
             .plane
             .partitions()
