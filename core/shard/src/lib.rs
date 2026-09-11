@@ -5157,6 +5157,14 @@ where
                 );
                 return;
             }
+            // The body landing is invisible to the head and the commit point: a
+            // backup repairing under a `StartView` it already adopted sits at the
+            // announced head with its commit point unmoved. Leave the suffix
+            // snapshot tagged as current and the next `DoViewChange` reports this
+            // op header-only, which the merge reads as proof this replica never
+            // journaled it, one nack away from truncating an op it is about to
+            // acknowledge.
+            consensus.note_journal_mutation();
             // Contiguous-frontier advance, mirroring
             // `apply_repaired_prepare`: DVC advertises the sequencer, so a
             // hole below a repaired op must stall the advance rather than
@@ -6091,10 +6099,11 @@ where
         // mutations through gate-taking metadata methods would make it structural.
         match journal.handle().truncate_from(from_op).await {
             Ok(removed) => {
-                // The snapshot's `(op, commit)` tag does not move when entries are
-                // removed under it, so the next `DoViewChange` would advertise the
-                // dropped headers and offer bodies this replica cannot serve.
-                consensus.invalidate_local_dvc_suffix();
+                // The snapshot's head and commit point do not move when entries
+                // are removed under them, so without this the next `DoViewChange`
+                // would advertise the dropped headers and offer bodies this replica
+                // cannot serve.
+                consensus.note_journal_mutation();
                 tracing::warn!(
                     shard = self.id,
                     from_op,
@@ -9899,10 +9908,10 @@ where
     {
         match journal.handle().truncate_from(stuck_op).await {
             Ok(removed) => {
-                // The snapshot's `(op, commit)` tag does not move when entries
-                // are removed under it, so the next `DoViewChange` would
-                // otherwise advertise headers this replica can no longer serve.
-                consensus.invalidate_local_dvc_suffix();
+                // The snapshot's head and commit point do not move when entries
+                // are removed under them, so without this the next `DoViewChange`
+                // would advertise headers this replica can no longer serve.
+                consensus.note_journal_mutation();
                 tracing::warn!(
                     shard = self.id,
                     stuck_op,
@@ -10309,9 +10318,9 @@ fn rebuild_pipeline_entries<B, P>(
 ///
 /// Called before every handler that could start or join a view change: consensus
 /// records its own `DoViewChange` there and has no journal to read. A stale
-/// snapshot is never reused; consensus tags it with its `(op, commit)` and falls
-/// back to an empty suffix, stalling the view change rather than nacking an op
-/// since acquired.
+/// snapshot is never reused; consensus tags it with the journal's head, commit
+/// point and mutation count, and falls back to an empty suffix, stalling the view
+/// change rather than nacking an op since acquired.
 fn refresh_metadata_dvc_suffix<B, P, MJ>(consensus: &VsrConsensus<B, P>, journal: Option<&MJ>)
 where
     B: MessageBus,
