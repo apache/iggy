@@ -490,9 +490,9 @@ where
         }),
         Some(PartitionReadReply::Rejected(error)) => Err(ReadPolledMessagesError::Rejected(error)),
         None => {
-            // A timeout drops the receiver without canceling the owner. Its
-            // eventual completion may still accept progress, so neither an
-            // empty success nor TransientNotAccepted describes this outcome.
+            // The owner rejects a disconnected receiver before poll admission,
+            // but timeout can race with that check. Missing replies therefore
+            // do not prove rejection and must not be reported as empty success.
             warn!(
                 transport_client_id,
                 namespace = namespace.inner(),

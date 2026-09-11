@@ -406,10 +406,11 @@ pub enum PartitionReadReply {
 /// the caller maps expiry to an error with unknown acceptance.
 ///
 /// 10s, not lower: a disk poll over tiny segments opens one file per
-/// segment, so a 1024-message read can legitimately take several seconds
-/// on an oversubscribed host (8 parallel test clusters). Expiry leaves the
-/// read running and able to advance progress, so a short budget creates
-/// unnecessary unknown outcomes. Must stay below the SDK's 30s request deadline.
+/// segment, so a read of 1024 messages can legitimately take several seconds
+/// on an oversubscribed host (8 parallel test clusters). Disk I/O continues
+/// after expiry, so a short budget can waste completed reads. Acceptance racing
+/// with expiry can still leave an unknown outcome. Must stay below the SDK's
+/// 30s request deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Budget for a partition write's wait on its committed reply. Longer than a
@@ -1982,12 +1983,13 @@ where
     /// request, so this read cannot advance progress and is safe to retry.
     ///
     /// `None` means submission succeeded but the reply sender was dropped or
-    /// `PARTITION_READ_TIMEOUT` expired. A timeout drops the
-    /// reply receiver without canceling a queued request or detached poll.
-    /// Completion can still advance progress and admit an automatic commit;
-    /// a later owner rejection cannot be delivered to this receiver. Callers
-    /// must not treat a missing reply as an accepted empty poll or as evidence
-    /// that retrying cannot advance progress again.
+    /// `PARTITION_READ_TIMEOUT` expired. A timeout drops the reply receiver
+    /// without canceling a queued request or detached read. The owner discards
+    /// a poll completion if it observes disconnection before admission. If
+    /// timeout races with that check, completion can still advance progress and
+    /// admit an automatic commit. Callers must not treat a missing reply as an
+    /// accepted empty poll or as evidence that retrying cannot advance progress
+    /// again.
     #[allow(clippy::future_not_send)]
     pub async fn partition_read(
         &self,

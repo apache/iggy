@@ -20,8 +20,8 @@
 //! 1. The owner snapshots the history identity and read resources.
 //! 2. Resident reads complete inline. Disk reads run in a detached task and
 //!    return their result through the owner's inbox.
-//! 3. The owner checks the history and recovery state, admits any automatic
-//!    commit, and updates consumer progress before releasing the reply.
+//! 3. The owner checks the reply connection, history, and recovery state, admits
+//!    any automatic commit, and updates progress before releasing the reply.
 //!
 //! A disk read can yield while purge or state transfer replaces the history,
 //! even on the same shard thread. The detached task therefore cannot advance
@@ -165,9 +165,11 @@ where
         let _ = reply.try_send(result);
     }
 
-    /// Accept a read on the owner's pump, then attempt the reply before replication.
-    /// Replication may suspend. A closed reply channel does not cancel an
-    /// automatic commit that the owner has already admitted.
+    /// Discard a read if its reply receiver is already disconnected at the check.
+    /// Otherwise accept it on the owner's pump and attempt the reply before
+    /// replication, which may suspend. Another shard can disconnect after the
+    /// check, so delivery is not guaranteed and admitted progress is not rolled
+    /// back if the reply fails.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_poll_completed(&self, completion: PollCompleted) {
         let PollCompleted {
@@ -187,6 +189,9 @@ where
                 queue_wait_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
                 "partition poll completion"
             );
+        }
+        if reply.is_disconnected() {
+            return;
         }
         let partitions = self.plane.partitions();
         let consumer_kind = result.consumer_kind();

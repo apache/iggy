@@ -41,12 +41,12 @@ use crate::{
     PartitionReadReply, ReplicaTopology, ShardFrame, ShardIdentity, shard_channel,
 };
 
-/// Characterize the current timeout behavior: losing the caller does not cancel
-/// owner acceptance. This records the unseen messages that a later Next skips;
-/// it does not prescribe the eventual cancellation contract.
+/// Expire the requester before releasing a nonempty completion to the owner.
+/// The closed reply channel must prevent admission so a later Next can return
+/// the unseen messages. Timeout racing with admission is a separate case.
 #[compio::test]
 #[allow(clippy::too_many_lines)]
-async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_skip_unseen_messages_on_next()
+async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_return_unseen_messages_on_next()
  {
     let namespace = IggyNamespace::new(1, 1, 0);
     let consumer = PollingConsumer::Consumer(7, 0);
@@ -128,7 +128,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ski
     );
 
     // Deliver the held result through the completion sender and owner inbox.
-    // Current behavior admits its automatic commit even though delivery fails.
+    // The owner must discard it before admitting progress for the absent caller.
     PollCompletionSender::new(
         Some(owner_sender),
         namespace,
@@ -147,13 +147,26 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ski
         .consumer_offset_read(&namespace, consumer)
         .unwrap();
     assert_eq!(
-        stored_offset,
-        Some(2),
-        "the nonempty late result advances local progress through the three unseen messages"
+        stored_offset, None,
+        "the late result must leave progress unset for the three unseen messages"
     );
+    partitions
+        .with_partition(&namespace, |partition| {
+            assert!(
+                partition.consensus().pipeline_is_empty(),
+                "the late completion must not assign an automatic commit"
+            );
+            assert_eq!(
+                partition.consensus().request_queue_len(),
+                0,
+                "the late completion must not queue an automatic commit"
+            );
+        })
+        .expect("fixture partition exists");
 
-    // A new Next now returns only offset 3. Disabling its automatic commit
-    // keeps the final cursor attributable to the timed out poll alone.
+    // A new Next must include the three unseen messages and the fourth message.
+    // Disabling its automatic commit keeps the final cursor attributable to
+    // the timed out poll alone.
     let next_poll = owner.partition_read(
         namespace,
         PartitionRead::Poll {
@@ -183,13 +196,13 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ski
     };
     assert_eq!(
         message_offsets(&fragments),
-        vec![3],
-        "Next skips offsets 0 through 2, which the caller never received"
+        vec![0, 1, 2, 3],
+        "Next must include offsets 0 through 2, which the caller never received"
     );
     let (stored_offset, _) = partitions
         .consumer_offset_read(&namespace, consumer)
         .unwrap();
-    assert_eq!(stored_offset, Some(2));
+    assert_eq!(stored_offset, None);
 }
 
 fn message_offsets(fragments: &PollFragments) -> Vec<u64> {
