@@ -253,7 +253,7 @@ impl TestServer {
 
         let mut command = Command::new(iggy_server_binary());
         command
-            .env("IGGY_SYSTEM_PATH", data_dir.display().to_string())
+            .env("IGGY_PATH", data_dir.display().to_string())
             .env("IGGY_TCP_ADDRESS", &address)
             .env("IGGY_HTTP_ENABLED", "false")
             .env("IGGY_QUIC_ENABLED", "false")
@@ -268,7 +268,7 @@ impl TestServer {
             // #[serial] alone does not survive nextest, which runs each test as its own process),
             // but a spawned server here can still land alongside a pinned server from a different
             // package's test in the same nextest run.
-            .env("IGGY_SYSTEM_SHARDING_PIN_CORES", "false")
+            .env("IGGY_SHARDING_PIN_CORES", "false")
             // `--with-default-root-credentials` is off by default (args.rs) - without these,
             // a fresh server provisions no loginable root user at all, and every bridge connect
             // attempt fails with "invalid credentials" no matter what this test passes.
