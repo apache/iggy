@@ -52,9 +52,10 @@ use crate::auth::{
     MAX_AUTH_SECRET_LEN, MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN, is_usable_secret, secrets_match,
     validate_bearer, validate_hmac,
 };
+use crate::management::MAX_REVOKE_REASON_LEN;
 use crate::metrics::{Metrics, PathKind, UNROUTED};
 use crate::routes::{Endpoint, EndpointOrigin, RouteLookup, RouteTable};
-use crate::types::{QueuedMessage, clamp_header_value, unix_now_seconds};
+use crate::types::{MAX_HEADER_VALUE_BYTES, QueuedMessage, clamp_header_value, unix_now_seconds};
 use crate::{CONNECTOR_NAME, EndpointAuthType, HttpSourceConfig, SharedState, management};
 
 /// Iggy header carrying the instance an accepted request was routed to.
@@ -71,10 +72,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// `Retry-After` on a 429, in seconds. Named because a test asserts it and a
 /// bare literal in two places drifts.
 const RETRY_AFTER_SECONDS: &str = "1";
-
-/// Iggy holds a header key to 255 bytes, and an instance name becomes one, so
-/// that is the ceiling on the `instance` field of a registration.
-const MAX_INSTANCE_NAME_BYTES: usize = 255;
 
 /// Worst case growth from JSON escaping, where one byte becomes `\u00XX`.
 ///
@@ -94,10 +91,20 @@ const JSON_ESCAPE_EXPANSION: usize = 6;
 /// replacing a secret that had leaked.
 ///
 /// Derived rather than picked, so raising a field cap cannot quietly
-/// reintroduce that. A registration is the largest legal body, and the
-/// kilobyte on top covers field names and punctuation.
+/// reintroduce that. A registration is the largest legal body by roughly an
+/// order of magnitude, but every capped field the admin listener accepts is in
+/// the sum regardless, the revoke reason included, or raising that one cap
+/// would be exactly the gap this derivation exists to close. The kilobyte on
+/// top covers field names and punctuation.
+///
+/// `instance` is bounded by the same 255 as any other Iggy header value, which
+/// is what it becomes: it travels under the fixed `iggy_source_instance` key.
 const MAX_ADMIN_BODY_SIZE_BYTES: usize = JSON_ESCAPE_EXPANSION
-    * (MAX_AUTH_SECRET_LEN + MAX_HMAC_HEADER_LEN + MAX_HMAC_PREFIX_LEN + MAX_INSTANCE_NAME_BYTES)
+    * (MAX_AUTH_SECRET_LEN
+        + MAX_HMAC_HEADER_LEN
+        + MAX_HMAC_PREFIX_LEN
+        + MAX_HEADER_VALUE_BYTES
+        + MAX_REVOKE_REASON_LEN)
     + 1024;
 
 /// How long a `join()` waits for a draining listener to release its address.
@@ -283,8 +290,12 @@ struct SharedServer {
     drained: Arc<Notify>,
 }
 
-/// The instance set and the routes derived from it, published as one value so
-/// no reader can see them disagree.
+/// The instance set and the routes serving it, published as one value so no
+/// reader can see them disagree.
+///
+/// The routes project only the instances that have polled, so `instances` is
+/// the wider of the two: an instance appears there from the moment it joins,
+/// and in `routes` from its first poll.
 #[derive(Debug, Default)]
 pub(crate) struct Published {
     pub(crate) instances: Vec<Arc<SharedState>>,
@@ -411,18 +422,18 @@ impl ServerState {
         );
     }
 
-    /// Swaps in a new instance set and the routes it projects to, or leaves
-    /// both untouched if the instances collide on a path.
-    /// Validates across every joined instance and serves only those that can
-    /// drain.
+    /// Swaps in a new instance set with the routes of those that can drain,
+    /// or leaves both untouched if the instances collide on a path.
     ///
     /// Two builds on purpose. The first is the check, and it has to see every
     /// instance: a conflict between a joining instance and a sibling must
     /// refuse the join, not lie dormant until the offender first polls and the
     /// table suddenly fails to rebuild. The second is what gets served, and it
     /// leaves out instances whose poll task has not started, because a route
-    /// to one of those accepts requests into a bridge with no reader. Neither
-    /// build is on a request path; both run on join, leave and registration.
+    /// to one of those accepts requests into a bridge with no reader.
+    ///
+    /// Neither build is on a request path. Both run on join, on leave, on a
+    /// management mutation, and on an instance's first poll.
     fn publish(&self, instances: Vec<Arc<SharedState>>) -> Result<(), Error> {
         RouteTable::build(&instances)
             .map_err(|conflict| Error::InvalidConfigValue(conflict.to_string()))?;
@@ -789,6 +800,14 @@ async fn named_path_outcome(
     // `Retry-After: 1` has the sender upload every byte of it again. Relaxed
     // by nature, so `try_send` stays the real gate; this only declines work
     // whose answer is already known.
+    //
+    // Answering without draining costs the connection. Hyper makes one drain
+    // attempt and then closes the read half, so above roughly 16 KiB of body
+    // the socket is not reusable and a shed request costs a fresh one. The
+    // response itself still arrives, `Retry-After` included, because the write
+    // half stays open. Cutting the upload off is the point, and this is what
+    // it costs; `Connection: close` was measured and is not an improvement,
+    // since it saves nothing here and ends keep-alive for small bodies too.
     if instance.sender.is_full() {
         let response = reject_bridge_full(&instance, &state.metrics);
         return (Some(instance), response);
@@ -1107,10 +1126,13 @@ fn enqueue(
     // is one no `poll()` will ever drain. 200 would be a lie the sender cannot
     // detect, and a 503 it retries.
     //
-    // The message stays in the channel. `leave()` may or may not have counted
-    // it in `dropped_on_close` depending on which side won, so that diagnostic
-    // can over-report by one here. Preferable to the alternative, which is a
-    // sender that believes a lost request succeeded.
+    // The message stays in the channel, and `dropped_on_close` may not have
+    // counted it: `leave()` reads the bridge length after setting the flag, so
+    // a message accepted either side of that read can be missed. The
+    // diagnostic under-reports, it does not double count, because the SDK
+    // joins the poll task before `close()` runs. Either way it is preferable
+    // to the alternative, which is a sender that believes a lost request
+    // succeeded.
     if instance.has_departed() {
         error!(
             "Refused a request for {CONNECTOR_NAME} connector ID: {}, it left the listener while the request was in flight",

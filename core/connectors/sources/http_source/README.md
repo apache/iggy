@@ -151,7 +151,7 @@ Values are coerced before they are deserialized: `true`/`false` become booleans 
 
 **An unknown key in `plugin_config` is ignored, not rejected.** It has to be: the runtime delivers env overrides as flat top-level keys, so refusing keys this table does not list would break a documented path. The cost is that a misspelling reads as "unset", and for `auth_bearer_token` and `management_token` unset is not a mild default. A typo in the first serves `POST /topics/{topic_path}` to anyone; a typo in the second silently removes the management API.
 
-Neither fails `open()`, and the two are not equally visible. The connector names its named-path auth posture on every open, so `grep` for `with NO authentication` catches the first one, and that is the check worth running after any configuration change. A `management_token` typo is logged nowhere: it fails closed, so what you see is `/admin/endpoints` answering 404 the next time you register.
+Neither fails `open()`, and the log is what tells you. The connector names its named-path auth posture on every open, so `grep` for `with NO authentication` catches the first one. The second announces itself too: a listener with no usable `management_token` logs that dynamic endpoint management is disabled, naming the key, every time it binds. Both are worth grepping after any configuration change.
 
 `http_sink` calls its equivalent knob `max_payload_size_bytes`. The names differ deliberately: the sink's bounds an outgoing payload, this one bounds an accepted request.
 
@@ -199,7 +199,7 @@ The named path's 503 covers two conditions and says `route unavailable` for both
 
 `GET /health` on the public listener answers 200 only while every instance on it is serving, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped would otherwise keep receiving traffic into a bridge nothing drains. Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
 
-An instance that has not polled yet is not counted, which is a different condition from one that has stopped. Between `open()` and the first `poll()` the runtime logs into Iggy and ensures the stream and topic, with retries; counting that window meant restarting one instance took every healthy sibling out of rotation for the length of it.
+An instance that has not polled yet is not counted, which is a different condition from one that has stopped. Between `open()` and its first `poll()` the runtime builds the producer for every source and initialises every sink, in series, and only then starts the poll tasks; counting that window meant restarting one instance took every healthy sibling out of rotation for the length of it, and on boot the length of it includes connectors that have nothing to do with this one.
 
 Such an instance publishes no routes either, so its own paths answer 404 until its poll task runs and nothing is accepted that nothing would drain. A boot grace period would not do: it answers 200 while the bridge still has no reader.
 
@@ -355,7 +355,7 @@ That is fine at the hundreds of endpoints this connector is sized for. A deploym
 
 The registry is capped at `MAX_ENDPOINTS` (10000) per instance. At the cap the oldest revoked dynamic entries are reclaimed to make room; revoked static ones never are, because their tombstone is what outranks TOML. A registration that finds nothing reclaimable is refused with 507.
 
-The cap bounds the file as well as the API. An `endpoints` list declaring more than that fails `open()` naming the count, since a TOML file is something you can edit before starting. A state file already holding more only warns, because clearing it means losing every tombstone in it, and an instance in that state serves normally until the next registration: reclaiming room for one endpoint discards as many revoked entries as the registry is over by, in one step.
+The cap bounds the file as well as the API. An `endpoints` list declaring more than that fails `open()` naming the count, since a TOML file is something you can edit before starting. A state file already holding more only warns, because clearing it means losing every tombstone in it, and an instance in that state serves normally until the next registration: reclaiming room for one endpoint discards one more revoked entry than the registry is over by, in one step.
 
 Recovering a revoked static endpoint means giving it a **new** `endpoint_id`. Editing `auth_secret` in TOML does nothing, because the tombstone outranks the file by design, and deleting the state file to clear one tombstone also drops every dynamic endpoint and every other revocation with it.
 

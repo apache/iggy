@@ -627,14 +627,33 @@ mod tests {
     /// down over a condition with no supported way to clear it.
     #[test]
     fn given_more_endpoints_than_the_ceiling_when_restored_should_serve_them_anyway() {
-        let statics: Vec<_> = (0..=MAX_ENDPOINTS)
+        // State, not `None`. With no state `restore` returns at its early exit
+        // long before the ceiling is looked at, so this asserted nothing about
+        // the branch its doc describes and would have passed with the whole
+        // post-decode half of `restore` deleted.
+        //
+        // What it pins is still a decision rather than a fix: nothing here
+        // fails if the warning goes away. It is the refusal that must not
+        // appear, since a state file over the ceiling cannot be edited down
+        // without losing every tombstone in it.
+        let statics: Vec<_> = (0..MAX_ENDPOINTS)
             .map(|index| static_endpoint(&format!("{index:032x}")))
             .collect();
+        let mut persisted = EndpointRegistry::default();
+        assert!(persisted.insert(dynamic_endpoint(ENDPOINT_ONE)));
+        let state = persisted
+            .to_connector_state(1)
+            .expect("registry must serialize");
 
-        let restored = EndpointRegistry::restore(&statics, None, 1)
+        let restored = EndpointRegistry::restore(&statics, Some(state), 1)
             .expect("an over-full registry must still serve rather than fail the open");
 
-        assert_eq!(restored.endpoints().count(), MAX_ENDPOINTS + 1);
+        assert_eq!(
+            restored.endpoints().count(),
+            MAX_ENDPOINTS + 1,
+            "the merged registry is over the ceiling and every entry still serves"
+        );
+        assert!(restored.endpoint(ENDPOINT_ONE).is_some());
     }
 
     #[test]

@@ -26,7 +26,7 @@ mod types;
 use arc_swap::{ArcSwap, Guard};
 use async_trait::async_trait;
 use axum::http::{HeaderName, header};
-use iggy_common::HeaderKey;
+use iggy_common::{HeaderKey, HeaderValue};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source,
     source_connector,
@@ -635,9 +635,14 @@ impl HttpSourceConfig {
             )));
         }
         if let Some(instance_name) = &self.instance_name {
-            if HeaderKey::try_from(instance_name.as_str()).is_err() {
+            // Validated as the header value it becomes, not as a key. It
+            // travels under the fixed `iggy_source_instance` key, and
+            // `insert_header` drops rather than clamps, so a name past the
+            // limit would take the identity header off every message this
+            // instance produces rather than shortening it.
+            if HeaderValue::try_from(instance_name.as_str()).is_err() {
                 return Err(Error::InvalidConfigValue(format!(
-                    "instance_name '{instance_name}' must be a valid Iggy header key: non-empty and at most 255 bytes"
+                    "instance_name '{instance_name}' must be a valid Iggy header value: non-empty and at most 255 bytes"
                 )));
             }
             if instance_name == crate::metrics::UNROUTED {
@@ -964,9 +969,10 @@ impl Source for HttpSource {
         let _polling = self.shared.enter_poll();
         // Published here rather than in `join`, because this is the first
         // moment anything can drain what the routes would let in. Between the
-        // two sits the whole of `setup_source_producer`: an Iggy login, then a
-        // stream and topic ensure with retries. Routes that exist across that
-        // window accept requests into a bridge with no reader, and an instance
+        // two sits every source's producer setup and every sink's init, run in
+        // series before any poll task starts, so on boot the window spans
+        // connectors this one has nothing to do with. Routes that exist across
+        // it accept requests into a bridge with no reader, and an instance
         // that had not polled yet also read as a stopped one to the readiness
         // gate, so restarting one instance answered 503 for every healthy
         // sibling on the listener until this call.
@@ -1549,7 +1555,7 @@ mod tests {
 
     #[test]
     fn given_oversized_instance_name_when_validated_should_reject() {
-        // It becomes a HeaderKey, and Iggy caps those at 255 bytes. Without
+        // It becomes a HeaderValue, and Iggy caps those at 255 bytes. Without
         // this check the identity header would vanish from every message.
         let long_name = "n".repeat(256);
         let config = parse(&format!(

@@ -56,7 +56,7 @@ const ENDPOINT_ID_BYTES: usize = 16;
 /// A revoke reason rides the tombstone, and tombstones are never evicted,
 /// so an uncapped one is an authenticated caller writing to the state file
 /// without limit.
-const MAX_REVOKE_REASON_LEN: usize = 256;
+pub(crate) const MAX_REVOKE_REASON_LEN: usize = 256;
 
 pub(crate) fn router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
     if state.management_token.is_none() {
