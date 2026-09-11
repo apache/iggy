@@ -264,10 +264,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::future::Future;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use bytes::Bytes;
     use consensus::{Consensus, LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
@@ -284,23 +284,27 @@ mod tests {
     use iggy_binary_protocol::{WireName, WireOptions};
     use iggy_common::{
         ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-        PartitionStats,
+        IggyByteSize, PartitionStats,
     };
+    use metadata::IggyMetadata;
     use metadata::stm::StateMachine;
     use partitions::state_transfer::mark_materialization_missing;
-    use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig};
+    use partitions::{
+        IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionPathLayout,
+        PartitionsConfig,
+    };
     use server_common::SegmentStorage;
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
     use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
-    use shard::shards_table::ShardsTable;
-    use shard::{LifecycleFrame, Receiver, ShardFrame, shard_channel};
+    use shard::metrics::ShardMetrics;
+    use shard::shards_table::{PapayaShardsTable, ShardsTable};
+    use shard::{PartitionConsensusConfig, ReplicaTopology, ShardIdentity, channel, shard_channel};
 
     use super::*;
-    use crate::dispatch::partition::make_partition_read_handler;
     use crate::dispatch::test_support::{
-        SpyBus, TestShard, prepare_message, request_message, test_shard,
+        SpyBus, TestMux, TestShard, prepare_message, request_message,
     };
 
     const STREAM_ID: WireIdentifier = WireIdentifier::Numeric(0);
@@ -317,7 +321,7 @@ mod tests {
 
     #[compio::test]
     async fn given_rejected_join_when_recovered_should_retry_without_stale_revocations() {
-        let (shard, inbox) = group_shard();
+        let shard = group_shard();
         let directory = tempfile::tempdir().unwrap();
         let stale_namespace = namespace(&shard, STALE_PARTITION);
         let recovering_namespace = namespace(&shard, RECOVERING_PARTITION);
@@ -342,7 +346,6 @@ mod tests {
             .unwrap();
         let rejected = with_partition_reads(
             &shard,
-            &inbox,
             maybe_rewrite_consumer_group_request(&shard, join_request(FIRST_CLIENT)),
         )
         .await;
@@ -363,7 +366,6 @@ mod tests {
         recover_partition(&shard, &directory.path().join("donor")).await;
         let accepted = with_partition_reads(
             &shard,
-            &inbox,
             maybe_rewrite_consumer_group_request(&shard, join_request(FIRST_CLIENT)),
         )
         .await
@@ -393,7 +395,6 @@ mod tests {
 
         let next_join = with_partition_reads(
             &shard,
-            &inbox,
             maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
         )
         .await
@@ -419,7 +420,7 @@ mod tests {
     #[compio::test]
     async fn given_transferring_partition_when_joining_should_preserve_commit_ownership() {
         for missing in [true, false] {
-            let (shard, inbox) = group_shard();
+            let shard = group_shard();
             apply_initial_join(&shard);
             let directory = tempfile::tempdir().unwrap();
             let mut recovering = partition(&shard, RECOVERING_PARTITION, directory.path());
@@ -457,7 +458,6 @@ mod tests {
 
             let rewritten = with_partition_reads(
                 &shard,
-                &inbox,
                 maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
             )
             .await;
@@ -539,7 +539,7 @@ mod tests {
 
     #[compio::test]
     async fn given_unanswered_or_missing_partitions_when_joining_should_allow_eager_handoff() {
-        let (shard, inbox) = group_shard();
+        let shard = group_shard();
         apply_initial_join(&shard);
         let unanswered = namespace(&shard, STALE_PARTITION);
         shard.shards_table().remove(&unanswered);
@@ -551,7 +551,6 @@ mod tests {
         );
         let not_found = with_partition_reads(
             &shard,
-            &inbox,
             shard.partition_read(
                 namespace(&shard, RECOVERING_PARTITION),
                 PartitionRead::GroupOffsetState { group_id: 0 },
@@ -562,7 +561,6 @@ mod tests {
 
         let rewritten = with_partition_reads(
             &shard,
-            &inbox,
             maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
         )
         .await
@@ -585,12 +583,8 @@ mod tests {
         );
     }
 
-    fn group_shard() -> (Rc<TestShard>, Receiver<ShardFrame>) {
-        let bus = SpyBus::default();
-        let mut shard = test_shard(&bus, 0, 3, 1);
-        let (sender, inbox, _replies) = shard_channel(0, INBOX_CAPACITY, INBOX_CAPACITY);
-        shard.attach_senders(vec![sender]);
-        let shard = Rc::new(shard);
+    fn group_shard() -> Rc<TestShard> {
+        let shard = partition_read_shard();
         let mux = &shard.plane.metadata().mux_stm;
         mux.update(prepare_message(
             Operation::CreateStream,
@@ -644,7 +638,56 @@ mod tests {
                 PartitionLocation::new(ShardId::new(0), 0),
             );
         }
-        (shard, inbox)
+        shard
+    }
+
+    fn partition_read_shard() -> Rc<TestShard> {
+        let bus = SpyBus::default();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.set_incarnation(1);
+        consensus.init();
+        let metadata =
+            IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: IggyByteSize::from(1024_u64),
+                validate_checksum: true,
+                segment_size: IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let (sender, inbox, replies) = shard_channel(0, INBOX_CAPACITY, INBOX_CAPACITY);
+        Rc::new(
+            TestShard::new(
+                ShardIdentity::new(0, "consumer-group-test".to_string()),
+                bus.clone(),
+                Rc::new(|_, _| {}),
+                Rc::new(|_, _| {}),
+                Rc::new(|_| {}),
+                Rc::new(|_| {}),
+                metadata,
+                partitions,
+                vec![sender],
+                inbox,
+                replies,
+                PapayaShardsTable::new(),
+                PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus),
+                None,
+                ShardMetrics::for_shard(),
+            )
+            .unwrap(),
+        )
     }
 
     fn namespace(shard: &Rc<TestShard>, partition_id: u32) -> IggyNamespace {
@@ -748,24 +791,10 @@ mod tests {
 
     async fn with_partition_reads<T>(
         shard: &Rc<TestShard>,
-        inbox: &Receiver<ShardFrame>,
         operation: impl Future<Output = T>,
     ) -> T {
-        let handle = Rc::new(RefCell::new(Some(Rc::downgrade(shard))));
-        let handler = make_partition_read_handler(&handle);
-        let serve = async {
-            loop {
-                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                    namespace,
-                    read,
-                    reply,
-                }) = inbox.recv().await.unwrap()
-                else {
-                    panic!("unexpected frame while serving the join's partition reads");
-                };
-                handler(namespace, read, reply);
-            }
-        };
+        let (_stop, stop) = channel(1);
+        let serve = shard.run_message_pump(stop, Arc::new(AtomicBool::new(false)));
         match select(Box::pin(operation), Box::pin(serve)).await {
             Either::Left((result, _)) => result,
             Either::Right(_) => {

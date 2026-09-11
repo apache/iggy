@@ -41,14 +41,14 @@ use crate::{
 };
 use consensus::Pipeline;
 use consensus::{
-    AutoCommitRequestContext, ClientTable, ClientTableMode, CommitLogEvent, Consensus, PartitionDiagEvent, PipelineEntry,
-    PlaneKind, Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus,
-    ack_preflight, ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
-    build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repair_session_live,
-    repaired_frontier_update, replicate_frozen_to_next_in_chain, replicate_preflight,
-    report_uncommittable_head, restamp_prepare_view, send_prepare_ok as send_prepare_ok_common,
-    verify_prepare_integrity,
+    AutoCommitRequestContext, ClientTable, ClientTableMode, CommitLogEvent, Consensus,
+    PartitionDiagEvent, PipelineEntry, PlaneKind, Project, ReplicaLogContext, RequestLogEvent,
+    Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    build_deny_reply_from_request, build_reply_from_request, build_reply_message,
+    drain_committable_prefix, emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
+    fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
+    replicate_frozen_to_next_in_chain, replicate_preflight, report_uncommittable_head,
+    restamp_prepare_view, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_offsets::{
@@ -2955,6 +2955,13 @@ where
             .reserve_provisional(consumer_id, &self.durable_consumer_offsets)
             .map_err(|error| self.poll_capacity_error(error))?;
         let request = self.build_poll_auto_commit_request(kind, consumer_id, offset)?;
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| !persistence.has_capacity(request.as_slice().len()))
+        {
+            return Err(IggyError::TransientNotAccepted);
+        }
         if self.consensus.pipeline_is_full() {
             let context = AutoCommitRequestContext {
                 history: self.poll_history.clone(),
@@ -9112,12 +9119,13 @@ mod tests {
         );
         assert_eq!(partition.log.journal().inner.resident_count(), 0);
         let args = PollingArgs::new(iggy_common::PollingStrategy::offset(1), 1, false);
-        let (fragments, _, _) = partition
+        let result = partition
             .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, true)
             .execute()
-            .await
-            .unwrap();
-        let polled: Vec<_> = fragments
+            .await;
+        let completion = partition.complete_poll(result).unwrap();
+        let polled: Vec<_> = completion
+            .fragments
             .iter()
             .flat_map(|fragment| fragment.as_slice().iter().copied())
             .collect();
@@ -12042,6 +12050,43 @@ mod tests {
         assert_eq!(partition.group_offset_state(7), (None, None));
     }
 
+    #[compio::test]
+    async fn given_full_wal_when_poll_completes_should_reject_without_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let consumer = PollingConsumer::ConsumerGroup(7, 1);
+        let result = poll_read_result(&partition, consumer, true, Some(0));
+        let op = partition.consensus.sequencer().current_sequence();
+        persistence.exhaust_capacity_for_test();
+
+        assert!(matches!(
+            partition.complete_poll(result),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(partition.group_offset_state(7), (None, None));
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+        assert_eq!(partition.consensus.request_queue_len(), 0);
+        assert_eq!(partition.consensus.sequencer().current_sequence(), op);
+        assert_eq!(
+            partition
+                .consumer_group_offset_capacity
+                .occupied(&partition.durable_consumer_offsets),
+            0
+        );
+
+        persistence.release_capacity_for_test();
+        let result = poll_read_result(&partition, consumer, true, Some(0));
+        let completion = partition.complete_poll(result).expect("accept retry");
+        assert!(completion.replication.is_some());
+        assert_eq!(partition.group_offset_state(7), (Some(0), Some(0)));
+        assert_eq!(partition.consensus.pipeline_len(), 1);
+        assert_eq!(partition.consensus.sequencer().current_sequence(), op + 1);
+    }
+
     #[test]
     fn given_pending_poll_when_materialization_is_missing_should_reject_without_progress() {
         for auto_commit in [false, true] {
@@ -12189,6 +12234,8 @@ mod tests {
         let manual = poll_read_result(&partition, consumer, false, Some(4));
         let state = crate::state_transfer::ConsumerOffsetsWire {
             purge_generation: 0,
+            prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             next_offset: 10,
             consumers: Vec::new(),
             groups: Vec::new(),
@@ -12242,6 +12289,8 @@ mod tests {
         };
         let state = crate::state_transfer::ConsumerOffsetsWire {
             purge_generation: 0,
+            prepare_checksum: None,
+            checkpoint_prepare: Vec::new(),
             next_offset: 1,
             consumers: Vec::new(),
             groups: Vec::new(),
@@ -15950,7 +15999,6 @@ mod purge_poll_tests {
             group_path.to_string_lossy().into_owned(),
             ConsumerOffsets::with_capacity(1),
             ConsumerGroupOffsets::with_capacity(1),
-            false,
         );
         (directory, partition)
     }
