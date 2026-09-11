@@ -34,6 +34,7 @@ use crate::auth::{Admission, admit_endpoint};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::fmt;
 use std::io::Cursor;
 use tracing::{info, warn};
 
@@ -462,6 +463,54 @@ struct StateFrame<E> {
     endpoints: E,
 }
 
+/// Why a state blob was refused.
+///
+/// A variant per check rather than one string, so a test can say which guard
+/// fired instead of asserting that something did. Bare `is_err()` would have
+/// passed for a frame rejected by the wrong one.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameError {
+    Undecodable(String),
+    TrailingBytes {
+        consumed: u64,
+        len: usize,
+    },
+    Version(u16),
+    CountMismatch {
+        declared: u32,
+        carried: usize,
+    },
+    /// Ids carried as `log_prefix`, never whole: a secret-path id is the
+    /// credential, and this text reaches a log line.
+    MisfiledEndpoint {
+        key: String,
+        record: String,
+    },
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Undecodable(error) => write!(formatter, "the frame does not decode ({error})"),
+            Self::TrailingBytes { consumed, len } => {
+                write!(formatter, "the frame ends after {consumed} of {len} bytes")
+            }
+            Self::Version(version) => write!(
+                formatter,
+                "the frame is version {version}, and this connector writes version {STATE_VERSION}"
+            ),
+            Self::CountMismatch { declared, carried } => write!(
+                formatter,
+                "the frame declares {declared} endpoint(s) and carries {carried}"
+            ),
+            Self::MisfiledEndpoint { key, record } => write!(
+                formatter,
+                "the endpoint filed under {key} carries {record} in its own record"
+            ),
+        }
+    }
+}
+
 /// Decodes a state blob, refusing anything that is not exactly one frame.
 ///
 /// `rmp_serde::from_slice` stops at the end of the first value and never
@@ -479,29 +528,25 @@ struct StateFrame<E> {
 /// Fail closed, always. Every revocation tombstone lives in this blob, so a
 /// decode that guesses is one that puts a compromised endpoint back in service
 /// with its secret.
-fn decode_state_frame(blob: &[u8]) -> Result<BTreeMap<EndpointId, Endpoint>, String> {
+fn decode_state_frame(blob: &[u8]) -> Result<BTreeMap<EndpointId, Endpoint>, FrameError> {
     let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(blob));
     let frame = StateFrame::<BTreeMap<EndpointId, Endpoint>>::deserialize(&mut deserializer)
-        .map_err(|error| format!("the frame does not decode ({error})"))?;
+        .map_err(|error| FrameError::Undecodable(error.to_string()))?;
     let consumed = deserializer.position();
     if consumed != blob.len() as u64 {
-        return Err(format!(
-            "the frame ends after {consumed} of {} bytes",
-            blob.len()
-        ));
+        return Err(FrameError::TrailingBytes {
+            consumed,
+            len: blob.len(),
+        });
     }
     if frame.version != STATE_VERSION {
-        return Err(format!(
-            "the frame is version {}, and this connector writes version {STATE_VERSION}",
-            frame.version
-        ));
+        return Err(FrameError::Version(frame.version));
     }
     if frame.endpoint_count as usize != frame.endpoints.len() {
-        return Err(format!(
-            "the frame declares {} endpoint(s) and carries {}",
-            frame.endpoint_count,
-            frame.endpoints.len()
-        ));
+        return Err(FrameError::CountMismatch {
+            declared: frame.endpoint_count,
+            carried: frame.endpoints.len(),
+        });
     }
     // Every writer keys an endpoint by its own `endpoint_id`, so the two copies
     // agreeing is an invariant and not a coincidence worth repairing. Enforcing
@@ -517,11 +562,10 @@ fn decode_state_frame(blob: &[u8]) -> Result<BTreeMap<EndpointId, Endpoint>, Str
         .iter()
         .find(|(key, endpoint)| key.as_str() != endpoint.endpoint_id.as_str())
     {
-        return Err(format!(
-            "the endpoint filed under {} carries {} in its own record",
-            key.log_prefix(),
-            endpoint.endpoint_id.log_prefix()
-        ));
+        return Err(FrameError::MisfiledEndpoint {
+            key: key.log_prefix(),
+            record: endpoint.endpoint_id.log_prefix(),
+        });
     }
     Ok(frame.endpoints)
 }
@@ -727,10 +771,17 @@ mod tests {
     #[test]
     fn given_the_historic_registry_shape_when_decoded_should_refuse() {
         // What the registry encoded as before the frame existed: a one element
-        // array holding the endpoint map. Caught on arity, since the frame is
-        // three elements and the first of them is not a map.
-        assert!(decode_state_frame(&[0x91, 0x80]).is_err());
-        assert!(decode_state_frame(&[0x90]).is_err());
+        // array holding the endpoint map, and the bare empty array that read
+        // as a registry with no endpoints. Both fail the decode itself, since
+        // the frame is three elements and the first of them is not a map.
+        assert!(matches!(
+            decode_state_frame(&[0x91, 0x80]),
+            Err(FrameError::Undecodable(_))
+        ));
+        assert!(matches!(
+            decode_state_frame(&[0x90]),
+            Err(FrameError::Undecodable(_))
+        ));
     }
 
     #[test]
@@ -747,7 +798,10 @@ mod tests {
         bytes.push(0xc0);
 
         assert!(
-            decode_state_frame(&bytes).is_err(),
+            matches!(
+                decode_state_frame(&bytes),
+                Err(FrameError::TrailingBytes { .. })
+            ),
             "a blob carrying more than one frame is not a state file this connector wrote"
         );
     }
@@ -765,7 +819,13 @@ mod tests {
         };
         let bytes = rmp_serde::to_vec(&lying).expect("the shadow must serialize");
 
-        assert!(decode_state_frame(&bytes).is_err());
+        assert_eq!(
+            decode_state_frame(&bytes).expect_err("a lying count must be refused"),
+            FrameError::CountMismatch {
+                declared: 2,
+                carried: 0
+            }
+        );
     }
 
     /// The property the framing is for, swept rather than sampled: no edit to
@@ -844,7 +904,10 @@ mod tests {
         let bytes = rmp_serde::to_vec(&lying).expect("the shadow must serialize");
 
         assert!(
-            decode_state_frame(&bytes).is_err(),
+            matches!(
+                decode_state_frame(&bytes),
+                Err(FrameError::MisfiledEndpoint { .. })
+            ),
             "a tombstone filed under an id its own record does not claim must not be served"
         );
     }
@@ -858,8 +921,9 @@ mod tests {
         };
         let bytes = rmp_serde::to_vec(&future).expect("the shadow must serialize");
 
-        assert!(
-            decode_state_frame(&bytes).is_err(),
+        assert_eq!(
+            decode_state_frame(&bytes).expect_err("an unknown version must be refused"),
+            FrameError::Version(STATE_VERSION + 1),
             "a shape this connector does not know is refused, not guessed at"
         );
     }
