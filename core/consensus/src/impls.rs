@@ -2523,9 +2523,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// IS the whole quorum. `PrepareOk` loops through the loopback because it
     /// genuinely is a message to a peer that happens to be this replica.
     ///
-    /// The three callers that used to inline this sequence were the actual
-    /// duplication: an election timeout, an SVC for a higher view, and a DVC for
-    /// a higher view, differing only in `reason`.
+    /// A timed-out primary candidate can become a backup in the next view,
+    /// so every transition must restart its probe for a missing `StartView`.
     fn enter_view_change(
         &self,
         plane: PlaneKind,
@@ -2640,43 +2639,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        // Escalate: try next view
-        let old_view = self.view.get();
-        let next_view = old_view + 1;
-
-        self.view.set(next_view);
-        self.reset_view_change_state();
-        self.sent_own_start_view_change.set(true);
-        self.start_view_change_from_all_replicas
-            .borrow_mut()
-            .insert(self.replica as usize);
-
-        self.timeouts
-            .borrow_mut()
-            .reset(TimeoutKind::ViewChangeStatus);
-
-        emit_sim_event(
-            SimEventKind::ViewChangeStarted,
-            &ViewChangeLogEvent {
-                replica: ReplicaLogContext::from_consensus(self, plane),
-                old_view,
-                new_view: next_view,
-                reason: ViewChangeReason::ViewChangeStatusTimeout,
-            },
-        );
-
-        let action = VsrAction::SendStartViewChange {
-            view: next_view,
-            group: self.group,
-        };
-        emit_sim_event(
-            SimEventKind::ControlMessageScheduled,
-            &ControlActionLogEvent::from_vsr_action(
-                ReplicaLogContext::from_consensus(self, plane),
-                &action,
-            ),
-        );
-        vec![action]
+        self.enter_view_change(
+            plane,
+            self.view.get() + 1,
+            ViewChangeReason::ViewChangeStatusTimeout,
+        )
     }
 
     /// Collect uncommitted pipeline entries that should be retransmitted.
@@ -3981,22 +3948,28 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Send a message to `target`, routing self-addressed messages through the loopback queue.
     // VsrConsensus uses Cell/RefCell for single-threaded compio shards; futures are intentionally !Send.
     #[allow(clippy::future_not_send)]
-    pub(crate) async fn send_or_loopback(&self, target: u8, message: Message<GenericHeader>)
+    pub(crate) async fn send_or_loopback(&self, target: u8, message: Message<GenericHeader>) -> bool
     where
         B: MessageBus,
     {
         if target == self.replica {
             self.push_loopback(message);
-        } else if let Err(e) = self
+            return true;
+        }
+        match self
             .message_bus
             .send_to_replica(target, message.into_frozen())
             .await
         {
-            tracing::warn!(
-                replica = self.replica,
-                target,
-                "send_or_loopback failed: {e}"
-            );
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    replica = self.replica,
+                    target,
+                    "send_or_loopback failed: {error}"
+                );
+                false
+            }
         }
     }
 
@@ -5022,6 +4995,114 @@ mod vsr_consensus_tests {
                 .any(|action| matches!(action, VsrAction::SendCommit { .. })),
             "a stale primary must not advertise a commit point"
         );
+    }
+
+    #[test]
+    fn given_a_stalled_candidate_when_it_escalates_should_recover_a_lost_start_view() {
+        const REJOINING_REPLICA: u8 = 1;
+        const NEXT_PRIMARY: u8 = 2;
+        const REPLICA_COUNT: u8 = 3;
+        const LOCAL_HEAD: u64 = 20;
+        const PRIMARY_HEAD: u64 = LOCAL_HEAD + 1;
+        let plane = PlaneKind::Partitions;
+        let group = IggyNamespace::new(0, 0, 0).inner();
+        let backup = VsrConsensus::new(
+            1,
+            REJOINING_REPLICA,
+            REPLICA_COUNT,
+            group,
+            StageNoopBus,
+            LocalPipeline::new(),
+        );
+        backup.sequencer().set_sequence(LOCAL_HEAD);
+        backup.restore_commit_state(LOCAL_HEAD - 1, LOCAL_HEAD - 1);
+        backup.begin_view_probe();
+        for _ in 0..TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS * u64::from(PROBE_ATTEMPTS_MAX)
+        {
+            backup.tick(plane);
+        }
+        assert_eq!(backup.view(), 1);
+        assert_eq!(backup.status(), Status::ViewChange);
+        assert!(backup.is_primary_for_view(backup.view()));
+
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            backup.tick(plane);
+        }
+        assert_eq!(backup.view(), 2);
+        assert_eq!(backup.status(), Status::ViewChange);
+        assert!(!backup.is_primary_for_view(backup.view()));
+
+        // Model a settled primary whose initial StartView was withheld by persistence.
+        let mut primary = VsrConsensus::new(
+            1,
+            NEXT_PRIMARY,
+            REPLICA_COUNT,
+            group,
+            StageNoopBus,
+            LocalPipeline::new(),
+        );
+        primary.set_view(backup.view());
+        primary.set_log_view(backup.view());
+        primary.sequencer().set_sequence(PRIMARY_HEAD);
+        primary.restore_commit_state(LOCAL_HEAD, LOCAL_HEAD);
+        primary.init();
+
+        let probe = (0..TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS)
+            .flat_map(|_| backup.tick(plane))
+            .find_map(|action| match action {
+                VsrAction::SendRequestStartView { view, group } => Some(
+                    Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
+                        .transmute_header(|_, header: &mut RequestStartViewHeader| {
+                            header.command = Command::RequestStartView;
+                            header.cluster = 1;
+                            header.replica = REJOINING_REPLICA;
+                            header.view = view;
+                            header.group = group;
+                            header.size =
+                                u32::try_from(size_of::<RequestStartViewHeader>()).unwrap();
+                            header.seal();
+                        }),
+                ),
+                _ => None,
+            })
+            .expect("an escalated candidate must request the missing StartView as a backup");
+        let replies = primary.handle_request_start_view(plane, probe.header());
+        let [
+            VsrAction::SendStartView {
+                view,
+                op,
+                commit,
+                incarnation,
+                target,
+                group,
+                suffix,
+            },
+        ] = replies.as_slice()
+        else {
+            panic!("the settled primary must answer the backup's probe: {replies:?}");
+        };
+        assert_eq!(*target, Some(REJOINING_REPLICA));
+        assert!(suffix.is_empty());
+        let response = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.cluster = 1;
+                header.replica = NEXT_PRIMARY;
+                header.view = *view;
+                header.op = *op;
+                header.commit = *commit;
+                header.incarnation = *incarnation;
+                header.group = *group;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                header.seal();
+            });
+        backup.handle_start_view(plane, response.header(), &[]);
+        assert_eq!(backup.status(), Status::Normal);
+        assert_eq!(backup.view(), primary.view());
+        assert_eq!(backup.log_view(), primary.log_view());
+        assert_eq!(backup.sequencer().current_sequence(), PRIMARY_HEAD);
+        assert_eq!(backup.commit_max(), LOCAL_HEAD);
+        assert_eq!(backup.commit_min(), LOCAL_HEAD - 1);
     }
 
     // A genuine current primary (no newer view seen) keeps heartbeating.

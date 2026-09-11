@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use iggy::prelude::HeaderKind;
-use iggy_connector_sdk::retry::{exponential_backoff, jitter};
+use iggy_connector_sdk::retry::retry_backoff;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
@@ -229,11 +229,7 @@ impl RabbitMQSink {
                             "failed to reconnect: {reconnect_error}"
                         )));
                     }
-                    let delay = jitter(exponential_backoff(
-                        self.retry_delay,
-                        attempts.saturating_sub(1),
-                        self.max_retry_delay,
-                    ));
+                    let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
                     warn!(
                         "RabbitMQ not connected for connector ID: {} (attempt {attempts}/{}). Retrying in {:?}.",
                         self.id, self.max_retries, delay
@@ -372,11 +368,7 @@ impl RabbitMQSink {
                 }
             }
 
-            let delay = jitter(exponential_backoff(
-                self.retry_delay,
-                attempts.saturating_sub(1),
-                self.max_retry_delay,
-            ));
+            let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
             warn!(
                 "Transient RabbitMQ publish error for connector ID: {} (attempt {attempts}/{}): {error}. Retrying in {:?}.",
                 self.id, self.max_retries, delay

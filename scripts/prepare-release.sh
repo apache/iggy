@@ -60,6 +60,7 @@ RELEASE_PATHS=(
   "core"
   "examples"
   "foreign"
+  "gateways"
   "helm"
   "scripts"
   "web"

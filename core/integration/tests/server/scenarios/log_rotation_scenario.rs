@@ -89,19 +89,19 @@ fn config_special_scenario() -> LogRotationTestConfig {
 fn build_server_config(log_config: &LogRotationTestConfig) -> TestServerConfig {
     let mut extra_envs = HashMap::new();
     extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_MAX_FILE_SIZE".to_string(),
+        "IGGY_LOGGING_MAX_FILE_SIZE".to_string(),
         format!("{}", log_config.max_single_log_size),
     );
     extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_MAX_TOTAL_SIZE".to_string(),
+        "IGGY_LOGGING_MAX_TOTAL_SIZE".to_string(),
         format!("{}", log_config.max_total_log_size),
     );
     extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_ROTATION_CHECK_INTERVAL".to_string(),
+        "IGGY_LOGGING_ROTATION_CHECK_INTERVAL".to_string(),
         format!("{}", log_config.rotation_check_interval),
     );
     extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_RETENTION".to_string(),
+        "IGGY_LOGGING_RETENTION".to_string(),
         format!("{}", log_config.retention),
     );
 

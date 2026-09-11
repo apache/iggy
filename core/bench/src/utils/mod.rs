@@ -32,7 +32,7 @@ use crate::args::{
         DEFAULT_MESSAGES_PER_BATCH, DEFAULT_NUMBER_OF_CONSUMER_GROUPS, DEFAULT_NUMBER_OF_CONSUMERS,
         DEFAULT_NUMBER_OF_PRODUCERS, DEFAULT_PINNED_NUMBER_OF_PARTITIONS,
         DEFAULT_PINNED_NUMBER_OF_STREAMS, DEFAULT_QUIC_SERVER_ADDRESS, DEFAULT_TCP_SERVER_ADDRESS,
-        DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME,
+        DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME, DEFAULT_WEBSOCKET_SERVER_ADDRESS,
     },
 };
 
@@ -198,6 +198,15 @@ fn add_environment_variables(parts: &mut Vec<String>, server_address: &str) {
 }
 
 fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
+    parts.push(format!("--durability {}", args.durability()));
+    parts.push(format!(
+        "--consumer-offset-durability {}",
+        args.consumer_offset_durability()
+    ));
+    if let Some(threshold) = args.messages_required_to_save() {
+        parts.push(format!("--messages-required-to-save {threshold}"));
+    }
+
     let messages_per_batch = args.messages_per_batch();
     if messages_per_batch != BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()) {
         parts.push(format!("--messages-per-batch {messages_per_batch}"));
@@ -212,7 +221,7 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     if let Some(total_messages_size) = args.total_data()
         && total_messages_size != DEFAULT_TOTAL_MESSAGES_SIZE
     {
-        parts.push(format!("--total-messages-size {total_messages_size}"));
+        parts.push(format!("--total-data {total_messages_size}"));
     }
 
     let message_size = args.message_size();
@@ -291,7 +300,8 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     let default_streams = match args.benchmark_kind.as_simple_kind() {
         BenchmarkKind::BalancedProducerAndConsumerGroup
         | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_STREAMS.get(),
+        | BenchmarkKind::BalancedProducer
+        | BenchmarkKind::EndToEndProducingConsumerGroup => DEFAULT_BALANCED_NUMBER_OF_STREAMS.get(),
         _ => DEFAULT_PINNED_NUMBER_OF_STREAMS.get(),
     };
     if streams != default_streams {
@@ -302,10 +312,13 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     let default_partitions = match args.benchmark_kind.as_simple_kind() {
         BenchmarkKind::BalancedProducerAndConsumerGroup
         | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_PARTITIONS.get(),
+        | BenchmarkKind::BalancedProducer
+        | BenchmarkKind::EndToEndProducingConsumerGroup => {
+            DEFAULT_BALANCED_NUMBER_OF_PARTITIONS.get()
+        }
         _ => DEFAULT_PINNED_NUMBER_OF_PARTITIONS.get(),
     };
-    if partitions != default_partitions {
+    if partitions != 0 && partitions != default_partitions {
         parts.push(format!("--partitions {partitions}"));
     }
 
@@ -321,14 +334,15 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
         parts.push(format!("--max-topic-size \'{max_topic_size}\'"));
     }
 
-    let transport = args.transport().to_string().to_lowercase();
-    parts.push(transport.clone());
+    let transport = args.transport_command().as_str();
+    parts.push(transport.to_owned());
 
     let server_address = args.server_address();
-    let default_address = match transport.as_str() {
+    let default_address = match transport {
         "tcp" => DEFAULT_TCP_SERVER_ADDRESS,
         "quic" => DEFAULT_QUIC_SERVER_ADDRESS,
         "http" => DEFAULT_HTTP_SERVER_ADDRESS,
+        "websocket" => DEFAULT_WEBSOCKET_SERVER_ADDRESS,
         _ => "",
     };
 
@@ -343,5 +357,91 @@ fn add_output_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
 
     if let Some(remark) = args.remark() {
         parts.push(format!("--remark \'{remark}\'"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recreate_bench_command;
+    use crate::args::common::IggyBenchArgs;
+    use clap::Parser;
+
+    #[test]
+    fn reproduced_commands_preserve_consumer_only_and_end_to_end_topologies() {
+        for arguments in [
+            vec!["iggy-bench", "pinned-consumer", "tcp"],
+            vec!["iggy-bench", "balanced-consumer-group", "tcp"],
+            vec!["iggy-bench", "end-to-end-producing-consumer-group", "tcp"],
+            vec![
+                "iggy-bench",
+                "end-to-end-producing-consumer-group",
+                "--streams",
+                "6",
+                "--consumer-groups",
+                "6",
+                "--partitions",
+                "1",
+                "tcp",
+            ],
+        ] {
+            let mut original = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            original.validate();
+            let command = recreate_bench_command(&original);
+            let arguments = command
+                .split_ascii_whitespace()
+                .skip_while(|argument| *argument != "iggy-bench");
+            let mut reproduced = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            reproduced.validate();
+            assert_eq!(reproduced.streams(), original.streams(), "{command}");
+            assert_eq!(
+                reproduced.number_of_partitions(),
+                original.number_of_partitions(),
+                "{command}"
+            );
+            assert_eq!(
+                reproduced.number_of_consumer_groups(),
+                original.number_of_consumer_groups(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn reproduced_websocket_commands_preserve_independent_topic_policies() {
+        for messages in ["replicated", "persisted"] {
+            for offsets in ["replicated", "persisted"] {
+                let original = IggyBenchArgs::try_parse_from([
+                    "iggy-bench",
+                    "--durability",
+                    messages,
+                    "--consumer-offset-durability",
+                    offsets,
+                    "--messages-required-to-save",
+                    "128",
+                    "pinned-producer",
+                    "ws",
+                ])
+                .unwrap();
+                let command = recreate_bench_command(&original);
+                let arguments = command
+                    .split_ascii_whitespace()
+                    .skip_while(|argument| *argument != "iggy-bench");
+                let reproduced = IggyBenchArgs::try_parse_from(arguments).unwrap();
+                assert!(
+                    command
+                        .split_ascii_whitespace()
+                        .any(|argument| argument == "websocket")
+                );
+                assert_eq!(reproduced.durability(), original.durability());
+                assert_eq!(
+                    reproduced.consumer_offset_durability(),
+                    original.consumer_offset_durability()
+                );
+                assert_eq!(
+                    reproduced.messages_required_to_save(),
+                    original.messages_required_to_save()
+                );
+            }
+        }
     }
 }

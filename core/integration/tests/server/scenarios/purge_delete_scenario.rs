@@ -67,7 +67,7 @@ fn layout_topic_options() -> TopicCreateOptions {
         partitions_count: Some(1),
         message_expiry: Some(IggyExpiry::NeverExpire),
         segment_size: Some(IggyByteSize::from(SEGMENT_SIZE)),
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         messages_required_to_save: Some(1),
         ..TopicCreateOptions::default()
     }
