@@ -911,7 +911,9 @@ mod tests {
         assert_eq!(past_interval, None);
     }
 
-    fn non_empty_fragments() -> PollFragments<4096> {
+    // Resident execution passes already selected bytes through unchanged.
+    // The snapshot test needs a nonempty payload but does not decode messages.
+    fn placeholder_fragments() -> PollFragments<4096> {
         let mut fragments = PollFragments::new();
         fragments.push(crate::types::Fragment::whole(
             Owned::<4096>::zeroed(8).into(),
@@ -921,40 +923,52 @@ mod tests {
 
     #[test]
     fn resident_read_returns_snapshot_facts() {
-        let history = PollHistoryId::default();
-        let plan = PollPlan {
-            commit_offset: 42,
+        let snapshot_history = PollHistoryId::default();
+        let partition_commit_offset = 42;
+        let last_selected_offset = 5;
+        let consumer_id = 7;
+        let partition_id = 0;
+        let resident_plan = PollPlan {
+            commit_offset: partition_commit_offset,
             context: PollContext {
-                history: history.clone(),
-                consumer: PollingConsumer::Consumer(7, 0),
+                history: snapshot_history.clone(),
+                consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
             },
             tier: PollTier::Resident {
-                fragments: non_empty_fragments(),
-                last_matching_offset: Some(5),
+                fragments: placeholder_fragments(),
+                last_matching_offset: Some(last_selected_offset),
             },
         };
-        assert!(!plan.needs_off_pump_io());
-        let result = plan.execute_resident();
-        assert_eq!(result.context.history, history);
-        assert_eq!(result.commit_offset, 42);
-        assert_eq!(result.last_matching_offset, Some(5));
-        assert!(!result.fragments.is_empty());
+        assert!(!resident_plan.needs_off_pump_io());
+
+        // Reading preserves both the partition frontier and the last selected
+        // message offset. These are snapshot facts awaiting owner acceptance.
+        let read_result = resident_plan.execute_resident();
+        assert_eq!(read_result.context.history, snapshot_history);
+        assert_eq!(read_result.commit_offset, partition_commit_offset);
+        assert_eq!(read_result.last_matching_offset, Some(last_selected_offset));
+        assert!(!read_result.fragments.is_empty());
     }
 
     #[test]
     fn empty_read_returns_no_progress() {
-        let result = PollPlan {
+        let consumer_id = 7;
+        let partition_id = 0;
+        let empty_plan = PollPlan {
             commit_offset: 9,
             context: PollContext {
                 history: PollHistoryId::default(),
-                consumer: PollingConsumer::Consumer(7, 0),
+                consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
             },
             tier: PollTier::Empty,
-        }
-        .execute_resident();
-        assert!(result.fragments.is_empty());
-        assert_eq!(result.last_matching_offset, None);
+        };
+
+        // Automatic commits are enabled, but no matching message means there
+        // is no selected offset for the owner to apply as consumer progress.
+        let read_result = empty_plan.execute_resident();
+        assert!(read_result.fragments.is_empty());
+        assert_eq!(read_result.last_matching_offset, None);
     }
 }

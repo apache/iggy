@@ -156,47 +156,65 @@ mod tests {
     fn histories_match_only_their_own_clones() {
         let history = PollHistoryId::default();
         assert_eq!(history, history.clone());
-        assert_ne!(history, PollHistoryId::default());
+        let other_history = PollHistoryId::default();
+        assert_ne!(history, other_history);
     }
 
     #[test]
     fn last_reservation_releases_the_key() {
-        let epoch = Rc::new(Cell::new(0));
-        let keys = Rc::new(Cell::new(0));
+        let consumer_id = 7;
+        let reclaim_epoch = Rc::new(Cell::new(0));
+        let active_keys = Rc::new(Cell::new(0));
         let token = Rc::new(AutoCommitReservationToken::new(
             ConsumerKind::Consumer,
-            7,
-            Rc::clone(&epoch),
-            Rc::clone(&keys),
+            consumer_id,
+            Rc::clone(&reclaim_epoch),
+            Rc::clone(&active_keys),
         ));
-        let first = token.acquire();
-        let second = token.acquire();
-        assert_eq!(first.kind(), ConsumerKind::Consumer);
-        assert_eq!(first.consumer_id(), 7);
-        assert_eq!(keys.get(), 1);
-        drop(first);
-        assert_eq!(keys.get(), 1);
-        drop(second);
-        assert_eq!(keys.get(), 0);
-        assert_eq!(epoch.get(), 1);
+
+        // Two requests for the same consumer occupy one capacity slot.
+        let first_reservation = token.acquire();
+        let second_reservation = token.acquire();
+        assert_eq!(first_reservation.kind(), ConsumerKind::Consumer);
+        assert_eq!(first_reservation.consumer_id(), consumer_id);
+        assert_eq!(active_keys.get(), 1);
+
+        drop(first_reservation);
+        assert_eq!(
+            active_keys.get(),
+            1,
+            "the second request still holds the key"
+        );
+
+        drop(second_reservation);
+        assert_eq!(active_keys.get(), 0);
+        assert_eq!(
+            reclaim_epoch.get(),
+            1,
+            "releasing the key enables reclamation"
+        );
     }
 
     #[test]
     fn last_reservation_wraps_reclaim_epoch() {
-        let epoch = Rc::new(Cell::new(u64::MAX));
-        let keys = Rc::new(Cell::new(0));
+        let group_id = 7;
+        let reclaim_epoch = Rc::new(Cell::new(u64::MAX));
+        let active_keys = Rc::new(Cell::new(0));
         let token = Rc::new(AutoCommitReservationToken::new(
             ConsumerKind::ConsumerGroup,
-            7,
-            Rc::clone(&epoch),
-            Rc::clone(&keys),
+            group_id,
+            Rc::clone(&reclaim_epoch),
+            Rc::clone(&active_keys),
         ));
         let reservation = token.acquire();
         assert_eq!(reservation.kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(reservation.consumer_id(), 7);
+        assert_eq!(reservation.consumer_id(), group_id);
+
+        // The guard retains the token until release, even after its cached
+        // handle is gone. Advancing reclamation past u64::MAX must wrap.
         drop(token);
         drop(reservation);
-        assert_eq!(keys.get(), 0);
-        assert_eq!(epoch.get(), 0);
+        assert_eq!(active_keys.get(), 0);
+        assert_eq!(reclaim_epoch.get(), 0);
     }
 }

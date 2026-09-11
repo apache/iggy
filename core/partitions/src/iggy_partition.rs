@@ -10948,6 +10948,9 @@ mod tests {
         recording_partition_with_pipeline(replica, replica_count, LocalPipeline::new())
     }
 
+    /// Creates an empty partition with the supplied consensus queue capacities.
+    /// Its bus records sends without contacting clients or replicas; the returned
+    /// frame list contains client replies only.
     fn recording_partition_with_pipeline(
         replica: u8,
         replica_count: u8,
@@ -12005,14 +12008,17 @@ mod tests {
         drop(held);
     }
 
+    /// Constructs a result awaiting owner acceptance, without reading messages or
+    /// updating progress. `Some` adds a placeholder fragment so completion takes
+    /// the nonempty path; these bytes are never decoded. `None` models an empty read.
     fn poll_read_result<B: MessageBus>(
         partition: &IggyPartition<B>,
         consumer: PollingConsumer,
         auto_commit: bool,
-        offset: Option<u64>,
+        last_matching_offset: Option<u64>,
     ) -> PollReadResult {
         let mut fragments = PollFragments::new();
-        if offset.is_some() {
+        if last_matching_offset.is_some() {
             fragments.push(crate::Fragment::whole(Owned::<4096>::zeroed(8).into()));
         }
         PollReadResult {
@@ -12023,41 +12029,60 @@ mod tests {
             },
             fragments,
             commit_offset: partition.offsets().commit_offset,
-            last_matching_offset: offset,
+            last_matching_offset,
         }
     }
 
     #[test]
     fn given_read_result_when_owner_accepts_should_advance_before_replication() {
         let (mut partition, _) = recording_partition();
+        // Let Next compare its starting offset with the committed frontier (0)
+        // instead of taking the shortcut for a partition that has never had data.
         partition.offset_space.committed_seeded = true;
-        let consumer = PollingConsumer::Consumer(7, 0);
-        let result = poll_read_result(&partition, consumer, true, Some(0));
+        let consumer_id = 7;
+        let partition_id = 0;
+        let auto_commit = true;
+        let consumer = PollingConsumer::Consumer(consumer_id, partition_id);
+        let read_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
         assert_eq!(partition.get_consumer_offset(consumer), None);
-        let completion = partition.complete_poll(result).expect("accept poll");
+
+        // Acceptance advances local progress and assigns replication work, but
+        // the automatic commit has not yet been staged in the journal.
+        let completion = partition.complete_poll(read_result).expect("accept poll");
         assert_eq!(partition.get_consumer_offset(consumer), Some(0));
         assert!(completion.replication.is_some());
         assert!(partition.pending_consumer_offset_commits.is_empty());
-        let next = partition
+
+        // Next already starts after offset 0, before replication runs.
+        let validate_checksum = false;
+        let next_result = partition
             .build_poll_plan(
                 consumer,
-                &PollingArgs::new(iggy_common::PollingStrategy::next(), 1, true),
-                false,
+                &PollingArgs::new(iggy_common::PollingStrategy::next(), 1, auto_commit),
+                validate_checksum,
             )
             .execute_resident();
-        assert!(next.fragments.is_empty());
+        assert!(next_result.fragments.is_empty());
     }
 
     #[test]
     fn given_capacity_refusal_when_poll_completes_should_preserve_existing_progress() {
         let (mut partition, _) = recording_partition();
+        let durable_consumer_id = 8;
+        let polling_consumer_id = 7;
+        let partition_id = 0;
+        let auto_commit = true;
+
+        // Another consumer owns the only durable slot. The polling consumer has
+        // local progress at 4, but cannot admit an automatic commit through 9.
         partition.set_consumer_offsets_max(1);
-        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 8, 0, 0);
-        partition.apply_local_poll_offset(ConsumerKind::Consumer, 7, 4);
-        let consumer = PollingConsumer::Consumer(7, 0);
-        let result = poll_read_result(&partition, consumer, true, Some(9));
+        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, durable_consumer_id, 0, 0);
+        partition.apply_local_poll_offset(ConsumerKind::Consumer, polling_consumer_id, 4);
+        let consumer = PollingConsumer::Consumer(polling_consumer_id as usize, partition_id);
+        let read_result = poll_read_result(&partition, consumer, auto_commit, Some(9));
+
         assert!(matches!(
-            partition.complete_poll(result),
+            partition.complete_poll(read_result),
             Err(IggyError::TooManyConsumerOffsets)
         ));
         assert_eq!(partition.get_consumer_offset(consumer), Some(4));
@@ -12067,41 +12092,62 @@ mod tests {
     #[test]
     fn given_group_read_without_auto_commit_when_history_changes_should_not_record_last_polled() {
         let (mut partition, _) = recording_partition();
-        let result = poll_read_result(
-            &partition,
-            PollingConsumer::ConsumerGroup(7, 1),
-            false,
-            Some(0),
-        );
+        let group_id = 7;
+        let member_id = 1;
+        let auto_commit = false;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let old_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
+
+        // Group reads still record last_polled with automatic commits disabled.
+        // Retiring the history must prevent even that local progress update.
         partition.invalidate_poll_history();
         assert!(matches!(
-            partition.complete_poll(result),
+            partition.complete_poll(old_result),
             Err(IggyError::TransientNotAccepted)
         ));
-        assert_eq!(partition.group_offset_state(7), (None, None));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(
+            last_polled, None,
+            "the old read must not record group progress"
+        );
+        assert_eq!(committed, None, "automatic commits are disabled");
     }
 
     #[compio::test]
     async fn given_full_wal_when_poll_completes_should_reject_without_progress() {
+        // A primary with persisted offsets needs write-ahead log capacity before
+        // accepting an automatic commit. Use real persistence, then exhaust it.
         let directory = tempfile::tempdir().unwrap();
-        let (mut partition, _) = recording_partition_at(0, 3);
+        let primary_replica = 0;
+        let replica_count = 3;
+        let (mut partition, _) = recording_partition_at(primary_replica, replica_count);
         partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
         partition.open_persistence().await.unwrap();
         let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
-        let consumer = PollingConsumer::ConsumerGroup(7, 1);
-        let result = poll_read_result(&partition, consumer, true, Some(0));
-        let op = partition.consensus.sequencer().current_sequence();
+        let group_id = 7;
+        let member_id = 1;
+        let auto_commit = true;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let read_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
+        let operation_before_poll = partition.consensus.sequencer().current_sequence();
         persistence.exhaust_capacity_for_test();
 
+        // Refusal must leave progress, queues, operation assignment, and
+        // occupied capacity unchanged.
         assert!(matches!(
-            partition.complete_poll(result),
+            partition.complete_poll(read_result),
             Err(IggyError::TransientNotAccepted)
         ));
-        assert_eq!(partition.group_offset_state(7), (None, None));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, None);
+        assert_eq!(committed, None);
         assert_eq!(partition.consensus.pipeline_len(), 0);
         assert_eq!(partition.consensus.request_queue_len(), 0);
-        assert_eq!(partition.consensus.sequencer().current_sequence(), op);
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            operation_before_poll
+        );
         assert_eq!(
             partition
                 .consumer_group_offset_capacity
@@ -12109,31 +12155,44 @@ mod tests {
             0
         );
 
+        // The same offset becomes acceptable when capacity returns. These are
+        // local progress updates; the assigned replication has not run yet.
         persistence.release_capacity_for_test();
-        let result = poll_read_result(&partition, consumer, true, Some(0));
-        let completion = partition.complete_poll(result).expect("accept retry");
-        assert!(completion.replication.is_some());
-        assert_eq!(partition.group_offset_state(7), (Some(0), Some(0)));
+        let retry_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
+        let retry_completion = partition.complete_poll(retry_result).expect("accept retry");
+        assert!(retry_completion.replication.is_some());
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, Some(0));
+        assert_eq!(committed, Some(0));
         assert_eq!(partition.consensus.pipeline_len(), 1);
-        assert_eq!(partition.consensus.sequencer().current_sequence(), op + 1);
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            operation_before_poll + 1
+        );
     }
 
     #[test]
     fn given_pending_poll_when_materialization_is_missing_should_reject_without_progress() {
+        let group_id = 7;
+        let member_id = 1;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
         for auto_commit in [false, true] {
             let (mut partition, _) = recording_partition();
-            let result = poll_read_result(
-                &partition,
-                PollingConsumer::ConsumerGroup(7, 1),
-                auto_commit,
-                Some(9),
-            );
+            let read_result = poll_read_result(&partition, consumer, auto_commit, Some(9));
+
+            // The partition can lose its materialized data after planning even
+            // when its history identity has not changed.
             partition.materialization_missing = true;
             assert!(matches!(
-                partition.complete_poll(result),
+                partition.complete_poll(read_result),
                 Err(IggyError::TransientNotAccepted)
             ));
-            assert_eq!(partition.group_offset_state(7), (None, None));
+            let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+            assert_eq!(
+                last_polled, None,
+                "a rejected read must not record group progress"
+            );
+            assert_eq!(committed, None, "a rejected read must not commit an offset");
             assert_eq!(partition.consensus.pipeline_len(), 0);
             assert_eq!(partition.consensus.request_queue_len(), 0);
         }
@@ -12142,31 +12201,56 @@ mod tests {
     #[test]
     fn given_empty_read_when_partition_is_replaced_should_reject_old_result() {
         let (partition, _) = recording_partition();
-        let result = poll_read_result(&partition, PollingConsumer::Consumer(7, 0), true, None);
+        let consumer_id = 7;
+        let partition_id = 0;
+        let auto_commit = true;
+        let consumer = PollingConsumer::Consumer(consumer_id, partition_id);
+        let old_empty_result = poll_read_result(&partition, consumer, auto_commit, None);
+
+        // The same namespace does not give a replacement ownership of
+        // the old instance's results, even when they contain no messages.
         let (mut replacement, _) = recording_partition();
         assert!(matches!(
-            replacement.complete_poll(result),
+            replacement.complete_poll(old_empty_result),
             Err(IggyError::TransientNotAccepted)
         ));
     }
 
     #[test]
     fn given_group_reads_completing_in_reverse_order_should_keep_progress_monotone() {
-        let (mut partition, _) = recording_partition_at(1, 3);
-        let consumer = PollingConsumer::ConsumerGroup(7, 1);
-        let earlier = poll_read_result(&partition, consumer, true, Some(4));
-        let later = poll_read_result(&partition, consumer, true, Some(9));
+        // A backup accepts local poll progress without assigning replication.
+        let backup_replica = 1;
+        let replica_count = 3;
+        let (mut partition, _) = recording_partition_at(backup_replica, replica_count);
+        let group_id = 7;
+        let member_id = 1;
+        let auto_commit = true;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let earlier_result = poll_read_result(&partition, consumer, auto_commit, Some(4));
+        let later_result = poll_read_result(&partition, consumer, auto_commit, Some(9));
+
+        // Accept the result through 9 before the slower result through 4.
         assert!(
             partition
-                .complete_poll(later)
+                .complete_poll(later_result)
                 .expect("accept later poll")
                 .replication
                 .is_none()
         );
         partition
-            .complete_poll(earlier)
+            .complete_poll(earlier_result)
             .expect("accept earlier poll");
-        assert_eq!(partition.group_offset_state(7), (Some(9), Some(9)));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(
+            last_polled,
+            Some(9),
+            "the slower read must not rewind group progress"
+        );
+        assert_eq!(
+            committed,
+            Some(9),
+            "the slower read must not rewind its offset"
+        );
         assert_eq!(partition.consensus.pipeline_len(), 0);
     }
 
@@ -12174,65 +12258,88 @@ mod tests {
     fn given_pending_auto_commit_when_history_changes_should_release_only_its_queue_entry() {
         let (mut partition, _) = recording_partition();
         partition.set_consumer_offsets_max(1);
-        let reservation = partition
+        let automatic_consumer_id = 7;
+        let explicit_consumer_id = 8;
+        let explicit_client_id = 42;
+
+        // Only the automatic request carries a history identity and holds the
+        // provisional slot. Queue an explicit store beside it to prove that
+        // retiring the history does not discard unrelated client requests.
+        let automatic_reservation = partition
             .consumer_offset_capacity
-            .reserve_provisional(7, &partition.durable_consumer_offsets)
+            .reserve_provisional(automatic_consumer_id, &partition.durable_consumer_offsets)
             .unwrap();
-        let automatic = partition
-            .build_poll_auto_commit_request(ConsumerKind::Consumer, 7, 0)
+        let automatic_request = partition
+            .build_poll_auto_commit_request(ConsumerKind::Consumer, automatic_consumer_id, 0)
             .unwrap();
         partition
             .consensus
             .push_queued_request(consensus::RequestEntry::with_auto_commit(
-                automatic,
+                automatic_request,
                 AutoCommitRequestContext {
                     history: partition.poll_history.clone(),
-                    reservation,
+                    reservation: automatic_reservation,
                 },
             ))
             .unwrap();
-        let explicit = store_offset_request(42, 1, ConsumerKind::Consumer, 8, 0, AckLevel::Quorum);
+        let explicit_request = store_offset_request(
+            explicit_client_id,
+            1,
+            ConsumerKind::Consumer,
+            explicit_consumer_id,
+            0,
+            AckLevel::Quorum,
+        );
         partition
             .consensus
-            .push_queued_request(consensus::RequestEntry::new(explicit))
+            .push_queued_request(consensus::RequestEntry::new(explicit_request))
             .unwrap();
         assert_eq!(
             partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
             1
         );
+
         partition.invalidate_poll_history();
         assert_eq!(
             partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
             0
         );
-        let retained = partition
+        let retained_request = partition
             .consensus
             .pop_queued_request()
             .expect("explicit request survives");
-        assert_eq!(retained.message.header().client, 42);
+        assert_eq!(retained_request.message.header().client, explicit_client_id);
         assert!(partition.consensus.pop_queued_request().is_none());
     }
 
     #[compio::test]
     async fn given_old_auto_commit_context_when_promoted_should_not_assign_an_operation() {
         let (mut partition, _) = recording_partition();
-        let reservation = partition
+        let consumer_id = 7;
+        let old_reservation = partition
             .consumer_offset_capacity
-            .reserve_provisional(7, &partition.durable_consumer_offsets)
+            .reserve_provisional(consumer_id, &partition.durable_consumer_offsets)
             .unwrap();
-        let context = AutoCommitRequestContext {
+        let old_context = AutoCommitRequestContext {
             history: partition.poll_history.clone(),
-            reservation,
+            reservation: old_reservation,
         };
-        let request = partition
-            .build_poll_auto_commit_request(ConsumerKind::Consumer, 7, 0)
+        let old_request = partition
+            .build_poll_auto_commit_request(ConsumerKind::Consumer, consumer_id, 0)
             .unwrap();
+
+        // Inject the obsolete context after invalidation has swept the queue.
+        // Promotion must independently check its history before assigning an op.
         partition.invalidate_poll_history();
         partition
             .consensus
-            .push_queued_request(consensus::RequestEntry::with_auto_commit(request, context))
+            .push_queued_request(consensus::RequestEntry::with_auto_commit(
+                old_request,
+                old_context,
+            ))
             .unwrap();
         partition.drain_request_queue_into_prepares(1).await;
+
         assert_eq!(partition.consensus.pipeline_len(), 0);
         assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
         assert_eq!(
@@ -12243,6 +12350,8 @@ mod tests {
 
     #[compio::test]
     async fn given_read_when_state_is_installed_should_reject_the_previous_history() {
+        // State installation writes replacement offset tables, so the fixture
+        // needs filesystem paths even though its message log starts in memory.
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition();
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
@@ -12260,10 +12369,20 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let consumer = PollingConsumer::ConsumerGroup(7, 1);
-        let automatic = poll_read_result(&partition, consumer, true, Some(4));
-        let manual = poll_read_result(&partition, consumer, false, Some(4));
-        let state = crate::state_transfer::ConsumerOffsetsWire {
+        let group_id = 7;
+        let member_id = 1;
+        let auto_commit_enabled = true;
+        let auto_commit_disabled = false;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let old_automatic_result =
+            poll_read_result(&partition, consumer, auto_commit_enabled, Some(4));
+        let old_manual_result =
+            poll_read_result(&partition, consumer, auto_commit_disabled, Some(4));
+
+        // Replace the history after both reads have captured its old identity.
+        // Offset 4 is below the new frontier, so its value alone cannot establish
+        // that either result still belongs to the installed history.
+        let installed_state = crate::state_transfer::ConsumerOffsetsWire {
             purge_generation: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
@@ -12272,22 +12391,37 @@ mod tests {
             groups: Vec::new(),
             dedup: Vec::new(),
         };
+        let installed_commit_operation = 12;
+        let committed_purge_generation = 0;
         partition
-            .install_state_transfer(&repair_config(), 12, Vec::new(), &state.encode(), 0)
+            .install_state_transfer(
+                &repair_config(),
+                installed_commit_operation,
+                Vec::new(),
+                &installed_state.encode(),
+                committed_purge_generation,
+            )
             .await
             .unwrap();
-        for result in [automatic, manual] {
+
+        for old_result in [old_automatic_result, old_manual_result] {
             assert!(matches!(
-                partition.complete_poll(result),
+                partition.complete_poll(old_result),
                 Err(IggyError::TransientNotAccepted)
             ));
         }
-        assert_eq!(partition.group_offset_state(7), (None, None));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(
+            last_polled, None,
+            "old reads must not restore group progress"
+        );
+        assert_eq!(committed, None, "old reads must not commit an offset");
         assert_eq!(partition.consensus.pipeline_len(), 0);
     }
 
     #[compio::test]
     async fn given_read_when_failed_install_converges_should_reject_the_previous_history() {
+        // Valid offset table paths let installation reach the segment swap.
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition();
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
@@ -12305,9 +12439,15 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let consumer = PollingConsumer::ConsumerGroup(7, 1);
-        let result = poll_read_result(&partition, consumer, true, Some(4));
-        let staged = crate::state_transfer::StagedSegmentMeta {
+        let group_id = 7;
+        let member_id = 1;
+        let auto_commit = true;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let old_result = poll_read_result(&partition, consumer, auto_commit, Some(4));
+
+        // Describe staged files without creating them. The swap fails after
+        // preflight, forcing recovery to replace the served log with an empty one.
+        let missing_staged_segment = crate::state_transfer::StagedSegmentMeta {
             start_offset: 0,
             end_offset: 0,
             index_size: 0,
@@ -12318,7 +12458,7 @@ mod tests {
             log_staging: directory.path().join("00000000000000000000.log.staging"),
             index_staging: directory.path().join("00000000000000000000.index.staging"),
         };
-        let state = crate::state_transfer::ConsumerOffsetsWire {
+        let offered_state = crate::state_transfer::ConsumerOffsetsWire {
             purge_generation: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
@@ -12327,24 +12467,37 @@ mod tests {
             groups: Vec::new(),
             dedup: Vec::new(),
         };
-        let error = partition
-            .install_state_transfer(&repair_config(), 12, vec![staged], &state.encode(), 0)
+        let offered_commit_operation = 12;
+        let committed_purge_generation = 0;
+        let install_error = partition
+            .install_state_transfer(
+                &repair_config(),
+                offered_commit_operation,
+                vec![missing_staged_segment],
+                &offered_state.encode(),
+                committed_purge_generation,
+            )
             .await
             .unwrap_err();
         assert!(
             matches!(
-                error,
+                install_error,
                 crate::state_transfer::PartitionInstallError::SwapIo { .. }
             ),
-            "unexpected failure: {error:?}"
+            "unexpected failure: {install_error:?}"
         );
+
+        // Failure did not preserve the old history: recovery left an empty log,
+        // and its owner must reject the result captured before installation.
         assert_eq!(partition.log.segments().len(), 1);
         assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
         assert!(matches!(
-            partition.complete_poll(result),
+            partition.complete_poll(old_result),
             Err(IggyError::TransientNotAccepted)
         ));
-        assert_eq!(partition.group_offset_state(7), (None, None));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, None);
+        assert_eq!(committed, None);
     }
 
     #[compio::test]
@@ -12352,56 +12505,105 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition();
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-        let result = poll_read_result(
-            &partition,
-            PollingConsumer::ConsumerGroup(7, 1),
-            false,
-            Some(4),
-        );
+        let group_id = 7;
+        let member_id = 1;
+        let auto_commit = false;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let pending_result = poll_read_result(&partition, consumer, auto_commit, Some(4));
+
+        // Empty offset bytes fail decoding before installation mutates served
+        // state. The result's original history identity must remain acceptable.
+        let offered_commit_operation = 12;
+        let committed_purge_generation = 0;
         assert!(
             partition
-                .install_state_transfer(&repair_config(), 12, Vec::new(), &[], 0)
+                .install_state_transfer(
+                    &repair_config(),
+                    offered_commit_operation,
+                    Vec::new(),
+                    &[],
+                    committed_purge_generation,
+                )
                 .await
                 .is_err()
         );
         partition
-            .complete_poll(result)
+            .complete_poll(pending_result)
             .expect("unmodified history remains valid");
-        assert_eq!(partition.group_offset_state(7), (Some(4), None));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(
+            last_polled,
+            Some(4),
+            "the read still belongs to the served history"
+        );
+        assert_eq!(committed, None, "automatic commits are disabled");
     }
 
     #[compio::test]
     async fn given_full_prepare_queue_when_poll_completes_should_queue_its_context_and_advance() {
+        let primary_replica = 0;
+        let replica_count = 3;
+        let prepare_capacity = 1;
+        let request_capacity = 1;
+        let pipeline = LocalPipeline::with_capacities(prepare_capacity, request_capacity);
         let (mut partition, _) =
-            recording_partition_with_pipeline(0, 3, LocalPipeline::with_capacities(1, 1));
+            recording_partition_with_pipeline(primary_replica, replica_count, pipeline);
+        let client_id = 42;
+        let explicit_consumer_id = 7;
+
+        // One visible message makes offset 0 valid. Its explicit store occupies
+        // the only prepare slot while the request queue remains available.
         partition.stats.increment_messages_count(1);
         partition
             .on_request(
-                store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::Quorum),
+                store_offset_request(
+                    client_id,
+                    1,
+                    ConsumerKind::Consumer,
+                    explicit_consumer_id,
+                    0,
+                    AckLevel::Quorum,
+                ),
                 None,
             )
             .await;
-        let consumer = PollingConsumer::ConsumerGroup(8, 1);
-        let result = poll_read_result(&partition, consumer, true, Some(0));
+        let group_id = 8;
+        let member_id = 1;
+        let auto_commit = true;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let read_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
+
+        // Acceptance can advance local progress after queueing the automatic
+        // commit, even though no operation or replication work is assigned yet.
         let completion = partition
-            .complete_poll(result)
+            .complete_poll(read_result)
             .expect("request queue has room");
         assert!(completion.replication.is_none());
-        assert_eq!(partition.group_offset_state(8), (Some(0), Some(0)));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, Some(0));
+        assert_eq!(committed, Some(0));
         assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
-        let request = partition
+
+        // The queued request owns both the history identity and the capacity
+        // reservation. Taking it out of the queue must keep that slot occupied.
+        let queued_request = partition
             .consensus
             .pop_queued_request()
             .expect("automatic commit queued");
-        let context = request.auto_commit().expect("request carries its context");
-        assert_eq!(context.history, partition.poll_history);
-        assert_eq!(context.reservation.kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(context.reservation.consumer_id(), 8);
+        let queued_context = queued_request
+            .auto_commit()
+            .expect("request carries its context");
+        assert_eq!(queued_context.history, partition.poll_history);
+        assert_eq!(
+            queued_context.reservation.kind(),
+            ConsumerKind::ConsumerGroup
+        );
+        assert_eq!(queued_context.reservation.consumer_id() as usize, group_id);
         assert_eq!(
             partition.occupied_consumer_offset_count(ConsumerKind::ConsumerGroup),
             1
         );
-        drop(request);
+        drop(queued_request);
         assert_eq!(
             partition.occupied_consumer_offset_count(ConsumerKind::ConsumerGroup),
             0
@@ -12410,37 +12612,59 @@ mod tests {
 
     #[compio::test]
     async fn given_full_prepare_and_request_queues_when_poll_completes_should_preserve_progress() {
+        let primary_replica = 0;
+        let replica_count = 3;
+        let prepare_capacity = 1;
+        let request_capacity = 1;
+        let pipeline = LocalPipeline::with_capacities(prepare_capacity, request_capacity);
         let (mut partition, _) =
-            recording_partition_with_pipeline(0, 3, LocalPipeline::with_capacities(1, 1));
+            recording_partition_with_pipeline(primary_replica, replica_count, pipeline);
+        let client_id = 42;
+        let prepared_consumer_id = 7;
+        let queued_consumer_id = 9;
+
+        // Fill both admission paths: the first explicit store owns the prepare
+        // slot, and the second waits in the only request slot.
         partition.stats.increment_messages_count(1);
         partition
             .on_request(
-                store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::Quorum),
+                store_offset_request(
+                    client_id,
+                    1,
+                    ConsumerKind::Consumer,
+                    prepared_consumer_id,
+                    0,
+                    AckLevel::Quorum,
+                ),
                 None,
             )
             .await;
         partition
             .consensus
             .push_queued_request(consensus::RequestEntry::new(store_offset_request(
-                42,
+                client_id,
                 2,
                 ConsumerKind::Consumer,
-                9,
+                queued_consumer_id,
                 0,
                 AckLevel::Quorum,
             )))
             .unwrap();
-        let result = poll_read_result(
-            &partition,
-            PollingConsumer::ConsumerGroup(8, 1),
-            true,
-            Some(0),
-        );
+        let group_id = 8;
+        let member_id = 1;
+        let auto_commit = true;
+        let consumer = PollingConsumer::ConsumerGroup(group_id, member_id);
+        let read_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
+
+        // The group cannot queue its automatic commit. Rejection must leave its
+        // progress empty, release its reservation, and retain the existing work.
         assert!(matches!(
-            partition.complete_poll(result),
+            partition.complete_poll(read_result),
             Err(IggyError::TransientNotAccepted)
         ));
-        assert_eq!(partition.group_offset_state(8), (None, None));
+        let (last_polled, committed) = partition.group_offset_state(group_id as u64);
+        assert_eq!(last_polled, None);
+        assert_eq!(committed, None);
         assert_eq!(
             partition.occupied_consumer_offset_count(ConsumerKind::ConsumerGroup),
             0
@@ -15820,7 +16044,14 @@ mod purge_poll_tests {
 
     #[compio::test]
     async fn given_pending_disk_poll_when_purged_should_preserve_fresh_consumer_progress() {
-        Box::pin(assert_delayed_poll_preserves_fresh_progress(true, 2)).await;
+        let auto_commit = true;
+        let fresh_message_count = 2;
+        // The old offset 2 lies beyond the replacement history's offsets 0-1.
+        Box::pin(assert_delayed_poll_preserves_fresh_progress(
+            auto_commit,
+            fresh_message_count,
+        ))
+        .await;
     }
 
     #[compio::test]
@@ -15829,14 +16060,24 @@ mod purge_poll_tests {
         // The delayed poll targets old offsets 0-2. After purge, five fresh
         // messages occupy offsets 0-4. Recording progress 2 from the old poll
         // would make `Next` skip fresh offsets 0-2 even though 2 is in range.
-        Box::pin(assert_delayed_poll_preserves_fresh_progress(true, 5)).await;
+        let auto_commit = true;
+        let fresh_message_count = 5;
+        Box::pin(assert_delayed_poll_preserves_fresh_progress(
+            auto_commit,
+            fresh_message_count,
+        ))
+        .await;
     }
 
     #[compio::test]
     async fn given_disk_poll_without_auto_commit_when_purged_should_preserve_fresh_progress() {
+        // An individual consumer does not record progress without automatic
+        // commits. Here the regression assertion is rejection of the old result;
+        // the group case below also detects an unwanted last_polled update.
+        let auto_commit = false;
         for fresh_message_count in [2, 5] {
             Box::pin(assert_delayed_poll_preserves_fresh_progress(
-                false,
+                auto_commit,
                 fresh_message_count,
             ))
             .await;
@@ -15957,15 +16198,23 @@ mod purge_poll_tests {
         assert_eq!(committed, None, "automatic commits are disabled");
     }
 
+    // Keep the pause, purge, and late acceptance in one visible sequence.
+    #[allow(clippy::too_many_lines)]
     async fn assert_delayed_poll_preserves_fresh_progress(
         auto_commit: bool,
         fresh_message_count: u32,
     ) {
+        let consumer_id = 7;
+        let partition_id = 0;
+        let validate_checksum = true;
+        let consumer = PollingConsumer::Consumer(consumer_id, partition_id);
+
+        // 1. Write three messages and evict their journal data so polls must
+        // read the segment file. The save threshold is one message.
         let config = repair_config();
         let (_directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
-        let consumer = PollingConsumer::Consumer(7, 0);
-        for op in 1..=3 {
-            journal_send_batch(&mut partition, op).await;
+        for operation_number in 1..=3 {
+            journal_send_batch(&mut partition, operation_number).await;
         }
         partition.consensus().advance_commit_max(3);
         partition.commit_journal(&config).await;
@@ -15982,99 +16231,135 @@ mod purge_poll_tests {
                 .is_none()
         );
 
+        // 2. Cache the old file descriptor, then start a read against that file.
+        // The active segment needs no index I/O, so the first suspension holds
+        // a file clone in the message read even if purge later unlinks the file.
         accept_initial_disk_polls(&mut partition, consumer).await;
-        let read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
-        assert!(read_state.fd.borrow().is_some());
+        let old_segment_read_state = Rc::clone(&partition.log.sealed_read_state()[0]);
+        assert!(old_segment_read_state.fd.borrow().is_some());
 
-        let delayed = partition.build_poll_plan(
+        let old_poll_plan = partition.build_poll_plan(
             consumer,
             &PollingArgs::new(PollingStrategy::offset(0), 3, auto_commit),
-            true,
+            validate_checksum,
         );
-        assert!(delayed.needs_off_pump_io());
-        let mut delayed = std::pin::pin!(delayed.execute());
-        // The active segment needs no index I/O and its read descriptor is
-        // cached, so the first suspension holds a file clone in the real read.
+        assert!(old_poll_plan.needs_off_pump_io());
+        let mut old_disk_read = std::pin::pin!(old_poll_plan.execute());
         assert!(
-            futures::poll!(delayed.as_mut()).is_pending(),
+            futures::poll!(old_disk_read.as_mut()).is_pending(),
             "the disk poll must suspend before purge",
         );
 
         if auto_commit {
+            // Model another poll's queued commit from the old history. Purge
+            // must remove that request and release its reserved capacity too.
             queue_old_auto_commit(&partition);
         }
 
+        // 3. Purge clears progress, queued commits, and the cached descriptor.
         // Leave the read future unpolled until purge and the fresh append finish.
-        // Completion handling stays suspended even if the disk read finishes.
-        partition.purge(&config, 1).await.expect("purge partition");
-        assert_eq!(partition.applied_purge_generation(), 1);
+        // The underlying I/O may finish, but its result has not been accepted.
+        let purge_generation = 1;
+        partition
+            .purge(&config, purge_generation)
+            .await
+            .expect("purge partition");
+        assert_eq!(partition.applied_purge_generation(), purge_generation);
         assert_eq!(partition.consensus.request_queue_len(), 0);
         assert_eq!(
             partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
             0
         );
         assert_eq!(partition.get_consumer_offset(consumer), None);
-        assert!(read_state.fd.borrow().is_none());
+        assert!(old_segment_read_state.fd.borrow().is_none());
         assert_eq!(partition.log.active_segment().size.as_bytes_u64(), 0);
 
-        // Consensus operation numbers continue through purge, while message
-        // offsets restart at zero in the new segment.
-        let last_fresh_op = 3 + u64::from(fresh_message_count);
-        for op in 4..=last_fresh_op {
-            journal_send_batch(&mut partition, op).await;
+        // 4. Replace the deleted messages. Consensus operation numbers continue
+        // through purge, while message offsets restart at zero in the new file.
+        let last_fresh_operation = 3 + u64::from(fresh_message_count);
+        for operation_number in 4..=last_fresh_operation {
+            journal_send_batch(&mut partition, operation_number).await;
         }
-        partition.consensus().advance_commit_max(last_fresh_op);
+        partition
+            .consensus()
+            .advance_commit_max(last_fresh_operation);
         partition.commit_journal(&config).await;
-        assert_eq!(partition.consensus().commit_min(), last_fresh_op);
+        assert_eq!(partition.consensus().commit_min(), last_fresh_operation);
         assert_eq!(
             partition.offsets().commit_offset,
             u64::from(fresh_message_count) - 1
         );
 
-        let old_result = delayed.await;
+        // 5. Reject the result from the deleted history before it can advance
+        // this consumer's cursor over replacement messages.
+        let old_result = old_disk_read.await;
         let old_offsets = polled_offsets(&old_result.fragments);
         assert!(matches!(
             partition.complete_poll(old_result),
             Err(IggyError::TransientNotAccepted)
         ));
-        assert_eq!(partition.get_consumer_offset(consumer), None);
-        let fresh = partition.build_poll_plan(
-            consumer,
-            &PollingArgs::new(PollingStrategy::offset(0), fresh_message_count, false),
-            true,
+        assert_eq!(
+            partition.get_consumer_offset(consumer),
+            None,
+            "the rejected old result must not restore the consumer cursor"
         );
-        assert!(fresh.needs_off_pump_io());
-        let fresh_result = fresh.execute().await;
-        let fresh = partition
+
+        // 6. Both an explicit offset and Next must read the full new history.
+        // Disable commits for these checks so the first read does not advance
+        // the cursor and change the starting point of the second read.
+        let fresh_auto_commit = false;
+        let fresh_poll_plan = partition.build_poll_plan(
+            consumer,
+            &PollingArgs::new(
+                PollingStrategy::offset(0),
+                fresh_message_count,
+                fresh_auto_commit,
+            ),
+            validate_checksum,
+        );
+        assert!(fresh_poll_plan.needs_off_pump_io());
+        let fresh_result = fresh_poll_plan.execute().await;
+        let fresh_completion = partition
             .complete_poll(fresh_result)
             .expect("accept fresh read");
-        let next = partition
+        let next_result = partition
             .build_poll_plan(
                 consumer,
-                &PollingArgs::new(PollingStrategy::next(), fresh_message_count, false),
-                true,
+                &PollingArgs::new(
+                    PollingStrategy::next(),
+                    fresh_message_count,
+                    fresh_auto_commit,
+                ),
+                validate_checksum,
             )
             .execute()
             .await;
-        let next = partition
-            .complete_poll(next)
+        let next_completion = partition
+            .complete_poll(next_result)
             .expect("accept fresh Next read");
-        let expected = (0..u64::from(fresh_message_count)).collect::<Vec<_>>();
-        assert_eq!(polled_offsets(&fresh.fragments), expected);
+        let expected_fresh_offsets = (0..u64::from(fresh_message_count)).collect::<Vec<_>>();
         assert_eq!(
-            polled_offsets(&next.fragments),
-            expected,
+            polled_offsets(&fresh_completion.fragments),
+            expected_fresh_offsets
+        );
+        assert_eq!(
+            polled_offsets(&next_completion.fragments),
+            expected_fresh_offsets,
             "old offsets={old_offsets:?}, auto_commit={auto_commit}"
         );
     }
 
+    /// Queue a commit for consumer 7 at offset 2 with the current history and a
+    /// capacity reservation. Purge must discard both the request and its guard.
     fn queue_old_auto_commit(partition: &IggyPartition<IggyMessageBus>) {
+        let consumer_id = 7;
+        let last_polled_offset = 2;
         let reservation = partition
             .consumer_offset_capacity
-            .reserve_provisional(7, &partition.durable_consumer_offsets)
+            .reserve_provisional(consumer_id, &partition.durable_consumer_offsets)
             .unwrap();
         let request = partition
-            .build_poll_auto_commit_request(ConsumerKind::Consumer, 7, 2)
+            .build_poll_auto_commit_request(ConsumerKind::Consumer, consumer_id, last_polled_offset)
             .unwrap();
         partition
             .consensus
@@ -16092,34 +16377,44 @@ mod purge_poll_tests {
         );
     }
 
+    /// Read offsets 0 and then 0-2 without automatic commits, caching the segment
+    /// descriptor. For a group, accepting these reads also records `last_polled`.
     async fn accept_initial_disk_polls(
         partition: &mut IggyPartition<IggyMessageBus>,
         consumer: PollingConsumer,
     ) {
-        let warm = partition.build_poll_plan(
+        let auto_commit = false;
+        let validate_checksum = true;
+        let warm_poll_plan = partition.build_poll_plan(
             consumer,
-            &PollingArgs::new(PollingStrategy::offset(0), 1, false),
-            true,
+            &PollingArgs::new(PollingStrategy::offset(0), 1, auto_commit),
+            validate_checksum,
         );
-        assert!(warm.needs_off_pump_io());
-        let result = warm.execute().await;
-        let warm = partition.complete_poll(result).expect("accept warm read");
-        assert_eq!(polled_offsets(&warm.fragments), [0]);
-        assert!(warm.replication.is_none());
+        assert!(warm_poll_plan.needs_off_pump_io());
+        let warm_result = warm_poll_plan.execute().await;
+        let warm_completion = partition
+            .complete_poll(warm_result)
+            .expect("accept warm read");
+        assert_eq!(polled_offsets(&warm_completion.fragments), [0]);
+        assert!(warm_completion.replication.is_none());
         assert_eq!(partition.get_consumer_offset(consumer), None);
-        let complete = partition
+        let initial_result = partition
             .build_poll_plan(
                 consumer,
-                &PollingArgs::new(PollingStrategy::offset(0), 3, false),
-                true,
+                &PollingArgs::new(PollingStrategy::offset(0), 3, auto_commit),
+                validate_checksum,
             )
             .execute()
             .await;
-        let complete = partition.complete_poll(complete).expect("accept old read");
-        assert_eq!(polled_offsets(&complete.fragments), [0, 1, 2]);
-        assert!(complete.replication.is_none());
+        let initial_completion = partition
+            .complete_poll(initial_result)
+            .expect("accept old read");
+        assert_eq!(polled_offsets(&initial_completion.fragments), [0, 1, 2]);
+        assert!(initial_completion.replication.is_none());
     }
 
+    /// Replace the fixture's initial segment with real files and offset stores.
+    /// Keep the returned directory alive until every read using those files ends.
     async fn disk_poll_partition(
         config: &PartitionsConfig,
     ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {

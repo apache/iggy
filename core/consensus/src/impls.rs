@@ -4294,40 +4294,54 @@ mod request_queue_tests {
 
     #[test]
     fn queued_contexts_keep_each_reservation_until_their_own_removal() {
-        let epoch = Rc::new(Cell::new(0));
-        let keys = Rc::new(Cell::new(0));
+        let consumer_id = 7;
+        let client_id = 1;
+        let reclaim_epoch = Rc::new(Cell::new(0));
+        let active_keys = Rc::new(Cell::new(0));
         let token = Rc::new(AutoCommitReservationToken::new(
             ConsumerKind::Consumer,
-            7,
-            epoch,
-            Rc::clone(&keys),
+            consumer_id,
+            reclaim_epoch,
+            Rc::clone(&active_keys),
         ));
         let history = PollHistoryId::default();
         let mut pipeline = LocalPipeline::new();
-        for request in 1..=2 {
+
+        // Each queued request holds its own guard for the same consumer key.
+        // The queue stores these messages without interpreting their payloads.
+        for request_number in 1..=2 {
             let context = AutoCommitRequestContext {
                 history: history.clone(),
                 reservation: token.acquire(),
             };
             pipeline
                 .push_request(RequestEntry::with_auto_commit(
-                    make_request(1, request),
+                    make_request(client_id, request_number),
                     context,
                 ))
-                .unwrap();
+                .expect("both requests fit in the queue");
         }
-        let mut first = pipeline.pop_request().expect("first queued request");
-        let context = first
+
+        // Removing the first entry transfers its context to the caller, as
+        // promotion would. Releasing it must preserve the second reservation.
+        let mut first_request = pipeline.pop_request().expect("first queued request");
+        let first_context = first_request
             .take_auto_commit()
             .expect("context follows first request");
-        assert_eq!(first.message.header().request, 1);
-        assert_eq!(context.history, history);
-        drop(context);
+        assert_eq!(first_request.message.header().request, 1);
+        assert_eq!(first_context.history, history);
+        drop(first_context);
         assert_eq!(token.active_count(), 1);
-        assert_eq!(keys.get(), 1);
+        assert_eq!(
+            active_keys.get(),
+            1,
+            "the queued request still holds the key"
+        );
+
+        // Clearing the queue drops the remaining context and frees the key.
         pipeline.clear_request_queue();
         assert_eq!(token.active_count(), 0);
-        assert_eq!(keys.get(), 0);
+        assert_eq!(active_keys.get(), 0);
     }
 
     #[test]

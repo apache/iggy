@@ -347,7 +347,7 @@ mod tests {
         let before = streams
             .consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID)
             .unwrap();
-        let rejected = with_partition_reads(
+        let rejected = run_with_partition_message_pump(
             &shard,
             maybe_rewrite_consumer_group_request(&shard, join_request(FIRST_CLIENT)),
         )
@@ -367,7 +367,7 @@ mod tests {
         );
 
         recover_partition(&shard, &directory.path().join("donor")).await;
-        let accepted = with_partition_reads(
+        let accepted = run_with_partition_message_pump(
             &shard,
             maybe_rewrite_consumer_group_request(&shard, join_request(FIRST_CLIENT)),
         )
@@ -396,7 +396,7 @@ mod tests {
             vec![STALE_PARTITION, RECOVERING_PARTITION]
         );
 
-        let next_join = with_partition_reads(
+        let next_join = run_with_partition_message_pump(
             &shard,
             maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
         )
@@ -459,7 +459,7 @@ mod tests {
                 .consumer_group_member_assignment(&STREAM_ID, &TOPIC_ID, &GROUP_ID, FIRST_CLIENT)
                 .unwrap();
 
-            let rewritten = with_partition_reads(
+            let rewritten = run_with_partition_message_pump(
                 &shard,
                 maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
             )
@@ -542,35 +542,49 @@ mod tests {
 
     #[compio::test]
     async fn given_unroutable_partition_when_joining_should_preserve_ownership() {
+        let monotonic_group_id = 0;
         let shard = group_shard();
         apply_initial_join(&shard);
         let streams = shard.plane.metadata().mux_stm.streams();
-        let before = streams
+        let group_before_join = streams
             .consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID)
             .unwrap();
-        let unroutable = namespace(&shard, RECOVERING_PARTITION);
-        shard.shards_table().remove(&unroutable);
 
+        // The first member owns both partitions. Remove one route so gathering
+        // its progress is explicitly refused before any owner receives that read.
+        let unroutable_namespace = namespace(&shard, RECOVERING_PARTITION);
+        shard.shards_table().remove(&unroutable_namespace);
         assert!(matches!(
             shard
-                .partition_read(unroutable, PartitionRead::GroupOffsetState { group_id: 0 })
+                .partition_read(
+                    unroutable_namespace,
+                    PartitionRead::GroupOffsetState {
+                        group_id: monotonic_group_id
+                    },
+                )
                 .await,
             Some(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted
             ))
         ));
-        let rewritten = with_partition_reads(
+
+        // A refusal aborts the second member's join before it can be replicated.
+        let join_result = run_with_partition_message_pump(
             &shard,
             maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT)),
         );
         assert!(matches!(
-            rewritten.await,
+            join_result.await,
             Err(IggyError::TransientNotAccepted)
         ));
         assert_eq!(
             streams.consumer_group_details(&STREAM_ID, &TOPIC_ID, &GROUP_ID),
-            Some(before)
+            Some(group_before_join),
+            "a refused progress read must leave membership and assignments unchanged"
         );
+
+        // Committing previously polled work remains allowed for the existing owner.
+        let require_pollable = false;
         assert_eq!(
             streams.consumer_group_fence(
                 &STREAM_ID,
@@ -578,19 +592,25 @@ mod tests {
                 &GROUP_ID,
                 FIRST_CLIENT,
                 RECOVERING_PARTITION,
-                false
+                require_pollable
             ),
-            Some(0),
+            Some(monotonic_group_id),
             "the existing owner must retain permission to commit"
         );
-        assert!(!streams.has_pending_revocations());
+        assert!(
+            !streams.has_pending_revocations(),
+            "the rejected join must not start a handoff"
+        );
     }
 
     #[compio::test]
-    async fn given_unanswered_or_missing_partitions_when_joining_should_allow_eager_handoff() {
+    async fn given_dropped_or_not_found_group_replies_when_joining_should_allow_eager_handoff() {
         let mut shard = group_shard();
         apply_initial_join(&shard);
-        let not_found = with_partition_reads(
+
+        // Routes exist but no partitions have been installed. The real owner
+        // pump answers NotFound, establishing the missing partition case.
+        let missing_partition_reply = run_with_partition_message_pump(
             &shard,
             shard.partition_read(
                 namespace(&shard, RECOVERING_PARTITION),
@@ -598,18 +618,23 @@ mod tests {
             ),
         )
         .await;
-        assert!(matches!(not_found, Some(PartitionReadReply::NotFound)));
+        assert!(matches!(
+            missing_partition_reply,
+            Some(PartitionReadReply::NotFound)
+        ));
 
+        // Receive both join reads through a controlled owner inbox. Lose one
+        // reply after submission and answer NotFound for the other partition.
         let (sender, owner_inbox, _owner_replies) =
             shard_channel(0, INBOX_CAPACITY, INBOX_CAPACITY);
         Rc::get_mut(&mut shard)
             .unwrap()
             .attach_senders(vec![sender]);
-        let unanswered = namespace(&shard, STALE_PARTITION);
-        let missing = namespace(&shard, RECOVERING_PARTITION);
-        let owner = compio::runtime::spawn(async move {
-            let mut dropped_reply = false;
-            let mut replied_not_found = false;
+        let unanswered_namespace = namespace(&shard, STALE_PARTITION);
+        let missing_namespace = namespace(&shard, RECOVERING_PARTITION);
+        let owner_task = compio::runtime::spawn(async move {
+            let mut reply_was_dropped = false;
+            let mut not_found_was_sent = false;
             for _ in 0..PARTITION_COUNT {
                 let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
                     namespace,
@@ -619,41 +644,51 @@ mod tests {
                 else {
                     panic!("the group read must have reached the owner");
                 };
-                if namespace == unanswered {
+                if namespace == unanswered_namespace {
                     drop(reply);
-                    dropped_reply = true;
+                    reply_was_dropped = true;
                 } else {
-                    assert_eq!(namespace, missing);
+                    assert_eq!(namespace, missing_namespace);
                     reply.try_send(PartitionReadReply::NotFound).unwrap();
-                    replied_not_found = true;
+                    not_found_was_sent = true;
                 }
             }
-            assert!(dropped_reply);
-            assert!(replied_not_found);
+            assert!(reply_was_dropped, "one submitted read must lose its reply");
+            assert!(
+                not_found_was_sent,
+                "the other read must report a missing partition"
+            );
         });
 
-        let rewritten = maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT))
-            .await
-            .unwrap();
-        owner.await.expect("the owner task must finish");
+        // Neither outcome establishes outstanding work to drain. The join
+        // therefore permits immediate reassignment under the existing policy.
+        let join_for_replication =
+            maybe_rewrite_consumer_group_request(&shard, join_request(SECOND_CLIENT))
+                .await
+                .unwrap();
+        owner_task.await.expect("the owner task must finish");
+        let replicated_join =
+            ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&join_for_replication))
+                .unwrap();
         assert!(
-            ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&rewritten))
-                .unwrap()
-                .in_flight
-                .is_empty()
+            replicated_join.in_flight.is_empty(),
+            "neither partition should wait for its previous owner to drain"
         );
-        apply_join(&shard, &rewritten);
+        apply_join(&shard, &join_for_replication);
         let streams = shard.plane.metadata().mux_stm.streams();
         assert!(!streams.has_pending_revocations());
+        let (_generation, assigned_partitions) = streams
+            .consumer_group_member_assignment(&STREAM_ID, &TOPIC_ID, &GROUP_ID, SECOND_CLIENT)
+            .unwrap();
         assert_eq!(
-            streams
-                .consumer_group_member_assignment(&STREAM_ID, &TOPIC_ID, &GROUP_ID, SECOND_CLIENT)
-                .unwrap()
-                .1,
-            vec![RECOVERING_PARTITION]
+            assigned_partitions,
+            vec![RECOVERING_PARTITION],
+            "the new member can poll its partition immediately after the join is applied"
         );
     }
 
+    /// Create a group and routes for two partitions, with no members or local
+    /// partitions. Tests install partition state and apply joins explicitly.
     fn group_shard() -> Rc<TestShard> {
         let shard = partition_read_shard();
         let mux = &shard.plane.metadata().mux_stm;
@@ -712,6 +747,8 @@ mod tests {
         shard
     }
 
+    /// Build a shard with its own inbox so tests can serve group progress reads
+    /// and clears through the production message pump.
     fn partition_read_shard() -> Rc<TestShard> {
         let bus = SpyBus::default();
         let consensus = VsrConsensus::new(
@@ -860,7 +897,9 @@ mod tests {
             .unwrap();
     }
 
-    async fn with_partition_reads<T>(
+    /// Poll the shard's message pump alongside the operation until it finishes.
+    /// This serves progress reads and also executes any requested stale clears.
+    async fn run_with_partition_message_pump<T>(
         shard: &Rc<TestShard>,
         operation: impl Future<Output = T>,
     ) -> T {

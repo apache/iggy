@@ -328,25 +328,34 @@ mod tests {
 
     #[test]
     fn given_full_owner_inbox_when_poll_completes_should_reject_without_displacing_work() {
-        let (sender, receiver, _reply_inbox) = shard_channel(0, 1, 1);
+        let inbox_capacity = 1;
+        let (owner_sender, owner_inbox, _owner_reply_lane) = shard_channel(0, inbox_capacity, 1);
+
+        // Occupy the sole slot so the read result cannot reach owner acceptance.
         assert!(
-            sender
+            owner_sender
                 .try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply))
                 .is_ok()
         );
-        let (reply, replies) = channel(1);
+        let (reply_sender, caller_replies) = channel(1);
         let metrics = ShardMetrics::for_shard();
-        PollCompletionSender::new(Some(sender), namespace(), reply, metrics.clone())
-            .complete(empty_poll());
+        PollCompletionSender::new(
+            Some(owner_sender),
+            namespace(),
+            reply_sender,
+            metrics.clone(),
+        )
+        .complete(read_empty_partition());
 
+        // Refuse this poll while leaving the owner's existing work in place.
         assert!(matches!(
-            replies.try_recv(),
+            caller_replies.try_recv(),
             Ok(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted
             ))
         ));
         assert!(matches!(
-            receiver.try_recv(),
+            owner_inbox.try_recv(),
             Ok(ShardFrame::Lifecycle(LifecycleFrame::ReconcileApply))
         ));
         assert_eq!(metrics.frame_drops_value(), 1);
@@ -354,15 +363,20 @@ mod tests {
 
     #[test]
     fn given_closed_owner_inbox_when_poll_completes_should_reject() {
-        let (sender, receiver, _reply_inbox) = shard_channel(0, 1, 1);
-        drop(receiver);
-        let (reply, replies) = channel(1);
+        let (owner_sender, owner_inbox, _owner_reply_lane) = shard_channel(0, 1, 1);
+        drop(owner_inbox);
+        let (reply_sender, caller_replies) = channel(1);
         let metrics = ShardMetrics::for_shard();
-        PollCompletionSender::new(Some(sender), namespace(), reply, metrics.clone())
-            .complete(empty_poll());
+        PollCompletionSender::new(
+            Some(owner_sender),
+            namespace(),
+            reply_sender,
+            metrics.clone(),
+        )
+        .complete(read_empty_partition());
 
         assert!(matches!(
-            replies.try_recv(),
+            caller_replies.try_recv(),
             Ok(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted
             ))
@@ -372,14 +386,21 @@ mod tests {
 
     #[test]
     fn given_available_owner_inbox_when_poll_completes_should_leave_reply_to_owner() {
-        let (sender, receiver, _reply_inbox) = shard_channel(0, 1, 1);
-        let (reply, replies) = channel(1);
-        PollCompletionSender::new(Some(sender), namespace(), reply, ShardMetrics::for_shard())
-            .complete(empty_poll());
+        let (owner_sender, owner_inbox, _owner_reply_lane) = shard_channel(0, 1, 1);
+        let (reply_sender, caller_replies) = channel(1);
+        PollCompletionSender::new(
+            Some(owner_sender),
+            namespace(),
+            reply_sender,
+            ShardMetrics::for_shard(),
+        )
+        .complete(read_empty_partition());
 
-        assert!(replies.try_recv().is_err());
+        // Enqueueing the read result does not authorize a reply. The owner must
+        // still validate it and decide whether to accept the consumer progress.
+        assert!(caller_replies.try_recv().is_err());
         assert!(matches!(
-            receiver.try_recv(),
+            owner_inbox.try_recv(),
             Ok(ShardFrame::Lifecycle(LifecycleFrame::PollCompleted(_)))
         ));
     }
@@ -388,7 +409,9 @@ mod tests {
         IggyNamespace::new(1, 1, 0)
     }
 
-    fn empty_poll() -> PollReadResult {
+    /// Read an empty partition without invoking owner acceptance. These tests
+    /// exercise completion delivery, so no messages or disk I/O are needed.
+    fn read_empty_partition() -> PollReadResult {
         let partitions = IggyPartitions::<IggyMessageBus>::new(
             ShardId::new(0),
             PartitionsConfig {
@@ -413,11 +436,17 @@ mod tests {
             namespace(),
             IggyPartition::new(Arc::new(PartitionStats::default()), consensus),
         );
+        let consumer_id = 7;
+        let partition_id = 0;
         partitions
             .build_poll_snapshot(
                 &namespace(),
-                PollingConsumer::Consumer(7, 0),
-                &PollingArgs::new(PollingStrategy::next(), 0, true),
+                PollingConsumer::Consumer(consumer_id, partition_id),
+                &PollingArgs {
+                    strategy: PollingStrategy::next(),
+                    count: 0,
+                    auto_commit: true,
+                },
             )
             .expect("partition has a read snapshot")
             .execute_resident()

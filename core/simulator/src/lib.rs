@@ -1706,85 +1706,113 @@ mod tests {
         panic!("request {request_id} did not receive a reply");
     }
 
+    /// An accepted resident poll can reply before sending its automatic commit
+    /// to replicas. Holding that send must not hold the caller's reply as well.
     #[test]
     fn given_admitted_resident_poll_when_replica_send_stalls_should_reply_before_replication() {
+        // 1. Publish one message and let the cluster finish the initial work.
+        // The pause installed later must affect the poll's automatic commit.
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
         });
         let client_id = 1u128;
+        let replica_count = 3u8;
+        let primary_replica = 0u8;
         let namespace = IggyNamespace::new(1, 1, 0);
-        let mut sim = Simulator::new(
-            3,
+        let mut simulator = Simulator::new(
+            usize::from(replica_count),
             std::iter::once(client_id),
             packet::PacketSimulatorOptions {
-                node_count: 3,
+                node_count: replica_count,
                 client_count: 1,
                 seed: 0xC011_EC71,
                 ..packet::PacketSimulatorOptions::default()
             },
         );
-        sim.init_partition(namespace);
+        simulator.init_partition(namespace);
         let client = SimClient::new(client_id);
-        sim.register_client_with_primary(&client);
-        let produced = submit_and_wait_for_reply(
-            &mut sim,
+        simulator.register_client_with_primary(&client);
+        let append_reply = submit_and_wait_for_reply(
+            &mut simulator,
             client_id,
-            0,
+            primary_replica,
             client.send_messages(
                 namespace,
                 &[Bytes::from_static(b"reply-before-replication")],
             ),
         );
-        assert_eq!(produced.header().status, 0);
-        sim.run_pumps();
+        assert_eq!(append_reply.header().status, 0);
+        simulator.run_pumps();
 
-        let owner = Rc::clone(sim.replicas[0].partition_shard(namespace));
-        let consumer = PollingConsumer::Consumer(7, 0);
-        let args = PollingArgs::new(iggy_common::PollingStrategy::next(), 1, true);
-        let plan = owner
+        // 2. Confirm that the poll uses resident data. This scenario checks
+        // reply timing after inline acceptance, without a detached disk read.
+        let owner =
+            Rc::clone(simulator.replicas[usize::from(primary_replica)].partition_shard(namespace));
+        let consumer_id = 7;
+        let partition_id = 0;
+        let consumer = PollingConsumer::Consumer(consumer_id, partition_id);
+        let auto_commit = true;
+        let poll_args = PollingArgs::new(iggy_common::PollingStrategy::next(), 1, auto_commit);
+        let resident_plan = owner
             .plane
             .partitions()
-            .build_poll_snapshot(&namespace, consumer, &args)
+            .build_poll_snapshot(&namespace, consumer, &poll_args)
             .expect("poll snapshot");
         assert!(
-            !plan.needs_off_pump_io(),
+            !resident_plan.needs_off_pump_io(),
             "fixture must exercise inline resident completion"
         );
-        drop(plan);
-        let resume_replication = owner.bus.delay_next_replica_send();
-        let (reply, replies) = shard::channel(1);
-        let polling_owner = Rc::clone(&owner);
-        sim.executor.spawn(async move {
-            let result = polling_owner
-                .partition_read(namespace, shard::PartitionRead::Poll { consumer, args })
-                .await;
-            let _ = reply.try_send(result);
-        });
-        sim.executor.run_until_stalled(POLL_BUDGET);
+        drop(resident_plan);
 
-        let result = replies
+        // 3. Run the poll task with the next replica send paused.
+        // The separate caller task lets the owner send a reply while
+        // its replication continuation is still waiting for release.
+        let resume_replication = owner.bus.delay_next_replica_send();
+        let (poll_result_sender, poll_result_receiver) = shard::channel(1);
+        let polling_owner = Rc::clone(&owner);
+        simulator.executor.spawn(async move {
+            let poll_result = polling_owner
+                .partition_read(
+                    namespace,
+                    shard::PartitionRead::Poll {
+                        consumer,
+                        args: poll_args,
+                    },
+                )
+                .await;
+            let _ = poll_result_sender.try_send(poll_result);
+        });
+        simulator.executor.run_until_stalled(POLL_BUDGET);
+
+        // 4. The nonempty reply must already be available before releasing
+        // replication. Waiting for it asynchronously here would hide a stall.
+        let poll_reply = poll_result_receiver
             .recv()
             .now_or_never()
             .expect("admitted poll replies while replication remains suspended")
             .expect("reply channel is open")
             .expect("owning shard answered");
-        let shard::PartitionReadReply::Poll { fragments, .. } = result else {
-            panic!("expected admitted poll reply, got {result:?}");
+        let shard::PartitionReadReply::Poll { fragments, .. } = poll_reply else {
+            panic!("expected admitted poll reply, got {poll_reply:?}");
         };
         assert!(!fragments.is_empty());
         assert!(
             resume_replication.send(()).is_ok(),
             "replication must still be waiting after the poll reply"
         );
-        sim.run_pumps();
-        let progress = owner
+        simulator.run_pumps();
+        let (consumer_offset, _partition_commit_offset) = owner
             .plane
             .partitions()
             .consumer_offset_read(&namespace, consumer)
             .expect("partition exists");
-        assert_eq!(progress.0, Some(0), "admission records the served cursor");
+        assert_eq!(
+            consumer_offset,
+            Some(0),
+            "admission records the served cursor"
+        );
     }
 
     #[test]

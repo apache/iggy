@@ -1503,11 +1503,15 @@ mod tests {
         let shard = Rc::new(shard);
         let namespace = IggyNamespace::new(1, 1, 0);
 
+        // The owner has a live inbox, but no route identifies it for this partition.
         assert_eq!(
-            poll_error(&shard, namespace).await,
+            poll_and_expect_error(&shard, namespace).await,
             IggyError::TransientNotAccepted
         );
-        assert!(owner_inbox.try_recv().is_err());
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "a poll rejected during routing must never reach the owner"
+        );
     }
 
     #[compio::test]
@@ -1519,8 +1523,9 @@ mod tests {
             .shards_table()
             .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
 
+        // A route exists, but no sender was attached to submit work to its owner.
         assert_eq!(
-            poll_error(&shard, namespace).await,
+            poll_and_expect_error(&shard, namespace).await,
             IggyError::TransientNotAccepted
         );
     }
@@ -1529,7 +1534,9 @@ mod tests {
     async fn given_full_owner_inbox_when_polling_should_report_not_accepted() {
         let bus = SpyBus::default();
         let mut shard = test_shard(&bus, 0, 1, 1);
-        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let inbox_capacity = 1;
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, inbox_capacity, 1);
+        // Occupy the only slot before polling; no task drains this inbox.
         sender
             .try_send(ShardFrame::lifecycle(LifecycleFrame::MetadataCommitTick))
             .unwrap();
@@ -1541,14 +1548,17 @@ mod tests {
             .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
 
         assert_eq!(
-            poll_error(&shard, namespace).await,
+            poll_and_expect_error(&shard, namespace).await,
             IggyError::TransientNotAccepted
         );
         assert!(matches!(
             owner_inbox.try_recv().unwrap(),
             ShardFrame::Lifecycle(LifecycleFrame::MetadataCommitTick)
         ));
-        assert!(owner_inbox.try_recv().is_err());
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "only the filler frame may be queued; the poll was never submitted"
+        );
     }
 
     #[compio::test]
@@ -1557,6 +1567,7 @@ mod tests {
         let mut shard = test_shard(&bus, 0, 1, 1);
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
         shard.attach_senders(vec![sender]);
+        // Closing the destination leaves its sender attached, so submission fails.
         drop(owner_inbox);
         let shard = Rc::new(shard);
         let namespace = IggyNamespace::new(1, 1, 0);
@@ -1565,7 +1576,7 @@ mod tests {
             .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
 
         assert_eq!(
-            poll_error(&shard, namespace).await,
+            poll_and_expect_error(&shard, namespace).await,
             IggyError::TransientNotAccepted
         );
     }
@@ -1581,7 +1592,10 @@ mod tests {
         shard
             .shards_table()
             .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
-        let owner = compio::runtime::spawn(async move {
+
+        // Receive the request before dropping its reply. Submission succeeded,
+        // so the caller cannot infer whether the owner accepted any progress.
+        let owner_task = compio::runtime::spawn(async move {
             let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
                 owner_inbox.recv().await.unwrap()
             else {
@@ -1591,29 +1605,33 @@ mod tests {
         });
 
         assert_eq!(
-            poll_error(&shard, namespace).await,
+            poll_and_expect_error(&shard, namespace).await,
             IggyError::ShardCommunicationError
         );
-        owner.await.expect("the owner task must finish");
+        owner_task.await.expect("the owner task must finish");
     }
 
     #[compio::test]
     async fn given_pending_poll_when_owner_reply_times_out_should_report_unknown_acceptance() {
-        const TRANSPORT: u128 = 91;
-        const VSR_CLIENT: u128 = 1;
+        const TRANSPORT_CLIENT_ID: u128 = 91;
+        const VSR_CLIENT_ID: u128 = 1;
         let bus = SpyBus::default();
+        // Expire the reply timeout deterministically, without a wall clock wait.
         bus.instant_timers.set(true);
         let mut shard = test_shard(&bus, 0, 1, 1);
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
         shard.attach_senders(vec![sender]);
         let shard = Rc::new(shard);
+
+        // Create metadata and a route so authorization and resolution let the
+        // poll reach its owner inbox.
         let metadata = shard.plane.metadata();
         metadata.mux_stm.users().ensure_root_user("iggy", "hash");
         metadata
             .mux_stm
             .update(prepare_message(
                 Operation::CreateStream,
-                VSR_CLIENT,
+                VSR_CLIENT_ID,
                 1,
                 &CreateStreamRequest {
                     name: WireName::new("stream").unwrap(),
@@ -1626,7 +1644,7 @@ mod tests {
             .mux_stm
             .update(prepare_message(
                 Operation::CreateTopicWithAssignments,
-                VSR_CLIENT,
+                VSR_CLIENT_ID,
                 2,
                 &CreateTopicWithAssignmentsRequest {
                     request: CreateTopicRequest {
@@ -1653,7 +1671,7 @@ mod tests {
         shard
             .shards_table()
             .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
-        let body = PollMessagesRequest {
+        let poll_body = PollMessagesRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
@@ -1663,22 +1681,31 @@ mod tests {
             auto_commit: true,
         }
         .to_bytes();
-        let request = request_message(Operation::NonReplicated, VSR_CLIENT, 1, 1, &body);
+        let request = request_message(Operation::NonReplicated, VSR_CLIENT_ID, 1, 1, &poll_body);
 
         // Keep the owner request queued so its live reply sender forces the
-        // timeout path, rather than an immediate channel disconnection.
-        handle_poll_messages(&shard, TRANSPORT, &request, Some(DEFAULT_ROOT_USER_ID)).await;
+        // timeout path. The owner can still receive the request after that timeout.
+        handle_poll_messages(
+            &shard,
+            TRANSPORT_CLIENT_ID,
+            &request,
+            Some(DEFAULT_ROOT_USER_ID),
+        )
+        .await;
 
+        // The client receives one error header, with no successful empty poll body.
         let replies = bus.client_replies.borrow();
         assert_eq!(replies.len(), 1);
         let (client_id, frame) = &replies[0];
-        assert_eq!(*client_id, TRANSPORT);
+        assert_eq!(*client_id, TRANSPORT_CLIENT_ID);
         assert_eq!(frame.len(), std::mem::size_of::<ReplyHeader>());
         let status_start = std::mem::offset_of!(ReplyHeader, status);
         let status = u32::from_le_bytes(frame[status_start..status_start + 4].try_into().unwrap());
         assert_eq!(status, IggyError::ShardCommunicationError.as_code());
         drop(replies);
 
+        // Timing out abandons the reply receiver; a late owner reply cannot
+        // replace the communication error or produce a second client response.
         let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
             owner_inbox.try_recv().unwrap()
         else {
@@ -1689,7 +1716,8 @@ mod tests {
                 .try_send(PartitionReadReply::Rejected(
                     IggyError::TransientNotAccepted
                 ))
-                .is_err()
+                .is_err(),
+            "the timeout must have dropped the caller's reply receiver"
         );
         assert_eq!(bus.client_replies.borrow().len(), 1);
     }
@@ -2089,15 +2117,26 @@ mod tests {
         );
     }
 
-    async fn poll_error(shard: &Rc<TestShard>, namespace: IggyNamespace) -> IggyError {
-        let request = request_message(Operation::NonReplicated, 1, 1, 1, &[]);
-        let resolved = (
+    /// Attempt an already resolved poll and require an error, including when no
+    /// owner reply arrives. Bypassing metadata resolution isolates owner routing
+    /// and reply handling from authentication and request decoding.
+    async fn poll_and_expect_error(shard: &Rc<TestShard>, namespace: IggyNamespace) -> IggyError {
+        let vsr_client_id = 1;
+        let transport_client_id = 91;
+        let consumer_id = 1;
+        let partition_id = 0;
+        let request = request_message(Operation::NonReplicated, vsr_client_id, 1, 1, &[]);
+        let resolved_poll = (
             namespace,
-            0,
-            PollingConsumer::Consumer(1, 0),
-            PollingArgs::new(PollingStrategy::offset(0), 1, true),
+            partition_id,
+            PollingConsumer::Consumer(consumer_id, usize::try_from(partition_id).unwrap()),
+            PollingArgs {
+                strategy: PollingStrategy::offset(0),
+                count: 1,
+                auto_commit: true,
+            },
         );
-        match read_polled_messages(shard, 91, &request, resolved).await {
+        match read_polled_messages(shard, transport_client_id, &request, resolved_poll).await {
             Err(ReadPolledMessagesError::Rejected(error)) => error,
             Err(ReadPolledMessagesError::Fallback(_)) => {
                 panic!("poll must not return an empty reply")
