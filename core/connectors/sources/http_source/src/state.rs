@@ -147,11 +147,14 @@ impl EndpointRegistry {
         let mut tombstones = 0;
         let mut dropped_static = 0;
         for (endpoint_id, mut endpoint) in persisted {
-            // The id is both the map key and a field, and both are written out.
-            // A hand-edited state file could disagree between them, which would
-            // split `owner_of`, keyed off the map, from `lookup_secret_path`,
-            // built from the field. The key wins.
-            endpoint.endpoint_id = endpoint_id.clone();
+            // The id is both the map key and a field, and both are written
+            // out. They cannot disagree here: `decode_state_frame` refuses a
+            // frame where they do, rather than preferring one as this used to.
+            // Preferring the key repaired the disagreement silently, and that
+            // is the wrong direction for the same reason every other guard on
+            // this path fails closed: a disagreement means the file is not the
+            // one this connector wrote, and the half that split was the half
+            // deciding which endpoint a tombstone covers.
             let revoked = !endpoint.is_active();
             // The same rule registration applies, asked here and only warned
             // about. `restore` failing is a hard `open()` failure, so refusing
@@ -482,6 +485,26 @@ fn decode_state_frame(blob: &[u8]) -> Result<BTreeMap<EndpointId, Endpoint>, Str
             frame.endpoints.len()
         ));
     }
+    // Every writer keys an endpoint by its own `endpoint_id`, so the two copies
+    // agreeing is an invariant and not a coincidence worth repairing. Enforcing
+    // it turns the duplication into the one check that catches an edit inside
+    // an id: change the key and the tombstone moves to an endpoint nobody
+    // revoked, leaving the real one served from TOML; change the field and the
+    // record disagrees with where it is filed. A single edit cannot do both, so
+    // it cannot stay consistent.
+    //
+    // `log_prefix`, never the id itself. A secret-path id is the credential.
+    if let Some((key, endpoint)) = frame
+        .endpoints
+        .iter()
+        .find(|(key, endpoint)| key.as_str() != endpoint.endpoint_id.as_str())
+    {
+        return Err(format!(
+            "the endpoint filed under {} carries {} in its own record",
+            key.log_prefix(),
+            endpoint.endpoint_id.log_prefix()
+        ));
+    }
     Ok(frame.endpoints)
 }
 
@@ -692,19 +715,21 @@ mod tests {
     }
 
     /// The property the framing is for, swept rather than sampled: no edit to
-    /// a state blob may leave it decoding as a registry with fewer endpoints
-    /// than it was written with, and no prefix of it may decode at all. That
-    /// is the fail-open, since a tombstone that vanishes puts its endpoint
-    /// back on the wire from TOML with its secret.
+    /// a state blob may leave it decoding as a registry that has lost a
+    /// tombstone, and no prefix of it may decode at all. A tombstone that
+    /// vanishes, or that quietly moves to an id nobody revoked, puts a revoked
+    /// endpoint back on the wire from TOML with its secret.
     ///
-    /// It deliberately does not claim more than that. Editing a byte inside an
-    /// endpoint id produces a frame that is entirely well formed and still
-    /// carries its tombstone, under a different id, so the original id would
-    /// serve again. Nothing here authenticates the file's contents, and this
-    /// framing was never going to: that is an integrity property and wants a
-    /// different mechanism.
+    /// The id check is what makes the second half hold. Without it 480 of
+    /// these mutations produce a frame that is well formed, fully consumed and
+    /// honest about its count, carrying the tombstone under an id one
+    /// character away from the real one.
+    ///
+    /// What this still does not claim is authentication. Someone who can write
+    /// the file can write a consistent one, and they could read every secret
+    /// in it anyway. This catches corruption, not an author.
     #[test]
-    fn given_a_mutated_state_blob_when_decoded_should_never_lose_an_endpoint() {
+    fn given_a_mutated_state_blob_when_decoded_should_never_lose_a_tombstone() {
         let mut registry = EndpointRegistry::default();
         assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
         assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
@@ -720,14 +745,22 @@ mod tests {
                 }
                 let mut mutated = bytes.clone();
                 mutated[index] = value;
-                if let Ok(decoded) = decode_state_frame(&mutated) {
-                    assert_eq!(
-                        decoded.len(),
-                        baseline.len(),
-                        "byte {index} set to {value:#04x} decoded with {} endpoint(s)",
-                        decoded.len()
-                    );
-                }
+                let Ok(decoded) = decode_state_frame(&mutated) else {
+                    continue;
+                };
+                assert_eq!(
+                    decoded.len(),
+                    baseline.len(),
+                    "byte {index} set to {value:#04x} decoded with {} endpoint(s)",
+                    decoded.len()
+                );
+                assert!(
+                    decoded
+                        .get(ENDPOINT_ONE)
+                        .is_some_and(|endpoint| !endpoint.is_active()),
+                    "byte {index} set to {value:#04x} decoded without the tombstone for the \
+                     endpoint that was revoked"
+                );
             }
         }
         for len in 0..bytes.len() {
@@ -737,6 +770,29 @@ mod tests {
                 bytes.len()
             );
         }
+    }
+
+    #[test]
+    fn given_a_frame_whose_key_and_record_disagree_on_the_id_when_decoded_should_refuse() {
+        // One edit cannot change both copies, so a retargeted tombstone always
+        // leaves them disagreeing. Built through the map rather than by editing
+        // bytes so it stays honest if the encoding changes.
+        let mut endpoint = dynamic_endpoint(ENDPOINT_ONE);
+        endpoint.state = EndpointState::Revoked {
+            reason: "compromised".to_string(),
+            revoked_at: 42,
+        };
+        let lying = StateFrame {
+            version: STATE_VERSION,
+            endpoint_count: 1,
+            endpoints: BTreeMap::from([(endpoint_id(ENDPOINT_TWO), endpoint)]),
+        };
+        let bytes = rmp_serde::to_vec(&lying).expect("the shadow must serialize");
+
+        assert!(
+            decode_state_frame(&bytes).is_err(),
+            "a tombstone filed under an id its own record does not claim must not be served"
+        );
     }
 
     #[test]
