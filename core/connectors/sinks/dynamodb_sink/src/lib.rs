@@ -26,7 +26,7 @@ use aws_sdk_dynamodb::types::{
     ScalarAttributeType, WriteRequest,
 };
 use humantime::Duration as HumanDuration;
-use iggy_connector_sdk::retry::{exponential_backoff, jitter};
+use iggy_connector_sdk::retry::retry_backoff;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -585,15 +585,8 @@ impl DynamoDbSink {
         }
     }
 
-    /// Jitter adds up to 20%, so the delay is clamped afterwards to keep
-    /// `max_retry_delay` a real upper bound.
     fn backoff_delay(&self, attempt: u32) -> Duration {
-        jitter(exponential_backoff(
-            self.retry_delay,
-            attempt - 1,
-            self.max_retry_delay,
-        ))
-        .min(self.max_retry_delay)
+        retry_backoff(self.retry_delay, attempt, self.max_retry_delay)
     }
 
     async fn backoff(&self, attempt: u32) {
