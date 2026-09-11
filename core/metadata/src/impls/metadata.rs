@@ -1365,6 +1365,12 @@ where
             return;
         }
 
+        // Paired with the append, not with the sequencer advance below: a backup
+        // repairing under a `StartView` it already adopted is at the announced head
+        // already, so the entry arriving moves neither number the suffix snapshot
+        // is otherwise tagged by.
+        consensus.note_journal_mutation();
+
         // Journal mutation done; wire traffic below must not hold the gate.
         drop(journal_gate);
 
@@ -1853,10 +1859,10 @@ where
                 .await
                 .map_err(SnapshotError::Io)?;
             if removed > 0 {
-                // The DVC snapshot's `(op, commit)` tag does not move when
-                // entries are removed under it; left stale it would advertise
+                // The DVC snapshot's head and commit point do not move when
+                // entries are removed under them; left stale it would advertise
                 // headers this replica can no longer serve.
-                consensus.invalidate_local_dvc_suffix();
+                consensus.note_journal_mutation();
                 tracing::warn!(
                     snapshot_seq,
                     removed,
@@ -3354,7 +3360,12 @@ where
             }
         }
 
-        if let Err(e) = coordinator.drain(journal, snap_op).await {
+        let drained = coordinator.drain(journal, snap_op).await;
+        // On the error path too: a drain that fails part-way still removed
+        // whatever it reached, and a snapshot left offering those bodies strands
+        // the peer that picks this replica as a repair source.
+        consensus.note_journal_mutation();
+        if let Err(e) = drained {
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
