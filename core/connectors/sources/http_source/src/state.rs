@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::io::Cursor;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
 use crate::types::{EndpointId, unix_now_seconds};
@@ -96,8 +96,9 @@ impl EndpointRegistry {
     /// cannot be served: every revocation tombstone lives in the state, so
     /// continuing on the TOML alone would put an endpoint that was revoked for
     /// being compromised straight back on the wire. Failing here surfaces as
-    /// `last_error` on the control API, which is the only way an operator
-    /// learns the tombstones are unreadable.
+    /// a refused `open()`, which `open` logs with the reason. `last_error` on
+    /// the control API says only that initialization failed, so the log is
+    /// where an operator learns the tombstones are unreadable.
     pub fn restore(
         static_endpoints: &[StaticEndpointConfig],
         state: Option<ConnectorState>,
@@ -130,15 +131,12 @@ impl EndpointRegistry {
             return Ok(EndpointRegistry { endpoints });
         };
 
-        // Logged here, not only returned. `InitError` is substituted by the
-        // runtime before it reaches `last_error`, so without this line the
-        // reason a registry was refused never leaves the process.
+        // `open` logs this before returning it. It is not logged here as well,
+        // because `new` holds it until then and a second line would report the
+        // same refusal twice.
         let persisted = decode_state_frame(&blob).map_err(|reason| {
-            error!(
-                "Cannot decode the persisted registry for {CONNECTOR_NAME} connector ID: {connector_id}: {reason}. Refusing to serve {static_count} static endpoint(s) without its revocation tombstones"
-            );
             Error::InitError(format!(
-                "Cannot decode the persisted registry for {CONNECTOR_NAME} connector ID: {connector_id}: {reason}. Refusing to serve {static_count} static endpoints without its revocation tombstones"
+                "cannot decode the persisted registry for {CONNECTOR_NAME} connector ID: {connector_id}: {reason}. Refusing to serve {static_count} static endpoints without its revocation tombstones"
             ))
         })?;
 

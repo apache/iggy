@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{Admission, admit_endpoint};
 use crate::server::{INSTANCE_HEADER, RECEIVED_AT_HEADER, REMOTE_ADDR_HEADER};
@@ -127,9 +127,11 @@ pub struct HttpSource {
     last_poll_was_state_only: AtomicBool,
     /// Why the persisted registry could not be restored, if it could not be.
     ///
-    /// Held rather than acted on in `new` so `open` can fail with it, which is
-    /// what puts it on the control API as `last_error`.
-    restore_error: Option<String>,
+    /// Held rather than acted on in `new` so `open` can fail with it. The
+    /// error itself rather than its text: wrapping the text in a second
+    /// `InitError` printed the prefix twice, which nobody saw while the
+    /// message went nowhere, and `open` logs it now.
+    restore_error: Option<Error>,
 }
 
 /// Takes the message the `select!` arm received and tops the batch up with
@@ -704,9 +706,9 @@ impl HttpSourceConfig {
             // would take the whole instance down on the first restart after
             // that timestamp; the endpoint answers 404 on its own path instead.
             //
-            // Prefix only in the message: this becomes `last_error`, which the
-            // runtime logs and serves over its control API, and the operator
-            // fixes the endpoint while keeping the id.
+            // Prefix only in the message, so the operator fixes the endpoint
+            // while keeping the id. `open` logs this; `last_error` carries
+            // only that initialization failed.
             if let Err(reason) = admit_endpoint(
                 endpoint.auth_type,
                 &endpoint.auth_secret,
@@ -729,7 +731,8 @@ impl HttpSource {
     pub fn new(id: u32, config: HttpSourceConfig, state: Option<ConnectorState>) -> Self {
         // Clamped rather than rejected: `new` cannot fail, and an unchecked
         // value reaches crossfire before `open` runs. `validate` still rejects
-        // it, so the operator learns through `last_error` instead of an abort.
+        // it, so the operator learns from the refusal `open` logs rather than
+        // from an abort.
         let buffer_capacity = config.buffer_capacity.clamp(1, BUFFER_CAPACITY_LIMIT);
         if buffer_capacity != config.buffer_capacity {
             warn!(
@@ -744,7 +747,7 @@ impl HttpSource {
         let (registry, restore_error) =
             match EndpointRegistry::restore(&config.endpoints, state, id) {
                 Ok(registry) => (registry, None),
-                Err(error) => (EndpointRegistry::default(), Some(error.to_string())),
+                Err(error) => (EndpointRegistry::default(), Some(error)),
             };
         let (sender, receiver) = crossfire::mpsc::bounded_async(buffer_capacity);
         let instance_name = config
@@ -787,6 +790,25 @@ impl HttpSource {
             last_poll_was_state_only: AtomicBool::new(false),
             restore_error,
         }
+    }
+
+    /// Everything `open` does, split out so its one caller can log whatever
+    /// failed without a line at each of the three failure points.
+    async fn open_inner(&mut self) -> Result<(), Error> {
+        if let Some(error) = self.restore_error.take() {
+            return Err(error);
+        }
+        self.shared.config.validate()?;
+        server::join(Arc::clone(&self.shared)).await?;
+        self.shared.log_auth_posture();
+        info!(
+            "Opened {CONNECTOR_NAME} connector ID: {}, listen address: {}, endpoints: {}, named path: {:?}",
+            self.shared.id,
+            self.shared.config.listen_addr,
+            self.shared.registry().serving_count(unix_now_seconds()),
+            self.shared.config.topic_path,
+        );
+        Ok(())
     }
 
     /// A poisoned `staged` means a panic while a batch was held. The batch is
@@ -881,20 +903,20 @@ impl HttpSource {
 #[async_trait]
 impl Source for HttpSource {
     async fn open(&mut self) -> Result<(), Error> {
-        if let Some(error) = self.restore_error.take() {
-            return Err(Error::InitError(error));
+        let id = self.shared.id;
+        let opened = self.open_inner().await;
+        // The only place this reason exists. The SDK's `open` shim returns
+        // `0`/`1` and drops the `Err` payload, and the runtime substitutes
+        // "Plugin initialization failed" for `last_error`, so every message
+        // below this call was unreachable text: all of `validate`'s, the
+        // field `join` names on a mismatch, a route conflict, and the refusal
+        // to serve an undecodable registry. The log callback is installed
+        // before the plugin is built, so an `error!` here does reach the
+        // runtime's log even though the return value does not.
+        if let Err(error) = &opened {
+            error!("Failed to open {CONNECTOR_NAME} connector ID: {id}: {error}");
         }
-        self.shared.config.validate()?;
-        server::join(Arc::clone(&self.shared)).await?;
-        self.shared.log_auth_posture();
-        info!(
-            "Opened {CONNECTOR_NAME} connector ID: {}, listen address: {}, endpoints: {}, named path: {:?}",
-            self.shared.id,
-            self.shared.config.listen_addr,
-            self.shared.registry().serving_count(unix_now_seconds()),
-            self.shared.config.topic_path,
-        );
-        Ok(())
+        opened
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
@@ -2235,6 +2257,37 @@ mod tests {
         assert!(
             matches!(opened, Err(Error::InitError(_))),
             "an unreadable registry has lost every tombstone, so open must fail rather than serve the static config, and it must fail before the listener binds"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_refused_registry_when_opened_should_name_the_reason_once() {
+        // What `open` logs is the only account of this failure an operator
+        // gets: the SDK's shim drops the payload and the runtime reports
+        // "Plugin initialization failed" as `last_error`. So the text matters
+        // in a way it did not while nothing read it, and it used to carry
+        // `InitError`'s prefix twice from being wrapped on the way out of
+        // `new`.
+        let mut source = HttpSource::new(
+            1,
+            test_support::config(None, &[ENDPOINT_ONE]),
+            Some(ConnectorState(b"not valid msgpack".to_vec())),
+        );
+
+        let message = source
+            .open()
+            .await
+            .expect_err("an unreadable registry must refuse the open")
+            .to_string();
+
+        assert!(
+            message.contains("cannot decode the persisted registry"),
+            "the reason must survive to the message that gets logged, got: {message}"
+        );
+        assert_eq!(
+            message.matches("Init error").count(),
+            1,
+            "the error is wrapped once, not once per hop, got: {message}"
         );
     }
 

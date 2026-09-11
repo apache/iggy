@@ -261,7 +261,7 @@ Rotation deliberately keeps the path: a webhook sender configures the URL once, 
 | 503 | The owning instance closed while the request was in flight |
 | 507 | The registry is at `MAX_ENDPOINTS` with no reclaimable tombstone |
 
-Revocation writes a tombstone rather than deleting the entry. The tombstone persists, so a restart against a stale TOML file cannot resurrect an endpoint someone revoked. That rests on `open()` failing when the state file cannot be decoded, rather than falling back to the TOML: the connector reports the decode failure as `last_error` and serves nothing, instead of quietly putting revoked endpoints back on the wire.
+Revocation writes a tombstone rather than deleting the entry. The tombstone persists, so a restart against a stale TOML file cannot resurrect an endpoint someone revoked. That rests on `open()` failing when the state file cannot be decoded, rather than falling back to the TOML: the connector logs the decode failure and serves nothing, instead of quietly putting revoked endpoints back on the wire.
 
 The 202 means the endpoint stopped serving *now*, in memory, and that the tombstone has been accepted but not yet persisted. It is deliberately not a 204: the change reaches the runtime only on a later `poll()`, and `submitted` flips before the state leaves the plugin, so no field on this response could honestly claim durability. Watch `GET /admin/endpoints/{id}` for it.
 
@@ -358,6 +358,8 @@ Truncating the state file is the same act as deleting it, not a gentler one. The
 **Put a reverse proxy in front of the public listener.** It sets no header-read timeout, no idle timeout, and no connection cap, so a client that opens a socket and stops writing holds a task and a file descriptor indefinitely. The descriptor limit is shared with the rest of the runtime process, so exhaustion is not contained to this connector.
 
 **Keep the admin listener private.** It defaults to loopback. The management API is token-guarded, but health and metrics are not, and they expose instance names and traffic volumes.
+
+**Read the connector's log for why an `open()` failed, not `last_error`.** Every startup refusal names its cause: the invalid configuration field, the field a joining instance disagrees on, the route it conflicts over, or the state file it cannot decode. None of it survives the plugin boundary, which carries only success or failure, so the runtime records `Plugin initialization failed` on the control API instead. The connector logs the real reason itself just before it gives up.
 
 ## Limitations
 
