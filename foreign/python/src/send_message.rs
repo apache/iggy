@@ -146,9 +146,8 @@ impl SendMessagesConfirmation {
     /// at-least-once, so an earlier retry may already have committed these
     /// messages at a lower offset.
     ///
-    /// A batch is confirmed once it is committed in memory, not once it is
-    /// fsynced. A crash-restart can stamp a later batch with an offset a client
-    /// has already recorded.
+    /// Confirmation follows VSR quorum commit. A topic with persisted message
+    /// durability also waits for recoverable stable-storage copies on the quorum.
     ///
     /// The legacy server confirms nothing, so its confirmation list is empty
     /// and this value is never reached.
@@ -182,9 +181,8 @@ impl SendMessagesResponse {
     ///
     /// A reported `base_offset` never implies uniqueness, because delivery is
     /// at-least-once and an earlier retry may already have committed the same
-    /// messages at a lower offset. A batch is confirmed once it is committed in
-    /// memory, not once it is fsynced. A crash-restart can stamp a later batch
-    /// with an offset a client has already recorded.
+    /// messages at a lower offset. Confirmation follows the topic's message
+    /// durability policy: quorum commit, plus stable storage for persisted topics.
     #[getter]
     pub fn confirmations(&self) -> Vec<SendMessagesConfirmation> {
         self.inner

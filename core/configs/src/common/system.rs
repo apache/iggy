@@ -15,44 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::server::MemoryPoolConfig;
-use configs::{ConfigEnv, ConfigEnvMappings};
+use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
-use server_common::bootstrap::SystemPaths;
 use server_common::log::LoggingSettings;
 
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
 
-// Generic over the sharding config so every server flavour binds its own
-// `ShardingConfig` (different knob sets, different default source) while
-// sharing this whole struct and its path helpers.
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct SystemConfig<S: ConfigEnvMappings> {
-    pub path: String,
-    pub runtime: RuntimeConfig,
-    pub logging: LoggingConfig,
-    pub stream: StreamConfig,
-    pub topic: TopicConfig,
-    pub partition: PartitionConfig,
-    pub segment: SegmentConfig,
-    pub encryption: EncryptionConfig,
-    pub recovery: RecoveryConfig,
-    pub memory_pool: MemoryPoolConfig,
-    pub sharding: S,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct RuntimeConfig {
     pub path: String,
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct LoggingConfig {
     pub path: String,
     pub level: String,
@@ -83,7 +63,7 @@ impl From<&LoggingConfig> for LoggingSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct EncryptionConfig {
     pub enabled: bool,
     // skip_serializing keeps the key out of the runtime current_config.toml (and
@@ -92,197 +72,6 @@ pub struct EncryptionConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub key: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct StreamConfig {
-    pub path: String,
-}
-
-/// Only the on-disk layout: a topic's size cap and message expiry are its own
-/// creation options now (`max_topic_size`, `message_expiry`), defaulting to
-/// `iggy_common::DEFAULT_MAX_TOPIC_SIZE` / `DEFAULT_MESSAGE_EXPIRY`.
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct TopicConfig {
-    pub path: String,
-}
-
-/// `enforce_fsync`, `messages_required_to_save` and
-/// `size_of_messages_required_to_save` are per-topic creation options now,
-/// defaulting to the `iggy_common::DEFAULT_*` constants.
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct PartitionConfig {
-    pub path: String,
-    pub validate_checksum: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct RecoveryConfig {
-    pub recreate_missing_state: bool,
-}
-
-/// `size` and `preallocate` are per-topic creation options now
-/// (`segment_size`, `preallocate_segments`), defaulting to
-/// `iggy_common::DEFAULT_SEGMENT_SIZE` / `DEFAULT_PREALLOCATE_SEGMENTS`.
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct SegmentConfig {
-    pub archive_expired: bool,
-}
-
-impl<S: ConfigEnvMappings> SystemConfig<S> {
-    pub fn get_system_path(&self) -> String {
-        self.path.to_string()
-    }
-
-    pub fn get_state_path(&self) -> String {
-        format!("{}/state", self.get_system_path())
-    }
-
-    pub fn get_state_messages_file_path(&self) -> String {
-        format!("{}/log", self.get_state_path())
-    }
-
-    pub fn get_state_info_path(&self) -> String {
-        format!("{}/info", self.get_state_path())
-    }
-    pub fn get_state_tokens_path(&self) -> String {
-        format!("{}/tokens", self.get_state_path())
-    }
-
-    pub fn get_runtime_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.runtime.path)
-    }
-
-    pub fn get_streams_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.stream.path)
-    }
-
-    pub fn get_stream_path(&self, stream_id: usize) -> String {
-        format!("{}/{}", self.get_streams_path(), stream_id)
-    }
-
-    pub fn get_topics_path(&self, stream_id: usize) -> String {
-        format!("{}/{}", self.get_stream_path(stream_id), self.topic.path)
-    }
-
-    pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {
-        format!("{}/{}", self.get_topics_path(stream_id), topic_id)
-    }
-
-    pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
-        format!(
-            "{}/{}",
-            self.get_topic_path(stream_id, topic_id),
-            self.partition.path
-        )
-    }
-
-    pub fn get_partition_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/{}",
-            self.get_partitions_path(stream_id, topic_id),
-            partition_id
-        )
-    }
-
-    pub fn get_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/offsets",
-            self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/consumers",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_group_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/groups",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_segment_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        format!(
-            "{}/{:0>20}",
-            self.get_partition_path(stream_id, topic_id, partition_id),
-            start_offset
-        )
-    }
-
-    pub fn get_messages_file_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{LOG_EXTENSION}")
-    }
-
-    pub fn get_index_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{INDEX_EXTENSION}")
-    }
-}
-
-impl<S: ConfigEnvMappings> SystemPaths for SystemConfig<S> {
-    fn get_system_path(&self) -> String {
-        SystemConfig::get_system_path(self)
-    }
-
-    fn get_state_path(&self) -> String {
-        SystemConfig::get_state_path(self)
-    }
-
-    fn get_state_messages_file_path(&self) -> String {
-        SystemConfig::get_state_messages_file_path(self)
-    }
-
-    fn get_streams_path(&self) -> String {
-        SystemConfig::get_streams_path(self)
-    }
-
-    fn get_runtime_path(&self) -> String {
-        SystemConfig::get_runtime_path(self)
-    }
 }
 
 #[cfg(test)]

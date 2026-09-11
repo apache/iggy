@@ -40,7 +40,7 @@ use crate::shell::{ShellBus, ShellShard};
 use crate::snapshot;
 use crate::wire::request_body;
 use bytes::Bytes;
-use configs::server::{ServerConfig, ServerSystemConfig};
+use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
@@ -341,7 +341,7 @@ where
 pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: &Arc<ServerSystemConfig>,
+    server_config: &Arc<ServerConfig>,
     transport_client_id: u128,
     request: Message<RoutedRequestHeader>,
     // Acting user, peer address and read-your-writes floor for the read gates
@@ -483,7 +483,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_SNAPSHOT_FILE_CODE => {
-            handle_get_snapshot(shard, system_config, transport_client_id, &request, user_id).await;
+            handle_get_snapshot(shard, server_config, transport_client_id, &request, user_id).await;
         }
         POLL_MESSAGES_CODE => {
             handle_poll_messages(shard, transport_client_id, &request, user_id).await;
@@ -634,7 +634,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 async fn handle_get_snapshot<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    system_config: &Arc<ServerSystemConfig>,
+    server_config: &Arc<ServerConfig>,
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
@@ -651,7 +651,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     }
     let result = match decode_get_snapshot(request_body(request)) {
         Ok((compression, snapshot_types)) => {
-            snapshot::collect(Arc::clone(system_config), compression, snapshot_types).await
+            snapshot::collect(Arc::clone(server_config), compression, snapshot_types).await
         }
         Err(error) => Err(error),
     };

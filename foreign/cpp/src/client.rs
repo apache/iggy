@@ -104,9 +104,8 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
     );
     if config.has_reconnection_interval {
         let reconnection_interval =
-            RustNonZeroIggyDuration::try_from(config.reconnection_interval_micros).map_err(
-                |error| format!("Invalid reconnection interval: {error}"),
-            )?;
+            RustNonZeroIggyDuration::try_from(config.reconnection_interval_micros)
+                .map_err(|error| format!("Invalid reconnection interval: {error}"))?;
         builder = builder.with_reconnection_interval(reconnection_interval);
     }
     if config.has_reestablish_after {
@@ -481,12 +480,32 @@ impl Client {
             })?,
         };
 
-        let raw = crate::type_conversion::ffi_options_to_raw(options)
+        let mut raw = crate::type_conversion::ffi_options_to_raw(options)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
 
-        // `None` is what tells admission to resolve the server default, so the
-        // sentinels the string parsers produce must collapse back to it.
+        // Both completion policies are sent explicitly and default independently.
+        let durability = raw
+            .remove("durability")
+            .map(|value| value.parse::<iggy::prelude::Durability>())
+            .transpose()
+            .map_err(|_| {
+                iggy::prelude::IggyError::InvalidOptionValue("durability".to_owned()).to_string()
+            })?
+            .unwrap_or_default();
+        let consumer_offset_durability = raw
+            .remove("consumer_offset_durability")
+            .map(|value| value.parse::<iggy::prelude::Durability>())
+            .transpose()
+            .map_err(|_| {
+                iggy::prelude::IggyError::InvalidOptionValue(
+                    "consumer_offset_durability".to_owned(),
+                )
+                .to_string()
+            })?
+            .unwrap_or_default();
         let options = TopicCreateOptions {
+            durability,
+            consumer_offset_durability,
             partitions_count: Some(partitions_count),
             compression_algorithm: (rust_compression_algorithm
                 != RustCompressionAlgorithm::default())

@@ -122,6 +122,12 @@ pub(crate) struct TopicCreateArgs {
     /// "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
     #[arg(default_value = "server_default", value_parser = clap::value_parser!(IggyExpiry), verbatim_doc_comment)]
     pub(crate) message_expiry: Vec<IggyExpiry>,
+    /// Message completion policy: replicated or persisted. Both policies store messages on disk.
+    #[arg(long, default_value_t = iggy_common::Durability::Replicated)]
+    pub(crate) durability: iggy_common::Durability,
+    /// Offset completion policy: replicated or persisted. Independent of message durability.
+    #[arg(long, default_value_t = iggy_common::Durability::Replicated)]
+    pub(crate) consumer_offset_durability: iggy_common::Durability,
     /// Additional topic option as key=value, repeatable
     ///
     /// Values are sent as strings and parsed server-side through each option's
@@ -215,4 +221,67 @@ pub(crate) struct TopicPurgeArgs {
     /// Topic ID can be specified as a topic name or ID
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::TopicCreateArgs;
+    use clap::Parser;
+    use iggy_common::Durability;
+
+    #[derive(Parser)]
+    struct Create {
+        #[command(flatten)]
+        args: TopicCreateArgs,
+    }
+
+    #[test]
+    fn topic_durability_defaults_are_independent() {
+        let parsed = Create::try_parse_from([
+            "iggy",
+            "stream",
+            "topic",
+            "1",
+            "none",
+            "--durability",
+            "persisted",
+        ])
+        .unwrap();
+        assert_eq!(parsed.args.durability, Durability::Persisted);
+        assert_eq!(
+            parsed.args.consumer_offset_durability,
+            Durability::Replicated
+        );
+        let parsed = Create::try_parse_from([
+            "iggy",
+            "stream",
+            "topic",
+            "1",
+            "none",
+            "--consumer-offset-durability",
+            "persisted",
+        ])
+        .unwrap();
+        assert_eq!(parsed.args.durability, Durability::Replicated);
+        assert_eq!(
+            parsed.args.consumer_offset_durability,
+            Durability::Persisted
+        );
+    }
+
+    #[test]
+    fn unknown_durability_is_rejected() {
+        assert!(
+            Create::try_parse_from([
+                "iggy",
+                "stream",
+                "topic",
+                "1",
+                "none",
+                "--durability",
+                "memory"
+            ])
+            .is_err()
+        );
+    }
 }

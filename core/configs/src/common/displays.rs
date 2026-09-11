@@ -21,12 +21,8 @@ use super::server::{
 };
 use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
-    system::{
-        EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig, StreamConfig,
-        SystemConfig, TopicConfig,
-    },
+    system::{EncryptionConfig, LoggingConfig},
 };
-use configs::ConfigEnvMappings;
 use std::fmt::{Display, Formatter};
 
 impl Display for HttpConfig {
@@ -130,34 +126,6 @@ impl Display for EncryptionConfig {
     }
 }
 
-impl Display for StreamConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
-    }
-}
-
-impl Display for TopicConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
-    }
-}
-
-impl Display for PartitionConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ path: {}, validate_checksum: {} }}",
-            self.path, self.validate_checksum
-        )
-    }
-}
-
-impl Display for SegmentConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ archive_expired: {} }}", self.archive_expired,)
-    }
-}
-
 impl Display for LoggingConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -200,22 +168,6 @@ impl Display for TelemetryTracesConfig {
             f,
             "{{ transport: {}, endpoint: {} }}",
             self.transport, self.endpoint
-        )
-    }
-}
-
-impl<S: ConfigEnvMappings> Display for SystemConfig<S> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {} }}",
-            self.path,
-            self.logging,
-            self.stream,
-            self.topic,
-            self.partition,
-            self.segment,
-            self.encryption,
         )
     }
 }

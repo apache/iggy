@@ -62,7 +62,7 @@ pub enum ServerError {
     },
     #[error(
         "shard allocator produced zero shards; server must run at least one \
-         shard (check [system.sharding] cpu_allocation)"
+         shard (check [sharding] cpu_allocation)"
     )]
     ShardsCountZero,
     #[error(
@@ -100,35 +100,35 @@ pub enum ServerError {
         shard_id: u16,
         timeout: std::time::Duration,
     },
-    #[error("system.sharding.inbox_capacity must be in 1..={max}; got {value}")]
+    #[error("sharding.inbox_capacity must be in 1..={max}; got {value}")]
     InvalidInboxCapacity { value: usize, max: usize },
-    #[error("system.sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
+    #[error("sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
     InvalidReplyInboxCapacity { value: usize, max: usize },
-    #[error("system.sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
+    #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,
         max: std::time::Duration,
     },
-    #[error("system.sharding.shutdown_poll_interval must be in (0, {max:?}]; got {value:?}")]
+    #[error("sharding.shutdown_poll_interval must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownPollInterval {
         value: std::time::Duration,
         max: std::time::Duration,
     },
     #[error(
-        "system.sharding.shutdown_poll_interval ({poll:?}) must be <= \
+        "sharding.shutdown_poll_interval ({poll:?}) must be <= \
          shutdown_drain_timeout ({drain:?})"
     )]
     ShutdownPollExceedsDrain {
         poll: std::time::Duration,
         drain: std::time::Duration,
     },
-    #[error("system.sharding.shutdown_join_timeout must be <= {max:?}; got {value:?}")]
+    #[error("sharding.shutdown_join_timeout must be <= {max:?}; got {value:?}")]
     InvalidShutdownJoinTimeout {
         value: std::time::Duration,
         max: std::time::Duration,
     },
     #[error(
-        "system.sharding.shutdown_join_timeout ({join:?}) must be >= \
+        "sharding.shutdown_join_timeout ({join:?}) must be >= \
          shutdown_drain_timeout ({drain:?})"
     )]
     ShutdownJoinBelowDrain {
@@ -136,7 +136,7 @@ pub enum ServerError {
         drain: std::time::Duration,
     },
     #[error(
-        "system.sharding.reconcile_periodic_interval must be in (0, {max:?}]; got {value:?}. \
+        "sharding.reconcile_periodic_interval must be in (0, {max:?}]; got {value:?}. \
          Note that \"0\", \"none\", \"unlimited\", and \"disabled\" all parse to zero"
     )]
     InvalidReconcilePeriodicInterval {
@@ -157,6 +157,12 @@ pub enum ServerError {
     MetadataRecovery(#[source] RecoveryError),
     #[error("failed to open partition superblock at {dir}")]
     PartitionSuperblockIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to recover partition prepare WAL at {dir}: {source}")]
+    PartitionPrepareWalIo {
         dir: PathBuf,
         #[source]
         source: std::io::Error,
@@ -212,7 +218,7 @@ pub enum ServerError {
     // catch this error, and only they log it -- a claim here would render
     // beside theirs and contradict one branch or the other.
     #[error(
-        "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused segment \
+        "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused storage \
          recovery: {reason}"
     )]
     PartitionRecoveryRefused {
@@ -348,10 +354,10 @@ pub enum ServerError {
 /// into byte-clean files by an upstream crash window as well as by damage.
 ///
 /// An index that contradicts itself is deliberately NOT here, and neither is
-/// one the log cannot back UNLESS the topic runs under `enforce_fsync` and the
+/// one the log cannot back UNLESS the topic runs under `persisted durability` and the
 /// gap is deeper than the single in-flight entry: entries are derived from the
 /// log, so recovery drops such an index whole and rebuilds it from a byte-0
-/// walk of the log rather than believing any part of it. What `enforce_fsync`
+/// walk of the log rather than believing any part of it. What `persisted durability`
 /// adds is evidence from serialized completed flushes: an entry above chunk N
 /// means the log fdatasync covering chunk N completed before the later flush
 /// began. This is independent of reply timing and turns a deeper gap into
@@ -428,7 +434,7 @@ pub enum PartitionRecoveryRefusal {
         batch_partition_id: u64,
         position: u64,
     },
-    /// The sparse index of a topic running under `enforce_fsync` outruns its
+    /// The sparse index of a topic running under `persisted durability` outruns its
     /// log by more than the one entry a crash can legitimately strand there.
     /// Persistence writes exactly one entry per flush chunk, chunks never
     /// overlap, and flushes are serialized, so every entry below the last one
@@ -452,7 +458,7 @@ pub enum PartitionRecoveryRefusal {
         /// backs nothing.
         searched_entries: u64,
     },
-    /// Under `enforce_fsync`, the byte-0 rebuild after a dropped index proved
+    /// Under `persisted durability`, the byte-0 rebuild after a dropped index proved
     /// the log only through `walked_position`, short of `durable_position`,
     /// the byte the index's own last entry proves the log had already
     /// fdatasynced through (the flush that wrote the entry began only after
@@ -466,8 +472,16 @@ pub enum PartitionRecoveryRefusal {
         walked_position: u64,
         durable_position: u64,
     },
-    /// A writer reopening over recovered bounds found the on-disk length
-    /// diverging from the size recovery just validated and truncated to.
+    PrepareWal {
+        directory: PathBuf,
+        source: std::io::Error,
+    },
+    CheckpointSizeMismatch {
+        start_offset: u64,
+        validated_bytes: u64,
+        expected_bytes: u64,
+    },
+    /// The physical file length differs from the required recovered boundary.
     StorageSizeMismatch {
         start_offset: u64,
         on_disk_bytes: u64,
@@ -558,7 +572,7 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 searched_entries,
             } => write!(
                 f,
-                "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
+                "segment {start_offset} runs under persisted durability with {entry_count} sparse \
                  index entries, but its log backs only {provable_entries} of the \
                  {searched_entries} searched from the top (up to byte {provable_position}); \
                  every entry below the last describes a log chunk whose fdatasync had \
@@ -572,12 +586,26 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 durable_position,
             } => write!(
                 f,
-                "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
+                "segment {start_offset} runs under persisted durability with {entry_count} sparse \
                  index entries, and the byte-0 rebuild proved its log only through byte \
                  {walked_position}, short of byte {durable_position} which the last \
                  entry's own fdatasync ordering proves the log had already made durable; \
                  the log has lost previously durable bytes mid-chunk, so rebuilding \
                  would re-mint their offsets"
+            ),
+            Self::PrepareWal { directory, source } => write!(
+                f,
+                "prepare WAL at {} cannot be recovered: {source}",
+                directory.display()
+            ),
+            Self::CheckpointSizeMismatch {
+                start_offset,
+                validated_bytes,
+                expected_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} validated prefix has {validated_bytes} bytes, \
+                 but the WAL checkpoint requires {expected_bytes}"
             ),
             Self::StorageSizeMismatch {
                 start_offset,
@@ -586,7 +614,7 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
             } => write!(
                 f,
                 "segment {start_offset} file length {on_disk_bytes} diverged from \
-                 its recovered size {expected_bytes} at writer open"
+                 its required recovered size {expected_bytes}"
             ),
         }
     }
