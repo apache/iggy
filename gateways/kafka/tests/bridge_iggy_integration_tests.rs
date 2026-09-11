@@ -716,12 +716,12 @@ async fn connect_succeeds_with_password_containing_special_characters() {
 
     let mut command = Command::new(iggy_server_binary());
     command
-        .env("IGGY_SYSTEM_PATH", data_dir.path().display().to_string())
+        .env("IGGY_PATH", data_dir.path().display().to_string())
         .env("IGGY_TCP_ADDRESS", &address)
         .env("IGGY_HTTP_ENABLED", "false")
         .env("IGGY_QUIC_ENABLED", "false")
         .env("IGGY_WEBSOCKET_ENABLED", "false")
-        .env("IGGY_SYSTEM_SHARDING_PIN_CORES", "false")
+        .env("IGGY_SHARDING_PIN_CORES", "false")
         .env("IGGY_ROOT_USERNAME", "iggy")
         .env("IGGY_ROOT_PASSWORD", password);
     let mut child = command.spawn().expect("spawn iggy-server");
