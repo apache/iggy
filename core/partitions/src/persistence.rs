@@ -246,10 +246,9 @@ impl WriterLease {
             let mut writers = WRITERS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if writers
-                .get(&key)
-                .is_some_and(|registration| registration.id == previous.id)
-            {
+            if writers.get(&key).is_some_and(|registration| {
+                registration.id == previous.id && !registration.interrupted
+            }) {
                 writers.remove(&key);
             }
         }
@@ -1444,6 +1443,36 @@ mod tests {
         let (replacement, _) = replacement.await.unwrap();
         assert_eq!(replacement.head(), 0);
         assert!(replacement.failure().is_none());
+    }
+
+    #[compio::test]
+    async fn replacement_waiting_on_a_cancelled_writer_preserves_the_restart_fence() {
+        let directory = tempdir().unwrap();
+        let wal_directory = directory.path().join("prepares-7");
+        let next_incarnation = directory.path().join("prepares-8");
+        let (old, _) = PartitionPersistence::open(&wal_directory, 42, 7)
+            .await
+            .unwrap();
+        old.append(prepare(1, 0).into_frozen(), true).unwrap();
+        assert!(old.start());
+        let mut writer = Box::pin(Rc::clone(&old).run());
+        assert!(futures::poll!(&mut writer).is_pending());
+        old.retire();
+        let mut replacement = Box::pin(PartitionPersistence::open(&next_incarnation, 42, 8));
+        assert!(futures::poll!(&mut replacement).is_pending());
+
+        drop(writer);
+
+        assert_eq!(old.failure().unwrap().kind(), io::ErrorKind::Interrupted);
+        assert!(
+            replacement.await.is_err(),
+            "cancellation must fence an already-waiting replacement"
+        );
+        assert!(
+            PartitionPersistence::open(&next_incarnation, 42, 8)
+                .await
+                .is_err()
+        );
     }
 
     #[compio::test]

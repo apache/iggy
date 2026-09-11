@@ -228,22 +228,8 @@ impl DurableStorage for DiskStorage {
 
     async fn entries(&self, path: &Path) -> io::Result<Vec<StorageEntry>> {
         // getdents has no io_uring operation, and shard fallback pools are disabled.
-        // The permit lives on the worker so caller cancellation cannot spawn
-        // an unbounded number of directory scanners.
-        static SCANNER: Mutex<()> = Mutex::new(());
-        let permit = SCANNER.lock().await;
         let path = path.to_path_buf();
-        let (sender, receiver) = oneshot::channel();
-        std::thread::Builder::new()
-            .name("iggy-directory-scan".to_owned())
-            .spawn(move || {
-                let _permit = permit;
-                let result = directory_entries(&path);
-                let _ = sender.send(result);
-            })?;
-        receiver
-            .await
-            .map_err(|_| io::Error::other("directory scanner stopped"))?
+        run_blocking("iggy-directory-scan", move || directory_entries(&path)).await
     }
 
     async fn remove_tree(&self, path: &Path) -> io::Result<()> {
@@ -336,19 +322,39 @@ impl DurableFile for File {
         Ok(self.metadata().await?.len())
     }
 
-    fn truncate(&self, length: u64) -> impl Future<Output = io::Result<()>> {
-        // The running kernel may predate IORING_OP_FTRUNCATE. This is a
-        // recovery operation and must not enter a disabled blocking pool.
-        std::future::ready(
-            std::os::fd::AsFd::as_fd(self)
-                .try_clone_to_owned()
-                .and_then(|descriptor| std::fs::File::from(descriptor).set_len(length)),
-        )
+    async fn truncate(&self, length: u64) -> io::Result<()> {
+        // Older kernels lack IORING_OP_FTRUNCATE and shard fallback pools are
+        // disabled. Own the inode until the worker completes, even on cancellation.
+        let descriptor = std::os::fd::AsFd::as_fd(self).try_clone_to_owned()?;
+        run_blocking("iggy-file-truncate", move || {
+            std::fs::File::from(descriptor).set_len(length)
+        })
+        .await
     }
 
     async fn sync(&self) -> io::Result<()> {
         self.sync_data().await
     }
+}
+
+async fn run_blocking<T: Send + 'static>(
+    name: &'static str,
+    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    // Keep the permit on the worker: cancelling its caller must not admit
+    // another blocking operation while this one still owns filesystem state.
+    static WORKER: Mutex<()> = Mutex::new(());
+    let permit = WORKER.lock().await;
+    let (sender, receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = sender.send(operation());
+        })?;
+    receiver
+        .await
+        .map_err(|_| io::Error::other(format!("{name} stopped")))?
 }
 
 fn directory_entries(path: &Path) -> io::Result<Vec<StorageEntry>> {
@@ -368,4 +374,79 @@ fn directory_entries(path: &Path) -> io::Result<Vec<StorageEntry>> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiskStorage, DurableFile, DurableStorage, OpenMode, run_blocking};
+    use futures::channel::oneshot;
+    use futures::future::{Either, select};
+    use std::io;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const WORKER_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[compio::test]
+    async fn cancelled_blocking_operation_keeps_its_permit_until_completion() {
+        let executor_thread = std::thread::current().id();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = mpsc::channel();
+        let mut blocked = Box::pin(run_blocking("iggy-test-blocked", move || {
+            assert_ne!(std::thread::current().id(), executor_thread);
+            let _ = started.send(());
+            release_rx
+                .recv_timeout(WORKER_TIMEOUT)
+                .map_err(io::Error::other)
+        }));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        assert!(matches!(
+            select(started_rx, blocked.as_mut()).await,
+            Either::Left((Ok(()), _))
+        ));
+        drop(blocked);
+
+        let mut successor = Box::pin(run_blocking("iggy-test-successor", || Ok(())));
+        assert!(futures::poll!(&mut successor).is_pending());
+        compio::time::sleep(Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut successor).is_pending());
+        release.send(()).unwrap();
+        successor.await.unwrap();
+    }
+
+    #[compio::test]
+    async fn queued_truncate_preserves_the_open_inode_and_completes_before_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let renamed = directory.path().join("renamed");
+        std::fs::write(&original, b"original contents").unwrap();
+        let file = DiskStorage
+            .open(&original, OpenMode::ReadWrite)
+            .await
+            .unwrap();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = mpsc::channel();
+        let mut blocked = Box::pin(run_blocking("iggy-test-blocked", move || {
+            let _ = started.send(());
+            release_rx
+                .recv_timeout(WORKER_TIMEOUT)
+                .map_err(io::Error::other)
+        }));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        assert!(matches!(
+            select(started_rx, blocked.as_mut()).await,
+            Either::Left((Ok(()), _))
+        ));
+        let mut truncate = Box::pin(file.truncate(3));
+        assert!(futures::poll!(&mut truncate).is_pending());
+        std::fs::rename(&original, &renamed).unwrap();
+        std::fs::write(&original, b"replacement contents").unwrap();
+        release.send(()).unwrap();
+        blocked.await.unwrap();
+        truncate.await.unwrap();
+        file.sync().await.unwrap();
+
+        assert_eq!(std::fs::read(&renamed).unwrap(), b"ori");
+        assert_eq!(std::fs::read(&original).unwrap(), b"replacement contents");
+    }
 }

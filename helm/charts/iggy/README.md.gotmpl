@@ -221,7 +221,11 @@ stored values.
   cluster: a node that authenticates cannot talk to one that does not.
 * **`server.encryption`** encrypts message payloads and state commands at rest
   with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
-  cannot read what its peers wrote.
+  cannot read what its peers wrote. The chart selects the legacy configuration
+  for versioned images through `0.9.0-edge.7`, including its pinned image.
+  For newer builds with `[encryption]`, set `server.encryption.configVersion=flat`.
+  Custom tags require an explicit `flat` or `legacy` layout; `legacy` uses
+  `[system.encryption]`.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that

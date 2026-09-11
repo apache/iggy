@@ -1423,11 +1423,17 @@ pub(in crate::http) async fn send_messages(
     .map_err(PartitionWriteError::Rejected)?;
     // Rejects an oversized partitioning key and an empty or oversized batch.
     command.validate().map_err(PartitionWriteError::Rejected)?;
+    let policy = topic_durability(&state, &stream_id, &topic_id);
+    // Names can be reused while the session gate is held by another request.
+    let (stream_id, topic_id) = policy
+        .map(super::reads::TopicDurability::identifiers)
+        .transpose()
+        .map_err(PartitionWriteError::Rejected)?
+        .unwrap_or((stream_id, topic_id));
     let body = encode_send_messages(&stream_id, &topic_id, &command)
         .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
         ProduceAck::Replicated => {
-            let policy = topic_durability(&state, &stream_id, &topic_id);
             let (reply, header) = SendWrapper::new(partition_write_replicated(
                 &state,
                 &identity.session,

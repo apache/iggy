@@ -290,9 +290,24 @@ Secret owns it.
   {{- $server := .Values.server }}
   {{- $generated := include "iggy.secretName" . }}
   {{- if $server.encryption.enabled }}
-- name: IGGY_ENCRYPTION_ENABLED
+    {{- $configVersion := $server.encryption.configVersion | default "auto" }}
+    {{- if eq $configVersion "auto" }}
+      {{- $imageTag := $server.image.tag | default .Chart.AppVersion }}
+      {{- if and (regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $imageTag) (semverCompare "<=0.9.0-edge.7" $imageTag) }}
+        {{- $configVersion = "legacy" }}
+      {{- else }}
+        {{- fail "Cannot determine the encryption config layout for this server image. Set server.encryption.configVersion to flat for builds using [encryption], or legacy for builds using [system.encryption]." }}
+      {{- end }}
+    {{- end }}
+    {{- $prefix := "IGGY_ENCRYPTION" }}
+    {{- if eq $configVersion "legacy" }}
+      {{- $prefix = "IGGY_SYSTEM_ENCRYPTION" }}
+    {{- else if ne $configVersion "flat" }}
+      {{- fail "server.encryption.configVersion must be auto, legacy, or flat." }}
+    {{- end }}
+- name: {{ $prefix }}_ENABLED
   value: "true"
-- name: IGGY_ENCRYPTION_KEY
+- name: {{ $prefix }}_KEY
   valueFrom:
     secretKeyRef:
       name: {{ default $generated $server.encryption.existingSecret.name }}

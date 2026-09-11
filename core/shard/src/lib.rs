@@ -7409,25 +7409,6 @@ where
         // spreads over every group instead of replaying the same prefix.
         rotate_sweep_to_cursor(namespace_scratch, self.partition_walk_cursor.get());
 
-        let mut persistence_metrics = partitions::PersistenceMetrics::default();
-        for namespace in namespace_scratch.iter() {
-            if let Some(partition) = partitions.get_mut_by_ns(namespace) {
-                partition.drive_persistence().await;
-                if let Some(metrics) = partition.take_persistence_metrics() {
-                    persistence_metrics.disk_bytes += metrics.disk_bytes;
-                    persistence_metrics.retained_bytes += metrics.retained_bytes;
-                    persistence_metrics.queued_bytes += metrics.queued_bytes;
-                    persistence_metrics.in_flight_bytes += metrics.in_flight_bytes;
-                    persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
-                    persistence_metrics.completed_batches += metrics.completed_batches;
-                    persistence_metrics.batched_prepares += metrics.batched_prepares;
-                    persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
-                    persistence_metrics.failed_writes += metrics.failed_writes;
-                }
-            }
-        }
-        self.metrics.record_persistence(&persistence_metrics);
-
         // Pre-pass: issue every group's pending superblock write CONCURRENTLY.
         // A cluster-wide view change makes every group on this shard need one in
         // the same tick, and each `atomic_replace` is a create + write + 2
@@ -7476,6 +7457,25 @@ where
             }
             futures::future::join_all(chunk).await;
         }
+
+        let mut persistence_metrics = partitions::PersistenceMetrics::default();
+        for namespace in namespace_scratch.iter() {
+            if let Some(partition) = partitions.get_mut_by_ns(namespace) {
+                partition.drive_persistence().await;
+                if let Some(metrics) = partition.take_persistence_metrics() {
+                    persistence_metrics.disk_bytes += metrics.disk_bytes;
+                    persistence_metrics.retained_bytes += metrics.retained_bytes;
+                    persistence_metrics.queued_bytes += metrics.queued_bytes;
+                    persistence_metrics.in_flight_bytes += metrics.in_flight_bytes;
+                    persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
+                    persistence_metrics.completed_batches += metrics.completed_batches;
+                    persistence_metrics.batched_prepares += metrics.batched_prepares;
+                    persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
+                    persistence_metrics.failed_writes += metrics.failed_writes;
+                }
+            }
+        }
+        self.metrics.record_persistence(&persistence_metrics);
 
         // Counted at most ONCE per sweep and only if a re-arm actually fires,
         // then tracked locally as arms land. Counting per namespace is a full

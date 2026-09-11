@@ -1089,6 +1089,10 @@ where
         if self.materialization_missing || !self.ensure_wal_view() {
             return;
         }
+        // The shard's bounded pre-pass owns superblock I/O across partitions.
+        if self.superblock.is_some() && self.consensus.needs_superblock_persist() {
+            return;
+        }
         let durable_op = persistence.durable_op();
         loop {
             let pending = self
@@ -4041,22 +4045,6 @@ where
                 return;
             }
 
-            if self
-                .persistence
-                .as_ref()
-                .is_some_and(|persistence| !persistence.has_capacity(message.as_slice().len()))
-            {
-                Self::send_partition_deny_or_log(
-                    consensus,
-                    message.header(),
-                    IggyError::TransientNotAccepted.as_code(),
-                    "partition WAL backpressure reply failed",
-                    reply.take(),
-                )
-                .await;
-                return;
-            }
-
             // Parse once for both the delete-existence check and AckLevel dispatch.
             let consumer_offset = match message.header().operation {
                 Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
@@ -4138,6 +4126,22 @@ where
                     .await;
                     return;
                 }
+            }
+
+            if self
+                .persistence
+                .as_ref()
+                .is_some_and(|persistence| !persistence.has_capacity(message.as_slice().len()))
+            {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "partition WAL backpressure reply failed",
+                    reply.take(),
+                )
+                .await;
+                return;
             }
 
             if matches!(message.header().operation, Operation::DeleteConsumerOffset)
@@ -8050,9 +8054,11 @@ where
             return false;
         }
         if !self.persist_superblock_if_needed().await {
-            self.pending_persisted_acks
-                .borrow_mut()
-                .insert(header.op, *header);
+            if self.persistence.is_some() {
+                self.pending_persisted_acks
+                    .borrow_mut()
+                    .insert(header.op, *header);
+            }
             return false;
         }
         // Same fail-closed shape for a purge this replica accepted but has not
@@ -9293,6 +9299,61 @@ mod tests {
         persistence.drain_with_timeout().await.unwrap();
 
         (directory, partition, header)
+    }
+
+    #[compio::test]
+    async fn pending_wal_acks_wait_for_the_superblock_prepass() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = partition_at_view(3, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"pending").transmute_header(
+            |mut original, header: &mut PrepareHeader| {
+                original.view = 3;
+                original.checksum = original.identity_checksum();
+                *header = original;
+            },
+        );
+        let header = *prepare.header();
+        partition.consensus().sequencer().set_sequence(header.op);
+        partition
+            .consensus()
+            .set_last_prepare_checksum(header.checksum);
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.clone().into_frozen())
+            .await
+            .unwrap();
+        let persistence = partition.persistence.as_ref().unwrap();
+        persistence.append(prepare.into_frozen(), true).unwrap();
+        assert!(!partition.register_rebuilt_ack(&header));
+        persistence.certify_log_view(3, header.op, header.checksum);
+        partition.start_persistence();
+        persistence.drain_with_timeout().await.unwrap();
+        let store = Rc::new(RecordingSuperblock::default());
+        partition.set_superblock(store.clone(), None);
+        assert!(partition.consensus().needs_superblock_persist());
+
+        partition.drive_persistence().await;
+
+        assert_eq!(
+            store.attempts.get(),
+            0,
+            "the serial ACK drain must not issue a superblock write"
+        );
+        assert!(
+            partition
+                .pending_persisted_acks
+                .borrow()
+                .contains_key(&header.op)
+        );
+        assert!(partition.persist_superblock_if_needed().await);
+        partition.drive_persistence().await;
+        assert_eq!(store.attempts.get(), 1);
+        assert!(partition.pending_persisted_acks.borrow().is_empty());
     }
 
     #[compio::test]
@@ -10561,6 +10622,10 @@ mod tests {
             "the retried ack must go out once the view persisted"
         );
         assert!(!partition.consensus().needs_superblock_persist());
+        assert!(
+            partition.pending_persisted_acks.borrow().is_empty(),
+            "a partition without a WAL has no persistence driver to drain queued acks"
+        );
     }
 
     #[compio::test]
@@ -10968,6 +11033,67 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[compio::test]
+    async fn wal_backpressure_preserves_replay_outcomes() {
+        for expected_status in [
+            0,
+            IggyError::TransientNotCommitted.as_code(),
+            IggyError::TransientNotAccepted.as_code(),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut partition, replies) = recording_partition_at(0, 3);
+            partition.runtime_options.durability = iggy_common::Durability::Persisted;
+            partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            partition.open_persistence().await.unwrap();
+            let mut request = checksumless_send_request(partition.namespace(), 1);
+            request.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+            let header = *request.header();
+            if expected_status == 0 {
+                partition
+                    .dedup
+                    .commit_request(header.client, header.user_id, header.request, 1);
+            } else if expected_status == IggyError::TransientNotCommitted.as_code() {
+                let prepare =
+                    request
+                        .clone()
+                        .transmute_header(|request, prepare: &mut PrepareHeader| {
+                            prepare.command = Command::Prepare;
+                            prepare.operation = request.operation;
+                            prepare.client = request.client;
+                            prepare.user_id = request.user_id;
+                            prepare.request = request.request;
+                            prepare.op = 1;
+                            prepare.size = request.size;
+                        });
+                partition
+                    .consensus()
+                    .pipeline_message(PlaneKind::Partitions, &prepare);
+            }
+            let pipeline_len = partition.consensus().pipeline_len();
+            partition
+                .persistence
+                .as_ref()
+                .unwrap()
+                .exhaust_capacity_for_test();
+
+            partition.on_request(request, None).await;
+
+            let replies = replies.borrow();
+            assert_eq!(
+                replies.len(),
+                1,
+                "every retry must receive its known outcome"
+            );
+            let reply = bytemuck::checked::from_bytes::<ReplyHeader>(
+                &replies[0].1.as_slice()[..size_of::<ReplyHeader>()],
+            );
+            assert_eq!(reply.status, expected_status);
+            assert_eq!(partition.consensus().pipeline_len(), pipeline_len);
+            assert_eq!(partition.persistence.as_ref().unwrap().head(), 0);
         }
     }
 
