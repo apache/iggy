@@ -969,9 +969,10 @@ impl Source for HttpSource {
         let _polling = self.shared.enter_poll();
         // Published here rather than in `join`, because this is the first
         // moment anything can drain what the routes would let in. Between the
-        // two sits every source's producer setup and every sink's init, run in
-        // series before any poll task starts, so on boot the window spans
-        // connectors this one has nothing to do with. Routes that exist across
+        // two sit the sources the runtime has not reached yet and then every
+        // sink, run in series before any poll task starts, so on boot the
+        // window depends on connectors this one has nothing to do with. Which
+        // sources those are is not fixed: they come from an unordered map. Routes that exist across
         // it accept requests into a bridge with no reader, and an instance
         // that had not polled yet also read as a stopped one to the readiness
         // gate, so restarting one instance answered 503 for every healthy

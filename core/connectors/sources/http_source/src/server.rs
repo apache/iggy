@@ -811,12 +811,18 @@ async fn named_path_outcome(
     // whose answer is already known.
     //
     // Answering without draining costs the connection. Hyper makes one drain
-    // attempt and then closes the read half, so above roughly 16 KiB of body
-    // the socket is not reusable and a shed request costs a fresh one. The
-    // response itself still arrives, `Retry-After` included, because the write
-    // half stays open. Cutting the upload off is the point, and this is what
-    // it costs; `Connection: close` was measured and is not an improvement,
-    // since it saves nothing here and ends keep-alive for small bodies too.
+    // attempt and then closes the read half, and the threshold covers the head
+    // and body together rather than the body alone: near 32 KiB on a fresh
+    // connection, lower on a reused one as hyper's read strategy adapts, so a
+    // small body sent slowly enough loses the connection too.
+    //
+    // Whether the sender sees the 429 depends on the sender. One that reads
+    // while it writes usually does, since the write half stays open. One that
+    // writes the whole body first can take a reset instead and never see it,
+    // and at the default megabyte cap that is a real fraction of requests, so
+    // `Retry-After` is guidance for the senders that get it rather than a
+    // promise to all of them. Cutting the upload off is the point and this is
+    // what it costs; `Connection: close` was measured and does not help.
     if instance.sender.is_full() {
         let response = reject_bridge_full(&instance, &state.metrics);
         return (Some(instance), response);
@@ -1354,10 +1360,12 @@ struct InstanceHealth {
     /// instance stays registered and keeps accepting mutations that will never
     /// be persisted. See #3941.
     ///
-    /// Read it with `has_polled`, which is what separates the two ways this
-    /// can be false. Both false is an instance still starting up, and the
-    /// listener is not held to it. True and false is a poll task that stopped,
-    /// which is what takes the whole listener out of rotation.
+    /// Read it with `has_polled`, which separates the two ways this can be
+    /// false. `has_polled` false alongside it is an instance still starting
+    /// up, and the listener is not held to that one. `has_polled` true
+    /// alongside it is a poll task that stopped, which is what takes the whole
+    /// listener out of rotation. This one true with `has_polled` false is
+    /// simply a first poll in flight.
     poll_is_live: bool,
     has_polled: bool,
     state_submitted: bool,
