@@ -41,7 +41,7 @@ TEST_F(E2E_Stream, CreateDuplicateStreamThrows) {
     auto client                   = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_THROW(client.CreateStream(stream_name), std::exception);
+    ASSERT_THROW(client.CreateStream(stream_name), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, CreateStreamBeforeLoginThrows) {
@@ -49,12 +49,12 @@ TEST_F(E2E_Stream, CreateStreamBeforeLoginThrows) {
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(client.CreateStream(stream_name), std::exception);
+    ASSERT_THROW(client.CreateStream(stream_name), iggy::IggyException);
     ASSERT_NO_THROW(client.Connect());
-    ASSERT_THROW(client.CreateStream(stream_name), std::exception);
+    ASSERT_THROW(client.CreateStream(stream_name), iggy::IggyException);
     ASSERT_NO_THROW(client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(client.Disconnect());
-    ASSERT_THROW(client.CreateStream(stream_name), std::exception);
+    ASSERT_THROW(client.CreateStream(stream_name), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
@@ -67,7 +67,7 @@ TEST_F(E2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
     auto client = GetLoggedInHighLevelClient();
     for (const auto &stream_name : illegal_stream_names) {
         SCOPED_TRACE(stream_name);
-        ASSERT_THROW(client.CreateStream(stream_name), std::exception);
+        ASSERT_THROW(client.CreateStream(stream_name), iggy::IggyException);
     }
 
     const std::string max_length_name(255, 'a');
@@ -104,7 +104,7 @@ TEST_F(E2E_Stream, UpdateStreamWorksCorrectly) {
 
     ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name));
 
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 
     iggy::StreamDetails updated_stream_details = client.GetStream(iggy::Identifier::Numeric(stream_id));
 
@@ -148,11 +148,11 @@ TEST_F(E2E_Stream, UpdateStreamWithUnsupportedOptionsRejectsAndPreservesName) {
 
     const auto options = iggy::StreamUpdateOptions().SetRawEntries({{"not_a_real_option", "true"}});
     ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name, options),
-                 std::exception);
+                 iggy::IggyException);
 
     const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
     EXPECT_EQ(stream.Name(), stream_name);
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(updated_stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(updated_stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, UpdateStreamBeforeLoginThrows) {
@@ -166,14 +166,14 @@ TEST_F(E2E_Stream, UpdateStreamBeforeLoginThrows) {
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
     ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name),
-                 std::exception);
+                 iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Connect());
     ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name),
-                 std::exception);
+                 iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(unauthenticated_client.Disconnect());
     ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name),
-                 std::exception);
+                 iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, UpdateStreamWithVariousUtf8Characters) {
@@ -210,7 +210,7 @@ TEST_F(E2E_Stream, UpdateNonExistentStreamThrows) {
     const std::string stream_name         = GetRandomName();
     const std::string updated_stream_name = GetRandomName();
     auto client                           = GetLoggedInHighLevelClient();
-    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name), std::exception);
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, UpdateStreamWithDuplicateNameThrows) {
@@ -223,7 +223,8 @@ TEST_F(E2E_Stream, UpdateStreamWithDuplicateNameThrows) {
     ASSERT_NO_THROW(client.CreateStream(second_stream_name));
     TrackStream(second_stream_name);
 
-    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(first_stream_name), second_stream_name), std::exception);
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(first_stream_name), second_stream_name),
+                 iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, UpdateDeletedStreamThrows) {
@@ -237,7 +238,7 @@ TEST_F(E2E_Stream, UpdateDeletedStreamThrows) {
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name), std::exception);
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
@@ -281,7 +282,7 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
 
     ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id), updated_stream_name));
 
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
     auto stream_after_update = client.GetStream(iggy::Identifier::Numeric(stream_id));
     iggy::ffi::Stats stats_after_update{};
     ASSERT_NO_THROW({ stats_after_update = ffi_client->get_stats(); });
@@ -336,7 +337,8 @@ TEST_F(E2E_Stream, UpdateStreamValidatesNameBounds) {
     };
     for (const auto &invalid_stream_name : invalid_stream_names) {
         SCOPED_TRACE("invalid_stream_name_length=" + std::to_string(invalid_stream_name.size()));
-        ASSERT_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id), invalid_stream_name), std::exception);
+        ASSERT_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id), invalid_stream_name),
+                     iggy::IggyException);
     }
 }
 
@@ -355,7 +357,7 @@ TEST_F(E2E_Stream, DeleteNotCreatedStreamThrows) {
     RecordProperty("description", "Throws when deleting a stream that does not exist.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
-    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, DeleteStreamBeforeLoginThrows) {
@@ -364,14 +366,14 @@ TEST_F(E2E_Stream, DeleteStreamBeforeLoginThrows) {
 
     auto client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 
     ASSERT_NO_THROW(client.Connect());
 
-    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
     ASSERT_NO_THROW(client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(client.Disconnect());
-    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, DeleteStreamTwiceThrows) {
@@ -383,7 +385,7 @@ TEST_F(E2E_Stream, DeleteStreamTwiceThrows) {
 
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
-    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, GetStreamByStringIdentifierReturnsStreamDetails) {
@@ -407,7 +409,7 @@ TEST_F(E2E_Stream, GetNonExistentStreamDetailsThrows) {
     RecordProperty("description", "Throws when requesting details for a stream that does not exist.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, GetStreamDetailsBeforeLoginThrows) {
@@ -415,12 +417,12 @@ TEST_F(E2E_Stream, GetStreamDetailsBeforeLoginThrows) {
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
     ASSERT_NO_THROW(client.Connect());
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
     ASSERT_NO_THROW(client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(client.Disconnect());
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, GetDeletedStreamDetailsThrows) {
@@ -432,7 +434,7 @@ TEST_F(E2E_Stream, GetDeletedStreamDetailsThrows) {
     ASSERT_NO_THROW(client.GetStream(iggy::Identifier::String(stream_name)));
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, GetStreamsReturnsEmptyAfterCleanup) {
@@ -514,12 +516,12 @@ TEST_F(E2E_Stream, GetStreamsBeforeLoginThrows) {
     RecordProperty("description", "Throws when get_streams is called before authentication.");
     auto client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(client.GetStreams(), std::exception);
+    ASSERT_THROW(client.GetStreams(), iggy::IggyException);
     ASSERT_NO_THROW(client.Connect());
-    ASSERT_THROW(client.GetStreams(), std::exception);
+    ASSERT_THROW(client.GetStreams(), iggy::IggyException);
     ASSERT_NO_THROW(client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(client.Disconnect());
-    ASSERT_THROW(client.GetStreams(), std::exception);
+    ASSERT_THROW(client.GetStreams(), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, GetStreamsConsistentWithGetStream) {
@@ -590,7 +592,7 @@ TEST_F(E2E_Stream, PurgeStreamOnNonExistentStreamThrows) {
     RecordProperty("description", "Throws when purging a stream that does not exist.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
-    ASSERT_THROW(client.PurgeStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.PurgeStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, PurgeStreamAfterStreamDeletionThrows) {
@@ -602,7 +604,7 @@ TEST_F(E2E_Stream, PurgeStreamAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client.PurgeStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(client.PurgeStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, PurgeStreamPreservesStreamMetadata) {
@@ -950,10 +952,10 @@ TEST_F(E2E_Stream, PurgeStreamBeforeLoginThrows) {
 
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(unauthenticated_client.PurgeStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(unauthenticated_client.PurgeStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Connect());
-    ASSERT_THROW(unauthenticated_client.PurgeStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(unauthenticated_client.PurgeStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(unauthenticated_client.Disconnect());
-    ASSERT_THROW(unauthenticated_client.PurgeStream(iggy::Identifier::String(stream_name)), std::exception);
+    ASSERT_THROW(unauthenticated_client.PurgeStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 }

@@ -21,6 +21,48 @@
 
 namespace iggy {
 
+namespace {
+
+rust::Vec<ffi::HeaderEntry> ToFfiRawOptions(const std::map<std::string, std::string> &raw_options) {
+    rust::Vec<ffi::HeaderEntry> ffi_options;
+    ffi_options.reserve(raw_options.size());
+    for (const auto &[key, value] : raw_options) {
+        ffi::HeaderEntry ffi_entry;
+        ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
+        ffi_entry.key.value.reserve(key.size());
+        for (const char character : key) {
+            ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
+        }
+        ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
+        ffi_entry.value.value.reserve(value.size());
+        for (const char character : value) {
+            ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
+        }
+        ffi_options.push_back(std::move(ffi_entry));
+    }
+    return ffi_options;
+}
+
+template <typename FfiOptions, typename Options>
+void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
+    if (const auto value = options.CompressionAlgorithm()) {
+        ffi_options.has_compression_algorithm = true;
+        ffi_options.compression_algorithm     = std::string(value->Value());
+    }
+    if (const auto value = options.MessageExpiry()) {
+        ffi_options.has_message_expiry   = true;
+        ffi_options.message_expiry_kind  = std::string(value->Kind());
+        ffi_options.message_expiry_value = value->Value();
+    }
+    if (const auto value = options.MaxTopicSize()) {
+        ffi_options.has_max_topic_size = true;
+        ffi_options.max_topic_size     = std::string(value->Value());
+    }
+    ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
+}
+
+}  // namespace
+
 IggyBlockingClient::IggyBlockingClient(IggyBlockingClient &&other) noexcept
     : client_(std::exchange(other.client_, nullptr)) {}
 
@@ -68,22 +110,7 @@ StreamDetails IggyBlockingClient::CreateStream(std::string name) {
 
 void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options) {
     RethrowAsIggyException([this, &stream, &name, &options] {
-        rust::Vec<ffi::HeaderEntry> ffi_options;
-        ffi_options.reserve(options.RawEntries().size());
-        for (const auto &entry : options.RawEntries()) {
-            ffi::HeaderEntry ffi_entry;
-            ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
-            ffi_entry.key.value.reserve(entry.first.size());
-            for (char character : entry.first) {
-                ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
-            }
-            ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
-            ffi_entry.value.value.reserve(entry.second.size());
-            for (char character : entry.second) {
-                ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
-            }
-            ffi_options.push_back(std::move(ffi_entry));
-        }
+        auto ffi_options = ToFfiRawOptions(options.RawEntries());
         Handle()->update_stream(stream.ToFfi(), name, std::move(ffi_options));
     });
 }
@@ -117,36 +144,14 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
                                              std::string name,
                                              const TopicCreateOptions &options) {
     return RethrowAsIggyException([this, &stream, &name, &options] {
-        ffi::TopicCreateOptions ffi_options;
+        ffi::TopicCreateOptions ffi_options{};
+        SetMutableTopicOptions(ffi_options, options);
         if (auto value = options.PartitionsCount()) {
             ffi_options.has_partitions_count = true;
             ffi_options.partitions_count     = *value;
         } else {
             ffi_options.has_partitions_count = false;
             ffi_options.partitions_count     = 0;
-        }
-        if (auto value = options.CompressionAlgorithm()) {
-            ffi_options.has_compression_algorithm = true;
-            ffi_options.compression_algorithm     = std::string(value->Value());
-        } else {
-            ffi_options.has_compression_algorithm = false;
-            ffi_options.compression_algorithm     = "";
-        }
-        if (auto value = options.MessageExpiry()) {
-            ffi_options.has_message_expiry   = true;
-            ffi_options.message_expiry_kind  = std::string(value->Kind());
-            ffi_options.message_expiry_value = value->Value();
-        } else {
-            ffi_options.has_message_expiry   = false;
-            ffi_options.message_expiry_kind  = "";
-            ffi_options.message_expiry_value = 0;
-        }
-        if (auto value = options.MaxTopicSize()) {
-            ffi_options.has_max_topic_size = true;
-            ffi_options.max_topic_size     = std::string(value->Value());
-        } else {
-            ffi_options.has_max_topic_size = false;
-            ffi_options.max_topic_size     = "";
         }
         if (auto value = options.SegmentSize()) {
             ffi_options.has_segment_size = true;
@@ -190,22 +195,6 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_preallocate_segments = false;
             ffi_options.preallocate_segments     = false;
         }
-        ffi_options.raw_options.reserve(options.RawEntries().size());
-        for (const auto &entry : options.RawEntries()) {
-            ffi::HeaderEntry ffi_entry;
-            ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
-            ffi_entry.key.value.reserve(entry.first.size());
-            for (char character : entry.first) {
-                ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
-            }
-            ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
-            ffi_entry.value.value.reserve(entry.second.size());
-            for (char character : entry.second) {
-                ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
-            }
-            ffi_options.raw_options.push_back(std::move(ffi_entry));
-        }
-
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options)));
     });
 }
@@ -215,45 +204,8 @@ void IggyBlockingClient::UpdateTopic(const Identifier &stream,
                                      std::string name,
                                      const TopicUpdateOptions &options) {
     RethrowAsIggyException([this, &stream, &topic, &name, &options] {
-        ffi::TopicUpdateOptions ffi_options;
-        if (auto value = options.CompressionAlgorithm()) {
-            ffi_options.has_compression_algorithm = true;
-            ffi_options.compression_algorithm     = std::string(value->Value());
-        } else {
-            ffi_options.has_compression_algorithm = false;
-            ffi_options.compression_algorithm     = "";
-        }
-        if (auto value = options.MessageExpiry()) {
-            ffi_options.has_message_expiry   = true;
-            ffi_options.message_expiry_kind  = std::string(value->Kind());
-            ffi_options.message_expiry_value = value->Value();
-        } else {
-            ffi_options.has_message_expiry   = false;
-            ffi_options.message_expiry_kind  = "";
-            ffi_options.message_expiry_value = 0;
-        }
-        if (auto value = options.MaxTopicSize()) {
-            ffi_options.has_max_topic_size = true;
-            ffi_options.max_topic_size     = std::string(value->Value());
-        } else {
-            ffi_options.has_max_topic_size = false;
-            ffi_options.max_topic_size     = "";
-        }
-        ffi_options.raw_options.reserve(options.RawEntries().size());
-        for (const auto &entry : options.RawEntries()) {
-            ffi::HeaderEntry ffi_entry;
-            ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
-            ffi_entry.key.value.reserve(entry.first.size());
-            for (char character : entry.first) {
-                ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
-            }
-            ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
-            ffi_entry.value.value.reserve(entry.second.size());
-            for (char character : entry.second) {
-                ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
-            }
-            ffi_options.raw_options.push_back(std::move(ffi_entry));
-        }
+        ffi::TopicUpdateOptions ffi_options{};
+        SetMutableTopicOptions(ffi_options, options);
 
         Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), name, std::move(ffi_options));
     });

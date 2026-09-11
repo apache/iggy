@@ -167,7 +167,6 @@ class Identifier final {
   private:
     Identifier(Kind kind, std::variant<std::uint32_t, std::string> value) : kind_(kind), value_(std::move(value)) {}
 
-    static Identifier FromFfi(ffi::Identifier identifier);
     ffi::Identifier ToFfi() const;
 
     friend class IggyBlockingClient;
@@ -1004,8 +1003,14 @@ class Expiry final {
      * @brief Creates a time-based expiry policy.
      * @param micros Message lifetime in microseconds.
      * @return Time-based expiry policy.
+     * @throws std::invalid_argument if @p micros is zero.
      */
-    static Expiry Duration(std::uint64_t micros) { return Expiry("duration", micros); }
+    static Expiry Duration(std::uint64_t micros) {
+        if (micros == 0) {
+            throw std::invalid_argument("Expiry duration must be greater than zero");
+        }
+        return Expiry("duration", micros);
+    }
 
     /**
      * @brief Returns the expiry policy kind.
@@ -1054,8 +1059,7 @@ class TopicCreateOptions final {
 
     /**
      * @brief Returns the number of partitions to create.
-     * @return Configured partition count, or `std::nullopt` to use the server
-     *         default.
+     * @return Configured partition count, or `std::nullopt` to default to 1.
      */
     [[nodiscard]] std::optional<std::uint32_t> PartitionsCount() const noexcept { return partitions_count_; }
 
@@ -1537,146 +1541,6 @@ class PollingStrategy final {
 
     std::string polling_strategy_kind_;
     std::uint64_t polling_strategy_value_;
-};
-
-namespace detail {
-
-/// Numeric option values are little-endian on the wire. Encoded byte by byte so
-/// a big-endian host produces the same block as a little-endian one.
-template <typename Value>
-std::vector<std::uint8_t> to_little_endian_bytes(const Value value) {
-    std::vector<std::uint8_t> bytes{};
-    bytes.reserve(sizeof(Value));
-    for (std::size_t index{}; index < sizeof(Value); ++index) {
-        bytes.push_back(static_cast<std::uint8_t>((value >> (index * 8)) & 0xFF));
-    }
-
-    return bytes;
-}
-
-inline std::vector<std::uint8_t> to_bool_bytes(const bool value) {
-    std::vector<std::uint8_t> bytes{};
-    bytes.push_back(static_cast<std::uint8_t>(value ? 1 : 0));
-
-    return bytes;
-}
-
-inline std::vector<std::uint8_t> to_key_bytes(const std::string_view key) {
-    std::vector<std::uint8_t> bytes{};
-    bytes.reserve(key.size());
-    for (const char character : key) {
-        bytes.push_back(static_cast<std::uint8_t>(character));
-    }
-
-    return bytes;
-}
-
-/// An option key is always `String`-kinded. Only the value kind varies per key.
-inline HeaderEntry to_option_entry(const std::string_view key,
-                                   const HeaderKind value_kind,
-                                   std::vector<std::uint8_t> value) {
-    return HeaderEntry::Create(HeaderField::Create(HeaderKind::String, to_key_bytes(key)),
-                               HeaderField::Create(value_kind, std::move(value)));
-}
-
-}  // namespace detail
-
-/**
- * @brief Creates catalog entries for ResourceOptions::Explicit().
- *
- * Each factory encodes one key from the server's topic option catalog using
- * that key's required value kind. The server rejects unknown keys and values
- * encoded with a different kind.
- *
- * For example, pass
- * `ResourceOptions::Explicit({TopicOption::SegmentSize(1024 * 1024)})` to
- * CreateTopic(). The server rejects unknown keys and values encoded with a
- * different kind.
- *
- * @note These options are accepted only during topic creation. UpdateTopic()
- *       rejects them because they define how partition storage is created.
- *       Changing them later could leave existing and new segments with
- *       different storage settings.
- */
-class TopicOption final {
-  public:
-    /**
-     * @brief Set the size at which this topic's segments rotate.
-     *
-     * Must be a multiple of 512 bytes, at least 1 MiB, and no larger than the
-     * server's segment ceiling.
-     *
-     * @param bytes Segment size in bytes.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry SegmentSize(const std::uint64_t bytes) {
-        return detail::to_option_entry("segment_size", HeaderKind::Uint64, detail::to_little_endian_bytes(bytes));
-    }
-
-    /**
-     * @brief Choose the message completion policy.
-     *
-     * @param value The policy, defaulting to Replicated.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry Durability(const ::iggy::Durability value = ::iggy::Durability::Replicated) {
-        return detail::to_option_entry("durability", HeaderKind::String, detail::to_key_bytes(to_string(value)));
-    }
-
-    /**
-     * @brief Choose explicit offset completion independently of message durability.
-     * @param value The policy, defaulting to Replicated.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry ConsumerOffsetDurability(const ::iggy::Durability value = ::iggy::Durability::Replicated) {
-        return detail::to_option_entry("consumer_offset_durability", HeaderKind::String,
-                                       detail::to_key_bytes(to_string(value)));
-    }
-
-    /**
-     * @brief Flush the journal once it holds this many messages.
-     *
-     * Must be non-zero. Paired with
-     * `SizeOfMessagesRequiredToSave(bytes)`: whichever threshold trips
-     * first flushes.
-     *
-     * @param messages Message count at which to flush the journal.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry MessagesRequiredToSave(const std::uint32_t messages) {
-        return detail::to_option_entry("messages_required_to_save", HeaderKind::Uint32,
-                                       detail::to_little_endian_bytes(messages));
-    }
-
-    /**
-     * @brief Flush the journal once it holds this many bytes.
-     *
-     * Capped at 1 GiB: a threshold above the largest a segment may be never
-     * trips, and the journal does not survive a crash.
-     *
-     * @param bytes Byte count at which to flush the journal.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry SizeOfMessagesRequiredToSave(const std::uint64_t bytes) {
-        return detail::to_option_entry("size_of_messages_required_to_save", HeaderKind::Uint64,
-                                       detail::to_little_endian_bytes(bytes));
-    }
-
-    /**
-     * @brief Choose whether a segment's bytes are reserved on disk when it is created.
-     *
-     * Reserves `segment_size * partitions_count` up front, which the server
-     * caps at 64 GiB per topic.
-     *
-     * @param enabled Whether to reserve segment storage on disk.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry PreallocateSegments(const bool enabled) {
-        return detail::to_option_entry("preallocate_segments", HeaderKind::Bool, detail::to_bool_bytes(enabled));
-    }
-
-  private:
-    TopicOption() = delete;
 };
 
 /**

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::ffi;
+use std::{collections::BTreeMap, str::FromStr};
+
 use bytes::Bytes;
 use iggy::prelude::{
     CompressionAlgorithm as RustCompressionAlgorithm,
@@ -42,7 +43,8 @@ use iggy_common::{
     TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
     UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
-use std::collections::BTreeMap;
+
+use crate::ffi;
 
 impl From<RustIdentifier> for ffi::Identifier {
     fn from(identifier: RustIdentifier) -> Self {
@@ -517,6 +519,30 @@ pub(crate) fn ffi_options_to_raw(
     Ok(raw)
 }
 
+fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
+    match kind {
+        "server_default" | "default" => Ok(RustIggyExpiry::ServerDefault),
+        "never_expire" => Ok(RustIggyExpiry::NeverExpire),
+        "duration" if value == 0 => {
+            Err("message expiry duration must be greater than zero".to_string())
+        }
+        "duration" => Ok(RustIggyExpiry::ExpireDuration(
+            iggy::prelude::IggyDuration::from(value),
+        )),
+        _ => Err(format!("invalid message expiry kind '{kind}'")),
+    }
+}
+
+fn parse_compression_algorithm(value: &str) -> Result<RustCompressionAlgorithm, String> {
+    RustCompressionAlgorithm::from_str(value)
+        .map_err(|error| format!("invalid compression algorithm '{value}': {error}"))
+}
+
+fn parse_max_topic_size(value: &str) -> Result<RustMaxTopicSize, String> {
+    RustMaxTopicSize::from_str(value)
+        .map_err(|error| format!("invalid max topic size '{value}': {error}"))
+}
+
 impl From<RustOptionSpec> for ffi::OptionSpec {
     fn from(spec: RustOptionSpec) -> Self {
         ffi::OptionSpec {
@@ -532,47 +558,21 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
     type Error = String;
 
     fn try_from(options: ffi::TopicCreateOptions) -> Result<Self, Self::Error> {
-        use std::str::FromStr;
         let compression_algorithm = if options.has_compression_algorithm {
-            Some(
-                RustCompressionAlgorithm::from_str(&options.compression_algorithm).map_err(
-                    |error| {
-                        format!(
-                            "invalid compression algorithm '{}': {error}",
-                            options.compression_algorithm
-                        )
-                    },
-                )?,
-            )
+            Some(parse_compression_algorithm(&options.compression_algorithm)?)
         } else {
             None
         };
         let message_expiry = if options.has_message_expiry {
-            Some(match options.message_expiry_kind.as_str() {
-                "server_default" | "default" => RustIggyExpiry::ServerDefault,
-                "never_expire" => RustIggyExpiry::NeverExpire,
-                "duration" => RustIggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(
-                    options.message_expiry_value,
-                )),
-                _ => {
-                    return Err(format!(
-                        "invalid message expiry kind '{}'",
-                        options.message_expiry_kind
-                    ));
-                }
-            })
+            Some(parse_message_expiry(
+                &options.message_expiry_kind,
+                options.message_expiry_value,
+            )?)
         } else {
             None
         };
         let max_topic_size = if options.has_max_topic_size {
-            Some(
-                RustMaxTopicSize::from_str(&options.max_topic_size).map_err(|error| {
-                    format!(
-                        "invalid max topic size '{}': {error}",
-                        options.max_topic_size
-                    )
-                })?,
-            )
+            Some(parse_max_topic_size(&options.max_topic_size)?)
         } else {
             None
         };
@@ -592,7 +592,13 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
         } else {
             RustDurability::default()
         };
-        let raw = ffi_options_to_raw(options.raw_options)?;
+        let mut raw = ffi_options_to_raw(options.raw_options)?;
+        if options.has_durability {
+            raw.remove("durability");
+        }
+        if options.has_consumer_offset_durability {
+            raw.remove("consumer_offset_durability");
+        }
         Ok(RustTopicCreateOptions {
             partitions_count: if options.has_partitions_count {
                 Some(options.partitions_count)
@@ -635,47 +641,21 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
     type Error = String;
 
     fn try_from(options: ffi::TopicUpdateOptions) -> Result<Self, Self::Error> {
-        use std::str::FromStr;
         let compression_algorithm = if options.has_compression_algorithm {
-            Some(
-                RustCompressionAlgorithm::from_str(&options.compression_algorithm).map_err(
-                    |error| {
-                        format!(
-                            "invalid compression algorithm '{}': {error}",
-                            options.compression_algorithm
-                        )
-                    },
-                )?,
-            )
+            Some(parse_compression_algorithm(&options.compression_algorithm)?)
         } else {
             None
         };
         let message_expiry = if options.has_message_expiry {
-            Some(match options.message_expiry_kind.as_str() {
-                "server_default" | "default" => RustIggyExpiry::ServerDefault,
-                "never_expire" => RustIggyExpiry::NeverExpire,
-                "duration" => RustIggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(
-                    options.message_expiry_value,
-                )),
-                _ => {
-                    return Err(format!(
-                        "invalid message expiry kind '{}'",
-                        options.message_expiry_kind
-                    ));
-                }
-            })
+            Some(parse_message_expiry(
+                &options.message_expiry_kind,
+                options.message_expiry_value,
+            )?)
         } else {
             None
         };
         let max_topic_size = if options.has_max_topic_size {
-            Some(
-                RustMaxTopicSize::from_str(&options.max_topic_size).map_err(|error| {
-                    format!(
-                        "invalid max topic size '{}': {error}",
-                        options.max_topic_size
-                    )
-                })?,
-            )
+            Some(parse_max_topic_size(&options.max_topic_size)?)
         } else {
             None
         };
@@ -1037,5 +1017,18 @@ impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
                 .map(ffi::SendMessagesConfirmation::from)
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_reject_zero_message_expiry_duration() {
+        assert_eq!(
+            parse_message_expiry("duration", 0).err().as_deref(),
+            Some("message expiry duration must be greater than zero")
+        );
     }
 }

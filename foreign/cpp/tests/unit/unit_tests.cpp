@@ -28,18 +28,6 @@
 
 #include "iggy.hpp"
 
-namespace {
-
-std::string option_key(const iggy::HeaderEntry &entry) {
-    return std::string(entry.Key().Value().begin(), entry.Key().Value().end());
-}
-
-const std::vector<std::uint8_t> &option_value_bytes(const iggy::HeaderEntry &entry) {
-    return entry.Value().Value();
-}
-
-}  // namespace
-
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::CompressionAlgorithm::None().Value(), "none");
     EXPECT_EQ(iggy::CompressionAlgorithm::Gzip().Value(), "gzip");
@@ -106,6 +94,7 @@ TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
     const auto duration = iggy::Expiry::Duration(15);
     EXPECT_EQ(duration.Kind(), "duration");
     EXPECT_EQ(duration.Value(), static_cast<std::uint64_t>(15));
+    EXPECT_THROW(iggy::Expiry::Duration(0), std::invalid_argument);
 }
 
 TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
@@ -121,23 +110,6 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.SizeOfMessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.PreallocateSegments().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
-}
-
-TEST(TopicOptionTest, DurabilityEncodesCanonicalStrings) {
-    const auto persisted = iggy::TopicOption::Durability(iggy::Durability::Persisted);
-    EXPECT_EQ(persisted.Key().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_key(persisted), "durability");
-    EXPECT_EQ(persisted.Value().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_value_bytes(persisted), (std::vector<std::uint8_t>{'p', 'e', 'r', 's', 'i', 's', 't', 'e', 'd'}));
-
-    const auto offset = iggy::TopicOption::ConsumerOffsetDurability();
-    EXPECT_EQ(offset.Key().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_key(offset), "consumer_offset_durability");
-    EXPECT_EQ(offset.Value().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_value_bytes(offset),
-              (std::vector<std::uint8_t>{'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd'}));
-
-    EXPECT_THROW(iggy::TopicOption::Durability(static_cast<iggy::Durability>(99)), std::invalid_argument);
 }
 
 TEST(TopicCreateOptionsTest, PartitionsCountStoresValue) {
@@ -364,6 +336,36 @@ TEST(IggyExceptionTest, StoresMessage) {
     const std::string message = "boom2";
     const iggy::IggyException from_string(message);
     EXPECT_EQ(std::string(from_string.what()), message);
+}
+
+TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
+    auto client   = iggy::IggyBlockingClient::Builder().Build();
+    auto moved_to = std::move(client);
+    (void)moved_to;
+
+    const auto stream = iggy::Identifier::String("stream");
+    const auto topic  = iggy::Identifier::String("topic");
+
+    EXPECT_THROW(client.Connect(), iggy::IggyException);
+    EXPECT_THROW(client.Disconnect(), iggy::IggyException);
+    EXPECT_THROW(client.Shutdown(), iggy::IggyException);
+    EXPECT_THROW(client.Login("iggy", "iggy"), iggy::IggyException);
+    EXPECT_THROW(client.Logout(), iggy::IggyException);
+    EXPECT_THROW(client.CreateStream("stream"), iggy::IggyException);
+    EXPECT_THROW(client.UpdateStream(stream, "updated-stream"), iggy::IggyException);
+    EXPECT_THROW(client.GetStreams(), iggy::IggyException);
+    EXPECT_THROW(client.GetStream(stream), iggy::IggyException);
+    EXPECT_THROW(client.DeleteStream(stream), iggy::IggyException);
+    EXPECT_THROW(client.PurgeStream(stream), iggy::IggyException);
+    EXPECT_THROW(client.CreateTopic(stream, "topic", iggy::TopicCreateOptions().SetPartitionsCount(1)),
+                 iggy::IggyException);
+    EXPECT_THROW(client.UpdateTopic(stream, topic, "updated-topic"), iggy::IggyException);
+    EXPECT_THROW(client.GetTopics(stream), iggy::IggyException);
+    EXPECT_THROW(client.GetTopic(stream, topic), iggy::IggyException);
+    EXPECT_THROW(client.DeleteTopic(stream, topic), iggy::IggyException);
+    EXPECT_THROW(client.PurgeTopic(stream, topic), iggy::IggyException);
+    EXPECT_THROW(client.CreatePartitions(stream, topic, 1), iggy::IggyException);
+    EXPECT_THROW(client.DeletePartitions(stream, topic, 1), iggy::IggyException);
 }
 
 TEST(AutoLoginKindTest, HasStableDiscriminantsAndZeroInitializedDefault) {

@@ -32,27 +32,6 @@ LoginInfo LoginInfo::FromFfi(ffi::LoginInfo login_info) {
     return LoginInfo(login_info.user_id, std::move(access_token), access_token_expiry);
 }
 
-Identifier Identifier::FromFfi(ffi::Identifier identifier) {
-    const std::string kind(identifier.kind.c_str(), identifier.kind.size());
-    if (kind == "numeric") {
-        if (identifier.length != sizeof(std::uint32_t) || identifier.value.size() != sizeof(std::uint32_t)) {
-            throw IggyException("Invalid numeric identifier returned by Rust");
-        }
-        const auto id = static_cast<std::uint32_t>(identifier.value[0]) |
-                        (static_cast<std::uint32_t>(identifier.value[1]) << 8U) |
-                        (static_cast<std::uint32_t>(identifier.value[2]) << 16U) |
-                        (static_cast<std::uint32_t>(identifier.value[3]) << 24U);
-        return Numeric(id);
-    }
-    if (kind == "string") {
-        if (identifier.length != identifier.value.size()) {
-            throw IggyException("Invalid string identifier returned by Rust");
-        }
-        return String(std::string(identifier.value.begin(), identifier.value.end()));
-    }
-    throw IggyException("Invalid identifier kind returned by Rust");
-}
-
 ffi::Identifier Identifier::ToFfi() const {
     ffi::Identifier identifier{};
     if (kind_ == Kind::Numeric) {
