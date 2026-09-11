@@ -237,7 +237,7 @@ TEST_F(E2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRemainder)
     TrackStream(stream_name);
 
     iggy::TopicCreateOptions options;
-    options.SetPartitionsCount(1).SetRawEntries({{"enforce_fsync", "true"}});
+    options.SetPartitionsCount(1).SetDurability(iggy::Durability::Persisted);
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));
 
     const auto topic_details =
@@ -245,17 +245,25 @@ TEST_F(E2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRemainder)
 
     // Admission re-encodes the block from its own parse, so a value comes back
     // in its key's catalog kind rather than in the kind that was sent.
+    // The SDK sends both durability fields, including the independently
+    // defaulted offset policy.
     const auto &explicit_options = topic_details.Options().Explicit();
-    ASSERT_EQ(explicit_options.size(), 1u);
-    auto explicit_it = explicit_options.find("enforce_fsync");
+    ASSERT_EQ(explicit_options.size(), 2u);
+    auto explicit_it = explicit_options.find("durability");
     ASSERT_NE(explicit_it, explicit_options.end());
-    EXPECT_EQ(explicit_it->second.Kind(), iggy::HeaderKind::Bool);
-    EXPECT_EQ(explicit_it->second.Value(), (std::vector<std::uint8_t>{1}));
+    EXPECT_EQ(explicit_it->second.Kind(), iggy::HeaderKind::String);
+    EXPECT_EQ(explicit_it->second.Value(), (std::vector<std::uint8_t>{'p', 'e', 'r', 's', 'i', 's', 't', 'e', 'd'}));
+    auto offset_it = explicit_options.find("consumer_offset_durability");
+    ASSERT_NE(offset_it, explicit_options.end());
+    EXPECT_EQ(offset_it->second.Kind(), iggy::HeaderKind::String);
+    EXPECT_EQ(offset_it->second.Value(),
+              (std::vector<std::uint8_t>{'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd'}));
 
     EXPECT_FALSE(topic_details.Options().Derived().empty());
     const auto &derived_options = topic_details.Options().Derived();
     EXPECT_EQ(derived_options.count("max_topic_size"), 1u);
-    EXPECT_EQ(derived_options.count("enforce_fsync"), 0u);
+    EXPECT_EQ(derived_options.count("durability"), 0u);
+    EXPECT_EQ(derived_options.count("consumer_offset_durability"), 0u);
 
     iggy::TopicCreateOptions unknown_options;
     unknown_options.SetPartitionsCount(1).SetRawEntries({{"not_a_real_option", "true"}});
@@ -281,7 +289,7 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     iggy::TopicCreateOptions options;
     options.SetPartitionsCount(1)
         .SetSegmentSize(segment_size_bytes)
-        .SetEnforceFsync(true)
+        .SetDurability(iggy::Durability::Persisted)
         .SetMessagesRequiredToSave(messages_required_to_save)
         .SetSizeOfMessagesRequiredToSave(size_of_messages_required_to_save)
         .SetPreallocateSegments(false);
@@ -293,7 +301,8 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
 
     const auto &explicit_options = topic_details.Options().Explicit();
     EXPECT_EQ(explicit_options.count("segment_size"), 1u);
-    EXPECT_EQ(explicit_options.count("enforce_fsync"), 1u);
+    EXPECT_EQ(explicit_options.count("durability"), 1u);
+    EXPECT_EQ(explicit_options.count("consumer_offset_durability"), 1u);
     EXPECT_EQ(explicit_options.count("messages_required_to_save"), 1u);
     EXPECT_EQ(explicit_options.count("size_of_messages_required_to_save"), 1u);
     EXPECT_EQ(explicit_options.count("preallocate_segments"), 1u);
@@ -304,12 +313,13 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
         EXPECT_EQ(it->second.Kind(), expected) << "Wrong kind for key: " << key;
     };
     check_kind("segment_size", iggy::HeaderKind::Uint64);
-    check_kind("enforce_fsync", iggy::HeaderKind::Bool);
+    check_kind("durability", iggy::HeaderKind::String);
+    check_kind("consumer_offset_durability", iggy::HeaderKind::String);
     check_kind("messages_required_to_save", iggy::HeaderKind::Uint32);
     check_kind("size_of_messages_required_to_save", iggy::HeaderKind::Uint64);
     check_kind("preallocate_segments", iggy::HeaderKind::Bool);
 
-    EXPECT_EQ(explicit_options.size(), 5u);
+    EXPECT_EQ(explicit_options.size(), 6u);
     EXPECT_EQ(topic_details.Options().Derived().count("segment_size"), 0u)
         << "segment_size was set explicitly, so it cannot be derived";
 }
@@ -325,18 +335,18 @@ TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
     ASSERT_NO_THROW({ topic_options = client->describe_options("topic"); });
 
     const iggy::ffi::OptionSpec *segment_size = nullptr;
-    bool found_enforce_fsync                  = false;
+    bool found_durability                     = false;
     for (const auto &option : topic_options) {
         const std::string key = static_cast<std::string>(option.key);
         if (key == "segment_size") {
             segment_size = &option;
-        } else if (key == "enforce_fsync") {
-            found_enforce_fsync = true;
+        } else if (key == "durability") {
+            found_durability = true;
         }
     }
 
     ASSERT_NE(segment_size, nullptr) << "Topic catalog is missing segment_size";
-    EXPECT_TRUE(found_enforce_fsync) << "Topic catalog is missing enforce_fsync";
+    EXPECT_TRUE(found_durability) << "Topic catalog is missing durability";
     EXPECT_EQ(segment_size->kind, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::Uint64));
     EXPECT_FALSE(segment_size->default_value.empty());
     EXPECT_FALSE(segment_size->description.empty());

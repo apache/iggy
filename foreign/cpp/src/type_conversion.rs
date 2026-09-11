@@ -19,10 +19,10 @@ use crate::ffi;
 use bytes::Bytes;
 use iggy::prelude::{
     CompressionAlgorithm as RustCompressionAlgorithm,
-    ConsumerGroupDetails as RustConsumerGroupDetails, IdKind, Identifier as RustIdentifier,
-    IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry, IggyMessage as RustIggyMessage,
-    MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec, Partition as RustPartition,
-    PolledMessages as RustPolledMessages,
+    ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
+    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
+    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec,
+    Partition as RustPartition, PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
     StreamDetails as RustStreamDetails, Topic as RustTopic,
@@ -576,6 +576,22 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
         } else {
             None
         };
+        let durability = if options.has_durability {
+            RustDurability::from_str(&options.durability)
+                .map_err(|error| format!("invalid durability '{}': {error}", options.durability))?
+        } else {
+            RustDurability::default()
+        };
+        let consumer_offset_durability = if options.has_consumer_offset_durability {
+            RustDurability::from_str(&options.consumer_offset_durability).map_err(|error| {
+                format!(
+                    "invalid consumer offset durability '{}': {error}",
+                    options.consumer_offset_durability
+                )
+            })?
+        } else {
+            RustDurability::default()
+        };
         let raw = ffi_options_to_raw(options.raw_options)?;
         Ok(RustTopicCreateOptions {
             partitions_count: if options.has_partitions_count {
@@ -591,11 +607,8 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             } else {
                 None
             },
-            enforce_fsync: if options.has_enforce_fsync {
-                Some(options.enforce_fsync)
-            } else {
-                None
-            },
+            durability,
+            consumer_offset_durability,
             messages_required_to_save: if options.has_messages_required_to_save {
                 Some(options.messages_required_to_save)
             } else {

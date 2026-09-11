@@ -443,72 +443,8 @@ impl Client {
     ) -> Result<ffi::TopicDetails, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
-        let rust_compression_algorithm = match compression_algorithm.to_lowercase().as_str() {
-            "" | "none" => RustCompressionAlgorithm::None,
-            _ => RustCompressionAlgorithm::from_str(&compression_algorithm).map_err(|error| {
-                format!(
-                    "Could not create topic '{topic_name}': invalid compression algorithm '{compression_algorithm}': {error}"
-                )
-            })?,
-        };
-        let rust_message_expiry = match message_expiry_kind.as_str() {
-            "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
-            "never_expire" => RustIggyExpiry::NeverExpire,
-            "duration" => RustIggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(
-                message_expiry_value,
-            )),
-            _ => {
-                return Err(format!(
-                    "Could not create topic '{topic_name}': invalid message expiry kind '{message_expiry_kind}'"
-                ));
-            }
-        };
-        let rust_max_topic_size = match max_topic_size.as_str() {
-            "" | "server_default" | "0" => RustMaxTopicSize::ServerDefault,
-            _ => RustMaxTopicSize::from_str(&max_topic_size).map_err(|error| {
-                format!(
-                    "Could not create topic '{topic_name}': invalid max topic size '{max_topic_size}': {error}"
-                )
-            })?,
-        };
-
-        let mut raw = crate::type_conversion::ffi_options_to_raw(options)
+        let options = RustTopicCreateOptions::try_from(options)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
-
-        // Both completion policies are sent explicitly and default independently.
-        let durability = raw
-            .remove("durability")
-            .map(|value| value.parse::<iggy::prelude::Durability>())
-            .transpose()
-            .map_err(|_| {
-                iggy::prelude::IggyError::InvalidOptionValue("durability".to_owned()).to_string()
-            })?
-            .unwrap_or_default();
-        let consumer_offset_durability = raw
-            .remove("consumer_offset_durability")
-            .map(|value| value.parse::<iggy::prelude::Durability>())
-            .transpose()
-            .map_err(|_| {
-                iggy::prelude::IggyError::InvalidOptionValue(
-                    "consumer_offset_durability".to_owned(),
-                )
-                .to_string()
-            })?
-            .unwrap_or_default();
-        let options = TopicCreateOptions {
-            durability,
-            consumer_offset_durability,
-            partitions_count: Some(partitions_count),
-            compression_algorithm: (rust_compression_algorithm
-                != RustCompressionAlgorithm::default())
-            .then_some(rust_compression_algorithm),
-            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
-                .then_some(rust_message_expiry),
-            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
-                .then_some(rust_max_topic_size),
-            raw,
-            ..TopicCreateOptions::default()
-        };
 
         RUNTIME.block_on(async {
             let topic_details = self

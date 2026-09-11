@@ -155,12 +155,19 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_segment_size = false;
             ffi_options.segment_size     = 0;
         }
-        if (auto value = options.EnforceFsync()) {
-            ffi_options.has_enforce_fsync = true;
-            ffi_options.enforce_fsync     = *value;
+        if (auto value = options.Durability()) {
+            ffi_options.has_durability = true;
+            ffi_options.durability     = std::string(iggy::to_string(*value));
         } else {
-            ffi_options.has_enforce_fsync = false;
-            ffi_options.enforce_fsync     = false;
+            ffi_options.has_durability = false;
+            ffi_options.durability     = "";
+        }
+        if (auto value = options.ConsumerOffsetDurability()) {
+            ffi_options.has_consumer_offset_durability = true;
+            ffi_options.consumer_offset_durability     = std::string(iggy::to_string(*value));
+        } else {
+            ffi_options.has_consumer_offset_durability = false;
+            ffi_options.consumer_offset_durability     = "";
         }
         if (auto value = options.MessagesRequiredToSave()) {
             ffi_options.has_messages_required_to_save = true;

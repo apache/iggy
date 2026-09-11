@@ -115,7 +115,8 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.MessageExpiry().has_value());
     EXPECT_FALSE(options.MaxTopicSize().has_value());
     EXPECT_FALSE(options.SegmentSize().has_value());
-    EXPECT_FALSE(options.EnforceFsync().has_value());
+    EXPECT_FALSE(options.Durability().has_value());
+    EXPECT_FALSE(options.ConsumerOffsetDurability().has_value());
     EXPECT_FALSE(options.MessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.SizeOfMessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.PreallocateSegments().has_value());
@@ -155,16 +156,21 @@ TEST(TopicCreateOptionsTest, SegmentSizeStoresValue) {
     EXPECT_EQ(*options.SegmentSize(), 0x0102030405060708ULL);
 }
 
-TEST(TopicCreateOptionsTest, EnforceFsyncStoresBool) {
-    iggy::TopicCreateOptions enabled;
-    enabled.SetEnforceFsync(true);
-    ASSERT_TRUE(enabled.EnforceFsync().has_value());
-    EXPECT_EQ(*enabled.EnforceFsync(), true);
+TEST(TopicCreateOptionsTest, DurabilityStoresPolicy) {
+    iggy::TopicCreateOptions persisted;
+    persisted.SetDurability(iggy::Durability::Persisted);
+    ASSERT_TRUE(persisted.Durability().has_value());
+    EXPECT_EQ(*persisted.Durability(), iggy::Durability::Persisted);
 
-    iggy::TopicCreateOptions disabled;
-    disabled.SetEnforceFsync(false);
-    ASSERT_TRUE(disabled.EnforceFsync().has_value());
-    EXPECT_EQ(*disabled.EnforceFsync(), false);
+    iggy::TopicCreateOptions replicated;
+    replicated.SetDurability(iggy::Durability::Replicated);
+    ASSERT_TRUE(replicated.Durability().has_value());
+    EXPECT_EQ(*replicated.Durability(), iggy::Durability::Replicated);
+
+    iggy::TopicCreateOptions offset;
+    offset.SetConsumerOffsetDurability(iggy::Durability::Persisted);
+    ASSERT_TRUE(offset.ConsumerOffsetDurability().has_value());
+    EXPECT_EQ(*offset.ConsumerOffsetDurability(), iggy::Durability::Persisted);
 }
 
 TEST(TopicCreateOptionsTest, MessagesRequiredToSaveStoresValue) {
@@ -210,9 +216,9 @@ TEST(TopicCreateOptionsTest, MaximumValuesPreserved) {
 
 TEST(TopicCreateOptionsTest, ChainingAndOverwrite) {
     iggy::TopicCreateOptions options;
-    options.SetSegmentSize(1024).SetEnforceFsync(true).SetMessagesRequiredToSave(512);
+    options.SetSegmentSize(1024).SetDurability(iggy::Durability::Persisted).SetMessagesRequiredToSave(512);
     EXPECT_EQ(*options.SegmentSize(), 1024ULL);
-    EXPECT_EQ(*options.EnforceFsync(), true);
+    EXPECT_EQ(*options.Durability(), iggy::Durability::Persisted);
     EXPECT_EQ(*options.MessagesRequiredToSave(), 512u);
     options.SetSegmentSize(2048);
     EXPECT_EQ(*options.SegmentSize(), 2048ULL);

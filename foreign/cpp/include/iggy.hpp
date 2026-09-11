@@ -1028,6 +1028,18 @@ class Expiry final {
     std::uint64_t expiry_value_;
 };
 
+enum class Durability { Replicated, Persisted };
+
+constexpr std::string_view to_string(const Durability durability) {
+    switch (durability) {
+        case Durability::Replicated:
+            return "replicated";
+        case Durability::Persisted:
+            return "persisted";
+    }
+    throw std::invalid_argument("Unknown durability");
+}
+
 /**
  * @brief Options for creating a topic.
  *
@@ -1140,18 +1152,40 @@ class TopicCreateOptions final {
     }
 
     /**
-     * @brief Returns whether partition writes are synchronously flushed to disk.
-     * @return Configured setting, or `std::nullopt` to use the server default.
+     * @brief Returns the message completion policy.
+     * @return Configured policy, or `std::nullopt` to use the server default
+     *         (`replicated`).
      */
-    [[nodiscard]] std::optional<bool> EnforceFsync() const noexcept { return enforce_fsync_; }
+    [[nodiscard]] std::optional<::iggy::Durability> Durability() const noexcept { return durability_; }
 
     /**
-     * @brief Sets whether partition writes are synchronously flushed to disk.
-     * @param enforce_fsync `true` to fsync writes; `false` otherwise.
+     * @brief Sets the message completion policy.
+     * @param durability `replicated` or `persisted`, independent of the
+     *        consumer-offset policy.
      * @return Reference to this options object.
      */
-    TopicCreateOptions &SetEnforceFsync(bool enforce_fsync) noexcept {
-        enforce_fsync_ = enforce_fsync;
+    TopicCreateOptions &SetDurability(::iggy::Durability durability) noexcept {
+        durability_ = durability;
+        return *this;
+    }
+
+    /**
+     * @brief Returns the consumer-offset completion policy.
+     * @return Configured policy, or `std::nullopt` to use the server default
+     *         (`replicated`).
+     */
+    [[nodiscard]] std::optional<::iggy::Durability> ConsumerOffsetDurability() const noexcept {
+        return consumer_offset_durability_;
+    }
+
+    /**
+     * @brief Sets the consumer-offset completion policy.
+     * @param durability `replicated` or `persisted`, independent of the
+     *        message policy.
+     * @return Reference to this options object.
+     */
+    TopicCreateOptions &SetConsumerOffsetDurability(::iggy::Durability durability) noexcept {
+        consumer_offset_durability_ = durability;
         return *this;
     }
 
@@ -1263,7 +1297,8 @@ class TopicCreateOptions final {
     std::optional<::iggy::Expiry> message_expiry_;
     std::optional<::iggy::MaxTopicSize> max_topic_size_;
     std::optional<std::uint64_t> segment_size_;
-    std::optional<bool> enforce_fsync_;
+    std::optional<::iggy::Durability> durability_;
+    std::optional<::iggy::Durability> consumer_offset_durability_;
     std::optional<std::uint32_t> messages_required_to_save_;
     std::optional<std::uint64_t> size_of_messages_required_to_save_;
     std::optional<bool> preallocate_segments_;
@@ -1545,18 +1580,6 @@ inline HeaderEntry to_option_entry(const std::string_view key,
 }
 
 }  // namespace detail
-
-enum class Durability { Replicated, Persisted };
-
-constexpr std::string_view to_string(const Durability durability) {
-    switch (durability) {
-        case Durability::Replicated:
-            return "replicated";
-        case Durability::Persisted:
-            return "persisted";
-    }
-    throw std::invalid_argument("Unknown durability");
-}
 
 /**
  * @brief Creates catalog entries for ResourceOptions::Explicit().
