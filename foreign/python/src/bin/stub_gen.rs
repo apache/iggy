@@ -51,10 +51,12 @@ fn main() -> Result<()> {
     // a cwd-relative path leaves the tracked stub without its license header.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("apache_iggy.pyi");
     let mut f = File::open(&path)?;
-    let mut content = LICENSE.as_bytes().to_owned();
-    f.read_to_end(&mut content)?;
+    let mut content = LICENSE.to_owned();
+    f.read_to_string(&mut content)?;
+    content = content.replacen("__all__ = [", "__all__ = [\n    \"Durability\",", 1);
+    content.push_str("\nclass Durability(str, enum.Enum):\n    REPLICATED = 'replicated'\n    PERSISTED = 'persisted'\n");
 
     let mut f = File::create(path)?;
-    f.write_all(content.as_slice())?;
+    f.write_all(content.as_bytes())?;
     Ok(())
 }

@@ -105,7 +105,7 @@ services:
     environment:
       <<: *cluster-topology
       RUST_LOG: info
-      IGGY_SYSTEM_PATH: local_data_leader
+      IGGY_PATH: local_data_leader
       IGGY_TCP_ADDRESS: 0.0.0.0:8091
       IGGY_HTTP_ADDRESS: 0.0.0.0:3001
       IGGY_QUIC_ADDRESS: 0.0.0.0:8081
@@ -131,7 +131,7 @@ services:
     environment:
       <<: *cluster-topology
       RUST_LOG: info
-      IGGY_SYSTEM_PATH: local_data_follower
+      IGGY_PATH: local_data_follower
       IGGY_TCP_ADDRESS: 0.0.0.0:8092
       IGGY_HTTP_ADDRESS: 0.0.0.0:3002
       IGGY_QUIC_ADDRESS: 0.0.0.0:8082

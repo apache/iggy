@@ -110,7 +110,13 @@ public class TopicsTcpClient implements TopicsClient {
             Map<String, HeaderValue> options) {
 
         var payload = createTopicPayload(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, options);
+                streamId,
+                partitionsCount,
+                compressionAlgorithm,
+                messageExpiry,
+                maxTopicSize,
+                name,
+                org.apache.iggy.topic.TopicOptions.withDurabilityDefaults(options));
 
         return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
             try {

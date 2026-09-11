@@ -81,6 +81,30 @@ pub(in crate::boot) async fn build_shard_for_thread(
     roster_cells: &RosterCells,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
+    let retired_key: iggy_common::HeaderKey =
+        "enforce_fsync".parse().expect("retired key is valid");
+    let enabled = iggy_common::HeaderValue::from(true);
+    let retired_durability = metadata.mux_stm.streams().read(|inner| {
+        inner.items.iter().find_map(|(stream_id, stream)| {
+            stream.topics.iter().find_map(|(topic_id, topic)| {
+                topic
+                    .options
+                    .get(&retired_key)
+                    .is_some_and(|option| option.value == enabled)
+                    .then_some((stream_id, topic_id))
+            })
+        })
+    });
+    if let Some((stream_id, topic_id)) = retired_durability {
+        error!(
+            stream_id,
+            topic_id,
+            "stored topic uses removed enforce_fsync=true. Recreate it with explicit durability in a data directory prepared for this version. No legacy durability translation is performed"
+        );
+        return Err(ServerError::Iggy(Box::new(
+            iggy_common::IggyError::UnsupportedOptionKey("enforce_fsync".to_owned()),
+        )));
+    }
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
         inner
             .items
@@ -107,8 +131,8 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // At-rest encryption: built once per shard from the shared config; the
     // ingestion path encrypts on the primary and the poll reply decrypts.
     // A bad key fails the boot rather than silently serving plaintext.
-    let encryptor = if config.system.encryption.enabled {
-        let aes = Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key)
+    let encryptor = if config.encryption.enabled {
+        let aes = Aes256GcmEncryptor::from_base64_key(&config.encryption.key)
             .map_err(|error| ServerError::Iggy(Box::new(error)))?;
         Some(Arc::new(EncryptorKind::Aes256Gcm(aes)))
     } else {
@@ -121,16 +145,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
             size_of_messages_required_to_save: IggyByteSize::from(
                 iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
             ),
-            enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
-            consumer_offset_enforce_fsync: config.partition.consumer_offset_enforce_fsync,
-            validate_checksum: config.system.partition.validate_checksum,
+
+            validate_checksum: config.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             encryptor,
             path_layout: partitions::PartitionPathLayout {
-                streams_root: config.system.get_streams_path(),
-                topics_dir: config.system.topic.path.clone(),
-                partitions_dir: config.system.partition.path.clone(),
+                streams_root: config.get_streams_path(),
             },
         },
         owned_partitions_capacity,
@@ -242,7 +263,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     } = wire_shell_handlers(
         &bus,
         &shard_handle,
-        Arc::clone(&config.system),
+        Arc::new(config.clone()),
         config.personal_access_token.max_tokens_per_user,
     );
     sessions
@@ -662,6 +683,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn partition_runtime_and_server_use_the_same_fixed_directory_layout() {
+        let server = ServerConfig {
+            path: "/var/lib/iggy".to_owned(),
+            ..ServerConfig::default()
+        };
+        let partition = PartitionsConfig {
+            messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+            size_of_messages_required_to_save: IggyByteSize::from(
+                iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            validate_checksum: server.partition.validate_checksum,
+            segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            encryptor: None,
+            path_layout: partitions::PartitionPathLayout {
+                streams_root: server.get_streams_path(),
+            },
+        };
+        for (stream, topic, id) in [(0, 0, 0), (1, 2, 3), (23, 45, 67)] {
+            assert_eq!(
+                server.get_partition_path(stream, topic, id),
+                partition.get_partition_path(stream, topic, id)
+            );
+        }
+    }
+
+    #[test]
     fn superblock_fatal_window_converts_to_capped_backoff_retries() {
         assert_eq!(
             superblock_window_to_failures(Duration::ZERO),
@@ -1000,6 +1048,24 @@ mod tests {
             config_default as u64,
             shard::REPAIR_CHUNK_MAX,
             "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn wal_capacity_defaults_and_bounds_match_journal() {
+        assert_eq!(
+            configs::partition::PartitionConfig::default()
+                .wal_bytes_max
+                .as_bytes_u64(),
+            journal::partition_journal::PARTITION_WAL_BYTES_MAX
+        );
+        assert_eq!(
+            configs::partition::MIN_PARTITION_WAL_BYTES_MAX,
+            journal::partition_journal::PARTITION_WAL_CAPACITY_MIN
+        );
+        assert_eq!(
+            configs::partition::MAX_PARTITION_WAL_BYTES_MAX,
+            journal::partition_journal::PARTITION_WAL_CAPACITY_MAX
         );
     }
 
