@@ -54,9 +54,8 @@ void IggyBlockingClient::Shutdown() {
 }
 
 LoginInfo IggyBlockingClient::Login(std::string username, std::string password) {
-    return RethrowAsIggyException([this, &username, &password] {
-        return LoginInfo::FromFfi(Handle()->login_user(std::move(username), std::move(password)));
-    });
+    return RethrowAsIggyException(
+        [this, &username, &password] { return LoginInfo::FromFfi(Handle()->login_user(username, password)); });
 }
 
 void IggyBlockingClient::Logout() {
@@ -64,12 +63,11 @@ void IggyBlockingClient::Logout() {
 }
 
 StreamDetails IggyBlockingClient::CreateStream(std::string name) {
-    return RethrowAsIggyException(
-        [this, &name] { return StreamDetails::FromFfi(Handle()->create_stream(std::move(name))); });
+    return RethrowAsIggyException([this, &name] { return StreamDetails::FromFfi(Handle()->create_stream(name)); });
 }
 
 void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options) {
-    return RethrowAsIggyException([this, &stream, &name, &options] {
+    RethrowAsIggyException([this, &stream, &name, &options] {
         rust::Vec<ffi::HeaderEntry> ffi_options;
         ffi_options.reserve(options.RawEntries().size());
         for (const auto &entry : options.RawEntries()) {
@@ -86,7 +84,7 @@ void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name
             }
             ffi_options.push_back(std::move(ffi_entry));
         }
-        Handle()->update_stream(stream.ToFfi(), std::move(name), std::move(ffi_options));
+        Handle()->update_stream(stream.ToFfi(), name, std::move(ffi_options));
     });
 }
 
@@ -108,11 +106,11 @@ StreamDetails IggyBlockingClient::GetStream(const Identifier &stream) {
 }
 
 void IggyBlockingClient::DeleteStream(const Identifier &stream) {
-    return RethrowAsIggyException([this, &stream] { Handle()->delete_stream(stream.ToFfi()); });
+    RethrowAsIggyException([this, &stream] { Handle()->delete_stream(stream.ToFfi()); });
 }
 
 void IggyBlockingClient::PurgeStream(const Identifier &stream) {
-    return RethrowAsIggyException([this, &stream] { Handle()->purge_stream(stream.ToFfi()); });
+    RethrowAsIggyException([this, &stream] { Handle()->purge_stream(stream.ToFfi()); });
 }
 
 TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
@@ -201,7 +199,7 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.raw_options.push_back(std::move(ffi_entry));
         }
 
-        return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), std::move(name), std::move(ffi_options)));
+        return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options)));
     });
 }
 
@@ -209,7 +207,7 @@ void IggyBlockingClient::UpdateTopic(const Identifier &stream,
                                      const Identifier &topic,
                                      std::string name,
                                      const TopicUpdateOptions &options) {
-    return RethrowAsIggyException([this, &stream, &topic, &name, &options] {
+    RethrowAsIggyException([this, &stream, &topic, &name, &options] {
         ffi::TopicUpdateOptions ffi_options;
         if (auto value = options.CompressionAlgorithm()) {
             ffi_options.has_compression_algorithm = true;
@@ -250,7 +248,7 @@ void IggyBlockingClient::UpdateTopic(const Identifier &stream,
             ffi_options.raw_options.push_back(std::move(ffi_entry));
         }
 
-        Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), std::move(name), std::move(ffi_options));
+        Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), name, std::move(ffi_options));
     });
 }
 
@@ -272,17 +270,17 @@ TopicDetails IggyBlockingClient::GetTopic(const Identifier &stream, const Identi
 }
 
 void IggyBlockingClient::DeleteTopic(const Identifier &stream, const Identifier &topic) {
-    return RethrowAsIggyException([this, &stream, &topic] { Handle()->delete_topic(stream.ToFfi(), topic.ToFfi()); });
+    RethrowAsIggyException([this, &stream, &topic] { Handle()->delete_topic(stream.ToFfi(), topic.ToFfi()); });
 }
 
 void IggyBlockingClient::PurgeTopic(const Identifier &stream, const Identifier &topic) {
-    return RethrowAsIggyException([this, &stream, &topic] { Handle()->purge_topic(stream.ToFfi(), topic.ToFfi()); });
+    RethrowAsIggyException([this, &stream, &topic] { Handle()->purge_topic(stream.ToFfi(), topic.ToFfi()); });
 }
 
 void IggyBlockingClient::CreatePartitions(const Identifier &stream,
                                           const Identifier &topic,
                                           const std::uint32_t partitions_count) {
-    return RethrowAsIggyException([this, &stream, &topic, partitions_count] {
+    RethrowAsIggyException([this, &stream, &topic, partitions_count] {
         Handle()->create_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count);
     });
 }
@@ -290,7 +288,7 @@ void IggyBlockingClient::CreatePartitions(const Identifier &stream,
 void IggyBlockingClient::DeletePartitions(const Identifier &stream,
                                           const Identifier &topic,
                                           const std::uint32_t partitions_count) {
-    return RethrowAsIggyException([this, &stream, &topic, partitions_count] {
+    RethrowAsIggyException([this, &stream, &topic, partitions_count] {
         Handle()->delete_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count);
     });
 }
