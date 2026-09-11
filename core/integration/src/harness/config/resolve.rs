@@ -25,12 +25,7 @@ use std::collections::HashMap;
 /// `ServerConfig::all_env_var_names` cannot know them. `IGGY_CONFIG_PATH`
 /// selects the config file itself and the root credentials are consumed by
 /// `args.rs` before the config loads; `IGGY_TEST_VERBOSE` is harness-only.
-pub const NON_CONFIG_ENV_VARS: [&str; 4] = [
-    "IGGY_CONFIG_PATH",
-    "IGGY_ROOT_USERNAME",
-    "IGGY_ROOT_PASSWORD",
-    "IGGY_TEST_VERBOSE",
-];
+pub const NON_CONFIG_ENV_VARS: &[&str] = configs::server::SERVER_PROCESS_ENV_VARS;
 
 /// Resolve config paths to environment variable names.
 ///
@@ -40,8 +35,8 @@ pub const NON_CONFIG_ENV_VARS: [&str; 4] = [
 ///
 /// # Implicit defaults
 ///
-/// - `encryption` is shorthand for `system.encryption.key`.
-/// - Setting that key also turns `system.encryption.enabled` on, unless the
+/// - `encryption` is shorthand for `encryption.key`.
+/// - Setting that key also turns `encryption.enabled` on, unless the
 ///   caller passed it explicitly.
 ///
 /// # Errors
@@ -54,9 +49,9 @@ pub fn resolve_config_paths(
     let mut needs_encryption_enabled = false;
 
     for (path, value) in overrides {
-        // Special shorthand: "encryption" maps to "system.encryption.key"
+        // Special shorthand: "encryption" maps to "encryption.key"
         let resolved_path = if path == "encryption" {
-            "system.encryption.key"
+            "encryption.key"
         } else {
             path.as_str()
         };
@@ -69,10 +64,7 @@ pub fn resolve_config_paths(
                 env_vars.insert(m.env_name.to_string(), value.clone());
 
                 // Track if encryption key is set (auto-enable encryption)
-                if path == "encryption"
-                    || path == "encryption.key"
-                    || path == "system.encryption.key"
-                {
+                if path == "encryption" || path == "encryption.key" {
                     needs_encryption_enabled = true;
                 }
             }
@@ -94,7 +86,7 @@ pub fn resolve_config_paths(
     }
 
     // Auto-enable encryption when key is set
-    if needs_encryption_enabled && let Some(m) = find_mapping("system.encryption.enabled") {
+    if needs_encryption_enabled && let Some(m) = find_mapping("encryption.enabled") {
         env_vars
             .entry(m.env_name.to_string())
             .or_insert_with(|| "true".to_string());
@@ -249,16 +241,16 @@ mod tests {
     fn resolve_valid_path() {
         let mut overrides = HashMap::new();
         overrides.insert(
-            "system.partition.validate_checksum".to_string(),
+            "partition.validate_checksum".to_string(),
             "false".to_string(),
         );
 
         let result = resolve_config_paths(&overrides);
         assert!(result.is_ok());
         let env_vars = result.unwrap();
-        assert!(env_vars.contains_key("IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM"));
+        assert!(env_vars.contains_key("IGGY_PARTITION_VALIDATE_CHECKSUM"));
         assert_eq!(
-            env_vars.get("IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM"),
+            env_vars.get("IGGY_PARTITION_VALIDATE_CHECKSUM"),
             Some(&"false".to_string())
         );
     }
@@ -274,14 +266,14 @@ mod tests {
         let result = resolve_config_paths(&overrides);
         assert!(result.is_ok());
         let env_vars = result.unwrap();
-        assert!(env_vars.contains_key("IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM"));
+        assert!(env_vars.contains_key("IGGY_PARTITION_VALIDATE_CHECKSUM"));
     }
 
     #[test]
     fn validate_env_var_names_accepts_live_names_and_passes_through_non_iggy() {
         let envs = HashMap::from([
             (
-                "IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM".to_string(),
+                "IGGY_PARTITION_VALIDATE_CHECKSUM".to_string(),
                 "false".to_string(),
             ),
             ("RUST_LOG".to_string(), "debug".to_string()),
@@ -305,10 +297,10 @@ mod tests {
     fn validate_env_var_names_rejects_a_name_no_config_leaf_reads() {
         // The exact shape that went silent when these keys moved to per-topic
         // options: a name that was valid before and now does nothing.
-        let envs = HashMap::from([("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "1MiB".to_string())]);
+        let envs = HashMap::from([("IGGY_SEGMENT_SIZE".to_string(), "1MiB".to_string())]);
         let error = validate_env_var_names(&envs).expect_err("deleted key must be rejected");
         assert!(
-            error.contains("IGGY_SYSTEM_SEGMENT_SIZE"),
+            error.contains("IGGY_SEGMENT_SIZE"),
             "the report must name the offending variable, got: {error}"
         );
     }
@@ -336,11 +328,11 @@ mod tests {
         assert!(result.is_ok());
         let env_vars = result.unwrap();
         assert_eq!(
-            env_vars.get("IGGY_SYSTEM_ENCRYPTION_KEY"),
+            env_vars.get("IGGY_ENCRYPTION_KEY"),
             Some(&"/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string())
         );
         assert_eq!(
-            env_vars.get("IGGY_SYSTEM_ENCRYPTION_ENABLED"),
+            env_vars.get("IGGY_ENCRYPTION_ENABLED"),
             Some(&"true".to_string())
         );
     }

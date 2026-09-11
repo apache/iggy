@@ -25,9 +25,11 @@ The crash behavior is intentionally at-least-once:
 | After send success but before state persistence | Persisted state is unchanged, so the batch may be delivered again. |
 | After state persistence but before the plugin processes the ACK | The restored state records the delivered batch. Deferred source-side cleanup may still be pending. |
 | After the plugin processes the ACK | The state and plugin cursor both record the delivered batch. |
-| After an in-memory confirmation and source cleanup, but before Iggy fsyncs | A server crash can lose the batch after source cleanup unless server-side `enforce_fsync` is enabled. |
+| After a replicated confirmation and source cleanup, but before stable storage | Losing the replicas holding the unpersisted tail can lose the batch. Create the topic with `durability=persisted` when source cleanup requires durable quorum confirmation. |
 
-An ACK means that Iggy confirmed the batch in memory; durability depends on the server's `enforce_fsync` setting. Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after repeated NACKs.
+An ACK follows Iggy's quorum confirmation. The topic's `durability` policy decides whether that confirmation also waits for stable storage on the quorum. Both policies normally write messages to disk.
+
+Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after repeated NACKs.
 
 The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it. The SDK stops polling if the handler returns an error, preventing a failed rollback from advancing to another batch.
 

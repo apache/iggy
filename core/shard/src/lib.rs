@@ -372,7 +372,8 @@ pub enum PartitionReadReply {
     /// consumer_offsets_max`, and `TransientNotAccepted` when the auto-commit
     /// could not be submitted: the owning shard's inbox was full, or the
     /// partition changed primary or incarnation during the read. Transient
-    /// refusal permits re-polling. A capacity refusal needs a slot reclaimed
+    /// refusal also covers any read while the partition requires state transfer,
+    /// and permits retrying. A capacity refusal needs a slot reclaimed
     /// or a higher configured limit before a new key can succeed.
     Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
@@ -468,7 +469,7 @@ where
 /// `vec[i]` necessarily reaches shard `i`. The second receiver is the reply
 /// lane: cross-shard client `Reply` forwards, whose drops are terminal, ride
 /// a channel of their own so a consensus burst filling the main lane cannot
-/// evict them (see `[system.sharding] reply_inbox_capacity`).
+/// evict them (see `[sharding] reply_inbox_capacity`).
 #[must_use]
 pub fn shard_channel(
     owner_shard: u16,
@@ -671,27 +672,40 @@ pub enum LifecycleFrame {
     /// The `fd` is an owning [`DupedFd`] so that a frame dropped
     /// unprocessed (shutdown, pump drain abort, router panic before
     /// `install_*_fd`) closes the dup instead of leaking it.
-    ReplicaInboundSetup { fd: DupedFd, slot: u64 },
+    ReplicaInboundSetup {
+        fd: DupedFd,
+        slot: u64,
+    },
     /// Shard 0 dialed the higher-id peer `replica_id` and delegates the
     /// raw connection; the receiving shard runs the dialer handshake
     /// half, installs on success, and answers shard 0 with
     /// [`LifecycleFrame::ReplicaOutboundHandshakeDone`] so the
     /// pending-dial entry clears and the reconnect sweep may redial on
     /// failure.
-    ReplicaOutboundSetup { fd: DupedFd, replica_id: u8 },
+    ReplicaOutboundSetup {
+        fd: DupedFd,
+        replica_id: u8,
+    },
     /// Owning shard -> shard 0: a delegated inbound handshake finished
     /// (any outcome). Releases the global in-flight cap slot. Lost acks
     /// are covered by the slot's deadline expiry on shard 0.
-    ReplicaInboundHandshakeDone { slot: u64 },
+    ReplicaInboundHandshakeDone {
+        slot: u64,
+    },
     /// Owning shard -> shard 0: a delegated outbound handshake finished
     /// (any outcome). Clears the pending-dial entry for `replica_id`.
     /// Lost acks are covered by the entry's deadline expiry on shard 0.
-    ReplicaOutboundHandshakeDone { replica_id: u8 },
+    ReplicaOutboundHandshakeDone {
+        replica_id: u8,
+    },
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
     /// 16 bits of `meta.client_id`.
-    ClientConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
+    ClientConnectionSetup {
+        fd: DupedFd,
+        meta: ClientConnMeta,
+    },
     /// Shard 0 distributes an inbound SDK WebSocket client's pre-upgrade
     /// TCP connection fd to the owning shard. The HTTP-Upgrade handshake
     /// has NOT run yet at this point: the fd is plain TCP, the dup is
@@ -710,7 +724,10 @@ pub enum LifecycleFrame {
     /// state is non-serialisable and tied to the endpoint's reactor.
     /// Shard 0 therefore terminates QUIC locally and uses the existing
     /// `ForwardClientSend` variant for outbound traffic.
-    ClientWsConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
+    ClientWsConnectionSetup {
+        fd: DupedFd,
+        meta: ClientConnMeta,
+    },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.
     ForwardReplicaSend {
@@ -719,7 +736,10 @@ pub enum LifecycleFrame {
     },
     /// A shard that doesn't hold the client's TCP connection forwards a
     /// client send to the owning shard (top 16 bits of `client_id`).
-    ForwardClientSend { client_id: u128, msg: BusMessage },
+    ForwardClientSend {
+        client_id: u128,
+        msg: BusMessage,
+    },
     /// A peer shard hands a metadata consensus submit (login/logout) to
     /// shard 0, the metadata consensus owner. The committed op returns over
     /// the `reply` sender carried in [`MetadataSubmit`]. Always addressed to
@@ -762,6 +782,7 @@ pub enum LifecycleFrame {
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
     MetadataCommitTick,
+    PartitionPersistenceCompleted(partitions::PersistenceCompletion),
     /// Wake marker for the reconciler-to-pump funnel. Pump drains the
     /// shard's `reconcile_queue` on receipt; tail drain on every frame
     /// catches dropped markers.
@@ -1062,7 +1083,7 @@ const SEGMENT_SIZE_CEILING_BYTES: u64 = 1 << 30;
 /// SDK batch types), so the largest appendable batch is whatever the message bus
 /// will frame. This tracks the shipped `message_bus.max_message_size` default; an
 /// operator raising that is caught by the config validator, which requires
-/// `partition.transfer_artifact_bytes_max` to cover `system.segment.size` plus
+/// `partition.transfer_artifact_bytes_max` to cover the topic's `segment_size` plus
 /// the configured bus cap.
 const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -4081,6 +4102,8 @@ where
     // while `partitions` builds as a plain dependency, so `RetainedPartitionLog`
     // and `adopt_retained_log` are configured out and the crate does not compile.
     // The feature forwards to `partitions/simulator` instead.
+    /// # Panics
+    /// Rejects persisted policies because this in-memory materializer has no durable backend.
     #[cfg(feature = "simulator")]
     pub fn init_partition(
         &self,
@@ -4093,6 +4116,7 @@ where
     ) where
         B: MessageBus + Clone + 'static,
         T: ShardsTable,
+        M: metadata::impls::metadata::StreamsFrontend,
     {
         let PartitionMaterialisation {
             epoch,
@@ -4156,8 +4180,23 @@ where
             stats,
             consensus,
             partitions.config().segment_size,
-            partitions.config().consumer_offset_enforce_fsync,
         );
+        let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map(|topic| {
+                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                })
+                .unwrap_or_default()
+        });
+        assert!(
+            !runtime_options.durability.is_persisted()
+                && !runtime_options.consumer_offset_durability.is_persisted(),
+            "the in-memory partition simulator does not implement persisted topics. Use storage fault-model tests or the real-server harness"
+        );
+        partition.set_runtime_options(runtime_options);
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state.as_ref());
@@ -4296,10 +4335,7 @@ where
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
         // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
-        if partition.persist_superblock_if_needed().await {
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
-        }
+        dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions).await;
     }
 
     #[allow(clippy::future_not_send)]
@@ -4373,10 +4409,7 @@ where
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
         // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
-        if partition.persist_superblock_if_needed().await {
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
-        }
+        dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions).await;
         // Outside the gate: the persist fences the SEND, not the local commit
         // walk (state a crash forgets is state no peer ever saw). Same
         // transfer gate as the metadata arm: no walk while transferring.
@@ -4527,6 +4560,7 @@ where
             );
             return;
         };
+        partition.ensure_materialization_recovery();
         let actions =
             partition
                 .consensus()
@@ -4550,10 +4584,7 @@ where
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
         // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
-        if partition.persist_superblock_if_needed().await {
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
-        }
+        dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions).await;
         // Gate on actual adoption: a rejected StartView returns no actions,
         // and re-arming on one would re-mint the nonce and drop an in-flight
         // descriptor.
@@ -4689,7 +4720,9 @@ where
                 // advertises this replica's current view. Withhold on failure;
                 // the stale peer keeps heartbeating, so it re-triggers once a
                 // later persist succeeds.
-                if partition.persist_superblock_if_needed().await {
+                if !partition.requires_state_transfer()
+                    && partition.persist_superblock_if_needed().await
+                {
                     respond_start_view::<B, _, MJ>(consensus).await;
                 }
             }
@@ -4740,10 +4773,7 @@ where
         // dispatcher owns SendPrepareOk and the debug durable-before-send
         // tripwire, and skipping it would drop both silently the day this
         // handler emits one.
-        if partition.persist_superblock_if_needed().await {
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
-        }
+        dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions).await;
     }
 
     /// Serve a repair range from this replica's journal: stream
@@ -5741,10 +5771,8 @@ where
             // view, so the `StartView` it emits advertises a view the superblock
             // must already record. Same gate as the `on_do_view_change` and
             // `on_start_view` partition arms.
-            if partition.persist_superblock_if_needed().await {
-                dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
-                dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
-            }
+            dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions)
+                .await;
             local_actions
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
@@ -7430,6 +7458,25 @@ where
             futures::future::join_all(chunk).await;
         }
 
+        let mut persistence_metrics = partitions::PersistenceMetrics::default();
+        for namespace in namespace_scratch.iter() {
+            if let Some(partition) = partitions.get_mut_by_ns(namespace) {
+                partition.drive_persistence().await;
+                if let Some(metrics) = partition.take_persistence_metrics() {
+                    persistence_metrics.disk_bytes += metrics.disk_bytes;
+                    persistence_metrics.retained_bytes += metrics.retained_bytes;
+                    persistence_metrics.queued_bytes += metrics.queued_bytes;
+                    persistence_metrics.in_flight_bytes += metrics.in_flight_bytes;
+                    persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
+                    persistence_metrics.completed_batches += metrics.completed_batches;
+                    persistence_metrics.batched_prepares += metrics.batched_prepares;
+                    persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
+                    persistence_metrics.failed_writes += metrics.failed_writes;
+                }
+            }
+        }
+        self.metrics.record_persistence(&persistence_metrics);
+
         // Counted at most ONCE per sweep and only if a re-arm actually fires,
         // then tracked locally as arms land. Counting per namespace is a full
         // scan per partition, so with per-partition groups the sweep would be
@@ -7519,7 +7566,9 @@ where
             if consensus.status() != Status::Normal {
                 refresh_partition_dvc_suffix(partition);
             }
+            partition.ensure_materialization_recovery();
             let actions = consensus.tick(PlaneKind::Partitions);
+            partition.ensure_materialization_recovery();
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
             // it is also what retries a persist an earlier site withheld on.
@@ -7527,10 +7576,8 @@ where
             // Locals to the partition dispatcher only; see the view-change
             // sites for the rationale.
             dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
-            if partition.persist_superblock_if_needed().await {
-                dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
-                dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
-            }
+            dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions)
+                .await;
 
             // Finish a view change whose quorum decided ahead of the local log.
             self.advance_pending_partition_view(namespace).await;
@@ -7552,6 +7599,20 @@ where
                     } else {
                         walk_cursor.get_or_insert(namespace);
                     }
+                }
+                if partition.needs_persistence_checkpoint() {
+                    if walks < PARTITION_WALKS_PER_TICK_MAX {
+                        walks += 1;
+                        partition.checkpoint_persistence(partitions.config()).await;
+                    } else {
+                        walk_cursor.get_or_insert(namespace);
+                    }
+                }
+                if let Some(fault) = partition.fatal() {
+                    if fatal.is_none() {
+                        fatal = Some(fault.clone());
+                    }
+                    continue;
                 }
                 let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
@@ -8023,7 +8084,7 @@ where
     /// passes, so admission cannot revoke a transfer midway.
     ///
     /// BOTH inputs are the configured ones. Dividing by the compile-time
-    /// segment ceiling instead of the deployed `system.segment.size` would make
+    /// segment ceiling instead of the deployed the topic's `segment_size` would make
     /// the numerator the only thing an operator controls: on a 64 MiB-segment
     /// deployment the same budget holds sixteen times as many payloads as a cap
     /// derived from the 1 GiB ceiling would admit, and rejoins serialise for no
@@ -8501,11 +8562,10 @@ where
     /// disk as they complete, so this bounds corruption, not memory.
     const PARTITION_TRANSFER_TOTAL_LEN_MAX: u64 = 1 << 40;
 
-    /// Alloc cap for the `CONSUMER_OFFSETS` artifact, which accumulates whole
-    /// in `ArtifactProgress::buf` before decode can reject it. Its decoder
-    /// ceilings imply ~24 MiB (two sections of 2^20 12-byte entries); this
-    /// leaves headroom without letting a hostile manifest stage gigabytes.
-    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 = 32 << 20;
+    /// Bound the buffered offset and dedup state plus one maximum-sized
+    /// checkpoint prepare and its length prefix before allocating the artifact.
+    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 =
+        (32 << 20) + journal::partition_journal::PREPARE_BYTES_MAX as u64 + 4;
 
     /// Concurrent partition transfers this shard will run as a RECEIVER. A
     /// whole-node rejoin arms one per lagging partition; unbounded, the sum
@@ -8835,6 +8895,16 @@ where
         else {
             return false;
         };
+        // A resident window may only be waiting for persistence or a bounded commit walk.
+        if partition
+            .log
+            .journal()
+            .inner
+            .repaired_window_shape(consensus.commit_min(), fetch_to_op)
+            .complete
+        {
+            return false;
+        }
         let nonce = iggy_common::random_id::get_uuid();
         let from_op = consensus.commit_min() + 1;
         let cluster = consensus.cluster();
@@ -10191,6 +10261,7 @@ fn rebuild_pipeline_entries<B, P>(
     from_op: u64,
     to_op: u64,
     header_at: impl Fn(u64) -> Option<PrepareHeader>,
+    local_ack: impl Fn(&PrepareHeader) -> bool,
 ) where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
@@ -10206,7 +10277,9 @@ fn rebuild_pipeline_entries<B, P>(
             // post-view-change prepares cannot stamp below committed ones.
             consensus.observe_prepare_timestamp(header.timestamp);
             let mut entry = consensus::PipelineEntry::new(header);
-            entry.add_ack(self_id);
+            if local_ack(&header) {
+                entry.add_ack(self_id);
+            }
             Some(entry)
         })
         .collect();
@@ -10559,7 +10632,7 @@ const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 ///
 /// Same correlated-fan-out argument as the repair arm, and the walk is the
 /// costlier half: `commit_journal` reaches `commit_messages`, which flushes a
-/// segment and fsyncs under `enforce_fsync`.
+/// segment and synchronizes it under `durability=persisted`.
 ///
 /// The two caps together are what bound the tick: this one bounds how many
 /// groups a sweep walks, [`partitions::COMMIT_WALK_OPS_MAX`] bounds how far
@@ -11514,12 +11587,19 @@ async fn dispatch_vsr_actions<B, P, J>(
                 let Some(journal) = journal else {
                     continue;
                 };
-                rebuild_pipeline_entries(consensus, self_id, *from_op, *to_op, |op| {
-                    usize::try_from(op)
-                        .ok()
-                        .and_then(|slot| journal.handle().header(slot))
-                        .map(|header| *header)
-                });
+                rebuild_pipeline_entries(
+                    consensus,
+                    self_id,
+                    *from_op,
+                    *to_op,
+                    |op| {
+                        usize::try_from(op)
+                            .ok()
+                            .and_then(|slot| journal.handle().header(slot))
+                            .map(|header| *header)
+                    },
+                    |_| true,
+                );
             }
             // Handled by the caller (shard view change handlers) since it
             // requires access to the plane's commit_journal method.
@@ -11549,6 +11629,28 @@ async fn dispatch_vsr_actions<B, P, J>(
     }
 }
 
+#[allow(clippy::future_not_send)]
+async fn dispatch_partition_wire_actions<B, P, J, SB>(
+    consensus: &VsrConsensus<B, P>,
+    partition: &IggyPartition<B, SB>,
+    mut actions: Vec<VsrAction>,
+) where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+    J: JournalHandle,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    SB: SuperblockStore,
+{
+    if !partition.persist_superblock_if_needed().await {
+        return;
+    }
+    if partition.requires_state_transfer() {
+        actions.retain(|action| matches!(action, VsrAction::SendRequestStartView { .. }));
+    }
+    dispatch_vsr_actions::<B, P, J>(consensus, None, &actions).await;
+    dispatch_partition_journal_actions(consensus, partition, &actions).await;
+}
+
 #[allow(
     clippy::future_not_send,
     clippy::too_many_lines,
@@ -11561,12 +11663,10 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
 ) where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
+    SB: SuperblockStore,
 {
-    use std::mem::size_of;
-
     let bus = consensus.message_bus();
     let self_id = consensus.replica();
-    let cluster = consensus.cluster();
     let journal = &partition.log.journal().inner;
 
     let send = |target: u8, msg: Frozen<MESSAGE_ALIGN>| async move {
@@ -11597,44 +11697,16 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 view,
                 from_op,
                 to_op,
-                target,
-                group,
+                ..
             } => {
+                if *view != consensus.view() {
+                    continue;
+                }
                 for op in *from_op..=*to_op {
-                    let Some(prepare_header) = journal.header_by_op(op) else {
-                        continue;
-                    };
-                    let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
-                        .transmute_header(|_, h: &mut PrepareOkHeader| {
-                            h.command = Command::PrepareOk;
-                            h.cluster = cluster;
-                            h.replica = self_id;
-                            h.view = *view;
-                            h.op = op;
-                            h.commit = consensus.commit_max();
-                            h.timestamp = prepare_header.timestamp;
-                            h.parent = prepare_header.parent;
-                            h.prepare_checksum = prepare_header.checksum;
-                            h.request = prepare_header.request;
-                            h.operation = prepare_header.operation;
-                            h.group = *group;
-                            h.size = size_of::<PrepareOkHeader>() as u32;
-                            h.seal();
-                        });
-                    send(*target, msg.into_generic().into_frozen()).await;
+                    partition.acknowledge_prepare(op).await;
                 }
             }
             VsrAction::RetransmitPrepares { targets } => {
-                // DURABILITY CAVEAT: the only `Storage` impl on
-                // `PartitionJournal` right now is the in-memory
-                // `PartitionJournalMemStorage`. After a process restart
-                // the journal is empty and every `journal.entry` below
-                // returns `None`, so retransmit silently drops the
-                // request and peers stall until a view change. The bus
-                // and consensus plumbing is correct; only the storage
-                // needs to become durable before cluster workloads go to
-                // production. Server boot emits a loud warning to the
-                // operator (see `main.rs`).
                 let current_view = consensus.view();
                 for (header, replicas) in targets {
                     let Some(prepare) = journal.entry(header).await else {
@@ -11656,9 +11728,14 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 }
             }
             VsrAction::RebuildPipeline { from_op, to_op } => {
-                rebuild_pipeline_entries(consensus, self_id, *from_op, *to_op, |op| {
-                    journal.header_by_op(op)
-                });
+                rebuild_pipeline_entries(
+                    consensus,
+                    self_id,
+                    *from_op,
+                    *to_op,
+                    |op| journal.header_by_op(op),
+                    |header| partition.register_rebuilt_ack(header),
+                );
             }
             _ => {}
         }
@@ -13129,5 +13206,235 @@ mod metadata_repair_session_tests {
         // A frame was lost inside the served chunk: re-requesting now would
         // race the retry timer for the same window.
         assert!(!repair_chunk_walked(5, 5, 12));
+    }
+}
+
+#[cfg(test)]
+mod partition_ack_durability_tests {
+    use super::*;
+    use consensus::LocalPipeline;
+    use iggy_common::PartitionStats;
+    use iggy_common::{Durability, IggyByteSize, TopicRuntimeOptions};
+    use journal::prepare_journal::PrepareJournal;
+    use message_bus::IggyMessageBus;
+    use server_common::iobuf::Owned;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn ordinary_start_view_replies_do_not_turn_missing_bodies_into_canonical_headers() {
+        let bus = IggyMessageBus::new(0);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = sent.clone();
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        for replica in 1..3 {
+            assert!(bus.owner_table().try_claim(replica, 1));
+        }
+        let consensus = VsrConsensus::new(1, 0, 3, 42, bus, LocalPipeline::new());
+        consensus.init();
+        let partition: Box<IggyPartition<IggyMessageBus>> =
+            Box::new(IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(1024 * 1024),
+            ));
+        let mut headers: Vec<PrepareHeader> = Vec::new();
+        for op in 1..=2 {
+            let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
+                .transmute_header(|_, header: &mut PrepareHeader| {
+                    header.command = Command::Prepare;
+                    header.operation = Operation::StoreConsumerOffset;
+                    header.cluster = 1;
+                    header.group = 42;
+                    header.op = op;
+                    header.parent = headers.last().map_or(0, |previous| previous.checksum);
+                    header.timestamp = op;
+                    header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                    header.checksum = header.identity_checksum();
+                });
+            headers.push(*prepare.header());
+            partition
+                .log
+                .journal()
+                .inner
+                .append(prepare.into_frozen())
+                .await
+                .unwrap();
+        }
+        let consensus = partition.consensus();
+        consensus.sequencer().set_sequence(2);
+        consensus.advance_commit_max(1);
+        let probe = Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
+            .transmute_header(|_, header: &mut RequestStartViewHeader| {
+                header.command = Command::RequestStartView;
+                header.cluster = 1;
+                header.replica = 1;
+                header.group = 42;
+                header.size = u32::try_from(size_of::<RequestStartViewHeader>()).unwrap();
+                header.seal();
+            });
+        let actions = consensus.handle_request_start_view(PlaneKind::Partitions, probe.header());
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
+            .await;
+        assert_eq!(
+            sent.borrow().len(),
+            1,
+            "probe reply is addressed to its requester"
+        );
+        respond_start_view::<_, _, PrepareJournal>(consensus).await;
+        assert_eq!(
+            sent.borrow().len(),
+            3,
+            "stale-view correction reaches both backups"
+        );
+        let backup = Box::new(VsrConsensus::new(
+            1,
+            1,
+            3,
+            42,
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        ));
+        backup.init();
+        for frame in sent.borrow().iter() {
+            let header_size = size_of::<StartViewHeader>();
+            assert_eq!(frame.len(), header_size);
+            let message =
+                Message::<StartViewHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            backup.handle_start_view(
+                PlaneKind::Partitions,
+                message.header(),
+                &message.as_slice()[header_size..],
+            );
+            assert!(!backup.view_log_is_pending());
+            let suffix = build_dvc_suffix(
+                backup.commit_max(),
+                backup.sequencer().current_sequence(),
+                |_| None,
+                None,
+            );
+            assert_eq!(
+                suffix.nack_bitset(),
+                1,
+                "the uncommitted body is still missing"
+            );
+        }
+        sent.borrow_mut().clear();
+        headers.reverse();
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(
+            consensus,
+            &partition,
+            vec![VsrAction::SendStartView {
+                view: 0,
+                op: 2,
+                commit: 1,
+                incarnation: 0,
+                target: Some(1),
+                group: 42,
+                suffix: headers,
+            }],
+        )
+        .await;
+        let frames = sent.borrow();
+        assert_eq!(frames.len(), 1);
+        let header_size = size_of::<StartViewHeader>();
+        let message =
+            Message::<StartViewHeader>::try_from(Owned::copy_from_slice(frames[0].as_slice()))
+                .unwrap();
+        consensus::dvc_suffix_decode(&message.as_slice()[header_size..], 2, 0, 0).unwrap();
+        backup.handle_start_view(
+            PlaneKind::Partitions,
+            message.header(),
+            &message.as_slice()[header_size..],
+        );
+        assert!(
+            backup.view_log_is_pending(),
+            "a merge-concluding suffix still reaches the backup"
+        );
+    }
+
+    #[compio::test]
+    async fn start_view_ack_waits_for_partition_wal_completion() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "iggy-start-view-wal-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let consensus =
+            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        consensus.mark_superblock_durable(0, 0);
+        let mut partition: IggyPartition<IggyMessageBus> = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+        );
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.set_runtime_options(TopicRuntimeOptions {
+            consumer_offset_durability: Durability::Persisted,
+            ..TopicRuntimeOptions::default()
+        });
+        partition.open_persistence().await.unwrap();
+        let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::StoreConsumerOffset;
+                header.cluster = 1;
+                header.group = 42;
+                header.op = 1;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                header.checksum = header.identity_checksum();
+            },
+        );
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .unwrap();
+        partition.consensus().sequencer().set_sequence(1);
+        dispatch_partition_journal_actions(
+            partition.consensus(),
+            &partition,
+            &[VsrAction::SendPrepareOk {
+                view: 0,
+                from_op: 1,
+                to_op: 1,
+                target: 0,
+                group: 42,
+            }],
+        )
+        .await;
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert!(
+            acknowledgments.is_empty(),
+            "StartView must not bypass the WAL barrier"
+        );
+        for _ in 0..100 {
+            compio::runtime::time::sleep(Duration::from_millis(10)).await;
+            partition.drive_persistence().await;
+            partition
+                .consensus()
+                .drain_loopback_into(&mut acknowledgments);
+            if !acknowledgments.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(acknowledgments.len(), 1);
+        drop(partition);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

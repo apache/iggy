@@ -61,7 +61,7 @@ const STREAM_NAME: &str = "view-durability-stream";
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_advanced_metadata_view_when_survivor_restarts_should_recover_view_from_superblock(
     harness: &mut TestHarness,
 ) {

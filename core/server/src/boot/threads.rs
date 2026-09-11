@@ -48,7 +48,7 @@ use tracing::{error, info, warn};
 /// per shard, and the first panic `install_panic_hook` recorded. The
 /// caller flips the flag via [`Self::install_ctrlc_handler`] and then
 /// drains every shard via [`Self::join_all`], bounded by the shared
-/// `ShutdownDeadline` (`system.sharding.shutdown_join_timeout`).
+/// `ShutdownDeadline` (`sharding.shutdown_join_timeout`).
 pub struct ShardHandles {
     pub(in crate::boot) shutdown_flag: Arc<AtomicBool>,
     pub(in crate::boot) shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)>,
@@ -336,7 +336,7 @@ impl Drop for ShutdownOnDrop {
 /// The single post-shutdown budget, shared by the main thread's shard
 /// joins and shard 0's peer wait.
 ///
-/// Both waits are bounded by `system.sharding.shutdown_join_timeout` and
+/// Both waits are bounded by `sharding.shutdown_join_timeout` and
 /// they NEST: shard 0 cannot start waiting for its peers until its own
 /// drain returned, which is already inside the join budget. Arming one
 /// instant on first use, whichever wait gets there first, keeps the two
@@ -730,7 +730,7 @@ pub(in crate::boot) async fn await_pump_drain(
     let Some(pump_handle) = pump_handle else {
         return Ok(());
     };
-    let drain_budget = config.system.sharding.shutdown_drain_timeout.get_duration();
+    let drain_budget = config.sharding.shutdown_drain_timeout.get_duration();
     let Ok(join_result) = compio::time::timeout(drain_budget, pump_handle).await else {
         error!(
             shard = shard_id,
@@ -1127,10 +1127,7 @@ mod tests {
     async fn pump_drain_timeout_is_not_reported_as_clean() {
         let mut config = ServerConfig::default();
         let timeout = Duration::from_millis(1);
-        Arc::get_mut(&mut config.system)
-            .expect("a fresh ServerConfig owns its system config")
-            .sharding
-            .shutdown_drain_timeout = iggy_common::IggyDuration::new(timeout);
+        config.sharding.shutdown_drain_timeout = iggy_common::IggyDuration::new(timeout);
         let pump = compio::runtime::spawn(std::future::pending::<Option<FatalCommit>>());
 
         let error = await_pump_drain(Some(pump), &config, 7)

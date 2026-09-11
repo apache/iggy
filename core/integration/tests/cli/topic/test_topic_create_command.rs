@@ -287,6 +287,24 @@ Options:
 {CLAP_INDENT}
           [default: server_default]
 
+      --durability <DURABILITY>
+          Message completion policy: replicated or persisted. Both policies store messages on disk
+
+          Possible values:
+          - replicated: Quorum commit without an additional stable-storage barrier
+          - persisted:  Quorum commit backed by recoverable stable-storage copies
+{CLAP_INDENT}
+          [default: replicated]
+
+      --consumer-offset-durability <CONSUMER_OFFSET_DURABILITY>
+          Offset completion policy: replicated or persisted. Independent of message durability
+
+          Possible values:
+          - replicated: Quorum commit without an additional stable-storage barrier
+          - persisted:  Quorum commit backed by recoverable stable-storage copies
+{CLAP_INDENT}
+          [default: replicated]
+
       --set <KEY=VALUE>
           Additional topic option as key=value, repeatable
 {CLAP_INDENT}
@@ -322,10 +340,14 @@ Arguments:
   [MESSAGE_EXPIRY]...      Message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:
-  -t, --topic-id <TOPIC_ID>              Topic ID to create
-  -m, --max-topic-size <MAX_TOPIC_SIZE>  Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
-      --set <KEY=VALUE>                  Additional topic option as key=value, repeatable
-  -h, --help                             Print help (see more with '--help')
+  -t, --topic-id <TOPIC_ID>                                      Topic ID to create
+  -m, --max-topic-size <MAX_TOPIC_SIZE>                          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
+      --durability <DURABILITY>                                  Message completion policy: replicated or persisted. Both policies store messages on disk [default: replicated] [possible values:
+                                                                 replicated, persisted]
+      --consumer-offset-durability <CONSUMER_OFFSET_DURABILITY>  Offset completion policy: replicated or persisted. Independent of message durability [default: replicated] [possible values:
+                                                                 replicated, persisted]
+      --set <KEY=VALUE>                                          Additional topic option as key=value, repeatable
+  -h, --help                                                     Print help (see more with '--help')
 "#,
             ),
         ))

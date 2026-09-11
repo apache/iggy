@@ -18,6 +18,13 @@
 use compio::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use tracing::warn;
+
+#[cfg(target_os = "linux")]
+use nix::fcntl::{FallocateFlags, fallocate};
+
+#[cfg(not(target_os = "linux"))]
+static PREALLOCATION_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
 
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -42,6 +49,45 @@ impl DirEntry {
             name,
         }
     }
+}
+
+/// Reserve segment space without changing its contents or logical length.
+/// Unsupported or failed reservations fall back to buffered allocation.
+#[cfg(target_os = "linux")]
+pub fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
+    let Ok(len) = i64::try_from(len) else {
+        warn!(
+            target: "iggy.partitions.storage",
+            file = %file_path.display(),
+            preallocate_len = len,
+            "file preallocation size is unsupported, using buffered allocation"
+        );
+        return;
+    };
+
+    // Shard runtimes disable the worker pool, so this opt-in reservation runs
+    // inline. Slow filesystem allocation stalls the shard until it returns.
+    if let Err(error) = fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len) {
+        warn!(
+            target: "iggy.partitions.storage",
+            file = %file_path.display(),
+            preallocate_len = len,
+            %error,
+            "file preallocation failed, using buffered allocation"
+        );
+    }
+}
+
+/// Reserve segment space when supported, without changing its logical length.
+#[cfg(not(target_os = "linux"))]
+pub fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) {
+    PREALLOCATION_UNAVAILABLE.call_once(|| {
+        warn!(
+            target: "iggy.partitions.storage",
+            file = %file_path.display(),
+            "file preallocation is unavailable on this platform, using buffered allocation"
+        );
+    });
 }
 
 /// Asynchronously walks a directory tree iteratively (without recursion).

@@ -125,19 +125,16 @@ TEST(TopicOptionTest, SegmentSizeEncodesLittleEndianUint64) {
     EXPECT_EQ(option_value_bytes(option), (std::vector<std::uint8_t>{0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}));
 }
 
-TEST(TopicOptionTest, EnforceFsyncEncodesSingleBoolByte) {
-    const auto enabled = iggy::TopicOption::EnforceFsync(true);
-
-    EXPECT_EQ(enabled.key.kind, kind_code(iggy::ffi::HeaderKind::String));
-    EXPECT_EQ(option_key(enabled), "enforce_fsync");
-    EXPECT_EQ(enabled.value.kind, kind_code(iggy::ffi::HeaderKind::Bool));
-    EXPECT_EQ(option_value_bytes(enabled), (std::vector<std::uint8_t>{1}));
-
-    const auto disabled = iggy::TopicOption::EnforceFsync(false);
-
-    EXPECT_EQ(option_key(disabled), "enforce_fsync");
-    EXPECT_EQ(disabled.value.kind, kind_code(iggy::ffi::HeaderKind::Bool));
-    EXPECT_EQ(option_value_bytes(disabled), (std::vector<std::uint8_t>{0}));
+TEST(TopicOptionTest, DurabilityEncodesCanonicalStrings) {
+    const auto persisted = iggy::TopicOption::Durability(iggy::Durability::Persisted);
+    EXPECT_EQ(option_key(persisted), "durability");
+    EXPECT_EQ(persisted.value.kind, kind_code(iggy::ffi::HeaderKind::String));
+    EXPECT_EQ(option_value_bytes(persisted), (std::vector<std::uint8_t>{'p', 'e', 'r', 's', 'i', 's', 't', 'e', 'd'}));
+    const auto offset = iggy::TopicOption::ConsumerOffsetDurability();
+    EXPECT_EQ(option_key(offset), "consumer_offset_durability");
+    EXPECT_EQ(option_value_bytes(offset),
+              (std::vector<std::uint8_t>{'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd'}));
+    EXPECT_THROW(iggy::TopicOption::Durability(static_cast<iggy::Durability>(99)), std::invalid_argument);
 }
 
 TEST(TopicOptionTest, MessagesRequiredToSaveEncodesLittleEndianUint32) {
