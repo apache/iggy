@@ -68,7 +68,7 @@ pub async fn run(harness: &mut TestHarness) {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
                 messages_required_to_save: Some(10_000),
-                enforce_fsync: Some(false),
+                durability: iggy_common::Durability::Replicated,
                 ..TopicCreateOptions::default()
             },
         )

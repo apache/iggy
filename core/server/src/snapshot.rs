@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use async_zip::base::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use futures::channel::oneshot;
 use iggy_common::{IggyDuration, IggyError, SnapshotCompression, SystemSnapshotType};
 use tracing::{error, info, warn};
@@ -55,7 +55,7 @@ static SNAPSHOT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// [`SNAPSHOT_IN_PROGRESS`]); a concurrent request busy-rejects with
 /// [`IggyError::SnapshotFileCompletionFailed`].
 pub async fn collect(
-    system_config: Arc<ServerSystemConfig>,
+    server_config: Arc<ServerConfig>,
     compression: SnapshotCompression,
     snapshot_types: Vec<SystemSnapshotType>,
 ) -> Result<Vec<u8>, IggyError> {
@@ -89,7 +89,7 @@ pub async fn collect(
             // A dropped receiver means the requester disconnected while
             // collecting; there is nobody left to deliver to.
             let _ = result_sender.send(collect_blocking(
-                &system_config,
+                &server_config,
                 compression,
                 &snapshot_types,
             ));
@@ -128,14 +128,14 @@ impl Drop for SnapshotInProgressGuard {
 }
 
 fn collect_blocking(
-    system_config: &ServerSystemConfig,
+    server_config: &ServerConfig,
     compression: SnapshotCompression,
     snapshot_types: &[SystemSnapshotType],
 ) -> Result<Vec<u8>, IggyError> {
     let started = Instant::now();
     let mut entries = Vec::with_capacity(snapshot_types.len());
     for snapshot_type in snapshot_types {
-        match capture(snapshot_type, system_config) {
+        match capture(snapshot_type, server_config) {
             Ok(content) => entries.push((format!("{snapshot_type}.txt"), content)),
             // Parity with the legacy collector: a failed section is logged and
             // skipped so the rest of the archive still ships.
@@ -156,7 +156,7 @@ fn collect_blocking(
 
 fn capture(
     snapshot_type: &SystemSnapshotType,
-    system_config: &ServerSystemConfig,
+    server_config: &ServerConfig,
 ) -> io::Result<Vec<u8>> {
     match snapshot_type {
         SystemSnapshotType::FilesystemOverview => {
@@ -167,8 +167,8 @@ fn capture(
             command_stdout(Command::new("top").args(["-H", "-b", "-n", "1"]))
         }
         SystemSnapshotType::Test => command_stdout(Command::new("echo").arg("test")),
-        SystemSnapshotType::ServerLogs => server_logs(system_config),
-        SystemSnapshotType::ServerConfig => server_config(system_config),
+        SystemSnapshotType::ServerLogs => server_logs(server_config),
+        SystemSnapshotType::ServerConfig => read_server_config(server_config),
         // `collect` expands `All` before handing off to the collector.
         SystemSnapshotType::All => Err(io::Error::other("`all` must be expanded by the caller")),
     }
@@ -195,17 +195,17 @@ fn process_list() -> io::Result<Vec<u8>> {
     Ok(content)
 }
 
-fn server_logs(system_config: &ServerSystemConfig) -> io::Result<Vec<u8>> {
+fn server_logs(server_config: &ServerConfig) -> io::Result<Vec<u8>> {
     // Mirror the logger's path derivation (server_common `Logging::late_init`):
     // it canonicalizes the configured subdirectory before joining the system
     // path, so a relative `logging.path` that already exists resolves against the
     // CWD. Skipping the canonicalize here would read a different (often empty)
     // directory than the one the logger actually writes to.
-    let logs_subdirectory = PathBuf::from(&system_config.logging.path);
+    let logs_subdirectory = PathBuf::from(&server_config.logging.path);
     let logs_subdirectory = logs_subdirectory
         .canonicalize()
         .unwrap_or(logs_subdirectory);
-    let logs_path = PathBuf::from(system_config.get_system_path()).join(logs_subdirectory);
+    let logs_path = PathBuf::from(server_config.get_system_path()).join(logs_subdirectory);
     let mut log_files = Vec::new();
     for entry in std::fs::read_dir(&logs_path)? {
         let entry = entry?;
@@ -224,8 +224,8 @@ fn server_logs(system_config: &ServerSystemConfig) -> io::Result<Vec<u8>> {
     Ok(content)
 }
 
-fn server_config(system_config: &ServerSystemConfig) -> io::Result<Vec<u8>> {
-    let config_path = PathBuf::from(system_config.get_runtime_path()).join("current_config.toml");
+fn read_server_config(server_config: &ServerConfig) -> io::Result<Vec<u8>> {
+    let config_path = PathBuf::from(server_config.get_runtime_path()).join("current_config.toml");
     std::fs::read(config_path)
 }
 
@@ -277,7 +277,7 @@ mod tests {
         // second collector thread) rather than piling up threads.
         let held = SnapshotInProgressGuard::acquire().expect("flag starts free");
         let result = futures::executor::block_on(collect(
-            Arc::new(ServerSystemConfig::default()),
+            Arc::new(ServerConfig::default()),
             SnapshotCompression::Stored,
             vec![SystemSnapshotType::Test],
         ));

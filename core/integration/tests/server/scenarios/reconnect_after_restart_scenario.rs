@@ -27,12 +27,12 @@ const TOPIC_NAME: &str = "test-reconnect-topic";
 
 /// The restart specs below need every committed batch on disk before the
 /// server goes down: there is no flush primitive, so the topic carries the
-/// eager-flush thresholds that used to be `[system.partition]` config.
+/// eager-flush thresholds that used to be `[partition]` config.
 fn eager_flush_options() -> TopicCreateOptions {
     TopicCreateOptions {
         partitions_count: Some(1),
         message_expiry: Some(IggyExpiry::NeverExpire),
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         messages_required_to_save: Some(1),
         ..TopicCreateOptions::default()
     }

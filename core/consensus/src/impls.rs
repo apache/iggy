@@ -1106,8 +1106,8 @@ where
     /// built-in default.
     probe_attempts_max: Cell<u32>,
 
-    /// This replica's own uncommitted suffix, with the `(op, commit)` the journal
-    /// was at when it was read.
+    /// This replica's own uncommitted suffix, with the head, commit point and
+    /// mutation count the journal was at when it was read.
     ///
     /// Installed by the shard via [`Self::set_local_dvc_suffix`] before any handler
     /// that could enter a view change. Snapshotted rather than recomputed per send
@@ -1115,11 +1115,24 @@ where
     /// replica's log, and silently retracting one lets the new primary assemble a
     /// quorum that never simultaneously existed.
     ///
-    /// Tagged by `(op, commit)`, not by view, because that is what the suffix
-    /// describes: a view advance leaves the log alone so the snapshot survives,
-    /// while anything moving the head or commit point makes the tag mismatch,
-    /// which reads as no snapshot at all.
-    local_dvc_suffix: RefCell<Option<(u64, u64, DvcSuffix)>>,
+    /// Tagged by `(op, commit, journal_mutations)`, not by view, because that is
+    /// what the suffix describes: a view advance leaves the log alone so the
+    /// snapshot survives, while anything moving the head, the commit point or the
+    /// journal's contents makes the tag mismatch, which reads as no snapshot at
+    /// all.
+    local_dvc_suffix: RefCell<Option<(u64, u64, u64, DvcSuffix)>>,
+
+    /// Counts mutations of the journal this replica's suffix is read from.
+    ///
+    /// `(op, commit)` alone says how far the log reaches, not what it holds. A
+    /// backup that adopted a `StartView` sits at the announced head with the
+    /// bodies still missing, so repair filling one moves neither number, and the
+    /// header-only snapshot taken before it would keep going out. The merge reads
+    /// a header no sender can serve as proof that sender never journaled the op,
+    /// which is now a nack: a stale snapshot would nack an op this replica holds
+    /// and acked. Bumped by every append, truncation, drain and eviction on both
+    /// planes.
+    journal_mutations: Cell<u64>,
 
     /// The log a DVC quorum settled on, parked until this replica's journal can
     /// serve all of it.
@@ -1425,6 +1438,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             probe_attempts: Cell::new(0),
             probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
             local_dvc_suffix: RefCell::new(None),
+            journal_mutations: Cell::new(0),
             pending_view_log: RefCell::new(None),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
@@ -2191,28 +2205,44 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Installing twice for one view overwrites: the shard refreshes before each
     /// handler, and a later suffix is at least as complete (repair only adds).
     pub fn set_local_dvc_suffix(&self, suffix: DvcSuffix) {
-        let (op, commit) = self.local_dvc_suffix_tag();
-        *self.local_dvc_suffix.borrow_mut() = Some((op, commit, suffix));
+        let (op, commit, mutations) = self.local_dvc_suffix_tag();
+        *self.local_dvc_suffix.borrow_mut() = Some((op, commit, mutations, suffix));
     }
 
     /// Drop the cached suffix snapshot.
     ///
-    /// The `(op, commit)` tag tracks how far the log reaches, not what it still
-    /// contains, so a mutation that removes entries without moving either
-    /// (truncating a diverging uncommitted range) leaves a snapshot reading as
-    /// current while offering bodies this replica can no longer serve. A peer that
-    /// picks it as a body source then waits out the whole view change.
-    ///
-    /// Call from the mutation site. The next refresh re-reads the journal.
+    /// For a change the journal counter cannot see: `start_pending_view` takes the
+    /// parked log the snapshot was stitched over, which alters the suffix while
+    /// every journal entry stays put.
     pub fn invalidate_local_dvc_suffix(&self) {
         self.local_dvc_suffix.borrow_mut().take();
     }
 
-    /// The `(op, commit)` a snapshot must match to still describe this log.
-    /// `commit` is clamped to `op` exactly as the outgoing DVC clamps it.
-    fn local_dvc_suffix_tag(&self) -> (u64, u64) {
+    /// Record that the journal backing this replica's suffix changed: an append, a
+    /// truncation, a drain, an eviction.
+    ///
+    /// Call from the mutation site. The next refresh re-reads the journal, and
+    /// until it does the snapshot reads as absent rather than as a description of
+    /// a log that has moved on. Both directions matter: a removal leaves a
+    /// snapshot offering bodies this replica can no longer serve, stranding a peer
+    /// that picks it as a repair source, and an append leaves one nacking an op
+    /// this replica has since journaled and acked, which is a licence to truncate
+    /// committed data.
+    pub fn note_journal_mutation(&self) {
+        self.journal_mutations
+            .set(self.journal_mutations.get().wrapping_add(1));
+    }
+
+    /// The `(op, commit, journal_mutations)` a snapshot must match to still
+    /// describe this log. `commit` is clamped to `op` exactly as the outgoing DVC
+    /// clamps it.
+    fn local_dvc_suffix_tag(&self) -> (u64, u64, u64) {
         let op = self.sequencer.current_sequence();
-        (op, self.commit_max.get().min(op))
+        (
+            op,
+            self.commit_max.get().min(op),
+            self.journal_mutations.get(),
+        )
     }
 
     /// This replica's suffix snapshot, or an empty one when none matches the log's
@@ -2223,7 +2253,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub fn local_dvc_suffix(&self) -> DvcSuffix {
         let tag = self.local_dvc_suffix_tag();
         match &*self.local_dvc_suffix.borrow() {
-            Some((op, commit, suffix)) if (*op, *commit) == tag => suffix.clone(),
+            Some((op, commit, mutations, suffix)) if (*op, *commit, *mutations) == tag => {
+                suffix.clone()
+            }
             _ => DvcSuffix::empty(),
         }
     }
@@ -2235,7 +2267,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let tag = self.local_dvc_suffix_tag();
         !matches!(
             &*self.local_dvc_suffix.borrow(),
-            Some((op, commit, _)) if (*op, *commit) == tag
+            Some((op, commit, mutations, _)) if (*op, *commit, *mutations) == tag
         )
     }
 
@@ -2523,9 +2555,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// IS the whole quorum. `PrepareOk` loops through the loopback because it
     /// genuinely is a message to a peer that happens to be this replica.
     ///
-    /// The three callers that used to inline this sequence were the actual
-    /// duplication: an election timeout, an SVC for a higher view, and a DVC for
-    /// a higher view, differing only in `reason`.
+    /// A timed-out primary candidate can become a backup in the next view,
+    /// so every transition must restart its probe for a missing `StartView`.
     fn enter_view_change(
         &self,
         plane: PlaneKind,
@@ -2618,9 +2649,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .reset(TimeoutKind::DoViewChangeMessage);
 
         // NOT the snapshot the first send used: `build_do_view_change` re-reads
-        // `local_dvc_suffix()`, whose `(op, commit)` tag can have moved since, in
-        // which case it answers EMPTY, retracting every nack and body offer already
-        // sent. Survivable only because `dvc_record` drops a duplicate sender, so the
+        // `local_dvc_suffix()`, whose tag can have moved since, in which case it
+        // answers EMPTY, retracting every nack and body offer already sent.
+        // Survivable only because `dvc_record` drops a duplicate sender, so the
         // candidate keeps the first vote. Allow a retransmit to replace a seated vote
         // and this must pin the snapshot instead.
         let action = self.build_do_view_change(self.primary_index(self.view.get()));
@@ -2640,43 +2671,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        // Escalate: try next view
-        let old_view = self.view.get();
-        let next_view = old_view + 1;
-
-        self.view.set(next_view);
-        self.reset_view_change_state();
-        self.sent_own_start_view_change.set(true);
-        self.start_view_change_from_all_replicas
-            .borrow_mut()
-            .insert(self.replica as usize);
-
-        self.timeouts
-            .borrow_mut()
-            .reset(TimeoutKind::ViewChangeStatus);
-
-        emit_sim_event(
-            SimEventKind::ViewChangeStarted,
-            &ViewChangeLogEvent {
-                replica: ReplicaLogContext::from_consensus(self, plane),
-                old_view,
-                new_view: next_view,
-                reason: ViewChangeReason::ViewChangeStatusTimeout,
-            },
-        );
-
-        let action = VsrAction::SendStartViewChange {
-            view: next_view,
-            group: self.group,
-        };
-        emit_sim_event(
-            SimEventKind::ControlMessageScheduled,
-            &ControlActionLogEvent::from_vsr_action(
-                ReplicaLogContext::from_consensus(self, plane),
-                &action,
-            ),
-        );
-        vec![action]
+        self.enter_view_change(
+            plane,
+            self.view.get() + 1,
+            ViewChangeReason::ViewChangeStatusTimeout,
+        )
     }
 
     /// Collect uncommitted pipeline entries that should be retransmitted.
@@ -3981,22 +3980,28 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Send a message to `target`, routing self-addressed messages through the loopback queue.
     // VsrConsensus uses Cell/RefCell for single-threaded compio shards; futures are intentionally !Send.
     #[allow(clippy::future_not_send)]
-    pub(crate) async fn send_or_loopback(&self, target: u8, message: Message<GenericHeader>)
+    pub(crate) async fn send_or_loopback(&self, target: u8, message: Message<GenericHeader>) -> bool
     where
         B: MessageBus,
     {
         if target == self.replica {
             self.push_loopback(message);
-        } else if let Err(e) = self
+            return true;
+        }
+        match self
             .message_bus
             .send_to_replica(target, message.into_frozen())
             .await
         {
-            tracing::warn!(
-                replica = self.replica,
-                target,
-                "send_or_loopback failed: {e}"
-            );
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    replica = self.replica,
+                    target,
+                    "send_or_loopback failed: {error}"
+                );
+                false
+            }
         }
     }
 
@@ -5022,6 +5027,114 @@ mod vsr_consensus_tests {
                 .any(|action| matches!(action, VsrAction::SendCommit { .. })),
             "a stale primary must not advertise a commit point"
         );
+    }
+
+    #[test]
+    fn given_a_stalled_candidate_when_it_escalates_should_recover_a_lost_start_view() {
+        const REJOINING_REPLICA: u8 = 1;
+        const NEXT_PRIMARY: u8 = 2;
+        const REPLICA_COUNT: u8 = 3;
+        const LOCAL_HEAD: u64 = 20;
+        const PRIMARY_HEAD: u64 = LOCAL_HEAD + 1;
+        let plane = PlaneKind::Partitions;
+        let group = IggyNamespace::new(0, 0, 0).inner();
+        let backup = VsrConsensus::new(
+            1,
+            REJOINING_REPLICA,
+            REPLICA_COUNT,
+            group,
+            StageNoopBus,
+            LocalPipeline::new(),
+        );
+        backup.sequencer().set_sequence(LOCAL_HEAD);
+        backup.restore_commit_state(LOCAL_HEAD - 1, LOCAL_HEAD - 1);
+        backup.begin_view_probe();
+        for _ in 0..TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS * u64::from(PROBE_ATTEMPTS_MAX)
+        {
+            backup.tick(plane);
+        }
+        assert_eq!(backup.view(), 1);
+        assert_eq!(backup.status(), Status::ViewChange);
+        assert!(backup.is_primary_for_view(backup.view()));
+
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            backup.tick(plane);
+        }
+        assert_eq!(backup.view(), 2);
+        assert_eq!(backup.status(), Status::ViewChange);
+        assert!(!backup.is_primary_for_view(backup.view()));
+
+        // Model a settled primary whose initial StartView was withheld by persistence.
+        let mut primary = VsrConsensus::new(
+            1,
+            NEXT_PRIMARY,
+            REPLICA_COUNT,
+            group,
+            StageNoopBus,
+            LocalPipeline::new(),
+        );
+        primary.set_view(backup.view());
+        primary.set_log_view(backup.view());
+        primary.sequencer().set_sequence(PRIMARY_HEAD);
+        primary.restore_commit_state(LOCAL_HEAD, LOCAL_HEAD);
+        primary.init();
+
+        let probe = (0..TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS)
+            .flat_map(|_| backup.tick(plane))
+            .find_map(|action| match action {
+                VsrAction::SendRequestStartView { view, group } => Some(
+                    Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
+                        .transmute_header(|_, header: &mut RequestStartViewHeader| {
+                            header.command = Command::RequestStartView;
+                            header.cluster = 1;
+                            header.replica = REJOINING_REPLICA;
+                            header.view = view;
+                            header.group = group;
+                            header.size =
+                                u32::try_from(size_of::<RequestStartViewHeader>()).unwrap();
+                            header.seal();
+                        }),
+                ),
+                _ => None,
+            })
+            .expect("an escalated candidate must request the missing StartView as a backup");
+        let replies = primary.handle_request_start_view(plane, probe.header());
+        let [
+            VsrAction::SendStartView {
+                view,
+                op,
+                commit,
+                incarnation,
+                target,
+                group,
+                suffix,
+            },
+        ] = replies.as_slice()
+        else {
+            panic!("the settled primary must answer the backup's probe: {replies:?}");
+        };
+        assert_eq!(*target, Some(REJOINING_REPLICA));
+        assert!(suffix.is_empty());
+        let response = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.cluster = 1;
+                header.replica = NEXT_PRIMARY;
+                header.view = *view;
+                header.op = *op;
+                header.commit = *commit;
+                header.incarnation = *incarnation;
+                header.group = *group;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                header.seal();
+            });
+        backup.handle_start_view(plane, response.header(), &[]);
+        assert_eq!(backup.status(), Status::Normal);
+        assert_eq!(backup.view(), primary.view());
+        assert_eq!(backup.log_view(), primary.log_view());
+        assert_eq!(backup.sequencer().current_sequence(), PRIMARY_HEAD);
+        assert_eq!(backup.commit_max(), LOCAL_HEAD);
+        assert_eq!(backup.commit_min(), LOCAL_HEAD - 1);
     }
 
     // A genuine current primary (no newer view seen) keeps heartbeating.
