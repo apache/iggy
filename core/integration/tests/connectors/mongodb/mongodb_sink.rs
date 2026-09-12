@@ -442,7 +442,7 @@ async fn duplicate_key_is_idempotent_replay_not_sink_error(
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn ordered_duplicate_partial_insert_has_exact_accounting(
+async fn unordered_duplicate_partial_insert_has_exact_accounting(
     harness: &TestHarness,
     fixture: MongoDbSinkFixture,
 ) {
@@ -713,7 +713,7 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
     );
     assert!(
         !id13_inserted,
-        "Expected suffix message (_id=13) to be skipped after ordered schema validation failure"
+        "Expected suffix message (_id=13) to fail the collection validator"
     );
 
     let total_docs = collection

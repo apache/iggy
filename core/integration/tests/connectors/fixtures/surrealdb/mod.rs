@@ -20,6 +20,6 @@ mod sink;
 
 pub use container::SurrealDbOps;
 pub use sink::{
-    SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
-    SurrealDbSinkRawFixture,
+    SurrealDbSinkBatchFixture, SurrealDbSinkDatabaseFixture, SurrealDbSinkFixture,
+    SurrealDbSinkJsonFixture, SurrealDbSinkNamespaceFixture, SurrealDbSinkRawFixture,
 };

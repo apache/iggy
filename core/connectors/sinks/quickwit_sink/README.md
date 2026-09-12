@@ -9,16 +9,16 @@ The Quickwit connector sends data to the Quickwit API using HTTP. It checks read
 | `url` | Required | Quickwit base URL with an `http` or `https` scheme and host. Path prefixes and a trailing slash are supported; query strings and fragments are rejected. |
 | `index` | Required | Index configuration as YAML, with a nonempty `index_id`. See the [Quickwit index configuration docs](https://quickwit.io/docs/configuration/index-config). |
 | `verbose_logging` | `false` | Log received and ingested message counts at `info` instead of `debug`. |
-| `max_retries` | `3` | Total HTTP attempts including the first; `1` disables retries. |
+| `max_retries` | `3` | Total HTTP attempts including the first; `0` and `1` both allow one attempt. |
 | `retry_delay` | `"1s"` | Base exponential delay for HTTP retries and readiness probes. |
-| `retry_max_delay` | `"5s"` | Maximum delay between HTTP retry attempts. |
-| `max_open_retries` | `10` | Total readiness probes including the first; `1` disables retries. |
+| `retry_max_delay` | `"5s"` | Cap for calculated HTTP retry delays; a valid `Retry-After` on HTTP 429 overrides it. |
+| `max_open_retries` | `10` | Total attempts per readiness check including the first; `0` and `1` both allow one attempt. |
 | `open_retry_max_delay` | `"30s"` | Maximum delay between readiness probes. |
-| `timeout` | `"30s"` | Timeout for each HTTP request. |
+| `timeout` | `"30s"` | Timeout per HTTP attempt; retries and waits can extend the complete operation. |
 
 Duration values require units, such as `250ms` or `30s`. Invalid or zero durations prevent initialization. Unknown plugin configuration keys are rejected.
 
-Set `plugin_config_format` in the connector TOML or with the `IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_FORMAT` environment variable.
+The runtime's `plugin_config_format` can be set in the connector TOML or with the `IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_FORMAT` environment variable. The `index` field itself is always a YAML string. The following fragment belongs in a complete sink entry with a plugin path and stream configuration; see the [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink/).
 
 ```toml
 [plugin_config]
@@ -28,7 +28,7 @@ verbose_logging = false
 max_retries = 3
 retry_delay = "1s"
 retry_max_delay = "5s"
-# Total readiness probes including the first; 1 disables retries.
+# Total attempts per readiness check including the first; 1 disables retries.
 max_open_retries = 10
 open_retry_max_delay = "30s"
 timeout = "30s"
@@ -103,8 +103,12 @@ The examples use `mode: dynamic` to retain wrapper fields. With `mode: strict`, 
 
 ## Delivery semantics
 
-Transient HTTP failures, including 429, can retry a request that Quickwit already accepted. Quickwit ingest has no deduplication key, so these retries can produce duplicate documents. Set `max_retries = 1` to disable HTTP retries and use at-most-once request submission.
+Transient HTTP failures, including 429, can retry a request that Quickwit already accepted. Quickwit ingest has no deduplication key, so these retries can produce duplicate documents. Set `max_retries = 1` to disable the sink's HTTP retry loop. Calculated delays use exponential backoff with jitter; a valid `Retry-After` on HTTP 429 replaces the calculated delay.
 
-The sink cannot guarantee at-least-once delivery. The runtime commits offsets when polling and ignores the plugin's consume return code. A permanent error or exhausted retry budget is logged, but affected messages are not redelivered. The runtime's processed-message count does not prove successful indexing. These runtime limitations are tracked in [#2927](https://github.com/apache/iggy/issues/2927) and [#2928](https://github.com/apache/iggy/issues/2928).
+Service readiness retries any failed health probe. After verifying or creating the index, the sink probes its ingest endpoint with an empty body before accepting messages.
+Index readiness retries HTTP 404, 429, 5xx and network failures.
+Each readiness check uses `max_open_retries` and `open_retry_max_delay`; these probes submit no documents.
 
-Chunks are independent: successful writes remain committed if another chunk fails. The sink continues later chunks and returns the last error. A successful ingest response acknowledges submission for indexing, not that every document passed the index mapping. This sink has no circuit breaker.
+The sink cannot guarantee at-least-once delivery. The runtime commits offsets when polling, logs/counts plugin callback errors and continues without replaying the failed batch. A permanent error or exhausted retry budget is logged, but affected messages are not redelivered. The runtime's processed-message count does not prove successful indexing.
+
+Chunks are independent: successful writes remain committed if another chunk fails. The sink continues later chunks and returns the last error. A successful ingest response acknowledges submission for indexing, not search visibility or acceptance of every document. The sink checks the HTTP status without inspecting per-document rejection counts. It does not add Iggy metadata or headers, and it does not update or compare an existing index's mapping. This sink has no circuit breaker.

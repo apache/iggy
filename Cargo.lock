@@ -7462,6 +7462,7 @@ dependencies = [
  "simd-json",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

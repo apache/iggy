@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use iggy_connector_sdk::retry::{
     RetryPolicy, build_retry_client, check_connectivity_with_retry, is_transient_status,
+    retry_async,
 };
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
@@ -72,7 +73,7 @@ pub struct QuickwitSinkConfig {
     pub retry_delay: Option<String>,
     /// Maximum retry delay cap as a human-readable duration string, e.g. "5s" (default: 5s).
     pub retry_max_delay: Option<String>,
-    /// Total readiness attempts including the first (default: 10). 1 disables retries.
+    /// Total attempts per readiness check including the first (default: 10). 1 disables retries.
     pub max_open_retries: Option<u32>,
     /// Maximum retry delay cap when opening the sink, e.g. "30s" (default: 30s).
     pub open_retry_max_delay: Option<String>,
@@ -170,6 +171,40 @@ impl QuickwitSink {
                 )))
             }
         }
+    }
+
+    async fn wait_for_index(
+        &self,
+        client: &reqwest::Client,
+        policy: RetryPolicy,
+    ) -> Result<(), Error> {
+        // Index metadata can exist before Quickwit's ingest queue accepts documents.
+        retry_async(
+            policy,
+            &format!("Quickwit sink ID {} ingest readiness", self.id),
+            |error: &reqwest::Error| {
+                error.status().is_none_or(|status| {
+                    status == StatusCode::NOT_FOUND || is_transient_status(status)
+                })
+            },
+            || async {
+                client
+                    .post(&self.ingest_url)
+                    .header(reqwest::header::CONTENT_LENGTH, "0")
+                    .body("")
+                    .send()
+                    .await?
+                    .error_for_status()
+                    .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|failure| {
+            Error::InitError(format!(
+                "Quickwit index '{}' ingest readiness: {failure}",
+                self.index_id
+            ))
+        })
     }
 
     async fn ingest(&self, messages: Vec<OwnedValue>) -> Result<(), Error> {
@@ -369,25 +404,26 @@ impl Sink for QuickwitSink {
                 .timeout(timeout)
                 .build()
                 .map_err(|error| Error::InitError(format!("reqwest client: {error}")))?;
+            let open_retry_policy = RetryPolicy {
+                max_attempts: self
+                    .config
+                    .max_open_retries
+                    .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
+                    .max(1),
+                base_delay: retry_delay,
+                max_delay: open_retry_max_delay,
+            };
             check_connectivity_with_retry(
                 &raw_client,
                 endpoint_url(&base_url, &["health", "readyz"])?,
                 "Quickwit sink",
                 self.id,
-                RetryPolicy {
-                    max_attempts: self
-                        .config
-                        .max_open_retries
-                        .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
-                        .max(1),
-                    base_delay: retry_delay,
-                    max_delay: open_retry_max_delay,
-                },
+                open_retry_policy,
             )
             .await?;
 
             self.client = Some(build_retry_client(
-                raw_client,
+                raw_client.clone(),
                 self.config
                     .max_retries
                     .unwrap_or(DEFAULT_MAX_RETRIES)
@@ -399,7 +435,7 @@ impl Sink for QuickwitSink {
             if !self.has_index().await? {
                 self.create_index().await?;
             }
-            Ok(())
+            self.wait_for_index(&raw_client, open_retry_policy).await
         }
         .await;
         if let Err(error) = result {
@@ -683,6 +719,11 @@ mod tests {
                         "index `test` already exist(s)",
                     ),
                     ("GET /prefix/api/v1/indexes/test HTTP/1.1", 200, "{}"),
+                    (
+                        "POST /prefix/api/v1/test/ingest?commit=auto HTTP/1.1",
+                        200,
+                        "{}",
+                    ),
                 ])
                 .await;
                 let mut config = test_config();
@@ -727,13 +768,111 @@ mod tests {
     }
 
     #[test]
+    fn given_delayed_ingest_readiness_when_opened_should_deliver_the_first_batch() {
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            for index_exists in [false, true] {
+                let mut responses = vec![
+                    ("GET /health/readyz HTTP/1.1", 200, ""),
+                    (
+                        "GET /api/v1/indexes/test HTTP/1.1",
+                        if index_exists { 200 } else { 404 },
+                        "{}",
+                    ),
+                ];
+                if !index_exists {
+                    responses.push(("POST /api/v1/indexes HTTP/1.1", 200, "{}"));
+                }
+                let readiness_start = responses.len();
+                responses.extend([
+                    (
+                        "POST /api/v1/test/ingest?commit=auto HTTP/1.1",
+                        404,
+                        "index not found",
+                    ),
+                    ("POST /api/v1/test/ingest?commit=auto HTTP/1.1", 200, "{}"),
+                    ("POST /api/v1/test/ingest?commit=auto HTTP/1.1", 200, "{}"),
+                ]);
+                let (url, server) = start_test_server(responses).await;
+                let mut config = test_config();
+                config.url = url;
+                config.max_open_retries = Some(3);
+                let mut sink = QuickwitSink::new(1, config);
+                sink.open()
+                    .await
+                    .expect("sink should wait for its ingest queue");
+                consume_payloads(&sink, vec![Payload::Text("first message".to_string())])
+                    .await
+                    .expect("first batch should reach the ready index");
+                let requests = server.await.expect("test server should finish");
+                assert!(
+                    requests[readiness_start..requests.len() - 1]
+                        .iter()
+                        .all(Vec::is_empty)
+                );
+                let mut body = requests
+                    .into_iter()
+                    .last()
+                    .expect("data request should exist");
+                assert_eq!(
+                    simd_json::from_slice::<OwnedValue>(&mut body)
+                        .expect("data request should be JSON"),
+                    simd_json::json!({"text": "first message", "data_type": "text"})
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn given_unavailable_ingest_readiness_when_opened_should_stop_within_the_attempt_budget() {
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            for (status, max_attempts) in
+                [(404, 0), (404, 1), (404, 3), (429, 3), (503, 3), (401, 3)]
+            {
+                let expected_attempts = if status == 401 {
+                    1
+                } else {
+                    max_attempts.max(1)
+                };
+                let mut responses = vec![
+                    ("GET /health/readyz HTTP/1.1", 200, ""),
+                    ("GET /api/v1/indexes/test HTTP/1.1", 200, "{}"),
+                ];
+                responses.extend(std::iter::repeat_n(
+                    (
+                        "POST /api/v1/test/ingest?commit=auto HTTP/1.1",
+                        status,
+                        "not ready",
+                    ),
+                    expected_attempts as usize,
+                ));
+                let (url, server) = start_test_server(responses).await;
+                let mut config = test_config();
+                config.url = url;
+                config.max_open_retries = Some(max_attempts);
+                let mut sink = QuickwitSink::new(1, config);
+                assert!(
+                    matches!(sink.open().await, Err(Error::InitError(_))),
+                    "status {status}"
+                );
+                assert!(sink.client.is_none());
+                let requests = server.await.expect("test server should finish");
+                assert_eq!(requests.len(), expected_attempts as usize + 2);
+                assert!(requests.iter().all(Vec::is_empty));
+            }
+        });
+    }
+
+    #[test]
     fn given_ingest_failure_when_consumed_should_classify_http_errors() {
         let runtime = test_runtime();
         runtime.block_on(async {
-            for status in [400, 429, 503] {
+            for status in [400, 404, 429, 503] {
                 let (url, server) = start_test_server(vec![
                     ("GET /health/readyz HTTP/1.1", 200, ""),
                     ("GET /api/v1/indexes/test HTTP/1.1", 200, "{}"),
+                    ("POST /api/v1/test/ingest?commit=auto HTTP/1.1", 200, "{}"),
                     (
                         "POST /api/v1/test/ingest?commit=auto HTTP/1.1",
                         status,
@@ -747,7 +886,7 @@ mod tests {
                 sink.open().await.expect("sink should open");
                 let result =
                     consume_payloads(&sink, vec![Payload::Text("message".to_string())]).await;
-                if status == 400 {
+                if status == 400 || status == 404 {
                     assert!(matches!(result, Err(Error::PermanentHttpError(_))));
                 } else {
                     assert!(matches!(result, Err(Error::HttpRequestFailed(_))));
@@ -773,6 +912,7 @@ mod tests {
             let (url, server) = start_test_server(vec![
                 ("GET /health/readyz HTTP/1.1", 200, ""),
                 ("GET /api/v1/indexes/test HTTP/1.1", 200, "{}"),
+                ("POST /api/v1/test/ingest?commit=auto HTTP/1.1", 200, "{}"),
                 (
                     "POST /api/v1/test/ingest?commit=auto HTTP/1.1",
                     503,
@@ -802,8 +942,8 @@ mod tests {
             .await;
             assert!(matches!(result, Err(Error::HttpRequestFailed(_))));
             let requests = server.await.expect("test server should finish");
-            assert_eq!(requests[2].len(), MAX_INGEST_BODY_BYTES);
-            assert_eq!(requests[2].last(), Some(&b'\n'));
+            assert_eq!(requests[3].len(), MAX_INGEST_BODY_BYTES);
+            assert_eq!(requests[3].last(), Some(&b'\n'));
             let mut last_body = requests
                 .into_iter()
                 .last()
@@ -824,6 +964,7 @@ mod tests {
                 ("GET /health/readyz HTTP/1.1", 200, ""),
                 ("GET /api/v1/indexes/test HTTP/1.1", 200, "{}"),
                 ("POST /api/v1/test/ingest?commit=auto HTTP/1.1", 200, "{}"),
+                ("POST /api/v1/test/ingest?commit=auto HTTP/1.1", 200, "{}"),
             ])
             .await;
             let mut config = test_config();
@@ -841,7 +982,7 @@ mod tests {
             .await;
             assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
             let requests = server.await.expect("test server should finish");
-            assert_eq!(requests[2], b"{\"sequence\":1}\n{\"sequence\":3}\n");
+            assert_eq!(requests[3], b"{\"sequence\":1}\n{\"sequence\":3}\n");
         });
     }
 
@@ -926,18 +1067,20 @@ mod tests {
             .next()
             .expect("request line should exist")
             .to_string();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length").then(|| {
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .expect("content length should be valid")
-                })
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("content length should be valid")
             })
-            .unwrap_or(0);
+        });
+        assert!(
+            !request_line.starts_with("POST ") || content_length.is_some(),
+            "Quickwit requires an explicit Content-Length for POST requests"
+        );
+        let content_length = content_length.unwrap_or(0);
         let body_start = headers_end + b"\r\n\r\n".len();
         while buffer.len() < body_start + content_length {
             let read = stream.read(&mut chunk).await.expect("body should read");

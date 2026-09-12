@@ -240,8 +240,6 @@ impl TestFixture for MongoDbSinkJsonFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = self.inner.connectors_runtime_envs();
-        // Schema must be "json" for the runtime to route messages correctly.
-        // Already set in base, but override STREAMS_0_SCHEMA explicitly.
         envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string());
         envs
     }

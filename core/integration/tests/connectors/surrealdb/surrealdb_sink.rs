@@ -17,8 +17,8 @@
 
 use super::{LARGE_BATCH_COUNT, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
-    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
-    SurrealDbSinkRawFixture,
+    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkDatabaseFixture, SurrealDbSinkFixture,
+    SurrealDbSinkJsonFixture, SurrealDbSinkNamespaceFixture, SurrealDbSinkRawFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -57,6 +57,35 @@ fn push_hex_component(out: &mut String, bytes: &[u8]) {
     seed = seeds::connector_stream
 )]
 async fn json_messages_sink_to_surrealdb(harness: &TestHarness, fixture: SurrealDbSinkJsonFixture) {
+    assert_json_messages(harness, fixture).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/surrealdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_namespace_auth_should_insert_messages(
+    harness: &TestHarness,
+    fixture: SurrealDbSinkNamespaceFixture,
+) {
+    assert_json_messages(harness, fixture).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/surrealdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_database_auth_should_insert_messages(
+    harness: &TestHarness,
+    fixture: SurrealDbSinkDatabaseFixture,
+) {
+    assert_json_messages(harness, fixture).await;
+}
+
+async fn assert_json_messages<P: Sync>(
+    harness: &integration::harness::TestHarness,
+    fixture: SurrealDbSinkFixture<P>,
+) {
     let client = harness.root_client().await.unwrap();
     let surreal_client = fixture
         .create_client()

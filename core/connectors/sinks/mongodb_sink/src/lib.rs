@@ -835,15 +835,6 @@ mod tests {
         assert!(!is_transient_error(&e));
     }
 
-    // ---- process_messages error propagation tests ----
-    // These tests verify that the sink does NOT silently lose data when inserts fail.
-
-    /// Test contract: When MongoDB insert fails, process_messages MUST return Err.
-    /// This prevents silent data loss where upstream commits while writes failed.
-    ///
-    /// Given: A sink with no client (will fail on get_client)
-    /// When: process_messages is called with messages
-    /// Then: Returns Err (not Ok) and does NOT count failed messages as processed
     #[tokio::test]
     async fn given_no_client_should_return_error_not_silent_ok() {
         let config = given_default_config();
