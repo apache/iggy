@@ -53,10 +53,10 @@ use tracing::trace;
 /// built with [`IggyStreamConfig::new()`] can therefore point the producer and the consumer at
 /// different topics. [`IggyStreamConfig::from_stream_topic()`] gives both the same pair.
 ///
-/// Those two facts combine into a trap. Only the producer half creates anything here, so if the
+/// Only the producer half creates a stream and topic, so if the
 /// consumer half names a topic that the producer half does not create, [`IggyConsumer::init()`]
-/// spends [`init_retries()`] and then fails with [`IggyError::TopicNameNotFound`]. Keep the two
-/// halves on the same stream and topic unless the other topic exists already.
+/// spends [`init_retries()`] and then fails with [`IggyError::TopicNameNotFound`]. Ensure both point
+/// to the same stream and topic unless the other topic exists already.
 ///
 /// # Examples
 ///
@@ -152,7 +152,7 @@ use tracing::trace;
 ///
 /// # Shutting down
 ///
-/// `IggyStream` builds the clients and then steps out of the way, so stopping them is your job.
+/// `IggyStream` builds the clients. Stopping them is left to you.
 /// Call [`IggyConsumer::shutdown()`], then [`IggyProducer::shutdown()`], then
 /// [`IggyClient::shutdown()`].
 ///
