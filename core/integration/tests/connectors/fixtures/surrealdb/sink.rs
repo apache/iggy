@@ -33,7 +33,11 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::info;
 
+const SCOPED_USERNAME: &str = "scoped_sink";
+const SCOPED_PASSWORD: &str = "scoped_password";
+
 pub trait SurrealDbSinkProfile {
+    const AUTH_SCOPE: &'static str = "root";
     const SCHEMA: &'static str;
     const BATCH_SIZE: Option<usize>;
 }
@@ -41,6 +45,8 @@ pub trait SurrealDbSinkProfile {
 pub struct SurrealDbSinkJsonProfile;
 pub struct SurrealDbSinkRawProfile;
 pub struct SurrealDbSinkBatchProfile;
+pub struct SurrealDbSinkNamespaceProfile;
+pub struct SurrealDbSinkDatabaseProfile;
 
 impl SurrealDbSinkProfile for SurrealDbSinkJsonProfile {
     const SCHEMA: &'static str = "json";
@@ -56,6 +62,21 @@ impl SurrealDbSinkProfile for SurrealDbSinkBatchProfile {
     const SCHEMA: &'static str = "json";
     const BATCH_SIZE: Option<usize> = Some(10);
 }
+
+impl SurrealDbSinkProfile for SurrealDbSinkNamespaceProfile {
+    const AUTH_SCOPE: &'static str = "namespace";
+    const SCHEMA: &'static str = "json";
+    const BATCH_SIZE: Option<usize> = None;
+}
+
+impl SurrealDbSinkProfile for SurrealDbSinkDatabaseProfile {
+    const AUTH_SCOPE: &'static str = "database";
+    const SCHEMA: &'static str = "json";
+    const BATCH_SIZE: Option<usize> = None;
+}
+
+pub type SurrealDbSinkNamespaceFixture = SurrealDbSinkFixture<SurrealDbSinkNamespaceProfile>;
+pub type SurrealDbSinkDatabaseFixture = SurrealDbSinkFixture<SurrealDbSinkDatabaseProfile>;
 
 pub type SurrealDbSinkJsonFixture = SurrealDbSinkFixture<SurrealDbSinkJsonProfile>;
 pub type SurrealDbSinkRawFixture = SurrealDbSinkFixture<SurrealDbSinkRawProfile>;
@@ -169,6 +190,18 @@ where
 {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = SurrealDbContainer::start().await?;
+        if P::AUTH_SCOPE != "root" {
+            let client = container.create_client().await?;
+            client
+                .query_result(&format!("DEFINE TABLE {DEFAULT_TABLE} SCHEMALESS;"))
+                .await?;
+            client
+                .query_result(&format!(
+                    "DEFINE USER {SCOPED_USERNAME} ON {} PASSWORD '{SCOPED_PASSWORD}' ROLES EDITOR;",
+                    P::AUTH_SCOPE
+                ))
+                .await?;
+        }
         Ok(Self {
             container,
             profile: PhantomData,
@@ -187,11 +220,20 @@ where
         );
         envs.insert(ENV_SINK_DATABASE.to_string(), DEFAULT_DATABASE.to_string());
         envs.insert(ENV_SINK_TABLE.to_string(), DEFAULT_TABLE.to_string());
-        envs.insert(ENV_SINK_USERNAME.to_string(), ROOT_USERNAME.to_string());
-        envs.insert(ENV_SINK_PASSWORD.to_string(), ROOT_PASSWORD.to_string());
-        envs.insert(ENV_SINK_AUTH_SCOPE.to_string(), "root".to_string());
-        envs.insert(ENV_SINK_AUTO_DEFINE_TABLE.to_string(), "true".to_string());
-        envs.insert(ENV_SINK_DEFINE_INDEXES.to_string(), "true".to_string());
+        let root_auth = P::AUTH_SCOPE == "root";
+        let (username, password) = if root_auth {
+            (ROOT_USERNAME, ROOT_PASSWORD)
+        } else {
+            (SCOPED_USERNAME, SCOPED_PASSWORD)
+        };
+        envs.insert(ENV_SINK_USERNAME.to_string(), username.to_string());
+        envs.insert(ENV_SINK_PASSWORD.to_string(), password.to_string());
+        envs.insert(ENV_SINK_AUTH_SCOPE.to_string(), P::AUTH_SCOPE.to_string());
+        envs.insert(
+            ENV_SINK_AUTO_DEFINE_TABLE.to_string(),
+            root_auth.to_string(),
+        );
+        envs.insert(ENV_SINK_DEFINE_INDEXES.to_string(), root_auth.to_string());
         envs.insert(ENV_SINK_PAYLOAD_FORMAT.to_string(), "auto".to_string());
         envs.insert(
             ENV_SINK_STREAMS_0_STREAM.to_string(),

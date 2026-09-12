@@ -29,8 +29,7 @@ use iggy_connector_sdk::Error;
 /// Newline and carriage-return are the InfluxDB line-protocol record
 /// delimiters that can corrupt parsing; a literal newline inside
 /// a measurement name would split the line and corrupt the batch.
-/// Tab characters are rejected with an error as they are not valid
-/// in the InfluxDB line-protocol spec and would corrupt tag-set parsing.
+/// This connector rejects tab characters in unquoted names.
 #[inline]
 pub(crate) fn write_measurement(buf: &mut String, value: &str) -> Result<(), Error> {
     // Span-copy: all escape targets are ASCII (single byte), so byte positions
@@ -42,9 +41,7 @@ pub(crate) fn write_measurement(buf: &mut String, value: &str) -> Result<(), Err
         let esc = match b {
             b'\t' => {
                 return Err(Error::InvalidConfigValue(
-                    "measurement name must not contain tab characters — tabs are not valid \
-                     in the InfluxDB line-protocol spec and would corrupt tag-set parsing"
-                        .into(),
+                    "measurement name must not contain tab characters".into(),
                 ));
             }
             b'\\' => "\\\\",
@@ -68,8 +65,7 @@ pub(crate) fn write_measurement(buf: &mut String, value: &str) -> Result<(), Err
 ///
 /// Newline and carriage-return are InfluxDB line-protocol record delimiters that
 /// can corrupt tag-set parsing.
-/// Tab characters are rejected with an error as they are not valid
-/// in the InfluxDB line-protocol spec and would corrupt tag-set parsing.
+/// This connector rejects tab characters in unquoted names.
 #[inline]
 pub(crate) fn write_tag_value(buf: &mut String, value: &str) -> Result<(), Error> {
     // Span-copy: all escape targets are ASCII (single byte), so byte positions
@@ -81,9 +77,7 @@ pub(crate) fn write_tag_value(buf: &mut String, value: &str) -> Result<(), Error
         let esc = match b {
             b'\t' => {
                 return Err(Error::CannotStoreData(
-                    "tag value must not contain tab characters — tabs are not valid \
-                     in the InfluxDB line-protocol spec and would corrupt tag-set parsing"
-                        .into(),
+                    "tag value must not contain tab characters".into(),
                 ));
             }
             b'\\' => "\\\\",
@@ -106,18 +100,10 @@ pub(crate) fn write_tag_value(buf: &mut String, value: &str) -> Result<(), Error
 ///
 /// Escapes: `\` → `\\`, `"` → `\"`, `\n` → `\\n`, `\r` → `\\r`
 ///
-/// NOTE: Escaping `\n` and `\r` inside quoted string field values is a
-/// deliberate divergence from the InfluxDB line-protocol spec (which only
-/// mandates `\\` and `\"` inside quoted strings). The divergence prevents
-/// line-splitting in downstream consumers that use raw newlines as record
-/// delimiters — e.g. log shippers, stream processors, and InfluxDB's own
-/// bulk-write HTTP parser if the body is re-streamed line by line.
-///
-/// Tab (`\t`) is intentionally NOT escaped here. String field values are
-/// double-quoted in line protocol, and the spec permits literal tabs inside
-/// quoted strings. Measurement names and tag values (see [`write_measurement`]
-/// and [`write_tag_value`]) are unquoted, so tabs must be escaped there to
-/// avoid misparsing the tag set.
+/// Line protocol does not support literal newlines in field values. This
+/// connector stores CR/LF as visible `\r`/`\n` text, which does not preserve
+/// those original bytes. Use the base64 payload format when they must round-trip.
+/// Literal tabs are allowed in quoted string fields.
 #[inline]
 pub(crate) fn write_field_string(buf: &mut String, value: &str) {
     // Span-copy: all escape targets are ASCII (single byte), so byte positions

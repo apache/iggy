@@ -21,7 +21,6 @@ enabled = true
 version = 0
 name = "Doris sink"
 path = "../../target/release/libiggy_connector_doris_sink"
-plugin_config_format = "toml"
 verbose = false
 
 [[streams]]

@@ -6,8 +6,8 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 
 - The target Doris **database and table must be pre-created** before enabling the sink. The connector never issues DDL.
 - `database` and `table` config values must match `[A-Za-z0-9_]+`. Anything else is rejected at startup with `Error::InvalidConfigValue` — this also prevents path traversal in the constructed `/api/{db}/{table}/_stream_load` URL.
-- Messages must arrive with `Payload::Json` (i.e. the configured stream schema is `json`). If a non-JSON payload reaches the connector it logs at `error!` and aborts the whole poll; since the consumer offset is already committed at poll time the batch is not replayed — effectively silent data loss — so the upstream schema must be guaranteed JSON. (Under `schema = "json"` the SDK drops non-JSON before the connector sees it, so this abort is a defensive guard.)
-- The Iggy message JSON shape must match the target table columns. Use the optional `columns` plugin setting if the column order differs from the JSON keys.
+- Messages must arrive with `Payload::Json` (i.e. the configured stream schema is `json`). If a non-JSON payload reaches the connector it logs at `error!` and aborts the whole poll; since the consumer offset is already committed at poll time the batch is not replayed - data loss despite the error log - so the upstream schema must be guaranteed JSON. (Under `schema = "json"` the SDK drops non-JSON before the connector sees it, so this abort is a defensive guard.)
+- The Iggy message JSON shape must match the target table columns. JSON fields map by name. Use the optional `columns` plugin setting for field mappings or derived expressions.
 
 ## How it works
 
@@ -16,7 +16,8 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
    - `hash16` is a single 64-bit blake3 hash computed over the *raw* (un-sanitized), length-prefixed `(label_prefix, table, stream, topic)` tuple.
      Identities that sanitize to the same string therefore get distinct labels, whether the collision is in the names (`events.v1` vs `events_v1`) or in two tenants' prefixes that truncate alike (`prod_events_us_east_1` vs `..._2`). Length prefixes prevent boundary-shift aliasing (`("ab","c")` ≠ `("a","bc")`). The target table participates because Doris labels are scoped to a database, not a table.
    - The total label is bounded under Doris's 128-char cap regardless of input length (worst case 120 chars).
-   - Doris dedupes loads by label inside its `label_keep_max_second` window. The in-request retry (step 6) re-PUTs a transiently-failed batch under the same label, so a prior attempt that actually landed (e.g. a `2xx` with a missing or unreadable body) is absorbed, not doubled. This protects **in-request retry only**: the runtime commits the offset before `consume()` runs and discards its return, so a failure outliving the retry budget or a crash mid-load is **at-most-once**.
+   - Doris dedupes loads while it retains their labels (see Operational guidance). The in-request retry (step 6) re-PUTs a transiently-failed batch under the same label, so a prior attempt that actually landed (e.g. a `2xx` with a missing or unreadable body) is absorbed, not doubled.
+     The runtime uses consumer auto-commit before `consume()` finishes and does not replay a failed poll, so a failure outliving the retry budget or a crash mid-load can lose data. Expired labels or changed chunk boundaries can also permit duplicate loads during a redrive.
 3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth, `Expect: 100-continue`, `label: <label>`, and the format headers (`format: json` + `strip_outer_array: true` for JSON; `format: csv` with control-char `column_separator`/`line_delimiter` + `enclose`/`escape` for CSV). `Expect: 100-continue` is required by Doris's Stream Load endpoint, which rejects PUTs that omit it; it also lets Doris reject auth/4xx before the body uploads.
 4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects).
    `308 Permanent Redirect` is also followed as a defensive measure; redirects beyond a hard cap of 5 (or a redirect with no usable `Location`) are rejected as a permanent `PermanentHttpError`, since retrying a malformed/looping redirect cannot help.
@@ -27,7 +28,8 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
    - An empty or unreadable `2xx` response body → ambiguous commit outcome, retried under the same label. A non-empty malformed body remains a permanent protocol error.
    - HTTP `5xx`/`408`/`429` → transient error (`Error::CannotStoreData`): retried in-request up to `max_retries` attempts (exponential backoff + jitter) under the same label before being surfaced.
    - `Fail`, any other `4xx`, or a non-empty unparsable response body → permanent error (`Error::PermanentHttpError`); never retried — re-PUTing bad data would just hammer the FE.
-6. A *transient* failure (the classifications above, plus a transport-level error) is retried in-request: the same batch is re-`PUT` under the same label, up to `max_retries` attempts with backoff and ±20% jitter (`iggy_connector_sdk::retry`). Since the runtime commits the offset at poll time, this is the connector's only redelivery path; once the budget is exhausted the final attempt's error is surfaced and the batch is not retried again — **at-most-once** across polls.
+6. A *transient* failure (the classifications above, plus a transport-level error) is retried in-request: the same batch is re-`PUT` under the same label, up to `max_retries` attempts with backoff and ±20% jitter (`iggy_connector_sdk::retry`). Since the runtime commits the offset at poll time, this is the connector's only redelivery path; once the budget is exhausted the final attempt's error is surfaced and the failed poll is not automatically replayed.
+   The runtime logs and counts the error, adds no processed messages for that batch, and continues polling.
 
 ## Configuration
 
@@ -36,10 +38,10 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `fe_url` | yes | — | Doris frontend HTTP base URL, e.g. `http://localhost:8030`. |
 | `database` | yes | — | Target database. Must match `[A-Za-z0-9_]+`. |
 | `table` | yes | — | Target table. Must match `[A-Za-z0-9_]+`. |
-| `username` | yes | — | Doris user with `LOAD_PRIV` on the table. |
+| `username` | yes | - | Doris user authorized for Stream Load; required grants depend on the Doris version. |
 | `password` | yes | — | Doris user password. Stored as a `secrecy::SecretString` and never logged. |
 | `label_prefix` | no | `iggy` | Prefix for the deterministic Stream Load label. |
-| `batch_size` | no | `1000` | Maximum number of messages per Stream Load request. |
+| `batch_size` | no | `1000` | Maximum number of messages per Stream Load request; `0` is treated as `1`. |
 | `timeout` | no | `30s` | Per-request HTTP timeout (total request budget), as a human-readable duration (e.g. `30s`, `1m`). |
 | `connect_timeout` | no | `5s` | TCP connect timeout, independent of `timeout`, as a human-readable duration. Raise it for cross-region or cold-start FEs. |
 | `max_retries` | no | `3` | Total Stream Load attempts per batch on a *transient* failure (`0` or `1` disables retries). Each retry re-PUTs under the same label, which Doris dedupes. Values above `10` are honored but emit a startup warning because they can substantially delay graceful shutdown. |
@@ -48,7 +50,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. Must be a finite value in `[0.0, 1.0]`; an out-of-range value fails `open()`. |
 | `columns` | no | unset | Forwarded as the `columns` Stream Load header. Validated at startup; an invalid value fails `open()`. |
 | `where` | no | unset | Forwarded as the `where` Stream Load header. Validated at startup; an invalid value fails `open()`. |
-| `output_format` | no | `json` | Stream Load output format: `json` or `csv`. CSV is opt-in for throughput; it **requires `columns`** (CSV is positional, unlike name-mapped JSON) and emits control-char-framed, `enclose`/`escape`-quoted rows. `open()` fails if `output_format = "csv"` and `columns` is unset. (Named `output_format`, not `format`, to avoid an env-override collision with `plugin_config_format`.) |
+| `output_format` | no | `json` | Stream Load output format: `json` or `csv`. CSV is opt-in for throughput; it **requires `columns`** (CSV is positional, unlike name-mapped JSON) and emits control-char-framed, `enclose`/`escape`-quoted rows. `open()` fails if `output_format = "csv"` and `columns` is unset. List bare JSON field names first, followed by any derived expressions; CSV reads only the leading names before the first `=` expression. |
 | `allow_insecure_redirect` | no | `false` | Permit a Stream Load redirect that downgrades `https://` → `http://`. Refused by default because it would push credentials onto a cleartext hop. |
 | `allowed_redirect_hosts` | no | unset | Allowlist of redirect targets. Each entry is `host` (pins the host, any port) or `host:port` (pins the exact endpoint). When set and non-empty, any other redirect target is refused. |
 
@@ -61,7 +63,6 @@ enabled = true
 version = 0
 name = "Doris sink"
 path = "target/release/libiggy_connector_doris_sink"
-plugin_config_format = "toml"
 
 [[streams]]
 stream = "events"
@@ -92,17 +93,18 @@ timeout = "30s"
 
 ## Operational guidance
 
-- **`label_keep_max_second`.** The connector's in-request retry re-PUTs a transiently-failed batch under the same label, so Doris must retain that label for at least the connector's full retry budget for the replay to dedupe. The Doris default is 3 days, which is conservative.
+- **Label retention.** The connector's in-request retry re-PUTs a transiently-failed batch under the same label, so Doris must retain that label for at least the connector's full retry budget for the replay to dedupe.
+  Verify the settings for your Doris version. Doris 4.0.3 uses `streaming_label_keep_max_second` (default 12 hours) for Stream Load, rather than the general `label_keep_max_second` default of three days. See [Doris FE configuration](https://doris.apache.org/docs/4.x/admin-manual/config/fe-config/#streaming_label_keep_max_second).
   If you set this lower on the Doris side, use `N × 6 × timeout + (N - 1) × max_retry_delay` as a conservative per-chunk bound, where `N` is the effective total attempt count (`1` when `max_retries` is `0` or `1`), and leave operational headroom.
   Each attempt can issue the initial FE request plus up to five redirected requests, and each request has its own `timeout`; every inter-attempt delay is capped at `max_retry_delay`, including jitter. Once a label expires, a retry re-loads instead of deduping, producing duplicate rows.
 - **Graceful shutdown waits for in-flight retries.** Shutdown is observed between polls, not during `consume()`. An in-flight `consume()` call must return, after any remaining chunks and retries, before the plugin can close. The runtime waits up to five seconds for each consume task; if that deadline expires, the task handle is dropped and the task continues detached. The subsequent plugin close blocks while removing the SDK instance until the in-flight consume call releases its guard.
   Configure `timeout`, `max_retries`, `max_retry_delay`, and `batch_size` so the per-chunk bound above, multiplied by the maximum chunks per poll (`ceil(batch_length / batch_size)`), fits your deployment's stop/restart window.
 - **Label identity changed to include the target table.** Builds containing this fix generate a different hash than older builds for the same batch. This prevents two sinks targeting different tables in one database from silently deduplicating each other.
   Completed batches are not replayed by an ordinary upgrade, but an old-build label never dedupes against a replay generated by a new build, even after the old request finishes. Coordinate upgrades to avoid an in-flight version boundary, and do not rely on deduplication for a cross-version manual redrive.
-- **Keep `batch_size` stable across a redrive.** The label includes the chunk's `first_offset` and `last_offset`, which are a function of `batch_size`. If you change `batch_size` between a failed load and its redrive, the chunk boundaries shift, the offsets differ, and the new label no longer matches the old one — so Doris re-loads instead of deduping, producing duplicate rows.
+- **Preserve label inputs and chunk boundaries across a redrive.** Labels include each chunk's `first_offset` and `last_offset`. Both `batch_length` and `batch_size` affect those boundaries, and actual poll sizes can vary even with unchanged settings. Different boundaries produce different labels and can reload rows instead of deduplicating them.
 - **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
 - **Multi-chunk batches are best-effort for operational failures.** A poll larger than `batch_size` is split into chunks, each loaded as its own labelled Stream Load (with its own in-request retry budget for transient failures). If a chunk still fails after its retries (serialize, HTTP, or status-classification error), the connector keeps the first error, attempts the remaining chunks, and returns that error at the end — it does **not** stop at the first such failure.
-  The runtime commits the consumer offset for the whole poll before `consume()` runs, so a chunk that exhausts its in-request retries is not replayed across polls; pushing the other chunks through maximizes delivered data, and the first error is surfaced at the end (logged at `error!` for observability — the runtime currently discards `consume()`'s return value, so there is no cross-poll redrive or DLQ).
+  The runtime commits the consumer offset for the whole poll before `consume()` runs, so a chunk that exhausts its in-request retries is not replayed across polls; pushing the other chunks through maximizes delivered data, and the first error is surfaced at the end (logged at `error!` for observability; the runtime counts the error and continues polling, with no automatic replay of the failed poll or DLQ).
   The one deliberate exception is a **non-JSON payload**, which is treated as a schema-contract violation and aborts the whole poll immediately (see the Requirements note above). Under `schema = "json"` this is unreachable, so it is a defensive guard rather than a normal path.
 
 ## Limitations
@@ -110,4 +112,4 @@ timeout = "30s"
 - Output is JSON (default) or CSV (`output_format = "csv"`, which requires `columns`). Both serialize from `Payload::Json`; raw-text/CSV passthrough and Parquet are not supported. CSV maps JSON `null` and missing keys to SQL `NULL` (`\N`), an empty string to `""`, emits numbers and booleans bare (`true`/`false`), and stringifies nested objects/arrays as JSON.
 - HTTP Basic auth only.
 - No automatic table creation.
-- In-request retry only. Transient backend failures are retried within a single `consume()` call (step 6), but the runtime commits the consumer offset at poll time and discards `consume()`'s return value, so there is no cross-poll redrive or DLQ — delivery is at-most-once under a crash or a failure that outlives the retry budget.
+- In-request retry only. Transient backend failures are retried within a single `consume()` call (step 6). Consumer auto-commit and the lack of automatic replay or a DLQ mean a crash or exhausted retry budget can lose data. Label retention and chunk boundaries also limit deduplication, so this is not an end-to-end exactly-once guarantee.
