@@ -2076,6 +2076,7 @@ mod tests {
             vec![sender],
             inbox_rx,
             reply_inbox_rx,
+            1,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,

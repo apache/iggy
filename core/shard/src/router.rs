@@ -290,6 +290,7 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
+        let _completion_pump = self.poll_completions.pump_guard();
         if let Some(sender) = self.senders.get(self.id as usize).cloned() {
             let metrics = self.metrics.clone();
             self.plane
@@ -335,11 +336,10 @@ where
             futures::select_biased! {
                 _ = stop_signal.as_mut() => break,
                 () = consensus_tick.as_mut() => {
-                    // Sharing the pump task is what keeps `tick_partitions`
-                    // borrow-safe, but it bounds the tick's worst-case delay
-                    // to one main frame body's longest `.await` (replication
-                    // append + commit_journal fsync/rotate + reply) plus the
-                    // one reply-lane bus send drained per main frame.
+                    // Sharing the pump task keeps `tick_partitions` borrows
+                    // safe, but a tick can wait for a main frame's processing
+                    // (replication, journal fsync or rotation, and reply), plus
+                    // one reply and one poll completion, including its loopback.
                     // TODO(hubcio): if a load test shows tick starvation,
                     // make `tick_partitions` borrow-free so the tick can be
                     // decoupled from the pump again without reintroducing the
@@ -393,6 +393,7 @@ where
                     {
                         self.process_frame(reply).await;
                     }
+                    self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
                 }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
@@ -418,6 +419,7 @@ where
                             {
                                 self.process_frame(reply).await;
                             }
+                            self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
                         }
                         Err(_) => break,
                     }
@@ -431,12 +433,25 @@ where
                             if self.accept_frame_for_self(&frame) {
                                 self.process_frame(frame).await;
                             }
+                            self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                completion = self.poll_completions.recv().fuse() => {
+                    match completion {
+                        Ok(completion) => {
+                            self.on_poll_completed(*completion).await;
+                            self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                            self.apply_reconcile_ops();
                         }
                         Err(_) => break,
                     }
                 }
             }
         }
+
+        self.poll_completions.close();
 
         // A stop can win the select immediately after a frame fenced a
         // partition, before the next tick observes it. Preserve that fault so
@@ -487,6 +502,27 @@ where
         fatal
     }
 
+    /// A busy ordinary lane yields one completion per frame. Keeping this
+    /// service bounded lets ordinary work progress under a completion flood.
+    #[allow(clippy::future_not_send)]
+    async fn process_one_poll_completion(
+        &self,
+        loopback_buf: &mut Vec<Message<GenericHeader>>,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        if let Ok(completion) = self.poll_completions.try_recv() {
+            self.on_poll_completed(*completion).await;
+            self.process_loopback(loopback_buf, namespace_scratch).await;
+            self.apply_reconcile_ops();
+        }
+    }
+
     /// Process queued work after the select loop has stopped. Redispatch keeps
     /// its live-pump rank over the inbox, and every delivered frame gets its
     /// loopback before another frame can run.
@@ -511,8 +547,24 @@ where
                 if let Some(fault) = self.first_partition_commit_fault() {
                     return Some(fault);
                 }
+                self.process_one_poll_completion(loopback_buf, namespace_scratch)
+                    .await;
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
             }
             let Ok(frame) = self.inbox.try_recv() else {
+                if let Ok(completion) = self.poll_completions.try_recv() {
+                    self.on_poll_completed(*completion).await;
+                    self.process_loopback(loopback_buf, namespace_scratch).await;
+                    self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        return Some(fault);
+                    }
+                    // Completion processing can stage ordinary work. Return
+                    // to the main drain before accepting another completion.
+                    continue;
+                }
                 break;
             };
             if self.accept_frame_for_self(&frame) {
@@ -522,6 +574,11 @@ where
                 if let Some(fault) = self.first_partition_commit_fault() {
                     return Some(fault);
                 }
+            }
+            self.process_one_poll_completion(loopback_buf, namespace_scratch)
+                .await;
+            if let Some(fault) = self.first_partition_commit_fault() {
+                return Some(fault);
             }
         }
 
@@ -744,9 +801,6 @@ where
                 reply,
             } => {
                 self.on_partition_read(namespace, read, reply).await;
-            }
-            LifecycleFrame::PollCompleted(completion) => {
-                self.on_poll_completed(*completion).await;
             }
             LifecycleFrame::PartitionSubmit { request, reply } => {
                 // Addressed to the shard owning the request's namespace (the

@@ -286,6 +286,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         senders,
         inbox,
         reply_inbox,
+        config.sharding.poll_completion_capacity,
         shards_table,
         PartitionConsensusConfig::new(
             topology.cluster_id,

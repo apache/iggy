@@ -789,6 +789,7 @@ mod tests {
                 vec![sender],
                 inbox,
                 replies,
+                1,
                 PapayaShardsTable::new(),
                 PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus),
                 None,

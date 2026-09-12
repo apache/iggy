@@ -735,6 +735,13 @@ inbox_capacity = 1024
 # peak client-reply fan-out per shard.
 reply_inbox_capacity = 1024
 
+# Maximum running disk polls plus queued completions per shard. Each disk read
+# reserves a slot before I/O and retains it until the owner dequeues or discards
+# the result, including after a requester timeout. When all slots are occupied,
+# new disk polls are rejected before I/O. Main and reply inbox traffic uses
+# separate capacity. This limits operation count, not retained message bytes.
+poll_completion_capacity = 1024
+
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized
 # larger than typical TCP RTT times in-flight write-batch so writers

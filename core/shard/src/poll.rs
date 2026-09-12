@@ -18,8 +18,8 @@
 //! Poll reads complete under the partition owner's control.
 //!
 //! 1. The owner snapshots the history identity and read resources.
-//! 2. Resident reads complete inline. Disk reads run in a detached task and
-//!    return their result through the owner's inbox.
+//! 2. Resident reads complete inline. Disk reads reserve completion capacity
+//!    before detached I/O and return through the owner's completion lane.
 //! 3. The owner checks the reply connection, history, and recovery state, admits
 //!    any automatic commit, and updates progress before releasing the reply.
 //!
@@ -37,6 +37,7 @@ use message_bus::MessageBus;
 use partitions::{PollCompletion, PollPlan, PollReadResult};
 use server_common::sharding::IggyNamespace;
 
+pub mod completion;
 #[cfg(test)]
 mod completion_tests;
 #[cfg(test)]
@@ -45,13 +46,13 @@ mod test_support;
 mod timeout_tests;
 
 /// A read result awaiting acceptance by its partition owner.
-/// Disk tasks send it through the inbox. Resident reads pass it directly to
-/// the same completion handler.
+/// Disk tasks send it through the reserved completion lane. Resident reads
+/// pass it directly to the same completion handler.
 ///
-/// The inbox requires `Send` even for messages addressed to this same shard.
-/// The owner acquires any capacity reservation while accepting the result.
-/// Guards stay in its local request queue or replication state, outside this
-/// channel's `Send` boundary.
+/// The channel requires `Send` even for messages addressed to this same shard.
+/// Completion capacity is released on dequeue. Consumer offset capacity is
+/// reserved separately during owner acceptance; those guards stay in the
+/// owner's local request queue or replication state, outside this channel.
 pub struct PollCompleted {
     /// Namespace whose current partition must validate the captured history.
     namespace: IggyNamespace,
@@ -96,6 +97,25 @@ where
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {
                     None => PartitionReadReply::NotFound,
                     Some(plan) if plan.needs_off_pump_io() => {
+                        let route_failure = self.senders.get(usize::from(self.id)).map_or(
+                            Some(crate::metrics::frame_drop_reason::UNROUTABLE),
+                            |sender| {
+                                sender
+                                    .is_disconnected()
+                                    .then_some(crate::metrics::frame_drop_reason::DISCONNECTED)
+                            },
+                        );
+                        if let Some(reason) = route_failure {
+                            completion::reject(&reply, &self.metrics, reason);
+                            return;
+                        }
+                        let Some(completion) = self.poll_completions.try_reserve(
+                            namespace,
+                            reply,
+                            self.metrics.clone(),
+                        ) else {
+                            return;
+                        };
                         #[cfg(feature = "poll-diagnostics")]
                         tracing::debug!(
                             target: "iggy.shard.poll_diagnostics",
@@ -103,12 +123,6 @@ where
                             phase = "dispatch",
                             tier = "disk",
                             "partition poll dispatch"
-                        );
-                        let completion = completion::PollCompletionSender::new(
-                            self.senders.get(usize::from(self.id)).cloned(),
-                            namespace,
-                            reply,
-                            self.metrics.clone(),
                         );
                         self.bus.spawn(read_poll(namespace, plan, completion));
                         return;
@@ -243,224 +257,4 @@ async fn read_poll(
         );
     }
     completion.complete(result);
-}
-
-mod completion {
-    use super::PollCompleted;
-    use crate::coordinator::classify_try_send_err;
-    use crate::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
-    use crate::{LifecycleFrame, PartitionReadReply, Sender, ShardFrame, TaggedSender};
-    use iggy_common::IggyError;
-    use partitions::PollReadResult;
-    use server_common::sharding::IggyNamespace;
-
-    /// The read task can return bytes to the owner or reject a lost completion.
-    /// The reply sender stays private so it cannot authorize successful reads.
-    pub(super) struct PollCompletionSender {
-        /// Originating owner's inbox, whose absence causes a rejection.
-        inbox: Option<TaggedSender>,
-        namespace: IggyNamespace,
-        /// May be used here only to reject a result that cannot reach its owner.
-        reply: Sender<PartitionReadReply>,
-        metrics: ShardMetrics,
-    }
-
-    impl PollCompletionSender {
-        /// Bind the result and reply route to the shard that built the snapshot.
-        pub(super) const fn new(
-            inbox: Option<TaggedSender>,
-            namespace: IggyNamespace,
-            reply: Sender<PartitionReadReply>,
-            metrics: ShardMetrics,
-        ) -> Self {
-            Self {
-                inbox,
-                namespace,
-                reply,
-                metrics,
-            }
-        }
-
-        /// Return the result to the owner without waiting for inbox capacity.
-        /// A missing, full, or disconnected inbox records a dropped completion
-        /// and attempts a `TransientNotAccepted` reply. Successful enqueueing
-        /// leaves the reply to the owner.
-        pub(super) fn complete(self, result: PollReadResult) {
-            let Some(inbox) = self.inbox else {
-                self.metrics.record_frame_drop(
-                    frame_drop_variant::PARTITION_POLL_COMPLETION,
-                    frame_drop_reason::UNROUTABLE,
-                );
-                let _ = self.reply.try_send(PartitionReadReply::Rejected(
-                    IggyError::TransientNotAccepted,
-                ));
-                return;
-            };
-            let frame =
-                ShardFrame::lifecycle(LifecycleFrame::PollCompleted(Box::new(PollCompleted {
-                    namespace: self.namespace,
-                    result,
-                    reply: self.reply,
-                    #[cfg(feature = "poll-diagnostics")]
-                    queued_at: Some(std::time::Instant::now()),
-                })));
-            if let Err(error) = inbox.try_send(frame) {
-                self.metrics.record_frame_drop(
-                    frame_drop_variant::PARTITION_POLL_COMPLETION,
-                    classify_try_send_err(&error),
-                );
-                let frame = match error {
-                    crossfire::TrySendError::Full(frame)
-                    | crossfire::TrySendError::Disconnected(frame) => frame,
-                };
-                if let ShardFrame::Lifecycle(LifecycleFrame::PollCompleted(completion)) = frame {
-                    let _ = completion.reply.try_send(PartitionReadReply::Rejected(
-                        IggyError::TransientNotAccepted,
-                    ));
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::completion::PollCompletionSender;
-    use crate::metrics::ShardMetrics;
-    use crate::{LifecycleFrame, PartitionReadReply, ShardFrame, channel, shard_channel};
-    use consensus::{LocalPipeline, VsrConsensus};
-    use iggy_common::{IggyByteSize, IggyError, PartitionStats, PollingStrategy};
-    use message_bus::IggyMessageBus;
-    use partitions::{
-        IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig, PollReadResult,
-        PollingArgs, PollingConsumer,
-    };
-    use server_common::sharding::{IggyNamespace, ShardId};
-    use std::sync::Arc;
-
-    #[test]
-    fn given_full_owner_inbox_when_poll_completes_should_reject_without_displacing_work() {
-        let inbox_capacity = 1;
-        let (owner_sender, owner_inbox, _owner_reply_lane) = shard_channel(0, inbox_capacity, 1);
-
-        // Occupy the sole slot so the read result cannot reach owner acceptance.
-        assert!(
-            owner_sender
-                .try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply))
-                .is_ok()
-        );
-        let (reply_sender, caller_replies) = channel(1);
-        let metrics = ShardMetrics::for_shard();
-        PollCompletionSender::new(
-            Some(owner_sender),
-            namespace(),
-            reply_sender,
-            metrics.clone(),
-        )
-        .complete(read_empty_partition());
-
-        // Refuse this poll while leaving the owner's existing work in place.
-        assert!(matches!(
-            caller_replies.try_recv(),
-            Ok(PartitionReadReply::Rejected(
-                IggyError::TransientNotAccepted
-            ))
-        ));
-        assert!(matches!(
-            owner_inbox.try_recv(),
-            Ok(ShardFrame::Lifecycle(LifecycleFrame::ReconcileApply))
-        ));
-        assert_eq!(metrics.frame_drops_value(), 1);
-    }
-
-    #[test]
-    fn given_closed_owner_inbox_when_poll_completes_should_reject() {
-        let (owner_sender, owner_inbox, _owner_reply_lane) = shard_channel(0, 1, 1);
-        drop(owner_inbox);
-        let (reply_sender, caller_replies) = channel(1);
-        let metrics = ShardMetrics::for_shard();
-        PollCompletionSender::new(
-            Some(owner_sender),
-            namespace(),
-            reply_sender,
-            metrics.clone(),
-        )
-        .complete(read_empty_partition());
-
-        assert!(matches!(
-            caller_replies.try_recv(),
-            Ok(PartitionReadReply::Rejected(
-                IggyError::TransientNotAccepted
-            ))
-        ));
-        assert_eq!(metrics.frame_drops_value(), 1);
-    }
-
-    #[test]
-    fn given_available_owner_inbox_when_poll_completes_should_leave_reply_to_owner() {
-        let (owner_sender, owner_inbox, _owner_reply_lane) = shard_channel(0, 1, 1);
-        let (reply_sender, caller_replies) = channel(1);
-        PollCompletionSender::new(
-            Some(owner_sender),
-            namespace(),
-            reply_sender,
-            ShardMetrics::for_shard(),
-        )
-        .complete(read_empty_partition());
-
-        // Enqueueing the read result does not authorize a reply. The owner must
-        // still validate it and decide whether to accept the consumer progress.
-        assert!(caller_replies.try_recv().is_err());
-        assert!(matches!(
-            owner_inbox.try_recv(),
-            Ok(ShardFrame::Lifecycle(LifecycleFrame::PollCompleted(_)))
-        ));
-    }
-
-    fn namespace() -> IggyNamespace {
-        IggyNamespace::new(1, 1, 0)
-    }
-
-    /// Read an empty partition without invoking owner acceptance. These tests
-    /// exercise completion delivery, so no messages or disk I/O are needed.
-    fn read_empty_partition() -> PollReadResult {
-        let partitions = IggyPartitions::<IggyMessageBus>::new(
-            ShardId::new(0),
-            PartitionsConfig {
-                messages_required_to_save: 1,
-                size_of_messages_required_to_save: IggyByteSize::from(1024_u64),
-                validate_checksum: true,
-                segment_size: IggyByteSize::from(1_048_576_u64),
-                preallocate_segments: false,
-                encryptor: None,
-                path_layout: PartitionPathLayout::default(),
-            },
-        );
-        let consensus = VsrConsensus::new(
-            1,
-            0,
-            1,
-            namespace().inner(),
-            IggyMessageBus::new(0),
-            LocalPipeline::new(),
-        );
-        partitions.insert(
-            namespace(),
-            IggyPartition::new(Arc::new(PartitionStats::default()), consensus),
-        );
-        let consumer_id = 7;
-        let partition_id = 0;
-        partitions
-            .build_poll_snapshot(
-                &namespace(),
-                PollingConsumer::Consumer(consumer_id, partition_id),
-                &PollingArgs {
-                    strategy: PollingStrategy::next(),
-                    count: 0,
-                    auto_commit: true,
-                },
-            )
-            .expect("partition has a read snapshot")
-            .execute_resident()
-    }
 }

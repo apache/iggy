@@ -31,18 +31,17 @@ use partitions::{IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer}
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
-use super::completion::PollCompletionSender;
 use super::test_support::{PollTestMetadata, partition_with_messages};
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    IggyShard, PartitionConsensusConfig, PartitionReadReply, Receiver, ReplicaTopology,
-    ShardIdentity, TaggedSender, channel, shard_channel,
+    IggyShard, LifecycleFrame, PartitionConsensusConfig, PartitionRead, PartitionReadReply,
+    Receiver, ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
 };
 
 /// Replacement can reuse every message offset from the old history. The pump
 /// must reject the old completion by history, then accept a fresh completion
-/// through the same inbox without having inherited any stale group progress.
+/// through the same completion lane without inheriting stale group progress.
 #[compio::test]
 #[allow(clippy::too_many_lines)]
 async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale_completion_through_owner_pump()
@@ -56,7 +55,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let bus = Rc::new(IggyMessageBus::new(0));
     let old_payloads = ["old zero", "old one", "old two"];
     let (old_partition, config) = partition_with_messages(&bus, namespace, &old_payloads).await;
-    let (owner, owner_sender) = owner_with_inbox(&bus, config, namespace);
+    let (owner, _owner_sender) = owner_with_inbox(&bus, config, namespace);
     let partitions = owner.plane.partitions();
     partitions.insert(namespace, old_partition);
     let poll_args = PollingArgs {
@@ -67,6 +66,11 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
 
     // Read the committed old batch but hold its result before owner acceptance.
     // Resident bytes make the release ordering explicit without disk timing.
+    let (stale_reply_sender, stale_replies) = channel(1);
+    let old_completion = owner
+        .poll_completions
+        .try_reserve(namespace, stale_reply_sender, owner.metrics().clone())
+        .expect("reserve the old read before executing it");
     let old_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
         .expect("old partition has a read snapshot");
@@ -93,16 +97,9 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let (_stop_sender, stop_receiver) = channel(1);
     let pump = owner.run_message_pump(stop_receiver, Arc::new(AtomicBool::new(false)));
     futures::pin_mut!(pump);
-    let (stale_reply_sender, stale_replies) = channel(1);
-    PollCompletionSender::new(
-        Some(owner_sender.clone()),
-        namespace,
-        stale_reply_sender,
-        owner.metrics().clone(),
-    )
-    .complete(delayed_result);
+    old_completion.complete(delayed_result);
     assert_eq!(
-        owner.inbox_len(),
+        owner.poll_completion_inbox_len(),
         1,
         "stale result is queued for owner validation"
     );
@@ -137,25 +134,23 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
         "old history must be rejected, got {stale_reply:?}"
     );
 
-    // A fresh result takes the same sender, inbox, router and pump. Distinct
+    // A fresh result takes the same completion lane and pump. Distinct
     // payloads prove the reply belongs to the replacement at the reused offsets.
+    let (fresh_reply_sender, fresh_replies) = channel(1);
+    let fresh_completion = owner
+        .poll_completions
+        .try_reserve(namespace, fresh_reply_sender, owner.metrics().clone())
+        .expect("reserve the fresh read before executing it");
     let fresh_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
         .expect("replacement has a read snapshot");
     assert!(!fresh_plan.needs_off_pump_io());
     let fresh_result = fresh_plan.execute_resident();
-    let (fresh_reply_sender, fresh_replies) = channel(1);
-    PollCompletionSender::new(
-        Some(owner_sender),
-        namespace,
-        fresh_reply_sender,
-        owner.metrics().clone(),
-    )
-    .complete(fresh_result);
+    fresh_completion.complete(fresh_result);
     assert_eq!(
-        owner.inbox_len(),
+        owner.poll_completion_inbox_len(),
         1,
-        "fresh result uses the same owner inbox"
+        "fresh result uses the same completion lane"
     );
     assert!(
         matches!(
@@ -196,13 +191,142 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     );
 }
 
+/// A full ordinary inbox must not refuse a completed read. Interleaving offset
+/// queries with two reads also proves neither lane drains its whole backlog
+/// before giving the other lane a turn.
+#[compio::test]
+#[allow(clippy::too_many_lines)]
+async fn given_full_owner_inbox_when_reserved_reads_complete_should_interleave_both_lanes() {
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let group_id = 7;
+    let consumer = PollingConsumer::ConsumerGroup(
+        usize::try_from(group_id).expect("group id fits the consumer key"),
+        0,
+    );
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let payloads = ["first completion", "second completion"];
+    let (partition, config) = partition_with_messages(&bus, namespace, &payloads).await;
+    let (owner, owner_sender) = owner_with_inbox(&bus, config, namespace);
+    let partitions = owner.plane.partitions();
+    partitions.insert(namespace, partition);
+    let mut delayed_reads = Vec::new();
+    let mut poll_replies = Vec::new();
+
+    // Reserve both reads before executing them. Each nonempty result advances
+    // the same group's progress by one offset, making acceptance order visible.
+    for offset in [0, 1] {
+        let (reply_sender, replies) = channel(1);
+        let completion = owner
+            .poll_completions
+            .try_reserve(namespace, reply_sender, owner.metrics().clone())
+            .expect("reserve completion capacity before reading");
+        let plan = partitions
+            .build_poll_snapshot(
+                &namespace,
+                consumer,
+                &PollingArgs {
+                    strategy: PollingStrategy::offset(offset),
+                    count: 1,
+                    auto_commit: false,
+                },
+            )
+            .expect("fixture partition has a read snapshot");
+        assert!(!plan.needs_off_pump_io());
+        delayed_reads.push((completion, plan.execute_resident()));
+        poll_replies.push(replies);
+    }
+
+    // The fixture's ordinary inbox has two slots. These queries fill it before
+    // either completed read is returned, reproducing the former refusal path.
+    let mut progress_replies = Vec::new();
+    for _ in 0..2 {
+        let (reply, replies) = channel(1);
+        assert!(
+            owner_sender
+                .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
+                    namespace,
+                    read: PartitionRead::GroupOffsetState { group_id },
+                    reply,
+                }))
+                .is_ok()
+        );
+        progress_replies.push(replies);
+    }
+    assert!(matches!(
+        owner_sender.try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply)),
+        Err(crossfire::TrySendError::Full(_))
+    ));
+    for (completion, result) in delayed_reads {
+        completion.complete(result);
+    }
+    assert_eq!(owner.inbox_len(), 2, "ordinary work remains queued");
+    assert_eq!(owner.poll_completion_inbox_len(), 2);
+    assert_eq!(owner.metrics().frame_drops_value(), 0);
+    for replies in &poll_replies {
+        assert!(matches!(
+            replies.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+    }
+
+    let (_stop_sender, stop_receiver) = channel(1);
+    let pump = owner.run_message_pump(stop_receiver, Arc::new(AtomicBool::new(false)));
+    futures::pin_mut!(pump);
+    assert!(futures::poll!(pump.as_mut()).is_pending());
+
+    // The first query runs before either read is accepted. The second runs
+    // after exactly one acceptance: each lane yields while the other has work.
+    for (replies, expected_last_polled) in progress_replies.iter().zip([None, Some(0)]) {
+        let PartitionReadReply::GroupOffsetState {
+            last_polled,
+            committed,
+        } = replies.try_recv().expect("ordinary query was processed")
+        else {
+            panic!("expected the group's progress at this pump turn");
+        };
+        assert_eq!(last_polled, expected_last_polled);
+        assert_eq!(committed, None, "automatic commits were disabled");
+    }
+
+    // Both accepted results contain their requested message, so an empty read
+    // or an early rejection cannot make the progress observations pass.
+    for (expected_offset, replies) in poll_replies.iter().enumerate() {
+        let PartitionReadReply::Poll { fragments, .. } = replies
+            .try_recv()
+            .expect("completed read reached its caller")
+        else {
+            panic!("a full ordinary inbox must not reject a reserved completion");
+        };
+        let bytes: Vec<u8> = fragments
+            .iter()
+            .flat_map(|fragment| fragment.as_slice().iter().copied())
+            .collect();
+        let batch = decode_batch_slice(&bytes).expect("decode the completed read");
+        let offsets: Vec<u64> = batch
+            .iter()
+            .map(|message| batch.header.base_offset + u64::from(message.header.offset_delta))
+            .collect();
+        let returned_payloads: Vec<&[u8]> = batch.iter().map(|message| message.payload).collect();
+        assert_eq!(offsets, vec![expected_offset as u64]);
+        assert_eq!(
+            returned_payloads,
+            vec![payloads[expected_offset].as_bytes()]
+        );
+    }
+    let (last_polled, committed) = partitions.group_offset_state(&namespace, group_id).unwrap();
+    assert_eq!(last_polled, Some(1));
+    assert_eq!(committed, None);
+    assert_eq!(owner.inbox_len(), 0);
+    assert_eq!(owner.poll_completion_inbox_len(), 0);
+}
+
 #[compio::test]
 async fn given_owner_processed_completion_when_shutdown_arrives_should_wake_and_drain_queued_completion()
  {
     let namespace = IggyNamespace::new(1, 1, 0);
     let bus = Rc::new(IggyMessageBus::new(0));
     let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
-    let (owner, owner_sender) = owner_with_inbox(&bus, config, namespace);
+    let (owner, _owner_sender) = owner_with_inbox(&bus, config, namespace);
     owner.plane.partitions().insert(namespace, partition);
     let (stop_sender, stop_receiver) = channel(1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -213,8 +337,8 @@ async fn given_owner_processed_completion_when_shutdown_arrives_should_wake_and_
     futures::pin_mut!(pump);
 
     // Processing a completion advances the pump into another wait. Shutdown
-    // must still wake it after an ordinary inbox branch has already won.
-    let first_reply = queue_resident_poll(&owner, &owner_sender, namespace);
+    // must still wake it after a completion branch has already won.
+    let first_reply = queue_resident_poll(&owner, namespace);
     assert!(pump.as_mut().poll(&mut context).is_pending());
     assert_single_message_reply(&first_reply);
     wake_observer.notified.store(false, Ordering::Relaxed);
@@ -223,13 +347,14 @@ async fn given_owner_processed_completion_when_shutdown_arrives_should_wake_and_
 
     // Both shutdown and a completion are ready before the pump resumes.
     // Graceful shutdown must drain the completion before the final flush.
-    let queued_reply = queue_resident_poll(&owner, &owner_sender, namespace);
+    let queued_reply = queue_resident_poll(&owner, namespace);
     assert!(matches!(
         pump.as_mut().poll(&mut context),
         Poll::Ready(None)
     ));
     assert_single_message_reply(&queued_reply);
     assert_eq!(owner.inbox_len(), 0);
+    assert_eq!(owner.poll_completion_inbox_len(), 0);
     assert!(!shutdown_flag.load(Ordering::Relaxed));
 }
 
@@ -238,7 +363,7 @@ async fn given_owner_processed_completion_when_shutdown_sender_drops_should_wake
     let namespace = IggyNamespace::new(1, 1, 0);
     let bus = Rc::new(IggyMessageBus::new(0));
     let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
-    let (owner, owner_sender) = owner_with_inbox(&bus, config, namespace);
+    let (owner, _owner_sender) = owner_with_inbox(&bus, config, namespace);
     owner.plane.partitions().insert(namespace, partition);
     let (stop_sender, stop_receiver) = channel(1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -248,7 +373,7 @@ async fn given_owner_processed_completion_when_shutdown_sender_drops_should_wake
     let pump = owner.run_message_pump(stop_receiver, Arc::clone(&shutdown_flag));
     futures::pin_mut!(pump);
 
-    let reply = queue_resident_poll(&owner, &owner_sender, namespace);
+    let reply = queue_resident_poll(&owner, namespace);
     assert!(pump.as_mut().poll(&mut context).is_pending());
     assert_single_message_reply(&reply);
 
@@ -262,6 +387,7 @@ async fn given_owner_processed_completion_when_shutdown_sender_drops_should_wake
         Poll::Ready(None)
     ));
     assert_eq!(owner.inbox_len(), 0);
+    assert_eq!(owner.poll_completion_inbox_len(), 0);
     assert!(!shutdown_flag.load(Ordering::Relaxed));
 }
 
@@ -296,6 +422,7 @@ fn owner_with_inbox(
         vec![sender.clone()],
         inbox,
         replies,
+        2,
         routes,
         PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
         None,
@@ -307,7 +434,6 @@ fn owner_with_inbox(
 
 fn queue_resident_poll(
     owner: &CompletionTestShard,
-    owner_sender: &TaggedSender,
     namespace: IggyNamespace,
 ) -> Receiver<PartitionReadReply> {
     let plan = owner
@@ -325,14 +451,16 @@ fn queue_resident_poll(
         .expect("fixture has a read snapshot");
     assert!(!plan.needs_off_pump_io());
     let (reply_sender, replies) = channel(1);
-    PollCompletionSender::new(
-        Some(owner_sender.clone()),
-        namespace,
-        reply_sender,
-        owner.metrics().clone(),
-    )
-    .complete(plan.execute_resident());
-    assert_eq!(owner.inbox_len(), 1, "completion awaits owner acceptance");
+    owner
+        .poll_completions
+        .try_reserve(namespace, reply_sender, owner.metrics().clone())
+        .expect("reserve capacity before completing the read")
+        .complete(plan.execute_resident());
+    assert_eq!(
+        owner.poll_completion_inbox_len(),
+        1,
+        "completion awaits owner acceptance"
+    );
     assert!(matches!(
         replies.try_recv(),
         Err(crossfire::TryRecvError::Empty)

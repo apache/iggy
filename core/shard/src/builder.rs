@@ -72,6 +72,7 @@ where
     senders: Vec<TaggedSender>,
     inbox: Receiver<ShardFrame>,
     reply_inbox: Receiver<ShardFrame>,
+    poll_completion_capacity: usize,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
@@ -102,6 +103,7 @@ where
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
         reply_inbox: Receiver<ShardFrame>,
+        poll_completion_capacity: usize,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coord_config: CoordinatorConfig,
@@ -119,6 +121,7 @@ where
             senders,
             inbox,
             reply_inbox,
+            poll_completion_capacity,
             shards_table,
             partition_consensus,
             coord_config,
@@ -138,6 +141,10 @@ where
     /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
     /// fit in `u16`. Both are bootstrap programming errors and the
     /// `u16` overflow check fires on every shard, not only shard 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_completion_capacity` is zero.
     pub fn build(self) -> Result<BuiltShard<B, MJ, S, M, T, SB>, ShardCtorError> {
         let is_shard_zero = self.identity.id == 0;
 
@@ -229,6 +236,7 @@ where
             self.senders,
             self.inbox,
             self.reply_inbox,
+            self.poll_completion_capacity,
             self.shards_table,
             self.partition_consensus,
             coordinator,

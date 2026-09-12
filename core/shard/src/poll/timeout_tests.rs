@@ -16,12 +16,13 @@
 // under the License.
 
 use std::cell::RefCell;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
 use consensus::PartitionsHandle;
 use futures::channel::oneshot;
-use iggy_common::PollingStrategy;
+use iggy_common::{IggyError, PollingStrategy};
 use message_bus::{
     BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn,
     SendError,
@@ -33,12 +34,12 @@ use server_common::iobuf::Frozen;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
-use super::completion::PollCompletionSender;
+use super::completion::PollCompletionLane;
 use super::test_support::{PollTestMetadata, partition_with_messages};
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
     IggyShard, LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig, PartitionRead,
-    PartitionReadReply, ReplicaTopology, ShardFrame, ShardIdentity, shard_channel,
+    PartitionReadReply, ReplicaTopology, ShardFrame, ShardIdentity, channel, shard_channel,
 };
 
 /// Expire the requester before releasing a nonempty completion to the owner.
@@ -51,8 +52,9 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     let namespace = IggyNamespace::new(1, 1, 0);
     let consumer = PollingConsumer::Consumer(7, 0);
     let (expire_timeout, timeout_elapsed) = oneshot::channel();
-    let bus = PollTimeoutBus {
+    let bus = PollTestBus {
         next_timeout: Rc::new(RefCell::new(Some(timeout_elapsed))),
+        ..Default::default()
     };
     let mut owner = owner_with_messages(&bus, namespace).await;
     let (owner_sender, owner_inbox, _owner_reply_lane) = shard_channel(0, 2, 1);
@@ -96,6 +98,11 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     else {
         panic!("expected the routed poll request");
     };
+    let late_reply = reply.clone();
+    let completion = owner
+        .poll_completions
+        .try_reserve(requested_namespace, reply, owner.metrics().clone())
+        .expect("reserve the read before the requester times out");
     let read_plan = partitions
         .build_poll_snapshot(&requested_namespace, requested_consumer, &args)
         .expect("poll has a read snapshot");
@@ -114,7 +121,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     );
     assert!(
         matches!(
-            reply.try_send(PartitionReadReply::Ack),
+            late_reply.try_send(PartitionReadReply::Ack),
             Err(crossfire::TrySendError::Disconnected(_))
         ),
         "timeout closed the reply channel before completion"
@@ -127,21 +134,13 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
         "reading alone has not accepted progress"
     );
 
-    // Deliver the held result through the completion sender and owner inbox.
-    // The owner must discard it before admitting progress for the absent caller.
-    PollCompletionSender::new(
-        Some(owner_sender),
-        namespace,
-        reply,
-        owner.metrics().clone(),
-    )
-    .complete(delayed_result);
-    let ShardFrame::Lifecycle(LifecycleFrame::PollCompleted(completion)) = owner_inbox
+    // The reservation survives requester timeout and follows the late result
+    // into the completion lane. The owner discards it before admitting progress.
+    completion.complete(delayed_result);
+    let completion = owner
+        .poll_completions
         .try_recv()
-        .expect("late completion reached the owner inbox")
-    else {
-        panic!("expected the completed poll");
-    };
+        .expect("late completion reached its reserved lane");
     owner.on_poll_completed(*completion).await;
     let (stored_offset, _) = partitions
         .consumer_offset_read(&namespace, consumer)
@@ -205,6 +204,241 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     assert_eq!(stored_offset, None);
 }
 
+/// Admission is checked against a synthetic disk plan: the fixture's journal
+/// bytes are evicted and spawned futures are captured without execution. This
+/// proves dispatch ordering; the partition tests separately cover real disk I/O.
+#[compio::test]
+#[allow(clippy::too_many_lines)]
+async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject_until_owner_dequeues()
+ {
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let group_id = 7;
+    let consumer = PollingConsumer::ConsumerGroup(7, 0);
+    let bus = PollTestBus::default();
+    let mut owner = owner_with_messages(&bus, namespace).await;
+    owner.poll_completions = PollCompletionLane::new(1);
+    let (owner_sender, _owner_inbox, _owner_replies) = shard_channel(0, 2, 1);
+    owner.attach_senders(vec![owner_sender]);
+    let partitions = owner.plane.partitions();
+    let args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
+    let resident_plan = partitions
+        .build_poll_snapshot(&namespace, consumer, &args)
+        .expect("fixture has messages before eviction");
+    assert!(!resident_plan.needs_off_pump_io());
+    let delayed_result = resident_plan.execute_resident();
+    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    assert!(
+        partitions
+            .build_poll_snapshot(&namespace, consumer, &args)
+            .expect("evicted messages have a disk plan")
+            .needs_off_pump_io()
+    );
+    assert!(bus.spawned_tasks.borrow().is_empty());
+
+    // A running read owns the sole slot even while its queue is empty.
+    let (held_reply, _held_replies) = channel(1);
+    let reservation = owner
+        .poll_completions
+        .try_reserve(namespace, held_reply, owner.metrics().clone())
+        .expect("reserve the only slot");
+    assert_eq!(owner.poll_completion_inbox_len(), 0);
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args: args.clone(),
+            },
+            reply,
+        )
+        .await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert!(
+        bus.spawned_tasks.borrow().is_empty(),
+        "full capacity must reject before spawning I/O"
+    );
+
+    // Returning the result transfers its reservation into queue occupancy.
+    // A finished read cannot admit a replacement until the owner takes it out.
+    reservation.complete(delayed_result);
+    assert_eq!(owner.poll_completion_inbox_len(), 1);
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args: args.clone(),
+            },
+            reply,
+        )
+        .await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert!(
+        bus.spawned_tasks.borrow().is_empty(),
+        "queued results still consume capacity"
+    );
+    let (last_polled, committed) = partitions.group_offset_state(&namespace, group_id).unwrap();
+    assert_eq!(
+        last_polled, None,
+        "rejected dispatch must not advance group progress"
+    );
+    assert_eq!(
+        committed, None,
+        "rejected dispatch must not commit an offset"
+    );
+    partitions
+        .with_partition(&namespace, |partition| {
+            assert!(partition.consensus().pipeline_is_empty());
+            assert_eq!(partition.consensus().request_queue_len(), 0);
+        })
+        .expect("fixture partition exists");
+
+    // Discarding the dequeued result frees the slot without accepting its data.
+    drop(
+        owner
+            .poll_completions
+            .try_recv()
+            .expect("owner dequeues held result"),
+    );
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .await;
+    assert_eq!(
+        bus.spawned_tasks.borrow().len(),
+        1,
+        "a newly available slot permits disk dispatch"
+    );
+    assert!(matches!(
+        replies.try_recv(),
+        Err(crossfire::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        owner.poll_completion_inbox_len(),
+        0,
+        "captured disk task has not run"
+    );
+    bus.spawned_tasks.borrow_mut().clear();
+}
+
+#[compio::test]
+async fn given_missing_owner_route_when_disk_poll_arrives_should_reject_before_dispatch() {
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let bus = PollTestBus::default();
+    let owner = owner_with_messages(&bus, namespace).await;
+    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    let consumer = PollingConsumer::ConsumerGroup(7, 0);
+    let args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
+    assert!(
+        owner
+            .plane
+            .partitions()
+            .build_poll_snapshot(&namespace, consumer, &args)
+            .expect("fixture must enter the disk path")
+            .needs_off_pump_io()
+    );
+    let (reply, replies) = channel(1);
+
+    owner
+        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert!(bus.spawned_tasks.borrow().is_empty());
+    assert_eq!(owner.poll_completion_inbox_len(), 0);
+    assert_eq!(owner.metrics().frame_drops_value(), 1);
+    let (last_polled, committed) = owner
+        .plane
+        .partitions()
+        .group_offset_state(&namespace, 7)
+        .unwrap();
+    assert_eq!(last_polled, None);
+    assert_eq!(committed, None);
+}
+
+#[compio::test]
+async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_dispatch() {
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let bus = PollTestBus::default();
+    let mut owner = owner_with_messages(&bus, namespace).await;
+    let (owner_sender, owner_inbox, owner_replies) = shard_channel(0, 2, 1);
+    owner.attach_senders(vec![owner_sender]);
+    drop(owner_inbox);
+    drop(owner_replies);
+    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    let consumer = PollingConsumer::ConsumerGroup(7, 0);
+    let args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
+    assert!(
+        owner
+            .plane
+            .partitions()
+            .build_poll_snapshot(&namespace, consumer, &args)
+            .expect("fixture must enter the disk path")
+            .needs_off_pump_io()
+    );
+    let (reply, replies) = channel(1);
+
+    owner
+        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert!(bus.spawned_tasks.borrow().is_empty());
+    assert_eq!(owner.poll_completion_inbox_len(), 0);
+    assert_eq!(owner.metrics().frame_drops_value(), 1);
+    let (last_polled, committed) = owner
+        .plane
+        .partitions()
+        .group_offset_state(&namespace, 7)
+        .unwrap();
+    assert_eq!(last_polled, None);
+    assert_eq!(committed, None);
+}
+
+/// Remove the fixture's only resident batch to select disk dispatch without
+/// creating files. Captured tasks must stay unpolled: these tests establish
+/// admission behavior, while real disk reads are covered in partition tests.
+#[allow(clippy::future_not_send)]
+async fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
+    let partitions = owner.plane.partitions();
+    let partition = partitions
+        .remove(&namespace)
+        .expect("fixture partition exists");
+    let retained = partition.log.journal().inner.evict_prefix(1).await;
+    assert!(retained.is_empty(), "fixture has exactly one batch");
+    assert!(
+        partition
+            .log
+            .journal()
+            .inner
+            .oldest_resident_offset()
+            .is_none()
+    );
+    partitions.insert(namespace, partition);
+}
+
 fn message_offsets(fragments: &PollFragments) -> Vec<u64> {
     // A partial batch has separate header and payload fragments. Reassemble
     // the fixture's single batch before decoding its actual message offsets.
@@ -219,13 +453,13 @@ fn message_offsets(fragments: &PollFragments) -> Vec<u64> {
         .collect()
 }
 
-type PollTestShard = IggyShard<PollTimeoutBus, (), (), PollTestMetadata, PapayaShardsTable>;
+type PollTestShard = IggyShard<PollTestBus, (), (), PollTestMetadata, PapayaShardsTable>;
 
 /// Commit four messages at offsets 0 through 3 while retaining their bytes in
 /// the resident journal. The regression controls completion acceptance, so
 /// setup needs neither disk files nor a running shard pump.
 #[allow(clippy::future_not_send)]
-async fn owner_with_messages(bus: &PollTimeoutBus, namespace: IggyNamespace) -> PollTestShard {
+async fn owner_with_messages(bus: &PollTestBus, namespace: IggyNamespace) -> PollTestShard {
     let shard_id = ShardId::new(0);
     let (partition, config) = partition_with_messages(bus, namespace, &["x"; 4]).await;
     let partitions = IggyPartitions::new(shard_id, config);
@@ -243,15 +477,23 @@ async fn owner_with_messages(bus: &PollTimeoutBus, namespace: IggyNamespace) -> 
     )
 }
 
-/// Only the first request's timeout is controlled. Later timers stay pending;
-/// neither request relies on elapsed wall time or a shortened production budget.
-#[derive(Clone)]
-struct PollTimeoutBus {
+type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
+
+/// The first configured timer expires on demand; other timers stay pending.
+/// Detached tasks are captured so dispatch tests can observe admission without
+/// executing their synthetic disk plans.
+#[derive(Clone, Default)]
+struct PollTestBus {
     next_timeout: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
+    spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
 }
 
 #[allow(clippy::future_not_send)]
-impl MessageBus for PollTimeoutBus {
+impl MessageBus for PollTestBus {
+    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        self.spawned_tasks.borrow_mut().push(Box::pin(future));
+    }
+
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
         assert_eq!(duration, PARTITION_READ_TIMEOUT);
         let timeout = self.next_timeout.borrow_mut().take();

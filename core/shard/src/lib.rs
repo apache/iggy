@@ -765,8 +765,6 @@ pub enum LifecycleFrame {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
     },
-    /// Return a disk read to the owner before any consumer progress changes.
-    PollCompleted(Box<PollCompleted>),
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
@@ -1454,6 +1452,10 @@ where
     /// fill the main lane. Fed via [`TaggedSender::reply_sender`].
     reply_inbox: Receiver<ShardFrame>,
 
+    /// Disk reads reserve this lane before I/O so ordinary frames cannot
+    /// displace their results. Only the owner pump validates completions.
+    poll_completions: poll::completion::PollCompletionLane,
+
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
 
@@ -1659,6 +1661,13 @@ where
         self.reply_inbox.len()
     }
 
+    /// Queued disk completions covered by the simulator's lost wakeup check.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn poll_completion_inbox_len(&self) -> usize {
+        self.poll_completions.len()
+    }
+
     /// The armed metadata repair window as `(to_op, peer)`, `None` when no session
     /// is running.
     ///
@@ -1686,6 +1695,8 @@ where
     /// * `inbox` - the receiver that this shard drains in its message pump.
     /// * `reply_inbox` - the reply lane's receiver, drained by the same
     ///   pump (client `Reply` forwards only; see [`TaggedSender::reply_sender`]).
+    /// * `poll_completion_capacity` - separate limit on running disk polls plus
+    ///   results awaiting dequeue by this shard's owner pump. Must be nonzero.
     /// * `shards_table` - namespace -> shard routing table.
     /// * `coordinator` - `Some` on shard 0 (supplied by the builder when
     ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
@@ -1702,6 +1713,10 @@ where
     /// fit in `u16`. Both are bootstrap programming errors: the
     /// permutation would silently misroute every inter-shard frame, or
     /// addressing space (u16) would wrap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_completion_capacity` is zero.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: ShardIdentity,
@@ -1715,6 +1730,7 @@ where
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
         reply_inbox: Receiver<ShardFrame>,
+        poll_completion_capacity: usize,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
@@ -1728,6 +1744,7 @@ where
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
+        let poll_completions = poll::completion::PollCompletionLane::new(poll_completion_capacity);
         Ok(Self {
             id,
             name,
@@ -1741,6 +1758,7 @@ where
             shard_count,
             inbox,
             reply_inbox,
+            poll_completions,
             shards_table,
             partition_consensus,
             coordinator,
@@ -2218,6 +2236,7 @@ where
             shard_count: 1,
             inbox,
             reply_inbox,
+            poll_completions: poll::completion::PollCompletionLane::new(1),
             shards_table,
             partition_consensus,
             metrics: crate::metrics::ShardMetrics::for_shard(),

@@ -1050,6 +1050,16 @@ impl Simulator {
                     self.seed,
                     self.executor.schedule_hash(),
                 );
+                let pending_completions = shard.poll_completion_inbox_len();
+                assert_eq!(
+                    pending_completions,
+                    0,
+                    "lost wakeup: replica {replica_id} shard {} completion lane holds \
+                     {pending_completions} result(s) at quiescence (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
                 let pending_redispatch = shard.redispatched_frame_count();
                 assert_eq!(
                     pending_redispatch,
