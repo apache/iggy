@@ -242,6 +242,8 @@ mod tests {
                 ("IGGY_ENCRYPTION_KEY", TEST_SECRET),
                 ("IGGY_UNRELATED_CREDENTIAL", TEST_SECRET),
                 ("IGGY_SHARDING_CPU_ALLOCATION", "4"),
+                ("IGGY_SHARD_RUNTIME_CAPACITY", "8192"),
+                ("IGGY_SHARD_EVENT_INTERVAL", "256"),
             ])
             .timeout(BENCH_WAIT_TIMEOUT)
             .unwrap();
@@ -253,6 +255,8 @@ mod tests {
             .path();
         let report = fs::read_to_string(report_dir.join("report.json")).unwrap();
         assert!(report.contains("IGGY_SHARDING_CPU_ALLOCATION=4"));
+        assert!(report.contains("IGGY_SHARD_RUNTIME_CAPACITY=8192"));
+        assert!(report.contains("IGGY_SHARD_EVENT_INTERVAL=256"));
         for (source, content) in [
             ("report", report.as_str()),
             ("stdout", &String::from_utf8_lossy(&output.stdout)),
