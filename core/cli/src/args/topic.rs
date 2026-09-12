@@ -171,13 +171,13 @@ pub(crate) struct TopicUpdateArgs {
     pub(crate) compression_algorithm: CompressionAlgorithm,
     /// New max topic size in human-readable format like "unlimited" or "15GB"
     ///
-    /// Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
+    /// Skipping this parameter or using "server_default" preserves the current max topic size.
     /// A finite size cannot be lower than the topic segment size.
     #[arg(short, long, default_value = "server_default", verbatim_doc_comment)]
     pub(crate) max_topic_size: MaxTopicSize,
     /// New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
     ///
-    /// Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
+    /// Skipping this parameter or using "server_default" preserves the current message expiry.
     #[arg(default_value = "server_default", value_parser = clap::value_parser!(IggyExpiry), verbatim_doc_comment)]
     pub(crate) message_expiry: Vec<IggyExpiry>,
 }

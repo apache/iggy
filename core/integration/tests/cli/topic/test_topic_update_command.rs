@@ -314,7 +314,7 @@ Arguments:
   [MESSAGE_EXPIRY]...
           New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
 {CLAP_INDENT}
-          Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
+          Skipping this parameter or using "server_default" preserves the current message expiry.
 {CLAP_INDENT}
           [default: server_default]
 
@@ -322,7 +322,7 @@ Options:
   -m, --max-topic-size <MAX_TOPIC_SIZE>
           New max topic size in human-readable format like "unlimited" or "15GB"
 {CLAP_INDENT}
-          Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
+          Skipping this parameter or using "server_default" preserves the current max topic size.
           A finite size cannot be lower than the topic segment size.
 {CLAP_INDENT}
           [default: server_default]
