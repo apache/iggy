@@ -135,7 +135,7 @@ async function produceData(client: Client, streamName: string, topicName: string
   const maxBatches = 100;
 
   while (batchesCount < maxBatches) {
-    const recordsCount = Math.floor(Math.random() * 400) + 100; // 100-500
+    const recordsCount = Math.floor(Math.random() * 400) + 100;
     const messages = Array.from({ length: recordsCount }).map(() => {
       const record = randomRecord();
       return {

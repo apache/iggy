@@ -49,7 +49,7 @@ async function consumeMessages(client: Client) {
     interval
   );
 
-  let offset = 0;
+  let offset = 0n;
   let consumedBatches = 0;
 
   while (consumedBatches < BATCHES_LIMIT) {
@@ -60,7 +60,7 @@ async function consumeMessages(client: Client) {
         topicId: TOPIC_ID,
         consumer: Consumer.Single,
         partitionId: PARTITION_ID,
-        pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
+        pollingStrategy: PollingStrategy.Offset(offset),
         count: MESSAGES_PER_BATCH,
         autocommit: false
       });
@@ -70,13 +70,12 @@ async function consumeMessages(client: Client) {
         continue;
       }
 
-      offset += polledMessages.messages.length;
-
       for (const message of polledMessages.messages) {
         const payload = message.payload.toString();
-        const { offset, timestamp } = message.headers;
+        const { offset: messageOffset, timestamp } = message.headers;
 
-        log('Received message: %s (offset: %d, timestamp: %d)', payload, offset, timestamp);
+        log('Received message: %s (offset: %d, timestamp: %d)', payload, messageOffset, timestamp);
+        offset = messageOffset + 1n;
       }
       log('Consumed %d message(s).', polledMessages.messages.length);
     } catch (error) {

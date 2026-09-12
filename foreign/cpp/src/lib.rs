@@ -598,7 +598,6 @@ mod ffi {
         ) -> Result<Vec<u8>>;
         fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
 
-        // Future functions
         fn disconnect(self: &Client) -> Result<()>;
         fn shutdown(self: &Client) -> Result<()>;
         // fn subscribe_events(self: &Client) -> Result<()>;

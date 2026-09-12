@@ -221,9 +221,9 @@ func WithServerAddress(address string) Option {
 }
 
 // WithAutoLogin signs the client in with the given credentials on every
-// connection, including the ones a reconnect establishes. Without it a
-// reconnect cannot restore the session, so a request that hits a dropped
-// connection fails instead of replaying.
+// connection, including the ones a reconnect establishes. Without it,
+// successful explicit sign-ins supply remembered credentials until logout.
+// A send with an unknown outcome is not replayed on reconnect.
 func WithAutoLogin(credentials Credentials) Option {
 	return func(opts *Options) {
 		opts.config.autoLogin = NewAutoLogin(credentials)
@@ -851,8 +851,8 @@ func (c *IggyTcpClient) exchangeLocked(
 		case errors.Is(err, ierror.ErrTransientNotCommitted) && time.Now().Before(readDeadline):
 			// The outcome is unknown, so only a replay of the same request id
 			// on this session is safe. On the metadata plane the client table
-			// answers a committed request from its reply cache; the partition
-			// plane keeps no client table, so its replay is at-least-once.
+			// answers a committed request from its reply cache; partition
+			// requests use the group's bounded request-id deduplication window.
 			if waitErr := c.waitBeforeReplay(ctx, readDeadline); waitErr != nil {
 				return nil, waitErr
 			}

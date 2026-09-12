@@ -142,6 +142,8 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
 }
 
 pub fn from_connection_string(connection_string: String) -> Result<*mut Client, String> {
+    // QUIC creates its endpoint before a blocking API call enters the runtime.
+    let _guard = RUNTIME.enter();
     let client = RustIggyClient::from_connection_string(&connection_string)
         .map_err(|error| format!("Could not parse connection string: {error}"))?;
 

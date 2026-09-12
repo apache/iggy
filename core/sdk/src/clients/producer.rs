@@ -62,7 +62,7 @@ pub(crate) fn no_confirmations() -> SendMessagesResponse {
 }
 
 /// True when `error` can only have been raised after the server committed the
-/// batch. Resending then turns one durable write into as many copies as the
+/// batch. Resending then turns one committed write into as many copies as the
 /// retry budget allows, on a plane that keeps no reply cache to collapse them.
 ///
 /// Both kinds are raised while decoding the HTTP reply body, which is reached
@@ -638,7 +638,7 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// | Setting | Order | What happens |
 /// | --- | --- | --- |
-/// | [`Partitioning::balanced()`], the default | not guaranteed with multiple partitions | the server chooses a partition per request, so consecutive sends and chunks may land in different logs |
+/// | [`Partitioning::balanced()`], the default | not guaranteed with multiple partitions | the binary SDK or HTTP server chooses a partition per request, so consecutive sends and chunks may land in different logs |
 /// | [`Partitioning::partition_id()`], [`Partitioning::messages_key()`] with a stable key, [`partitioner()`] returning a stable id | same partition | every batch is routed to the same log, satisfying the first ordering requirement |
 /// | one task, awaiting each [`send()`](Self::send) before the next | sequential | requests reach a partition in call order |
 /// | several tasks sharing the producer, or overlapping sends | not guaranteed | requests race, so call order does not determine append order |
@@ -661,13 +661,13 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// A successful direct send returns [`SendMessagesResponse`], normally holding one
 /// [`SendMessagesConfirmationResponse`] per chunk. Each confirmation records a partition and the
-/// `base_offset` assigned to the first message in that chunk. A legacy server may return no
-/// confirmation payload, and a background producer always returns an empty confirmation list.
+/// `base_offset` assigned to the first message in that chunk. The list can be empty when the
+/// server supplies no offsets, and a background producer always returns an empty list.
 ///
-/// A confirmation means the server committed the batch in memory. It does not mean the batch was
-/// fsynced. After a crash and restart, a later batch can receive an offset that a client recorded
-/// before the crash. Delivery is also at least once, so a retry can commit the same messages at
-/// another offset.
+/// Completion follows the topic's message durability policy. Replicated completion waits for
+/// quorum commit; persisted completion also waits for recoverable stable-storage copies on the
+/// required quorum. Replicated messages can be lost in a crash, allowing offsets to be reused.
+/// A retry can also commit the same messages at another offset.
 ///
 /// # Retrying and what a failure means
 ///
@@ -906,8 +906,9 @@ impl IggyProducer {
     /// An offset is a position, not an identity. Delivery is at-least-once, so an earlier retry may
     /// have committed the same messages at a lower offset, see
     /// [Retrying and what a failure means](IggyProducer#retrying-and-what-a-failure-means).
-    /// A confirmation reports an in-memory commit, not an fsync. A crash and restart can therefore
-    /// lose an acknowledged batch and later reuse an offset the client already observed.
+    /// Completion follows the topic's message durability policy: quorum commit for replicated
+    /// messages, plus recoverable stable-storage copies on the required quorum for persisted
+    /// messages. Replicated messages can be lost in a crash, allowing offsets to be reused.
     ///
     /// # How long the call takes
     ///

@@ -71,9 +71,7 @@ under the License.
         path: `/streams/${+page.params.streamId}/topics/${topic.id}`,
         body: {
           name: form.data.name,
-          message_expiry: form.data.message_expiry,
-          compression_algorithm: topic.compressionAlgorithm,
-          max_topic_size: 0
+          message_expiry: form.data.message_expiry
         }
       });
 

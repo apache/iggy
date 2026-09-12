@@ -1,19 +1,31 @@
 # Iggy Examples
 
-This directory contains comprehensive sample applications that showcase various usage patterns of the Iggy client SDK for Python, from basic operations to advanced multi-tenant scenarios. To learn more about building applications with Iggy, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
+This directory contains Python SDK examples for connection configuration, sending and polling messages, user headers, and TLS. To learn more about building applications with Iggy, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
 
 ## Running Examples
 
-To run any example, first start the server with
+These examples target server 0.9.0. For unreleased changes, build the SDK and
+server from the same source checkout. Start the server in a separate terminal,
+from the repository root:
 
 ```bash
-# Using latest release
-docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 \
-  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
+# Server 0.9.0
+docker run --rm \
+  --cap-add=SYS_NICE --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
+  -p 8090:8090 \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=iggy \
+  apache/iggy:0.9.0
 
-# Or build from source (recommended for development)
-cd ../../ && cargo run --bin iggy-server -- --with-default-root-credentials --fresh
+# Or build from source
+cargo run --bin iggy-server -- --with-default-root-credentials --fresh
 ```
+
+The container variables expose the TCP listener and bootstrap `iggy`/`iggy` for
+new data. Stored credentials are not replaced, and environment credentials take
+precedence over the source command's default-credentials flag. Use `--fresh`
+only with disposable local replica data.
 
 For server configuration options and help:
 
@@ -24,11 +36,13 @@ cargo run --bin iggy-server -- --help
 You can also customize the server using environment variables:
 
 ```bash
-## Example: Enable HTTP transport and set custom address
-IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server
+# Enable HTTP transport and set its address
+IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server
 ```
 
-and then install Python dependencies:
+With Python 3.10 or newer and Rust/Cargo available, install dependencies from
+`examples/python`. `uv` selects the local SDK path in `pyproject.toml`; pip needs
+that path explicitly:
 
 ```bash
 # Using uv
@@ -37,7 +51,7 @@ uv sync
 # Using pip with the dependencies declared in pyproject.toml
 python -m venv .venv
 source .venv/bin/activate
-pip install .
+pip install ../../foreign/python .
 ```
 
 ## Basic Examples
@@ -70,7 +84,9 @@ python basic/producer.py
 python basic/consumer.py
 ```
 
-Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
+Demonstrates client connection, authentication, batch message sending, and polling
+over TCP, QUIC, or WebSocket. HTTP requires an explicit login call; its
+connection-string credentials are not applied automatically.
 
 ### Message Headers
 

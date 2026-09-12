@@ -26,14 +26,14 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 ## Features
 
 - **Transports**: TCP (custom binary), QUIC, HTTP, WebSocket. One unified `IggyClient` API across all four.
-- **TLS** on every transport, configured via connection string (`?tls=true&tls_ca_file=/path/to/ca.crt`) or builder.
-- **Connection strings** with auto-login on `connect()`: `iggy://` (TCP default), `iggy+tcp://`, `iggy+quic://`, `iggy+http://`, `iggy+ws://`. Reconnection retries and heartbeat interval are configurable as URL options.
+- **TLS**: TCP and WebSocket expose TLS connection-string options; QUIC always uses TLS; HTTP uses an HTTPS URL configured through the builder.
+- **Connection strings**: `iggy://` (TCP default), `iggy+tcp://`, `iggy+quic://`, `iggy+http://`, `iggy+ws://`. Binary transports apply credentials on `connect()`; HTTP requires an explicit login. Option keys and reconnection support differ by transport.
 - **Authentication**: username/password and Personal Access Tokens (PAT).
 - **Async, non-blocking** client built on Tokio with custom zero-copy (de)serialization.
 - **High-level builders** on `IggyClient`: `producer(stream, topic)`, `consumer(name, stream, topic, partition)`, and `consumer_group(name, stream, topic)`.
-- **Producer modes**: `direct` (synchronous send) and `background` (buffered with parallel shard workers using `OrderedSharding` or `BalancedSharding`). Configurable batch length / size and linger time.
-- **Partitioning**: `balanced`, `partition_key`, or explicit `partition_id`. Custom `Partitioner` is pluggable.
-- **Consumer**: standalone or consumer-group; consumed as an async `Stream`. Polling strategies: `next`, `offset`, `timestamp`, `first`, `last`.
+- **Producer modes**: `direct` (awaited send) and `background` (buffered with parallel shard workers using `OrderedSharding` or `BalancedSharding`). Configurable batch length / size and linger time.
+- **Partitioning**: `balanced`, `messages_key`, or explicit `partition_id`. Custom `Partitioner` is pluggable.
+- **Consumer**: standalone or consumer-group over binary transports; HTTP supports standalone consumers only. Consumed as an async `Stream`. Polling strategies: `next`, `offset`, `timestamp`, `first`, `last`.
 - **Auto-commit** offset policies: `Interval`, `When`, `After`, `IntervalOrWhen`, `IntervalOrAfter`, or disabled.
 - **Stream builder** (`IggyStream`, `IggyStreamProducer`, `IggyStreamConsumer`) for declarative producer + consumer setup on shared or separate stream/topic.
 - **Reliability**: automatic reconnection with retries, heartbeat, send retries, and offset auto-commit handled by the high-level API.
@@ -42,13 +42,26 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 
 ## Installation
 
+Run from your application crate. Use a release compatible with your server; for
+unreleased changes, build the SDK and server from the same source checkout.
+
 ```bash
 cargo add iggy
 ```
 
-Optional features map to common scenarios. See the [Rust SDK docs](https://iggy.apache.org/docs/sdk/rust/intro/) for the full list.
+All four transports are included; this crate declares no optional Cargo features.
 
 ## Quick start
+
+Start a source server from the repository root in a separate terminal:
+
+```bash
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+Use disposable replica data with `--fresh`. Environment credentials override the
+flag, and recovered credentials are not replaced. The sample expects `iggy`/`iggy`
+and requires `iggy`, Tokio and `futures-util` in the application.
 
 ```rust
 use std::error::Error;

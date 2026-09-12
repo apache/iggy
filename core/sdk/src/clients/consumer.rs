@@ -484,8 +484,8 @@ unsafe impl Sync for IggyConsumer {}
 /// - The **reading position** is held by the consumer, one per partition, and is the offset of the
 ///   last message handed over
 ///   ([`get_last_consumed_offset()`](Self::get_last_consumed_offset)). It dies with the process.
-/// - The **stored offset** lives on the server under the consumer name, or the group name for a
-///   group. This offset survives restarts. Writing it is called *storing* or *committing* an offset.
+/// - The **stored offset** is committed to the server under the consumer or group name.
+///   Its restart guarantees depend on the topic's consumer-offset durability policy.
 ///
 /// Committing matters because [`PollingStrategy::next()`] resumes from the stored offset. A
 /// consumer that never commits starts over from the same place on every run. Within a run it

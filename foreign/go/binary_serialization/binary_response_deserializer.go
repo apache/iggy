@@ -170,8 +170,8 @@ const pollPrefixLength = 16
 // batch length, with each frame's deltas resolved to absolute values. A
 // truncated body is a decode error rather than a shorter batch: silently
 // dropping the tail would let a consumer that commits CurrentOffset skip
-// messages it never saw. The returned messages alias the reply buffer; a
-// retained message pins it.
+// messages it never saw. Uncompressed payloads and user headers alias the
+// reply buffer; retaining those slices pins it. S2 payloads are copied.
 func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMessageCompression) (*iggcon.PolledMessage, error) {
 	if len(payload) == 0 {
 		return &iggcon.PolledMessage{

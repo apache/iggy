@@ -15,13 +15,23 @@ blocking implementation. VSR is the only protocol it supports.
 
 ## Installation
 
+The current source requires Go 1.25 or newer. From your application module,
+install a release compatible with your server:
+
 ```bash
 go get github.com/apache/iggy/foreign/go
 ```
 
+Unversioned `go get` does not automatically select prereleases. VSR edge
+versions are available, for example `v0.9.0-edge.6`. For unreleased changes,
+build both SDK and server from the same checkout; `examples/go/go.mod`
+replaces this module with the local SDK source.
+
 ## Running a server
 
-Build and start a VSR server from a checkout of this repository:
+From the repository root, build and start a VSR server using a new,
+disposable data directory. The root environment variables bootstrap a new
+instance; they do not replace credentials recovered from disk or peers:
 
 ```bash
 cargo build --bin iggy-server
@@ -38,14 +48,16 @@ Disable the ones you do not need so they cannot race with another process.
 
 ## Delivery semantics
 
-`SendMessages` returns the placements the server committed. Delivery is
-at-least-once. A request that hits a dropped connection is replayed over a
-fresh one, and a fresh connection registers a new client identity, so the
-server cannot match the replay against the original and the batch may commit
-twice. Consumers that need exactly-once handling deduplicate on the message id.
+`SendMessages` returns any placements the server reports. A send whose reply
+is lost to a dropped connection returns `ErrDisconnected` without a replay.
+A reconnect registers a new client identity, so a caller retry can append
+the batch twice. Consumers must handle duplicates through idempotent
+processing or application-level deduplication.
 
-A confirmation reports an in-memory commit, not a flush to disk, and an empty
-confirmation list is a valid success.
+Crash durability follows the topic's `durability` policy: `replicated`
+confirms replication, while `persisted` also waits for the required replicas
+to persist the message data. An empty confirmation list is a valid success
+but does not by itself prove that new messages were appended.
 
 ## Testing
 

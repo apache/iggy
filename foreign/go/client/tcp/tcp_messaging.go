@@ -44,9 +44,8 @@ func (c *IggyTcpClient) SendMessages(
 		return nil, ierror.ErrInvalidMessagesCount
 	}
 
-	// Routing needs an explicit partition: the broker never picks one under
-	// consensus. Balanced and key-based strategies resolve here against the
-	// topic's partition count.
+	// Resolve balanced and key-based routing here so the SDK can cache the
+	// topic's partition count and retain its own round-robin position.
 	resolved, err := c.resolvePartitioning(ctx, streamId, topicId, partitioning)
 	if err != nil {
 		return nil, err

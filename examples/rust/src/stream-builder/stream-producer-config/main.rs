@@ -39,15 +39,15 @@ async fn main() -> Result<(), IggyError> {
         .topic_partitions_count(10)
         // The max number of messages to send in a batch. The greater the batch size, the higher the throughput for bulk data.
         // Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
-        // Note, this only applies to batch send messages. Single messages are sent immediately.
         .batch_length(100)
-        // Sets the interval between sending the messages. Affects latency so you want to benchmark this value.
+        // Minimum gap between sequential direct sends, measured from the previous successful send.
         .linger_time(IggyDuration::from_str("5ms").unwrap())
         // `Partitioning` is used to specify to which partition the messages should be sent.
         // It has the following kinds:
-        // - `Balanced` - the partition ID is calculated by the server using the round-robin algorithm.
+        // - `Balanced` - the binary client selects a partition with its round-robin cursor.
         // - `PartitionId` - the partition ID is provided by the client.
-        // - `MessagesKey` - the partition ID is calculated by the server using the hash of the provided messages key.
+        // - `MessagesKey` - the binary client hashes the messages key to a partition ID.
+        // Binary clients cache partition counts for their lifetime, including reconnects.
         .partitioning(Partitioning::balanced())
         // Sets the retry policy (maximum number of retries and interval between them) in case of messages sending failure.
         // The error can be related either to disconnecting from the server or to the server rejecting the messages.
@@ -56,7 +56,7 @@ async fn main() -> Result<(), IggyError> {
         .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
         // Optionally, set a custom client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
         // Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
-        // .encryptor( Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[1; 32])?)))
+        // .encryptor(std::sync::Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[1; 32])?)))
         .build();
 
     let (client, producer) = IggyStreamProducer::with_client_from_url(IGGY_URL, &config).await?;

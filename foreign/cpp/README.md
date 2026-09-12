@@ -10,17 +10,17 @@
 
 C++ client for [Apache Iggy](https://iggy.apache.org) message streaming.
 
-Currently, the bazel build system relies on the system-provided cargo toolchain, so concurrent runs can race and lead to data corruption if executed remotely
+Bazel uses the Cargo and Rust toolchain provisioned by `rules_rust`. The Rust bridge builds locally into a separate target directory in the Bazel output tree. Use the Bazel version pinned in `.bazelversion` with a compatible Java runtime (Java 21 or newer for Bazel 9.2.0).
 
 Build commands
 
 ```bash
-// Build binary
+# Build library
 bazel build //:iggy-cpp
 
-// Unit tests
+# Unit tests
 bazel test //:unit
 
-// Low level integration tests (requires running server)
+# Low-level integration tests (require a running server)
 bazel test //:e2e
 ```

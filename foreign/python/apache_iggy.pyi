@@ -989,9 +989,9 @@ class IggyClient:
     ) -> IggyClient:
         r"""
         Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
-        `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
-        new runtime for asynchronous operations.
-        Future versions might utilize asyncio for more Pythonic async.
+        `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. Construction is
+        synchronous; async methods return asyncio awaitables backed by the shared
+        Tokio runtime.
 
         Args:
             conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
@@ -1661,7 +1661,7 @@ class IggyClient:
         Returns:
             An awaitable that resolves to `SendMessagesResponse`. Its confirmations
             report the committed partition and batch base offset. The list is empty
-            when the server reports no offsets, including on the legacy server.
+            when the server reports no offsets.
 
         Raises:
             ValueError: If a string stream or topic identifier is invalid.
@@ -2332,9 +2332,6 @@ class SendMessagesConfirmation:
 
         Confirmation follows VSR quorum commit. A topic with persisted message
         durability also waits for recoverable stable-storage copies on the quorum.
-
-        The legacy server confirms nothing, so its confirmation list is empty
-        and this value is never reached.
         """
 
 @typing.final
@@ -2347,9 +2344,8 @@ class SendMessagesResponse:
         r"""
         Gets the commit confirmations, one per partition the batch was written to.
 
-        The list is empty when the server reports no offsets, and the legacy
-        server never reports any, so branch on it being empty rather than
-        indexing into it.
+        The list is empty when the server reports no offsets, so check whether
+        it is empty before indexing into it.
 
         A reported `base_offset` never implies uniqueness, because delivery is
         at-least-once and an earlier retry may already have committed the same

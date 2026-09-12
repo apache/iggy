@@ -130,7 +130,7 @@ under the License.
   });
 
   let messagesToDelete = $derived(
-    arraySum(topic.partitions.slice($form.partitions_count).map((p) => p.messagesCount))
+    arraySum(topic.partitions.slice(-$form.partitions_count).map((p) => p.messagesCount))
   );
 </script>
 

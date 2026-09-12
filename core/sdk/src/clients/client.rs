@@ -257,7 +257,9 @@ impl IggyClient {
     /// - `iggy+http://` for HTTP.
     /// - `iggy+ws://` for WebSocket.
     ///
-    /// Authentication at the server is mandatory.
+    /// Protected requests require authentication. The credential field is required
+    /// by the parser; HTTP callers must still log in explicitly. Binary transports
+    /// apply these credentials during `connect()`.
     /// - user + password: `<user>:<password>@<host>:<port>`
     /// - personal access token: `<personal_access_token>@host:port`
     ///
@@ -285,10 +287,10 @@ impl IggyClient {
     ///
     /// - `tls`: bool. Enable/disable TLS. Default: `false`.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
-    /// - `tls_ca_file`: filesystem path. Extra CA certificate to trust. Default: unset.
-    /// - `reconnection_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
-    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
-    /// - `reestablish_after`: [`IggyDuration`]. Grace period before reconnecting. Default: `5s`.
+    /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
+    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between retry passes. Default: `1s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `nodelay`: `bool`. Disable Nagle's algorithm (`TCP_NODELAY`). Default: `false`.
     ///
@@ -313,15 +315,15 @@ impl IggyClient {
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `reconnection_max_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
-    /// - `reconnection_reestablish_after`: [`IggyDuration`]. Grace period before reconnecting. Default: `5s`.
+    /// - `reconnection_reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
     /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer. Default: `10000000`.
     /// - `max_concurrent_bidi_streams`: u64. Number of concurrent bidirectional streams. Default: `10000`.
     /// - `datagram_send_buffer_size`: u64. Number of bytes in the datagram send buffer. Default: `100000`.
     /// - `initial_mtu`: u16. Initial MTU estimate (in bytes). Default: `1200`.
-    /// - `send_window`: u64. Number of bytes bytes of the flow-control send window. Default: `100000`.
+    /// - `send_window`: u64. Number of bytes of the flow-control send window. Default: `100000`.
     /// - `receive_window`: u64. Number of bytes of the flow-control receive window. Default: `100000`.
-    /// - `keep_alive_interval`: u64. QUIC keep-alive period (in milliseconds). Default: `5000`.
-    /// - `max_idle_timeout`: u64. Close after this much idle time (in middleseconds). Default: `10000`.
+    /// - `keep_alive_interval`: u64. QUIC keep-alive period in milliseconds; zero disables it. Default: `5000`.
+    /// - `max_idle_timeout`: u64. Idle timeout in milliseconds; zero leaves Quinn's 30-second default. Default: `10000`.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -355,7 +357,7 @@ impl IggyClient {
     ///
     /// # async fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
-    ///     "iggy+http://localhost:3000?heartbeat_interval=5s&retries=3",
+    ///     "iggy+http://user:password@127.0.0.1:3000?heartbeat_interval=5s&retries=3",
     /// )?
     /// .build()?;
     /// client.login_user("user", "password").await?;
@@ -368,16 +370,16 @@ impl IggyClient {
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `reconnection_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
-    /// - `reestablish_after`: [`IggyDuration`]. Grace period before reconnecting. Default: `5s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
     /// - `read_buffer_size`: usize. Size of the read buffer in bytes. Default: `131072`.
     /// - `write_buffer_size`: usize. Size of the write buffer in bytes. Default: `131072`.
-    /// - `max_write_buffer_size`: usize. Maximum size of the write buffer in bytes. Default: `usize::MAX`.
+    /// - `max_write_buffer_size`: usize. Must exceed `write_buffer_size`. Default: `usize::MAX`.
     /// - `max_message_size`: usize. Maximum accepted message size in bytes. Default: `67108864`.
     /// - `max_frame_size`: usize. Maximum accepted frame size in bytes. Default: `16777216`.
-    /// - `accept_unmasked_frames`: bool. Accept/ decline unmasked frames. Default: `false`.
-    /// - `tls`: `bool`. Enable/disbale TLS. Default: `false`.
+    /// - `accept_unmasked_frames`: bool. Has no effect on client connections. Default: `false`.
+    /// - `tls`: `bool`. Enable/disable TLS. Default: `false`.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
-    /// - `tls_ca_file`: filesystem path. Extra CA certificate to trust. Default: unset.
+    /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
     /// - `tls_validate_certificate`: bool. Whether to verify the server certificate. Default: `false`.
     ///
     /// ```no_run

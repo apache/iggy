@@ -263,6 +263,40 @@ public class IggyTypedPublisherTests
         recorder.AllMessages.Select(Decode).Should().BeEquivalentTo(expected);
     }
 
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task DisposeAsync_AfterLogoutFailure_Should_DisposeOnlyOwnedClient(bool ownsClient, bool initialized)
+    {
+        var client = Mock.Get(BuildClient(new SendRecorder()));
+        client.Setup(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("Connection lost during logout."));
+        var config = Config();
+        config.CreateIggyClient = ownsClient;
+        var publisher = new IggyPublisher<string>(client.Object, config,
+            NullLogger<IggyPublisher<string>>.Instance);
+
+        if (initialized)
+        {
+            await publisher.InitAsync(Ct);
+        }
+        else
+        {
+            client.Setup(value => value.GetStreamByIdAsync(It.IsAny<Identifier>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("Connection lost during initialization."));
+            await Assert.ThrowsAsync<IOException>(() => publisher.InitAsync(Ct));
+        }
+
+        await publisher.DisposeAsync();
+        await publisher.DisposeAsync();
+
+        client.Verify(value => value.Dispose(), ownsClient ? Times.Once() : Times.Never());
+        client.Verify(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()),
+            ownsClient && initialized ? Times.Once() : Times.Never());
+    }
+
     private static string Decode(SentMessage message)
     {
         return Encoding.UTF8.GetString(message.Payload);

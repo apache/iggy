@@ -14,12 +14,14 @@ _This is part of the Apache Iggy monorepo. For the main project, see the [root r
 
 ## Installation
 
+These examples target server **0.9.0**. The released `0.8.0` artifact uses the older TCP protocol. Use `0.9.0-SNAPSHOT` for the pre-release SDK, with the ASF repository configured under [Snapshot Versions](#snapshot-versions), or build the SDK and server from the same checkout. Java 17 or newer is required.
+
 Add the dependency to your project:
 
 **Gradle:**
 
 ```gradle
-implementation 'org.apache.iggy:iggy:0.6.0'
+implementation 'org.apache.iggy:iggy:0.9.0-SNAPSHOT'
 ```
 
 **Maven:**
@@ -28,11 +30,11 @@ implementation 'org.apache.iggy:iggy:0.6.0'
 <dependency>
     <groupId>org.apache.iggy</groupId>
     <artifactId>iggy</artifactId>
-    <version>0.6.0</version>
+    <version>0.9.0-SNAPSHOT</version>
 </dependency>
 ```
 
-Find the latest version on [Maven Repository](https://mvnrepository.com/artifact/org.apache.iggy/iggy).
+Check [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) for `0.9.0` release availability.
 
 ### Snapshot Versions
 
@@ -42,13 +44,14 @@ Snapshot versions are also available through the ASF snapshot repository:
 
 ```gradle
 repositories {
+    mavenCentral()
     maven {
         url = uri("https://repository.apache.org/content/repositories/snapshots/")
     }
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.6.1-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.0-SNAPSHOT'
 }
 ```
 
@@ -65,14 +68,18 @@ dependencies {
     </repository>
 </repositories>
 
-<dependency>
-    <groupId>org.apache.iggy</groupId>
-    <artifactId>iggy</artifactId>
-    <version>0.6.1-SNAPSHOT</version>
-</dependency>
+<dependencies>
+    <dependency>
+        <groupId>org.apache.iggy</groupId>
+        <artifactId>iggy</artifactId>
+        <version>0.9.0-SNAPSHOT</version>
+    </dependency>
+</dependencies>
 ```
 
 ## Quick Start
+
+Start the server with the [example prerequisites](../../examples/java/#running-examples) and matching credentials. The following snippets show alternative clients. Close a blocking client with `close()` or an async client with `close().join()` when finished.
 
 ### TCP Client (Blocking)
 
@@ -216,7 +223,7 @@ callback stalls every client that shares the group.
 
 ```java
 // Get SDK version
-String version = Iggy.version();  // e.g., "0.6.1-SNAPSHOT"
+String version = Iggy.version();  // e.g., "0.9.0-SNAPSHOT"
 
 // Get detailed version info
 IggyVersion info = Iggy.versionInfo();
@@ -228,18 +235,18 @@ info.getUserAgent();   // User-Agent string for HTTP
 
 ## Exception Handling
 
-All exceptions thrown by the SDK inherit from `IggyException`. This allows you to catch all SDK-related errors with a single catch block, or handle specific exception types for more granular error handling.
+The SDK's custom exception types inherit from `IggyException`. Joining a failed future can wrap the cause in `CompletionException`; the HTTP client's `close()` method declares `IOException`. Handle those boundaries as well as specific SDK errors.
 
 ## Examples
 
 See the **[Java Examples](../../examples/java/)** directory for runnable applications demonstrating the SDK:
 
-- **BlockingProducer**: synchronous message production with batch sending
-- **BlockingConsumer**: synchronous consumption with polling loops
+- **GettingStartedProducer**: synchronous message production with batch sending
+- **GettingStartedConsumer**: synchronous consumption with polling loops
 - **AsyncProducer**: non-blocking batch production with concurrent request submission
 - **AsyncConsumer**: async consumption with backpressure and error recovery
 
-Each example includes comprehensive documentation on when to use blocking vs. async clients, CompletableFuture patterns, thread pool management, and performance characteristics.
+The examples README describes blocking and async clients, CompletableFuture patterns, and thread pool management.
 
 For Apache Flink integration, see the [Flink Connector Library](external-processors/iggy-connector-flink/iggy-connector-library/README.md).
 

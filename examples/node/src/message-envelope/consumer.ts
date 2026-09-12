@@ -102,7 +102,7 @@ async function consumeMessages(
     interval
   );
 
-  let offset = 0;
+  let offset = 0n;
   let consumedBatches = 0;
 
   while (consumedBatches < BATCHES_LIMIT) {
@@ -113,23 +113,20 @@ async function consumeMessages(
         topicId: topic.id,
         consumer: Consumer.Single,
         partitionId: topic.partitions[0].id,
-        pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
+        pollingStrategy: PollingStrategy.Offset(offset),
         count: MESSAGES_PER_BATCH,
         autocommit: false,
       });
 
       if (!polledMessages || polledMessages.messages.length === 0) {
         log('No messages available.');
-        consumedBatches++;
-        await new Promise(resolve => setTimeout(resolve, interval));
         continue;
       }
-
-      offset += polledMessages.messages.length;
 
       for (const message of polledMessages.messages) {
         const payload = new TextDecoder().decode(new Uint8Array(Object.values(message.payload)));
         handleMessage(payload);
+        offset = message.headers.offset + 1n;
       }
       log('Consumed %d message(s).', polledMessages.messages.length);
     } catch (error) {

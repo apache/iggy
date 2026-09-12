@@ -438,7 +438,16 @@ impl WebSocketClient {
         matches!(self.config.auto_login, AutoLogin::Enabled(_))
     }
     /// Create a new WebSocket client with the provided configuration.
+    ///
+    /// Returns [`IggyError::InvalidConfiguration`] if the maximum write buffer
+    /// size does not exceed the write buffer size.
     pub fn create(config: Arc<WebSocketClientConfig>) -> Result<Self, IggyError> {
+        let ws_config = config.ws_config.to_tungstenite_config();
+        if ws_config.max_write_buffer_size <= ws_config.write_buffer_size {
+            error!("WebSocket max_write_buffer_size must be greater than write_buffer_size");
+            return Err(IggyError::InvalidConfiguration);
+        }
+
         let (sender, receiver) = broadcast(1000);
         let server_address = config.server_address.clone();
         Ok(WebSocketClient {
@@ -1156,6 +1165,34 @@ mod tests {
         let connection_string = "iggy+ws://user:secret@127.0.0.1:8092";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn should_reject_invalid_write_buffer_limits() {
+        for options in [
+            "max_write_buffer_size=1",
+            "write_buffer_size=0&max_write_buffer_size=0",
+            "write_buffer_size=1024&max_write_buffer_size=1024",
+            "write_buffer_size=1024&max_write_buffer_size=1023",
+        ] {
+            let connection_string = format!("iggy+ws://user:secret@127.0.0.1:8092?{options}");
+            let error = WebSocketClient::from_connection_string(&connection_string).err();
+
+            assert_eq!(error, Some(IggyError::InvalidConfiguration), "{options}");
+        }
+    }
+
+    #[test]
+    fn should_accept_write_buffer_limits_above_the_write_buffer() {
+        for options in [
+            "write_buffer_size=0&max_write_buffer_size=1",
+            "write_buffer_size=1024&max_write_buffer_size=1025",
+        ] {
+            let connection_string = format!("iggy+ws://user:secret@127.0.0.1:8092?{options}");
+            let error = WebSocketClient::from_connection_string(&connection_string).err();
+
+            assert_eq!(error, None, "{options}");
+        }
     }
 
     #[test]

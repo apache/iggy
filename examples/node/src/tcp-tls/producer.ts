@@ -21,12 +21,12 @@
 // using custom certificates from core/certs/.
 //
 // Prerequisites:
-//   Start the Iggy server with TLS enabled:
-//     IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+//   From the repository root, start a fresh TLS server (deletes local data):
 //     IGGY_TCP_TLS_ENABLED=true \
 //     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//     cargo r --bin iggy-server
+//     cargo r --bin iggy-server -- --fresh --with-default-root-credentials
+//   Explicit credential environment variables override the default-root flag.
 //
 // Run this example (from examples/node/):
 //   DEBUG=iggy:* npx tsx src/tcp-tls/producer.ts
@@ -70,9 +70,6 @@ async function produceMessages(
     });
 
     try {
-      // The VSR client routes each send to an explicit partition.
-      // TODO(hubcio): Balanced partitioning to be implemented; not decided
-      // yet whether it'll be on server side or client side.
       await client.message.send({
         streamId,
         topicId,

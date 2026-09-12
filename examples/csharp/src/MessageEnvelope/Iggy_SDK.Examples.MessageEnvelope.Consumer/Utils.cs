@@ -79,8 +79,11 @@ public static class Utils
                 continue;
             }
 
-            offset += (ulong)polledMessages.Messages.Count;
-            foreach (var message in polledMessages.Messages) HandleMessage(message, logger);
+            foreach (var message in polledMessages.Messages)
+            {
+                HandleMessage(message, logger);
+                offset = message.Header.Offset + 1;
+            }
             consumedBatches++;
             await Task.Delay(interval);
         }

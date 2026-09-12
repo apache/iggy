@@ -47,7 +47,7 @@ async function consumeMessages(client: Client): Promise<void> {
     interval
   );
 
-  let offset = 0;
+  let offset = 0n;
   let consumedBatches = 0;
 
   while (consumedBatches < BATCHES_LIMIT) {
@@ -58,7 +58,7 @@ async function consumeMessages(client: Client): Promise<void> {
         topicId: TOPIC_ID,
         consumer: Consumer.Single,
         partitionId: PARTITION_ID,
-        pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
+        pollingStrategy: PollingStrategy.Offset(offset),
         count: MESSAGES_PER_BATCH,
         autocommit: false
       });
@@ -71,10 +71,9 @@ async function consumeMessages(client: Client): Promise<void> {
         continue;
       }
 
-      offset += polledMessages.messages.length;
-
       for (const message of polledMessages.messages) {
         handleMessage(message);
+        offset = message.headers.offset + 1n;
       }
 
       consumedBatches++;

@@ -94,9 +94,9 @@ fn resolve_topic_params(
 #[pymethods]
 impl IggyClient {
     /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
-    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
-    /// new runtime for asynchronous operations.
-    /// Future versions might utilize asyncio for more Pythonic async.
+    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. Construction is
+    /// synchronous; async methods return asyncio awaitables backed by the shared
+    /// Tokio runtime.
     ///
     /// Args:
     ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
@@ -1277,7 +1277,7 @@ impl IggyClient {
     /// Returns:
     ///     An awaitable that resolves to `SendMessagesResponse`. Its confirmations
     ///     report the committed partition and batch base offset. The list is empty
-    ///     when the server reports no offsets, including on the legacy server.
+    ///     when the server reports no offsets.
     ///
     /// Raises:
     ///     ValueError: If a string stream or topic identifier is invalid.

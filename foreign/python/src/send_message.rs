@@ -148,9 +148,6 @@ impl SendMessagesConfirmation {
     ///
     /// Confirmation follows VSR quorum commit. A topic with persisted message
     /// durability also waits for recoverable stable-storage copies on the quorum.
-    ///
-    /// The legacy server confirms nothing, so its confirmation list is empty
-    /// and this value is never reached.
     #[getter]
     pub fn base_offset(&self) -> u64 {
         self.inner.base_offset
@@ -175,9 +172,8 @@ impl From<RustSendMessagesResponse> for SendMessagesResponse {
 impl SendMessagesResponse {
     /// Gets the commit confirmations, one per partition the batch was written to.
     ///
-    /// The list is empty when the server reports no offsets, and the legacy
-    /// server never reports any, so branch on it being empty rather than
-    /// indexing into it.
+    /// The list is empty when the server reports no offsets, so check whether
+    /// it is empty before indexing into it.
     ///
     /// A reported `base_offset` never implies uniqueness, because delivery is
     /// at-least-once and an earlier retry may already have committed the same

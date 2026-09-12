@@ -123,7 +123,6 @@ type Topics =
         message_expiry: number;
         name: string;
         partitions_count: number;
-        stream_id: number;
       };
     }
   | {
@@ -131,9 +130,9 @@ type Topics =
       path: `/streams/${number}/topics/${number}`;
       body: {
         name: string;
-        message_expiry: number;
-        compression_algorithm: number;
-        max_topic_size: number;
+        message_expiry?: number;
+        compression_algorithm?: 'none' | 'gzip';
+        max_topic_size?: number;
       };
     }
   | {

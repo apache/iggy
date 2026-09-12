@@ -19,6 +19,14 @@
 
 rootProject.name = "java-examples"
 
+dependencyResolutionManagement {
+    versionCatalogs {
+        create("libs") {
+            from(files("../../foreign/java/gradle/libs.versions.toml"))
+        }
+    }
+}
+
 includeBuild("../../foreign/java") {
       dependencySubstitution {
           substitute(module("org.apache.iggy:iggy")).using(project(":iggy"))

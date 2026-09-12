@@ -42,6 +42,13 @@ constexpr std::uint8_t kind_code(const iggy::ffi::HeaderKind kind) {
 
 }  // namespace
 
+TEST(ConnectionStringTest, ConstructsQuicClient) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::from_connection_string("iggy+quic://iggy:iggy@127.0.0.1:8080"); });
+    ASSERT_NE(client, nullptr);
+    iggy::ffi::delete_client(client);
+}
+
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::CompressionAlgorithm::None().CompressionAlgorithmValue(), "none");
     EXPECT_EQ(iggy::CompressionAlgorithm::Gzip().CompressionAlgorithmValue(), "gzip");
