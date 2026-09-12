@@ -23,10 +23,10 @@ from typing import NamedTuple
 from apache_iggy import DirectProducerConfig, IggyClient, Partitioning, SendMessage
 from loguru import logger
 
-STREAM_NAME = "direct-producer-stream"
-TOPIC_NAME = "direct-producer-topic"
-SEND_TO_STREAM_NAME = "direct-producer-send-to-stream"
-SEND_TO_TOPIC_NAME = "direct-producer-send-to-topic"
+STREAM_NAME = "high-level-stream"
+TOPIC_NAME = "high-level-topic"
+SEND_TO_STREAM_NAME = "high-level-send-to-stream"
+SEND_TO_TOPIC_NAME = "high-level-send-to-topic"
 
 
 class ArgNamespace(NamedTuple):

@@ -307,6 +307,21 @@ class TestProducerCreation:
             await producer.shutdown()
 
     @pytest.mark.asyncio
+    async def test_none_mode_uses_the_default_direct_mode(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        producer = await iggy_client.producer(
+            unique_name(),
+            unique_name(),
+            mode=None,
+        )
+        try:
+            response = await producer.send_one(SendMessage("default mode"))
+            assert len(response.confirmations) == 1
+        finally:
+            await producer.shutdown()
+
+    @pytest.mark.asyncio
     async def test_existing_resources_work_when_creation_is_disabled(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -697,7 +712,6 @@ class TestProducerValidationAndRetries:
         ("kwargs", "expected_exception"),
         [
             ({"partitioning": 0}, TypeError),
-            ({"mode": None}, TypeError),
             ({"mode": object()}, TypeError),
             ({"topic_partitions_count": -1}, ValueError),
             ({"topic_partitions_count": 2**32}, ValueError),

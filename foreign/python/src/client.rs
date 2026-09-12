@@ -1323,12 +1323,15 @@ impl IggyClient {
     }
 
     /// Creates and initializes a high-level producer bound to a stream and topic.
+    ///
+    /// This is a Python port of the Rust high-level producer API. For detailed
+    /// producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         stream,
         topic,
         partitioning=None,
-        mode=ProducerMode::default(),
+        mode=None,
         create_stream_if_not_exists=true,
         create_topic_if_not_exists=true,
         topic_partitions_count=1,
@@ -1346,7 +1349,10 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
             &crate::partitioning::Partitioning,
         >,
-        mode: ProducerMode,
+        #[gen_stub(override_type(
+            type_repr = "DirectProducerConfig | BackgroundProducerConfig | None"
+        ))]
+        mode: Option<ProducerMode>,
         create_stream_if_not_exists: bool,
         create_topic_if_not_exists: bool,
         topic_partitions_count: i64,
@@ -1359,7 +1365,7 @@ impl IggyClient {
         send_retries: Option<i64>,
         send_retry_interval: RetryInterval,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let direct_config = match mode {
+        let direct_config = match mode.unwrap_or_default() {
             ProducerMode::Direct(config) => config,
             ProducerMode::Background(config) => {
                 let _ = config;
