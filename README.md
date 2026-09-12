@@ -89,7 +89,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
   are reserved for future disk/network compression support; use message headers
   for manual compression today (see `examples/rust/src/message-headers/message-compression`).
 - Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
-- Prometheus metrics and **OpenTelemetry** logs & traces in the connectors runtime. Server OTLP export is unavailable pending runtime integration.
+- Prometheus metrics for the server and connectors runtime, plus **OpenTelemetry** logs & traces in the connectors runtime. Server OTLP export is unavailable pending runtime integration.
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
 - **Single binary deployment** without an external broker or database; dynamically linked builds still require operating-system libraries

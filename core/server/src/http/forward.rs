@@ -136,6 +136,8 @@ const RESPONSE_CAPACITY_HINT: usize = 64 * 1024;
 /// applied op, not this follower's (the response layer only fills either when
 /// absent); the applied op is also what this node records as the caller's
 /// read-your-writes floor, so dropping it here would reopen the stale read.
+/// `iggy-durability` preserves the primary's acknowledged completion policy
+/// for writes.
 const RELAYED_RESPONSE_HEADERS: [HeaderName; 5] = [
     CONTENT_TYPE,
     RETRY_AFTER,
