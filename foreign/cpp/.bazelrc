@@ -48,18 +48,4 @@ build:ci --config=release
 build:ci --lockfile_mode=error
 
 test:ci --lockfile_mode=error
-test:ci --test_summary=terse
-test:ci --test_arg=--gtest_brief=1
-
-# Self-contained coverage configuration.
-common:cpp-coverage --color=no
-common:cpp-coverage --curses=no
-common:cpp-coverage --announce_rc
-
-build:cpp-coverage --compilation_mode=dbg
-build:cpp-coverage --copt=-O0
-build:cpp-coverage --strip=never
-build:cpp-coverage --lockfile_mode=error
-
-test:cpp-coverage --test_summary=terse
-test:cpp-coverage --test_arg=--gtest_brief=1
+test:ci --test_summary=detailed
