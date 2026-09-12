@@ -274,6 +274,10 @@ where
     /// the bounded pump drain that turn a stalled flush into a timed-out
     /// non-zero exit instead of a process that reports healthy forever.
     #[allow(clippy::future_not_send)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the owner select loop and its shutdown sequence together"
+    )]
     pub async fn run_message_pump(
         &self,
         stop: Receiver<()>,
@@ -318,6 +322,9 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        // Keep the receive registered: recreating it repeats Crossfire's initial
+        // backoff on every pump turn while the shutdown channel is empty.
+        let mut stop_signal = std::pin::pin!(stop.recv().fuse());
         let mut fatal: Option<FatalCommit> = None;
         loop {
             // `select_biased!`, not `select!`: the unbiased macro draws its
@@ -326,7 +333,7 @@ where
             // intended priority anyway: stop, then tick, redispatch, then
             // newly received frames.
             futures::select_biased! {
-                _ = stop.recv().fuse() => break,
+                _ = stop_signal.as_mut() => break,
                 () = consensus_tick.as_mut() => {
                     // Sharing the pump task is what keeps `tick_partitions`
                     // borrow-safe, but it bounds the tick's worst-case delay

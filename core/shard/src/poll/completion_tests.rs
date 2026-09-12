@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Wake};
 
 use consensus::PartitionsHandle;
 use iggy_common::{IggyError, PollingStrategy};
@@ -34,8 +36,8 @@ use super::test_support::{PollTestMetadata, partition_with_messages};
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    IggyShard, PartitionConsensusConfig, PartitionReadReply, ReplicaTopology, ShardIdentity,
-    TaggedSender, channel, shard_channel,
+    IggyShard, PartitionConsensusConfig, PartitionReadReply, Receiver, ReplicaTopology,
+    ShardIdentity, TaggedSender, channel, shard_channel,
 };
 
 /// Replacement can reuse every message offset from the old history. The pump
@@ -194,6 +196,75 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     );
 }
 
+#[compio::test]
+async fn given_owner_processed_completion_when_shutdown_arrives_should_wake_and_drain_queued_completion()
+ {
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+    let (owner, owner_sender) = owner_with_inbox(&bus, config, namespace);
+    owner.plane.partitions().insert(namespace, partition);
+    let (stop_sender, stop_receiver) = channel(1);
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let wake_observer = Arc::new(PumpWakeObserver::default());
+    let waker = Arc::clone(&wake_observer).into();
+    let mut context = Context::from_waker(&waker);
+    let pump = owner.run_message_pump(stop_receiver, Arc::clone(&shutdown_flag));
+    futures::pin_mut!(pump);
+
+    // Processing a completion advances the pump into another wait. Shutdown
+    // must still wake it after an ordinary inbox branch has already won.
+    let first_reply = queue_resident_poll(&owner, &owner_sender, namespace);
+    assert!(pump.as_mut().poll(&mut context).is_pending());
+    assert_single_message_reply(&first_reply);
+    wake_observer.notified.store(false, Ordering::Relaxed);
+    stop_sender.try_send(()).expect("signal shutdown");
+    assert!(wake_observer.notified.load(Ordering::Relaxed));
+
+    // Both shutdown and a completion are ready before the pump resumes.
+    // Graceful shutdown must drain the completion before the final flush.
+    let queued_reply = queue_resident_poll(&owner, &owner_sender, namespace);
+    assert!(matches!(
+        pump.as_mut().poll(&mut context),
+        Poll::Ready(None)
+    ));
+    assert_single_message_reply(&queued_reply);
+    assert_eq!(owner.inbox_len(), 0);
+    assert!(!shutdown_flag.load(Ordering::Relaxed));
+}
+
+#[compio::test]
+async fn given_owner_processed_completion_when_shutdown_sender_drops_should_wake_and_stop() {
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+    let (owner, owner_sender) = owner_with_inbox(&bus, config, namespace);
+    owner.plane.partitions().insert(namespace, partition);
+    let (stop_sender, stop_receiver) = channel(1);
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let wake_observer = Arc::new(PumpWakeObserver::default());
+    let waker = Arc::clone(&wake_observer).into();
+    let mut context = Context::from_waker(&waker);
+    let pump = owner.run_message_pump(stop_receiver, Arc::clone(&shutdown_flag));
+    futures::pin_mut!(pump);
+
+    let reply = queue_resident_poll(&owner, &owner_sender, namespace);
+    assert!(pump.as_mut().poll(&mut context).is_pending());
+    assert_single_message_reply(&reply);
+
+    // Losing the final shutdown sender must wake an otherwise idle owner;
+    // manually polling to completion alone would miss a lost notification.
+    wake_observer.notified.store(false, Ordering::Relaxed);
+    drop(stop_sender);
+    assert!(wake_observer.notified.load(Ordering::Relaxed));
+    assert!(matches!(
+        pump.as_mut().poll(&mut context),
+        Poll::Ready(None)
+    ));
+    assert_eq!(owner.inbox_len(), 0);
+    assert!(!shutdown_flag.load(Ordering::Relaxed));
+}
+
 type CompletionTestShard = IggyShard<
     Rc<IggyMessageBus>,
     PrepareJournal,
@@ -232,4 +303,76 @@ fn owner_with_inbox(
     )
     .expect("valid owner inbox wiring");
     (owner, sender)
+}
+
+fn queue_resident_poll(
+    owner: &CompletionTestShard,
+    owner_sender: &TaggedSender,
+    namespace: IggyNamespace,
+) -> Receiver<PartitionReadReply> {
+    let plan = owner
+        .plane
+        .partitions()
+        .build_poll_snapshot(
+            &namespace,
+            PollingConsumer::Consumer(1, 0),
+            &PollingArgs {
+                strategy: PollingStrategy::offset(0),
+                count: 1,
+                auto_commit: false,
+            },
+        )
+        .expect("fixture has a read snapshot");
+    assert!(!plan.needs_off_pump_io());
+    let (reply_sender, replies) = channel(1);
+    PollCompletionSender::new(
+        Some(owner_sender.clone()),
+        namespace,
+        reply_sender,
+        owner.metrics().clone(),
+    )
+    .complete(plan.execute_resident());
+    assert_eq!(owner.inbox_len(), 1, "completion awaits owner acceptance");
+    assert!(matches!(
+        replies.try_recv(),
+        Err(crossfire::TryRecvError::Empty)
+    ));
+    replies
+}
+
+fn assert_single_message_reply(replies: &Receiver<PartitionReadReply>) {
+    let PartitionReadReply::Poll {
+        fragments,
+        current_offset,
+    } = replies.try_recv().expect("owner replied to the completion")
+    else {
+        panic!("the fixture's read should succeed");
+    };
+    assert_eq!(current_offset, 0);
+    let bytes: Vec<u8> = fragments
+        .iter()
+        .flat_map(|fragment| fragment.as_slice().iter().copied())
+        .collect();
+    let batch = decode_batch_slice(&bytes).expect("decode the reply");
+    let payloads: Vec<&[u8]> = batch.iter().map(|message| message.payload).collect();
+    assert_eq!(payloads, vec![b"message".as_slice()]);
+    assert!(matches!(
+        replies.try_recv(),
+        Err(crossfire::TryRecvError::Disconnected)
+    ));
+}
+
+#[derive(Default)]
+struct PumpWakeObserver {
+    notified: AtomicBool,
+}
+
+impl Wake for PumpWakeObserver {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, Ordering::Relaxed);
+    }
 }
