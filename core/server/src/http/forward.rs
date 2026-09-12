@@ -25,12 +25,12 @@
 //! them against the current primary's HTTP listener and relays the primary's
 //! response on the original connection, so any node answers any request.
 //!
-//! Scope: the middleware is attached (via `route_layer`) only to the
-//! control-plane routes, whose ops all commit through the metadata consensus
-//! group and therefore share one forward target. Partition-plane writes
-//! (produce, consumer-offset writes) are excluded: each partition is its own
-//! consensus group whose primary can diverge from the metadata primary, so
-//! forwarding them needs per-group target resolution.
+//! Control-plane routes share the metadata primary as their forward target.
+//! Partition-write routes use a separate fallback: after a typed
+//! `TransientNotAccepted` response, try each other roster node at most once.
+//! That denial proves the operation never entered a partition pipeline.
+//! Partition primaries can differ from the metadata primary, so this fallback
+//! cannot use the metadata leader as its sole target.
 //!
 //! Safety model, in order:
 //! - The bearer is verified locally (verify-only, no session mint) before any
@@ -82,6 +82,7 @@ use crate::http::error::{
     CustomError, error_response, gateway_timeout_response, primary_http_socket, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, resolve_credential};
+use crate::http::handlers::DURABILITY_HEADER;
 use crate::http::state::{APPLIED_OP_HEADER, ForwardState, HttpInner, VIEW_HEADER};
 use crate::server_error::ServerError;
 
@@ -135,8 +136,13 @@ const RESPONSE_CAPACITY_HINT: usize = 64 * 1024;
 /// applied op, not this follower's (the response layer only fills either when
 /// absent); the applied op is also what this node records as the caller's
 /// read-your-writes floor, so dropping it here would reopen the stale read.
-const RELAYED_RESPONSE_HEADERS: [HeaderName; 4] =
-    [CONTENT_TYPE, RETRY_AFTER, VIEW_HEADER, APPLIED_OP_HEADER];
+const RELAYED_RESPONSE_HEADERS: [HeaderName; 5] = [
+    CONTENT_TYPE,
+    RETRY_AFTER,
+    VIEW_HEADER,
+    APPLIED_OP_HEADER,
+    DURABILITY_HEADER,
+];
 
 /// Build the [`ForwardState`] at listener startup.
 ///

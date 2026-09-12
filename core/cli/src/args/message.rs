@@ -46,12 +46,11 @@ pub(crate) enum MessageAction {
     ///  iggy message poll --offset 0 stream topic 1
     #[clap(verbatim_doc_comment, visible_alias = "p")]
     Poll(PollMessagesArgs),
-    /// Flush messages from given topic ID and given stream ID
+    /// Legacy message flush command (unsupported by the server)
     ///
-    /// Command is used to force a flush of unsaved_buffer to disk
-    /// for specific stream, topic and partition. If fsync is enabled
-    /// then the data is flushed to disk and fsynced, otherwise the
-    /// data is only flushed to disk.
+    /// Binary transports return FeatureUnavailable. HTTP has no flush route.
+    /// For acknowledgements backed by stable storage, create the topic with
+    /// --durability persisted.
     ///
     /// Stream ID can be specified as a stream name or ID
     /// Topic ID can be specified as a topic name or ID
@@ -82,7 +81,7 @@ pub(crate) struct SendMessagesArgs {
     pub(crate) partition_id: Option<u32>,
     /// Messages key which will be used to partition the messages
     ///
-    /// Value of the key will be used by the server to calculate the partition ID
+    /// The key must contain 1 to 255 bytes. Binary clients resolve the partition ID; HTTP resolves it on the server.
     #[clap(verbatim_doc_comment)]
     #[clap(short, long, group = "partitioning")]
     pub(crate) message_key: Option<String>,
@@ -265,23 +264,22 @@ pub(crate) struct PollMessagesArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct FlushMessagesArgs {
-    /// ID of the stream for which messages will be flushed
+    /// Stream ID for the flush request
     ///
     /// Stream ID can be specified as a stream name or ID
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) stream_id: Identifier,
-    /// ID of the topic for which messages will be flushed
+    /// Topic ID for the flush request
     ///
     /// Topic ID can be specified as a topic name or ID
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
-    /// Partition ID for which messages will be flushed
+    /// Partition ID for the flush request
     #[arg(value_parser = clap::value_parser!(u32).range(0..))]
     pub(crate) partition_id: u32,
-    /// fsync flushed data to disk
+    /// Request fsync (unsupported by the server)
     ///
-    /// If option is enabled then the data is flushed to disk and fsynced,
-    /// otherwise the data is only flushed to disk. Default is false.
+    /// The server rejects flush requests regardless of this flag.
     #[clap(verbatim_doc_comment)]
     #[clap(short, long, default_value_t = false)]
     pub(crate) fsync: bool,

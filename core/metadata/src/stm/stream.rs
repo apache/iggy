@@ -2244,10 +2244,8 @@ impl StateHandler for UpdateTopicRequest {
 
         stream.topic_index.remove(&topic.name);
         topic.name = new_name_arc.clone();
-        // Settings arrive only through the options block now, so the typed
-        // fields are a projection of it and cannot drift. Absent means absent:
-        // a client that sends just a rename leaves every setting alone, and one
-        // built before a key existed cannot erase it.
+        // Parsing treats default sentinels as absent for these typed fields,
+        // while the stored option map below retains their raw values.
         if let Some(compression_algorithm) = updated.compression_algorithm {
             topic.compression_algorithm = compression_algorithm;
         }

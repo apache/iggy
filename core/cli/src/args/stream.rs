@@ -23,7 +23,7 @@ use iggy::prelude::Identifier;
 pub(crate) enum StreamAction {
     /// Create stream with given name
     ///
-    /// If stream ID is not provided then the server will automatically assign it
+    /// The server assigns the stream ID. The legacy --stream-id flag is ignored.
     ///
     /// Examples:
     ///  iggy stream create prod
@@ -79,7 +79,7 @@ pub(crate) enum StreamAction {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct StreamCreateArgs {
-    /// Stream ID to create
+    /// Legacy stream ID flag (ignored)
     #[clap(short, long)]
     pub(crate) stream_id: Option<u32>,
     /// Name of the stream

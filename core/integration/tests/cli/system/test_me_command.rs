@@ -195,7 +195,7 @@ pub async fn should_help_match() {
                 r#"get current client info
 
 Command connects to Iggy server and collects client info like client ID, user ID
-server address and protocol type.
+client address as seen by the server and protocol type.
 
 {USAGE_PREFIX} me
 

@@ -38,13 +38,9 @@ const CONFIRMATION_SIZE: usize = 20;
 /// ```
 ///
 /// `base_offset` is the offset assigned to the first message of the batch in
-/// that partition, bounded by three properties of the send path:
-/// - Delivery is at-least-once. An earlier retry of the same batch may already
-///   have committed at a lower offset, so the value never implies uniqueness.
-/// - A batch is confirmed once it is committed in memory, not once it is
-///   fsynced. A crash-restart can stamp a later batch with an offset a client
-///   has already recorded.
-/// - The legacy server confirms nothing, so its confirmation list is empty.
+/// that partition. It does not imply uniqueness: retries outside the server's
+/// deduplication coverage may append the batch again. Crash durability depends
+/// on the topic's durability policy, not on the presence of offset information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessagesConfirmationResponse {
     pub stream_id: u32,
@@ -91,9 +87,9 @@ impl WireDecode for SendMessagesConfirmationResponse {
 /// [confirmations_count:4][SendMessagesConfirmationResponse]*
 /// ```
 ///
-/// `confirmations_count == 0` means the batch committed with no offsets to
-/// report. The legacy server goes further and answers a successful send with no
-/// body at all, so a caller sees an empty list either way and must handle it.
+/// `confirmations_count == 0` supplies no offset information. Callers must also
+/// handle an empty successful reply body, which the server uses for a request
+/// classified as a duplicate. Neither response identifies an append position.
 ///
 /// The server currently reports a single partition per request; the list
 /// decodes any count, so a later multi-partition send needs no wire change.

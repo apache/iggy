@@ -168,7 +168,7 @@ const HTTP_READ_CLIENT_ID: u128 = 0;
 /// The completed topic policy after an awaited quorum commit. If namespace
 /// replacement prevents attesting its incarnation, report the proven quorum
 /// guarantee. [`DURABILITY_NONE`] means `?ack=none` dispatch acceptance.
-const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
+pub(super) const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
 
 const DURABILITY_NONE: &str = "none";
 

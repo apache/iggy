@@ -89,3 +89,4 @@ mod message_retrieval;
 mod purge_delete;
 mod scenarios;
 mod specific;
+mod telemetry;

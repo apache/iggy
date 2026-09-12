@@ -135,15 +135,15 @@ clock_skew = "5 s"
 not_before = "0 s"
 
 # Secret key for encoding JWTs.
-# If left empty, a secure random secret will be generated on each server start.
-# In cluster mode a configured secret (identical on every node) makes bearers
-# valid cluster-wide and activates follower-to-primary HTTP forwarding; with
-# cluster.auth enabled the key is instead derived from the shared PSK. Without
-# either, tokens are node-local and forwarding stays disabled.
+# If only one secret is set, it supplies both keys. With both empty, use the
+# cluster PSK when enabled, otherwise a random secret per start. Explicit JWT
+# secrets take precedence over the PSK. Identical keys on every node make bearers
+# valid cluster-wide and activate follower-to-primary HTTP forwarding. Without
+# configured JWT secrets or a cluster PSK, tokens are node-local and forwarding stays disabled.
 encoding_secret = ""
 
 # Secret key for decoding JWTs.
-# If left empty, a secure random secret will be generated on each server start.
+# When empty, the same fallback rules as encoding_secret apply.
 decoding_secret = ""
 
 # Indicates if the secret key is base64 encoded.
@@ -152,7 +152,7 @@ decoding_secret = ""
 use_base64_secret = false
 
 # Trusted issuers for A2A (Application-to-Application) authentication. Opt-in:
-# with none configured the listener accepts only self-issued HS256 tokens.
+# with none configured the listener accepts only self-issued HMAC tokens.
 # `issuer`, `audience` and `jwks_url` are required per entry; `user_id` is
 # optional but defaults to 0 (root), which is rejected - set it to the non-zero
 # iggy user every token from that issuer is remapped onto.
@@ -397,7 +397,7 @@ retention = "7 days"
 
 # Encryption configuration
 [encryption]
-# Determines whether server-side data encryption for the messages payloads and state commands is enabled (boolean).
+# Encrypt message payloads and user headers. Metadata and structural headers remain unencrypted.
 # `true` enables encryption for stored data using AES-256-GCM.
 # `false` means data is stored without encryption.
 enabled = false
@@ -416,14 +416,14 @@ enabled = true
 
 # Size of the memory pool (string).
 # Example: "512 MiB" or "1 GiB".
-# This defines the maximum, total memory allocated for the memory pool.
+# Buffers are allocated on demand; allocations beyond this budget use memory outside the pool.
 # Note: This number has to be multiplication of 4096 (default linux page size).
 # Minimum size is 512 MiB due to internal implementation details.
 size = "4 GiB"
 
 # Maximum number of buffers in each bucket (u32).
-# There are 32 buckets in the memory pool. Each bucket can hold up to this number of buffers
-# and holds different buffer sizes, from 256 B to 512 MiB.
+# There are 28 buckets in the memory pool. Each bucket can hold up to this number of buffers
+# and holds different buffer sizes, from 4 KiB to 512 MiB.
 # Note: This number has to be a power of 2. Minimum value is 128 due to internal implementation details.
 bucket_capacity = 8192
 
@@ -703,11 +703,11 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 [sharding]
 # CPU allocation - controls the number of shards and their CPU affinity.
 # Possible values:
-# - "all": Use all available CPU cores (default)
-# - numeric value (e.g. 4): Use 4 shards (4 threads pinned to cores 0, 1, 2, 3)
+# - "all": Use all available CPU cores
+# - numeric value (e.g. 4): Use 4 shards on the first 4 CPUs in the allowed set
 # - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
 # - numa settings:
-#     + "numa:auto": Use all available numa node, cores
+#     + "numa:auto": Use all available NUMA nodes and cores (default)
 #     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
 cpu_allocation = "numa:auto"
 
@@ -913,7 +913,7 @@ validate_checksum = true
 # Depth of a partition's prepare queue: how many uncommitted produce /
 # consumer-offset ops may be in flight at once for that partition. Submits past
 # it spill into a request queue of twice this depth; once both are full the
-# server drops the request without a reply and the client retries on its own
+# server replies with TransientNotAccepted. A lost reply can still cause a client
 # request timeout. Must be > 0 and <= 127: the ceiling is the view-change wire, not
 # memory. A DoViewChange describes the uncommitted suffix with one bit per op in a
 # u128 bitset, and this depth bounds that suffix.

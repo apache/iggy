@@ -68,14 +68,14 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Thread per core shared nothing design** together with `io_uring` guarantee the best possible performance on modern `Linux` systems.
 - **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
-- Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
+- Configurable server features (e.g. caching and transport protocols), plus per-topic segment size, durability and flush thresholds
 - Server-side storage of **consumer offsets**
 - Multiple ways of polling the messages:
   - By offset (using the indexes)
   - By timestamp (using the time indexes)
   - First/Last N messages
   - Next N messages for the specific consumer
-- Possibility of **auto committing the offset** (e.g. to achieve *at-most-once* delivery)
+- Optional **poll auto-commit**; processing guarantees depend on application processing and offset-commit ordering
 - **Consumer groups** providing the message ordering and horizontal scaling across the connected clients
 - **Message expiry** with auto deletion based on the configurable **retention policy**
 - Additional features such as **server side message deduplication**
@@ -89,10 +89,10 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
   are reserved for future disk/network compression support; use message headers
   for manual compression today (see `examples/rust/src/message-headers/message-compression`).
 - Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
-- Support for **OpenTelemetry** logs & traces + Prometheus metrics
+- Prometheus metrics and **OpenTelemetry** logs & traces in the connectors runtime. Server OTLP export is unavailable pending runtime integration.
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
-- **Single binary deployment** (no external dependencies)
+- **Single binary deployment** without an external broker or database; dynamically linked builds still require operating-system libraries
 - Running as a single node or as a **cluster**, with data replication based on **[Viewstamped Replication (VSR)](https://github.com/apache/iggy/blob/master/assets/vsr.pdf)**
 
 ![server](assets/server.png)
@@ -132,7 +132,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/igg
 
 ## CLI
 
-The interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
+The interactive CLI is implemented under `core/cli`, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
 
 Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed by typing `iggy` in your terminal.
 
