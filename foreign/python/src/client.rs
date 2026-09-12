@@ -66,6 +66,10 @@ fn to_runtime_error<E: Display>(error: E) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
 }
 
+fn to_value_error<E: Display>(error: E) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyValueError, _>(error.to_string())
+}
+
 /// Resolves the shared `create_topic`/`update_topic` parameters, applying
 /// server defaults where the caller left them unset.
 fn resolve_topic_params(
@@ -1394,12 +1398,12 @@ impl IggyClient {
         let mut builder = self
             .inner
             .producer(stream, topic)
-            .map_err(to_runtime_error)?
+            .map_err(to_value_error)?
             .direct((&direct_config).into())
             .send_retries(send_retries, send_retry_interval);
 
         if let Some(partitioning) = partitioning {
-            builder = builder.partitioning(partitioning.inner.clone());
+            builder = builder.partitioning(partitioning.inner.as_ref().clone());
         }
         if create_stream_if_not_exists {
             builder = builder.create_stream_if_not_exists();

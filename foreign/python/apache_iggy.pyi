@@ -54,6 +54,7 @@ __all__ = [
     "Partitioning",
     "Permissions",
     "PollingStrategy",
+    "ProducerSendError",
     "ProducerSharding",
     "QuicConfig",
     "QuicReconnectionConfig",
@@ -566,6 +567,7 @@ class DirectProducerConfig:
     def batch_length(self) -> builtins.int:
         r"""
         Maximum number of messages sent in one request.
+        A value of zero uses the internal limit of 1,000,000 messages.
         """
     @property
     def linger_time(self) -> datetime.timedelta:
@@ -2273,6 +2275,29 @@ class PollingStrategy:
         def __new__(cls) -> PollingStrategy.Next: ...
 
     ...
+
+@typing.final
+class ProducerSendError(builtins.RuntimeError):
+    r"""
+    A direct producer error that preserves partial-send recovery state.
+    """
+    @property
+    def cause(self) -> builtins.str:
+        r"""
+        The underlying Iggy error message.
+        """
+    @property
+    def failed(self) -> builtins.list[SendMessage]:
+        r"""
+        Messages without a usable confirmation after the failure.
+        An encryptor can leave these messages encrypted, so do not submit them
+        to the same producer without restoring their original payloads.
+        """
+    @property
+    def committed(self) -> builtins.list[SendMessagesConfirmation]:
+        r"""
+        Confirmations returned for chunks committed before the failure.
+        """
 
 @typing.final
 class QuicConfig:

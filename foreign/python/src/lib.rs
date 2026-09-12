@@ -47,7 +47,7 @@ use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use producer::{
     BackgroundProducerConfig, BackpressureMode, DirectProducerConfig, IggyProducer,
-    ProducerSharding,
+    ProducerSendError, ProducerSharding,
 };
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
@@ -68,6 +68,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;
     m.add_class::<IggyProducer>()?;
+    m.add_class::<ProducerSendError>()?;
     m.add_class::<DirectProducerConfig>()?;
     m.add_class::<BackgroundProducerConfig>()?;
     m.add_class::<ProducerSharding>()?;

@@ -33,6 +33,7 @@ from apache_iggy import (
     IggyProducer,
     MaxTopicSize,
     Partitioning,
+    ProducerSendError,
     ProducerSharding,
     SendMessage,
     SendMessagesResponse,
@@ -84,6 +85,10 @@ class TestDirectProducerConfig:
     def test_negative_linger_is_rejected(self, linger_time: timedelta):
         with pytest.raises(ValueError, match="negative"):
             DirectProducerConfig(linger_time=linger_time)
+
+    def test_linger_above_u64_microseconds_is_rejected(self):
+        with pytest.raises(ValueError, match="linger_time"):
+            DirectProducerConfig(linger_time=timedelta(days=999_999_999))
 
     def test_wrong_field_types_are_rejected(self):
         with pytest.raises(TypeError):
@@ -664,7 +669,13 @@ class TestProducerLifecycle:
         await producer.send_one(SendMessage("prime linger"))
 
         sending = asyncio.ensure_future(producer.send_one(SendMessage("in flight")))
-        await asyncio.sleep(0)
+
+        async def wait_for_active_send():
+            # pyrefly: ignore  # missing-attribute
+            while not producer._is_send_active():
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_active_send(), timeout=1)
         shutting_down = asyncio.ensure_future(producer.shutdown())
 
         response, shutdown_result = await asyncio.wait_for(
@@ -748,6 +759,22 @@ class TestProducerValidationAndRetries:
             await iggy_client.producer(unique_name(), 1)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stream", "topic"),
+        [
+            ("", "topic"),
+            ("stream", ""),
+            ("x" * 256, "topic"),
+            ("stream", "x" * 256),
+        ],
+    )
+    async def test_bound_destination_rejects_invalid_names_as_value_errors(
+        self, iggy_client: IggyClient, stream: str, topic: str
+    ):
+        with pytest.raises(ValueError):
+            await iggy_client.producer(stream, topic)
+
+    @pytest.mark.asyncio
     async def test_send_arguments_reject_low_level_shorthands_and_wrong_types(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -789,7 +816,7 @@ class TestProducerValidationAndRetries:
             await producer.shutdown()
 
     @pytest.mark.asyncio
-    async def test_server_send_errors_are_runtime_errors(
+    async def test_server_send_errors_preserve_recovery_state(
         self, iggy_client: IggyClient, unique_name
     ):
         producer = await iggy_client.producer(
@@ -798,11 +825,20 @@ class TestProducerValidationAndRetries:
             send_retries=0,
         )
         try:
-            with pytest.raises(RuntimeError):
+            with pytest.raises(ProducerSendError) as raised:
                 await producer.send_with_partitioning(
                     [SendMessage("missing partition")],
                     Partitioning.partition_id(1),
                 )
+
+            error = raised.value
+            assert isinstance(error, RuntimeError)
+            assert error.cause
+            assert isinstance(error.__cause__, RuntimeError)
+            assert str(error.__cause__) == error.cause
+            assert len(error.failed) == 1
+            assert isinstance(error.failed[0], SendMessage)
+            assert error.committed == []
         finally:
             await producer.shutdown()
 

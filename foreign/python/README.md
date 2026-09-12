@@ -263,6 +263,23 @@ strategy for one call, or `send_to(stream, topic, messages, partitioning)` to
 send to another existing destination. `send_to()` does not create or initialize
 that destination.
 
+Direct sends use at-least-once delivery. A request can commit even when its
+response is lost, so any retry can write the same batch again. `send_retries`
+counts retries after the initial attempt. The first retry runs immediately, and
+`send_retry_interval` delays only later retries. Set `send_retries` to `None` or
+`0` to disable producer retries. Set `send_retry_interval` to `None` to run all
+enabled retries without a delay. A zero interval raises `ValueError`.
+
+Transport retries are separate from producer retries. For example, the default
+`HttpConfig(retries=3)` gives each producer attempt up to four HTTP attempts.
+
+A failed direct send raises `ProducerSendError`, which is a `RuntimeError`
+subclass. Its `cause` property contains the underlying error text. Its
+`committed` property contains confirmations from completed chunks, and `failed`
+contains the remaining unconfirmed messages. If encryption is enabled, the
+failed messages contain encrypted payloads. Restore the original payloads
+before submitting them to the same producer again.
+
 Cleanup is asynchronous and must be explicit. Prefer `async with`, as above, so
 shutdown runs on both successful and exceptional exits. Otherwise, call
 `await producer.shutdown()` in a `finally` block. Shutdown waits for active

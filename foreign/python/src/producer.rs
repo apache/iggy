@@ -22,8 +22,9 @@ use iggy::clients::producer_config::BackpressureMode as RustBackpressureMode;
 #[cfg(test)]
 use iggy::prelude::BackgroundConfig as RustBackgroundConfig;
 use iggy::prelude::{
-    DirectConfig as RustDirectConfig, Identifier, IggyByteSize, IggyDuration,
+    DirectConfig as RustDirectConfig, Identifier, IggyByteSize, IggyDuration, IggyError,
     IggyMessage as RustIggyMessage, IggyProducer as RustIggyProducer,
+    SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
 };
 use pyo3::IntoPyObjectExt;
 use pyo3::conversion::FromPyObject;
@@ -37,7 +38,7 @@ use tokio::sync::RwLock;
 
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
 use crate::partitioning::Partitioning;
-use crate::send_message::{SendMessage, SendMessagesResponse};
+use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 
 const DEFAULT_BACKGROUND_NUM_SHARDS: usize = 1;
 const DEFAULT_BACKGROUND_BATCH_SIZE: usize = 1024 * 1024;
@@ -76,6 +77,12 @@ impl DirectProducerConfig {
     fn new(batch_length: i64, linger_time: DefaultDuration) -> PyResult<Self> {
         let batch_length = u32_param(batch_length, "batch_length")?;
         let linger_time = linger_time.resolve(IggyDuration::from(0))?;
+        if linger_time.get_duration().as_micros() > u128::from(u64::MAX) {
+            return Err(PyValueError::new_err(format!(
+                "'linger_time' must not exceed {} microseconds",
+                u64::MAX
+            )));
+        }
         Ok(Self {
             inner: RustDirectConfig::builder()
                 .batch_length(batch_length)
@@ -85,6 +92,7 @@ impl DirectProducerConfig {
     }
 
     /// Maximum number of messages sent in one request.
+    /// A value of zero uses the internal limit of 1,000,000 messages.
     #[getter]
     fn batch_length(&self) -> u32 {
         self.inner.batch_length
@@ -331,6 +339,76 @@ impl BackgroundProducerConfig {
     }
 }
 
+/// A direct producer error that preserves partial-send recovery state.
+#[gen_stub_pyclass]
+#[pyclass(frozen, extends=PyRuntimeError)]
+pub struct ProducerSendError {
+    cause: String,
+    failed: Arc<Vec<RustIggyMessage>>,
+    committed: Arc<Vec<RustSendMessagesConfirmationResponse>>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl ProducerSendError {
+    /// The underlying Iggy error message.
+    #[getter]
+    fn cause(&self) -> &str {
+        &self.cause
+    }
+
+    /// Messages without a usable confirmation after the failure.
+    /// An encryptor can leave these messages encrypted, so do not submit them
+    /// to the same producer without restoring their original payloads.
+    #[getter]
+    fn failed(&self) -> Vec<SendMessage> {
+        self.failed
+            .iter()
+            .map(SendMessage::clone_from_rust)
+            .collect()
+    }
+
+    /// Confirmations returned for chunks committed before the failure.
+    #[getter]
+    fn committed(&self) -> Vec<SendMessagesConfirmation> {
+        self.committed
+            .iter()
+            .map(SendMessagesConfirmation::from)
+            .collect()
+    }
+}
+
+impl ProducerSendError {
+    fn new_err(
+        cause: IggyError,
+        failed: Arc<Vec<RustIggyMessage>>,
+        committed: Arc<Vec<RustSendMessagesConfirmationResponse>>,
+    ) -> PyErr {
+        Python::attach(|py| {
+            let cause = cause.to_string();
+            let message = format!("Producer send failed: {cause}");
+            let cause_error = PyRuntimeError::new_err(cause.clone());
+            let instance = match Bound::new(
+                py,
+                Self {
+                    cause,
+                    failed,
+                    committed,
+                },
+            ) {
+                Ok(instance) => instance,
+                Err(error) => return error,
+            };
+            if let Err(error) = instance.setattr("args", (message,)) {
+                return error;
+            }
+            let error = PyErr::from_value(instance.into_any());
+            error.set_cause(py, Some(cause_error));
+            error
+        })
+    }
+}
+
 /// Python port of the Rust high-level producer API, bound to one stream and topic.
 ///
 /// For detailed producer semantics, see
@@ -373,7 +451,7 @@ impl IggyProducer {
                 .send(messages)
                 .await
                 .map(SendMessagesResponse::from)
-                .map_err(to_runtime_error)
+                .map_err(to_send_error)
         })
     }
 
@@ -395,7 +473,7 @@ impl IggyProducer {
                 .send_one(message)
                 .await
                 .map(SendMessagesResponse::from)
-                .map_err(to_runtime_error)
+                .map_err(to_send_error)
         })
     }
 
@@ -411,7 +489,7 @@ impl IggyProducer {
         >,
     ) -> PyResult<Bound<'py, PyAny>> {
         let messages = extract_messages(messages)?;
-        let partitioning = partitioning.map(|value| Arc::new(value.inner.clone()));
+        let partitioning = partitioning.map(|value| value.inner.clone());
         let inner = self.inner.clone();
         future_into_py(py, async move {
             let producer = inner.read().await;
@@ -422,7 +500,7 @@ impl IggyProducer {
                 .send_with_partitioning(messages, partitioning)
                 .await
                 .map(SendMessagesResponse::from)
-                .map_err(to_runtime_error)
+                .map_err(to_send_error)
         })
     }
 
@@ -448,7 +526,7 @@ impl IggyProducer {
         let stream = Arc::new(extract_send_to_identifier(stream, "stream")?);
         let topic = Arc::new(extract_send_to_identifier(topic, "topic")?);
         let messages = extract_messages(messages)?;
-        let partitioning = partitioning.map(|value| Arc::new(value.inner.clone()));
+        let partitioning = partitioning.map(|value| value.inner.clone());
         let inner = self.inner.clone();
         future_into_py(py, async move {
             let producer = inner.read().await;
@@ -459,15 +537,23 @@ impl IggyProducer {
                 .send_to(stream, topic, messages, partitioning)
                 .await
                 .map(SendMessagesResponse::from)
-                .map_err(to_runtime_error)
+                .map_err(to_send_error)
         })
+    }
+
+    #[gen_stub(skip)]
+    fn _is_send_active(&self) -> bool {
+        self.inner.try_write().is_err()
     }
 
     /// Waits for active sends and closes the producer. Repeated calls are safe.
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move { shutdown(inner).await })
+        future_into_py(py, async move {
+            shutdown(inner).await?;
+            Ok(Python::attach(|py| py.None()))
+        })
     }
 
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
@@ -742,8 +828,16 @@ fn clone_rust_message(message: &SendMessage) -> RustIggyMessage {
     message.clone().inner
 }
 
-fn to_runtime_error(error: impl ToString) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+fn to_send_error(error: IggyError) -> PyErr {
+    match error {
+        IggyError::ProducerSendFailed {
+            cause,
+            failed,
+            committed,
+            ..
+        } => ProducerSendError::new_err(*cause, failed, committed),
+        error => PyRuntimeError::new_err(error.to_string()),
+    }
 }
 
 pub(crate) fn u32_param(value: i64, parameter: &str) -> PyResult<u32> {
@@ -769,7 +863,7 @@ fn u64_param(value: i128, parameter: &str) -> PyResult<u64> {
 
 #[cfg(test)]
 mod tests {
-    use pyo3::exceptions::{PyOverflowError, PyTypeError};
+    use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
 
     use super::*;
 
@@ -780,6 +874,78 @@ mod tests {
 
         assert_eq!(python.inner.batch_length, rust.batch_length);
         assert_eq!(python.inner.linger_time, rust.linger_time);
+    }
+
+    #[test]
+    fn direct_linger_rejects_values_above_u64_microseconds() {
+        Python::initialize();
+        Python::attach(|py| {
+            let duration = PyDelta::new(py, 999_999_999, 0, 0, false).unwrap().unbind();
+            let error = DirectProducerConfig::new(1_000, DefaultDuration::Value(duration))
+                .err()
+                .unwrap();
+
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(error.to_string().contains("linger_time"));
+        });
+    }
+
+    #[test]
+    fn producer_send_error_preserves_recovery_state() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cause = IggyError::CannotSendMessagesDueToClientDisconnection;
+            let cause_message = cause.to_string();
+            let error = to_send_error(IggyError::ProducerSendFailed {
+                cause: Box::new(cause),
+                failed: Arc::new(vec![RustIggyMessage::from_str("failed").unwrap()]),
+                committed: Arc::new(vec![RustSendMessagesConfirmationResponse {
+                    stream_id: 1,
+                    topic_id: 2,
+                    partition_id: 3,
+                    base_offset: 4,
+                }]),
+                stream_name: "stream".to_owned(),
+                topic_name: "topic".to_owned(),
+            });
+
+            assert!(error.is_instance_of::<ProducerSendError>(py));
+            assert!(error.is_instance_of::<PyRuntimeError>(py));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("cause")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                cause_message
+            );
+
+            let failed = error
+                .value(py)
+                .getattr("failed")
+                .unwrap()
+                .extract::<Vec<Py<SendMessage>>>()
+                .unwrap();
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].borrow(py).inner.payload.as_ref(), b"failed");
+
+            let committed = error
+                .value(py)
+                .getattr("committed")
+                .unwrap()
+                .extract::<Vec<Py<SendMessagesConfirmation>>>()
+                .unwrap();
+            assert_eq!(committed.len(), 1);
+            assert_eq!(committed[0].borrow(py).inner.base_offset, 4);
+
+            let source = error.cause(py).unwrap();
+            assert!(source.is_instance_of::<PyRuntimeError>(py));
+            assert_eq!(
+                source.value(py).str().unwrap().to_str().unwrap(),
+                cause_message
+            );
+        });
     }
 
     #[test]
