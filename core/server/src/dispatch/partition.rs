@@ -2043,6 +2043,8 @@ mod tests {
         const TRANSPORT: u128 = 91;
         const SESSION: u64 = 1;
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+        // This test does not dispatch disk polls, so keep that lane minimal.
+        const POLL_COMPLETION_CAPACITY: usize = 1;
 
         let bus = SpyBus::default();
         let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
@@ -2076,7 +2078,7 @@ mod tests {
             vec![sender],
             inbox_rx,
             reply_inbox_rx,
-            1,
+            POLL_COMPLETION_CAPACITY,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,

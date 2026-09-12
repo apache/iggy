@@ -2205,6 +2205,10 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
+        // Direct owner tests can keep one disk poll outstanding. Tests needing
+        // concurrent reads construct a lane with their chosen capacity.
+        const POLL_COMPLETION_CAPACITY: usize = 1;
+
         // Placeholder lanes: the simulator delivers frames straight to
         // `on_message` (see the `shard_count` note below), so nothing ever
         // sends here and capacity 1 exists only to satisfy the fields. The
@@ -2237,7 +2241,10 @@ where
             shard_count: 1,
             inbox,
             reply_inbox,
-            poll_completions: poll::completion::PollCompletionLane::new(1, &metrics),
+            poll_completions: poll::completion::PollCompletionLane::new(
+                POLL_COMPLETION_CAPACITY,
+                &metrics,
+            ),
             shards_table,
             partition_consensus,
             metrics,

@@ -750,6 +750,9 @@ mod tests {
     /// Build a shard with its own inbox so tests can serve group progress reads
     /// and clears through the production message pump.
     fn partition_read_shard() -> Rc<TestShard> {
+        // These tests do not dispatch disk polls, so keep that lane minimal.
+        const POLL_COMPLETION_CAPACITY: usize = 1;
+
         let bus = SpyBus::default();
         let consensus = VsrConsensus::new(
             1,
@@ -789,7 +792,7 @@ mod tests {
                 vec![sender],
                 inbox,
                 replies,
-                1,
+                POLL_COMPLETION_CAPACITY,
                 PapayaShardsTable::new(),
                 PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus),
                 None,
