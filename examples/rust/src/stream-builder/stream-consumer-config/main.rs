@@ -55,7 +55,7 @@ async fn main() -> Result<(), IggyError> {
         .consumer_name("test_consumer".to_string())
         // The type of consumer. It can be either `Consumer` or `ConsumerGroup`. ConsumerGroup is default.
         .consumer_kind(ConsumerKind::ConsumerGroup)
-        // Topic creation count and ordinary consumer partition ID. Group assignment ignores it.
+        // Topic creation count. Ordinary consumers select a partition separately with partition_id.
         .partitions_count(1)
         // The polling interval for messages.
         .polling_interval(IggyDuration::from_str("5ms").unwrap())

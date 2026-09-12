@@ -233,15 +233,16 @@ public final class AsyncConsumer {
                             int messageCount = polled.messages().size();
 
                             if (messageCount > 0) {
-                                offset.set(polled.messages()
-                                        .get(messageCount - 1)
-                                        .header()
-                                        .offset()
-                                        .add(BigInteger.ONE));
-                                consumedBatches.incrementAndGet();
-
                                 return processMessages(polled, totalReceived, processingPool)
-                                        .thenRun(() -> emptyPolls.set(0));
+                                        .thenRun(() -> {
+                                            offset.set(polled.messages()
+                                                    .get(messageCount - 1)
+                                                    .header()
+                                                    .offset()
+                                                    .add(BigInteger.ONE));
+                                            consumedBatches.incrementAndGet();
+                                            emptyPolls.set(0);
+                                        });
                             } else {
                                 int empty = emptyPolls.incrementAndGet();
                                 if (empty >= MAX_EMPTY_POLLS) {

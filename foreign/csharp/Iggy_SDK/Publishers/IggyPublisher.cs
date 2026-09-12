@@ -32,7 +32,7 @@ namespace Apache.Iggy.Publishers;
 public partial class IggyPublisher : IAsyncDisposable
 {
     private readonly ILogger<IggyPublisher> _logger;
-    private bool _disposed;
+    private int _disposeState;
 
     /// <summary>
     ///     Gets the identifier of the stream this publisher sends messages to.
@@ -86,41 +86,45 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeState, 1) == 1)
         {
             return;
         }
 
         LogDisposingPublisher();
 
-        if (BackgroundProcessor != null)
+        try
         {
-            await BackgroundProcessor.DisposeAsync();
+            if (BackgroundProcessor != null)
+            {
+                await BackgroundProcessor.DisposeAsync();
+            }
         }
-
-        if (Config.CreateIggyClient)
+        finally
         {
-            try
+            if (Config.CreateIggyClient)
             {
                 try
                 {
-                    if (IsInitialized)
+                    try
                     {
-                        await Client.LogoutUserAsync();
+                        if (IsInitialized)
+                        {
+                            await Client.LogoutUserAsync();
+                        }
+                    }
+                    finally
+                    {
+                        Client.Dispose();
                     }
                 }
-                finally
+                catch (Exception e)
                 {
-                    Client.Dispose();
+                    LogFailedToLogoutOrDispose(e);
                 }
-            }
-            catch (Exception e)
-            {
-                LogFailedToLogoutOrDispose(e);
             }
         }
 
-        _disposed = true;
         LogPublisherDisposed();
     }
 

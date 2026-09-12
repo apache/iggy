@@ -208,7 +208,7 @@ Replay-safe operations can also be retried after a lost connection. Two cases su
   and raw binary requests are TCP-only and throw `FeatureUnavailableException` on HTTP.
 - `StoreOffsetAsync` / `DeleteOffsetAsync` need an explicit partition id under VSR: the broker does not
   resolve a `null` partition for a consumer-offset request, so passing one throws client-side.
-- No on-demand flush API is available; configure topic durability instead.
+- `FlushUnsavedBufferAsync` always throws `FeatureUnavailableException`; configure topic durability instead.
 - Polling a missing topic throws `IggyInvalidStatusCodeException`. An existing topic with no available
   messages returns an empty poll.
 

@@ -43,8 +43,8 @@ import org.apache.iggy.message.SendMessagesResponse;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Method;
 import java.math.BigInteger;
@@ -86,9 +86,10 @@ class ConsumerOffsetTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {0, 25})
-    void shouldConsumeRetainedMessagesOnceAsynchronously(int firstOffset) throws Exception {
+    @CsvSource({"0, false", "25, false", "0, true", "25, true"})
+    void shouldAdvanceAsynchronouslyOnlyAfterProcessing(int firstOffset, boolean failFirstProcessing) throws Exception {
         var retained = new RetainedMessages(firstOffset, MESSAGES_COUNT, false);
+        List<BigInteger> requestedOffsets = new ArrayList<>();
         var client = new AsyncIggyTcpClient("localhost", 8090) {
             @Override
             public org.apache.iggy.client.async.MessagesClient messages() {
@@ -102,6 +103,13 @@ class ConsumerOffsetTest {
                             PollingStrategy strategy,
                             Long count,
                             boolean autoCommit) {
+                        requestedOffsets.add(strategy.value());
+                        if (failFirstProcessing && requestedOffsets.size() == 1) {
+                            var message = retained.retained.get(0);
+                            var invalid = new Message(message.header(), null, message.userHeaders());
+                            return CompletableFuture.completedFuture(
+                                    new PolledMessages(0L, message.header().offset(), 1L, List.of(invalid)));
+                        }
                         return CompletableFuture.completedFuture(retained.pollMessages(
                                 streamId, topicId, partitionId, consumer, strategy, count, autoCommit));
                     }
@@ -122,6 +130,11 @@ class ConsumerOffsetTest {
             var completed = (CompletableFuture<?>) consume.invoke(null, client, processingPool);
             completed.get(10, TimeUnit.SECONDS);
             retained.assertConsumedOnce();
+            if (failFirstProcessing) {
+                assertThat(requestedOffsets)
+                        .as("processing failure must retry the same polling offset")
+                        .startsWith(BigInteger.ZERO, BigInteger.ZERO);
+            }
         } finally {
             processingPool.shutdownNow();
             assertThat(processingPool.awaitTermination(5, TimeUnit.SECONDS)).isTrue();

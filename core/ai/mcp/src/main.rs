@@ -77,9 +77,16 @@ async fn run() -> Result<(), McpRuntimeError> {
         .await
         .expect("Failed to load configuration");
 
-    let transport = config.transport;
-    log::init_logging(&config.telemetry, transport, VERSION);
+    let telemetry = log::init_logging(&config.telemetry, config.transport, VERSION);
+    let result = run_service(config).await;
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown().await;
+    }
+    result
+}
 
+async fn run_service(config: McpServerConfig) -> Result<(), McpRuntimeError> {
+    let transport = config.transport;
     info!("Starting Iggy MCP Server, transport: {transport}...");
 
     let consumer = if config.iggy.consumer.is_empty() {
@@ -139,25 +146,31 @@ async fn run() -> Result<(), McpRuntimeError> {
             systemd::notify_ready();
             #[cfg(feature = "systemd")]
             systemd::spawn_watchdog(watchdog_cancel.clone());
-            #[cfg(unix)]
             std::future::pending::<()>().await;
         }
         Ok::<(), McpRuntimeError>(())
     };
 
     #[cfg(unix)]
-    tokio::select! {
-        result = serve => result?,
+    let result = tokio::select! {
+        result = serve => result,
         _ = ctrl_c.recv() => {
             info!("Received SIGINT. Shutting down Iggy MCP Server...");
+            Ok(())
         },
         _ = sigterm.recv() => {
             info!("Received SIGTERM. Shutting down Iggy MCP Server...");
+            Ok(())
         }
-    }
+    };
 
     #[cfg(not(unix))]
-    serve.await?;
+    let result = tokio::select! {
+        result = serve => result,
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(McpRuntimeError::SignalRegistration)
+        }
+    };
 
     #[cfg(feature = "systemd")]
     {
@@ -165,7 +178,9 @@ async fn run() -> Result<(), McpRuntimeError> {
         systemd::notify_stopping();
     }
 
-    client_to_shutdown.shutdown().await?;
+    let shutdown_result = client_to_shutdown.shutdown().await;
+    result?;
+    shutdown_result?;
     info!("Iggy MCP Server stopped successfully");
     Ok(())
 }

@@ -24,6 +24,8 @@ use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
 
+const DEFAULT_PARTITION_ID: u32 = 0;
+
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
 pub struct IggyConsumerConfig {
@@ -48,9 +50,11 @@ pub struct IggyConsumerConfig {
     consumer_name: String,
     /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`. ConsumerGroup is default.
     consumer_kind: ConsumerKind,
-    /// Partition count when creating a topic and partition ID for an ordinary consumer.
-    /// Consumer-group assignment ignores this value.
+    /// Partition count when creating a topic.
     partitions_count: u32,
+    /// Partition ID for an ordinary consumer. Defaults to 0 and is ignored by consumer groups.
+    #[builder(default = DEFAULT_PARTITION_ID)]
+    partition_id: u32,
     /// The polling interval for messages.
     polling_interval: IggyDuration,
     /// `PollingStrategy` specifies from where to start polling messages. See `PollingStrategy` for details.
@@ -85,6 +89,7 @@ impl Default for IggyConsumerConfig {
             polling_interval: IggyDuration::from_str("5ms").unwrap(),
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
+            partition_id: DEFAULT_PARTITION_ID,
             encryptor: None,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: Some(5),
@@ -110,7 +115,7 @@ impl IggyConsumerConfig {
     /// * `consumer_kind` - The consumer kind.
     /// * `polling_interval` - The interval between polling for new messages.
     /// * `polling_strategy` - The polling strategy.
-    /// * `partitions_count` - Topic creation count and ordinary consumer partition ID.
+    /// * `partitions_count` - Topic creation count.
     /// * `encryptor` - The encryptor.
     /// * `polling_retry_interval` - The polling retry interval.
     /// * `init_retries` - The number of init retries.
@@ -119,6 +124,8 @@ impl IggyConsumerConfig {
     ///
     /// Returns:
     /// A new `IggyConsumerConfig`.
+    ///
+    /// Ordinary consumers use partition 0. Use [`Self::with_partition_id`] to select another partition.
     ///
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -154,6 +161,7 @@ impl IggyConsumerConfig {
             polling_interval,
             polling_strategy,
             partitions_count,
+            partition_id: DEFAULT_PARTITION_ID,
             encryptor,
             polling_retry_interval,
             init_retries,
@@ -196,6 +204,7 @@ impl IggyConsumerConfig {
             polling_interval,
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
+            partition_id: DEFAULT_PARTITION_ID,
             encryptor: None,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: Some(5),
@@ -205,6 +214,12 @@ impl IggyConsumerConfig {
 }
 
 impl IggyConsumerConfig {
+    /// Selects the partition for an ordinary consumer. Consumer groups ignore this setting.
+    pub fn with_partition_id(mut self, partition_id: u32) -> Self {
+        self.partition_id = partition_id;
+        self
+    }
+
     pub fn stream_id(&self) -> &Identifier {
         &self.stream_id
     }
@@ -254,6 +269,10 @@ impl IggyConsumerConfig {
 
     pub fn partitions_count(&self) -> u32 {
         self.partitions_count
+    }
+
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
     }
 
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {

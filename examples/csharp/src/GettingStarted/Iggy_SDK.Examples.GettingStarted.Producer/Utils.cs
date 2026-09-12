@@ -19,7 +19,6 @@ using System.Net;
 using System.Text;
 using Apache.Iggy;
 using Apache.Iggy.Contracts;
-using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Iggy_SDK.Examples.Shared;

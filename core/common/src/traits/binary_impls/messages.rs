@@ -127,8 +127,7 @@ async fn topic_partition_count<B: BinaryClient>(
     Ok(details.partitions_count)
 }
 
-/// Resolve `Balanced` / `MessagesKey` to an explicit `PartitionId` client-side
-/// (the VSR broker only routes explicit partitions, matching Kafka).
+/// Resolve `Balanced` / `MessagesKey` locally using the SDK's partition cache and cursor.
 async fn resolve_partitioning<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,

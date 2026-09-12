@@ -297,6 +297,55 @@ public class IggyTypedPublisherTests
             ownsClient && initialized ? Times.Once() : Times.Never());
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DisposeAsync_ConcurrentCalls_Should_DisposeOwnedClientOnce(bool logoutFails)
+    {
+        var logout = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = Mock.Get(BuildClient(new SendRecorder()));
+        client.Setup(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()))
+            .Returns(logout.Task);
+        var config = Config();
+        config.CreateIggyClient = true;
+        var publisher = await CreatePublisherAsync(client.Object, config);
+
+        var first = publisher.DisposeAsync().AsTask();
+        var second = publisher.DisposeAsync().AsTask();
+        if (logoutFails)
+        {
+            logout.SetException(new IOException("Connection lost during logout."));
+        }
+        else
+        {
+            logout.SetResult();
+        }
+
+        await Task.WhenAll(first, second).WaitAsync(Ct);
+
+        client.Verify(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()), Times.Once());
+        client.Verify(value => value.Dispose(), Times.Once());
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WhenBackgroundCleanupFails_Should_DisposeOwnedClient()
+    {
+        var client = Mock.Get(BuildClient(new SendRecorder()));
+        client.Setup(value => value.UnsubscribeConnectionEvents(
+                It.IsAny<Func<ConnectionStateChangedEventArgs, Task>>()))
+            .Throws(new IOException("Connection cleanup failed."));
+        var config = Config(true);
+        config.CreateIggyClient = true;
+        var publisher = new IggyPublisher<string>(client.Object, config,
+            NullLogger<IggyPublisher<string>>.Instance);
+
+        await Assert.ThrowsAsync<IOException>(() => publisher.DisposeAsync().AsTask());
+        await publisher.DisposeAsync();
+
+        client.Verify(value => value.Dispose(), Times.Once());
+        client.Verify(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()), Times.Never());
+    }
+
     private static string Decode(SentMessage message)
     {
         return Encoding.UTF8.GetString(message.Payload);

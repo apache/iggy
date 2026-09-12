@@ -23,9 +23,9 @@ use assert_cmd::prelude::CommandCargoExt;
 
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerOffsetInfo, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
-    RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo,
-    UserInfoDetails,
+    ConsumerOffsetInfo, IggyMessage, MessageClient, Partitioning, PersonalAccessTokenExpiry,
+    PersonalAccessTokenInfo, PolledMessages, RawPersonalAccessToken, Snapshot, Stats, Stream,
+    StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails,
 };
 use integration::{
     harness::{McpClient, McpConfig, TestHarness, seeds},
@@ -336,17 +336,34 @@ async fn should_poll_messages(harness: &TestHarness) {
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
 async fn should_send_messages(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
-    invoke_empty(
+    for partitioning in [None, Some("partition")] {
+        invoke_empty(
+            &mcp_client,
+            "send_messages",
+            Some(json!({
+                "stream_id": seeds::names::STREAM,
+                "topic_id": seeds::names::TOPIC,
+                "partitioning": partitioning,
+                "messages": [{"payload": "test"}]
+            })),
+        )
+        .await;
+    }
+    let messages: PolledMessages = invoke(
         &mcp_client,
-        "send_messages",
+        "poll_messages",
         Some(json!({
             "stream_id": seeds::names::STREAM,
             "topic_id": seeds::names::TOPIC,
             "partition_id": 0,
-            "messages": [{"payload": "test"}]
+            "offset": 1
         })),
     )
     .await;
+    assert_eq!(messages.messages.len(), 2);
+    for message in messages.messages {
+        assert_eq!(message.payload_as_string().expect("UTF-8 payload"), "test");
+    }
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
@@ -676,7 +693,21 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
         .build()
         .expect("Failed to build read-only MCP harness");
     harness
-        .start_with_seed(|client| async move { seeds::mcp_standard(&client).await })
+        .start_with_seed(|client| async move {
+            seeds::mcp_standard(&client).await?;
+            let mut messages = [IggyMessage::builder()
+                .payload(seeds::names::MESSAGE_PAYLOAD.into())
+                .build()?];
+            client
+                .send_messages(
+                    &seeds::names::STREAM.try_into()?,
+                    &seeds::names::TOPIC.try_into()?,
+                    &Partitioning::partition_id(0),
+                    &mut messages,
+                )
+                .await?;
+            Ok(())
+        })
         .await
         .expect("Failed to start read-only MCP harness");
     let client = harness.mcp_client().await.expect("MCP client required");
@@ -686,10 +717,10 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
         "partition_id": 0,
     });
     let messages: PolledMessages = invoke(&client, "poll_messages", Some(partition.clone())).await;
-    assert_eq!(messages.messages.len(), 1, "Read-only polling must work");
+    assert_eq!(messages.messages.len(), 2, "Read-only polling must work");
 
     let mut store = partition.clone();
-    store["offset"] = json!(0);
+    store["offset"] = json!(1);
     let mut auto_commit = partition.clone();
     auto_commit["auto_commit"] = json!(true);
     let mut next = partition.clone();
@@ -714,10 +745,12 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
         let params = CallToolRequestParams::new(method.to_owned())
             .with_arguments(arguments.as_object_mut().expect("Tool arguments").clone());
         let result = client.call_tool(params).await;
-        if !matches!(result, Err(ServiceError::McpError(error))
+        if !matches!(&result, Err(ServiceError::McpError(error))
             if error.message == format!("Insufficient '{permission}' permissions"))
         {
-            unexpected.push(method);
+            unexpected.push(format!(
+                "{method} ({arguments}), required {permission}: {result:?}"
+            ));
         }
     }
     assert!(

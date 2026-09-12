@@ -83,6 +83,19 @@ Set `command` to the absolute path of the built executable. This Claude Desktop 
 
 ![MCP](../../../assets/iggy_mcp_server.png)
 
+## Tool permissions
+
+Each tool checks these MCP permissions before forwarding the request. The broker also enforces the authenticated Iggy account's permissions.
+
+| Permission | Tools |
+| --- | --- |
+| `read` | `ping`, `get_cluster_metadata`, `get_stream`, `get_streams`, `get_topic`, `get_topics`, `poll_messages`, `get_stats`, `get_me`, `get_client`, `get_clients`, `snapshot`, `get_consumer_group`, `get_consumer_groups`, `get_consumer_offset`, `get_personal_access_tokens`, `get_user`, `get_users` |
+| `create` | `create_stream`, `create_topic`, `create_partitions`, `send_messages`, `create_consumer_group`, `create_personal_access_token`, `create_user` |
+| `update` | `update_stream`, `update_topic`, `store_consumer_offset`, `update_user`, `update_permissions`, `change_password` |
+| `delete` | `delete_stream`, `purge_stream`, `delete_topic`, `purge_topic`, `delete_partitions`, `delete_segments`, `delete_consumer_group`, `delete_consumer_offset`, `delete_personal_access_token`, `delete_user` |
+
+`poll_messages` additionally requires `update` when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false. For read-only polling, use `offset`, `first`, `last`, or `timestamp` with auto-commit disabled.
+
 ## Systemd integration
 
 Build with the `systemd` feature to enable systemd readiness and watchdog notifications:
@@ -112,3 +125,5 @@ endpoint = "http://localhost:4317"
 ```
 
 For HTTP export, set `transport = "http"` and use complete signal URLs: `http://localhost:4318/v1/logs` for logs and `http://localhost:4318/v1/traces` for traces. The MCP server does not append those paths.
+
+Shutdown flushes pending logs and spans before stopping the async runtime.
