@@ -27,8 +27,6 @@ import (
 	"time"
 
 	"github.com/apache/iggy/bdd/go/tests/env"
-	"github.com/apache/iggy/foreign/go/client"
-	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/cucumber/godog"
@@ -64,21 +62,6 @@ type leaderSteps struct{}
 
 func getLeaderContext(ctx context.Context) *leaderCtx {
 	return ctx.Value(leaderCtxKey{}).(*leaderCtx)
-}
-
-func createAndConnectClient(ctx context.Context, addr string) (iggcon.Client, error) {
-	cli, err := client.NewIggyClient(
-		client.WithTcp(
-			tcp.WithServerAddress(addr),
-		),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if err = cli.Connect(ctx); err != nil {
-		return nil, err
-	}
-	return cli, nil
 }
 
 func resolveServerAddress(role string, port uint16) string {
@@ -235,7 +218,7 @@ func (s leaderSteps) whenCreateClientToRole(ctx context.Context, role string, _ 
 		return fmt.Errorf("%s server should be configured", role)
 	}
 
-	cli, err := createAndConnectClient(ctx, addr)
+	cli, err := connectToServer(ctx, addr)
 	if err != nil {
 		return err
 	}
@@ -258,7 +241,7 @@ func (s leaderSteps) whenCreateClientDirectToLeader(ctx context.Context, port ui
 		return fmt.Errorf("leader should be on port %d, but address is %s", port, addr)
 	}
 	var err error
-	c.Clients["main"], err = createAndConnectClient(ctx, addr)
+	c.Clients["main"], err = connectToServer(ctx, addr)
 	if err != nil {
 		return err
 	}
@@ -275,7 +258,7 @@ func (s leaderSteps) whenCreateClientToPort(ctx context.Context, port uint16) er
 		return fmt.Errorf("server on port %d should be configured", port)
 	}
 	var err error
-	c.Clients["main"], err = createAndConnectClient(ctx, addr)
+	c.Clients["main"], err = connectToServer(ctx, addr)
 	if err != nil {
 		return err
 	}
@@ -290,7 +273,7 @@ func (s leaderSteps) whenCreateNamedClient(ctx context.Context, name string, por
 		return fmt.Errorf("server on port %d should be configured", port)
 	}
 	var err error
-	c.Clients[name], err = createAndConnectClient(ctx, addr)
+	c.Clients[name], err = connectToServer(ctx, addr)
 	if err != nil {
 		return err
 	}
