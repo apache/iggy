@@ -97,6 +97,79 @@ async fn state_save_failure_preserves_state_and_source_recovers(harness: &TestHa
     random_source_liveness::assert_produces_messages(harness).await;
 }
 
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/random/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn sources_running_does_not_climb_across_restarts(harness: &TestHarness) {
+    // The gauge counts running instances, and a restart takes one down before
+    // bringing one up, so one configured source stays at one however often it
+    // is restarted. It used to be reported by two mechanisms and taken back by
+    // one.
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+
+    wait_for_sources_running(&http, &api_url, 1).await;
+
+    for round in 1..=3 {
+        let response = http
+            .post(format!("{api_url}/sources/{SOURCE_KEY}/restart"))
+            .header("api-key", API_KEY)
+            .send()
+            .await
+            .expect("restart request should be sent");
+        assert_eq!(
+            response.status().as_u16(),
+            204,
+            "restart {round} should be accepted"
+        );
+
+        wait_for_sources_running(&http, &api_url, 1).await;
+    }
+
+    // Read it once more after the gauge has settled. A report that lands after
+    // the poll above would otherwise go unseen.
+    sleep(STATE_STABILITY_WINDOW).await;
+    assert_eq!(
+        sources_running(&http, &api_url).await,
+        1,
+        "one running source must stay counted once, whatever it took to restart it"
+    );
+}
+
+async fn sources_running(http: &Client, api_url: &str) -> u32 {
+    http.get(format!("{api_url}/stats"))
+        .header("api-key", API_KEY)
+        .send()
+        .await
+        .expect("runtime stats should be available")
+        .json::<ConnectorRuntimeStats>()
+        .await
+        .expect("runtime stats should be valid")
+        .sources_running
+}
+
+async fn wait_for_sources_running(http: &Client, api_url: &str, expected: u32) {
+    let observed = timeout(WAIT_TIMEOUT, async {
+        loop {
+            let running = sources_running(http, api_url).await;
+            if running == expected {
+                return running;
+            }
+            sleep(RETRY_INTERVAL).await;
+        }
+    })
+    .await;
+    assert!(
+        observed.is_ok(),
+        "sources_running never reached {expected}; last read {}",
+        sources_running(http, api_url).await
+    );
+}
+
 async fn wait_for_state_file(state_path: &Path) {
     timeout(Duration::from_secs(5), async {
         while !state_path.exists() {

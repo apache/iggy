@@ -82,28 +82,23 @@ impl SourceManager {
         metrics: Option<&Arc<Metrics>>,
     ) {
         if let Some(source) = self.sources.get(key) {
-            let mut source = source.lock().await;
-            let old_status = source.info.status;
-            source.info.status = status;
-            if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
-                source.info.last_error = None;
-            }
-            if let Some(metrics) = metrics {
-                if old_status != ConnectorStatus::Running && status == ConnectorStatus::Running {
-                    metrics.increment_sources_running();
-                } else if old_status == ConnectorStatus::Running
-                    && status != ConnectorStatus::Running
-                {
-                    metrics.decrement_sources_running();
-                }
-            }
+            source.lock().await.apply_status(status, metrics);
         }
     }
 
-    pub async fn set_error(&self, key: &str, error_message: &str) {
+    pub async fn set_error(&self, key: &str, error_message: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(source) = self.sources.get(key) {
             let mut source = source.lock().await;
-            source.info.status = ConnectorStatus::Error;
+            // Through the shared transition, so leaving `Running` moves the
+            // gauge. Skipping it left an errored instance counted as running,
+            // and the loop's later `Stopped` could not correct that either,
+            // because by then the old status was `Error` and neither branch
+            // fires.
+            //
+            // The message is assigned after the transition, and that ordering is
+            // what preserves it. `Error` being outside the set that clears
+            // `last_error` is belt and braces here, not the mechanism.
+            source.apply_status(ConnectorStatus::Error, metrics);
             source.info.last_error = Some(ConnectorError::new(error_message));
         }
     }
@@ -236,35 +231,60 @@ impl SourceManager {
             state,
         )?;
         info!("Source connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
+        // Armed from here until the id is recorded below. `SourceInstanceGuard`
+        // carries why that window strands the instance.
+        let instance_guard =
+            source::SourceInstanceGuard::for_container(container.clone(), plugin_id, key);
 
         let (producer, encoder, transforms) =
-            source::setup_source_producer(key, config, iggy_client).await?;
+            match source::setup_source_producer(key, config, iggy_client).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    // Closed here rather than left to `drop` so this error
+                    // reaches the caller after teardown, not alongside it.
+                    // `drop` stays the net for a cancellation, and for any `?`
+                    // added inside this window later.
+                    instance_guard.close().await;
+                    return Err(error);
+                }
+            };
 
         let handle_callback = container.iggy_source_handle_v2;
         let batch_result_callback = container.iggy_source_batch_result;
-        let handler_tasks = source::spawn_source_handler(
-            plugin_id,
-            key,
-            config.verbose,
-            config.benchmark,
-            producer,
-            encoder,
-            transforms,
-            state_storage,
-            handle_callback,
-            batch_result_callback,
-            context.clone(),
-        );
 
+        // The lock is taken before the spawn so nothing can await between
+        // registering the tasks and recording the id that reaches them. A
+        // cancellation in that gap left the `SOURCE_SENDERS` entry and both
+        // spawned tasks behind with no id naming them, and the forwarding loop
+        // then ran for the life of the process. The guard closes the plugin
+        // instance on that path but cannot reach either of those.
+        //
+        // The forwarding loop's own first act is to take this lock, so it waits
+        // for this block to end rather than racing it.
         {
             let mut details = details.lock().await;
-            details.info.id = plugin_id;
-            details.info.status = ConnectorStatus::Running;
-            details.info.last_error = None;
-            details.config = config.clone();
-            details.handler_tasks = handler_tasks;
-            metrics.increment_sources_running();
+            details.record_started(plugin_id, config, || {
+                source::spawn_source_handler(
+                    plugin_id,
+                    key,
+                    config.verbose,
+                    config.benchmark,
+                    producer,
+                    encoder,
+                    transforms,
+                    state_storage,
+                    handle_callback,
+                    batch_result_callback,
+                    context.clone(),
+                )
+            });
+            // In the same hold as the id record, not after it. Released first,
+            // this transition raced the forwarding loop's own report and could
+            // overwrite an `Error` the loop had already set.
+            details.apply_status(ConnectorStatus::Running, Some(metrics));
         }
+        // `details.info.id` now names this instance, so a later stop reaches it.
+        instance_guard.disarm();
 
         Ok(())
     }
@@ -326,6 +346,55 @@ pub struct SourceDetails {
     pub handler_tasks: Vec<JoinHandle<()>>,
     pub container: Option<Arc<Container<SourceApi>>>,
     pub restart_guard: Arc<Mutex<()>>,
+}
+
+impl SourceDetails {
+    /// Applies a status transition and the gauge move that belongs with it.
+    ///
+    /// On `&mut self` rather than behind a key, so it can run inside a lock the
+    /// caller already holds. `update_status` takes the lock and delegates;
+    /// `start_connector` calls it in the same hold as the id record.
+    ///
+    /// That matters: applied after releasing that lock, the initial `Running`
+    /// could land after the forwarding loop had already reported `Running` and
+    /// then failed its first batch, overwriting `Error`, clearing `last_error`,
+    /// and counting the instance a second time.
+    fn apply_status(&mut self, status: ConnectorStatus, metrics: Option<&Arc<Metrics>>) {
+        let old_status = self.info.status;
+        self.info.status = status;
+        if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
+            self.info.last_error = None;
+        }
+        let Some(metrics) = metrics else {
+            return;
+        };
+        // Only a real crossing of `Running` moves the gauge, so repeated
+        // reports of a status the connector already holds cost nothing.
+        if old_status != ConnectorStatus::Running && status == ConnectorStatus::Running {
+            metrics.increment_sources_running();
+        } else if old_status == ConnectorStatus::Running && status != ConnectorStatus::Running {
+            metrics.decrement_sources_running();
+        }
+    }
+
+    /// Records an instance that has just started, spawning its handlers in the
+    /// same breath.
+    ///
+    /// Deliberately not `async`, and that is the point. The id has to be
+    /// recorded under the same lock hold as the spawn: a cancellation between
+    /// the two strands the `SOURCE_SENDERS` entry and both tasks with nothing
+    /// naming them, which no guard can reach. Taking `spawn` as a closure is
+    /// what lets the compiler refuse an await added between them.
+    fn record_started(
+        &mut self,
+        plugin_id: u32,
+        config: &SourceConfig,
+        spawn: impl FnOnce() -> Vec<JoinHandle<()>>,
+    ) {
+        self.handler_tasks = spawn();
+        self.info.id = plugin_id;
+        self.config = config.clone();
+    }
 }
 
 impl fmt::Debug for SourceDetails {
@@ -464,6 +533,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_started_should_store_the_id_and_the_spawned_tasks() {
+        // Both have to land under one lock hold, so they are recorded together
+        // and there is nowhere to await between them. A stop reaches the
+        // instance through the id and drains it through the tasks, so losing
+        // either leaves something behind.
+        let mut details = create_test_source_details("pg", 1);
+        let config = details.config.clone();
+
+        details.record_started(7, &config, || vec![tokio::spawn(async {})]);
+
+        assert_eq!(
+            details.info.id, 7,
+            "a later stop closes whatever id this recorded"
+        );
+        assert_eq!(
+            details.handler_tasks.len(),
+            1,
+            "a stop drains the tasks recorded here, so they cannot be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_double_count_when_an_error_falls_between_two_running_reports() {
+        // The interleaving spetz measured on #4064: the forwarding loop reports
+        // `Running`, fails its first batch, and a second `Running` report lands
+        // afterwards. That second report crosses into `Running` again, so it
+        // increments a gauge the error never gave back, and the instance is
+        // counted twice.
+        //
+        // What the consecutive-`Running` test cannot see: there the second
+        // report finds the status already `Running`, so no crossing happens and
+        // no arithmetic is exercised. The error in the middle is the whole point.
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .set_error("pg", "first batch failed", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            0,
+            "an instance that has failed is not running, and the gauge has to say so \
+             or nothing later can correct it"
+        );
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "one instance, however many times its status crossed Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_error_message_when_the_status_becomes_error() {
+        // `set_error` routes through a transition that clears `last_error` for
+        // some statuses, so its observable contract is worth pinning: the
+        // status ends `Error` and the message survives.
+        //
+        // Worth knowing what this does NOT pin. The message is assigned after
+        // the transition, so widening the clear to include `Error` leaves this
+        // green; checked, and the mutant survives. The ordering is the
+        // mechanism, and no unit test can see an ordering inside one lock hold.
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        manager
+            .set_error("pg", "producer setup failed", Some(&metrics))
+            .await;
+
+        let source = manager.get("pg").await.expect("source must exist");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert_eq!(
+            source
+                .info
+                .last_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("producer setup failed"),
+            "the transition must not clear the message set right after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_increment_metrics_once_when_running_is_reported_twice() {
+        // Both a start and the forwarding loop report `Running` for the same
+        // instance, so the gauge has to count instances rather than reports.
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "a second report of a status the connector already has must not move the gauge"
+        );
+    }
+
+    #[tokio::test]
     async fn should_decrement_metrics_when_leaving_running() {
         let metrics = Arc::new(Metrics::init());
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
@@ -479,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_running() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Running, None)
@@ -494,7 +679,7 @@ mod tests {
     async fn should_set_error_status_and_message() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
 
-        manager.set_error("pg", "connection failed").await;
+        manager.set_error("pg", "connection failed", None).await;
 
         let source = manager.get("pg").await.unwrap();
         let details = source.lock().await;
@@ -557,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_stopped() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Stopped, None)
@@ -609,6 +794,6 @@ mod tests {
     async fn set_error_should_be_noop_for_unknown_key() {
         let manager = SourceManager::new(vec![]);
 
-        manager.set_error("nonexistent", "some error").await;
+        manager.set_error("nonexistent", "some error", None).await;
     }
 }

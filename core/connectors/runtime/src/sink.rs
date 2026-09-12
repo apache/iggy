@@ -22,7 +22,8 @@ use crate::log::LOG_CALLBACK;
 use crate::metrics::{Metrics, SinkLabels};
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer,
-    SinkConnectorPlugin, SinkConnectorWrapper, resolve_plugin_path, transform,
+    SinkConnectorPlugin, SinkConnectorWrapper, close_plugin_instance, resolve_plugin_path,
+    transform,
 };
 use dlopen2::wrapper::Container;
 use futures::StreamExt;
@@ -182,12 +183,8 @@ pub async fn init(
                 let connector = sink_connectors
                     .get_mut(&path)
                     .expect("sink connector was inserted above");
-                let close_result = (connector.container.iggy_sink_close)(plugin_id);
-                if close_result != 0 {
-                    warn!(
-                        "iggy_sink_close returned {close_result} while cleaning up failed sink connector with ID: {plugin_id} ({key})"
-                    );
-                }
+                let close = connector.container.iggy_sink_close;
+                close_plugin_instance(&|id| close(id), "sink", plugin_id, &key);
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()
