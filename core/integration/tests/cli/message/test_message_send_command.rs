@@ -22,11 +22,11 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::*;
-use integration::iggy_harness;
 use predicates::str::{contains, diff};
 use serial_test::parallel;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
+use std::time::Duration;
 use twox_hash::XxHash32;
 
 #[derive(Debug)]
@@ -464,22 +464,24 @@ Options:
         .await;
 }
 
-#[iggy_harness]
-async fn given_invalid_message_key_when_sending_should_return_error_without_panicking(
-    harness: &TestHarness,
-) {
-    let server_address = harness.server().raw_tcp_addr().unwrap();
+#[test]
+#[parallel]
+fn given_invalid_message_key_when_sending_should_reject_before_connecting() {
+    const UNREACHABLE_SERVER_ADDRESS: &str = "127.0.0.1:0";
+    const ARGUMENT_PARSE_TIMEOUT: Duration = Duration::from_secs(5);
+
     let cli_home = tempfile::tempdir().unwrap();
     let oversized_key = "x".repeat(usize::from(u8::MAX) + 1);
+    let oversized_unicode_key = "é".repeat(usize::from(u8::MAX) / "é".len() + 1);
 
-    for key in ["", oversized_key.as_str()] {
+    for key in ["", oversized_key.as_str(), oversized_unicode_key.as_str()] {
         #[allow(deprecated)]
         let mut command = assert_cmd::Command::cargo_bin("iggy").unwrap();
         command
             .env("IGGY_HOME", cli_home.path())
             .args([
                 "--tcp-server-address",
-                &server_address,
+                UNREACHABLE_SERVER_ADDRESS,
                 "-u",
                 DEFAULT_ROOT_USERNAME,
                 "-p",
@@ -492,8 +494,10 @@ async fn given_invalid_message_key_when_sending_should_return_error_without_pani
                 "topic",
                 "payload",
             ])
+            .timeout(ARGUMENT_PARSE_TIMEOUT)
             .assert()
-            .code(1)
+            .code(2)
+            .stderr(contains("--message-key <MESSAGE_KEY>"))
             .stderr(contains("Invalid command"));
     }
 }

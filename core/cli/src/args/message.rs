@@ -83,7 +83,7 @@ pub(crate) struct SendMessagesArgs {
     ///
     /// The key must contain 1 to 255 bytes. Binary clients resolve the partition ID; HTTP resolves it on the server.
     #[clap(verbatim_doc_comment)]
-    #[clap(short, long, group = "partitioning")]
+    #[clap(short, long, value_parser = parse_message_key, group = "partitioning")]
     pub(crate) message_key: Option<String>,
     /// Messages to be sent
     ///
@@ -114,6 +114,10 @@ pub(crate) struct SendMessagesArgs {
     #[clap(verbatim_doc_comment)]
     #[clap(long, value_parser = NonEmptyStringValueParser::new(), group = "input_messages")]
     pub(crate) input_file: Option<String>,
+}
+
+fn parse_message_key(value: &str) -> Result<String, IggyError> {
+    Partitioning::messages_key_str(value).map(|_| value.to_owned())
 }
 
 /// Parse Header Key, Kind and Value from the string separated by a ':'
@@ -288,7 +292,35 @@ pub(crate) struct FlushMessagesArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::{Command, IggyConsoleArgs};
+    use clap::Parser;
     use std::str::FromStr;
+
+    #[test]
+    fn given_valid_message_key_when_sending_should_preserve_key_bytes() {
+        let max_key_bytes = usize::from(u8::MAX);
+        for key in [
+            "x".to_owned(),
+            "x".repeat(max_key_bytes),
+            format!("{}x", "é".repeat(max_key_bytes / "é".len())),
+        ] {
+            let parsed = IggyConsoleArgs::try_parse_from([
+                "iggy",
+                "message",
+                "send",
+                "--message-key",
+                &key,
+                "stream",
+                "topic",
+                "payload",
+            ])
+            .unwrap();
+            let Some(Command::Message(MessageAction::Send(args))) = parsed.command else {
+                panic!("Expected the message send command");
+            };
+            assert_eq!(args.message_key.as_deref(), Some(key.as_str()));
+        }
+    }
 
     #[test]
     fn parse_key_val_should_parse_string() {
