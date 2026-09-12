@@ -311,7 +311,7 @@ class AutoLogin:
 @typing.final
 class BackgroundProducerConfig:
     r"""
-    Immutable configuration for the future background producer mode.
+    Immutable configuration for a producer that queues sends on background workers.
 
     For detailed background-producer semantics, see
     https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
@@ -377,7 +377,7 @@ class BackgroundProducerConfig:
         sharding: ProducerSharding = ...,
     ) -> BackgroundProducerConfig:
         r"""
-        Constructs the stable configuration surface for background mode.
+        Constructs background batching, capacity, backpressure, and sharding configuration.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -1820,6 +1820,12 @@ class IggyClient:
 
         This is a Python port of the Rust high-level producer API. For detailed
         producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+        `None` selects direct mode. `BackgroundProducerConfig` starts background
+        workers and makes successful sends mean queue acceptance rather than a
+        server commit. The returned producer is ready to send.
+
+        Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
+        when stream/topic initialization fails.
         """
     def poll_messages(
         self,
@@ -2021,24 +2027,33 @@ class IggyProducer:
 
     For detailed producer semantics, see
     https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+
+    Direct sends complete after the server responds and contain commit confirmations.
+    Background sends complete once accepted by a worker and contain no confirmations.
+    Always use the async context manager or call `shutdown()` explicitly; dropping a
+    background producer can lose accepted buffered messages.
     """
     def send(
         self, messages: list[SendMessage]
     ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends a batch to the producer's bound stream and topic.
+        In background mode, success means accepted into the dispatcher and the
+        returned confirmation list is empty.
         """
     def send_one(
         self, message: SendMessage
     ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends one message to the producer's bound stream and topic.
+        It has the same mode-dependent completion semantics as `send()`.
         """
     def send_with_partitioning(
         self, messages: list[SendMessage], partitioning: Partitioning | None = None
     ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends a batch with an optional per-call partitioning override.
+        It has the same mode-dependent completion semantics as `send()`.
         """
     def send_to(
         self,
@@ -2049,10 +2064,13 @@ class IggyProducer:
     ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends a batch to another existing stream and topic.
+        It has the same mode-dependent completion semantics as `send()` and does
+        not create the alternate destination.
         """
     def shutdown(self) -> collections.abc.Awaitable[None]:
         r"""
         Waits for active sends and closes the producer. Repeated calls are safe.
+        Background shutdown flushes every accepted buffered message before returning.
         """
     def __aenter__(self) -> collections.abc.Awaitable[IggyProducer]: ...
     def __aexit__(

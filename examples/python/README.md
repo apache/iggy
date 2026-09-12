@@ -54,16 +54,26 @@ deterministically through an async context manager. The high-level consumer
 joins a consumer group, polls all assigned partitions, invokes an async handler,
 and commits each message after it has been handled.
 
-Run the producer first. It creates the stream and topic and publishes 12
-messages for the consumer, which exits after receiving all of them:
+Run either producer first. Both create the stream and topic and publish 12
+messages for the consumer, which exits after receiving all of them. `producer.py`
+uses direct mode and waits for server confirmations; `background_producer.py`
+uses bounded background workers and flushes them on context-manager exit:
 
 ```bash
 # Using uv
 uv run high-level/producer.py
 uv run high-level/consumer.py
 
+# Or use the background producer before starting the same consumer
+uv run high-level/background_producer.py
+uv run high-level/consumer.py
+
 # Without using uv
 python high-level/producer.py
+python high-level/consumer.py
+
+# Or use the background producer before starting the same consumer
+python high-level/background_producer.py
 python high-level/consumer.py
 ```
 

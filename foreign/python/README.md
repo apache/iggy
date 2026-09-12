@@ -216,6 +216,9 @@ destination before returning. By default, it creates a missing stream and topic,
 uses balanced partitioning, sends directly in batches of up to 1,000 messages,
 and retries failed sends up to three times with a one-second retry interval.
 
+The default mode is direct. Pass `BackgroundProducerConfig` to queue sends on
+background workers instead.
+
 ```python
 import asyncio
 from datetime import timedelta
@@ -280,14 +283,81 @@ contains the remaining unconfirmed messages. If encryption is enabled, the
 failed messages contain encrypted payloads. Restore the original payloads
 before submitting them to the same producer again.
 
+### Background Mode
+
+A successful background send means the dispatcher accepted the messages. The
+worker writes them later, so all four send methods return a
+`SendMessagesResponse` with an empty `confirmations` list. It does not mean the
+server has committed the messages.
+
+```python
+from datetime import timedelta
+
+from apache_iggy import (
+    BackgroundProducerConfig,
+    BackpressureMode,
+    ProducerSharding,
+    SendMessage,
+)
+
+producer = await client.producer(
+    "orders",
+    "created",
+    mode=BackgroundProducerConfig(
+        num_shards=4,
+        linger_time=timedelta(milliseconds=10),
+        batch_size=1024 * 1024,
+        batch_length=100,
+        max_buffer_size=32 * 1024 * 1024,
+        failure_mode=BackpressureMode.block_with_timeout(
+            timedelta(seconds=1)
+        ),
+        max_in_flight=4,
+        sharding=ProducerSharding.ORDERED,
+    ),
+)
+
+async with producer:
+    accepted = await producer.send_one(SendMessage("order-1"))
+    assert accepted.confirmations == []
+```
+
+Each shard flushes when any configured condition is met: `batch_length` queued
+send calls, `batch_size` reported bytes, or `linger_time` since the first send
+entered an empty buffer. `batch_length` counts calls, not individual messages.
+Zero disables either batching threshold, while a zero linger flushes as soon as
+the worker receives a send.
+
+`ProducerSharding.ORDERED` hashes the stream/topic destination so its sends use
+one sequential worker and retain dispatch order. `ProducerSharding.BALANCED`
+assigns consecutive sends round-robin across the shards for throughput; ordering
+for one destination is not guaranteed.
+
+`max_buffer_size` bounds bytes queued or in flight across the whole producer.
+When it is full, `BackpressureMode.block()` waits indefinitely,
+`block_with_timeout(duration)` waits up to that duration, and
+`fail_immediately()` raises `RuntimeError` without accepting the batch. A single
+batch larger than the whole budget always fails. A zero byte budget is
+unlimited. `max_in_flight` separately bounds concurrent write requests across
+all shards; zero uses the runtime maximum.
+
+Producer retries and transport reconnection happen inside background workers.
+The Python API does not currently expose a background error callback, so a write
+that still fails after its retries is logged by the Rust SDK and its unconfirmed
+messages are dropped.
+
+See the complete runnable
+[`background_producer.py`](../../examples/python/high-level/background_producer.py)
+example for all background configuration fields and deterministic shutdown.
+
 Cleanup is asynchronous and must be explicit. Prefer `async with`, as above, so
 shutdown runs on both successful and exceptional exits. Otherwise, call
 `await producer.shutdown()` in a `finally` block. Shutdown waits for active
 sends, is safe to call more than once, and rejects later sends with
-`RuntimeError`. Object destruction does not perform asynchronous cleanup.
-
-Only direct mode is implemented currently. Passing `BackgroundProducerConfig`
-to `producer()` raises `NotImplementedError`.
+`RuntimeError`. In background mode it also drains every queue and flushes all
+accepted messages before returning. Object destruction does not perform
+asynchronous cleanup; dropping a background producer without `shutdown()` can
+lose buffered messages.
 
 ## Examples
 
