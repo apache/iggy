@@ -82,7 +82,7 @@ for gate in "${GATES[@]}"; do
     node) paths=(foreign/node) ;;
     # The go job also runs the bdd/go suite with foreign/go in -coverpkg.
     go) paths=(foreign/go bdd/go) ;;
-    cpp) paths=(foreign/cpp bdd/cpp) ;;
+    cpp) paths=(foreign/cpp) ;;
     *)
       echo "coverage-gate: no pathspecs defined for gate '$gate'" >&2
       exit 1

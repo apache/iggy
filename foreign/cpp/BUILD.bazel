@@ -60,7 +60,7 @@ genrule(
         env -u PWD \
             CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" \
             RUSTC="$$RUSTC" \
-            "$$CARGO" build --quiet $$FLAGS
+            "$$CARGO" build $$FLAGS
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
 
@@ -129,9 +129,9 @@ cc_import(
     static_library = ":libiggy_cpp.a",
 )
 
-cc_library(
+cc_import(
     name = "profiler_rt",
-    srcs = ["libprofiler_builtins.a"],
+    static_library = ":libprofiler_builtins.a",
     alwayslink = True,
 )
 
