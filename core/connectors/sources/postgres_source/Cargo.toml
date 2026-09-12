@@ -52,7 +52,7 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
-sqlx = { workspace = true }
+sqlx = { workspace = true, features = ["bigdecimal"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

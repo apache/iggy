@@ -20,12 +20,14 @@ use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     PostgresOps, PostgresSourceByteaFixture, PostgresSourceDeleteFixture,
     PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceOps,
+    PostgresSourceOps, PostgresSourceTextKeyFixture,
 };
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
-use integration::harness::seeds;
+use iggy_connector_sdk::ConnectorState;
+use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
+use std::fs;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -544,4 +546,333 @@ async fn state_persists_across_connector_restart(
     }
 
     pool.close().await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn checkpoint_failure_source_replays_rows_until_acknowledged(
+    harness: &TestHarness,
+    fixture: PostgresSourceByteaFixture,
+) {
+    let runtime = harness.connectors_runtime().expect("connector runtime");
+    let checkpoint = runtime.state_path().join("source_postgres.state");
+    fs::create_dir(&checkpoint).expect("force checkpoint rename failure");
+
+    let pool = fixture.create_pool().await.expect("PostgreSQL pool");
+    let payload = b"replay after checkpoint failure";
+    let query = format!(
+        "CREATE TABLE {} AS SELECT 1 AS id, $1::BYTEA AS payload",
+        fixture.table_name()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(query))
+        .bind(payload.as_slice())
+        .execute(&pool)
+        .await
+        .expect("create the table and its row atomically");
+    pool.close().await;
+
+    let checkpoint_failed = wait_for_failed_checkpoint(harness).await;
+    fs::remove_dir(&checkpoint).expect("restore checkpoint destination");
+    assert!(checkpoint_failed, "the produced row must receive a Nack");
+
+    let received = poll_payloads(harness, "checkpoint_failure", 2).await;
+
+    for _ in 0..POLL_ATTEMPTS {
+        if checkpoint.is_file() {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert!(
+        checkpoint.is_file(),
+        "checkpoint must recover after the failure"
+    );
+    assert!(
+        received.len() >= 2,
+        "a Nacked row must be replayed; received {} copies",
+        received.len()
+    );
+    for message in received {
+        assert_eq!(message, payload);
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn text_keys_source_tracks_and_deletes_numeric_and_quoted_values(
+    harness: &TestHarness,
+    fixture: PostgresSourceDeleteFixture,
+) {
+    let pool = fixture.create_pool().await.expect("PostgreSQL pool");
+    let query = format!(
+        "CREATE TABLE {} AS SELECT id FROM (VALUES ('01'), ('02'), ('O''Brien')) rows(id)",
+        fixture.table_name()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(query))
+        .execute(&pool)
+        .await
+        .expect("create TEXT keys and rows atomically");
+
+    let expected = ["01", "02", "O'Brien"];
+    let received: Vec<_> = poll_payloads(harness, "text_keys", expected.len())
+        .await
+        .into_iter()
+        .map(|payload| {
+            let row: serde_json::Value =
+                serde_json::from_slice(&payload).expect("source JSON envelope");
+            row["data"]["id"].as_str().expect("TEXT key").to_string()
+        })
+        .collect();
+    assert_eq!(
+        received, expected,
+        "TEXT keys must retain their exact values"
+    );
+    assert_eq!(
+        fixture.count_rows(&pool).await,
+        0,
+        "all selected keys must be deleted"
+    );
+    pool.close().await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn numeric_rows_source_preserves_numbers_and_nulls(
+    harness: &TestHarness,
+    fixture: PostgresSourceJsonFixture,
+) {
+    let pool = fixture.create_pool().await.expect("PostgreSQL pool");
+    let query = format!(
+        "CREATE TABLE {} AS SELECT * FROM (VALUES
+            (1, 12.50::NUMERIC), (2, -98765.125), (3, 0),
+            (4, 123456789.875), (5, NULL)) rows(id, amount)",
+        fixture.table_name()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(query))
+        .execute(&pool)
+        .await
+        .expect("create NUMERIC rows atomically");
+    pool.close().await;
+
+    let expected = [
+        Some(12.5),
+        Some(-98765.125),
+        Some(0.0),
+        Some(123456789.875),
+        None,
+    ];
+    let received = poll_payloads(harness, "numeric_rows", expected.len()).await;
+    assert_eq!(
+        received.len(),
+        expected.len(),
+        "every NUMERIC row must be delivered"
+    );
+    for (payload, expected) in received.iter().zip(expected) {
+        let row: serde_json::Value = serde_json::from_slice(payload).expect("source JSON envelope");
+        assert_eq!(
+            row["data"]["amount"].as_f64(),
+            expected,
+            "NUMERIC value in {row}"
+        );
+        assert_eq!(row["data"]["amount"].is_null(), expected.is_none());
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn selected_payload_key_source_tracks_and_marks_rows(
+    harness: &TestHarness,
+    fixture: PostgresSourceTextKeyFixture,
+) {
+    let pool = fixture.create_pool().await.expect("PostgreSQL pool");
+    let query = format!(
+        "CREATE TABLE {} AS SELECT id, FALSE AS processed FROM (VALUES ('01'), ('02'), ('03')) rows(id)",
+        fixture.table_name()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(query))
+        .execute(&pool)
+        .await
+        .expect("create rows whose payload is also the tracking and primary key");
+
+    let expected = [b"01".to_vec(), b"02".to_vec(), b"03".to_vec()];
+    let received = poll_payloads(harness, "payload_key", expected.len()).await;
+    assert_eq!(received, expected, "selected keys must be delivered once");
+
+    let query = format!(
+        "SELECT COUNT(*) FROM {} WHERE processed",
+        fixture.table_name()
+    );
+    let checkpoint = harness
+        .connectors_runtime()
+        .expect("connector runtime")
+        .state_path()
+        .join("source_postgres.state");
+    let mut processed = 0i64;
+    for _ in 0..POLL_ATTEMPTS {
+        processed = sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
+            .fetch_one(&pool)
+            .await
+            .expect("count marked rows");
+        if processed == expected.len() as i64 && checkpoint.is_file() {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert_eq!(
+        processed,
+        expected.len() as i64,
+        "selected payload keys must still identify rows to mark"
+    );
+
+    let state = ConnectorState(fs::read(checkpoint).expect("acknowledged checkpoint"))
+        .deserialize::<serde_json::Value>("PostgreSQL test", 1)
+        .expect("existing MessagePack state");
+    assert_eq!(
+        state[1][fixture.table_name()],
+        "03",
+        "selected payload key must still advance the cursor"
+    );
+    assert_eq!(state[2], 3, "each row must be acknowledged once");
+    pool.close().await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delete_source_retains_rows_until_acknowledged(
+    harness: &TestHarness,
+    fixture: PostgresSourceDeleteFixture,
+) {
+    let pool = fixture.create_pool().await.expect("PostgreSQL pool");
+    assert_cleanup_after_ack(harness, &pool, fixture.table_name(), "TRUE").await;
+    pool.close().await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mark_source_retains_unprocessed_rows_until_acknowledged(
+    harness: &TestHarness,
+    fixture: PostgresSourceMarkFixture,
+) {
+    let pool = fixture.create_pool().await.expect("PostgreSQL pool");
+    assert_cleanup_after_ack(harness, &pool, fixture.table_name(), "NOT is_processed").await;
+    pool.close().await;
+}
+
+async fn assert_cleanup_after_ack(
+    harness: &TestHarness,
+    pool: &sqlx::PgPool,
+    table: &str,
+    pending_condition: &str,
+) {
+    let checkpoint = harness
+        .connectors_runtime()
+        .expect("connector runtime")
+        .state_path()
+        .join("source_postgres.state");
+    fs::create_dir(&checkpoint).expect("force checkpoint rename failure");
+    let query = format!("CREATE TABLE {table} AS SELECT 1 AS id, FALSE AS is_processed");
+    sqlx::query(sqlx::AssertSqlSafe(query))
+        .execute(pool)
+        .await
+        .expect("create the table and row atomically");
+    let failed = wait_for_failed_checkpoint(harness).await;
+    let query = format!("SELECT COUNT(*) FROM {table} WHERE {pending_condition}");
+    let pending: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
+        .fetch_one(pool)
+        .await
+        .expect("count rows before Ack");
+    fs::remove_dir(&checkpoint).expect("restore checkpoint destination");
+    assert!(failed, "the produced batch must receive Nack");
+    assert_eq!(pending, 1, "Nack must leave the row available for replay");
+
+    let received = poll_payloads(harness, "cleanup_ack", 2).await;
+    assert!(received.len() >= 2, "the rejected row must be replayed");
+    for payload in received {
+        let record: serde_json::Value = serde_json::from_slice(&payload).expect("JSON envelope");
+        assert_eq!(record["data"]["id"], 1);
+    }
+    let mut pending = 1i64;
+    for _ in 0..POLL_ATTEMPTS {
+        pending = sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
+            .fetch_one(pool)
+            .await
+            .expect("count rows after Ack");
+        if pending == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert_eq!(pending, 0, "Ack must apply the requested row cleanup");
+    let state = ConnectorState(fs::read(checkpoint).expect("acknowledged checkpoint"))
+        .deserialize::<serde_json::Value>("PostgreSQL test", 1)
+        .expect("MessagePack state");
+    assert_eq!(
+        state[2], 1,
+        "a replay must not double-count the acknowledged row"
+    );
+}
+
+async fn wait_for_failed_checkpoint(harness: &TestHarness) -> bool {
+    let runtime = harness.connectors_runtime().expect("connector runtime");
+    for _ in 0..POLL_ATTEMPTS {
+        if runtime
+            .collect_logs()
+            .0
+            .contains("Failed to save state for source connector")
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    false
+}
+
+async fn poll_payloads(
+    harness: &TestHarness,
+    consumer_name: &str,
+    expected: usize,
+) -> Vec<Vec<u8>> {
+    let client = harness.root_client().await.expect("root client");
+    let stream: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer = Consumer::new(consumer_name.try_into().unwrap());
+    let mut received = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream,
+                &topic,
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received.extend(
+                polled
+                    .messages
+                    .into_iter()
+                    .map(|message| message.payload.to_vec()),
+            );
+            if received.len() >= expected {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    received
 }

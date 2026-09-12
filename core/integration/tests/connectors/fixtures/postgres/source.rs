@@ -499,3 +499,40 @@ impl TestFixture for PostgresSourceMarkFixture {
         envs
     }
 }
+
+pub struct PostgresSourceTextKeyFixture {
+    source: PostgresSourceJsonFixture,
+}
+
+impl PostgresOps for PostgresSourceTextKeyFixture {
+    fn container(&self) -> &PostgresContainer {
+        self.source.container()
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceTextKeyFixture {
+    fn table_name(&self) -> &str {
+        self.source.table_name()
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceTextKeyFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            source: PostgresSourceJsonFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.source.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_PAYLOAD_COLUMN.to_string(), "id".to_string());
+        envs.insert(ENV_SOURCE_PAYLOAD_FORMAT.to_string(), "text".to_string());
+        envs.insert(
+            ENV_SOURCE_PROCESSED_COLUMN.to_string(),
+            "processed".to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "text".to_string());
+        envs
+    }
+}
