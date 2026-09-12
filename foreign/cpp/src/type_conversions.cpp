@@ -115,4 +115,25 @@ Stream Stream::FromFfi(ffi::Stream stream) {
                   ResourceOptions::FromFfi(std::move(stream.options), rust::Vec<ffi::HeaderEntry>{}));
 }
 
+ConsumerGroupMember ConsumerGroupMember::FromFfi(ffi::ConsumerGroupMember member) {
+    return ConsumerGroupMember(member.id, member.partitions_count,
+                               std::vector<std::uint32_t>(member.partitions.begin(), member.partitions.end()));
+}
+
+ConsumerGroup ConsumerGroup::FromFfi(ffi::ConsumerGroup group) {
+    return ConsumerGroup(group.id, std::string(group.name.c_str(), group.name.size()), group.partitions_count,
+                         group.members_count);
+}
+
+ConsumerGroupDetails ConsumerGroupDetails::FromFfi(ffi::ConsumerGroupDetails group) {
+    std::vector<ConsumerGroupMember> members;
+    members.reserve(group.members.size());
+    for (auto &member : group.members) {
+        members.push_back(ConsumerGroupMember::FromFfi(std::move(member)));
+    }
+
+    return ConsumerGroupDetails(group.id, std::string(group.name.c_str(), group.name.size()), group.partitions_count,
+                                group.members_count, std::move(members));
+}
+
 }  // namespace iggy

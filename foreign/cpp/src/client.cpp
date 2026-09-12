@@ -252,6 +252,80 @@ void IggyBlockingClient::DeletePartitions(const Identifier &stream,
     });
 }
 
+ConsumerGroupDetails IggyBlockingClient::CreateConsumerGroup(const Identifier &stream,
+                                                             const Identifier &topic,
+                                                             std::string name) {
+    return RethrowAsIggyException([this, &stream, &topic, &name] {
+        return ConsumerGroupDetails::FromFfi(Handle()->create_consumer_group(stream.ToFfi(), topic.ToFfi(), name));
+    });
+}
+
+ConsumerGroupDetails IggyBlockingClient::GetConsumerGroup(const Identifier &stream,
+                                                          const Identifier &topic,
+                                                          const Identifier &group) {
+    return RethrowAsIggyException([this, &stream, &topic, &group] {
+        return ConsumerGroupDetails::FromFfi(
+            Handle()->get_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi()));
+    });
+}
+
+std::vector<ConsumerGroup> IggyBlockingClient::GetConsumerGroups(const Identifier &stream, const Identifier &topic) {
+    return RethrowAsIggyException([this, &stream, &topic] {
+        std::vector<ConsumerGroup> groups;
+        auto ffi_groups = Handle()->get_consumer_groups(stream.ToFfi(), topic.ToFfi());
+        groups.reserve(ffi_groups.size());
+        for (auto &group : ffi_groups) {
+            groups.push_back(ConsumerGroup::FromFfi(std::move(group)));
+        }
+        return groups;
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerGroup(const Identifier &stream,
+                                             const Identifier &topic,
+                                             const Identifier &group) {
+    RethrowAsIggyException([this, &stream, &topic, &group] {
+        Handle()->delete_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi());
+    });
+}
+
+void IggyBlockingClient::JoinConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group) {
+    RethrowAsIggyException([this, &stream, &topic, &group] {
+        Handle()->join_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi());
+    });
+}
+
+void IggyBlockingClient::LeaveConsumerGroup(const Identifier &stream,
+                                            const Identifier &topic,
+                                            const Identifier &group) {
+    RethrowAsIggyException([this, &stream, &topic, &group] {
+        Handle()->leave_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi());
+    });
+}
+
+IggyBlockingConsumer IggyBlockingClient::CreateConsumer(std::string name,
+                                                        const Identifier &stream,
+                                                        const Identifier &topic,
+                                                        std::uint32_t partition_id) {
+    return RethrowAsIggyException([this, &name, &stream, &topic, partition_id] {
+        return IggyBlockingConsumer(Handle()->create_consumer(name, stream.ToFfi(), topic.ToFfi(), partition_id));
+    });
+}
+
+IggyBlockingConsumer IggyBlockingClient::CreateGroupConsumer(std::string name,
+                                                             const Identifier &stream,
+                                                             const Identifier &topic) {
+    return RethrowAsIggyException([this, &name, &stream, &topic] {
+        return IggyBlockingConsumer(Handle()->create_group_consumer(name, stream.ToFfi(), topic.ToFfi()));
+    });
+}
+
+IggyBlockingProducer IggyBlockingClient::CreateProducer(const Identifier &stream, const Identifier &topic) {
+    return RethrowAsIggyException([this, &stream, &topic] {
+        return IggyBlockingProducer(Handle()->create_producer(stream.ToFfi(), topic.ToFfi()));
+    });
+}
+
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
     if (client_ == nullptr) {
         throw IggyException("Could not create Iggy client");

@@ -21,3 +21,19 @@ use iggy::prelude::IggyProducer as RustIggyProducer;
 pub struct Producer {
     pub inner: RustIggyProducer,
 }
+
+/// Releases a producer previously returned by `create_producer`.
+///
+/// # Safety
+///
+/// - Passing the pointer to this function more than once is undefined
+///   behaviour (double-free).
+/// - Using the pointer after this function has been called is undefined
+///   behaviour (use-after-free).
+pub unsafe fn delete_producer(producer: *mut Producer) {
+    if !producer.is_null() {
+        unsafe {
+            drop(Box::from_raw(producer));
+        }
+    }
+}

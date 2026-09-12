@@ -23,9 +23,9 @@ mod producer;
 mod type_conversion;
 
 use client::{Client, delete_connection as delete_client, from_connection_string, new_connection};
-use consumer::Consumer;
+use consumer::{Consumer, delete_consumer};
 use messages::make_message;
-use producer::Producer;
+use producer::{Producer, delete_producer};
 use std::sync::LazyLock;
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -685,6 +685,28 @@ mod ffi {
         fn set_string(self: &mut Identifier, id: String) -> Result<()>;
         fn set_numeric(self: &mut Identifier, id: u32) -> Result<()>;
 
+        fn create_consumer(
+            self: &Client,
+            name: String,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+        ) -> Result<*mut Consumer>;
+        fn create_group_consumer(
+            self: &Client,
+            name: String,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<*mut Consumer>;
+        unsafe fn delete_consumer(consumer: *mut Consumer);
+
+        fn create_producer(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<*mut Producer>;
+        unsafe fn delete_producer(producer: *mut Producer);
+
         // Consumer methods
         // fn name(self: &Consumer) -> Result<String>;
         // fn topic(self: &Consumer) -> Result<Identifier>;
@@ -696,7 +718,6 @@ mod ffi {
         // fn get_last_stored_offset(self: &Consumer, partition_id: u32) -> Result<u64>;
         // fn init(self: &mut Consumer) -> Result<()>;
         // fn shutdown(self: &mut Consumer) -> Result<()>;
-        // unsafe fn delete_consumer(consumer: *mut Consumer) -> Result<()>;
 
         // Producer methods
         // fn stream(self: &Producer) -> Result<Identifier>;
@@ -707,6 +728,5 @@ mod ffi {
         // fn send_with_partitioning(self: &Producer, partitioning_kind: String, partitioning_value: Vec<u8>, messages: Vec<IggyMessageToSend>) -> Result<()>;
         // fn send_to(self: &Producer, stream_id: Identifier, topic_id: Identifier, partitioning_kind: String, partitioning_value: Vec<u8>, messages: Vec<IggyMessageToSend>) -> Result<()>;
         // fn shutdown(self: &mut Producer) -> Result<()>;
-        // unsafe fn delete_producer(producer: *mut Producer) -> Result<()>;
     }
 }

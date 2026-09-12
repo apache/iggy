@@ -42,12 +42,17 @@
 namespace iggy {
 
 class IggyBlockingClient;
+class IggyBlockingConsumer;
+class IggyBlockingProducer;
 class LoginInfo;
 class Partition;
 class Topic;
 class TopicDetails;
 class Stream;
 class StreamDetails;
+class ConsumerGroup;
+class ConsumerGroupDetails;
+class ConsumerGroupMember;
 
 namespace detail {
 /** @brief Internal base for string-backed option types. */
@@ -834,6 +839,77 @@ class Stream final {
     ResourceOptions options_;
 };
 
+class ConsumerGroupMember final {
+  public:
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+    [[nodiscard]] const std::vector<std::uint32_t> &Partitions() const noexcept { return partitions_; }
+
+  private:
+    ConsumerGroupMember(std::uint32_t id, std::uint32_t partitions_count, std::vector<std::uint32_t> partitions)
+        : id_(id), partitions_count_(partitions_count), partitions_(std::move(partitions)) {}
+
+    static ConsumerGroupMember FromFfi(ffi::ConsumerGroupMember member);
+
+    friend class ConsumerGroupDetails;
+
+    std::uint32_t id_;
+    std::uint32_t partitions_count_;
+    std::vector<std::uint32_t> partitions_;
+};
+
+class ConsumerGroup final {
+  public:
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+
+  private:
+    ConsumerGroup(std::uint32_t id, std::string name, std::uint32_t partitions_count, std::uint32_t members_count)
+        : id_(id), name_(std::move(name)), partitions_count_(partitions_count), members_count_(members_count) {}
+
+    static ConsumerGroup FromFfi(ffi::ConsumerGroup group);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t id_;
+    std::string name_;
+    std::uint32_t partitions_count_;
+    std::uint32_t members_count_;
+};
+
+class ConsumerGroupDetails final {
+  public:
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+    [[nodiscard]] const std::vector<ConsumerGroupMember> &Members() const noexcept { return members_; }
+
+  private:
+    ConsumerGroupDetails(std::uint32_t id,
+                         std::string name,
+                         std::uint32_t partitions_count,
+                         std::uint32_t members_count,
+                         std::vector<ConsumerGroupMember> members)
+        : id_(id),
+          name_(std::move(name)),
+          partitions_count_(partitions_count),
+          members_count_(members_count),
+          members_(std::move(members)) {}
+
+    static ConsumerGroupDetails FromFfi(ffi::ConsumerGroupDetails group);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t id_;
+    std::string name_;
+    std::uint32_t partitions_count_;
+    std::uint32_t members_count_;
+    std::vector<ConsumerGroupMember> members_;
+};
+
 /**
  * @brief Compression algorithm used for topic messages.
  *
@@ -1543,6 +1619,48 @@ class PollingStrategy final {
     std::uint64_t polling_strategy_value_;
 };
 
+class IggyBlockingConsumer final {
+  public:
+    IggyBlockingConsumer(const IggyBlockingConsumer &)            = delete;
+    IggyBlockingConsumer &operator=(const IggyBlockingConsumer &) = delete;
+
+    IggyBlockingConsumer(IggyBlockingConsumer &&other) noexcept;
+    IggyBlockingConsumer &operator=(IggyBlockingConsumer &&other) noexcept;
+
+    ~IggyBlockingConsumer();
+
+  private:
+    explicit IggyBlockingConsumer(ffi::Consumer *consumer);
+
+    [[nodiscard]] ffi::Consumer *Handle() const;
+    void Reset() noexcept;
+
+    friend class IggyBlockingClient;
+
+    ffi::Consumer *consumer_;
+};
+
+class IggyBlockingProducer final {
+  public:
+    IggyBlockingProducer(const IggyBlockingProducer &)            = delete;
+    IggyBlockingProducer &operator=(const IggyBlockingProducer &) = delete;
+
+    IggyBlockingProducer(IggyBlockingProducer &&other) noexcept;
+    IggyBlockingProducer &operator=(IggyBlockingProducer &&other) noexcept;
+
+    ~IggyBlockingProducer();
+
+  private:
+    explicit IggyBlockingProducer(ffi::Producer *producer);
+
+    [[nodiscard]] ffi::Producer *Handle() const;
+    void Reset() noexcept;
+
+    friend class IggyBlockingClient;
+
+    ffi::Producer *producer_;
+};
+
 /**
  * @brief Owning client connection to an Apache Iggy server.
  *
@@ -1984,6 +2102,20 @@ class IggyBlockingClient final {
      *         request fails.
      */
     void DeletePartitions(const Identifier &stream, const Identifier &topic, std::uint32_t partitions_count);
+
+    ConsumerGroupDetails CreateConsumerGroup(const Identifier &stream, const Identifier &topic, std::string name);
+    ConsumerGroupDetails GetConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+    std::vector<ConsumerGroup> GetConsumerGroups(const Identifier &stream, const Identifier &topic);
+    void DeleteConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+    void JoinConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+    void LeaveConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+
+    IggyBlockingConsumer CreateConsumer(std::string name,
+                                        const Identifier &stream,
+                                        const Identifier &topic,
+                                        std::uint32_t partition_id);
+    IggyBlockingConsumer CreateGroupConsumer(std::string name, const Identifier &stream, const Identifier &topic);
+    IggyBlockingProducer CreateProducer(const Identifier &stream, const Identifier &topic);
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);
