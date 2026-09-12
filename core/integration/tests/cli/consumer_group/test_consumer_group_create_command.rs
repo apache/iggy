@@ -242,11 +242,11 @@ pub async fn should_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["consumer-group", "create", "--help"],
             format!(
-                r#"Create consumer group with given ID and name for given stream ID and topic ID.
+                r#"Create consumer group with given name for given stream ID and topic ID.
 
 Stream ID can be specified as a stream name or ID
 Topic ID can be specified as a topic name or ID
-If group ID is not provided then the server will automatically assign it
+The server assigns the group ID. The legacy --group-id flag is ignored.
 
 Examples:
  iggy consumer-group create 1 1 prod
@@ -272,7 +272,7 @@ Arguments:
 
 Options:
   -g, --group-id <GROUP_ID>
-          Consumer group ID to create
+          Legacy consumer group ID flag (ignored)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -291,7 +291,7 @@ pub async fn should_short_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["consumer-group", "create", "-h"],
             format!(
-                r#"Create consumer group with given ID and name for given stream ID and topic ID.
+                r#"Create consumer group with given name for given stream ID and topic ID.
 
 {USAGE_PREFIX} consumer-group create [OPTIONS] <STREAM_ID> <TOPIC_ID> <NAME>
 
@@ -301,7 +301,7 @@ Arguments:
   <NAME>       Consumer group name to create
 
 Options:
-  -g, --group-id <GROUP_ID>  Consumer group ID to create
+  -g, --group-id <GROUP_ID>  Legacy consumer group ID flag (ignored)
   -h, --help                 Print help (see more with '--help')
 "#,
             ),

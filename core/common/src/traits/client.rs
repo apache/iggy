@@ -26,7 +26,7 @@ use std::fmt::Debug;
 
 /// The client trait which is the main interface to the Iggy server.
 /// It consists of multiple modules, each of which is responsible for a specific set of commands.
-/// Except the ping, login and get me, all the other methods require authentication.
+/// Server operations require authentication, except ping and the login flows.
 #[async_trait]
 pub trait Client:
     ClusterClient

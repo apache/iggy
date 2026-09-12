@@ -114,7 +114,7 @@ pub async fn should_help_match() {
             format!(
                 r#"Create stream with given name
 
-If stream ID is not provided then the server will automatically assign it
+The server assigns the stream ID. The legacy --stream-id flag is ignored.
 
 Examples:
  iggy stream create prod
@@ -128,7 +128,7 @@ Arguments:
 
 Options:
   -s, --stream-id <STREAM_ID>
-          Stream ID to create
+          Legacy stream ID flag (ignored)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -155,7 +155,7 @@ Arguments:
   <NAME>  Name of the stream
 
 Options:
-  -s, --stream-id <STREAM_ID>  Stream ID to create
+  -s, --stream-id <STREAM_ID>  Legacy stream ID flag (ignored)
   -h, --help                   Print help (see more with '--help')
 "#,
             ),

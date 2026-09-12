@@ -268,10 +268,9 @@ pub fn decode_send_confirmations(response: &[u8]) -> Result<SendMessagesResponse
 ///
 /// An unreadable body degrades to no confirmations instead of an error. The
 /// producer retry loop filters nothing and resends on any `Err`, so failing
-/// here would turn one committed write into as many copies as the retry budget
-/// allows, on a plane that keeps no reply cache to deduplicate them. Reporting
-/// a zeroed entry instead would be no better: the caller cannot tell it from a
-/// genuine commit at offset 0 and would checkpoint the shape mismatch.
+/// here would resend a committed write under a new request id, outside the
+/// partition's retry deduplication. A zeroed entry would be indistinguishable
+/// from a genuine commit at offset 0 and would checkpoint the shape mismatch.
 fn committed_send_confirmations(response: &[u8]) -> SendMessagesResponse {
     decode_send_confirmations(response).unwrap_or_else(|_| SendMessagesResponse {
         confirmations: Vec::new(),

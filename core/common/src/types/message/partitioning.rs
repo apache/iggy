@@ -25,13 +25,17 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-/// A type that defines a what strategy the server should choose to partition the messages.
+/// Selects the partitioning strategy for a batch of messages.
 ///
 /// Iggy uses a hierarchical model for append-only logs. A stream contains topics which hold partitions. Each partition is an append-only log.[^note]
 /// A producer of messages such as an `IggyProducer`, that appends messages to the log can choose between three partitioning strategies.
-/// - `Balanced` - the partition ID is calculated by the server using the round-robin algorithm.
-/// - `MessagesKey` - the partition ID is calculated by the server using the hash of the provided messages key.
+/// - `Balanced` - selects a partition using round-robin.
+/// - `MessagesKey` - hashes the key modulo the topic partition count.
 /// - `PartitionId` - the partition ID is provided by the client.
+///
+/// Binary clients resolve `Balanced` and `MessagesKey` before sending. The HTTP
+/// client sends the strategy to the server, which resolves it at admission.
+/// Changing the partition count can change a key's destination.
 ///
 /// Note, that using a [`Partitioner`] on top of [`Partitioning`] sets the strategy to [`PartitioningKind::PartitionId`]. The value is then computed
 /// based on your concrete implementation of [`Partitioner::calculate_partition_id()`].
@@ -72,7 +76,7 @@ impl Display for Partitioning {
 }
 
 impl Partitioning {
-    /// Partition the messages using the balanced round-robin algorithm on the server.
+    /// Partition the messages using round-robin.
     pub fn balanced() -> Self {
         Partitioning {
             kind: PartitioningKind::Balanced,

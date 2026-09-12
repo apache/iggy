@@ -47,8 +47,8 @@
 //!
 //! Integer order equals semver order. The value tracks the
 //! `iggy_binary_protocol` crate release; under 0.x a minor bump may break
-//! the wire, so the gate is minor-scoped. Past 1.0.0 the gate follows
-//! strict semver: major bump = incompatible, minor/patch = compatible.
+//! the wire, so the gate is minor-scoped. Compatibility across minor versions
+//! after 1.0.0 requires changing the minimum-version calculation below.
 //!
 //! ## `ClientVersionInfo` body prefix
 //!

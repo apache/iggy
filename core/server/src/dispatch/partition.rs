@@ -255,7 +255,7 @@ where
 /// The partition plane admits writes on the primary only (it asserts so), and a
 /// poll is served on whichever node owns the namespace locally, which may be a
 /// backup. So gate on primary status here. Auto-commit
-/// is server-managed best-effort (at-least-once delivery), so a follower-served
+/// is server-managed best-effort, so a follower-served
 /// poll simply does not advance the durable offset. The same contract covers a
 /// local cursor that never became durable: when the per-kind live map is over
 /// its limit the partition evicts such a cursor, and that consumer's next

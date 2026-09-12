@@ -42,6 +42,7 @@ use crate::server::http_client::HttpClient;
 const STREAM_NAME: &str = "rejoin-stream";
 const TOPIC_NAME: &str = "rejoin-topic";
 const PARTITION_ID: u32 = 0;
+const DURABILITY_HEADER: &str = "iggy-durability";
 
 /// Acks the pinned producer must capture before any disruption, so the
 /// session is warm and mid-stream rather than freshly connected.
@@ -435,6 +436,14 @@ async fn given_http_writes_on_a_rejoined_backup_when_the_primary_moved_should_fo
         .await
         .expect("forwarded HTTP produce");
     assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get(DURABILITY_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(<&str>::from(Durability::Persisted)),
+        "forwarded produce must preserve the primary's durability guarantee"
+    );
     let confirmation: SendMessagesConfirmations =
         response.json().await.expect("decode confirmations");
     let confirmation = confirmation

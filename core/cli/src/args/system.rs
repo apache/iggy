@@ -67,7 +67,7 @@ pub(crate) struct SnapshotArgs {
     ///
     /// Examples:
     /// - `--compression bzip2` for higher compression.
-    /// - `--compression none` to store without compression.
+    /// - `--compression stored` to store without compression.
     #[arg(verbatim_doc_comment, short, long, value_parser = clap::value_parser!(SnapshotCompression))]
     pub(crate) compression: Option<SnapshotCompression>,
 

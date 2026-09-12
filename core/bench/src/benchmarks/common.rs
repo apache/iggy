@@ -359,8 +359,8 @@ pub fn build_producing_consumer_groups_futures(
             };
 
             let consumer_group_id = if should_consume {
-                // Each stream has exactly one CG, server assigns IDs starting from 0
-                Some(start_consumer_group_id)
+                // Match the group name created for this stream.
+                Some(start_consumer_group_id + stream_idx)
             } else {
                 None
             };

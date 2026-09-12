@@ -229,15 +229,9 @@ pub mod topic_option_keys {
 
 /// Values an absent topic option resolves to at admission.
 ///
-/// These are the knobs' single source of truth: they used to live in
-/// topic creation options,
-/// which meant every one of them had two homes and an operator could not tell
-/// which won. A topic carries whatever it was created with; anything the
-/// client did not send resolves to the constant here and is persisted as a
-/// derived entry, so the effective value is always visible on `GetTopic`.
-///
-/// Each value matches what the shipped `config.toml` carried, so removing the
-/// keys changed no behavior for a topic created without options.
+/// These defaults are fixed by the option catalog, not server configuration.
+/// Values the client omits are resolved at admission and persisted as derived
+/// entries, so `GetTopic` reports the effective values and their provenance.
 pub const DEFAULT_PARTITIONS_COUNT: u32 = 1;
 /// `MaxTopicSize::Unlimited` (was `[topic] max_size = "unlimited"`).
 pub const DEFAULT_MAX_TOPIC_SIZE: u64 = u64::MAX;
@@ -249,14 +243,10 @@ pub const DEFAULT_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
 /// Preallocation is opt-in.
 ///
-/// That default was never actually in force: the reservation ran through
-/// `compio::spawn_blocking`, which panics the shard because shard executors
-/// disable the blocking pool, so any deployment that worked at all had
-/// preallocation off. With the call fixed to run inline it reserves real
-/// extents, and `FALLOC_FL_KEEP_SIZE` against the 1 GiB default segment size
-/// means 1 GiB of disk per partition the moment it is created -- a full test
-/// sweep reserved 393 GB before this was flipped. A topic that wants the
-/// latency benefit asks for it with `preallocate_segments`.
+/// Each owned partition requests `segment_size` bytes when opening a segment.
+/// Linux uses `FALLOC_FL_KEEP_SIZE` to reserve extents without extending the
+/// logical file. Unsupported or failed reservations fall back to ordinary
+/// allocation with a warning.
 pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
 /// 1 MiB (was `[partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
@@ -347,10 +337,9 @@ pub fn validate_preallocated_topic_bytes(
 
 /// Validate an explicit per-topic `segment_size` against its bounds.
 ///
-/// `ceiling` is node-derived: the smaller of the global segment maximum and
-/// the state-transfer artifact budget minus one bus frame (a segment may
-/// close one whole batch past its cap; an artifact ceiling below that
-/// refuses a legal segment and livelocks the partition's rejoin).
+/// Admission uses [`MAX_TOPIC_SEGMENT_SIZE`] as `ceiling`. Server startup
+/// separately validates that state-transfer budgets can hold a segment at
+/// that ceiling plus one whole batch of overshoot.
 ///
 /// # Errors
 ///

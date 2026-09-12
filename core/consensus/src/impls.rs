@@ -1657,8 +1657,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.commit_min.set(commit_min);
     }
 
-    /// Maximum number of faulty replicas that can be tolerated.
-    /// For a cluster of 2f+1 replicas, this returns f.
+    /// `StartViewChange` votes needed from other replicas before sending `DoViewChange`.
+    /// This is f for 2f+1 replicas, not the failure bound for every quorum configuration.
     #[must_use]
     pub const fn max_faulty(&self) -> usize {
         (self.replica_count as usize - 1) / 2
@@ -4042,8 +4042,8 @@ where
         // cost on the produce path, and it would describe the WRONG bytes:
         // `stamp_prepare_for_persistence` rewrites the command header INSIDE this
         // sealed region before the entry is journaled. Leaving those prepares at `0`
-        // is the designed "nothing to verify" sentinel, so a future durable partition
-        // journal skips verification instead of failing every entry as corrupt.
+        // is the designed "nothing to verify" sentinel: partition prepares
+        // leave message-body integrity to the batch checksums.
         //
         // TODO(consensus): a partition prepare's `checksum` covers its header alone,
         // so two at one op with matching header fields are indistinguishable however
@@ -4053,8 +4053,8 @@ where
         // the zero. Two closures, both larger than they look:
         //
         // 1. The batch checksum, recomputed after `stamp_prepare_for_persistence`.
-        //    But stamping runs per replica after replication and folds `base_offset`
-        //    in, so identity would change at stamp time and the journaled entry would
+        //    But stamping runs after this projection and folds `base_offset` in,
+        //    so identity would change at stamp time and the journaled entry would
         //    no longer match the pipeline entry `handle_prepare_ok` compares.
         // 2. The stamp-invariant cover: everything past the 256-byte command header,
         //    which stamping never touches. Identical on every replica, safe to seal

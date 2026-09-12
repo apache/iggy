@@ -196,12 +196,11 @@ pub async fn should_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["message", "flush", "--help"],
             format!(
-                r#"Flush messages from given topic ID and given stream ID
+                r#"Legacy message flush command (unsupported by the server)
 
-Command is used to force a flush of unsaved_buffer to disk
-for specific stream, topic and partition. If fsync is enabled
-then the data is flushed to disk and fsynced, otherwise the
-data is only flushed to disk.
+Binary transports return FeatureUnavailable. HTTP has no flush route.
+For acknowledgements backed by stable storage, create the topic with
+--durability persisted.
 
 Stream ID can be specified as a stream name or ID
 Topic ID can be specified as a topic name or ID
@@ -216,24 +215,23 @@ Examples:
 
 Arguments:
   <STREAM_ID>
-          ID of the stream for which messages will be flushed
+          Stream ID for the flush request
 {CLAP_INDENT}
           Stream ID can be specified as a stream name or ID
 
   <TOPIC_ID>
-          ID of the topic for which messages will be flushed
+          Topic ID for the flush request
 {CLAP_INDENT}
           Topic ID can be specified as a topic name or ID
 
   <PARTITION_ID>
-          Partition ID for which messages will be flushed
+          Partition ID for the flush request
 
 Options:
   -f, --fsync
-          fsync flushed data to disk
+          Request fsync (unsupported by the server)
 {CLAP_INDENT}
-          If option is enabled then the data is flushed to disk and fsynced,
-          otherwise the data is only flushed to disk. Default is false.
+          The server rejects flush requests regardless of this flag.
 
   -h, --help
           Print help (see a summary with '-h')
@@ -252,17 +250,17 @@ pub async fn should_short_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["message", "flush", "-h"],
             format!(
-                r#"Flush messages from given topic ID and given stream ID
+                r#"Legacy message flush command (unsupported by the server)
 
 {USAGE_PREFIX} message flush [OPTIONS] <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
 
 Arguments:
-  <STREAM_ID>     ID of the stream for which messages will be flushed
-  <TOPIC_ID>      ID of the topic for which messages will be flushed
-  <PARTITION_ID>  Partition ID for which messages will be flushed
+  <STREAM_ID>     Stream ID for the flush request
+  <TOPIC_ID>      Topic ID for the flush request
+  <PARTITION_ID>  Partition ID for the flush request
 
 Options:
-  -f, --fsync  fsync flushed data to disk
+  -f, --fsync  Request fsync (unsupported by the server)
   -h, --help   Print help (see more with '--help')
 "#,
             ),

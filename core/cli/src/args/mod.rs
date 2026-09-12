@@ -87,7 +87,7 @@ pub(crate) struct IggyConsoleArgs {
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct CliOptions {
-    /// Quiet mode (disabled stdout printing)
+    /// Suppress logging output (command-specific output may remain)
     #[clap(short, long, default_value_t = false)]
     pub(crate) quiet: bool,
 
@@ -159,7 +159,7 @@ pub(crate) enum Command {
     /// get current client info
     ///
     /// Command connects to Iggy server and collects client info like client ID, user ID
-    /// server address and protocol type.
+    /// client address as seen by the server and protocol type.
     #[clap(verbatim_doc_comment)]
     Me,
     /// list the options a resource's create command accepts

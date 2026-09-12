@@ -6854,6 +6854,7 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "configs",
  "figlet-rs",
  "futures-util",
  "governor",

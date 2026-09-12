@@ -31,7 +31,7 @@ pub enum Operation {
     /// consensus pipeline (prepare/replicate/commit) as normal operations
     /// but skips state machine dispatch at commit time, the metadata
     /// plane calls `commit_register` directly, which mints the session's
-    /// fence epoch (1 at first register, +1 per rebind).
+    /// fence epoch from the committed Register log position.
     Register = 1,
 
     /// Non-replicated client request carried in VSR framing. The concrete
