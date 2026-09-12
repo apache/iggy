@@ -1046,8 +1046,8 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             default_value: Bytes::copy_from_slice(
                 &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
             ),
-            description: "Per-partition sealed-segment size cap in bytes, or a byte-size string \
-                              (e.g. 1 GiB); finite values must be at least the segment size"
+            description: "Topic-wide sealed-segment size cap, split across all partitions, in bytes \
+                              or a byte-size string (e.g. 1 GiB); finite values must be at least the segment size"
                 .to_string(),
         },
         OptionDescriptor {
