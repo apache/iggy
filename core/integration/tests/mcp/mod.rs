@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use assert_cmd::prelude::CommandCargoExt;
+
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
@@ -22,14 +28,20 @@ use iggy_common::{
     UserInfoDetails,
 };
 use integration::{
-    harness::{McpClient, seeds},
+    harness::{McpClient, McpConfig, TestHarness, seeds},
     iggy_harness,
 };
 use rmcp::{
     model::CallToolRequestParams,
     serde::de::DeserializeOwned,
     serde_json::{self, json},
+    service::ServiceError,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::timeout;
+
+const MCP_STDIO_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn invoke<T: DeserializeOwned>(
     client: &McpClient,
     method: &str,
@@ -633,4 +645,166 @@ async fn should_change_password(harness: &TestHarness) {
         })),
     )
     .await;
+}
+
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_reject_mutating_tools_with_read_only_permissions() {
+    let mut harness = TestHarness::builder()
+        .default_server()
+        .root_tcp_client()
+        .mcp(
+            McpConfig::builder()
+                .consumer_name(seeds::names::CONSUMER)
+                .extra_envs(HashMap::from([
+                    (
+                        "IGGY_MCP_PERMISSIONS_CREATE".to_string(),
+                        "false".to_string(),
+                    ),
+                    ("IGGY_MCP_PERMISSIONS_READ".to_string(), "true".to_string()),
+                    (
+                        "IGGY_MCP_PERMISSIONS_UPDATE".to_string(),
+                        "false".to_string(),
+                    ),
+                    (
+                        "IGGY_MCP_PERMISSIONS_DELETE".to_string(),
+                        "false".to_string(),
+                    ),
+                ]))
+                .build(),
+        )
+        .build()
+        .expect("Failed to build read-only MCP harness");
+    harness
+        .start_with_seed(|client| async move { seeds::mcp_standard(&client).await })
+        .await
+        .expect("Failed to start read-only MCP harness");
+    let client = harness.mcp_client().await.expect("MCP client required");
+    let partition = json!({
+        "stream_id": seeds::names::STREAM,
+        "topic_id": seeds::names::TOPIC,
+        "partition_id": 0,
+    });
+    let messages: PolledMessages = invoke(&client, "poll_messages", Some(partition.clone())).await;
+    assert_eq!(messages.messages.len(), 1, "Read-only polling must work");
+
+    let mut store = partition.clone();
+    store["offset"] = json!(0);
+    let mut auto_commit = partition.clone();
+    auto_commit["auto_commit"] = json!(true);
+    let mut next = partition.clone();
+    next["strategy"] = json!("next");
+    let mut unexpected = Vec::new();
+    for (method, mut arguments, permission) in [
+        (
+            "create_personal_access_token",
+            json!({"name": "forbidden-token"}),
+            "create",
+        ),
+        (
+            "delete_personal_access_token",
+            json!({"name": seeds::names::PERSONAL_ACCESS_TOKEN}),
+            "delete",
+        ),
+        ("store_consumer_offset", store, "update"),
+        ("delete_consumer_offset", partition.clone(), "delete"),
+        ("poll_messages", auto_commit, "update"),
+        ("poll_messages", next, "update"),
+    ] {
+        let params = CallToolRequestParams::new(method.to_owned())
+            .with_arguments(arguments.as_object_mut().expect("Tool arguments").clone());
+        let result = client.call_tool(params).await;
+        if !matches!(result, Err(ServiceError::McpError(error))
+            if error.message == format!("Insufficient '{permission}' permissions"))
+        {
+            unexpected.push(method);
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "Mutating tools bypassed read-only permissions: {unexpected:?}"
+    );
+
+    let offset: Option<ConsumerOffsetInfo> =
+        invoke(&client, "get_consumer_offset", Some(partition)).await;
+    assert_eq!(offset.expect("Seeded offset must remain").stored_offset, 0);
+    let tokens: Vec<PersonalAccessTokenInfo> =
+        invoke(&client, "get_personal_access_tokens", None).await;
+    assert_eq!(
+        tokens.len(),
+        1,
+        "Rejected calls must leave tokens unchanged"
+    );
+    assert_eq!(tokens[0].name, seeds::names::PERSONAL_ACCESS_TOKEN);
+}
+
+#[iggy_harness]
+#[allow(deprecated)]
+async fn should_exit_stdio_on_disconnect_or_signal(harness: &TestHarness) {
+    for close_stdin in [true, false] {
+        let address = harness.server().tcp_addr().expect("TCP address required");
+        let mut command = Command::cargo_bin("iggy-mcp").expect("MCP binary required");
+        command
+            .env("IGGY_MCP_TRANSPORT", "stdio")
+            .env("IGGY_MCP_IGGY_ADDRESS", address.to_string())
+            .env("IGGY_MCP_IGGY_USERNAME", "iggy")
+            .env("IGGY_MCP_IGGY_PASSWORD", "iggy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Failed to start stdio MCP server");
+        let mut stdin = child.stdin.take().expect("MCP stdin required");
+        let mut stdout = BufReader::new(child.stdout.take().expect("MCP stdout required"));
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "stdio-shutdown-test", "version": "1"}
+            }
+        });
+        stdin
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .expect("Failed to initialize MCP session");
+        let mut response = String::new();
+        timeout(MCP_STDIO_TIMEOUT, stdout.read_line(&mut response))
+            .await
+            .expect("MCP initialization timed out")
+            .expect("Failed to read MCP initialization response");
+        let response: serde_json::Value =
+            serde_json::from_str(&response).expect("Invalid MCP initialization response");
+        assert!(
+            response.get("result").is_some(),
+            "Initialization failed: {response}"
+        );
+        let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        stdin
+            .write_all(format!("{initialized}\n").as_bytes())
+            .await
+            .expect("Failed to confirm MCP initialization");
+        if close_stdin {
+            drop(stdin);
+        } else {
+            let status = Command::new("kill")
+                .arg("-TERM")
+                .arg(child.id().expect("Running MCP process").to_string())
+                .status()
+                .expect("Failed to signal MCP server");
+            assert!(status.success(), "Failed to send SIGTERM to MCP server");
+        }
+
+        let status = timeout(MCP_STDIO_TIMEOUT, child.wait())
+            .await
+            .unwrap_or_else(|_| panic!("MCP server did not exit (close_stdin={close_stdin})"))
+            .expect("Failed to wait for MCP server");
+        assert!(
+            status.success(),
+            "MCP server failed during shutdown: {status}"
+        );
+    }
 }

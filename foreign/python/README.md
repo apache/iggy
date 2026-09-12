@@ -28,13 +28,17 @@ pip install apache-iggy
 
 ### Prerequisites
 
-Every installation below compiles the Rust extension, so you'll need:
+Python 3.10 or newer is required. Published wheels include the Rust extension;
+installing a wheel does not require Rust. Building from source and running the
+development checks below also requires:
 
-- Python 3.10+
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - All checks tooling from [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md).
 - Docker
+
+Use an SDK release compatible with your server. For unreleased changes, build
+the SDK and server from the same source checkout.
 
 ### Local Development
 

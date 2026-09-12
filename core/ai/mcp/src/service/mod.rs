@@ -345,6 +345,9 @@ impl IggyService {
         if strategy.kind == PollingKind::Next {
             auto_commit = true;
         }
+        if auto_commit {
+            self.permissions.ensure_update()?;
+        }
 
         request(
             self.client
@@ -573,7 +576,7 @@ impl IggyService {
             offset,
         }): Parameters<StoreConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_update()?;
         request(
             self.client
                 .store_consumer_offset(
@@ -596,7 +599,7 @@ impl IggyService {
             partition_id,
         }): Parameters<DeleteConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_delete()?;
         request(
             self.client
                 .delete_consumer_offset(
@@ -622,7 +625,7 @@ impl IggyService {
             CreatePersonalAccessToken,
         >,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_create()?;
         let expiry = expiry
             .and_then(|expiry| expiry.parse().ok())
             .unwrap_or_default();
@@ -638,7 +641,7 @@ impl IggyService {
         &self,
         Parameters(DeletePersonalAccessToken { name }): Parameters<DeletePersonalAccessToken>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_delete()?;
         request(self.client.delete_personal_access_token(&name).await)
     }
 

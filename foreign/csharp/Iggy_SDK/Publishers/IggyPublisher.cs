@@ -98,12 +98,21 @@ public partial class IggyPublisher : IAsyncDisposable
             await BackgroundProcessor.DisposeAsync();
         }
 
-        if (Config.CreateIggyClient && IsInitialized)
+        if (Config.CreateIggyClient)
         {
             try
             {
-                await Client.LogoutUserAsync();
-                Client.Dispose();
+                try
+                {
+                    if (IsInitialized)
+                    {
+                        await Client.LogoutUserAsync();
+                    }
+                }
+                finally
+                {
+                    Client.Dispose();
+                }
             }
             catch (Exception e)
             {

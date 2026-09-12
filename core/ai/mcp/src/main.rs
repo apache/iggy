@@ -24,6 +24,9 @@ use iggy::prelude::{Client, Identifier};
 use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
 use std::{env, sync::Arc};
+use tokio::runtime::Builder;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
 
 mod api;
@@ -39,8 +42,18 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_CONFIG_PATH: &str = "core/ai/mcp/config.toml";
 
-#[tokio::main]
-async fn main() -> Result<(), McpRuntimeError> {
+fn main() -> Result<(), McpRuntimeError> {
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(McpRuntimeError::RuntimeCreation)?;
+    let result = runtime.block_on(run());
+    // Tokio cannot cancel its blocking stdin read when a signal ends a live session.
+    runtime.shutdown_background();
+    result
+}
+
+async fn run() -> Result<(), McpRuntimeError> {
     let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert("Iggy MCP Server");
     eprintln!("{}", figure.unwrap());
@@ -92,46 +105,49 @@ async fn main() -> Result<(), McpRuntimeError> {
     #[cfg(feature = "systemd")]
     let watchdog_cancel = tokio_util::sync::CancellationToken::new();
 
-    if transport == McpTransport::Stdio {
-        let Ok(service) = IggyService::new(iggy_client, iggy_consumer, permissions)
-            .serve(stdio())
-            .await
-            .inspect_err(|error| {
-                error!("Serving error. {error}");
-            })
-        else {
-            error!("Failed to create service");
-            return Err(McpRuntimeError::FailedToCreateService);
-        };
-
-        #[cfg(feature = "systemd")]
-        systemd::notify_ready();
-        #[cfg(feature = "systemd")]
-        systemd::spawn_watchdog(watchdog_cancel.clone());
-
-        if let Err(error) = service.waiting().await {
-            error!("Waiting for service error. {error}");
-        }
-    } else {
-        api::init(config.http, iggy_client, iggy_consumer, permissions).await?;
-
-        #[cfg(feature = "systemd")]
-        systemd::notify_ready();
-        #[cfg(feature = "systemd")]
-        systemd::spawn_watchdog(watchdog_cancel.clone());
-    }
-
     #[cfg(unix)]
-    let (mut ctrl_c, mut sigterm) = {
-        use tokio::signal::unix::{SignalKind, signal};
-        (
-            signal(SignalKind::interrupt()).expect("Failed to create SIGINT signal"),
-            signal(SignalKind::terminate()).expect("Failed to create SIGTERM signal"),
-        )
+    let (mut ctrl_c, mut sigterm) = (
+        signal(SignalKind::interrupt()).map_err(McpRuntimeError::SignalRegistration)?,
+        signal(SignalKind::terminate()).map_err(McpRuntimeError::SignalRegistration)?,
+    );
+
+    let serve = async {
+        if transport == McpTransport::Stdio {
+            let Ok(service) = IggyService::new(iggy_client, iggy_consumer, permissions)
+                .serve(stdio())
+                .await
+                .inspect_err(|error| {
+                    error!("Serving error. {error}");
+                })
+            else {
+                error!("Failed to create service");
+                return Err(McpRuntimeError::FailedToCreateService);
+            };
+
+            #[cfg(feature = "systemd")]
+            systemd::notify_ready();
+            #[cfg(feature = "systemd")]
+            systemd::spawn_watchdog(watchdog_cancel.clone());
+
+            if let Err(error) = service.waiting().await {
+                error!("Waiting for service error. {error}");
+            }
+        } else {
+            api::init(config.http, iggy_client, iggy_consumer, permissions).await?;
+
+            #[cfg(feature = "systemd")]
+            systemd::notify_ready();
+            #[cfg(feature = "systemd")]
+            systemd::spawn_watchdog(watchdog_cancel.clone());
+            #[cfg(unix)]
+            std::future::pending::<()>().await;
+        }
+        Ok::<(), McpRuntimeError>(())
     };
 
     #[cfg(unix)]
     tokio::select! {
+        result = serve => result?,
         _ = ctrl_c.recv() => {
             info!("Received SIGINT. Shutting down Iggy MCP Server...");
         },
@@ -139,6 +155,9 @@ async fn main() -> Result<(), McpRuntimeError> {
             info!("Received SIGTERM. Shutting down Iggy MCP Server...");
         }
     }
+
+    #[cfg(not(unix))]
+    serve.await?;
 
     #[cfg(feature = "systemd")]
     {

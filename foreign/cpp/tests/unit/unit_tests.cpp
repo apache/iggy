@@ -28,6 +28,13 @@
 
 #include "iggy.hpp"
 
+TEST(ConnectionStringTest, ConstructsQuicClient) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::from_connection_string("iggy+quic://iggy:iggy@127.0.0.1:8080"); });
+    ASSERT_NE(client, nullptr);
+    iggy::ffi::delete_client(client);
+}
+
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::CompressionAlgorithm::None().Value(), "none");
     EXPECT_EQ(iggy::CompressionAlgorithm::Gzip().Value(), "gzip");

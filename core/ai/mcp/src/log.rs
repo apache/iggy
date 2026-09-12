@@ -21,7 +21,10 @@ use opentelemetry::{KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::log_processor_with_async_runtime;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::runtime::Tokio;
+use opentelemetry_sdk::trace::span_processor_with_async_runtime;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::EnvFilter;
@@ -139,7 +142,13 @@ fn init_logs_exporter(
                 .expect("Failed to initialize HTTP logger.");
             opentelemetry_sdk::logs::SdkLoggerProvider::builder()
                 .with_resource(resource)
-                .with_batch_exporter(log_exporter)
+                .with_log_processor(
+                    log_processor_with_async_runtime::BatchLogProcessor::builder(
+                        log_exporter,
+                        Tokio,
+                    )
+                    .build(),
+                )
                 .build()
         }
     }
@@ -169,8 +178,122 @@ fn init_traces_exporter(
                 .expect("Failed to initialize HTTP tracer.");
             opentelemetry_sdk::trace::SdkTracerProvider::builder()
                 .with_resource(resource)
-                .with_batch_exporter(trace_exporter)
+                .with_span_processor(
+                    span_processor_with_async_runtime::BatchSpanProcessor::builder(
+                        trace_exporter,
+                        Tokio,
+                    )
+                    .build(),
+                )
                 .build()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, StatusCode, Uri};
+    use opentelemetry::logs::{LogRecord, Logger, LoggerProvider};
+    use opentelemetry::trace::{Span, Tracer, TracerProvider};
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::init_telemetry;
+    use crate::configs::{
+        TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
+    };
+
+    const SIGNAL_COUNT: usize = 2;
+    const TEST_SCOPE: &str = "mcp-telemetry-test";
+    const LOG_BODY: &str = "mcp-telemetry-log";
+    const TRACE_NAME: &str = "mcp-telemetry-span";
+
+    #[tokio::test]
+    async fn given_http_telemetry_when_flushed_should_export_logs_and_traces() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local telemetry collector");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("collector address")
+        );
+        let (requests, mut received) = mpsc::channel(SIGNAL_COUNT);
+        let collector = Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+            let requests = requests.clone();
+            async move {
+                requests
+                    .send((uri, headers, body))
+                    .await
+                    .expect("record exported signal");
+                StatusCode::OK
+            }
+        });
+        let (stop, stopped) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, collector)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("serve telemetry collector");
+        });
+        let config = TelemetryConfig {
+            enabled: true,
+            logs: TelemetryLogsConfig {
+                transport: TelemetryTransport::Http,
+                endpoint: format!("{endpoint}/v1/logs"),
+            },
+            traces: TelemetryTracesConfig {
+                transport: TelemetryTransport::Http,
+                endpoint: format!("{endpoint}/v1/traces"),
+            },
+            ..TelemetryConfig::default()
+        };
+        let (logger_provider, tracer_provider) = init_telemetry(&config, env!("CARGO_PKG_VERSION"));
+        let logger = logger_provider.logger(TEST_SCOPE);
+        let mut record = logger.create_log_record();
+        record.set_body(LOG_BODY.into());
+        logger.emit(record);
+        let tracer = tracer_provider.tracer(TEST_SCOPE);
+        let mut span = tracer.start(TRACE_NAME);
+        span.end();
+
+        let results = tokio::task::spawn_blocking(move || {
+            (
+                logger_provider.force_flush(),
+                tracer_provider.force_flush(),
+                logger_provider.shutdown(),
+                tracer_provider.shutdown(),
+            )
+        })
+        .await
+        .expect("telemetry flush task should complete");
+        stop.send(()).expect("stop telemetry collector");
+        server.await.expect("collector task should complete");
+        assert!(results.0.is_ok(), "log export failed: {:?}", results.0);
+        assert!(results.1.is_ok(), "trace export failed: {:?}", results.1);
+        assert!(results.2.is_ok(), "logger shutdown failed: {:?}", results.2);
+        assert!(results.3.is_ok(), "tracer shutdown failed: {:?}", results.3);
+
+        let requests: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+        assert_eq!(
+            requests.len(),
+            SIGNAL_COUNT,
+            "both signals must be exported"
+        );
+        for (path, marker) in [("/v1/logs", LOG_BODY), ("/v1/traces", TRACE_NAME)] {
+            let (_, headers, body) = requests
+                .iter()
+                .find(|(uri, _, _)| uri.path() == path)
+                .expect("signal must reach its configured endpoint");
+            assert_eq!(headers["content-type"], "application/x-protobuf");
+            assert!(
+                body.windows(marker.len())
+                    .any(|bytes| bytes == marker.as_bytes()),
+                "exported signal must contain its emitted record: {path}"
+            );
         }
     }
 }

@@ -21,7 +21,8 @@
     "test:stream-builder": "tsx src/stream-builder/example.ts",
     "test:sink-data-producer": "tsx src/sink-data-producer/producer.ts",
     "test:tcp-tls:producer": "tsx src/tcp-tls/producer.ts",
-    "test:tcp-tls:consumer": "tsx src/tcp-tls/consumer.ts"
+    "test:tcp-tls:consumer": "tsx src/tcp-tls/consumer.ts",
+    "test:unit": "node --import tsx --experimental-test-module-mocks --test tests/*.test.mjs"
   },
   "keywords": [
     "iggy",

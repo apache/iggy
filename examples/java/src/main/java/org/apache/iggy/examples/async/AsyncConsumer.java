@@ -233,8 +233,11 @@ public final class AsyncConsumer {
                             int messageCount = polled.messages().size();
 
                             if (messageCount > 0) {
-                                // Update offset for next poll
-                                offset.updateAndGet(current -> current.add(BigInteger.valueOf(messageCount)));
+                                offset.set(polled.messages()
+                                        .get(messageCount - 1)
+                                        .header()
+                                        .offset()
+                                        .add(BigInteger.ONE));
                                 consumedBatches.incrementAndGet();
 
                                 return processMessages(polled, totalReceived, processingPool)

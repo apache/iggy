@@ -17,7 +17,8 @@
 
 export function decodeBase64(str: string): string | null {
   try {
-    return atob(str);
+    const bytes = Uint8Array.from(atob(str), (character) => character.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
   } catch {
     return null;
   }

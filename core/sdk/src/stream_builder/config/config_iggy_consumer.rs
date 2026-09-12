@@ -37,20 +37,20 @@ pub struct IggyConsumerConfig {
     topic_name: String,
     /// The auto-commit configuration for storing the message offset on the server. See  `AutoCommit` for details.
     auto_commit: AutoCommit,
-    /// The max number of messages to send in a batch. The greater the batch length, the higher the throughput for bulk data.
+    /// The max number of messages to poll in a batch. The greater the batch length, the higher the throughput for bulk data.
     /// Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
     batch_length: u32,
     /// Create the stream if it doesn't exist.
     create_stream_if_not_exists: bool,
     /// Create the topic if it doesn't exist.
     create_topic_if_not_exists: bool,
-    /// The name of the consumer. Must be unique
+    /// Members of the same consumer group use the same name.
     consumer_name: String,
     /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`. ConsumerGroup is default.
     consumer_kind: ConsumerKind,
-    /// Sets the number of partitions for ConsumerKind `Consumer`. Does not apply to `ConsumerGroup`.
+    /// Partition count when creating a topic and partition ID for an ordinary consumer.
+    /// Consumer-group assignment ignores this value.
     partitions_count: u32,
-    /// Sets the replication factor for the consumed topic.
     /// The polling interval for messages.
     polling_interval: IggyDuration,
     /// `PollingStrategy` specifies from where to start polling messages. See `PollingStrategy` for details.
@@ -61,7 +61,7 @@ pub struct IggyConsumerConfig {
     /// Might be useful when the stream or topic is created dynamically by the producer.
     init_retries: Option<u32>,
     init_interval: NonZeroIggyDuration,
-    /// Sets a optional client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
+    /// Sets client-side payload and user-header decryption. Currently only Aes256Gcm is supported.
     /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
     encryptor: Option<Arc<EncryptorKind>>,
 }
@@ -103,14 +103,14 @@ impl IggyConsumerConfig {
     /// * `topic_id` - The topic id.
     /// * `topic_name` - The topic name.
     /// * `auto_commit` - The auto commit config.
-    /// * `batch_length` - The max number of messages to send in a batch.
+    /// * `batch_length` - The max number of messages to poll in a batch.
     /// * `create_stream_if_not_exists` - Whether to create the stream if it does not exists.
     /// * `create_topic_if_not_exists` - Whether to create the topic if it does not exists.
     /// * `consumer_name` - The consumer name.
     /// * `consumer_kind` - The consumer kind.
     /// * `polling_interval` - The interval between polling for new messages.
     /// * `polling_strategy` - The polling strategy.
-    /// * `partitions_count` - The number of partitions.
+    /// * `partitions_count` - Topic creation count and ordinary consumer partition ID.
     /// * `encryptor` - The encryptor.
     /// * `polling_retry_interval` - The polling retry interval.
     /// * `init_retries` - The number of init retries.
@@ -167,7 +167,7 @@ impl IggyConsumerConfig {
     ///
     /// * `stream` - The stream name.
     /// * `topic` - The topic name.
-    /// * `batch_length` - The max number of messages to send in a batch.
+    /// * `batch_length` - The max number of messages to poll in a batch.
     /// * `polling_interval` - The interval between polling for new messages.
     ///
     /// Returns:
