@@ -2896,7 +2896,6 @@ where
         &mut self,
         result: PollReadResult,
     ) -> Result<PollCompletion, IggyError> {
-        self.resynchronize_consumer_offset_reservations();
         // Recovery can become necessary while disk I/O is pending, even if
         // the history identity has not changed.
         if result.context.history != self.poll_history
@@ -2905,6 +2904,7 @@ where
         {
             return Err(IggyError::TransientNotAccepted);
         }
+        self.resynchronize_consumer_offset_reservations();
         let mut replication = None;
         if let Some(offset) = result
             .last_matching_offset
@@ -12165,6 +12165,76 @@ mod tests {
             "the old read must not record group progress"
         );
         assert_eq!(committed, None, "automatic commits are disabled");
+    }
+
+    #[compio::test]
+    async fn given_stale_poll_when_reservations_need_resync_should_reject_before_reconciliation() {
+        let mut partition = test_partition();
+        partition.set_consumer_offsets_max(1);
+        let discarded_consumer_id = 8;
+        let discarded_operation = 1;
+        journal_prepare(
+            &partition,
+            discarded_operation,
+            Operation::StoreConsumerOffset,
+        )
+        .await;
+        partition
+            .consensus
+            .sequencer()
+            .set_sequence(discarded_operation);
+        partition.stage_consumer_offset_upsert(
+            discarded_operation,
+            ConsumerKind::Consumer,
+            discarded_consumer_id,
+            0,
+            false,
+        );
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let auto_commit = true;
+        let stale_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
+
+        // Truncation removes the pending operation but leaves its capacity
+        // reservation for reconciliation. The old read cannot belong to the
+        // replacement history or trigger that maintenance.
+        partition.invalidate_poll_history();
+        partition
+            .truncate_uncommitted_from(discarded_operation)
+            .await
+            .unwrap();
+        assert!(partition.pending_consumer_offset_commits.is_empty());
+        assert!(partition.offset_reservations_need_resync.get());
+        assert_eq!(
+            partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
+            1
+        );
+
+        assert!(matches!(
+            partition.complete_poll(stale_result),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(
+            partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
+            1,
+            "rejecting a stale read must not reconcile the discarded reservation"
+        );
+        assert!(partition.offset_reservations_need_resync.get());
+        assert_eq!(partition.get_consumer_offset(consumer), None);
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+
+        // A valid completion still reconciles before admission, freeing the
+        // only slot so the owner can admit an automatic commit for this consumer.
+        let fresh_result = poll_read_result(&partition, consumer, auto_commit, Some(0));
+        let completion = partition
+            .complete_poll(fresh_result)
+            .expect("accept fresh poll");
+        assert!(completion.replication.is_some());
+        assert!(!partition.offset_reservations_need_resync.get());
+        assert_eq!(partition.get_consumer_offset(consumer), Some(0));
+        assert_eq!(
+            partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
+            1
+        );
     }
 
     #[compio::test]
