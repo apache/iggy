@@ -20,11 +20,13 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
+use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::*;
-use predicates::str::diff;
+use predicates::str::{contains, diff};
 use serial_test::parallel;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
+use std::time::Duration;
 use twox_hash::XxHash32;
 
 #[derive(Debug)]
@@ -405,7 +407,7 @@ Options:
   -m, --message-key <MESSAGE_KEY>
           Messages key which will be used to partition the messages
 {CLAP_INDENT}
-          Value of the key will be used by the server to calculate the partition ID
+          The key must contain 1 to 255 bytes. Binary clients resolve the partition ID; HTTP resolves it on the server.
 
   -H, --headers <HEADERS>
           Comma separated list of key:kind:value, sent as header with the message
@@ -460,4 +462,42 @@ Options:
             ),
         ))
         .await;
+}
+
+#[test]
+#[parallel]
+fn given_invalid_message_key_when_sending_should_reject_before_connecting() {
+    const UNREACHABLE_SERVER_ADDRESS: &str = "127.0.0.1:0";
+    const ARGUMENT_PARSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let cli_home = tempfile::tempdir().unwrap();
+    let oversized_key = "x".repeat(usize::from(u8::MAX) + 1);
+    let oversized_unicode_key = "é".repeat(usize::from(u8::MAX) / "é".len() + 1);
+
+    for key in ["", oversized_key.as_str(), oversized_unicode_key.as_str()] {
+        #[allow(deprecated)]
+        let mut command = assert_cmd::Command::cargo_bin("iggy").unwrap();
+        command
+            .env("IGGY_HOME", cli_home.path())
+            .args([
+                "--tcp-server-address",
+                UNREACHABLE_SERVER_ADDRESS,
+                "-u",
+                DEFAULT_ROOT_USERNAME,
+                "-p",
+                DEFAULT_ROOT_PASSWORD,
+                "message",
+                "send",
+                "--message-key",
+                key,
+                "stream",
+                "topic",
+                "payload",
+            ])
+            .timeout(ARGUMENT_PARSE_TIMEOUT)
+            .assert()
+            .code(2)
+            .stderr(contains("--message-key <MESSAGE_KEY>"))
+            .stderr(contains("Invalid command"));
+    }
 }

@@ -21,8 +21,8 @@
 //! core so they do not fight over CPU time. This module reads the
 //! operator's choice ([`CpuAllocation`] from the config), looks at the
 //! real machine with `hwloc`, and hands back one [`ShardInfo`] per
-//! shard. On Linux it also pins each shard's thread to its core and
-//! pins memory to the right NUMA node, so memory stays close and fast.
+//! shard. With pinning enabled on Linux, it binds shard threads to CPUs.
+//! NUMA allocation modes also bind memory to the selected node.
 
 use cpu_allocation::{CpuAllocation, NumaConfig, allowed_cpus};
 use hwlocality::Topology;

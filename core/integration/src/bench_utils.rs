@@ -37,7 +37,7 @@ const DEFAULT_NUMBER_OF_STREAMS: u64 = 8;
 // the stale-binary hint below with it. Exists because a stale prebuilt
 // iggy-bench speaking an outdated protocol hangs both sides silently
 // instead of erroring.
-const BENCH_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
+pub const BENCH_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub fn run_bench_and_wait_for_finish(
     server_addr: &str,

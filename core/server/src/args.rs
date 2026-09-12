@@ -49,8 +49,8 @@ CONFIGURATION:
 ENVIRONMENT VARIABLES:
     Any configuration value can be overridden with an IGGY_ prefixed variable;
     underscores separate the nested keys (IGGY_TCP_ADDRESS sets [tcp] address).
-    A '.env' file in the working directory is loaded during startup, or the one
-    named by IGGY_ENV_PATH.
+    A '.env' file in the working directory or its parents is loaded at startup,
+    or the one named by IGGY_ENV_PATH.
 
     Common examples:
         IGGY_PATH=/data/iggy                    # Data directory
@@ -110,9 +110,9 @@ pub struct Args {
     /// already present in the environment, so the flag is equivalent to
     /// exporting both by hand and the environment always takes precedence.
     ///
-    /// Only the first creation of the root user reads these values. On an
-    /// existing data directory the stored root user is recovered as it is and
-    /// the flag has no effect.
+    /// These values initialize only a newly created root user. On restart,
+    /// supplied credentials are validated but do not replace the recovered
+    /// root user or its stored password.
     ///
     /// Examples:
     ///   iggy-server --with-default-root-credentials     # Root logs in as iggy/iggy
