@@ -78,13 +78,12 @@ const INDEX_SCAN_YIELD_STRIDE: u64 = 1024;
 
 /// Index entries the log may legitimately fail to back under `durable_segments`.
 /// Persistence writes exactly one entry per flush chunk and chunks never
-/// overlap. The two halves fdatasync concurrently WITHIN one flush, but
-/// flushes are serialized, and the log's fdatasync covers the whole file: an
-/// entry existing above entry N therefore proves the log was synced through
-/// chunk N. Only the chunk in flight when the process died can leave an entry
-/// the log never backed. See [`PartitionRecoveryRefusal::FsyncedLogLoss`] for
-/// why a deeper step-back is evidence about the log rather than about the
-/// index.
+/// overlap. The WAL makes a body durable before it acknowledges it, and the
+/// flush that indexes that body runs later still, so an entry existing on disk
+/// proves the log bytes it names were already fdatasynced. Only the chunk in
+/// flight when the process died can leave an entry the log never backed. See
+/// [`PartitionRecoveryRefusal::FsyncedLogLoss`] for why a deeper step-back is
+/// evidence about the log rather than about the index.
 const MAX_FSYNCED_INDEX_STEP_BACK_ENTRIES: u64 = 1;
 
 /// Index entries the backward anchor search probes before giving up, at one

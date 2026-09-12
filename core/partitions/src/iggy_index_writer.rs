@@ -106,6 +106,14 @@ impl IggyIndexWriter {
     ///
     /// Returns an error if the index bytes cannot be written or synced to disk.
     pub(crate) async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
+        let saved = self.save_indexes_buffered(indexes).await?;
+        if saved > 0 && self.fsync {
+            self.fsync().await?;
+        }
+        Ok(saved)
+    }
+
+    pub(crate) async fn save_indexes_buffered(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
         if indexes.is_empty() {
             return Ok(0);
         }
@@ -118,10 +126,6 @@ impl IggyIndexWriter {
             .await
             .0
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
-
-        if self.fsync {
-            self.fsync().await?;
-        }
 
         trace!(
             target: "iggy.partitions.storage",
@@ -161,6 +165,17 @@ impl IggyIndexWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn buffered_indexes_defer_sync_errors_to_the_original_writer_barrier() {
+        let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
+            .await
+            .unwrap();
+        assert_eq!(writer.save_indexes_buffered(vec![1; 32]).await.unwrap(), 32);
+        assert!(writer.fsync().await.is_err());
+        assert!(writer.save_indexes(vec![1; 32]).await.is_err());
+    }
 
     #[compio::test]
     async fn given_seeded_size_diverging_from_disk_when_opening_existing_file_should_return_size_mismatch_error()

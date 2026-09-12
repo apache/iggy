@@ -691,9 +691,15 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
                         && std::fs::read(entry.path().join("frontier"))
                             .ok()
                             .is_some_and(|bytes| {
-                                bytes.len() == 4096
-                                    && u64::from_le_bytes(bytes[48..56].try_into().unwrap()) == 2
-                                    && u64::from_le_bytes(bytes[72..80].try_into().unwrap()) == 2
+                                // The frontier alternates two slots, so scan
+                                // both: a slot only ever holds a state that was
+                                // published, and the checkpoint never goes
+                                // backwards, so either copy naming op 2 proves
+                                // this replica reached it.
+                                bytes.as_chunks::<4096>().0.iter().any(|slot| {
+                                    u64::from_le_bytes(slot[48..56].try_into().unwrap()) == 2
+                                        && u64::from_le_bytes(slot[72..80].try_into().unwrap()) == 2
+                                })
                             })
                 })
             })

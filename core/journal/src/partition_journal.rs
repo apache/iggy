@@ -42,9 +42,38 @@ pub const PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
 pub const PARTITION_WAL_CAPACITY_MIN: u64 = 2 * (64 * 1024 * 1024 + 4096);
 pub const PARTITION_WAL_CAPACITY_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const RECORD_PREFIX: usize = 32;
+/// The published frontier. Rewritten IN PLACE, so anything that freezes a
+/// partition's files must copy this one rather than retain it by hard link.
+pub const FRONTIER_FILE_NAME: &str = "frontier";
+/// Scratch name the complete slot file is built under before it is renamed over
+/// the frontier. Only [`PartitionPrepareJournal::install_frontier`] uses it, so
+/// it appears once per open and never on an acknowledgment path.
+const FRONTIER_TEMPORARY_NAME: &str = "frontier.tmp";
+/// Fixed slots the frontier alternates between, so a publication overwrites the
+/// older copy in place instead of creating and renaming a temporary file.
+const FRONTIER_SLOTS: usize = 2;
+const FRONTIER_BYTES: usize = FRONTIER_SLOTS * PARTITION_WAL_BLOCK_SIZE;
+/// Publication counter, placed directly after the last field the frontier block
+/// encodes so that adding a field cannot silently move it onto this one. Inside
+/// the range the block's own checksum covers, and reserved in every frontier
+/// this build and its predecessor wrote, so a block from before the two-slot
+/// layout reads back as sequence zero.
+const FRONTIER_SEQUENCE_OFFSET: usize = SEALED_STATE_MAGIC_OFFSET + size_of::<u64>();
+const _: () = assert!(FRONTIER_SEQUENCE_OFFSET + size_of::<u64>() <= PARTITION_WAL_BLOCK_SIZE);
 pub const PREPARE_BYTES_MAX: usize = 64 * 1024 * 1024;
-const STATE_MAGIC: &[u8; 8] = b"IGGYWAL1";
-const REFERENCE_STATE_MAGIC: &[u8; 8] = b"IGGYWAL2";
+/// Two-slot frontier. `IGGYWAL1` and `IGGYWAL2` were the single-block layout,
+/// which this build neither writes nor reads.
+///
+/// The value has to differ from those two. A build that predates the slots
+/// reads block 0 and truncates the data file to the length it finds there, and
+/// after an acknowledgment lands in slot 1 that block is one publication stale.
+/// Rejecting the magic makes such a build refuse the open instead of dropping
+/// acknowledged records.
+const STATE_MAGIC: &[u8; 8] = b"IGGYWAL3";
+/// Segment references live in a flag inside the block, not in the magic, so a
+/// later format bump costs one constant rather than doubling the set.
+const SEGMENT_REFERENCES_FLAG: usize = 100;
+const _: () = assert!(SEGMENT_REFERENCES_FLAG < segments::SEGMENT_STATE_OFFSET);
 const SEALED_STATE_MAGIC_OFFSET: usize =
     segments::SEGMENT_STATE_OFFSET + segments::SEGMENT_STATE_BYTES;
 const INLINE_RECORD: u32 = 0;
@@ -77,6 +106,8 @@ pub trait DurableAppend {
 pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     directory: PathBuf,
     file: S::File,
+    frontier: S::File,
+    frontier_sequence: u64,
     storage: S,
     capacity: u64,
     state: JournalState,
@@ -183,19 +214,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
         storage.create_directories(directory).await?;
         storage.sync_directory(parent).await?;
-        let state_path = directory.join("frontier");
-        let existing = match storage.open(&state_path, OpenMode::Read).await {
-            Ok(file) => {
-                let bytes = file.read(0, PARTITION_WAL_BLOCK_SIZE).await?;
-                let state = JournalState::decode(&bytes)?;
-                if state.group != group || state.incarnation != incarnation {
-                    return Err(invalid("partition WAL identity mismatch"));
-                }
-                Some(state)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
+        let state_path = directory.join(FRONTIER_FILE_NAME);
+        let (published, slots) = Self::open_frontier(&storage, &state_path).await?;
+        let (existing, sequence, verified) = Self::read_frontier(published.as_ref(), slots).await?;
+        if slots > 0 && verified == 0 {
+            return Err(invalid("unreadable partition WAL frontier"));
+        }
+        if let Some(state) = existing
+            && (state.group != group || state.incarnation != incarnation)
+        {
+            return Err(invalid("partition WAL identity mismatch"));
+        }
         if existing.is_none() {
             Self::validate_unpublished_history(&storage, directory).await?;
         }
@@ -216,9 +245,26 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if file.length().await? < state.length {
             return Err(invalid("partition WAL lost acknowledged bytes"));
         }
+        // After the data file it names, never before: a frontier is visible the
+        // moment its rename lands, and one naming a generation that does not
+        // exist is unrecoverable history rather than a fresh journal.
+        let (frontier, frontier_sequence) = match published {
+            Some(file) if slots == FRONTIER_SLOTS => (file, sequence),
+            _ => {
+                let sequence =
+                    Self::install_frontier(&storage, directory, &state_path, state, sequence)
+                        .await?;
+                (
+                    storage.open(&state_path, OpenMode::ReadWrite).await?,
+                    sequence,
+                )
+            }
+        };
         let mut journal = Self {
             directory: directory.to_path_buf(),
             file,
+            frontier,
+            frontier_sequence,
             storage,
             capacity,
             state,
@@ -234,25 +280,124 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             preallocate_segments,
             retained_bytes: 0,
         };
-        journal.recover_entries().await?;
-        // Only bytes covered by the durable frontier could have released an ack.
-        journal.file.truncate(state.length).await?;
+        // A slot that did not verify may have been the newest, so the frontier
+        // this open read can name less than an acknowledgment already covered.
+        // Only then does recovery walk past the frontier.
+        journal.recover_entries(verified < slots).await?;
+        // Only verified bytes could have released an ack. Recovery adopted every
+        // record past the published frontier whose envelope, chain and body all
+        // verify; what follows them is a tail no barrier ever covered.
+        let recovered = journal.state;
+        journal.durable_head = recovered.head;
+        journal.file.truncate(recovered.length).await?;
         journal.file.sync().await?;
         journal.storage.sync_directory(directory).await?;
-        if existing.is_none() {
-            journal.publish(state).await?;
+        // Also when nothing changed but a slot did not verify: leaving it
+        // damaged keeps every later open on the tail-walking path, where an
+        // ordinary unacknowledged tail reads as damage and refuses the open.
+        // Publication targets the slot that is not the newest, which is the
+        // damaged one.
+        if recovered != state || verified < slots {
+            journal.publish(recovered).await?;
         }
-        journal.discover_obsolete().await?;
-        loop {
-            let remaining = journal.obsolete.len();
-            journal.cleanup_obsolete().await;
-            if journal.obsolete.is_empty() || journal.obsolete.len() == remaining {
-                break;
-            }
-        }
+        journal.remove_obsolete_history().await?;
         journal.recover_segment_files().await?;
         journal.migrate_segment_prepares().await?;
         Ok(journal)
+    }
+
+    /// Open the frontier slot file without creating it, with the number of whole
+    /// slots it holds.
+    ///
+    /// A visible frontier always holds whole slots: it is only ever created, or
+    /// grown to its full slot count, by [`Self::install_frontier`], through a
+    /// rename. Publication then overwrites one slot of a file it never resizes.
+    /// A length in between belongs to no protocol this build can read.
+    async fn open_frontier(storage: &S, path: &Path) -> io::Result<(Option<S::File>, usize)> {
+        let published = match storage.open(path, OpenMode::ReadWrite).await {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let length = match &published {
+            Some(file) => file.length().await?,
+            None => 0,
+        };
+        if length > FRONTIER_BYTES as u64 || !length.is_multiple_of(PARTITION_WAL_BLOCK_SIZE as u64)
+        {
+            return Err(invalid("unknown partition WAL frontier size"));
+        }
+        let slots = usize::try_from(length)
+            .map_err(|_| invalid("unknown partition WAL frontier size"))?
+            / PARTITION_WAL_BLOCK_SIZE;
+        Ok((published, slots))
+    }
+
+    /// Install a complete slot file, atomically, and return its newest sequence.
+    ///
+    /// Runs once per open: for a journal that has no frontier yet, and for one
+    /// whose frontier predates the second slot. Both slots carry `state`, so the
+    /// first in-place publication always has an intact partner to fall back on,
+    /// and a visible frontier never holds a slot no publication completed. That
+    /// is what lets [`Self::open_frontier`] trust the file it finds: a torn
+    /// write inside this temporary name never becomes the frontier, and a torn
+    /// write afterwards can only damage the slot being published.
+    async fn install_frontier(
+        storage: &S,
+        directory: &Path,
+        path: &Path,
+        state: JournalState,
+        sequence: u64,
+    ) -> io::Result<u64> {
+        let temporary = directory.join(FRONTIER_TEMPORARY_NAME);
+        let mut file = storage.open(&temporary, OpenMode::Create).await?;
+        let mut newest = sequence;
+        for _ in 0..FRONTIER_SLOTS {
+            newest = newest
+                .checked_add(1)
+                .ok_or_else(|| invalid("WAL frontier sequence exhausted"))?;
+            file.write_aligned(frontier_offset(newest), state.encode(newest))
+                .await?;
+        }
+        file.sync().await?;
+        storage.rename(&temporary, path).await?;
+        storage.sync_directory(directory).await?;
+        Ok(newest)
+    }
+
+    /// The newest intact slot wins. A slot that fails verification is either the
+    /// interrupted half of the publication in flight, which never released an
+    /// acknowledgment, or a copy the newer one superseded; either way its
+    /// partner is the frontier. Losing the NEWEST slot rolls the published
+    /// prefix back one publication, which [`Self::recover_unpublished_tail`]
+    /// then re-adopts from the records themselves.
+    ///
+    /// Returns the newest intact slot, its publication sequence, and how many
+    /// of the `slots` whole blocks verified. A slot that does not verify is
+    /// either the interrupted half of a publication in flight or a copy the
+    /// newer one superseded, so the count is what tells the caller whether the
+    /// frontier it got could be older than an acknowledgment already covered.
+    async fn read_frontier(
+        file: Option<&S::File>,
+        slots: usize,
+    ) -> io::Result<(Option<JournalState>, u64, usize)> {
+        let mut newest = None;
+        let mut sequence = 0;
+        let mut verified = 0;
+        let Some(file) = file.filter(|_| slots > 0) else {
+            return Ok((newest, sequence, verified));
+        };
+        let bytes = file.read(0, slots * PARTITION_WAL_BLOCK_SIZE).await?;
+        for slot in bytes.as_chunks::<PARTITION_WAL_BLOCK_SIZE>().0 {
+            if let Ok((state, slot_sequence)) = JournalState::decode(slot) {
+                verified += 1;
+                if newest.is_none() || slot_sequence > sequence {
+                    newest = Some(state);
+                    sequence = slot_sequence;
+                }
+            }
+        }
+        Ok((newest, sequence, verified))
     }
 
     pub const fn certified_log_view(&self) -> Option<u32> {
@@ -350,7 +495,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     pub async fn prepares(&self) -> io::Result<Vec<Message<PrepareHeader>>> {
         let mut prepares = Vec::with_capacity(self.entries.len());
         for entry in self.entries.values() {
-            let (_, length, prepare, _) = self.read_record(entry.position).await?;
+            let (_, length, prepare, _) =
+                self.read_record(entry.position, self.state.length).await?;
             if length != entry.length {
                 return Err(invalid("partition WAL index length mismatch"));
             }
@@ -534,6 +680,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
 
     /// Make every buffered predecessor recoverable with one frontier publication.
     ///
+    /// The body barrier and the WAL barrier cover different inodes, so they run
+    /// under one `join` and a batch pays one barrier latency rather than two.
+    /// Their completion order does not matter, because neither is the
+    /// acknowledgment point: the frontier publication is, and it follows both.
+    ///
     /// # Errors
     /// Returns an error unless the buffered prefix and its frontier are durable.
     pub async fn sync(&mut self) -> io::Result<()> {
@@ -542,8 +693,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Ok(());
         }
         self.poisoned = true;
-        self.sync_segment_files().await?;
-        self.file.sync().await?;
+        let (bodies, records) =
+            futures::future::join(self.segment_barrier(), self.file.sync()).await;
+        bodies?;
+        records?;
+        self.segment_files_dirty = false;
+        self.segment_links_dirty = false;
         self.publish(self.state).await?;
         self.durable_head = self.state.head;
         self.retain_active_segment_file();
@@ -741,13 +896,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    async fn recover_entries(&mut self) -> io::Result<()> {
+    /// Rebuild the entry index from the published prefix, which must verify in
+    /// full. `lost_publication` extends the walk past that prefix through
+    /// [`Self::recover_unpublished_tail`].
+    async fn recover_entries(&mut self, lost_publication: bool) -> io::Result<()> {
         let state = self.state;
         let mut position = 0;
         let mut previous = state.checkpoint;
         let mut checksum = state.checkpoint_checksum;
         while position < state.length {
-            let (header, length, prepare, reference) = self.read_record(position).await?;
+            let (header, length, prepare, reference) =
+                self.read_record(position, state.length).await?;
             let next_offset = if state.segment_storage.is_some() && reference.is_some() {
                 Some(segments::batch_next_offset(prepare.as_slice())?)
             } else {
@@ -790,7 +949,108 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .values()
             .map(|entry| entry.retained_bytes)
             .sum();
+        if lost_publication {
+            self.recover_unpublished_tail(previous, checksum).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Recover the records a frontier publication this open could not read had
+    /// already covered.
+    ///
+    /// Runs only when a slot failed to verify, which can happen only while a
+    /// publication was in flight. The writer is serial and publishes after both
+    /// data barriers, so a publication in flight proves every record before it
+    /// was already durable: between the surviving frontier and the end of the
+    /// data file the records are complete, and every one of them is adopted.
+    ///
+    /// That is why this walk REFUSES instead of stopping. Once a slot is lost,
+    /// nothing left on disk says how far acknowledgment had reached, so a record
+    /// that does not verify there cannot be dismissed as an unwritten tail. It
+    /// is damage to history that may have been acknowledged, and the partition
+    /// has to fence and rebuild from its peers rather than open a truncated log.
+    /// When both slots verify the frontier is exact and the tail is discarded as
+    /// it always was.
+    async fn recover_unpublished_tail(
+        &mut self,
+        mut previous: u64,
+        mut checksum: u128,
+    ) -> io::Result<()> {
+        // Bounded by the protocol, never by `capacity`: that budget is
+        // configurable and only gates admission, so a lowered one must still
+        // reopen the history it already accepted.
+        let limit = self.file.length().await?;
+        if limit > PARTITION_WAL_CAPACITY_MAX {
+            return Err(invalid("partition WAL recovered tail exceeds its bounds"));
+        }
+        let mut position = self.state.length;
+        while position < limit {
+            let (header, length, prepare, reference) = self.read_record(position, limit).await?;
+            let next_op = previous
+                .checked_add(1)
+                .ok_or_else(|| invalid("WAL op overflow"))?;
+            if header.op != next_op || (self.state.anchor_known && header.parent != checksum) {
+                return Err(invalid("partition WAL prepare chain is broken"));
+            }
+            let body_bytes = record_length(header.size as usize)? as u64;
+            let mut state = self.state;
+            let next_offset = if let Some(segments) = &mut state.segment_storage {
+                let (reserved, next_offset) = segments.reserve(&header, prepare.as_slice())?;
+                if reserved != reference || !segments.valid() {
+                    return Err(invalid("partition WAL recovered segment boundary mismatch"));
+                }
+                next_offset
+            } else {
+                None
+            };
+            state.length = position + length as u64;
+            state.head = header.op;
+            state.head_checksum = header.checksum;
+            state.segment_references |= reference.is_some();
+            if state
+                .certified_log_view
+                .is_some_and(|view| header.view > view)
+            {
+                state.certified_log_view = None;
+            }
+            if !state.anchor_known {
+                state.checkpoint_checksum = header.parent;
+                state.anchor_known = true;
+            }
+            self.recovered_prepares.push(prepare);
+            self.entries.insert(
+                header.op,
+                StoredPrepare {
+                    position,
+                    length,
+                    checksum: header.checksum,
+                    reference,
+                    next_offset,
+                    retained_bytes: body_bytes,
+                },
+            );
+            self.retained_bytes += body_bytes;
+            self.state = state;
+            previous = header.op;
+            checksum = header.checksum;
+            position += length as u64;
+        }
         Ok(())
+    }
+
+    /// Drop every file the recovered history does not retain, repeating while
+    /// the queue shrinks: `cleanup_obsolete` removes a bounded batch per call
+    /// and re-queues what it could not remove.
+    async fn remove_obsolete_history(&mut self) -> io::Result<()> {
+        self.discover_obsolete().await?;
+        loop {
+            let remaining = self.obsolete.len();
+            self.cleanup_obsolete().await;
+            if self.obsolete.is_empty() || self.obsolete.len() == remaining {
+                return Ok(());
+            }
+        }
     }
 
     async fn discover_obsolete(&mut self) -> io::Result<()> {
@@ -805,7 +1065,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 .and_then(|value| value.parse::<u64>().ok());
             if !entry.directory
                 && (generation.is_some_and(|generation| generation != self.state.generation)
-                    || name == "frontier.tmp"
+                    || name == FRONTIER_TEMPORARY_NAME
                     || (is_retained_segment_name(name)
                         && !retained.contains(&self.directory.join(&entry.name))))
             {
@@ -842,7 +1102,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
 
     async fn validate_unpublished_history(storage: &S, directory: &Path) -> io::Result<()> {
         for entry in storage.entries(directory).await? {
-            if entry.directory || entry.name == "frontier.tmp" {
+            if entry.directory || entry.name == FRONTIER_TEMPORARY_NAME {
                 continue;
             }
             // An interrupted first open can leave only its empty generation-zero file.
@@ -876,13 +1136,15 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     async fn read_record(
         &self,
         position: u64,
+        limit: u64,
     ) -> io::Result<(
         PrepareHeader,
         usize,
         Message<PrepareHeader>,
         Option<SegmentReference>,
     )> {
-        let (mut buffer, frame_length, reference) = self.read_encoded_record(position).await?;
+        let (mut buffer, frame_length, reference) =
+            self.read_encoded_record(position, limit).await?;
         let length = buffer.as_slice().len();
         if let Some(reference) = reference {
             let payload = &buffer.as_slice()[RECORD_PREFIX..RECORD_PREFIX + frame_length];
@@ -935,6 +1197,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     async fn read_encoded_record(
         &self,
         position: u64,
+        limit: u64,
     ) -> io::Result<(Owned<4096>, usize, Option<SegmentReference>)> {
         let prefix = self
             .file
@@ -948,7 +1211,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         let length = record_length(frame_length)?;
         if position
             .checked_add(length as u64)
-            .is_none_or(|end| end > self.state.length)
+            .is_none_or(|end| end > limit)
         {
             return Err(invalid("partition WAL record crosses durable frontier"));
         }
@@ -1018,21 +1281,41 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok((buffer, frame_length, reference))
     }
 
-    async fn publish(&self, state: JournalState) -> io::Result<()> {
+    /// Publish the frontier by overwriting the older of two fixed slots.
+    ///
+    /// Both slots exist and hold a complete record from the moment the journal
+    /// opens ([`Self::install_frontier`]), so a publication is one 4096-byte
+    /// overwrite plus `fdatasync`: no create, no truncate, no size change, no
+    /// rename and no directory barrier. On a journaling filesystem that is the
+    /// difference between zero metadata transactions per acknowledgment and
+    /// roughly two, which at thousands of acknowledgments per second per node
+    /// costs more than the prepare bytes the batch carries.
+    ///
+    /// A torn slot fails its checksum and its partner still holds the previous
+    /// publication, the guarantee the temporary-file rename used to provide.
+    /// Unlike the rename, an unreadable NEWEST slot leaves the published prefix
+    /// one publication behind; [`Self::recover_unpublished_tail`] recovers it
+    /// from the records themselves.
+    ///
+    /// The slot follows the sequence's parity, so a publication never overwrites
+    /// the copy it would have to fall back on.
+    async fn publish(&mut self, state: JournalState) -> io::Result<()> {
         if state
             .segment_storage
             .is_some_and(|segments| !segments.valid())
         {
             return Err(invalid("invalid durable segment boundaries"));
         }
-        let temporary = self.directory.join("frontier.tmp");
-        let mut file = self.storage.open(&temporary, OpenMode::Create).await?;
-        file.write(0, state.encode()).await?;
-        file.sync().await?;
-        self.storage
-            .rename(&temporary, &self.directory.join("frontier"))
+        let sequence = self
+            .frontier_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("WAL frontier sequence exhausted"))?;
+        self.frontier
+            .write_aligned(frontier_offset(sequence), state.encode(sequence))
             .await?;
-        self.storage.sync_directory(&self.directory).await
+        self.frontier.sync().await?;
+        self.frontier_sequence = sequence;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1113,8 +1396,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             if op < checkpoint || truncate.is_some_and(|from| op >= from) {
                 continue;
             }
-            let (record, payload_length, mut reference) =
-                self.read_encoded_record(entry.position).await?;
+            let (record, payload_length, mut reference) = self
+                .read_encoded_record(entry.position, self.state.length)
+                .await?;
             let mut next_offset = entry.next_offset;
             // Purge removes polled data, but these operations still participate
             // in repair. Inline their bodies before releasing whole segment inodes.
@@ -1122,7 +1406,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 && reference.is_some()
                 && op <= state.purge_floor
             {
-                let (_, _, prepare, _) = self.read_record(entry.position).await?;
+                let (_, _, prepare, _) =
+                    self.read_record(entry.position, self.state.length).await?;
                 reference = None;
                 next_offset = None;
                 Some(prepare)
@@ -1198,6 +1483,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.sync_segment_files().await?;
         file.sync().await?;
         self.storage.sync_directory(&self.directory).await?;
+        // The outgoing generation too, through the handle that wrote it. A torn
+        // publication leaves the older slot naming this generation, and recovery
+        // then walks its tail. An unsynced record there is indistinguishable
+        // from damage, which would refuse an otherwise sound history.
+        self.file.sync().await?;
         self.publish(state).await?;
         let obsolete = data_path(&self.directory, self.state.generation);
         let retained = self.retained_segment_paths(&entries, state.segment_storage);
@@ -1231,13 +1521,18 @@ impl<S: DurableStorage> DurableAppend for PartitionPrepareJournal<S> {
 }
 
 impl JournalState {
-    fn encode(self) -> Vec<u8> {
-        let mut bytes = vec![0; PARTITION_WAL_BLOCK_SIZE];
-        bytes[..8].copy_from_slice(if self.segment_references {
-            REFERENCE_STATE_MAGIC
-        } else {
-            STATE_MAGIC
-        });
+    /// Encode one frontier slot into an aligned single-block buffer.
+    ///
+    /// Aligned, block-sized and written at a block-aligned offset into a file
+    /// that never resizes, so the publication already satisfies what `O_DIRECT`
+    /// requires of a write and needs no read-modify-write to get there.
+    fn encode(self, sequence: u64) -> Owned<4096> {
+        let mut buffer = Owned::zeroed(PARTITION_WAL_BLOCK_SIZE);
+        let bytes = buffer.as_mut_slice();
+        bytes[FRONTIER_SEQUENCE_OFFSET..FRONTIER_SEQUENCE_OFFSET + size_of::<u64>()]
+            .copy_from_slice(&sequence.to_le_bytes());
+        bytes[..8].copy_from_slice(STATE_MAGIC);
+        bytes[SEGMENT_REFERENCES_FLAG] = u8::from(self.segment_references);
         for (offset, value) in [
             (16, self.group),
             (24, self.incarnation),
@@ -1268,13 +1563,11 @@ impl JournalState {
         bytes.copy_within(..8, SEALED_STATE_MAGIC_OFFSET);
         let checksum = XxHash3_64::oneshot(&bytes[16..]);
         bytes[8..16].copy_from_slice(&checksum.to_le_bytes());
-        bytes
+        buffer
     }
 
-    fn decode(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() != PARTITION_WAL_BLOCK_SIZE
-            || (&bytes[..8] != STATE_MAGIC && &bytes[..8] != REFERENCE_STATE_MAGIC)
-        {
+    fn decode(bytes: &[u8]) -> io::Result<(Self, u64)> {
+        if bytes.len() != PARTITION_WAL_BLOCK_SIZE || &bytes[..8] != STATE_MAGIC {
             return Err(invalid("unknown partition WAL frontier format"));
         }
         let read_u64 = |offset| -> io::Result<u64> {
@@ -1287,15 +1580,21 @@ impl JournalState {
         if read_u64(8)? != XxHash3_64::oneshot(&bytes[16..]) {
             return Err(invalid("partition WAL frontier checksum mismatch"));
         }
-        let sealed_magic = &bytes[SEALED_STATE_MAGIC_OFFSET..SEALED_STATE_MAGIC_OFFSET + 8];
-        if sealed_magic != [0; 8] && sealed_magic != &bytes[..8] {
+        // The magic sits outside the checksummed range, so this copy inside it
+        // is what proves the magic itself was not damaged.
+        if bytes[SEALED_STATE_MAGIC_OFFSET..SEALED_STATE_MAGIC_OFFSET + 8] != bytes[..8] {
             return Err(invalid("partition WAL frontier format checksum mismatch"));
         }
+        let segment_references = match bytes[SEGMENT_REFERENCES_FLAG] {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("invalid segment reference flag")),
+        };
         let state = Self {
-            segment_references: &bytes[..8] == REFERENCE_STATE_MAGIC,
+            segment_references,
             segment_storage: match bytes[segments::SEGMENT_STATE_FLAG] {
                 0 => None,
-                1 if &bytes[..8] == REFERENCE_STATE_MAGIC => Some(SegmentState::decode(
+                1 if segment_references => Some(SegmentState::decode(
                     &bytes[segments::SEGMENT_STATE_OFFSET
                         ..segments::SEGMENT_STATE_OFFSET + segments::SEGMENT_STATE_BYTES],
                 )?),
@@ -1348,8 +1647,14 @@ impl JournalState {
         {
             return Err(invalid("invalid partition WAL frontier bounds"));
         }
-        Ok(state)
+        Ok((state, read_u64(FRONTIER_SEQUENCE_OFFSET)?))
     }
+}
+
+/// Byte offset of the slot a publication sequence owns. Alternating by parity is
+/// what keeps a publication off the copy it would have to fall back on.
+const fn frontier_offset(sequence: u64) -> u64 {
+    (sequence % FRONTIER_SLOTS as u64) * PARTITION_WAL_BLOCK_SIZE as u64
 }
 
 /// Padded size of a prepare record, including its envelope.
@@ -1681,9 +1986,14 @@ mod tests {
             .await
             .unwrap();
         journal.sync().await.unwrap();
-        assert_eq!(
-            &std::fs::read(directory.join("frontier")).unwrap()[..8],
-            REFERENCE_STATE_MAGIC
+        let published = std::fs::read(directory.join("frontier")).unwrap();
+        assert_eq!(&published[..8], STATE_MAGIC);
+        assert!(
+            published
+                .as_chunks::<PARTITION_WAL_BLOCK_SIZE>()
+                .0
+                .iter()
+                .any(|slot| slot[SEGMENT_REFERENCES_FLAG] == 1)
         );
         journal.mark_purge(1, 2).await.unwrap();
         DiskStorage
@@ -1914,6 +2224,76 @@ mod tests {
             journal.file.metadata().await.unwrap().len(),
             journal.size_bytes()
         );
+    }
+
+    #[compio::test]
+    async fn a_lost_frontier_slot_recovers_the_acknowledged_tail() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.append(second.into_frozen()).await.unwrap();
+        // Publication alternates two slots of one file in place: no temporary
+        // name is created and renamed per acknowledgment.
+        let path = directory.path().join("frontier");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            FRONTIER_BYTES as u64
+        );
+        assert!(!directory.path().join("frontier.tmp").exists());
+        let newest = usize::try_from(journal.frontier_sequence % FRONTIER_SLOTS as u64).unwrap()
+            * PARTITION_WAL_BLOCK_SIZE;
+        drop(journal);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[newest..newest + PARTITION_WAL_BLOCK_SIZE].fill(0);
+        std::fs::write(&path, bytes).unwrap();
+        // The surviving slot names op 1, but op 2 was acknowledged: recovery
+        // walks past the frontier it could read and adopts the verified record.
+        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 2);
+        assert_eq!(journal.prepares().await.unwrap().len(), 2);
+    }
+
+    #[compio::test]
+    async fn a_lost_frontier_slot_does_not_hide_damaged_acknowledged_records() {
+        for damage in ["zeroed", "shortened"] {
+            let directory = tempdir().unwrap();
+            let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+                .await
+                .unwrap();
+            let first = prepare(1, 0);
+            let second = prepare(2, first.header().checksum);
+            journal.append(first.into_frozen()).await.unwrap();
+            journal.append(second.into_frozen()).await.unwrap();
+            let newest = usize::try_from(frontier_offset(journal.frontier_sequence)).unwrap();
+            let position = usize::try_from(journal.entries[&2].position).unwrap();
+            let data = data_path(directory.path(), journal.state.generation);
+            drop(journal);
+            let frontier = directory.path().join(FRONTIER_FILE_NAME);
+            let mut slots = std::fs::read(&frontier).unwrap();
+            slots[newest..newest + PARTITION_WAL_BLOCK_SIZE].fill(0);
+            std::fs::write(&frontier, &slots).unwrap();
+            let mut records = std::fs::read(&data).unwrap();
+            match damage {
+                "zeroed" => records[position..].fill(0),
+                "shortened" => records.truncate(position + PARTITION_WAL_BLOCK_SIZE / 2),
+                _ => unreachable!(),
+            }
+            std::fs::write(&data, &records).unwrap();
+            assert!(
+                PartitionPrepareJournal::open(directory.path(), 42, 7)
+                    .await
+                    .is_err(),
+                "{damage}: recovery must refuse uncertain acknowledged history"
+            );
+            assert_eq!(std::fs::read(&data).unwrap(), records);
+            assert_eq!(std::fs::read(&frontier).unwrap(), slots);
+        }
     }
 
     #[compio::test]
@@ -2184,10 +2564,10 @@ mod tests {
             incarnation: 7,
             ..JournalState::default()
         };
-        let mut bytes = state.encode();
-        assert_eq!(JournalState::decode(&bytes).unwrap(), state);
-        bytes[24] ^= 1;
-        assert!(JournalState::decode(&bytes).is_err());
+        let mut bytes = state.encode(1);
+        assert_eq!(JournalState::decode(bytes.as_slice()).unwrap().0, state);
+        bytes.as_mut_slice()[24] ^= 1;
+        assert!(JournalState::decode(bytes.as_slice()).is_err());
     }
 
     #[compio::test]
@@ -2457,9 +2837,12 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let encoded = state.encode();
-            assert!(JournalState::decode(&encoded).is_err(), "{invalid}");
-            std::fs::write(directory.join("frontier"), encoded).unwrap();
+            let encoded = state.encode(1);
+            assert!(
+                JournalState::decode(encoded.as_slice()).is_err(),
+                "{invalid}"
+            );
+            std::fs::write(directory.join("frontier"), encoded.as_slice()).unwrap();
             drop(journal);
             let error = PartitionPrepareJournal::open(&directory, 42, 7)
                 .await
@@ -2509,9 +2892,9 @@ mod tests {
             .unwrap();
         let mut state = journal.state;
         state.segment_storage.as_mut().unwrap().max_size = iggy_common::MAX_TOPIC_SEGMENT_SIZE + 1;
-        let encoded = state.encode();
-        assert!(JournalState::decode(&encoded).is_err());
-        std::fs::write(directory.join("frontier"), encoded).unwrap();
+        let encoded = state.encode(1);
+        assert!(JournalState::decode(encoded.as_slice()).is_err());
+        std::fs::write(directory.join("frontier"), encoded.as_slice()).unwrap();
         drop(journal);
         assert!(
             PartitionPrepareJournal::open_with_storage_and_capacity(
@@ -2537,24 +2920,32 @@ mod tests {
                 segment_references,
                 ..JournalState::default()
             };
-            let mut encoded = state.encode();
-            assert_eq!(JournalState::decode(&encoded).unwrap(), state);
+            let encoded = state.encode(1);
+            assert_eq!(JournalState::decode(encoded.as_slice()).unwrap().0, state);
             // The old reader hashes the same payload and ignores reserved bytes.
             assert_eq!(
-                u64::from_le_bytes(encoded[8..16].try_into().unwrap()),
-                XxHash3_64::oneshot(&encoded[16..])
+                u64::from_le_bytes(encoded.as_slice()[8..16].try_into().unwrap()),
+                XxHash3_64::oneshot(&encoded.as_slice()[16..])
             );
-            encoded[..8].copy_from_slice(if segment_references {
-                STATE_MAGIC
-            } else {
-                REFERENCE_STATE_MAGIC
-            });
-            assert!(JournalState::decode(&encoded).is_err());
-            let mut legacy = state.encode();
-            legacy[SEALED_STATE_MAGIC_OFFSET..SEALED_STATE_MAGIC_OFFSET + 8].fill(0);
-            let checksum = XxHash3_64::oneshot(&legacy[16..]);
-            legacy[8..16].copy_from_slice(&checksum.to_le_bytes());
-            assert_eq!(JournalState::decode(&legacy).unwrap(), state);
+            assert_eq!(
+                encoded.as_slice()[SEGMENT_REFERENCES_FLAG],
+                u8::from(segment_references)
+            );
+            // Both single-block magics are refused, which is what keeps a build
+            // that predates the slots from reading block 0 as the whole record.
+            for magic in [b"IGGYWAL1", b"IGGYWAL2"] {
+                let mut legacy = state.encode(1);
+                legacy.as_mut_slice()[..8].copy_from_slice(magic);
+                assert!(JournalState::decode(legacy.as_slice()).is_err());
+            }
+            // The magic is outside the checksummed range, so damaging it is
+            // caught only by the copy inside that range.
+            let mut damaged = state.encode(1);
+            damaged.as_mut_slice()[SEALED_STATE_MAGIC_OFFSET..SEALED_STATE_MAGIC_OFFSET + 8]
+                .fill(0);
+            let checksum = XxHash3_64::oneshot(&damaged.as_slice()[16..]);
+            damaged.as_mut_slice()[8..16].copy_from_slice(&checksum.to_le_bytes());
+            assert!(JournalState::decode(damaged.as_slice()).is_err());
         }
     }
 
@@ -2966,6 +3357,128 @@ mod tests {
         header.checksum_body = u128::from(checksum);
         header.checksum = header.identity_checksum();
         Message::try_from(bytes).unwrap()
+    }
+
+    /// A build that predates the two-slot layout reads block 0 and truncates to
+    /// the length it finds there. After an acknowledgment lands in slot 1 that
+    /// block is one publication stale, so the magic has to be one such a build
+    /// rejects, and a frontier it wrote has to be rejected here in turn.
+    #[compio::test]
+    async fn the_two_slot_frontier_shares_no_magic_with_the_single_block_layout() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        journal.append(prepare(1, 0).into_frozen()).await.unwrap();
+        drop(journal);
+        let path = directory.path().join(FRONTIER_FILE_NAME);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), FRONTIER_BYTES);
+        for slot in bytes.as_chunks::<PARTITION_WAL_BLOCK_SIZE>().0 {
+            assert_eq!(&slot[..8], STATE_MAGIC);
+            assert_ne!(&slot[..8], b"IGGYWAL1");
+            assert_ne!(&slot[..8], b"IGGYWAL2");
+        }
+
+        // The other direction. A frontier a single-block build wrote is not a
+        // format this one reads, so it refuses rather than adopting a length
+        // that predates the slots.
+        let single = tempdir().unwrap();
+        let mut block = JournalState {
+            group: 42,
+            incarnation: 7,
+            ..JournalState::default()
+        }
+        .encode(0);
+        let legacy = block.as_mut_slice();
+        legacy[..8].copy_from_slice(b"IGGYWAL1");
+        legacy.copy_within(..8, SEALED_STATE_MAGIC_OFFSET);
+        let checksum = XxHash3_64::oneshot(&legacy[16..]);
+        legacy[8..16].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(single.path().join(FRONTIER_FILE_NAME), block.as_slice()).unwrap();
+        std::fs::write(data_path(single.path(), 0), []).unwrap();
+        assert!(
+            PartitionPrepareJournal::open(single.path(), 42, 7)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A slot left damaged keeps every later open on the tail-walking path,
+    /// where an ordinary unacknowledged tail reads as damage. Reopening has to
+    /// repair it even when recovery itself adopted nothing.
+    #[compio::test]
+    async fn reopening_repairs_a_damaged_slot_even_when_recovery_changes_nothing() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        journal.append(prepare(1, 0).into_frozen()).await.unwrap();
+        let older = usize::try_from(frontier_offset(journal.frontier_sequence + 1)).unwrap();
+        let data = data_path(directory.path(), journal.state.generation);
+        drop(journal);
+        let path = directory.path().join(FRONTIER_FILE_NAME);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[older..older + PARTITION_WAL_BLOCK_SIZE].fill(0);
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Nothing to adopt, so the recovered state matches the published one.
+        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 1);
+        drop(journal);
+        let repaired = std::fs::read(&path).unwrap();
+        for slot in repaired.as_chunks::<PARTITION_WAL_BLOCK_SIZE>().0 {
+            assert!(JournalState::decode(slot).is_ok());
+        }
+
+        // With both slots intact an unacknowledged partial tail is truncated
+        // rather than walked, so it cannot refuse the open.
+        let mut records = std::fs::read(&data).unwrap();
+        records.extend_from_slice(&[0; PARTITION_WAL_BLOCK_SIZE / 2]);
+        std::fs::write(&data, &records).unwrap();
+        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 1);
+    }
+
+    /// `capacity` gates admission, not recovery. Lowering it must still reopen
+    /// the history the previous budget already accepted, including on the
+    /// tail-walking path a damaged slot forces.
+    #[compio::test]
+    async fn a_lowered_capacity_still_reopens_history_through_a_damaged_slot() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        let second = sized_prepare(2, first.header().checksum, PREPARE_BYTES_MAX);
+        let third = sized_prepare(3, second.header().checksum, PREPARE_BYTES_MAX);
+        journal.append(first.into_frozen()).await.unwrap();
+        // Past the published frontier, so reopening has to walk them, and past
+        // the lowered budget, so a budget check there would refuse them.
+        journal.append_buffered(second.into_frozen()).await.unwrap();
+        journal.append_buffered(third.into_frozen()).await.unwrap();
+        let newest = usize::try_from(frontier_offset(journal.frontier_sequence)).unwrap();
+        drop(journal);
+        let path = directory.path().join(FRONTIER_FILE_NAME);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[newest..newest + PARTITION_WAL_BLOCK_SIZE].fill(0);
+        std::fs::write(&path, &bytes).unwrap();
+        let journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            directory.path(),
+            42,
+            7,
+            DiskStorage,
+            PARTITION_WAL_CAPACITY_MIN,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(journal.head(), 3);
+        assert!(journal.size_bytes() > PARTITION_WAL_CAPACITY_MIN);
     }
 
     fn prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
