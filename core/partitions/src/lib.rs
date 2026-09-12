@@ -23,11 +23,16 @@ mod iggy_index_reader;
 mod iggy_index_writer;
 mod iggy_partition;
 mod iggy_partitions;
+pub mod install_backup;
 mod journal;
 mod log;
 mod messages_writer;
 pub mod offset_storage;
+mod persistence;
 mod poll_plan;
+pub use persistence::{
+    PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
+};
 mod segment;
 pub mod segment_anchor;
 pub mod state_transfer;

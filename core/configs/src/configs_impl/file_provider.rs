@@ -28,32 +28,36 @@ use tracing::{error, info, warn};
 
 const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocatedTarget {
+    TopicOption(&'static str),
+    MovedTo(&'static str),
+    Removed,
+}
+
 /// A config key that no longer exists, and what took over from it.
 ///
-/// Nothing else catches such a key. Its struct field is gone and no config
-/// table sets `deny_unknown_fields`, so figment drops an unrecognized key
-/// without a word from either source: a server still carrying
-/// `enforce_fsync = true` would boot reporting success and run without fsync.
-/// Every relocated key used to change behavior, so the boot is refused rather
-/// than warned about.
+/// Reject obsolete keys explicitly, including environment variables that the
+/// typed provider would otherwise ignore. These entries are rejection rules,
+/// never accepted mappings or compatibility aliases.
 #[derive(Debug, Clone, Copy)]
 pub struct RelocatedKey {
     /// Dotted config path, for example `system.segment.size`. A deleted table
     /// matches everything nested under it as well.
     pub path: &'static str,
-    /// The per-topic option key that replaced it, or `None` when the feature
-    /// it configured was removed outright.
-    pub replacement: Option<&'static str>,
+    /// The replacement location, or an explicit removal with no alias.
+    pub replacement: RelocatedTarget,
 }
 
 impl RelocatedKey {
     /// Sentence telling the operator where the setting went.
     fn guidance(&self) -> String {
         match self.replacement {
-            Some(option) => {
+            RelocatedTarget::TopicOption(option) => {
                 format!("it is now the per-topic '{option}' option, set on CreateTopic")
             }
-            None => "the feature it configured was removed".to_string(),
+            RelocatedTarget::MovedTo(path) => format!("move this setting to '{path}'"),
+            RelocatedTarget::Removed => "this setting or table was removed".to_string(),
         }
     }
 }
@@ -66,6 +70,7 @@ pub struct FileConfigProvider<P> {
     display_config: bool,
     env_prefix: &'static str,
     relocated_keys: &'static [RelocatedKey],
+    known_env_names: Option<Vec<&'static str>>,
 }
 
 impl<P: Provider> FileConfigProvider<P> {
@@ -89,6 +94,7 @@ impl<P: Provider> FileConfigProvider<P> {
             display_config,
             env_prefix: "",
             relocated_keys: &[],
+            known_env_names: None,
         }
     }
 
@@ -109,6 +115,31 @@ impl<P: Provider> FileConfigProvider<P> {
         self
     }
 
+    pub fn with_known_env_names(mut self, names: Vec<&'static str>) -> Self {
+        self.known_env_names = Some(names);
+        self
+    }
+
+    fn reject_unknown_env_names(&self) -> Result<(), ConfigurationError> {
+        let Some(known) = &self.known_env_names else {
+            return Ok(());
+        };
+        let unknown = unknown_env_names(
+            env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+            self.env_prefix,
+            known,
+        );
+        for name in &unknown {
+            eprintln!("Unknown configuration environment variable '{name}'");
+        }
+        let rejected = !unknown.is_empty();
+        if rejected {
+            Err(ConfigurationError::InvalidConfigurationValue)
+        } else {
+            Ok(())
+        }
+    }
+
     fn reject_relocated_keys(&self) -> Result<(), ConfigurationError> {
         if self.relocated_keys.is_empty() {
             return Ok(());
@@ -123,7 +154,7 @@ impl<P: Provider> FileConfigProvider<P> {
                 .is_some_and(|file| file.find_value(key.path).is_ok())
             {
                 found = true;
-                error!(
+                eprintln!(
                     "Config key '{}' no longer exists; {}. Remove the key to boot.",
                     key.path,
                     key.guidance()
@@ -132,7 +163,7 @@ impl<P: Provider> FileConfigProvider<P> {
         }
         for (name, key) in relocated_env_vars(env_names, self.env_prefix, self.relocated_keys) {
             found = true;
-            error!(
+            eprintln!(
                 "Environment variable '{name}' sets config key '{}', which no longer exists; {}. \
                  Unset it to boot.",
                 key.path,
@@ -155,6 +186,7 @@ impl<P: Provider + Clone> ConfigProvider for FileConfigProvider<P> {
         // below is just as silent about a key no field reads, and the
         // pure-env container never touches the file branch at all.
         self.reject_relocated_keys()?;
+        self.reject_unknown_env_names()?;
 
         // Start with the default configuration if provided
         let mut config_builder = Figment::new();
@@ -217,7 +249,7 @@ fn relocated_env_vars<'keys>(
     prefix: &str,
     keys: &'keys [RelocatedKey],
 ) -> Vec<(String, &'keys RelocatedKey)> {
-    let derived: Vec<(String, &RelocatedKey)> = keys
+    let mut derived: Vec<(String, &RelocatedKey)> = keys
         .iter()
         .map(|key| {
             (
@@ -227,6 +259,7 @@ fn relocated_env_vars<'keys>(
         })
         .collect();
 
+    derived.sort_unstable_by_key(|(name, _)| std::cmp::Reverse(name.len()));
     let mut found = Vec::new();
     for name in names {
         for (env_name, key) in &derived {
@@ -240,6 +273,16 @@ fn relocated_env_vars<'keys>(
         }
     }
     found
+}
+
+fn unknown_env_names(
+    names: impl Iterator<Item = String>,
+    prefix: &str,
+    known: &[&str],
+) -> Vec<String> {
+    names
+        .filter(|name| name.starts_with(prefix) && !known.contains(&name.as_str()))
+        .collect()
 }
 
 fn file_exists<P: AsRef<Path>>(path: P) -> bool {
@@ -272,16 +315,42 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
 mod tests {
     use super::*;
 
+    // Intentionally obsolete inputs verify rejection, not compatibility.
     const KEYS: &[RelocatedKey] = &[
         RelocatedKey {
             path: "system.partition.enforce_fsync",
-            replacement: Some("enforce_fsync"),
+            replacement: RelocatedTarget::TopicOption("durability"),
         },
         RelocatedKey {
             path: "system.message_deduplication",
-            replacement: None,
+            replacement: RelocatedTarget::Removed,
         },
     ];
+
+    #[test]
+    fn unknown_names_are_rejected_without_rejecting_known_process_settings() {
+        let unknown = unknown_env_names(
+            names(&[
+                "IGGY_ENCRYPTION_UNKNOWN",
+                "IGGY_TCP_ADDRESS",
+                "IGGY_ROOT_PASSWORD",
+                "PATH",
+            ])
+            .into_iter(),
+            "IGGY_",
+            &["IGGY_TCP_ADDRESS", "IGGY_ROOT_PASSWORD"],
+        );
+        assert_eq!(unknown, vec!["IGGY_ENCRYPTION_UNKNOWN"]);
+    }
+
+    #[test]
+    fn moved_settings_name_their_new_location() {
+        let key = RelocatedKey {
+            path: "system.encryption",
+            replacement: RelocatedTarget::MovedTo("encryption"),
+        };
+        assert_eq!(key.guidance(), "move this setting to 'encryption'");
+    }
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
@@ -297,7 +366,10 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC");
-        assert_eq!(found[0].1.replacement, Some("enforce_fsync"));
+        assert_eq!(
+            found[0].1.replacement,
+            RelocatedTarget::TopicOption("durability")
+        );
     }
 
     #[test]
@@ -310,7 +382,7 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1.path, "system.message_deduplication");
-        assert_eq!(found[0].1.replacement, None);
+        assert_eq!(found[0].1.replacement, RelocatedTarget::Removed);
     }
 
     #[test]
@@ -330,6 +402,34 @@ mod tests {
         assert!(found.is_empty(), "unexpected matches: {found:?}");
     }
 
+    /// The allowlist is exact names but the filter is a bare `IGGY_` prefix, and
+    /// `IGGY_` prefixes every sibling binary's namespace. A shared container
+    /// environment, a shared `env_file`, or the `.env` that `main.rs` loads
+    /// through `dotenvy` before `load_config` runs will refuse server boot.
+    #[test]
+    #[ignore = "PR #4092 review: the `IGGY_` prefix fence refuses the repo's own `IGGY_CONNECTORS_*`, `IGGY_MCP_*` and CLI variables, with no opt-out"]
+    fn given_a_sibling_binarys_env_vars_when_rejecting_then_the_server_should_still_boot() {
+        let siblings = [
+            "IGGY_CONNECTORS_CONFIG_PATH",
+            "IGGY_CONNECTORS_STATE_PATH",
+            "IGGY_MCP_CONFIG_PATH",
+            "IGGY_MCP_TRANSPORT",
+            "IGGY_HOME",
+            "IGGY_USERNAME",
+            "IGGY_PASSWORD",
+        ];
+        let unknown = unknown_env_names(
+            names(&siblings).into_iter(),
+            "IGGY_",
+            crate::server_config::server::SERVER_PROCESS_ENV_VARS,
+        );
+
+        assert!(
+            unknown.is_empty(),
+            "the server refuses to boot when its own sibling products' variables are present: {unknown:?}"
+        );
+    }
+
     #[test]
     fn given_another_configs_prefix_when_matching_then_should_report_none() {
         let found = relocated_env_vars(
@@ -339,6 +439,38 @@ mod tests {
         );
 
         assert!(found.is_empty(), "unexpected matches: {found:?}");
+    }
+
+    /// `main.rs` loads a `.env` through `dotenvy` before `load_config` runs, and
+    /// `dotenvy` injects into the process environment that `reject_unknown_env_names`
+    /// scans with `env::vars_os()`. So the fence does not need a shared container
+    /// or a shared `env_file`: a `.env` in the working directory is enough.
+    ///
+    /// Mutates the process environment, so it must not run beside another test
+    /// that reads it.
+    #[test]
+    #[ignore = "PR #4092 review: a `.env` loaded by `dotenvy` before `load_config` refuses server boot; also mutates the process environment, so it must not run in parallel"]
+    fn given_a_dotenv_with_a_connectors_variable_when_loading_then_the_server_should_boot() {
+        // SAFETY: single-threaded assertion over a variable no other test reads.
+        unsafe { std::env::set_var("IGGY_CONNECTORS_CONFIG_PATH", "/etc/iggy/connectors.toml") };
+
+        let provider = FileConfigProvider::new(
+            "nonexistent-config.toml".to_string(),
+            Toml::string(""),
+            false,
+            None,
+        )
+        .with_relocated_keys("IGGY_", &[])
+        .with_known_env_names(crate::server_config::server::SERVER_PROCESS_ENV_VARS.to_vec());
+        let rejected = provider.reject_unknown_env_names();
+
+        // SAFETY: paired with the set above.
+        unsafe { std::env::remove_var("IGGY_CONNECTORS_CONFIG_PATH") };
+
+        assert!(
+            rejected.is_ok(),
+            "a .env naming the connectors runtime's own config path refuses server boot, with no opt-out and a message that names no remedy"
+        );
     }
 
     #[test]

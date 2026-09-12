@@ -372,7 +372,7 @@ mod tests {
     };
     use crate::responses::build_empty_reply;
     use crate::session_manager::SessionManager;
-    use configs::server::ServerSystemConfig;
+    use configs::server::ServerConfig;
     use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_common::RESYNC_REQUIRED_PARTITION_SENTINEL;
@@ -595,7 +595,7 @@ mod tests {
     async fn snapshot_reply_frame_unchanged() {
         let (bus, shard) = snapshot_shard();
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let system_config = Arc::new(ServerSystemConfig::default());
+        let server_config = Arc::new(ServerConfig::default());
         let request = request_message(Operation::NonReplicated, VSR_CLIENT, SESSION, REQUEST, &[])
             .transmute_header(|header, ping: &mut RoutedRequestHeader| {
                 *ping = header;
@@ -615,7 +615,7 @@ mod tests {
         handle_client_request(
             &shard,
             &sessions,
-            &system_config,
+            &server_config,
             1,
             TRANSPORT,
             request.into_generic(),

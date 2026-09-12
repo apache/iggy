@@ -123,6 +123,21 @@ runs:
           MODE=$(echo "$PLAN_JSON" | jq -r '.scope.mode')
           if [[ "$MODE" == "crates" ]]; then
             CRATES=$(echo "$PLAN_JSON" | jq -r '.scope.crates[]')
+            # `integration` launches the binaries of these packages through
+            # `Command::cargo_bin`, an edge cargo cannot record. The DAG selects
+            # them when their code or a crate they link (e.g. `partitions`)
+            # changes, but it does not select `integration`, so add it here.
+            # Keep this list in sync with the `cargo_bin` calls in core/integration.
+            SPAWNED_BINARY_PACKAGES=(server iggy-connectors iggy-mcp iggy-bench iggy-cli)
+            if ! grep -qx integration <<< "$CRATES"; then
+              for package in "${SPAWNED_BINARY_PACKAGES[@]}"; do
+                if grep -qx "$package" <<< "$CRATES"; then
+                  echo "::notice::Testing integration because it launches the binary of affected package ${package}"
+                  CRATES=$(printf '%s\nintegration\n' "$CRATES")
+                  break
+                fi
+              done
+            fi
             # `iggy_connector_<name>_{sink,source}` is exercised by
             # `integration::connectors::<name>`, but the plugin reaches the
             # runtime through dlopen, so cargo records no edge and the DAG drops

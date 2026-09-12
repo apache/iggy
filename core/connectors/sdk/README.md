@@ -25,9 +25,11 @@ The crash behavior is intentionally at-least-once:
 | After send success but before state persistence | Persisted state is unchanged, so the batch may be delivered again. |
 | After state persistence but before the plugin processes the ACK | The restored state records the delivered batch. Deferred source-side cleanup may still be pending. |
 | After the plugin processes the ACK | The state and plugin cursor both record the delivered batch. |
-| After an in-memory confirmation and source cleanup, but before Iggy fsyncs | A server crash can lose the batch after source cleanup unless server-side `enforce_fsync` is enabled. |
+| After a replicated confirmation and source cleanup, but before stable storage | Losing the replicas holding the unpersisted tail can lose the batch. Create the topic with `durability=persisted` when source cleanup requires durable quorum confirmation. |
 
-An ACK means that Iggy confirmed the batch in memory; durability depends on the server's `enforce_fsync` setting. Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after repeated NACKs.
+An ACK follows Iggy's quorum confirmation. The topic's `durability` policy decides whether that confirmation also waits for stable storage on the quorum. Both policies normally write messages to disk.
+
+Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after repeated NACKs.
 
 The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it. The SDK stops polling if the handler returns an error, preventing a failed rollback from advancing to another batch.
 
@@ -47,6 +49,19 @@ enabled = true
 key = "message"
 value.static = "hello"
 ```
+
+## Retry helpers
+
+`retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.
+
+Two items changed in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
+
+| Removed | Replacement |
+| --- | --- |
+| `ConnectivityConfig` | `RetryPolicy`. `max_open_retries` becomes `max_attempts`, `retry_delay` becomes `base_delay`, and `open_retry_max_delay` becomes `max_delay`. |
+| `jitter` (was public) | `retry_backoff`, which applies the jitter itself. |
+
+Both types carry `(u32, Duration, Duration)` and the two delay roles cross over, so a field-by-field rename compiles and swaps the base delay for the cap. Map the fields by name.
 
 ## Protocol Buffers Support
 

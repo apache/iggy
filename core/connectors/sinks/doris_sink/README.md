@@ -43,8 +43,8 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `timeout` | no | `30s` | Per-request HTTP timeout (total request budget), as a human-readable duration (e.g. `30s`, `1m`). |
 | `connect_timeout` | no | `5s` | TCP connect timeout, independent of `timeout`, as a human-readable duration. Raise it for cross-region or cold-start FEs. |
 | `max_retries` | no | `3` | Total Stream Load attempts per batch on a *transient* failure (`0` or `1` disables retries). Each retry re-PUTs under the same label, which Doris dedupes. Values above `10` are honored but emit a startup warning because they can substantially delay graceful shutdown. |
-| `retry_delay` | no | `200ms` | Base backoff before the first retry; doubles each attempt up to `max_retry_delay`, with ±20% jitter. |
-| `max_retry_delay` | no | `5s` | Strict upper bound on a single retry backoff, including jitter. |
+| `retry_delay` | no | `200ms` | Base backoff before the first retry; doubles each attempt up to `max_retry_delay`, drawn from a ±20% window that is cut off at the cap. |
+| `max_retry_delay` | no | `5s` | Strict upper bound on a single retry backoff, including jitter. The jitter window narrows as the backoff nears this cap, so the bound holds without every instance landing on it. |
 | `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. Must be a finite value in `[0.0, 1.0]`; an out-of-range value fails `open()`. |
 | `columns` | no | unset | Forwarded as the `columns` Stream Load header. Validated at startup; an invalid value fails `open()`. |
 | `where` | no | unset | Forwarded as the `where` Stream Load header. Validated at startup; an invalid value fails `open()`. |

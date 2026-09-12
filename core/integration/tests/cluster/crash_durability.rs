@@ -75,7 +75,7 @@ async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool) {
             partitions_count: Some(1),
             message_expiry: Some(IggyExpiry::NeverExpire),
             messages_required_to_save: Some(1),
-            enforce_fsync: Some(true),
+            durability: iggy_common::Durability::Persisted,
             ..TopicCreateOptions::default()
         }
     } else {
@@ -521,4 +521,378 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
         .unwrap_or_else(|state| {
             panic!("eagerly flushed acked data must survive a whole-cluster SIGKILL: {state}")
         });
+}
+
+/// The kill follows the confirmation without waiting for segment installation.
+/// This exercises the prepare WAL rather than graceful shutdown or page-cache flushes.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_persisted_topic_when_killed_below_flush_threshold_should_recover_acked_messages(
+    harness: &mut TestHarness,
+) {
+    verify_persisted_restart(harness, Durability::Persisted).await;
+}
+
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_persisted_singleton_when_killed_below_flush_threshold_should_recover_acked_messages(
+    harness: &mut TestHarness,
+) {
+    verify_persisted_restart(harness, Durability::Persisted).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_mixed_durability_when_killed_below_flush_threshold_should_recover_offset_predecessors(
+    harness: &mut TestHarness,
+) {
+    verify_persisted_restart(harness, Durability::Replicated).await;
+}
+
+async fn verify_persisted_restart(harness: &mut TestHarness, durability: Durability) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    client
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability,
+                consumer_offset_durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let mut acked = Vec::new();
+    for group in 0..3 {
+        acked.extend(produce_acked(&client, &format!("durable-prepare-{group}"), 4).await);
+        client
+            .store_consumer_offset(
+                &consumer,
+                &stream,
+                &topic,
+                Some(PARTITION_ID),
+                acked.last().unwrap().0,
+            )
+            .await
+            .unwrap();
+    }
+    let stored_offset = acked.last().unwrap().0;
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let stored = client
+            .get_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
+            .await
+            .unwrap();
+        if stored.is_some_and(|stored| stored.stored_offset == stored_offset) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "durable offset was not recovered"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_persisted_topic_when_backup_misses_writes_should_repair_before_durable_ack(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut acked = produce_acked(&client, "before-repair", 4).await;
+    let leader = disk::leader_node_index(harness).await;
+    let backup = (0..3).find(|node| *node != leader).unwrap();
+    harness.kill_node(backup).unwrap();
+    acked.extend(produce_acked(&client, "missed", 8).await);
+    harness.restart_node(backup).unwrap();
+    sleep(Duration::from_secs(6)).await;
+    acked.extend(produce_acked(&client, "after-repair", 4).await);
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let client = wait_until_cluster_serves(harness, &[0, 1, 2], CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(cluster_nodes = 3, server(partition.wal_bytes_max = "134225920 B"))]
+async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_the_log(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream_details = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::numeric(stream_details.id).unwrap();
+    let topic_details = client
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let topic = Identifier::numeric(topic_details.id).unwrap();
+    for batch in 1..=2u8 {
+        let payload = bytes::Bytes::from(vec![batch; 1024 * 1024]);
+        let mut messages = (0..33)
+            .map(|_| {
+                IggyMessage::builder()
+                    .payload(payload.clone())
+                    .build()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        client
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let checkpointed = (0..3).all(|node| {
+            let directory = harness.node(node).data_path().join(format!(
+                "streams/{}/topics/{}/partitions/0",
+                stream_details.id, topic_details.id
+            ));
+            std::fs::read_dir(directory).ok().is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("prepares-")
+                        && std::fs::read(entry.path().join("frontier"))
+                            .ok()
+                            .is_some_and(|bytes| {
+                                bytes.len() == 4096
+                                    && u64::from_le_bytes(bytes[48..56].try_into().unwrap()) == 2
+                                    && u64::from_le_bytes(bytes[72..80].try_into().unwrap()) == 2
+                            })
+                })
+            })
+        });
+        if checkpointed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "all replicas must checkpoint the same head before restart"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let client = wait_until_cluster_serves(harness, &[0, 1, 2], CONVERGE_TIMEOUT).await;
+    // The transferred checkpoint body exceeds the former offsets-only
+    // artifact cap, so this also verifies admission of a large prepare.
+    let payload = bytes::Bytes::from(vec![3; 1024 * 1024]);
+    let mut next = (0..33)
+        .map(|_| {
+            IggyMessage::builder()
+                .payload(payload.clone())
+                .build()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let clients = [
+        client,
+        harness.root_client_for_node(1).await.unwrap(),
+        harness.root_client_for_node(2).await.unwrap(),
+    ];
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    let writer = 'admission: loop {
+        for (index, client) in clients.iter().enumerate() {
+            match client
+                .send_messages(&stream, &topic, &Partitioning::partition_id(0), &mut next)
+                .await
+            {
+                Ok(_) => break 'admission index,
+                Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("checkpointed cluster did not resume writes: {error}"),
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkpointed partition must elect a primary"
+        );
+        sleep(POLL_INTERVAL).await;
+    };
+    let client = &clients[writer];
+    for (offset, value) in [(0, 1u8), (65, 2u8)] {
+        let polled = client
+            .poll_messages(
+                &stream,
+                &topic,
+                Some(0),
+                &Consumer::default(),
+                &PollingStrategy::offset(offset),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(polled.messages.len(), 1);
+        assert_eq!(
+            polled.messages[0].payload.as_ref(),
+            vec![value; 1024 * 1024]
+        );
+    }
+    verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id, 2).await;
+    verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id, 1).await;
+    verify_transferred_quorum(harness, &stream, &topic).await;
+}
+
+async fn verify_checkpoint_quarantine(
+    harness: &mut TestHarness,
+    stream_id: u32,
+    topic_id: u32,
+    node: usize,
+) {
+    let directory = harness.node(node).data_path().join(format!(
+        "streams/{stream_id}/topics/{topic_id}/partitions/0"
+    ));
+    harness.kill_node(node).unwrap();
+    // An empty segment starting inside the existing segment makes the chain
+    // structurally invalid even when recovery can use a sparse index.
+    std::fs::write(directory.join("00000000000000000001.log"), []).unwrap();
+    std::fs::write(directory.join("00000000000000000001.index"), []).unwrap();
+    harness.restart_node(node).unwrap();
+    let client = harness.root_client_for_node(node).await.unwrap();
+    let stream = Identifier::numeric(stream_id).unwrap();
+    let topic = Identifier::numeric(topic_id).unwrap();
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let repaired = client
+            .poll_messages(
+                &stream,
+                &topic,
+                Some(0),
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                1,
+                false,
+            )
+            .await
+            .is_ok_and(|polled| {
+                polled
+                    .messages
+                    .first()
+                    .is_some_and(|message| message.payload.as_ref() == vec![1; 1024 * 1024])
+            });
+        let quarantined = std::fs::read_dir(directory.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("0.fenced."));
+        if repaired && quarantined && !directory.join("materialization.missing").exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "quarantined checkpoint must be restored by full state transfer"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn verify_transferred_quorum(
+    harness: &mut TestHarness,
+    stream: &Identifier,
+    topic: &Identifier,
+) {
+    harness.kill_cluster().unwrap();
+    harness.restart_node(1).unwrap();
+    harness.restart_node(2).unwrap();
+    let _ = wait_until_cluster_serves(harness, &[1, 2], CONVERGE_TIMEOUT).await;
+    let clients = [
+        harness.root_client_for_node(1).await.unwrap(),
+        harness.root_client_for_node(2).await.unwrap(),
+    ];
+    let mut messages = vec![
+        IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"after-donor-loss"))
+            .build()
+            .unwrap(),
+    ];
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        for client in &clients {
+            match client
+                .send_messages(stream, topic, &Partitioning::partition_id(0), &mut messages)
+                .await
+            {
+                Ok(_) => return,
+                Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("transferred quorum rejected the next operation: {error}"),
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "transferred replicas must elect without their donor"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Every persisted case in this file kills with SIGKILL, and the module doc
+/// above states why that cannot reach fsync ordering. This pins the premise:
+/// a completed `write()` lives in the page cache, which the kernel owns, so
+/// process death cannot lose it. Consequently no barrier order (`file.sync()`,
+/// `sync_data()`, `fsync_dir()`) changes the outcome of a single test here,
+/// and `persisted` differs from `replicated` only in surviving writes that
+/// were never synced.
+///
+/// Covering the real contract needs a fault that discards unsynced pages:
+/// either the deterministic simulator (drop the persisted-topic assert in
+/// `core/shard/src/lib.rs` and route partition storage through
+/// `DurableStorage`) or `dm-log-writes` / `dm-flakey --drop_writes` under the
+/// data directory.
+#[test]
+fn given_a_completed_write_when_the_process_is_sigkilled_then_the_bytes_should_survive() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unsynced");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"printf 'acknowledged' > "$0"; kill -9 $$"#)
+        .arg(&path)
+        .status()
+        .expect("spawn a writer that dies before any barrier");
+    assert!(
+        !status.success(),
+        "the writer exited normally, so it is not modelling a crash"
+    );
+
+    let survived = std::fs::read(&path).unwrap_or_default();
+    assert_eq!(
+        survived.as_slice(),
+        b"acknowledged",
+        "an unsynced write did not survive SIGKILL, so the persisted cases in this file may be probing barrier order after all: {}",
+        String::from_utf8_lossy(&survived)
+    );
 }

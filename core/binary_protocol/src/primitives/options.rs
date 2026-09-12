@@ -397,8 +397,8 @@ mod tests {
     #[test]
     fn wire_options_constructors_validate() {
         let buf = encode(&[
-            (STRING, b"enforce_fsync", STRING, b"true"),
-            (STRING, b"enforce_fsync", STRING, b"false"),
+            (STRING, b"preallocate_segments", STRING, b"true"),
+            (STRING, b"preallocate_segments", STRING, b"false"),
         ]);
         assert!(WireOptions::from_slice(&buf).is_err());
         assert!(WireOptions::from_bytes(buf.freeze()).is_err());
@@ -432,31 +432,32 @@ mod tests {
     /// in their own unit tests, and a change to the TLV layout has to break all
     /// of them together instead of leaving one SDK talking to itself.
     ///
-    /// `enforce_fsync=true` (a `Bool`) and `segment_size=1 GiB` (a `Uint64`)
-    /// cover both a one-byte and an eight-byte value. What the vector pins is
-    /// the per-entry byte layout, not a key order: these two land sorted only
-    /// because `iggy_common` holds options in a `BTreeMap`, and
-    /// `unsorted_keys_are_accepted` covers the SDKs that emit insertion order.
+    /// The vector covers Bool, Uint64 and String values in insertion order.
+    /// It deliberately differs from Rust's sorted map order. Decoders accept
+    /// either ordering, and the bytes pin the per-entry layout across SDKs.
     const GOLDEN_OPTIONS_BLOCK: &[u8] = &[
-        2, 13, 0, 0, 0, // key kind String, length 13
-        b'e', b'n', b'f', b'o', b'r', b'c', b'e', b'_', b'f', b's', b'y', b'n', b'c', 3, 1, 0, 0,
-        0, 1, // value kind Bool, length 1, true
+        2, 20, 0, 0, 0, // key kind String, length 20
+        b'p', b'r', b'e', b'a', b'l', b'l', b'o', b'c', b'a', b't', b'e', b'_', b's', b'e', b'g',
+        b'm', b'e', b'n', b't', b's', 3, 1, 0, 0, 0, 1, // value kind Bool, length 1, true
         2, 12, 0, 0, 0, // key kind String, length 12
         b's', b'e', b'g', b'm', b'e', b'n', b't', b'_', b's', b'i', b'z', b'e', 12, 8, 0, 0,
         0, // value kind Uint64, length 8
         0, 0, 0, 64, 0, 0, 0, 0, // 1 GiB little-endian
+        2, 10, 0, 0, 0, 100, 117, 114, 97, 98, 105, 108, 105, 116, 121, 2, 9, 0, 0, 0, 112, 101,
+        114, 115, 105, 115, 116, 101, 100,
     ];
 
     #[test]
     fn golden_options_block_is_byte_stable() {
         let encoded = encode(&[
-            (STRING, b"enforce_fsync", 3, &[1]),
+            (STRING, b"preallocate_segments", 3, &[1]),
             (
                 STRING,
                 b"segment_size",
                 UINT64,
                 &1_073_741_824u64.to_le_bytes(),
             ),
+            (STRING, b"durability", STRING, b"persisted"),
         ]);
 
         assert_eq!(
@@ -464,7 +465,7 @@ mod tests {
             GOLDEN_OPTIONS_BLOCK,
             "the options TLV layout changed; update every SDK's copy of this vector"
         );
-        assert_eq!(validate_options(GOLDEN_OPTIONS_BLOCK).unwrap(), 2);
+        assert_eq!(validate_options(GOLDEN_OPTIONS_BLOCK).unwrap(), 3);
     }
 
     #[test]
@@ -476,7 +477,7 @@ mod tests {
                 UINT64,
                 &1_073_741_824u64.to_le_bytes(),
             ),
-            (STRING, b"enforce_fsync", 3, &[1]),
+            (STRING, b"preallocate_segments", 3, &[1]),
         ]);
 
         assert_ne!(&unsorted[..], GOLDEN_OPTIONS_BLOCK);
