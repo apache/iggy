@@ -859,3 +859,40 @@ async fn verify_transferred_quorum(
         sleep(POLL_INTERVAL).await;
     }
 }
+
+/// Every persisted case in this file kills with SIGKILL, and the module doc
+/// above states why that cannot reach fsync ordering. This pins the premise:
+/// a completed `write()` lives in the page cache, which the kernel owns, so
+/// process death cannot lose it. Consequently no barrier order (`file.sync()`,
+/// `sync_data()`, `fsync_dir()`) changes the outcome of a single test here,
+/// and `persisted` differs from `replicated` only in surviving writes that
+/// were never synced.
+///
+/// Covering the real contract needs a fault that discards unsynced pages:
+/// either the deterministic simulator (drop the persisted-topic assert in
+/// `core/shard/src/lib.rs` and route partition storage through
+/// `DurableStorage`) or `dm-log-writes` / `dm-flakey --drop_writes` under the
+/// data directory.
+#[test]
+fn given_a_completed_write_when_the_process_is_sigkilled_then_the_bytes_should_survive() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unsynced");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"printf 'acknowledged' > "$0"; kill -9 $$"#)
+        .arg(&path)
+        .status()
+        .expect("spawn a writer that dies before any barrier");
+    assert!(
+        !status.success(),
+        "the writer exited normally, so it is not modelling a crash"
+    );
+
+    let survived = std::fs::read(&path).unwrap_or_default();
+    assert_eq!(
+        survived.as_slice(),
+        b"acknowledged",
+        "an unsynced write did not survive SIGKILL, so the persisted cases in this file may be probing barrier order after all: {}",
+        String::from_utf8_lossy(&survived)
+    );
+}

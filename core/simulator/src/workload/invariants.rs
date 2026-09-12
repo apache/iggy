@@ -28,6 +28,7 @@ use crate::workload::{CLIENT_REQUEST_QUEUE_MAX, Workload};
 use crate::{CommitHoldKind, CommitPrefixHole, Simulator};
 use consensus::Consensus;
 use server_common::sharding::IggyNamespace;
+use shard::metrics::frame_drop_reason;
 use std::collections::HashMap;
 
 /// Ticks a `Normal` metadata primary may sit behind its own recovery barrier
@@ -37,6 +38,12 @@ use std::collections::HashMap;
 /// re-pipelines its suffix, a handful of round trips, so two orders of magnitude
 /// of slack: only a barrier nothing will ever lower trips it.
 const RECOVERY_BARRIER_WEDGE_TICKS: u32 = 2_000;
+
+/// Frame-drop reasons that name a bug rather than a fault. Crashes produce
+/// `full` / `disconnected` / `delivery_failed` routinely; nothing the injector
+/// does can misplace a frame.
+const BUG_ONLY_FRAME_DROP_REASONS: [&str; 2] =
+    [frame_drop_reason::UNROUTABLE, frame_drop_reason::MISROUTED];
 
 /// Ticks a replica may hold its commit walk below a MISSING op.
 ///
@@ -85,6 +92,7 @@ impl Invariants {
     ///
     /// Globally:
     /// - total in-flight requests stay within the per-client queue ceiling,
+    /// - no shard has shed a frame for an `unroutable` or `misrouted` reason,
     /// - live replicas agree on every committed metadata op they share, and the
     ///   committed chain stays hash-linked (see [`StateChecker`]).
     ///
@@ -145,6 +153,7 @@ impl Invariants {
              (client_count={}, queue_max={CLIENT_REQUEST_QUEUE_MAX}) (seed={seed:#x})",
             workload.options.client_count,
         );
+        assert_no_bug_frame_drops(sim, seed);
 
         self.state_checker.check(sim, seed);
     }
@@ -270,6 +279,27 @@ impl Invariants {
     #[must_use]
     pub const fn state_checker(&self) -> &StateChecker {
         &self.state_checker
+    }
+}
+
+/// Panic if any shard has shed a frame for a reason no fault can produce.
+///
+/// Every tick rather than at quiesce, crashed replicas included: a restart
+/// rebuilds the shard with zero counters, so a drop is only visible on the ticks
+/// between it and the next crash. Miss it and the run instead fails tens of
+/// thousands of ticks later as a drain that never completed.
+fn assert_no_bug_frame_drops(sim: &Simulator, seed: u64) {
+    for (replica_idx, replica) in sim.replicas.iter().enumerate() {
+        for (shard_idx, shard) in replica.shards.iter().enumerate() {
+            for reason in BUG_ONLY_FRAME_DROP_REASONS {
+                let dropped = shard.metrics().frame_drop_count_for_reason(reason);
+                assert_eq!(
+                    dropped, 0,
+                    "replica {replica_idx} shard {shard_idx} shed {dropped} frame(s) with \
+                     reason={reason}; no injected fault produces that (seed={seed:#x})"
+                );
+            }
+        }
     }
 }
 
