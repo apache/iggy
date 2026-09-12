@@ -33,7 +33,7 @@ set -euo pipefail
 BASE="${1:-}"
 HEAD="${2:-}"
 ZERO="0000000000000000000000000000000000000000"
-GATES=(rust java csharp python php node go)
+GATES=(rust java csharp python php node go cpp)
 
 emit_all() {
   local gate
@@ -82,6 +82,7 @@ for gate in "${GATES[@]}"; do
     node) paths=(foreign/node) ;;
     # The go job also runs the bdd/go suite with foreign/go in -coverpkg.
     go) paths=(foreign/go bdd/go) ;;
+    cpp) paths=(foreign/cpp) ;;
     *)
       echo "coverage-gate: no pathspecs defined for gate '$gate'" >&2
       exit 1
