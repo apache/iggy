@@ -931,10 +931,8 @@ where
             Command::RequestPrepares => Ok(Self::RequestPrepares(
                 value.try_into_typed::<RequestPreparesHeader>()?,
             )),
-            // A repaired prepare is a stored PrepareHeader frame whose command
-            // byte was rewritten; typed validation would reject the byte, so
-            // parse through the generic backing and trust the prepare-shaped
-            // layout the way the journal that produced it did.
+            // Keep the repair command through routing so it reaches repair
+            // ingest instead of the live-prepare view fence.
             Command::RepairPrepare => Ok(Self::RepairPrepare(
                 value.try_into_typed::<RepairPrepareHeader>()?,
             )),

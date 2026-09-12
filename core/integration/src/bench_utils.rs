@@ -180,3 +180,88 @@ pub fn get_random_path() -> String {
     .display()
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::{TestHarness, TestServerConfig};
+
+    const BENCHMARK_DATA_BYTES: u64 = 5_000_000;
+    const REPORT_TEST_DATA: &str = "1MiB";
+    const TEST_SECRET: &str = "sensitive-benchmark-test-value";
+
+    #[tokio::test]
+    async fn given_fresh_server_when_running_end_to_end_group_benchmark_should_finish() {
+        let mut harness = TestHarness::builder()
+            .cluster_nodes(1)
+            .server(TestServerConfig::default())
+            .build()
+            .unwrap();
+        harness.start().await.unwrap();
+
+        run_bench_and_wait_for_finish(
+            &harness.server().raw_tcp_addr().unwrap(),
+            &TransportProtocol::Tcp,
+            "end-to-end-producing-consumer-group",
+            IggyByteSize::new(BENCHMARK_DATA_BYTES),
+        );
+    }
+
+    #[tokio::test]
+    async fn given_secret_environment_when_saving_benchmark_should_omit_credentials() {
+        let mut harness = TestHarness::builder()
+            .cluster_nodes(1)
+            .server(TestServerConfig::default())
+            .build()
+            .unwrap();
+        harness.start().await.unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let server_address = harness.server().raw_tcp_addr().unwrap();
+        #[allow(deprecated)]
+        let command = Command::cargo_bin("iggy-bench").unwrap();
+        let output = assert_cmd::Command::from_std(command)
+            .args([
+                "--total-data",
+                REPORT_TEST_DATA,
+                "pinned-producer",
+                "--producers",
+                "1",
+                "--streams",
+                "1",
+                "tcp",
+                "--server-address",
+                &server_address,
+                "output",
+                "--output-dir",
+            ])
+            .arg(output_dir.path())
+            .envs([
+                ("IGGY_ROOT_PASSWORD", TEST_SECRET),
+                ("IGGY_CLUSTER_AUTH_SHARED_SECRET", TEST_SECRET),
+                ("IGGY_HTTP_JWT_ENCODING_SECRET", TEST_SECRET),
+                ("IGGY_ENCRYPTION_KEY", TEST_SECRET),
+                ("IGGY_UNRELATED_CREDENTIAL", TEST_SECRET),
+                ("IGGY_SHARDING_CPU_ALLOCATION", "4"),
+            ])
+            .timeout(BENCH_WAIT_TIMEOUT)
+            .unwrap();
+        let report_dir = fs::read_dir(output_dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let report = fs::read_to_string(report_dir.join("report.json")).unwrap();
+        assert!(report.contains("IGGY_SHARDING_CPU_ALLOCATION=4"));
+        for (source, content) in [
+            ("report", report.as_str()),
+            ("stdout", &String::from_utf8_lossy(&output.stdout)),
+            ("stderr", &String::from_utf8_lossy(&output.stderr)),
+        ] {
+            assert!(
+                !content.contains(TEST_SECRET),
+                "{source} exposes a credential"
+            );
+        }
+    }
+}

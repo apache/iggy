@@ -287,8 +287,8 @@ pub struct RequestHeader {
     /// catch a `request` number reused for a different operation: a retry that
     /// disagrees with the stamp of the cached reply is refused rather than
     /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison. The Rust SDK stamps the ops the table dedups; partition and
-    /// non-replicated ops, and the other SDKs, leave it zero. The server
+    /// comparison. The Rust SDK stamps metadata/session ops and `DeleteSegments`;
+    /// partition and non-replicated ops leave it zero. The server
     /// verifies any nonzero stamp before routing.
     pub request_checksum: u128,
     pub timestamp: u64,
@@ -306,14 +306,13 @@ pub struct RequestHeader {
     /// cannot restart low after the server drops an entry and the client
     /// registers again.
     ///
-    /// Zero on `Register` itself (the client has no epoch to echo yet) and on
-    /// sessionless ops; header validation enforces both.
+    /// Header validation requires zero on `Register` itself. `NonReplicated`
+    /// operations also permit zero before a client has registered.
     pub session: u64,
-    /// Acting user id, stamped by the metadata primary at admission for every
-    /// gated client op so the in-apply RBAC gate resolves the same identity on
-    /// every replica; on `Register` it carries the freshly authenticated user.
-    /// The submitter's wire value is never trusted. Zero for `Logout`,
-    /// partition-plane, and server-internal ops.
+    /// Acting user id, stamped by the server for metadata and partition ops
+    /// so every replica uses the authenticated identity for RBAC and dedup.
+    /// On `Register` it carries the freshly authenticated user.
+    /// The submitter's wire value is never trusted.
     pub user_id: u32,
     pub reserved: [u8; 60],
 }
@@ -592,14 +591,12 @@ pub struct ReplyHeader {
     /// failure decided before commit (e.g. a dispatch-time authorization
     /// denial, or the partition primary rejecting a consumer-offset op).
     ///
-    /// Contract: this is nonzero ONLY on a pre-commit denial, and a deny
-    /// reply always carries an EMPTY body. So this header channel and the
-    /// committed per-sub-op results in the metadata result section are mutually
-    /// exclusive by construction: a reply either commits (status 0, result
-    /// section present) or is denied before commit (status set, no body), and a
-    /// consumer never reconciles the two. Carved from `reserved` exactly like
-    /// `user_id` in `RequestHeader` / `PrepareHeader`; no existing field offset
-    /// moves and `validate` does not inspect it.
+    /// Contract: a nonzero status always carries an EMPTY body. With status
+    /// zero, result-framed operations must still decode the result section:
+    /// it can carry a committed result or a pre-commit transient rejection.
+    /// Neither a zero status nor a result section alone proves commitment.
+    /// Carved from `reserved` like `user_id` in `RequestHeader` / `PrepareHeader`;
+    /// no existing field offset moves and `validate` does not inspect it.
     pub status: u32,
     pub reserved: [u8; 36],
 }
@@ -1041,8 +1038,8 @@ impl ConsensusHeader for PrepareHeader {
 
 /// `checksum` of a prepare no producer sealed.
 ///
-/// Written by a build predating the identity seal, or by the partition plane.
-/// Verification skips such entries so an older build's WAL still replays.
+/// Written by a build predating the identity seal. Verification skips such
+/// entries so an older build's WAL still replays.
 pub const CHECKSUM_UNSEALED: u128 = 0;
 
 /// The frame's body, bounded by `size`. What `checksum_body` covers.
@@ -1385,9 +1382,9 @@ impl ConsensusHeader for StartViewChangeHeader {
     }
 }
 
-// DoViewChangeHeader - view change vote (header-only)
+// DoViewChangeHeader - view change vote with log suffix
 
-/// Replica -> primary candidate: vote for view change. Header-only.
+/// Replica -> replicas: vote for view change, carrying a log-header suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct DoViewChangeHeader {
@@ -1559,9 +1556,9 @@ fn suffix_len_of(frame: &str, size: u32) -> Result<usize, ConsensusError> {
     Ok(suffix_len)
 }
 
-// StartViewHeader - new view announcement (header-only)
+// StartViewHeader - new view announcement with log suffix
 
-/// New primary -> all replicas: start new view. Header-only.
+/// New primary -> replicas: start a new view, with an optional log-header suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StartViewHeader {

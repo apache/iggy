@@ -24,7 +24,7 @@ pub(crate) enum TopicAction {
     /// Create topic with given name, number of partitions, compression algorithm and expiry time for given stream ID
     ///
     /// Stream ID can be specified as a stream name or ID
-    /// If topic ID is not provided then the server will automatically assign it
+    /// The server assigns the topic ID. The legacy --topic-id flag is ignored.
     ///
     /// Examples
     ///  iggy topic create 1 sensor1 2 gzip 15days
@@ -51,11 +51,11 @@ pub(crate) enum TopicAction {
     /// Topic ID can be specified as a topic name or ID
     ///
     /// Examples
-    ///  iggy update 1 1 sensor3 none
-    ///  iggy update prod sensor3 old-sensor none
-    ///  iggy update test debugs ready gzip 15days
-    ///  iggy update 1 1 new-name gzip
-    ///  iggy update 1 2 new-name none 1day 1hour 1min 1sec
+    ///  iggy topic update 1 1 sensor3 none
+    ///  iggy topic update prod sensor3 old-sensor none
+    ///  iggy topic update test debugs ready gzip 15days
+    ///  iggy topic update 1 1 new-name gzip
+    ///  iggy topic update 1 2 new-name none 1day 1hour 1min 1sec
     #[clap(verbatim_doc_comment, visible_alias = "u")]
     Update(TopicUpdateArgs),
     /// Get topic detail for given topic ID and stream ID
@@ -103,23 +103,23 @@ pub(crate) struct TopicCreateArgs {
     pub(crate) stream_id: Identifier,
     /// Name of the topic
     pub(crate) name: String,
-    /// Topic ID to create
+    /// Legacy topic ID flag (ignored)
     #[clap(short, long)]
     pub(crate) topic_id: Option<u32>,
     /// Number of partitions inside the topic
     pub(crate) partitions_count: u32,
-    /// Compression algorithm for the topic, set to "none" for no compression
+    /// Compression metadata (none or gzip). Payload compression is not implemented
     #[arg(value_parser = clap::value_parser!(CompressionAlgorithm), verbatim_doc_comment)]
     pub(crate) compression_algorithm: CompressionAlgorithm,
     /// Max topic size in human-readable format like "unlimited" or "15GB"
     ///
-    /// "server_default" or skipping parameter makes CLI to use server default (from current server config) max topic size
-    /// Can't be lower than segment size in the config.
+    /// Skipping this parameter or using "server_default" creates a topic with unlimited size.
+    /// A finite size cannot be lower than the topic segment size.
     #[arg(short, long, default_value = "server_default", verbatim_doc_comment)]
     pub(crate) max_topic_size: MaxTopicSize,
     /// Message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
     ///
-    /// "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
+    /// Skipping this parameter or using "server_default" creates a topic with no message expiry.
     #[arg(default_value = "server_default", value_parser = clap::value_parser!(IggyExpiry), verbatim_doc_comment)]
     pub(crate) message_expiry: Vec<IggyExpiry>,
     /// Message completion policy: replicated or persisted. Both policies store messages on disk.
@@ -166,18 +166,18 @@ pub(crate) struct TopicUpdateArgs {
     pub(crate) topic_id: Identifier,
     /// New name for the topic
     pub(crate) name: String,
-    /// Compression algorithm for the topic, set to "none" for no compression
+    /// Compression metadata (none or gzip). Payload compression is not implemented
     #[arg(value_parser = clap::value_parser!(CompressionAlgorithm), verbatim_doc_comment)]
     pub(crate) compression_algorithm: CompressionAlgorithm,
     /// New max topic size in human-readable format like "unlimited" or "15GB"
     ///
-    /// "server_default" or skipping parameter makes CLI to use server default (from current server config) max topic size
-    /// Can't be lower than segment size in the config.
+    /// Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
+    /// A finite size cannot be lower than the topic segment size.
     #[arg(short, long, default_value = "server_default", verbatim_doc_comment)]
     pub(crate) max_topic_size: MaxTopicSize,
     /// New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
     ///
-    /// "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
+    /// Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
     #[arg(default_value = "server_default", value_parser = clap::value_parser!(IggyExpiry), verbatim_doc_comment)]
     pub(crate) message_expiry: Vec<IggyExpiry>,
 }

@@ -286,11 +286,11 @@ Stream ID can be specified as a stream name or ID
 Topic ID can be specified as a topic name or ID
 
 Examples
- iggy update 1 1 sensor3 none
- iggy update prod sensor3 old-sensor none
- iggy update test debugs ready gzip 15days
- iggy update 1 1 new-name gzip
- iggy update 1 2 new-name none 1day 1hour 1min 1sec
+ iggy topic update 1 1 sensor3 none
+ iggy topic update prod sensor3 old-sensor none
+ iggy topic update test debugs ready gzip 15days
+ iggy topic update 1 1 new-name gzip
+ iggy topic update 1 2 new-name none 1day 1hour 1min 1sec
 
 {USAGE_PREFIX} topic update [OPTIONS] <STREAM_ID> <TOPIC_ID> <NAME> <COMPRESSION_ALGORITHM> [MESSAGE_EXPIRY]...
 
@@ -309,12 +309,12 @@ Arguments:
           New name for the topic
 
   <COMPRESSION_ALGORITHM>
-          Compression algorithm for the topic, set to "none" for no compression
+          Compression metadata (none or gzip). Payload compression is not implemented
 
   [MESSAGE_EXPIRY]...
           New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
 {CLAP_INDENT}
-          "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
+          Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
 {CLAP_INDENT}
           [default: server_default]
 
@@ -322,8 +322,8 @@ Options:
   -m, --max-topic-size <MAX_TOPIC_SIZE>
           New max topic size in human-readable format like "unlimited" or "15GB"
 {CLAP_INDENT}
-          "server_default" or skipping parameter makes CLI to use server default (from current server config) max topic size
-          Can't be lower than segment size in the config.
+          Skipping this parameter or using "server_default" sends the legacy zero sentinel. Pass an explicit value to avoid inconsistent option reporting.
+          A finite size cannot be lower than the topic segment size.
 {CLAP_INDENT}
           [default: server_default]
 
@@ -352,7 +352,7 @@ Arguments:
   <STREAM_ID>              Stream ID to update topic
   <TOPIC_ID>               Topic ID to update
   <NAME>                   New name for the topic
-  <COMPRESSION_ALGORITHM>  Compression algorithm for the topic, set to "none" for no compression
+  <COMPRESSION_ALGORITHM>  Compression metadata (none or gzip). Payload compression is not implemented
   [MESSAGE_EXPIRY]...      New message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:

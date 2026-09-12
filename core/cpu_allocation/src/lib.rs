@@ -36,8 +36,8 @@ pub use allowed_cpus::allowed_cpus;
 /// Tell server how many CPU cores to grab for shards, and how.
 ///
 /// Server make one shard per core. This say which cores. Pick one:
-/// - `All`: take every core machine have.
-/// - `Count(n)`: take first `n` cores.
+/// - `All`: use the parallelism available to the process.
+/// - `Count(n)`: use `n` shards, pinned within the allowed CPU set when enabled.
 /// - `Range(a, b)`: take cores `a` up to (not including) `b`.
 /// - `NumaAware(..)`: smart pick by NUMA node, keep memory close to core.
 ///
