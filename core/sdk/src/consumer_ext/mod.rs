@@ -21,12 +21,9 @@
 //! a `while let` loop, matching on the result of every message, and watching for a stop signal.
 //! This module replaces that loop with two pieces:
 //!
-//! - [`MessageConsumer`] is what you write. It handles one message.
+//! - [`MessageConsumer`] is what you implement. It handles one message.
 //! - [`IggyConsumerMessageExt::consume_messages`] is the loop. It reads messages, hands each one to
 //!   your [`MessageConsumer`], and returns when a shutdown signal arrives.
-//!
-//! [`IggyConsumerMessageExt`] is in the prelude. [`MessageConsumer`] is not, so import it from
-//! this module.
 //!
 //! # Examples
 //!
@@ -80,7 +77,7 @@ mod consumer_message_trait;
 use crate::{clients::consumer::ReceivedMessage, prelude::IggyError};
 pub use consumer_message_trait::IggyConsumerMessageExt;
 
-/// Handles one message that [`IggyConsumerMessageExt::consume_messages`] read.
+/// Handles one message that [`IggyConsumerMessageExt::consume_messages`] reads.
 ///
 /// Implement this trait on your own type and pass a reference to it. The loop calls
 /// [`consume()`](Self::consume) once per message, in the order the messages arrive, and waits for
@@ -90,9 +87,6 @@ pub use consumer_message_trait::IggyConsumerMessageExt;
 /// such as an [`AtomicU64`](std::sync::atomic::AtomicU64) or a
 /// [`Mutex`](tokio::sync::Mutex). [`MessageConsumer`] is also implemented for `&T`, so a reference
 /// to your type is itself a [`MessageConsumer`].
-///
-/// [`MessageConsumer`] is not in the prelude. Import it from
-/// [`consumer_ext`](crate::consumer_ext).
 ///
 /// # Examples
 ///
@@ -125,17 +119,6 @@ pub trait LocalMessageConsumer {
     /// # Errors
     ///
     /// Return any [`IggyError`] that describes why this message could not be handled.
-    /// [`IggyConsumerMessageExt::consume_messages`] logs that error and reads on, so a failed
-    /// message stops nothing. The error never suppresses a commit either, because every
-    /// [`AutoCommitAfter`](crate::prelude::AutoCommitAfter) variant applies its own trigger
-    /// whatever the handler returned. [`ConsumingEachMessage`] therefore commits the offset of a
-    /// failed message, while [`ConsumingEveryNthMessage`] and [`ConsumingAllMessages`] commit it
-    /// only when the offset meets their condition. Keep a message that must not be lost yourself,
-    /// or commit by hand with [`AutoCommit::Disabled`](crate::prelude::AutoCommit::Disabled).
-    ///
-    /// [`ConsumingAllMessages`]: crate::prelude::AutoCommitAfter::ConsumingAllMessages
-    /// [`ConsumingEachMessage`]: crate::prelude::AutoCommitAfter::ConsumingEachMessage
-    /// [`ConsumingEveryNthMessage`]: crate::prelude::AutoCommitAfter::ConsumingEveryNthMessage
     async fn consume(&self, message: ReceivedMessage) -> Result<(), IggyError>;
 }
 

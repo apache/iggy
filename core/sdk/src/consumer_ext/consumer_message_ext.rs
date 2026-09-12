@@ -31,8 +31,8 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// arriving together is a race, so a message that is buffered already can still be handled
     /// after the signal was sent. Dropping the sender counts as a signal.
     ///
-    /// The loop returns `Ok(())` in three cases: the signal arrived, the sender was dropped, or
-    /// the stream ended because [`shutdown()`](crate::prelude::IggyConsumer::shutdown) was called.
+    /// The loop returns `Ok(())` in three cases: (1) the signal arrived, (2) the sender was dropped, or
+    /// (3) the stream ended because [`shutdown()`](crate::prelude::IggyConsumer::shutdown) was called.
     /// After the two signal cases the consumer stays usable, so call
     /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown) afterwards to commit the reading
     /// position and leave the consumer group. Under

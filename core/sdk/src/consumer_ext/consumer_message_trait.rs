@@ -27,9 +27,6 @@ use tokio::sync::oneshot;
 /// replaces the `while let` loop you would otherwise write around
 /// [`StreamExt::next`](futures_util::StreamExt::next).
 ///
-/// The loop is also what makes the [`AutoCommitAfter`] variants work. Those variants commit an
-/// offset once your handler returned, which no other read path can observe.
-///
 /// # Examples
 ///
 /// Read a topic until Ctrl-C, then commit and leave the group:
@@ -79,21 +76,9 @@ use tokio::sync::oneshot;
 pub trait IggyConsumerMessageExt<'a> {
     /// Reads messages until a shutdown signal arrives, and hands each one to `message_consumer`.
     ///
-    /// The loop stops when `shutdown_rx` resolves, which happens both when the sender sends and
-    /// when the sender is dropped. It also stops when the stream ends, which happens after
-    /// `shutdown()` on the consumer. Every case returns `Ok(())`. After the two signal cases the
-    /// consumer stays usable, so committing the reading position and leaving the group is still
-    /// your call.
-    ///
-    /// A message whose handler returned an error is logged and skipped. The loop reads on.
-    ///
     /// # Errors
     ///
-    /// Returns the error that ended the loop, which is always a connection error:
-    /// [`IggyError::Disconnected`], [`IggyError::CannotEstablishConnection`],
-    /// [`IggyError::StaleClient`], [`IggyError::InvalidServerAddress`],
-    /// [`IggyError::InvalidClientAddress`], [`IggyError::NotConnected`] or
-    /// [`IggyError::ClientShutdown`]. Every other read error is logged and the loop reads on.
+    /// Return any [`IggyError`] that describes what went wrong while consuming.
     async fn consume_messages<P>(
         &mut self,
         message_consumer: &'a P,
