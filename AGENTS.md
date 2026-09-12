@@ -130,6 +130,7 @@ connectors work, load `connectors-overview` first as router.
 - [connector-source](.claude/skills/connector-source/SKILL.md) - source plugin authoring
 - [connector-transform](.claude/skills/connector-transform/SKILL.md) - transform authoring
 - [connector-testing](.claude/skills/connector-testing/SKILL.md) - unit + integration test patterns
+- [connector-review](.claude/skills/connector-review/SKILL.md) - adversarial 4-expert connectors PR/branch review, ~10 subagents per run
 
 Repo-wide, user-invoked only. `disable-model-invocation: true` keeps it
 out of the agent's context; do not replicate its steps. When a
