@@ -18,17 +18,26 @@
 
 set -euo pipefail
 
-OUTPUT="../../reports/cpp-coverage.lcov"
-COVERAGE_DIR="$(pwd)/target/cpp-coverage"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CPP_ROOT="$REPO_ROOT/foreign/cpp"
+
+cd "$CPP_ROOT"
+
+OUTPUT="$REPO_ROOT/reports/cpp-coverage.lcov"
+COVERAGE_DIR="$CPP_ROOT/target/cpp-coverage"
 BUILD_PROFRAW_DIR="$COVERAGE_DIR/build"
 PROFDATA="$COVERAGE_DIR/shim.profdata"
-CPP_RAW="$(pwd)/bazel-out/_coverage/_coverage_report.dat"
+CPP_RAW="$CPP_ROOT/bazel-out/_coverage/_coverage_report.dat"
 
 mkdir -p "$COVERAGE_DIR" "$BUILD_PROFRAW_DIR" "$(dirname "$OUTPUT")"
 rm -f "$COVERAGE_DIR"/*.profraw "$BUILD_PROFRAW_DIR"/*.profraw "$PROFDATA" "$OUTPUT"
 
-# shellcheck disable=SC1090
-source <(cargo llvm-cov show-env --no-rustc-wrapper --sh)
+if ! LLVM_COV_ENV="$(cargo llvm-cov show-env --no-rustc-wrapper --sh)"; then
+  echo "cpp-coverage: 'cargo llvm-cov show-env' failed" >&2
+  exit 1
+fi
+eval "$LLVM_COV_ENV"
 export LLVM_PROFILE_FILE="$COVERAGE_DIR/%p-%m.profraw"
 
 LLVM_BIN="$(rustc --print target-libdir)/../bin"
@@ -69,4 +78,4 @@ sed 's|^SF:|SF:foreign/cpp/|' "$CPP_RAW" >"$OUTPUT"
     include
   ' >>"$OUTPUT"
 
-../../scripts/ci/validate-lcov.sh "$OUTPUT"
+"$SCRIPT_DIR/validate-lcov.sh" "$OUTPUT"

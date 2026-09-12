@@ -63,7 +63,7 @@ runs:
       shell: bash
       run: |
         cd foreign/cpp
-        cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
+        cargo clippy --all-targets --all-features -- -D warnings
 
     - name: Build
       if: inputs.task == 'build'
@@ -90,7 +90,6 @@ runs:
       run: |
         cd foreign/cpp
         ../../scripts/ci/cpp-coverage.sh
-        bazel build --config=ci //:bdd_wire_server
 
     - name: Stop server after tests
       if: always() && inputs.task == 'test'
