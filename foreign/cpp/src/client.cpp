@@ -21,6 +21,48 @@
 
 namespace iggy {
 
+namespace {
+
+rust::Vec<ffi::HeaderEntry> ToFfiRawOptions(const std::map<std::string, std::string> &raw_options) {
+    rust::Vec<ffi::HeaderEntry> ffi_options;
+    ffi_options.reserve(raw_options.size());
+    for (const auto &[key, value] : raw_options) {
+        ffi::HeaderEntry ffi_entry;
+        ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
+        ffi_entry.key.value.reserve(key.size());
+        for (const char character : key) {
+            ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
+        }
+        ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
+        ffi_entry.value.value.reserve(value.size());
+        for (const char character : value) {
+            ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
+        }
+        ffi_options.push_back(std::move(ffi_entry));
+    }
+    return ffi_options;
+}
+
+template <typename FfiOptions, typename Options>
+void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
+    if (const auto &value = options.CompressionAlgorithm()) {
+        ffi_options.has_compression_algorithm = true;
+        ffi_options.compression_algorithm     = std::string(value->Value());
+    }
+    if (const auto &value = options.MessageExpiry()) {
+        ffi_options.has_message_expiry   = true;
+        ffi_options.message_expiry_kind  = std::string(value->Kind());
+        ffi_options.message_expiry_value = value->Value();
+    }
+    if (const auto &value = options.MaxTopicSize()) {
+        ffi_options.has_max_topic_size = true;
+        ffi_options.max_topic_size     = std::string(value->Value());
+    }
+    ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
+}
+
+}  // namespace
+
 IggyBlockingClient::IggyBlockingClient(IggyBlockingClient &&other) noexcept
     : client_(std::exchange(other.client_, nullptr)) {}
 
@@ -55,11 +97,159 @@ void IggyBlockingClient::Shutdown() {
 
 LoginInfo IggyBlockingClient::Login(std::string username, std::string password) {
     return RethrowAsIggyException(
-        [this, &username, &password] { return Handle()->login_user(std::move(username), std::move(password)); });
+        [this, &username, &password] { return LoginInfo::FromFfi(Handle()->login_user(username, password)); });
 }
 
 void IggyBlockingClient::Logout() {
     RethrowAsIggyException([this] { Handle()->logout_user(); });
+}
+
+StreamDetails IggyBlockingClient::CreateStream(std::string name) {
+    return RethrowAsIggyException([this, &name] { return StreamDetails::FromFfi(Handle()->create_stream(name)); });
+}
+
+void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options) {
+    RethrowAsIggyException([this, &stream, &name, &options] {
+        auto ffi_options = ToFfiRawOptions(options.RawEntries());
+        Handle()->update_stream(stream.ToFfi(), name, std::move(ffi_options));
+    });
+}
+
+std::vector<Stream> IggyBlockingClient::GetStreams() {
+    return RethrowAsIggyException([this] {
+        std::vector<Stream> streams;
+        auto ffi_streams = Handle()->get_streams();
+        streams.reserve(ffi_streams.size());
+        for (auto &stream : ffi_streams) {
+            streams.push_back(Stream::FromFfi(std::move(stream)));
+        }
+        return streams;
+    });
+}
+
+StreamDetails IggyBlockingClient::GetStream(const Identifier &stream) {
+    return RethrowAsIggyException(
+        [this, &stream] { return StreamDetails::FromFfi(Handle()->get_stream(stream.ToFfi())); });
+}
+
+void IggyBlockingClient::DeleteStream(const Identifier &stream) {
+    RethrowAsIggyException([this, &stream] { Handle()->delete_stream(stream.ToFfi()); });
+}
+
+void IggyBlockingClient::PurgeStream(const Identifier &stream) {
+    RethrowAsIggyException([this, &stream] { Handle()->purge_stream(stream.ToFfi()); });
+}
+
+TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
+                                             std::string name,
+                                             const TopicCreateOptions &options) {
+    return RethrowAsIggyException([this, &stream, &name, &options] {
+        ffi::TopicCreateOptions ffi_options{};
+        SetMutableTopicOptions(ffi_options, options);
+        if (auto value = options.PartitionsCount()) {
+            ffi_options.has_partitions_count = true;
+            ffi_options.partitions_count     = *value;
+        } else {
+            ffi_options.has_partitions_count = false;
+            ffi_options.partitions_count     = 0;
+        }
+        if (auto value = options.SegmentSize()) {
+            ffi_options.has_segment_size = true;
+            ffi_options.segment_size     = *value;
+        } else {
+            ffi_options.has_segment_size = false;
+            ffi_options.segment_size     = 0;
+        }
+        if (auto value = options.Durability()) {
+            ffi_options.has_durability = true;
+            ffi_options.durability     = std::string(iggy::to_string(*value));
+        } else {
+            ffi_options.has_durability = false;
+            ffi_options.durability     = "";
+        }
+        if (auto value = options.ConsumerOffsetDurability()) {
+            ffi_options.has_consumer_offset_durability = true;
+            ffi_options.consumer_offset_durability     = std::string(iggy::to_string(*value));
+        } else {
+            ffi_options.has_consumer_offset_durability = false;
+            ffi_options.consumer_offset_durability     = "";
+        }
+        if (auto value = options.MessagesRequiredToSave()) {
+            ffi_options.has_messages_required_to_save = true;
+            ffi_options.messages_required_to_save     = *value;
+        } else {
+            ffi_options.has_messages_required_to_save = false;
+            ffi_options.messages_required_to_save     = 0;
+        }
+        if (auto value = options.SizeOfMessagesRequiredToSave()) {
+            ffi_options.has_size_of_messages_required_to_save = true;
+            ffi_options.size_of_messages_required_to_save     = *value;
+        } else {
+            ffi_options.has_size_of_messages_required_to_save = false;
+            ffi_options.size_of_messages_required_to_save     = 0;
+        }
+        if (auto value = options.PreallocateSegments()) {
+            ffi_options.has_preallocate_segments = true;
+            ffi_options.preallocate_segments     = *value;
+        } else {
+            ffi_options.has_preallocate_segments = false;
+            ffi_options.preallocate_segments     = false;
+        }
+        return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options)));
+    });
+}
+
+void IggyBlockingClient::UpdateTopic(const Identifier &stream,
+                                     const Identifier &topic,
+                                     std::string name,
+                                     const TopicUpdateOptions &options) {
+    RethrowAsIggyException([this, &stream, &topic, &name, &options] {
+        ffi::TopicUpdateOptions ffi_options{};
+        SetMutableTopicOptions(ffi_options, options);
+
+        Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), name, std::move(ffi_options));
+    });
+}
+
+std::vector<Topic> IggyBlockingClient::GetTopics(const Identifier &stream) {
+    return RethrowAsIggyException([this, &stream] {
+        std::vector<Topic> topics;
+        auto ffi_topics = Handle()->get_topics(stream.ToFfi());
+        topics.reserve(ffi_topics.size());
+        for (auto &topic : ffi_topics) {
+            topics.push_back(Topic::FromFfi(std::move(topic)));
+        }
+        return topics;
+    });
+}
+
+TopicDetails IggyBlockingClient::GetTopic(const Identifier &stream, const Identifier &topic) {
+    return RethrowAsIggyException(
+        [this, &stream, &topic] { return TopicDetails::FromFfi(Handle()->get_topic(stream.ToFfi(), topic.ToFfi())); });
+}
+
+void IggyBlockingClient::DeleteTopic(const Identifier &stream, const Identifier &topic) {
+    RethrowAsIggyException([this, &stream, &topic] { Handle()->delete_topic(stream.ToFfi(), topic.ToFfi()); });
+}
+
+void IggyBlockingClient::PurgeTopic(const Identifier &stream, const Identifier &topic) {
+    RethrowAsIggyException([this, &stream, &topic] { Handle()->purge_topic(stream.ToFfi(), topic.ToFfi()); });
+}
+
+void IggyBlockingClient::CreatePartitions(const Identifier &stream,
+                                          const Identifier &topic,
+                                          const std::uint32_t partitions_count) {
+    RethrowAsIggyException([this, &stream, &topic, partitions_count] {
+        Handle()->create_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count);
+    });
+}
+
+void IggyBlockingClient::DeletePartitions(const Identifier &stream,
+                                          const Identifier &topic,
+                                          const std::uint32_t partitions_count) {
+    RethrowAsIggyException([this, &stream, &topic, partitions_count] {
+        Handle()->delete_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count);
+    });
 }
 
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
