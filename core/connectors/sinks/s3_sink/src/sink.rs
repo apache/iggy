@@ -227,11 +227,11 @@ impl S3Sink {
                 }
             };
 
+            *processed += 1;
+
             if let Some(payload) = flush_payload {
                 self.do_upload(bucket, payload).await?;
             }
-
-            *processed += 1;
         }
         Ok(())
     }
@@ -371,7 +371,7 @@ impl S3Sink {
                     attempt += 1;
                     if attempt >= max_attempts {
                         return Err(Error::CannotStoreData(format!(
-                            "S3 PutObject returned status {status} after {max_attempts} attempts for key '{s3_key}'"
+                            "S3 PutObject returned status {status} after {attempt} attempts for key '{s3_key}'"
                         )));
                     }
                     warn!(
@@ -383,7 +383,7 @@ impl S3Sink {
                     attempt += 1;
                     if attempt >= max_attempts {
                         return Err(Error::CannotStoreData(format!(
-                            "S3 PutObject failed after {max_attempts} attempts for key '{s3_key}': {e}"
+                            "S3 PutObject failed after {attempt} attempts for key '{s3_key}': {e}"
                         )));
                     }
                     warn!(
@@ -404,6 +404,10 @@ fn is_retriable_status(status: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use iggy_connector_sdk::{Payload, Schema};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
     use crate::{
         DEFAULT_MAX_FILE_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PATH_TEMPLATE, FileRotation, S3Sink,
@@ -429,6 +433,110 @@ mod tests {
             retry_delay: None,
             path_style: None,
         }
+    }
+
+    #[test]
+    fn given_failed_upload_should_count_each_lost_message_once() {
+        const TOTAL_MESSAGES: u64 = 3;
+        const ROTATION_MESSAGES: u64 = 2;
+
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for previously_buffered in [0, 1] {
+                let server = MockServer::start().await;
+                Mock::given(method("PUT"))
+                    .and(path("/test-bucket/.iggy-sink-probe"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .mount(&server)
+                    .await;
+                let config = S3SinkConfig {
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    file_rotation: FileRotation::Messages,
+                    max_messages_per_file: Some(ROTATION_MESSAGES),
+                    max_attempts: Some(1),
+                    output_format: "raw".to_string(),
+                    ..test_config()
+                };
+                let mut sink = S3Sink::new(1, config);
+                sink.open().await.expect("Successful startup probe");
+                let topic = TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "messages".to_string(),
+                };
+                let metadata = || MessagesMetadata {
+                    partition_id: 0,
+                    current_offset: 0,
+                    schema: Schema::Raw,
+                };
+                let message = |offset| ConsumedMessage {
+                    id: u128::from(offset) + 1,
+                    offset,
+                    checksum: 0,
+                    timestamp: 0,
+                    origin_timestamp: 0,
+                    headers: None,
+                    payload: Payload::Raw(vec![1]),
+                };
+                sink.consume(
+                    &topic,
+                    metadata(),
+                    (0..previously_buffered).map(message).collect(),
+                )
+                .await
+                .expect("Initial messages must remain buffered");
+                let result = sink
+                    .consume(
+                        &topic,
+                        metadata(),
+                        (previously_buffered..TOTAL_MESSAGES).map(message).collect(),
+                    )
+                    .await;
+                assert!(matches!(result, Err(Error::CannotStoreData(_))));
+                let state = sink.state.lock().await;
+                assert_eq!(state.messages_received, TOTAL_MESSAGES);
+                assert_eq!(state.messages_uploaded, 0);
+                assert_eq!(
+                    state.messages_lost, TOTAL_MESSAGES,
+                    "Upload failure must count the flushed buffer and unprocessed tail once, with {previously_buffered} previously buffered messages"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn given_zero_attempts_should_report_one_failed_upload() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = S3SinkConfig {
+                endpoint: Some(server.uri()),
+                access_key_id: Some("test-access-key".into()),
+                secret_access_key: Some("test-secret-key".into()),
+                max_attempts: Some(0),
+                ..test_config()
+            };
+            let bucket = crate::client::create_bucket(&config)
+                .await
+                .expect("Create test client");
+            let mut sink = S3Sink::new(1, config);
+            sink.validate_and_parse_config()
+                .expect("Valid configuration");
+            let error = sink
+                .upload_with_retry(&bucket, "message.bin", b"payload")
+                .await
+                .expect_err("The only upload must fail");
+            assert!(
+                error.to_string().contains("after 1 attempts"),
+                "Report the actual upload count: {error}"
+            );
+        });
     }
 
     #[test]

@@ -20,7 +20,7 @@ key = "s3"
 enabled = true
 version = 0
 name = "S3 sink"
-path = "../../target/release/libiggy_connector_s3_sink"
+path = "target/release/libiggy_connector_s3_sink"
 verbose = false
 
 [[streams]]

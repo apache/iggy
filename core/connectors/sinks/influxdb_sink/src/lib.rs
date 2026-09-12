@@ -29,6 +29,7 @@ use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use reqwest::Url;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
@@ -454,7 +455,15 @@ impl InfluxDbSink {
 
     fn build_raw_client(&self) -> Result<reqwest::Client, Error> {
         let timeout = parse_duration(self.config.timeout(), DEFAULT_TIMEOUT);
+        let mut authorization =
+            HeaderValue::from_str(&self.config.auth_header()).map_err(|error| {
+                Error::InvalidConfigValue(format!("Invalid InfluxDB authorization header: {error}"))
+            })?;
+        authorization.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, authorization);
         reqwest::Client::builder()
+            .default_headers(headers)
             .timeout(timeout)
             .build()
             .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))
@@ -503,10 +512,8 @@ impl InfluxDbSink {
         if self.include_metadata && self.include_partition_tag {
             write!(buf, ",partition={}", messages_metadata.partition_id).expect("infallible");
         }
-        // `offset` is always written as a tag regardless of `include_metadata`.
-        // It forms the deduplication key for idempotent writes: without it, two
-        // messages at the same timestamp in the same measurement+tag-set would
-        // silently overwrite each other in InfluxDB's last-write-wins model.
+        // Offset keeps messages in one partition distinct at the same timestamp.
+        // Removing stream/topic/partition tags can still collapse their identities.
         write!(buf, ",offset={}", message.offset).expect("infallible");
 
         buf.push(' ');
@@ -1963,6 +1970,36 @@ mod http_tests {
     }
 
     #[tokio::test]
+    async fn open_authenticates_health_check() {
+        for (is_v3, expected_auth) in [(true, "Bearer tok"), (false, "Token tok")] {
+            let app = Router::new().route(
+                "/health",
+                get(move |headers: HeaderMap| async move {
+                    if headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(expected_auth)
+                    {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            );
+            let base = start_server(app).await;
+            let config = if is_v3 {
+                v3_config(&base)
+            } else {
+                v2_config(&base)
+            };
+            let mut sink = InfluxDbSink::new(1, config);
+            sink.open()
+                .await
+                .expect("health check must use the configured version's authorization header");
+        }
+    }
+
+    #[tokio::test]
     async fn open_fails_when_health_returns_503() {
         let app = Router::new().route("/health", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
         let base = start_server(app).await;
@@ -2233,11 +2270,8 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn consume_records_success_per_successful_batch() {
-        // With 2 batches where the first fails and the second succeeds, the circuit
-        // breaker must record 1 failure AND 1 success — not 1 failure and 0 successes.
-        // If only failures are recorded, the breaker will trip after enough intermittent
-        // errors even when most batches succeed.
+    async fn consume_stays_closed_below_failure_threshold() {
+        // One failed consume call remains below the configured threshold of two.
         let call_count = Arc::new(AtomicU32::new(0));
         let cc2 = call_count.clone();
         let app = Router::new()
@@ -2257,9 +2291,6 @@ mod http_tests {
                 }),
             );
         let base = start_server(app).await;
-        // Use a threshold of 2 so the breaker trips after 2 failures.
-        // If the success of batch 2 is not recorded, successive calls that have
-        // 1 failure each would trip the breaker after 2 invocations.
         let config = InfluxDbSinkConfig::V2(V2SinkConfig {
             circuit_breaker_threshold: Some(2),
             circuit_breaker_cool_down: Some("60s".to_string()),
@@ -2268,10 +2299,9 @@ mod http_tests {
         let sink = open_sink(config).await;
         let msgs: Vec<_> = (0..4).map(|_| msg()).collect();
         let _ = sink.consume(&topic(), meta(), msgs).await; // first fails, second succeeds
-        // Circuit breaker should NOT be open: 1 failure + 1 success → not tripped.
         assert!(
             !sink.circuit_breaker.is_open().await,
-            "circuit breaker must not trip when at least one batch succeeded"
+            "one failed consume call must remain below the threshold of two"
         );
     }
 

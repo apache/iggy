@@ -231,7 +231,7 @@ impl PostgresSink {
         messages: &[ConsumedMessage],
     ) -> Result<(), Error> {
         let pool = self.get_pool()?;
-        let batch_size = self.config.batch_size.unwrap_or(100) as usize;
+        let batch_size = self.config.batch_size.unwrap_or(100).max(1) as usize;
 
         for batch in messages.chunks(batch_size) {
             if let Err(e) = self
@@ -560,6 +560,35 @@ mod tests {
             max_retries: None,
             retry_delay: None,
         }
+    }
+
+    #[test]
+    fn given_zero_batch_size_should_consume_empty_batch() {
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create test runtime");
+        runtime.block_on(async {
+            let mut config = test_config();
+            config.batch_size = Some(0);
+            let pool = PgPoolOptions::new()
+                .connect_lazy(config.connection_string.expose_secret())
+                .expect("Failed to configure lazy test pool");
+            let mut sink = PostgresSink::new(1, config);
+            sink.pool = Some(pool);
+
+            sink.consume(
+                &TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "messages".to_string(),
+                },
+                MessagesMetadata {
+                    partition_id: 0,
+                    current_offset: 0,
+                    schema: iggy_connector_sdk::Schema::Raw,
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("An empty batch must succeed with a zero batch-size setting");
+        });
     }
 
     #[test]

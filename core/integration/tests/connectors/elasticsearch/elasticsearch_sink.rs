@@ -24,6 +24,11 @@ use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use integration::harness::seeds;
 use integration::iggy_harness;
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
+
+const LOG_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const LOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
@@ -212,5 +217,57 @@ async fn elasticsearch_sink_preserves_json_structure(
         complex_messages.len(),
         "Expected {} documents",
         complex_messages.len()
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_rejected_document_when_indexing_should_report_zero_indexed(
+    harness: &TestHarness,
+    fixture: ElasticsearchSinkFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+    let stream_id: Identifier = seeds::names::STREAM.try_into().expect("stream ID");
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic ID");
+    let mut message = IggyMessage::builder()
+        .id(1)
+        .payload(Bytes::from_static(b"[1,2]"))
+        .build()
+        .expect("array payload message");
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            std::slice::from_mut(&mut message),
+        )
+        .await
+        .expect("send rejected document");
+
+    let runtime = harness.connectors_runtime().expect("connectors runtime");
+    let logs = timeout(LOG_WAIT_TIMEOUT, async {
+        loop {
+            let (stdout, stderr) = runtime.collect_logs();
+            let logs = format!("{stdout}\n{stderr}");
+            if logs.contains("Successfully indexed") {
+                break logs;
+            }
+            sleep(LOG_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("bulk completion should be logged");
+
+    assert!(logs.contains("Document indexing error:"), "{logs}");
+    assert_eq!(
+        fixture.get_document_count().await.expect("document count"),
+        0,
+        "Elasticsearch must reject the non-object document"
+    );
+    assert!(
+        logs.contains("Successfully indexed 0 documents"),
+        "the indexed count must exclude the rejected document: {logs}"
     );
 }

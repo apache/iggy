@@ -51,23 +51,16 @@ verbose_logging = false
 | `password` | string | `""` | ClickHouse password |
 | `insert_format` | string | `"json_each_row"` | Insert format: `json_each_row`, `row_binary`, or `string` |
 | `string_format` | string | `"json_each_row"` | ClickHouse format for `string` mode: `json_each_row`, `csv`, or `tsv` |
-| `timeout_seconds` | u64 | `30` | HTTP request timeout |
-| `max_retries` | u32 | `3` | Max retry attempts on transient errors |
-| `retry_delay` | u64 | `1` | Delay between retries, in seconds |
+| `timeout_seconds` | u64 | `30` | HTTP request timeout in seconds |
+| `max_retries` | u32 | `3` | Total attempts for startup requests and transient insert errors; at least one even when `0` |
+| `retry_delay` | u64 | `1` | Base for exponential retry delay, in seconds |
 | `verbose_logging` | bool | `false` | Log inserts at info level instead of debug |
-
-> **TODO:** `database` and `table` values are interpolated directly into SQL. Currently only
-> single quotes are escaped; backslashes pass through unchanged, which can misparse string
-> literals if a value ends with `\`. A future improvement should validate both fields against a
-> strict allowlist (`^[A-Za-z_][A-Za-z0-9_]*$`) at config load and escape backslashes in SQL
-> string literals. Deferred because these sinks run in operator-controlled environments where
-> config values are trusted.
 
 ## Insert Formats
 
 ### `json_each_row` (Default)
 
-Accepts messages with a `Payload::Json` payload. Each message is sent as a JSON object on its own line using ClickHouse's `JSONEachRow` format. ClickHouse handles type coercion from the JSON values to the column types, so the table can have any schema.
+Accepts messages with a `Payload::Json` payload. Each payload is serialized on its own line using ClickHouse's `JSONEachRow` format. Send JSON objects whose fields and values are compatible with the existing table and its ClickHouse input settings. The connector does not validate JSON rows against the table schema before sending them.
 
 ```toml
 [plugin_config]
@@ -80,9 +73,9 @@ insert_format = "json_each_row"
 
 Accepts messages with a `Payload::Json` payload. At startup the connector fetches the table schema from `system.columns` and validates that all column types are supported. Messages are then serialised to ClickHouse's `RowBinaryWithDefaults` binary format, which is more efficient than JSON for large volumes.
 
-Requires ClickHouse 23.7 or newer, when `RowBinaryWithDefaults` was introduced. Older servers reject the format; use `json_each_row` instead.
+Requires [ClickHouse 23.7 or newer](https://presentations.clickhouse.com/2023-release-23.7/index.html), when `RowBinaryWithDefaults` was introduced. Older servers reject the format; use `json_each_row` instead.
 
-The table must already exist. Columns with an ordinary `DEFAULT` expression can be omitted from the message — the connector emits a `0x01` prefix byte to signal that the default should be used. `MATERIALIZED`, `ALIAS`, and `EPHEMERAL` columns are not insertable and are dropped from the schema entirely.
+The table must already exist. Columns with an ordinary `DEFAULT` expression can be omitted from the message - the connector emits a `0x01` prefix byte to signal that the default should be used. An explicit JSON `null` requires a nullable column and is stored as `NULL`, even when that column has a default. Missing columns without defaults must be nullable. The connector excludes `MATERIALIZED`, `ALIAS`, and `EPHEMERAL` columns from its insert schema.
 
 The schema is captured once at startup and never refreshed. Do not `ALTER TABLE` the target while the connector runs. See [Schema changes while running](#schema-changes-while-running).
 
@@ -99,7 +92,7 @@ insert_format = "row_binary"
 
 ### `string`
 
-Accepts messages with a `Payload::Text` payload and passes them through to ClickHouse without modification. Use `string_format` to tell ClickHouse which format to expect.
+Accepts messages with a `Payload::Text` payload and appends a newline to each payload that does not already end with one. Set the stream `schema = "text"` and use `string_format` to tell ClickHouse which format to expect.
 
 ```toml
 [plugin_config]
@@ -170,17 +163,18 @@ string_format = "csv"
 
 ## Reliability
 
-The connector retries failed inserts up to `max_retries` times, starting from `retry_delay`. Retryable HTTP errors and network/timeout errors both back off exponentially with full jitter, so instances spread their retries instead of hammering a recovering server in lockstep. Non-retryable errors fail immediately. The startup ping and schema fetch use the same jittered backoff.
+Insert requests retry HTTP 408, 429, and 5xx responses, plus network and timeout errors. Other unsuccessful HTTP statuses fail immediately. `max_retries` is the total attempt limit, with at least one attempt even when set to `0`. Before retry number `n` (starting at 1), the delay is sampled from zero through `min(retry_delay * 2^n, 60)` seconds.
+With the defaults, there are at most three attempts and the first retry waits between zero and two seconds. The startup ping and, in `row_binary` mode, schema fetch use the same limit and backoff but retry every error.
 
 On shutdown the connector logs the total number of messages processed.
 
 ### Bad rows in a batch
 
-A message whose payload type does not match the chosen format (for example a text payload in JSON mode) is always skipped with a warning. The rest of the batch is still sent.
+A message whose payload type does not match the chosen format (for example a text payload in JSON mode) is skipped with an error log. The rest of the batch is still sent.
 
-The `rowbinary` format has one extra case. It turns each row into binary and writes it straight into the batch buffer, so a row that cannot be converted (a value that does not fit the target column) cannot be skipped cleanly — a half-written row would corrupt the rows after it. In that case the **whole batch fails** on the first bad row and is retried as a unit per the rules above.
+The `row_binary` format fails the whole batch on the first JSON row whose values cannot be converted to the target columns. This occurs before any insert request, so the batch does not enter the plugin's insert retry loop. No partial binary row is sent.
 
-If a single malformed row keeps failing, every retry of that batch will fail too. Fix or remove the bad message at the source, or switch to the `json` / `string` format, which skip bad rows instead of failing the batch.
+A batch with no serializable payloads returns success without an insert. In `json_each_row` and `string` modes, ClickHouse still validates the submitted data and can reject an insert containing a malformed row.
 
 ### Schema changes while running
 
@@ -188,7 +182,7 @@ In `row_binary` mode the table schema is fetched once at startup and cached for 
 
 An `ALTER TABLE` that runs while the connector is live breaks that assumption. Adding, dropping, or reordering a column shifts the byte layout by one or more columns. Depending on how the shifted bytes decode, ClickHouse either rejects the batch as malformed or, worse, stores it silently with values landing in the wrong columns. Nothing detects this at runtime, so the corruption is easy to miss.
 
-Only `row_binary` is affected. The `json_each_row` and `string` (`json_each_row` string) formats are self-describing and map values by field name, so they tolerate schema changes.
+The `json_each_row` format, including `string` mode with `string_format = "json_each_row"`, maps values by field name, but changed column names, types, or constraints can still make inserts fail. The plain `CSV` and `TSV` string formats use the current table column order.
 
 Until the hardening below lands, treat the `row_binary` schema as fixed for the connector's lifetime: **restart the connector after any `ALTER TABLE`** on the target table so it re-fetches the schema.
 
@@ -197,20 +191,16 @@ Two planned fixes remove the restriction:
 1. **Explicit column list in the INSERT.** Emitting `INSERT INTO db.table (col1, col2, ...) FORMAT RowBinaryWithDefaults` binds the stream to column *names* instead of table position. ClickHouse then routes each value by name, applies `DEFAULT` for columns the connector omits, and returns a hard error (instead of silently corrupting rows) when a named column has been dropped or renamed. This makes added and reordered columns safe and turns the remaining drift into a visible failure.
 2. **Refresh the schema on a failed insert.** When an insert fails with a data error, re-fetch the schema from `system.columns` and rebuild the column list before the batch is retried, letting the connector recover from a drop or rename on its own rather than failing every retry against a stale snapshot.
 
-### Delivery semantics: at-least-once
+### Delivery semantics
 
-This connector provides **at-least-once** delivery — not exactly-once. Retries resend the full batch body without an `insert_deduplication_token`, so if the server applied a batch but the acknowledgement was lost in transit (network drop, timeout), the retry will insert the same rows again.
+The runtime uses consumer auto-commit and does not replay a failed sink batch. End-to-end at-least-once delivery is therefore not guaranteed; see [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink#sample-implementation).
 
-**Affected table engines:**
+Plugin retries resend the same batch without an `insert_deduplication_token`, so a lost acknowledgement can also produce duplicate rows. ClickHouse deduplication depends on the table engine, query settings, identical retry data, and the retained deduplication window:
 
-- `MergeTree` — no deduplication at all; duplicate rows will be stored.
-- `ReplicatedMergeTree` — has implicit block-level deduplication based on the data checksum (controlled by `replicated_deduplication_window`, default 100 blocks), which will suppress duplicates in the common retry case as long as the window has not been exceeded.
+- `ReplicatedMergeTree` enables a deduplication log by default, controlled by `replicated_deduplication_window` and `replicated_deduplication_window_seconds`.
+- Non-replicated `MergeTree` can also deduplicate when `non_replicated_deduplication_window` is positive; its default is zero.
 
-If your workload cannot tolerate duplicate rows, either:
-
-1. Use a `ReplicatedMergeTree` table and keep `max_retries` low enough that retries stay within the deduplication window, or
-2. Use a `CollapsingMergeTree` / `ReplacingMergeTree` and apply deduplication at query time, or
-3. Accept duplicates at write time and deduplicate with `DISTINCT` or `GROUP BY` in your queries.
+See [ClickHouse insert deduplication](https://clickhouse.com/docs/concepts/features/operations/insert/deduplicating-inserts-on-retries) for the settings and limits. A small retry count alone does not ensure that a retry remains within the window, because other inserts can evict its deduplication record.
 
 ## Testing
 

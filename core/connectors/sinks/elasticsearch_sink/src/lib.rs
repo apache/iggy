@@ -176,9 +176,9 @@ impl ElasticsearchSink {
         &self,
         client: &Elasticsearch,
         documents: Vec<OwnedValue>,
-    ) -> Result<(), Error> {
+    ) -> Result<usize, Error> {
         if documents.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let mut body: Vec<JsonBody<_>> = Vec::with_capacity(documents.len() * 2);
@@ -220,6 +220,7 @@ impl ElasticsearchSink {
             .map_err(|e| Error::Connection(format!("Failed to parse bulk response: {}", e)))?;
 
         // Check for individual document errors
+        let mut documents_indexed = 0;
         if let Some(items) = response_body.get("items").and_then(|v| v.as_array()) {
             let mut errors = 0;
             for item in items {
@@ -231,12 +232,13 @@ impl ElasticsearchSink {
                 }
             }
 
+            documents_indexed = items.len() - errors;
             let mut state = self.state.lock().await;
             state.errors_count += errors;
-            state.documents_indexed += items.len() - errors;
+            state.documents_indexed += documents_indexed;
         }
 
-        Ok(())
+        Ok(documents_indexed)
     }
 }
 
@@ -350,10 +352,10 @@ impl Sink for ElasticsearchSink {
         }
 
         if !documents.is_empty() {
-            self.bulk_index_documents(client, documents).await?;
+            let documents_indexed = self.bulk_index_documents(client, documents).await?;
             info!(
                 "Successfully indexed {} documents to Elasticsearch index '{}'",
-                messages_count, self.config.index
+                documents_indexed, self.config.index
             );
         }
 

@@ -83,18 +83,28 @@ pub(crate) async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, 
 /// and fails for write-only IAM policies.
 pub(crate) async fn verify_bucket(bucket: &Bucket) -> Result<(), Error> {
     const PROBE_KEY: &str = ".iggy-sink-probe";
-    bucket.put_object(PROBE_KEY, &[]).await.map_err(|e| {
+    let response = bucket.put_object(PROBE_KEY, &[]).await.map_err(|e| {
         Error::InitError(format!(
             "S3 bucket '{}' connectivity check failed: {e}",
             bucket.name
         ))
     })?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Err(Error::InitError(format!(
+            "S3 bucket '{}' connectivity check returned status {status}",
+            bucket.name
+        )));
+    }
     let _ = bucket.delete_object(PROBE_KEY).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
     use crate::{
         FileRotation, default_max_file_size, default_output_format, default_path_template,
@@ -119,6 +129,36 @@ mod tests {
             retry_delay: None,
             path_style: None,
         }
+    }
+
+    #[test]
+    fn given_probe_response_should_require_success_status() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for status in [200, 403, 404, 503] {
+                let server = MockServer::start().await;
+                Mock::given(method("PUT"))
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&server)
+                    .await;
+                let config = S3SinkConfig {
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    ..base_config()
+                };
+                let bucket = create_bucket(&config).await.expect("Create S3 test client");
+                let result = verify_bucket(&bucket).await;
+                if status == 200 {
+                    assert!(result.is_ok(), "Successful probe must pass: {result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::InitError(_))),
+                        "Failed probe status {status} must prevent initialization: {result:?}"
+                    );
+                }
+            }
+        });
     }
 
     #[test]
