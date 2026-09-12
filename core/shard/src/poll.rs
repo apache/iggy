@@ -106,14 +106,11 @@ where
                             },
                         );
                         if let Some(reason) = route_failure {
-                            completion::reject(&reply, &self.metrics, reason);
+                            completion::reject(&reply, self.metrics.frame_drop_metrics(), reason);
                             return;
                         }
-                        let Some(completion) = self.poll_completions.try_reserve(
-                            namespace,
-                            reply,
-                            self.metrics.clone(),
-                        ) else {
+                        let Some(completion) = self.poll_completions.try_reserve(namespace, reply)
+                        else {
                             return;
                         };
                         #[cfg(feature = "poll-diagnostics")]

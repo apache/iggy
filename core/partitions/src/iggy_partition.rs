@@ -223,9 +223,9 @@ where
     /// separate from the eager poll maps because follower-local and uncommitted
     /// auto-commit progress must never consume a durable slot or enter a state
     /// transfer artifact.
-    pub(crate) durable_consumer_offsets: Rc<DurableConsumerOffsets>,
-    pub(crate) consumer_offset_capacity: Rc<ConsumerOffsetCapacity>,
-    pub(crate) consumer_group_offset_capacity: Rc<ConsumerOffsetCapacity>,
+    pub(crate) durable_consumer_offsets: DurableConsumerOffsets,
+    pub(crate) consumer_offset_capacity: ConsumerOffsetCapacity,
+    pub(crate) consumer_group_offset_capacity: ConsumerOffsetCapacity,
     pub(crate) observed_view: u32,
     offset_reservations_need_resync: Cell<bool>,
     offset_reservations_scan_state: Option<(u64, u64, u64, Option<u64>)>,
@@ -610,15 +610,15 @@ where
             fatal: None,
             pending_consumer_offset_commits: HashMap::new(),
             poll_history: PollHistoryId::default(),
-            durable_consumer_offsets: Rc::new(DurableConsumerOffsets::default()),
-            consumer_offset_capacity: Rc::new(ConsumerOffsetCapacity::new(
+            durable_consumer_offsets: DurableConsumerOffsets::default(),
+            consumer_offset_capacity: ConsumerOffsetCapacity::new(
                 ConsumerKind::Consumer,
                 crate::DEFAULT_CONSUMER_OFFSETS_MAX,
-            )),
-            consumer_group_offset_capacity: Rc::new(ConsumerOffsetCapacity::new(
+            ),
+            consumer_group_offset_capacity: ConsumerOffsetCapacity::new(
                 ConsumerKind::ConsumerGroup,
                 crate::DEFAULT_CONSUMER_OFFSETS_MAX,
-            )),
+            ),
             observed_view,
             offset_reservations_need_resync: Cell::new(false),
             offset_reservations_scan_state: None,
@@ -3446,7 +3446,7 @@ where
         }
     }
 
-    pub(crate) fn consumer_offset_capacity_for(
+    pub(crate) const fn consumer_offset_capacity_for(
         &self,
         kind: ConsumerKind,
     ) -> &ConsumerOffsetCapacity {

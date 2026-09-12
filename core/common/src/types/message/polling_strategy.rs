@@ -92,7 +92,12 @@ impl PollingStrategy {
         }
     }
 
-    /// Poll messages from the next message after the last polled message based on the stored consumer offset. Should be used with `auto_commit` set to `true`.
+    /// Poll messages after the consumer offset stored on the server.
+    ///
+    /// Advance that offset with automatic commits or explicit offset stores.
+    /// A missing response to a poll with automatic commits can leave it ahead
+    /// of messages the caller received. See the
+    /// [poll recovery contract](crate::MessageClient::poll_messages) before retrying.
     pub fn next() -> Self {
         Self {
             kind: PollingKind::Next,

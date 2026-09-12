@@ -101,7 +101,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     let late_reply = reply.clone();
     let completion = owner
         .poll_completions
-        .try_reserve(requested_namespace, reply, owner.metrics().clone())
+        .try_reserve(requested_namespace, reply)
         .expect("reserve the read before the requester times out");
     let read_plan = partitions
         .build_poll_snapshot(&requested_namespace, requested_consumer, &args)
@@ -216,7 +216,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
     let consumer = PollingConsumer::ConsumerGroup(7, 0);
     let bus = PollTestBus::default();
     let mut owner = owner_with_messages(&bus, namespace).await;
-    owner.poll_completions = PollCompletionLane::new(1);
+    owner.poll_completions = PollCompletionLane::new(1, owner.metrics());
     let (owner_sender, _owner_inbox, _owner_replies) = shard_channel(0, 2, 1);
     owner.attach_senders(vec![owner_sender]);
     let partitions = owner.plane.partitions();
@@ -239,7 +239,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
     let (held_reply, _held_replies) = channel(1);
     let reservation = owner
         .poll_completions
-        .try_reserve(namespace, held_reply, owner.metrics().clone())
+        .try_reserve(namespace, held_reply)
         .expect("reserve the only slot");
     assert_eq!(owner.poll_completion_inbox_len(), 0);
     let (reply, replies) = channel(1);

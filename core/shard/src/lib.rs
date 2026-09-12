@@ -1470,8 +1470,7 @@ where
     /// and in single-shard tests that bypass the coordinator.
     coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
 
-    /// Per-shard observability counters. Cloned at metric increment sites,
-    /// so cheap (`Arc` clone) regardless of label cardinality.
+    /// Observability counters shared with the metrics registry.
     metrics: crate::metrics::ShardMetrics,
 
     /// Late-bound `MetadataCommitTick` handler. `None` until reconciler
@@ -1744,7 +1743,8 @@ where
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
-        let poll_completions = poll::completion::PollCompletionLane::new(poll_completion_capacity);
+        let poll_completions =
+            poll::completion::PollCompletionLane::new(poll_completion_capacity, &metrics);
         Ok(Self {
             id,
             name,
@@ -2213,6 +2213,7 @@ where
         // unbounded variant is wanted here either.
         let (_tx, inbox) = channel(1);
         let (_reply_tx, reply_inbox) = channel(1);
+        let metrics = crate::metrics::ShardMetrics::for_shard();
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
@@ -2236,10 +2237,10 @@ where
             shard_count: 1,
             inbox,
             reply_inbox,
-            poll_completions: poll::completion::PollCompletionLane::new(1),
+            poll_completions: poll::completion::PollCompletionLane::new(1, &metrics),
             shards_table,
             partition_consensus,
-            metrics: crate::metrics::ShardMetrics::for_shard(),
+            metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(BTreeMap::new()),

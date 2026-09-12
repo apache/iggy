@@ -473,6 +473,12 @@ unsafe impl Sync for IggyConsumer {}
 /// automatically; the next call parks for [`polling_retry_interval()`] while polling is paused. Hence,
 /// deciding when to give up on repeated errors is up to you.
 ///
+/// With [`AutoCommitWhen::PollingMessages`], a missing response can leave the server's
+/// cursor ahead of messages this consumer received. Continuing with
+/// [`PollingStrategy::next()`] can skip those messages. See the
+/// [poll recovery contract](MessageClient::poll_messages) for recovery from explicit
+/// checkpoints for each partition.
+///
 /// For a boilerplate implementation of such a loop Iggy provides [`IggyConsumerMessageExt::consume_messages`].
 ///
 /// # Tracking what has been read

@@ -236,8 +236,7 @@ pub struct ShardMetrics {
     partition_wal_prepares: Counter,
     partition_wal_checkpoints: Counter,
     partition_wal_errors: Counter,
-    frame_drops_total: Family<FrameDropLabel, Counter>,
-    cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
+    frame_drops: FrameDropMetrics,
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
@@ -305,8 +304,10 @@ impl ShardMetrics {
             partition_wal_prepares: Counter::default(),
             partition_wal_checkpoints: Counter::default(),
             partition_wal_errors: Counter::default(),
-            frame_drops_total,
-            cached_counters,
+            frame_drops: FrameDropMetrics {
+                total: frame_drops_total,
+                cached_counters,
+            },
             partitions_materialised_total: Counter::default(),
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
@@ -462,19 +463,12 @@ impl ShardMetrics {
     /// path so accounting is preserved even if a future caller forgets
     /// to extend the const tables above.
     pub fn record_frame_drop(&self, variant: &'static str, reason: &'static str) {
-        if let (Some(v_idx), Some(r_idx)) = (variant_index(variant), reason_index(reason)) {
-            self.cached_counters[v_idx][r_idx]
-                .get_or_init(|| {
-                    self.frame_drops_total
-                        .get_or_create(&FrameDropLabel { variant, reason })
-                        .clone()
-                })
-                .inc();
-        } else {
-            self.frame_drops_total
-                .get_or_create(&FrameDropLabel { variant, reason })
-                .inc();
-        }
+        self.frame_drops.record(variant, reason);
+    }
+
+    /// The completion lane shares these handles once during shard setup.
+    pub(crate) const fn frame_drop_metrics(&self) -> &FrameDropMetrics {
+        &self.frame_drops
     }
 
     /// Bumped on the owning shard each time the partition reconciliation
@@ -557,7 +551,8 @@ impl ShardMetrics {
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
     pub fn frame_drops_value(&self) -> u64 {
-        self.cached_counters
+        self.frame_drops
+            .cached_counters
             .iter()
             .flatten()
             .filter_map(OnceLock::get)
@@ -577,7 +572,8 @@ impl ShardMetrics {
         let Some(reason_idx) = reason_index(reason) else {
             return 0;
         };
-        self.cached_counters
+        self.frame_drops
+            .cached_counters
             .iter()
             .filter_map(|variant| variant[reason_idx].get())
             .map(prometheus_client::metrics::counter::Counter::get)
@@ -731,7 +727,7 @@ impl ShardMetrics {
     #[must_use]
     pub fn frame_drop_count(&self, variant: &'static str, reason: &'static str) -> u64 {
         match (variant_index(variant), reason_index(reason)) {
-            (Some(v_idx), Some(r_idx)) => self.cached_counters[v_idx][r_idx]
+            (Some(v_idx), Some(r_idx)) => self.frame_drops.cached_counters[v_idx][r_idx]
                 .get()
                 .map_or(0, prometheus_client::metrics::counter::Counter::get),
             _ => 0,
@@ -748,7 +744,7 @@ impl ShardMetrics {
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",
-            self.frame_drops_total.clone(),
+            self.frame_drops.total.clone(),
         );
         registry.register(
             "partitions_materialised",
@@ -830,6 +826,35 @@ impl ShardMetrics {
     }
 }
 
+/// Frame drop accounting shared with the registered shard metrics.
+/// Clones retain the same family and lazy cache, so detached work records
+/// visible drops without carrying unrelated counters or creating unused series.
+#[derive(Clone)]
+pub(crate) struct FrameDropMetrics {
+    total: Family<FrameDropLabel, Counter>,
+    cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
+}
+
+impl FrameDropMetrics {
+    pub(crate) fn record(&self, variant: &'static str, reason: &'static str) {
+        if let (Some(variant_index), Some(reason_index)) =
+            (variant_index(variant), reason_index(reason))
+        {
+            self.cached_counters[variant_index][reason_index]
+                .get_or_init(|| {
+                    self.total
+                        .get_or_create(&FrameDropLabel { variant, reason })
+                        .clone()
+                })
+                .inc();
+        } else {
+            self.total
+                .get_or_create(&FrameDropLabel { variant, reason })
+                .inc();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,7 +871,8 @@ mod tests {
 
         let count = |variant, reason| {
             metrics
-                .frame_drops_total
+                .frame_drops
+                .total
                 .get_or_create(&FrameDropLabel { variant, reason })
                 .get()
         };
@@ -947,7 +973,8 @@ mod tests {
             metrics.record_frame_drop(frame_drop_variant::PARTITION, frame_drop_reason::UNROUTABLE);
         }
         let from_family = metrics
-            .frame_drops_total
+            .frame_drops
+            .total
             .get_or_create(&FrameDropLabel {
                 variant: frame_drop_variant::PARTITION,
                 reason: frame_drop_reason::UNROUTABLE,
@@ -993,7 +1020,8 @@ mod tests {
         let metrics = ShardMetrics::for_shard();
         metrics.record_frame_drop("unexpected_variant", "unexpected_reason");
         let from_family = metrics
-            .frame_drops_total
+            .frame_drops
+            .total
             .get_or_create(&FrameDropLabel {
                 variant: "unexpected_variant",
                 reason: "unexpected_reason",

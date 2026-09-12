@@ -39,7 +39,7 @@ use server_common::sharding::IggyNamespace;
 
 use super::PollCompleted;
 use crate::coordinator::classify_try_send_err;
-use crate::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+use crate::metrics::{FrameDropMetrics, ShardMetrics, frame_drop_reason, frame_drop_variant};
 use crate::{PartitionReadReply, Receiver, Sender, channel};
 
 /// A private bounded lane, with capacity shared by pending reads and results.
@@ -56,7 +56,7 @@ impl PollCompletionLane {
     /// # Panics
     ///
     /// Panics if `capacity` is zero.
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize, metrics: &ShardMetrics) -> Self {
         assert!(capacity > 0, "poll completion capacity must be nonzero");
         let (sender, receiver) = channel(capacity);
         Self {
@@ -66,6 +66,7 @@ impl PollCompletionLane {
                 capacity,
                 reserved: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
+                metrics: metrics.frame_drop_metrics().clone(),
             }),
         }
     }
@@ -76,10 +77,9 @@ impl PollCompletionLane {
         &self,
         namespace: IggyNamespace,
         reply: Sender<PartitionReadReply>,
-        metrics: ShardMetrics,
     ) -> Option<PollCompletionSender> {
         if self.state.closed.load(Ordering::Relaxed) || self.sender.is_disconnected() {
-            reject(&reply, &metrics, frame_drop_reason::DISCONNECTED);
+            reject(&reply, &self.state.metrics, frame_drop_reason::DISCONNECTED);
             return None;
         }
         if self
@@ -90,7 +90,7 @@ impl PollCompletionLane {
             })
             .is_err()
         {
-            reject(&reply, &metrics, frame_drop_reason::FULL);
+            reject(&reply, &self.state.metrics, frame_drop_reason::FULL);
             return None;
         }
         Some(PollCompletionSender {
@@ -100,7 +100,6 @@ impl PollCompletionLane {
             },
             namespace,
             reply,
-            metrics,
         })
     }
 
@@ -153,7 +152,6 @@ pub struct PollCompletionSender {
     slot: CompletionSlot,
     namespace: IggyNamespace,
     reply: Sender<PartitionReadReply>,
-    metrics: ShardMetrics,
 }
 
 impl PollCompletionSender {
@@ -162,7 +160,11 @@ impl PollCompletionSender {
     /// owner rejects the result and releases the reservation.
     pub(crate) fn complete(self, result: PollReadResult) {
         if self.slot.state.closed.load(Ordering::Relaxed) || self.inbox.is_disconnected() {
-            reject(&self.reply, &self.metrics, frame_drop_reason::DISCONNECTED);
+            reject(
+                &self.reply,
+                &self.slot.state.metrics,
+                frame_drop_reason::DISCONNECTED,
+            );
             return;
         }
         let completion = QueuedCompletion {
@@ -173,7 +175,7 @@ impl PollCompletionSender {
                 #[cfg(feature = "poll-diagnostics")]
                 queued_at: Some(std::time::Instant::now()),
             }),
-            _slot: self.slot,
+            slot: self.slot,
         };
         if let Err(error) = self.inbox.try_send(completion) {
             let reason = classify_try_send_err(&error);
@@ -184,7 +186,11 @@ impl PollCompletionSender {
                 }
                 TrySendError::Disconnected(completion) => completion,
             };
-            reject(&completion.result.reply, &self.metrics, reason);
+            reject(
+                &completion.result.reply,
+                &completion.slot.state.metrics,
+                reason,
+            );
         }
     }
 }
@@ -205,8 +211,12 @@ impl Drop for CompletionPumpGuard<'_> {
 }
 
 /// Report a completion route or admission failure without changing progress.
-pub fn reject(reply: &Sender<PartitionReadReply>, metrics: &ShardMetrics, reason: &'static str) {
-    metrics.record_frame_drop(frame_drop_variant::PARTITION_POLL_COMPLETION, reason);
+pub(super) fn reject(
+    reply: &Sender<PartitionReadReply>,
+    metrics: &FrameDropMetrics,
+    reason: &'static str,
+) {
+    metrics.record(frame_drop_variant::PARTITION_POLL_COMPLETION, reason);
     let _ = reply.try_send(PartitionReadReply::Rejected(
         IggyError::TransientNotAccepted,
     ));
@@ -218,6 +228,9 @@ struct LaneState {
     reserved: AtomicUsize,
     /// Closing stops both new reservations and delivery by existing reads.
     closed: AtomicBool,
+    /// Share the registered family and cache through the existing slot handle.
+    /// Disk reads need no additional metric handle clones at dispatch.
+    metrics: FrameDropMetrics,
 }
 
 /// Unique ownership of one slot, transferred from read to queued completion.
@@ -235,7 +248,7 @@ impl Drop for CompletionSlot {
 struct QueuedCompletion {
     result: Box<PollCompleted>,
     /// Kept until dequeue, even after the disk task has returned.
-    _slot: CompletionSlot,
+    slot: CompletionSlot,
 }
 
 impl QueuedCompletion {
@@ -256,23 +269,22 @@ mod tests {
         IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig, PollReadResult,
         PollingArgs, PollingConsumer,
     };
+    use prometheus_client::encoding::text::encode;
+    use prometheus_client::registry::Registry;
     use server_common::sharding::{IggyNamespace, ShardId};
 
     use super::{PollCompletionLane, PollCompletionSender};
-    use crate::metrics::ShardMetrics;
+    use crate::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
     use crate::{PartitionReadReply, Receiver, channel};
 
     #[test]
     fn given_pending_read_when_capacity_is_reserved_should_reject_another_reservation() {
-        let lane = PollCompletionLane::new(1);
+        let metrics = ShardMetrics::for_shard();
+        let lane = PollCompletionLane::new(1, &metrics);
         let (pending_read, _pending_replies) = reserve_read(&lane);
         let (reply, rejected_replies) = channel(1);
-        let metrics = ShardMetrics::for_shard();
 
-        assert!(
-            lane.try_reserve(namespace(), reply, metrics.clone())
-                .is_none()
-        );
+        assert!(lane.try_reserve(namespace(), reply).is_none());
         assert!(matches!(
             rejected_replies.try_recv(),
             Ok(PartitionReadReply::Rejected(
@@ -289,7 +301,8 @@ mod tests {
 
     #[test]
     fn given_queued_result_when_read_finishes_should_keep_reservation_until_dequeue() {
-        let lane = PollCompletionLane::new(1);
+        let metrics = ShardMetrics::for_shard();
+        let lane = PollCompletionLane::new(1, &metrics);
         let (read, replies) = reserve_read(&lane);
         read.complete(read_empty_partition());
         assert_eq!(lane.len(), 1);
@@ -299,10 +312,7 @@ mod tests {
         ));
 
         let (next_reply, _next_replies) = channel(1);
-        assert!(
-            lane.try_reserve(namespace(), next_reply, ShardMetrics::for_shard())
-                .is_none()
-        );
+        assert!(lane.try_reserve(namespace(), next_reply).is_none());
 
         // Dequeue frees capacity even while owner validation still holds bytes.
         let _result_for_owner = lane.try_recv().expect("result reaches owner");
@@ -315,14 +325,12 @@ mod tests {
 
     #[test]
     fn given_closed_caller_when_read_is_pending_should_retain_reservation() {
-        let lane = PollCompletionLane::new(1);
+        let metrics = ShardMetrics::for_shard();
+        let lane = PollCompletionLane::new(1, &metrics);
         let (pending_read, replies) = reserve_read(&lane);
         drop(replies);
         let (next_reply, _next_replies) = channel(1);
-        assert!(
-            lane.try_reserve(namespace(), next_reply, ShardMetrics::for_shard())
-                .is_none()
-        );
+        assert!(lane.try_reserve(namespace(), next_reply).is_none());
 
         pending_read.complete(read_empty_partition());
         assert_eq!(
@@ -338,7 +346,8 @@ mod tests {
 
     #[test]
     fn given_closed_lane_when_reserved_read_finishes_should_reject_without_enqueue() {
-        let lane = PollCompletionLane::new(1);
+        let metrics = ShardMetrics::for_shard();
+        let lane = PollCompletionLane::new(1, &metrics);
         let (pending_read, replies) = reserve_read(&lane);
         lane.close();
         pending_read.complete(read_empty_partition());
@@ -352,10 +361,7 @@ mod tests {
         assert_eq!(lane.len(), 0);
         assert_eq!(lane.state.reserved.load(Ordering::Relaxed), 0);
         let (next_reply, next_replies) = channel(1);
-        assert!(
-            lane.try_reserve(namespace(), next_reply, ShardMetrics::for_shard())
-                .is_none()
-        );
+        assert!(lane.try_reserve(namespace(), next_reply).is_none());
         assert!(matches!(
             next_replies.try_recv(),
             Ok(PartitionReadReply::Rejected(
@@ -366,11 +372,21 @@ mod tests {
 
     #[test]
     fn given_dropped_lane_when_read_is_pending_should_release_queued_and_pending_slots() {
-        let lane = PollCompletionLane::new(2);
+        let metrics = ShardMetrics::for_shard();
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let lane = PollCompletionLane::new(2, &metrics);
         let state = lane.state.clone();
         let (queued_read, queued_replies) = reserve_read(&lane);
         let (pending_read, pending_replies) = reserve_read(&lane);
         queued_read.complete(read_empty_partition());
+
+        let mut scrape = String::new();
+        encode(&mut scrape, &registry).expect("metrics are encodable");
+        assert!(
+            !scrape.contains(frame_drop_variant::PARTITION_POLL_COMPLETION),
+            "reserving and delivering reads must not create unused drop series",
+        );
         drop(lane);
 
         assert_eq!(state.reserved.load(Ordering::Relaxed), 1);
@@ -386,11 +402,31 @@ mod tests {
             ))
         ));
         assert_eq!(state.reserved.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.frame_drop_count(
+                frame_drop_variant::PARTITION_POLL_COMPLETION,
+                frame_drop_reason::DISCONNECTED,
+            ),
+            1,
+            "the late read must record its drop in the original shard metrics",
+        );
+        scrape.clear();
+        encode(&mut scrape, &registry).expect("metrics are encodable");
+        assert!(
+            scrape.lines().any(|line| {
+                line.starts_with("frame_drops_total{")
+                    && line.contains("variant=\"partition_poll_completion\"")
+                    && line.contains("reason=\"disconnected\"")
+                    && line.ends_with(" 1")
+            }),
+            "the registered family must observe the late read's drop"
+        );
     }
 
     #[test]
     fn given_canceled_pump_when_completions_exist_should_abandon_without_acceptance() {
-        let lane = PollCompletionLane::new(2);
+        let metrics = ShardMetrics::for_shard();
+        let lane = PollCompletionLane::new(2, &metrics);
         let pump = lane.pump_guard();
         let (queued_read, queued_replies) = reserve_read(&lane);
         let (pending_read, pending_replies) = reserve_read(&lane);
@@ -417,7 +453,7 @@ mod tests {
     ) -> (PollCompletionSender, Receiver<PartitionReadReply>) {
         let (reply, replies) = channel(1);
         let reservation = lane
-            .try_reserve(namespace(), reply, ShardMetrics::for_shard())
+            .try_reserve(namespace(), reply)
             .expect("scenario has capacity for this read");
         (reservation, replies)
     }

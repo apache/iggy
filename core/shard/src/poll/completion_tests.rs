@@ -69,7 +69,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let (stale_reply_sender, stale_replies) = channel(1);
     let old_completion = owner
         .poll_completions
-        .try_reserve(namespace, stale_reply_sender, owner.metrics().clone())
+        .try_reserve(namespace, stale_reply_sender)
         .expect("reserve the old read before executing it");
     let old_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
@@ -139,7 +139,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let (fresh_reply_sender, fresh_replies) = channel(1);
     let fresh_completion = owner
         .poll_completions
-        .try_reserve(namespace, fresh_reply_sender, owner.metrics().clone())
+        .try_reserve(namespace, fresh_reply_sender)
         .expect("reserve the fresh read before executing it");
     let fresh_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
@@ -218,7 +218,7 @@ async fn given_full_owner_inbox_when_reserved_reads_complete_should_interleave_b
         let (reply_sender, replies) = channel(1);
         let completion = owner
             .poll_completions
-            .try_reserve(namespace, reply_sender, owner.metrics().clone())
+            .try_reserve(namespace, reply_sender)
             .expect("reserve completion capacity before reading");
         let plan = partitions
             .build_poll_snapshot(
@@ -453,7 +453,7 @@ fn queue_resident_poll(
     let (reply_sender, replies) = channel(1);
     owner
         .poll_completions
-        .try_reserve(namespace, reply_sender, owner.metrics().clone())
+        .try_reserve(namespace, reply_sender)
         .expect("reserve capacity before completing the read")
         .complete(plan.execute_resident());
     assert_eq!(
