@@ -27,10 +27,6 @@ use tokio::sync::oneshot;
 /// replaces the `while let` loop you would otherwise write around
 /// [`StreamExt::next`](futures_util::StreamExt::next).
 ///
-/// Under [`CommitPolicy::Auto`] the loop counts each message as its [`CommitAfter`] says. With
-/// [`CommitAfter::Processing`] a message counts once your handler returned `Ok`, and a handler
-/// that fails ends the loop instead of being skipped.
-///
 /// # Examples
 ///
 /// Read a topic until Ctrl-C, then store the counted offsets and leave the group:
@@ -77,32 +73,14 @@ use tokio::sync::oneshot;
 /// # }
 /// ```
 ///
-/// [`CommitAfter`]: crate::prelude::CommitAfter
-/// [`CommitAfter::Processing`]: crate::prelude::CommitAfter::Processing
-/// [`CommitPolicy::Auto`]: crate::prelude::CommitPolicy::Auto
 /// [`IggyConsumer`]: crate::prelude::IggyConsumer
 #[async_trait]
 pub trait IggyConsumerMessageExt<'a> {
     /// Reads messages until a shutdown signal arrives, and hands each one to `message_consumer`.
     ///
-    /// The loop stops when `shutdown_rx` resolves, which happens both when the sender sends and
-    /// when the sender is dropped. It also stops when the consumer has no more messages, as
-    /// after `shutdown()` on the consumer. Every case returns `Ok(())`. After the two signal
-    /// cases the consumer stays usable, so storing the counted offsets and leaving the group is
-    /// still your call.
-    ///
-    /// Under `CommitPolicy::Auto`, a message counts before the consumer runs with
-    /// `CommitAfter::Delivery`, and once it returns with success with `CommitAfter::Processing`.
-    /// With `Processing`, a consumer that fails ends the loop and leaves its message uncounted.
-    /// Under every other policy, a message whose handler returned an error is logged and
-    /// skipped, and the loop reads on.
-    ///
     /// # Errors
     ///
-    /// Returns a [`ReadError`] for the error that ended the loop. It names its partition, if it
-    /// has one, so the caller can recover that partition and consume again. Every other read
-    /// error is logged and the loop reads on. The implementation on `IggyConsumer` lists the
-    /// errors that end the loop.
+    /// Returns the [`ReadError`] that ended the loop. It names its partition, if it has one.
     async fn consume_messages<P>(
         &mut self,
         message_consumer: &'a P,

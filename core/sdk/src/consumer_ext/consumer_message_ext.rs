@@ -31,8 +31,9 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// that arrives while a handler runs stops the loop after that handler returns. Dropping the
     /// sender counts as a signal.
     ///
-    /// The loop returns `Ok(())` when the signal arrives, when the sender is dropped, or when the
-    /// consumer has no more messages, as after [`shutdown()`](crate::prelude::IggyConsumer::shutdown).
+    /// The loop returns `Ok(())` in three cases: (1) the signal arrived, (2) the sender was
+    /// dropped, or (3) the consumer has no more messages, as after
+    /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown).
     /// After the two signal cases the consumer stays usable, so call
     /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown) afterwards to store the counted
     /// offsets and leave the consumer group.
