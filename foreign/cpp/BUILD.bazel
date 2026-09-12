@@ -27,6 +27,7 @@ genrule(
     srcs = glob(["src/**/*.rs"]) + [
         "Cargo.toml",
         "build.rs",
+        "@iggy_source//:cpp_rust_dependencies",
     ],
     outs = [
         "libiggy_cpp.a",
