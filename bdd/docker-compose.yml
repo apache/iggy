@@ -199,6 +199,24 @@ services:
     networks:
       - iggy-bdd-network
 
+  swift-bdd:
+    image: iggy-bdd-swift
+    build:
+      context: ..
+      dockerfile: bdd/swift/Dockerfile
+    environment:
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+      - BDD_FEATURE=${BDD_FEATURE:-all}
+      - BDD_SCENARIOS_DIR=/app/bdd/scenarios
+    volumes:
+      - ./scenarios/basic_messaging.feature:/app/bdd/scenarios/basic_messaging.feature
+      - ./scenarios/raw_command.feature:/app/bdd/scenarios/raw_command.feature
+      - ./scenarios/stream_crud.feature:/app/bdd/scenarios/stream_crud.feature
+    command: [ "swift", "run", "--skip-build", "iggy-bdd" ]
+    networks:
+      - iggy-bdd-network
+
 networks:
   iggy-bdd-network:
     driver: bridge

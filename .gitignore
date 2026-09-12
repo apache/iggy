@@ -24,6 +24,12 @@ foreign/cpp/build
 foreign/java/**/build
 foreign/java/**/out
 foreign/node/**/dist
+foreign/swift/.build
+foreign/swift/.swiftpm
+examples/swift/**/.build
+examples/swift/**/.swiftpm
+bdd/swift/**/.build
+bdd/swift/**/.swiftpm
 foreign/node/npm-debug.log*
 foreign/node/.npm
 **/node_modules

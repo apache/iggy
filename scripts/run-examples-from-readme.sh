@@ -21,7 +21,7 @@ set -euo pipefail
 # Unified script to run SDK examples from README.md files.
 # Usage: ./scripts/run-examples-from-readme.sh [OPTIONS]
 #
-#   --language LANG   Language to test: rust|go|node|python|php|java|csharp (default: all)
+#   --language LANG   Language to test: rust|go|node|python|php|java|csharp|swift (default: all)
 #   --target TARGET   Cargo target architecture for the server binary
 #   --skip-tls        Skip TLS example tests
 #
@@ -389,6 +389,27 @@ run_csharp_examples() {
         ""
 }
 
+# shellcheck disable=SC2329
+run_swift_examples() {
+    # The Swift SDK speaks only the VSR wire protocol.
+    resolve_server_binary "${TARGET}" "iggy-server"
+    # The VSR server logs no startup line, so readiness is a connect poll.
+    SERVER_READY_PROBE="tcp"
+    unset -f TRANSFORM_COMMAND 2>/dev/null || true
+
+    run_language_examples \
+        "Swift" \
+        "examples/swift" \
+        "README.md" \
+        "^swift run" \
+        "--tls" \
+        "^swift run.*--tls" \
+        0 \
+        ""
+
+    SERVER_READY_PROBE="log"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -427,14 +448,15 @@ case "${LANGUAGE}" in
     php)    run_one run_php_examples    "PHP"    ;;
     java)   run_one run_java_examples   "Java"   ;;
     csharp) run_one run_csharp_examples "C#"     ;;
+    swift)  run_one run_swift_examples  "Swift"  ;;
     all)
-        for lang in rust node go python php java csharp; do
+        for lang in rust node go python php java csharp swift; do
             run_one "run_${lang}_examples" "${lang}"
         done
         ;;
     *)
         echo "Unknown language: ${LANGUAGE}"
-        echo "Supported: rust, node, go, python, php, java, csharp, all"
+        echo "Supported: rust, node, go, python, php, java, csharp, swift, all"
         exit 1
         ;;
 esac

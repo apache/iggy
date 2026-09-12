@@ -106,6 +106,12 @@ jobs:
         with:
           download-deps: "false"
 
+      - name: Setup Swift for examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-swift'
+        uses: ./.github/actions/utils/setup-swift
+        with:
+          cache-key: examples
+
       - name: Build common binaries for all examples
         if: startsWith(inputs.component, 'examples-')
         run: |
@@ -198,6 +204,10 @@ jobs:
       - name: Run Java examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
         run: ./scripts/run-examples-from-readme.sh --language java
+
+      - name: Run Swift examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-swift'
+        run: ./scripts/run-examples-from-readme.sh --language swift
 
       - name: Upload reports
         if: always()

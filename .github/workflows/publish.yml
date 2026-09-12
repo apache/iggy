@@ -49,7 +49,7 @@ on:
         required: false
         default: ""
       publish_other:
-        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go)"
+        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go, swift)"
         type: string
         required: false
         default: ""
@@ -247,22 +247,25 @@ jobs:
 
             // Parse other SDKs
             ('${{ inputs.publish_other }}').split(',').map(s => s.trim()).filter(Boolean).forEach(sdk => {
-              if (['python','node','java','csharp','go'].includes(sdk)) {
+              if (['python','node','java','csharp','go','swift'].includes(sdk)) {
                 wants.push(`sdk-${sdk}`);
               } else {
                 core.warning(`Unknown SDK: ${sdk}`);
               }
             });
 
-            const toType = (entry) => ({
-              dockerhub: 'docker',
-              crates: 'rust',
-              pypi: 'python',
-              npm: 'node',
-              maven: 'java',
-              nuget: 'csharp',
-              none: 'go'
-            }[entry.registry] || 'unknown');
+            // Tag-only SDKs share the `none` registry, so their type comes
+            // from the component key instead.
+            const toType = (key, entry) => entry.registry === 'none'
+              ? key.replace(/^sdk-/, '')
+              : ({
+                  dockerhub: 'docker',
+                  crates: 'rust',
+                  pypi: 'python',
+                  npm: 'node',
+                  maven: 'java',
+                  nuget: 'csharp'
+                }[entry.registry] || 'unknown');
 
             const targets = [];
             const nonRustTargets = [];
@@ -279,7 +282,7 @@ jobs:
               const target = {
                 key,
                 name: key,
-                type: toType(entry),
+                type: toType(key, entry),
                 registry: entry.registry || '',
                 package: entry.package || '',
                 image: entry.image || '',
@@ -1128,6 +1131,16 @@ jobs:
       - name: Prepare Go tag
         if: matrix.type == 'go'
         uses: ./.github/actions/go/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # ─────────────────────────────────────────
+      # Swift Package (Tag-only)
+      # ─────────────────────────────────────────
+      - name: Prepare Swift tag
+        if: matrix.type == 'swift'
+        uses: ./.github/actions/swift/post-merge
         with:
           version: ${{ steps.ver.outputs.version }}
           dry_run: ${{ inputs.dry_run }}

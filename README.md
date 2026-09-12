@@ -125,6 +125,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/igg
 - [Python](https://pypi.org/project/apache-iggy/)
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
+- [Swift](https://github.com/apache/iggy/tree/master/foreign/swift)
 
 [C++](https://github.com/apache/iggy/tree/master/foreign/cpp) and [PHP](https://github.com/apache/iggy/tree/master/foreign/php) are work in progress.
 
