@@ -17,9 +17,10 @@
 
 #![allow(dead_code)]
 
-use crate::poll_plan::PollPlan;
+use crate::poll_plan::{PollPlan, PollReadResult};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
+use crate::{PollCompletion, PollReplication};
 use ahash::AHashSet;
 use consensus::{
     Consensus, Plane, PlaneIdentity, VsrConsensus, build_deny_reply_from_request_header,
@@ -469,17 +470,9 @@ where
         self.tombstoned.borrow_mut().remove(namespace);
     }
 
-    /// Build an owned [`PollPlan`] for a partition poll synchronously, under a
-    /// single pump-only `&mut` borrow (the in-memory journal tier + the
-    /// resident-tail straddle snapshot are read here, and the sealed-read-handle
-    /// LRU is touched; mem reads never yield). Returns `None` for a missing or
-    /// tombstoned namespace.
-    ///
-    /// Pairs with [`PollPlan::execute`], which runs the disk read +
-    /// offset persist/apply off the borrow on the owned plan. Splitting the
-    /// borrow-bound plan build from the borrow-free execution is what keeps
-    /// poll-read sound: the only partition reference is taken here, on the pump,
-    /// sequential with the pump's own `&mut` mutations, never on a sibling task.
+    /// Snapshot read resources under a synchronous borrow on the owning pump.
+    /// Returns `None` for a missing or tombstoned namespace. Execution carries
+    /// no partition borrow; its result returns to [`Self::complete_poll`].
     pub fn build_poll_snapshot(
         &self,
         namespace: &IggyNamespace,
@@ -493,6 +486,46 @@ where
         let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
         Some(partition.build_poll_plan(consumer, args, validate_checksum))
+    }
+
+    /// Validate and accept a poll synchronously on the owning pump.
+    /// Send the reply before driving any returned continuation through
+    /// [`Self::replicate_poll_completion`]. Success does not acknowledge a
+    /// durable offset commit.
+    ///
+    /// Acceptance is independent of reply delivery. A caller that stopped
+    /// waiting does not cancel completion: an accepted read can still advance
+    /// progress and admit an automatic commit even if its reply cannot be sent.
+    /// A history rejection accepts no progress from this read, but cannot
+    /// replace a response the transport already sent.
+    ///
+    /// # Errors
+    /// Rejects stale history, unavailable partition or admission state, invalid
+    /// consumer identifiers, and exhausted consumer, queue, or journal capacity.
+    /// Rejection does not accept progress from this read.
+    pub fn complete_poll(
+        &self,
+        namespace: &IggyNamespace,
+        result: PollReadResult,
+    ) -> Result<PollCompletion, IggyError> {
+        let partition = self
+            .get_mut_by_ns(namespace)
+            .ok_or(IggyError::TransientNotAccepted)?;
+        partition.complete_poll(result)
+    }
+
+    /// Drive an accepted poll's replication on the owning pump after its reply.
+    /// Use the continuation returned by [`Self::complete_poll`] for this namespace.
+    /// This call may suspend with a partition borrow, so it must remain on the
+    /// owning pump. A missing or tombstoned namespace drops the continuation.
+    pub async fn replicate_poll_completion(
+        &self,
+        namespace: &IggyNamespace,
+        replication: PollReplication,
+    ) {
+        if let Some(partition) = self.get_mut_by_ns(namespace) {
+            partition.replicate_poll_completion(replication).await;
+        }
     }
 
     /// Read a consumer's stored offset + the partition commit offset. Fully
@@ -663,31 +696,6 @@ where
     ) {
         if let Some(waiter) = waiter {
             let _ = waiter.send(build_deny_reply_from_request_header(header, status));
-        }
-    }
-
-    pub async fn on_auto_commit_request(
-        &self,
-        request: Message<RoutedRequestHeader>,
-        reservation: crate::AutoCommitReservation,
-    ) {
-        let namespace = IggyNamespace::from_raw(request.header().group);
-        if self.is_tombstoned(&namespace) {
-            tracing::debug!(
-                namespace_raw = namespace.inner(),
-                "dropping auto-commit for tombstoned partition"
-            );
-            return;
-        }
-        if let Some(partition) = self.get_mut_by_ns(&namespace) {
-            partition
-                .on_request_with_reservation(request, None, Some(reservation))
-                .await;
-        } else {
-            tracing::debug!(
-                namespace_raw = namespace.inner(),
-                "dropping auto-commit for missing partition"
-            );
         }
     }
 }

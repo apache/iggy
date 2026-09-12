@@ -15,42 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Owned, borrow-free poll execution.
+//! Owned poll reads without authority to change consumer progress.
 //!
-//! A poll must not hold a partition reference across an `.await`: the shard pump
-//! can reallocate the partitions `Vec` (`ReconcileOp::InsertOwned`) or take a
-//! `&mut` to the same namespace while a poll is parked, dangling the reference.
-//! So `IggyPartition::build_poll_plan` captures everything a poll needs
-//! synchronously under the borrow into the owned types here, drops the borrow,
-//! then [`PollPlan::execute`] runs the disk read + the in-memory auto-commit
-//! apply on owned data alone: consumer offsets are already `Arc`, the journal
-//! tail is a point-in-time `Frozen` snapshot, and each sealed segment carries a
-//! shared [`SealedSegmentReadState`] handle (a plain `Rc`, not a partition
-//! reference) whose read fd + sparse index the read reuses or fills on a miss.
-//! No value in this module holds a partition reference, so executing a plan is
-//! sound on a detached task concurrently with the pump's own writes.
+//! The pump snapshots file handles and resident fragments before a read can
+//! yield. Execution returns facts about that snapshot. Only the partition
+//! owner validates its history and accepts progress.
 
-use crate::PollFragments;
-use crate::consumer_offset_capacity::{
-    AutoCommitReservation, ConsumerOffsetCapacity, ConsumerOffsetCapacityError,
-    DurableConsumerOffsets,
-};
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
     MessageLookup, push_selected_batch_fragments, select_batch_slice, unpin_sparse_source,
 };
+use crate::{PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
-use iggy_common::{
-    ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
-};
+use iggy_common::{ConsumerKind, IggyError};
 use server_common::iobuf::{Frozen, Owned};
+use server_common::poll::PollHistoryId;
 use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
 use std::cell::{Cell, RefCell};
-use std::hash::Hash;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
@@ -170,76 +153,37 @@ pub struct DiskSegment {
     pub(crate) sealed: bool,
 }
 
-/// Owned auto-commit input, applied off the partition borrow after a poll (see
-/// module docs). Only the in-memory apply happens here; durability is the
-/// replicated [`crate::iggy_partition::IggyPartition::apply_staged_consumer_offset_commit`]
-/// path's job on every node, driven by the `StoreConsumerOffset` op the serving
-/// shard submits from [`AutoCommitApplied`]. A poll-local disk write would be
-/// node-local only and diverge on failover.
-pub struct AutoCommitCtx {
-    pub(crate) target: AutoCommitTarget,
-    pub(crate) capacity: Rc<ConsumerOffsetCapacity>,
-    pub(crate) durable: Rc<DurableConsumerOffsets>,
+/// Admission inputs carried by a read without access to consumer progress maps.
+#[derive(Debug)]
+pub struct PollContext {
+    /// History captured at planning, which must still match at completion.
+    pub(crate) history: PollHistoryId,
+    /// Consumer or group whose progress the owner may update after admission.
+    pub(crate) consumer: PollingConsumer,
+    /// For nonempty results, whether to advance the stored offset locally.
+    /// Group `last_polled` progress also advances when this is false.
+    pub(crate) auto_commit: bool,
 }
 
-/// The offset an `auto_commit` poll applied in memory, surfaced for replication.
-///
-/// The serving shard replicates it through the partition consensus (the only
-/// cross-node durable path); `kind` + `consumer_id` are the offset key the
-/// submitted `StoreConsumerOffset` op must carry.
-pub struct AutoCommitApplied {
-    pub kind: ConsumerKind,
-    pub consumer_id: u32,
-    pub offset: u64,
-    previous_offset: Option<u64>,
-    target: AutoCommitTarget,
-    capacity: Rc<ConsumerOffsetCapacity>,
-    durable: Rc<DurableConsumerOffsets>,
-    last_polled: Option<LastPolledCtx>,
+/// An owned read result awaiting validation by the partition owner.
+/// Finishing I/O does not authorize a successful reply or a progress update.
+#[derive(Debug)]
+pub struct PollReadResult {
+    pub(crate) context: PollContext,
+    /// Selected message bytes, which remain unaccepted until owner validation.
+    pub(crate) fragments: PollFragments,
+    /// Partition message frontier captured at planning, not consumer progress.
+    pub(crate) commit_offset: u64,
+    /// Inclusive offset of the last selected message, or `None` for no match.
+    pub(crate) last_matching_offset: Option<u64>,
 }
 
-/// The lock-free offset map this auto-commit updates, captured as an owned
-/// `Arc` so the apply needs no partition borrow. `create_path` builds the
-/// `ConsumerOffset` entry on first commit for a consumer that has none yet.
-pub enum AutoCommitTarget {
-    Consumer {
-        offsets: Arc<ConsumerOffsets>,
-        consumer_id: u32,
-        create_path: Option<String>,
-    },
-    ConsumerGroup {
-        offsets: Arc<ConsumerGroupOffsets>,
-        group_id: u32,
-        create_path: Option<String>,
-    },
-}
-
-/// Owned cooperative-rebalance input: a group's lock-free `last_polled` map
-/// (captured as an `Arc`) plus its id, so the highest offset served to the group
-/// is recorded off the partition borrow after the poll completes (the served
-/// offset is unknown until then). See [`PollPlan::execute`].
-pub struct LastPolledCtx {
-    pub(crate) offsets: Arc<ConsumerGroupOffsets>,
-    pub(crate) group_id: usize,
-}
-
-impl LastPolledCtx {
-    /// Bump the group's recorded high-water served offset (monotone via
-    /// `fetch_max`). Lock-free `papaya` on an owned `Arc`, so sound off the pump.
-    #[allow(clippy::cast_possible_truncation)]
-    fn record(&self, last_offset: u64) {
-        let guard = self.offsets.pin();
-        let key = ConsumerGroupId(self.group_id);
-        if let Some(existing) = guard.get(&key) {
-            existing.offset.fetch_max(last_offset, Ordering::Relaxed);
-        } else {
-            let created = ConsumerOffset::new(
-                ConsumerKind::ConsumerGroup,
-                u32::try_from(self.group_id).unwrap_or(u32::MAX),
-                last_offset,
-                String::new(),
-            );
-            guard.insert(key, created);
+impl PollReadResult {
+    #[must_use]
+    pub const fn consumer_kind(&self) -> ConsumerKind {
+        match self.context.consumer {
+            PollingConsumer::Consumer(..) => ConsumerKind::Consumer,
+            PollingConsumer::ConsumerGroup(..) => ConsumerKind::ConsumerGroup,
         }
     }
 }
@@ -275,49 +219,29 @@ impl ResidentTailSnapshot {
     }
 }
 
-/// Everything a poll needs, captured by `IggyPartition::build_poll_plan` (see
-/// module docs for the borrow contract).
+/// Owned read snapshot that may outlive the partition history it captured.
+///
+/// Execution yields a [`PollReadResult`] that the owner must accept through
+/// [`crate::IggyPartitions::complete_poll`] before replying or updating progress.
 pub struct PollPlan {
     /// Monotone high-water snapshot taken before the disk read, so it may lag a
     /// concurrent producer by the poll duration and self-corrects next poll.
     pub(crate) commit_offset: u64,
-    pub(crate) auto_commit: Option<AutoCommitCtx>,
-    pub(crate) last_polled: Option<LastPolledCtx>,
+    pub(crate) context: PollContext,
     pub(crate) tier: PollTier,
 }
 
 impl PollPlan {
-    /// Whether executing this plan needs off-pump IO: only a `Disk` tier read.
-    /// When `false` the result is fully resident and the caller runs
-    /// [`Self::execute_resident`] + replies on the pump; when `true` it must
-    /// spawn [`Self::execute`] so the pump is not blocked on file IO.
-    ///
-    /// Auto-commit no longer forces a detached task: its in-memory apply is
-    /// synchronous and its durability rides consensus off the serving shard
-    /// (no poll-local disk write), so a fully-resident `auto_commit` poll still
-    /// replies inline.
+    /// Whether this snapshot needs disk I/O on a detached read task.
+    /// Resident reads execute and complete synchronously on the owner.
     #[must_use]
     pub const fn needs_off_pump_io(&self) -> bool {
         matches!(self.tier, PollTier::Disk { .. })
     }
 
-    /// Execute this plan off the partition borrow: disk read (if any), straddle
-    /// splice into the owned resident-tail snapshot, then apply the auto-commit
-    /// to the owned `Arc` offset map. Holds no partition reference (see module
-    /// docs), so it is safe on a detached task. Returns the served fragments,
-    /// the poll's high-water offset, and the auto-committed offset (if any) for
-    /// the serving shard to replicate through consensus.
-    ///
-    /// # Errors
-    /// Returns a capacity error when auto-commit would create a new live-map
-    /// entry after the configured per-kind bound has been reached.
-    /// The serving shard also rejects completion with `TransientNotAccepted`
-    /// if the partition disappeared or changed incarnation during disk I/O.
-    /// No fragments are returned for that rejected completion.
-    pub async fn execute(
-        self,
-    ) -> Result<(PollFragments<4096>, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError>
-    {
+    /// Read the captured snapshot without changing consumer progress.
+    /// The result still requires owner validation, including when it is empty.
+    pub async fn execute(self) -> PollReadResult {
         let commit_offset = self.commit_offset;
         let (fragments, last_matching_offset) = match self.tier {
             PollTier::Empty => (PollFragments::new(), None),
@@ -382,27 +306,21 @@ impl PollPlan {
             },
         };
 
-        finish(
-            self.last_polled,
-            self.auto_commit,
+        PollReadResult {
+            context: self.context,
             commit_offset,
             fragments,
             last_matching_offset,
-        )
+        }
     }
 
-    /// Synchronous fast path for a fully-resident poll
-    /// ([`Self::needs_off_pump_io`] is `false`): no disk read, so the pump
-    /// applies the auto-commit in memory and replies inline without spawning.
-    /// The auto-committed offset is returned for the serving shard to replicate.
+    /// Read a resident snapshot synchronously on the pump.
+    /// The returned result requires the same owner validation as a disk read.
     ///
-    /// # Errors
-    /// Returns a capacity error when auto-commit would create a new live-map
-    /// entry after the configured per-kind bound has been reached.
-    pub fn execute_resident(
-        self,
-    ) -> Result<(PollFragments<4096>, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError>
-    {
+    /// # Panics
+    /// Panics if [`Self::needs_off_pump_io`] is true.
+    #[must_use]
+    pub fn execute_resident(self) -> PollReadResult {
         let commit_offset = self.commit_offset;
         let (fragments, last_matching_offset) = match self.tier {
             PollTier::Empty => (PollFragments::new(), None),
@@ -416,59 +334,13 @@ impl PollPlan {
                 unreachable!("execute_resident on Disk tier; needs_off_pump_io guards this")
             }
         };
-        finish(
-            self.last_polled,
-            self.auto_commit,
+        PollReadResult {
+            context: self.context,
             commit_offset,
             fragments,
             last_matching_offset,
-        )
+        }
     }
-}
-
-/// Common tail of [`PollPlan::execute`] and [`PollPlan::execute_resident`],
-/// factored out so the high-water record, auto-commit, and returned triple
-/// stay identical across both.
-fn finish(
-    last_polled: Option<LastPolledCtx>,
-    auto_commit: Option<AutoCommitCtx>,
-    commit_offset: u64,
-    fragments: PollFragments<4096>,
-    last_matching_offset: Option<u64>,
-) -> Result<(PollFragments<4096>, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError> {
-    let mut auto_commit_applied = apply_auto_commit(auto_commit, &fragments, last_matching_offset)?;
-    if let Some(applied) = &mut auto_commit_applied {
-        applied.last_polled = last_polled;
-    } else if let (Some(last_polled), Some(last_offset)) = (last_polled, last_matching_offset) {
-        last_polled.record(last_offset);
-    }
-    Ok((fragments, commit_offset, auto_commit_applied))
-}
-
-/// Apply an `auto_commit` to the in-memory offset map (monotone) and surface
-/// the committed offset so the serving shard can replicate it through
-/// consensus. `None` when the poll served nothing (empty fragments) or no
-/// auto-commit was requested. Shared by [`PollPlan::execute`] and
-/// [`PollPlan::execute_resident`] so both apply identically.
-///
-/// The eager in-memory apply preserves read-your-own-poll for a tight
-/// `Consumer::Next` loop that reads before the replicated commit lands; the
-/// commit's apply is an idempotent monotone set, so the double-apply converges.
-fn apply_auto_commit(
-    auto_commit: Option<AutoCommitCtx>,
-    fragments: &PollFragments<4096>,
-    last_matching_offset: Option<u64>,
-) -> Result<Option<AutoCommitApplied>, ConsumerOffsetCapacityError> {
-    let Some(auto_commit) = auto_commit else {
-        return Ok(None);
-    };
-    if fragments.is_empty() {
-        return Ok(None);
-    }
-    let Some(last_offset) = last_matching_offset else {
-        return Ok(None);
-    };
-    auto_commit.apply(last_offset).map(Some)
 }
 
 pub enum PollTier {
@@ -868,241 +740,6 @@ fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Optio
     .map(|entry| entry.position)
 }
 
-impl AutoCommitCtx {
-    /// The offset key (kind + numeric id) this auto-commit targets, for the
-    /// replicated `StoreConsumerOffset` op the serving shard submits.
-    pub(crate) const fn kind_and_id(&self) -> (ConsumerKind, u32) {
-        match &self.target {
-            AutoCommitTarget::Consumer { consumer_id, .. } => {
-                (ConsumerKind::Consumer, *consumer_id)
-            }
-            AutoCommitTarget::ConsumerGroup { group_id, .. } => {
-                (ConsumerKind::ConsumerGroup, *group_id)
-            }
-        }
-    }
-
-    /// Apply the committed offset to the in-memory map on the owned `Arc`
-    /// handle, with NO partition reference. Uses the monotone
-    /// [`upsert_offset_max`] so a stale off-pump auto-commit cannot rewind a
-    /// newer explicit store; the maps are lock-free (`papaya`), so this is
-    /// sound off the pump task.
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn apply(
-        self,
-        offset: u64,
-    ) -> Result<AutoCommitApplied, ConsumerOffsetCapacityError> {
-        let (kind, consumer_id) = self.kind_and_id();
-        let create = |path: Option<&str>| {
-            ConsumerOffset::new(
-                kind,
-                consumer_id,
-                offset,
-                path.map_or_else(String::new, |path| format!("{path}/{consumer_id}")),
-            )
-        };
-        let previous_offset = match &self.target {
-            AutoCommitTarget::Consumer {
-                offsets,
-                consumer_id,
-                create_path,
-            } => apply_local_offset(
-                offsets,
-                *consumer_id as usize,
-                offset,
-                &self.capacity,
-                self.durable.count(kind) >= self.capacity.limit(),
-                || create(create_path.as_deref()),
-            )?,
-            AutoCommitTarget::ConsumerGroup {
-                offsets,
-                group_id,
-                create_path,
-            } => apply_local_offset(
-                offsets,
-                ConsumerGroupId(*group_id as usize),
-                offset,
-                &self.capacity,
-                self.durable.count(kind) >= self.capacity.limit(),
-                || create(create_path.as_deref()),
-            )?,
-        };
-        Ok(AutoCommitApplied {
-            kind,
-            consumer_id,
-            offset,
-            previous_offset,
-            target: self.target,
-            capacity: self.capacity,
-            durable: self.durable,
-            last_polled: None,
-        })
-    }
-}
-
-impl AutoCommitApplied {
-    /// Record the group handoff frontier only after poll admission succeeds.
-    fn mark_served(&self) {
-        if let Some(last_polled) = &self.last_polled {
-            last_polled.record(self.offset);
-        }
-    }
-    /// Reserve a durable key before the synthetic store is submitted.
-    /// Returns `None` when committed state already covers this offset.
-    ///
-    /// # Errors
-    /// Returns a capacity error when this is a new durable key and the
-    /// partition's per-kind limit has been reached.
-    pub fn reserve_durable(
-        &self,
-    ) -> Result<Option<AutoCommitReservation>, ConsumerOffsetCapacityError> {
-        if self
-            .durable
-            .covers(self.kind, self.consumer_id, self.offset)
-        {
-            return Ok(None);
-        }
-        self.capacity
-            .reserve_provisional(self.consumer_id, &self.durable)
-            .map(Some)
-    }
-
-    pub(crate) fn belongs_to(&self, durable: &Rc<DurableConsumerOffsets>) -> bool {
-        Rc::ptr_eq(&self.durable, durable)
-    }
-
-    /// Run the serving shard's synchronous admission and settle this apply in
-    /// the same call: `Ok` marks the cursor served, `Err` rolls the eager
-    /// local update back and returns the error. The rollback is a bare store of
-    /// the previous offset, so nothing may yield between the decision and it.
-    /// Keeping both inside one synchronous method is what makes that hold for
-    /// every caller.
-    ///
-    /// # Errors
-    /// Whatever `decide` returned, after the rollback.
-    pub fn admit<E>(self, decide: impl FnOnce(&Self) -> Result<(), E>) -> Result<(), E> {
-        match decide(&self) {
-            Ok(()) => {
-                self.mark_served();
-                Ok(())
-            }
-            Err(error) => {
-                self.rollback_created();
-                Err(error)
-            }
-        }
-    }
-
-    /// Undo this poll's eager update after synchronous admission fails.
-    fn rollback_created(&self) {
-        match &self.target {
-            AutoCommitTarget::Consumer {
-                offsets,
-                consumer_id,
-                ..
-            } => rollback_local_offset(offsets, *consumer_id as usize, self.previous_offset),
-            AutoCommitTarget::ConsumerGroup {
-                offsets, group_id, ..
-            } => rollback_local_offset(
-                offsets,
-                ConsumerGroupId(*group_id as usize),
-                self.previous_offset,
-            ),
-        }
-        if self.previous_offset.is_none() {
-            self.capacity.note_local_key_change();
-            self.capacity.forget_inactive_provisional(self.consumer_id);
-        }
-    }
-}
-
-fn rollback_local_offset<K: Hash + Eq + Send + Sync + Copy>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
-    key: K,
-    previous: Option<u64>,
-) {
-    let guard = map.pin();
-    if let Some(previous) = previous {
-        if let Some(entry) = guard.get(&key) {
-            entry.offset.store(previous, Ordering::Relaxed);
-        }
-    } else {
-        guard.remove(&key);
-    }
-}
-
-fn apply_local_offset<K: Hash + Eq + Clone + Send + Sync>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
-    key: K,
-    offset: u64,
-    capacity: &ConsumerOffsetCapacity,
-    durable_full: bool,
-    create: impl FnOnce() -> ConsumerOffset,
-) -> Result<Option<u64>, ConsumerOffsetCapacityError> {
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        return Ok(Some(existing.offset.fetch_max(offset, Ordering::Relaxed)));
-    }
-    // The `len()` read and the insert are not atomic on this lock-free map.
-    // The bound holds because every poll of one partition runs on that
-    // partition's own shard thread, so no second inserter exists.
-    capacity.admit_local_map_key(guard.len(), durable_full)?;
-    guard.insert(key, create());
-    capacity.note_local_key_change();
-    Ok(None)
-}
-
-/// Upsert a committed offset into a lock-free `papaya` offset map: bump an
-/// existing entry in place, or build one via `create_on_miss` on first commit
-/// for a consumer/group that has none yet. Shared by the pump's
-/// [`IggyPartition::apply_consumer_offset_commit`] and the off-pump
-/// [`AutoCommitCtx::apply`] so both store offsets identically.
-pub fn upsert_offset<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
-    key: K,
-    offset: u64,
-    create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.store(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
-    }
-}
-
-/// Monotone variant of [`upsert_offset`] for the off-pump auto-commit: an
-/// existing entry is bumped via `fetch_max` so a stale auto-commit racing a
-/// newer explicit `StoreConsumerOffset` cannot rewind it backward. The
-/// on-miss create branch is identical. The explicit pump path keeps
-/// [`upsert_offset`] (`store`), since an explicit store may legitimately rewind.
-///
-/// Also used by the replicated commit-apply for a server auto-commit op
-/// ([`crate::iggy_partition::IggyPartition::apply_consumer_offset_commit`]): its
-/// offset was already advanced in memory by the eager poll-path apply, and this
-/// commit can land behind a newer poll, so it must not `store` (rewind) it.
-pub fn upsert_offset_max<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
-    key: K,
-    offset: u64,
-    create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.fetch_max(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
-    }
-}
-
 /// Walk stamped `[256B BatchHeader][blob]` batches in one disk
 /// chunk, pushing matching fragments. Returns bytes consumed: the start
 /// of the first batch that did not fully fit in the chunk (the caller
@@ -1274,7 +911,9 @@ mod tests {
         assert_eq!(past_interval, None);
     }
 
-    fn non_empty_fragments() -> PollFragments<4096> {
+    // Resident execution passes already selected bytes through unchanged.
+    // The snapshot test needs a nonempty payload but does not decode messages.
+    fn placeholder_fragments() -> PollFragments<4096> {
         let mut fragments = PollFragments::new();
         fragments.push(crate::types::Fragment::whole(
             Owned::<4096>::zeroed(8).into(),
@@ -1282,199 +921,54 @@ mod tests {
         fragments
     }
 
-    fn consumer_auto_commit(offsets: Arc<ConsumerOffsets>, consumer_id: u32) -> AutoCommitCtx {
-        consumer_auto_commit_with_limit(offsets, consumer_id, crate::DEFAULT_CONSUMER_OFFSETS_MAX)
-    }
-
-    fn consumer_auto_commit_with_limit(
-        offsets: Arc<ConsumerOffsets>,
-        consumer_id: u32,
-        limit: usize,
-    ) -> AutoCommitCtx {
-        AutoCommitCtx {
-            target: AutoCommitTarget::Consumer {
-                offsets,
-                consumer_id,
-                create_path: None,
+    #[test]
+    fn resident_read_returns_snapshot_facts() {
+        let snapshot_history = PollHistoryId::default();
+        let partition_commit_offset = 42;
+        let last_selected_offset = 5;
+        let consumer_id = 7;
+        let partition_id = 0;
+        let resident_plan = PollPlan {
+            commit_offset: partition_commit_offset,
+            context: PollContext {
+                history: snapshot_history.clone(),
+                consumer: PollingConsumer::Consumer(consumer_id, partition_id),
+                auto_commit: true,
             },
-            capacity: Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, limit)),
-            durable: Rc::new(DurableConsumerOffsets::default()),
-        }
-    }
-
-    #[test]
-    fn given_existing_phantom_when_primary_reservation_is_denied_should_restore_previous_offset() {
-        let offsets = Arc::new(ConsumerOffsets::with_capacity(2));
-        offsets.pin().insert(
-            7,
-            ConsumerOffset::new(ConsumerKind::Consumer, 7, 4, String::new()),
-        );
-        let context = consumer_auto_commit_with_limit(Arc::clone(&offsets), 7, 1);
-        context
-            .durable
-            .record_explicit(ConsumerKind::Consumer, 8, 0, 0);
-        let applied = context
-            .apply(9)
-            .expect("existing phantom is locally writable");
-        assert!(applied.reserve_durable().is_err());
-        applied.rollback_created();
-        assert_eq!(
-            offsets
-                .pin()
-                .get(&7)
-                .expect("phantom retained")
-                .offset
-                .load(Ordering::Relaxed),
-            4
-        );
-    }
-
-    #[test]
-    fn given_new_auto_commit_when_provisional_guard_is_dropped_should_reopen_capacity() {
-        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
-        let context = consumer_auto_commit_with_limit(Arc::clone(&offsets), 7, 1);
-        let capacity = Rc::clone(&context.capacity);
-        let durable = Rc::clone(&context.durable);
-        let applied = context.apply(9).expect("new poll fits");
-        let reservation = applied
-            .reserve_durable()
-            .expect("primary admits")
-            .expect("new slot");
-        assert!(capacity.check(8, &durable).is_err());
-        drop(reservation);
-        applied.rollback_created();
-        assert!(capacity.check(8, &durable).is_ok());
-        assert!(offsets.pin().is_empty());
-    }
-
-    #[test]
-    fn given_full_auto_commit_map_when_creating_key_should_reject_without_insertion() {
-        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
-        offsets.pin().insert(
-            1,
-            ConsumerOffset::new(ConsumerKind::Consumer, 1, 0, String::new()),
-        );
-        let plan = PollPlan {
-            commit_offset: 42,
-            auto_commit: Some(consumer_auto_commit_with_limit(offsets.clone(), 2, 1)),
-            last_polled: None,
             tier: PollTier::Resident {
-                fragments: non_empty_fragments(),
-                last_matching_offset: Some(5),
+                fragments: placeholder_fragments(),
+                last_matching_offset: Some(last_selected_offset),
             },
         };
+        assert!(!resident_plan.needs_off_pump_io());
 
-        let Err(error) = plan.execute_resident() else {
-            panic!("a missing key at the map limit must be rejected");
-        };
-        assert_eq!(error.kind, ConsumerKind::Consumer);
-        assert_eq!(error.occupied, 1);
-        assert!(offsets.pin().get(&2).is_none());
+        // Reading preserves both the partition frontier and the last selected
+        // message offset. These are snapshot facts awaiting owner acceptance.
+        let read_result = resident_plan.execute_resident();
+        assert_eq!(read_result.context.history, snapshot_history);
+        assert_eq!(read_result.commit_offset, partition_commit_offset);
+        assert_eq!(read_result.last_matching_offset, Some(last_selected_offset));
+        assert!(!read_result.fragments.is_empty());
     }
 
     #[test]
-    fn resident_auto_commit_applies_in_memory_and_surfaces_offset() {
-        // A resident auto_commit poll stays on the inline fast path (no detached
-        // task since the poll no longer persists), applies the committed offset
-        // to the in-memory map for read-your-own-poll, AND surfaces it so the
-        // serving shard replicates it through consensus.
-        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
-        let plan = PollPlan {
-            commit_offset: 42,
-            auto_commit: Some(consumer_auto_commit(offsets.clone(), 7)),
-            last_polled: None,
-            tier: PollTier::Resident {
-                fragments: non_empty_fragments(),
-                last_matching_offset: Some(5),
-            },
-        };
-
-        assert!(
-            !plan.needs_off_pump_io(),
-            "a resident auto_commit no longer persists on the poll path; the pump must not spawn",
-        );
-
-        let (fragments, commit_offset, applied) =
-            plan.execute_resident().expect("auto-commit is admitted");
-        assert!(!fragments.is_empty(), "resident fragments must be returned");
-        assert_eq!(commit_offset, 42, "commit offset is forwarded verbatim");
-
-        let applied = applied.expect("auto_commit must surface the applied offset for replication");
-        assert!(matches!(applied.kind, ConsumerKind::Consumer));
-        assert_eq!(applied.consumer_id, 7);
-        assert_eq!(applied.offset, 5);
-
-        let stored = offsets
-            .pin()
-            .get(&7usize)
-            .map(|entry| entry.offset.load(Ordering::Relaxed));
-        assert_eq!(
-            stored,
-            Some(5),
-            "the in-memory auto-commit must be applied on the resident path",
-        );
-    }
-
-    #[test]
-    fn empty_resident_poll_surfaces_no_auto_commit() {
-        // Nothing served -> nothing to commit: no offset is surfaced and the
-        // in-memory map stays untouched.
-        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
-        let plan = PollPlan {
+    fn empty_read_returns_no_progress() {
+        let consumer_id = 7;
+        let partition_id = 0;
+        let empty_plan = PollPlan {
             commit_offset: 9,
-            auto_commit: Some(consumer_auto_commit(offsets.clone(), 7)),
-            last_polled: None,
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(consumer_id, partition_id),
+                auto_commit: true,
+            },
             tier: PollTier::Empty,
         };
-        let (fragments, _commit_offset, applied) =
-            plan.execute_resident().expect("empty poll needs no slot");
-        assert!(fragments.is_empty());
-        assert!(
-            applied.is_none(),
-            "empty poll must not surface an auto-commit"
-        );
-        assert!(
-            offsets.pin().get(&7usize).is_none(),
-            "an empty poll must not touch the offset map",
-        );
-    }
 
-    #[test]
-    fn auto_commit_apply_is_monotone_but_explicit_store_rewinds() {
-        // Auto-commit must never rewind a newer offset (anti-rewind via
-        // fetch_max); an explicit StoreConsumerOffset may legitimately rewind.
-        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
-        consumer_auto_commit(offsets.clone(), 7)
-            .apply(10)
-            .expect("first auto-commit is admitted");
-        let after_high = offsets
-            .pin()
-            .get(&7usize)
-            .map(|entry| entry.offset.load(Ordering::Relaxed));
-        assert_eq!(after_high, Some(10));
-
-        // A stale auto-commit with a smaller offset must not rewind.
-        consumer_auto_commit(offsets.clone(), 7)
-            .apply(4)
-            .expect("existing key remains admitted");
-        let after_stale = offsets
-            .pin()
-            .get(&7usize)
-            .map(|entry| entry.offset.load(Ordering::Relaxed));
-        assert_eq!(after_stale, Some(10), "auto-commit fetch_max must hold");
-
-        // The explicit pump path (store-semantics) still rewinds to 4.
-        upsert_offset(&offsets, 7usize, 4, || {
-            ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new())
-        });
-        let after_explicit = offsets
-            .pin()
-            .get(&7usize)
-            .map(|entry| entry.offset.load(Ordering::Relaxed));
-        assert_eq!(
-            after_explicit,
-            Some(4),
-            "explicit store may rewind below the auto-committed offset",
-        );
+        // Automatic commits are enabled, but no matching message means there
+        // is no selected offset for the owner to apply as consumer progress.
+        let read_result = empty_plan.execute_resident();
+        assert!(read_result.fragments.is_empty());
+        assert_eq!(read_result.last_matching_offset, None);
     }
 }

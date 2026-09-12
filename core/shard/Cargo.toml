@@ -23,6 +23,7 @@ license = "Apache-2.0"
 publish = false
 
 [features]
+poll-diagnostics = []
 # Simulator-only test hook (`IggyShard::init_partition`): bypasses the
 # reconciler's `ReconcileOp::InsertOwned` funnel, mutating `IggyPartitions`
 # off the pump task. A `-p iggy-server` build excludes it; `cargo build

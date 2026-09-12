@@ -114,6 +114,8 @@ pub mod frame_drop_variant {
     /// shed frames would read as a routing loss.
     pub const PARTITION_AUTO_COMMIT: &str = "partition_auto_commit";
     pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
+    /// A completed disk poll could not enter the owner's inbox.
+    pub const PARTITION_POLL_COMPLETION: &str = "partition_poll_completion";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -162,7 +164,7 @@ pub mod frame_drop_reason {
 // pair enters the `Family` (and therefore the scrape) the first time a drop
 // site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 9;
+const VARIANT_COUNT: usize = 10;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -175,6 +177,7 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
     frame_drop_variant::PARTITION_AUTO_COMMIT,
     frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
+    frame_drop_variant::PARTITION_POLL_COMPLETION,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
