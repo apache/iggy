@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
+use tracing::warn;
 
+use iggy_gateway_kafka::bridge::IggyBridgeConfig;
 use iggy_gateway_kafka::server::{bind_listener, init_tracing};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -54,11 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The complete set of `IGGY_KAFKA_*` vars `load_config` reads. `IGGY_KAFKA_` is a
+/// The `IGGY_KAFKA_*` vars `load_config` itself reads. `IGGY_KAFKA_` is a
 /// `DELEGATED_ENV_VAR_PREFIXES` entry in `core/configs` (see that file's comment), which trades
 /// away the central provider's typo-detection for this whole namespace - a misspelled key here
 /// would otherwise silently no-op instead of surfacing anywhere. `reject_unknown_kafka_env_vars`
 /// is this crate's own replacement for that lost check.
+///
+/// Deliberately excludes `IggyBridgeConfig::KNOWN_ENV_VARS`: `reject_unknown_kafka_env_vars`
+/// checks both lists rather than one merged copy, so a bridge var rename can't silently desync
+/// this array from the one `bridge::config` actually reads.
 const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_BIND_ADDR",
     "IGGY_KAFKA_ADVERTISED_HOST",
@@ -71,13 +77,20 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
 ];
 
-/// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] - a typo (e.g.
-/// `IGGY_KAFKA_BIN_ADDR`) would otherwise be silently ignored: `core/configs`' central provider
-/// skips the whole `IGGY_KAFKA_` prefix, and this crate's own `env_var()` only ever looks up
-/// exact known names, so nothing reads the misspelled var and nothing warns either.
+/// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] or
+/// [`IggyBridgeConfig::KNOWN_ENV_VARS`] - a typo (e.g. `IGGY_KAFKA_BIN_ADDR`) would otherwise be
+/// silently ignored: `core/configs`' central provider skips the whole `IGGY_KAFKA_` prefix, and
+/// this crate's own `env_var()` only ever looks up exact known names, so nothing reads the
+/// misspelled var and nothing warns either. Checking both lists (not `IggyBridgeConfig`'s
+/// wiring into `main`) is deliberate: a user who exports a bridge var ahead of
+/// `#3535`/`#3536` landing must not see a spurious "unknown env var" rejection for a name this
+/// crate already recognizes.
 fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     for (key, _) in std::env::vars() {
-        if key.starts_with("IGGY_KAFKA_") && !KNOWN_KAFKA_ENV_VARS.contains(&key.as_str()) {
+        if key.starts_with("IGGY_KAFKA_")
+            && !KNOWN_KAFKA_ENV_VARS.contains(&key.as_str())
+            && !IggyBridgeConfig::KNOWN_ENV_VARS.contains(&key.as_str())
+        {
             return Err(format!(
                 "unknown Kafka gateway env var '{key}' (not in the recognized IGGY_KAFKA_* set - \
                  check for a typo; it would otherwise be silently ignored)"
@@ -87,11 +100,34 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     Ok(())
 }
 
+/// Warns if any bridge-specific env var is set, since `main` doesn't read `IggyBridgeConfig` or
+/// call `IggyBridge::connect` yet (`#3535`/`#3536`).
+///
+/// `reject_unknown_kafka_env_vars`'s own accepted-but-unread carve-out for these vars exists so a
+/// user exporting them ahead of that wiring landing isn't told the name is unrecognized - but that
+/// silence is exactly what the guard's own doc comment warns an unread var would otherwise cause.
+/// This closes that gap: still accepted, no longer silent.
+fn warn_on_unused_bridge_env_vars() {
+    let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|var| std::env::var(var).is_ok())
+        .collect();
+    if !set.is_empty() {
+        warn!(
+            "{} set but not yet used: the Kafka <-> Iggy bridge isn't wired into the running \
+             gateway until #3535/#3536 land",
+            set.join(", ")
+        );
+    }
+}
+
 /// Build [`GatewayConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
 /// break the listener (a zero connection cap serves nothing, a zero timeout drops every
 /// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
 fn load_config() -> Result<GatewayConfig, String> {
     reject_unknown_kafka_env_vars()?;
+    warn_on_unused_bridge_env_vars();
     let mut config = GatewayConfig::default();
 
     if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {
@@ -186,15 +222,22 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::{parse_positive, reject_unknown_kafka_env_vars};
 
-    /// Sequential (not two separate `#[test]` fns) so the two env-var mutations can't race
-    /// against each other under the test harness's default parallel execution - env vars are
-    /// process-global state.
+    /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - the whole binary's
+    /// default group, shared with `bridge::config`'s and `server`'s env-touching tests).
     ///
     /// # Safety
-    /// Single-threaded within this function; no other test in this crate touches `IGGY_KAFKA_*`.
+    /// Edition 2024's `env::set_var`/`remove_var` are unsound against *any* concurrent env read
+    /// or write on another thread, not merely one touching this same key - env vars are
+    /// process-wide C `environ` state, and the race is at that level. `#[serial]` is what makes
+    /// this sound, by excluding every other `#[serial]`-tagged test in this binary while this one
+    /// runs; being single-threaded within this function is necessary but not sufficient on its
+    /// own.
     #[test]
+    #[serial]
     fn reject_unknown_kafka_env_vars_flags_typo_but_accepts_known_keys() {
         unsafe {
             std::env::set_var("IGGY_KAFKA_BIN_ADDR", "127.0.0.1:9093"); // typo: missing D
@@ -218,6 +261,20 @@ mod tests {
         assert!(
             known_result.is_ok(),
             "known IGGY_KAFKA_ var must be accepted"
+        );
+
+        // A bridge-specific var (not in this module's own KNOWN_KAFKA_ENV_VARS) must also be
+        // accepted - the two lists are checked separately, not merged into one.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_ADDR", "127.0.0.1:8090");
+        }
+        let bridge_var_result = reject_unknown_kafka_env_vars();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_ADDR");
+        }
+        assert!(
+            bridge_var_result.is_ok(),
+            "known bridge IGGY_KAFKA_ var must be accepted"
         );
     }
 

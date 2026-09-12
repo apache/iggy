@@ -20,6 +20,13 @@ suite goes through `tests/common/fixtures.rs::load_fixture_body_or_skip`, which 
 regeneration hint when a fixture is missing, and panics instead when `KAFKA_FIXTURES_REQUIRED=1`
 is set (CI sets this) so a broken generation step can't leave a suite green with zero assertions.
 
+### `iggy-server` binary (required for `bridge_iggy_integration_tests`)
+
+No fixtures needed, but `cargo test -p iggy-gateway-kafka` now also runs
+`cargo build --package server --bin iggy-server` and spawns the resulting binary per test. First
+run pays that crate's build time; expect the suite to take noticeably longer than the rest of this
+crate's tests.
+
 ---
 
 ## Test files
@@ -47,6 +54,7 @@ file under `tests/` anymore.
 | [`server_integration_tests.rs`](../tests/server_integration_tests.rs) | `read_frame` unit-level I/O | No |
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |
 | [`listener_robustness_tests.rs`](../tests/listener_robustness_tests.rs) | TCP listener robustness — framing, pipelining, concurrency, connection limits | No |
+| [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
 
 `tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `scope.rs`, `server.rs`,
 `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`
