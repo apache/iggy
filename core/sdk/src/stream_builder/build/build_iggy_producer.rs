@@ -23,22 +23,26 @@ use crate::prelude::{IggyError, IggyExpiry, MaxTopicSize};
 use crate::stream_builder::IggyProducerConfig;
 use tracing::{error, trace};
 
-/// Build a producer from the stream configuration.
+/// Builds an [`IggyProducer`] from `config` and awaits [`IggyProducer::init()`].
 ///
-/// # Arguments
+/// The producer is always a direct producer, with the [`batch_length()`] and the [`linger_time()`]
+/// of the configuration. It creates the stream and the topic when they are missing. A topic
+/// created here gets [`topic_partitions_count()`] partitions, and the server defaults for message
+/// expiry and maximum size.
 ///
-/// * `client` - The Iggy client.
-/// * `config` - The configuration.
+/// An [`encryptor()`] in the configuration replaces the one of the client.
 ///
 /// # Errors
 ///
-/// * `IggyError` - If the iggy producer cannot be build.
+/// - Any error raised while building the producer, such as an invalid stream or topic name.
+/// - Any error returned by [`IggyProducer::init()`].
 ///
-/// # Details
-///
-/// This function will create a new `IggyProducer` with the given `IggyClient` and `IggyProducerConfig`.
-/// The `IggyProducerConfig` fields are used to configure the `IggyProducer`.
-///
+/// [`IggyProducer`]: crate::prelude::IggyProducer
+/// [`IggyProducer::init()`]: crate::prelude::IggyProducer::init
+/// [`batch_length()`]: crate::prelude::IggyProducerConfig::batch_length
+/// [`encryptor()`]: crate::prelude::IggyProducerConfig::encryptor
+/// [`linger_time()`]: crate::prelude::IggyProducerConfig::linger_time
+/// [`topic_partitions_count()`]: crate::prelude::IggyProducerConfig::topic_partitions_count
 pub(crate) async fn build_iggy_producer(
     client: &IggyClient,
     config: &IggyProducerConfig,

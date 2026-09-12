@@ -139,14 +139,13 @@ pub struct IggyProducerConfig {
     batch_length: u32,
     /// Minimum gap between sequential direct sends, measured from the previous successful send.
     linger_time: IggyDuration,
-    /// Specifies to which partition the messages should be sent.
+    /// Strategy that defines to which partition the messages should be sent.
     partitioning: Partitioning,
     /// Sets the maximum number of send retries in case of a message sending failure.
     send_retries_count: Option<u32>,
     /// Sets the interval between send retries in case of a message sending failure.
     send_retries_interval: Option<NonZeroIggyDuration>,
-    /// Sets a optional client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
-    /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
+    /// Sets a optional client side encryptor for encrypting the messages' payloads.
     encryptor: Option<Arc<EncryptorKind>>,
 }
 
@@ -172,10 +171,7 @@ impl Default for IggyProducerConfig {
 }
 
 impl IggyProducerConfig {
-    /// Sets every field at once, positionally.
-    ///
-    /// This applies no defaults. [`builder()`](Self::builder) sets the same fields by name and is
-    /// easier to read.
+    /// Return a new instance of a `IggyConsumerConfig`.
     ///
     /// # Examples
     ///
@@ -232,10 +228,9 @@ impl IggyProducerConfig {
         }
     }
 
-    /// Names one stream and one topic, and takes the defaults for the rest.
+    /// Names one stream, one topic, `batch_length` and `linger_time`. The rest defaults.
     ///
-    /// Each identifier is derived from the matching name. The topic gets one partition, balanced
-    /// partitioning, three send retries one second apart, and no encryptor.
+    /// The topic gets one partition, balanced partitioning, three send retries one second apart, and no encryptor.
     ///
     /// # Examples
     ///
@@ -288,7 +283,7 @@ impl IggyProducerConfig {
 }
 
 impl IggyProducerConfig {
-    /// Returns the stream identifier, which the build itself does not read.
+    /// Returns the stream identifier.
     pub fn stream_id(&self) -> &Identifier {
         &self.stream_id
     }
@@ -298,7 +293,7 @@ impl IggyProducerConfig {
         &self.stream_name
     }
 
-    /// Returns the topic identifier, which the build itself does not read.
+    /// Returns the topic identifier.
     pub fn topic_id(&self) -> &Identifier {
         &self.topic_id
     }
@@ -318,21 +313,17 @@ impl IggyProducerConfig {
         self.linger_time
     }
 
-    /// Returns the strategy that decides which partition a batch lands in.
+    /// Returns the strategy that decides which partition a batch of messages lands in.
     pub fn partitioning(&self) -> &Partitioning {
         &self.partitioning
     }
 
     /// Returns how many partitions a topic created by the build gets.
-    ///
-    /// An existing topic keeps the partitions it has.
     pub fn topic_partitions_count(&self) -> u32 {
         self.topic_partitions_count
     }
 
     /// Returns the encryptor for payloads and user headers, if there is one.
-    ///
-    /// It replaces the encryptor of the client that builds the producer.
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {
         self.encryptor.clone()
     }
@@ -343,8 +334,6 @@ impl IggyProducerConfig {
     }
 
     /// Returns the interval that paces those retries, if there is one.
-    ///
-    /// [`None`] retries back to back without any wait.
     pub fn send_retries_interval(&self) -> Option<NonZeroIggyDuration> {
         self.send_retries_interval
     }

@@ -272,10 +272,10 @@ impl IggyStreamConsumer {
         Ok(iggy_consumer)
     }
 
-    /// Creates the client as well, and returns it with the initialized consumer.
+    /// Creates and returns the client and the consumer.
     ///
-    /// The client is created from `connection_string` and connected, so this function sends no
-    /// ping. The rest matches [`build()`](Self::build). Keep the returned [`IggyClient`], because
+    /// The client is created from `connection_string` and connected.
+    /// The rest matches [`build()`](Self::build). Keep the returned [`IggyClient`], because
     /// you need it to shut the connection down.
     ///
     /// # Examples

@@ -36,7 +36,7 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// | Constructor | Use it for |
 /// | --- | --- |
 /// | [`builder()`](Self::builder) | naming every field you set |
-/// | [`from_stream_topic()`](Self::from_stream_topic) | one stream and one topic, defaults elsewhere |
+/// | [`from_stream_topic()`](Self::from_stream_topic) | `ConsumerGroup` for one stream and one topic, with `batch_length` and `polling_interval`, defaults elsewhere |
 /// | [`new()`](Self::new) | every field, positional |
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
@@ -72,21 +72,17 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 ///   that the build creates per topic. For [`ConsumerKind::Consumer`] it is also the ID of the
 ///   single partition the consumer reads. A [`ConsumerKind::ConsumerGroup`] ignores that second
 ///   meaning, because the server assigns its partitions.
-/// - [`encryptor()`](Self::encryptor) replaces the encryptor of the [`IggyClient`] for this
-///   consumer. The key must match the one the producer used. An encryptor also rules out the default
-///   [`auto_commit()`](Self::auto_commit), because that setting commits a batch before it is
-///   decrypted. [`IggyConsumer::init()`] rejects the pair with [`IggyError::InvalidConfiguration`].
-/// - [`PollingStrategy::last()`] never consults the stored offset. The server starts every poll
-///   [`batch_length()`](Self::batch_length) messages back from the end of the partition, so the first
-///   poll of a run returns up to that many messages that exist already. A restarted consumer
-///   therefore re-reads up to [`batch_length()`](Self::batch_length) messages that it handled before.
-///   If more messages arrived while it was down, it skips the oldest of them. Set
-///   [`PollingStrategy::next()`] to resume where the previous run stopped.
-///
-/// [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) and
-/// [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) are off, so a consumer alone
-/// creates nothing. It waits out [`init_retries()`](Self::init_retries) instead, which covers a
-/// producer that creates the topic at the same time.
+/// - [`encryptor()`](Self::encryptor) if you build from an [`IggyClient`] that already has an `encryptor` the one you define here
+///   replaces the encryptor of the [`IggyClient`] for consumer.
+///   An encryptor also rules out the default [`auto_commit()`](Self::auto_commit), because that setting commits a batch before it is
+///   decrypted. If decryption fails the offset would commit even though the message could not be consumed.
+///   Hence, the pair with [`IggyError::InvalidConfiguration`]. Pick any other [`auto_commit()`](Self::auto_commit) with an `encryptor`.
+/// - With [`PollingStrategy::last()`] the first and the first poll after a crash poll the latest `batch_length` messages.
+///   After that, only the newest messages are polled. This can be fewer than `batch_length`, but never more.
+/// - [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) and
+///   [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) are off, so a consumer alone
+///   creates nothing. It waits out [`init_retries()`](Self::init_retries) instead, which covers a
+///   producer that creates the topic at the same time.
 ///
 /// Keep [`stream_id()`](Self::stream_id) and [`stream_name()`](Self::stream_name) in agreement, and
 /// keep [`topic_id()`](Self::topic_id) and [`topic_name()`](Self::topic_name) in agreement.
@@ -175,8 +171,8 @@ pub struct IggyConsumerConfig {
     topic_name: String,
     /// The auto-commit configuration for storing the message offset on the server. See  `AutoCommit` for details.
     auto_commit: AutoCommit,
-    /// The max number of messages to poll in a batch. The greater the batch length, the higher the throughput for bulk data.
-    /// Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
+    /// The max number of messages to send in a batch. The greater the batch length, the higher the throughput for bulk data.
+    /// Note, there is a tradeoff between batch size and latency.
     batch_length: u32,
     /// Create the stream if it doesn't exist.
     create_stream_if_not_exists: bool,
@@ -197,9 +193,9 @@ pub struct IggyConsumerConfig {
     polling_strategy: PollingStrategy,
     /// Sets the polling retry interval in case of server disconnection.
     polling_retry_interval: NonZeroIggyDuration,
-    /// Sets the number of retries and the interval when initializing the consumer if the stream or topic is not found.
-    /// Might be useful when the stream or topic is created dynamically by the producer.
+    /// Sets the number of retries when initializing the consumer if the stream or topic is not found.
     init_retries: Option<u32>,
+    /// Sets the interval between retries when initializing the consumer if the stream or topic is not found.
     init_interval: NonZeroIggyDuration,
     /// Sets client-side payload and user-header decryption. Currently only Aes256Gcm is supported.
     /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
@@ -239,6 +235,8 @@ impl IggyConsumerConfig {
     ///
     /// This applies no defaults. [`builder()`](Self::builder) sets the same fields by name and is
     /// easier to read. Ordinary consumers use partition 0. Use [`Self::with_partition_id`] to select another partition.
+    ///
+    /// Return a new instance of a `IggyConsumerConfig`.
     ///
     /// # Examples
     ///
@@ -315,12 +313,12 @@ impl IggyConsumerConfig {
         }
     }
 
-    /// Names one stream and one topic, and takes the defaults for the rest.
+    /// Get a config for a `ConsumerGroup` that names one stream, one topic, sets a `batch_length` and
+    /// `polling_interval`. The rest take their defaults.
     ///
-    /// Each identifier is derived from the matching name. The consumer is called
-    /// `consumer-{stream}-{topic}` and joins a group under that name. It creates neither the
-    /// stream nor the topic. It reads with [`PollingStrategy::last()`], so every poll starts
-    /// `batch_length` messages back from the end of the partition.
+    /// The consumer is called `consumer-{stream}-{topic}` and joins a group under that name.
+    /// It creates neither the stream nor the topic. It reads with [`PollingStrategy::last()`],
+    /// so every poll starts `batch_length` messages back from the end of the partition.
     ///
     /// [`PollingStrategy::last()`]: crate::prelude::PollingStrategy::last
     ///
@@ -464,8 +462,6 @@ impl IggyConsumerConfig {
     }
 
     /// Returns the encryptor for payloads and user headers, if there is one.
-    ///
-    /// It replaces the encryptor of the client that builds the consumer.
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {
         self.encryptor.clone()
     }
@@ -480,7 +476,7 @@ impl IggyConsumerConfig {
         self.init_retries
     }
 
-    /// Returns the wait between those retries.
+    /// Returns the wait between the `init_retries`.
     pub fn init_interval(&self) -> NonZeroIggyDuration {
         self.init_interval
     }
