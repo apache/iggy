@@ -7178,8 +7178,10 @@ dependencies = [
  "serde",
  "serde_json",
  "simd-json",
+ "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

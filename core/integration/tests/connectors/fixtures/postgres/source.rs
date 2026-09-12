@@ -802,3 +802,51 @@ impl TestFixture for PostgresSourceNonUniqueTrackingFixture {
         envs
     }
 }
+
+pub struct PostgresSourceTextKeyFixture {
+    source: PostgresSourceJsonFixture,
+}
+
+impl PostgresOps for PostgresSourceTextKeyFixture {
+    fn container(&self) -> &PostgresContainer {
+        self.source.container()
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceTextKeyFixture {
+    fn table_name(&self) -> &str {
+        self.source.table_name()
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceTextKeyFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let source = PostgresSourceJsonFixture {
+            container: PostgresContainer::start().await?,
+        };
+        let pool = source.create_pool().await?;
+        let query = format!(
+            "CREATE TABLE {} (id TEXT PRIMARY KEY, processed BOOLEAN NOT NULL DEFAULT FALSE)",
+            source.table_name()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(&pool)
+            .await
+            .expect("create validated tracking and cleanup key before source startup");
+        pool.close().await;
+        Ok(Self { source })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.source.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_PAYLOAD_COLUMN.to_string(), "id".to_string());
+        envs.insert(ENV_SOURCE_PAYLOAD_FORMAT.to_string(), "text".to_string());
+        envs.insert(
+            ENV_SOURCE_PROCESSED_COLUMN.to_string(),
+            "processed".to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "text".to_string());
+        envs
+    }
+}

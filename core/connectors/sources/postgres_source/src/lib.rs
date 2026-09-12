@@ -1446,7 +1446,9 @@ impl PostgresSource {
             if !config.payload_col.is_empty() && column.name() == config.payload_col {
                 extracted_payload =
                     Some(self.extract_payload_column(row, i, config.payload_format)?);
-                continue;
+                if column.name() != config.tracking_column && column.name() != config.pk_column {
+                    continue;
+                }
             }
 
             let value = extract_column_value(row, i)?;
@@ -3410,16 +3412,20 @@ mod tests {
     fn given_custom_query_with_time_params_should_substitute_correctly() {
         let src = PostgresSource::new(1, test_config(), None);
 
-        let query = "SELECT * FROM $table WHERE created_at < '$now' AND epoch < $now_unix";
+        let query = "SELECT '$now', $now_unix FROM $table";
         let result = src.substitute_query_params(query, "logs", &None, 100);
+        let values = result
+            .strip_prefix("SELECT '")
+            .and_then(|value| value.strip_suffix(" FROM logs"))
+            .expect("query structure and table placeholder must be preserved");
+        let (timestamp, unix_seconds) = values.split_once("', ").unwrap();
+        let timestamp = DateTime::parse_from_rfc3339(timestamp)
+            .expect("$now must expand to an RFC3339 timestamp");
+        let unix_seconds: i64 = unix_seconds
+            .parse()
+            .expect("$now_unix must expand to integer seconds");
 
-        assert!(result.contains("FROM logs"));
-        assert!(!result.contains("$now"));
-        let unix_value = result
-            .rsplit_once("epoch < ")
-            .map(|(_, value)| value)
-            .unwrap();
-        assert!(unix_value.parse::<i64>().is_ok());
+        assert_eq!(unix_seconds, timestamp.timestamp());
     }
 
     #[test]

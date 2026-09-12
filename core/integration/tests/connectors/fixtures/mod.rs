@@ -85,7 +85,7 @@ pub use postgres::{
     PostgresSourceDeleteFixture, PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture,
     PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
     PostgresSourceNonUniqueTrackingFixture, PostgresSourceNumericTrackingFixture,
-    PostgresSourceOps,
+    PostgresSourceOps, PostgresSourceTextKeyFixture,
 };
 pub use quickwit::{
     QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,

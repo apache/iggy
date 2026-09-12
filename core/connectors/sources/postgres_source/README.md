@@ -8,17 +8,45 @@ The PostgreSQL source connector fetches data from PostgreSQL databases and strea
 - **Change Data Capture**: Monitor database changes using PostgreSQL logical replication
 - **Flexible Payload Extraction**: Extract BYTEA, TEXT, or JSONB columns directly as payload
 - **Custom Queries**: Use custom SQL queries with parameter substitution
-- **Delete After Read**: Automatically delete rows after processing
-- **Mark as Processed**: Mark rows as processed using a boolean column
-- **Multiple Tables**: Monitor multiple tables simultaneously
+- **Delete After Read**: Delete rows after delivery and checkpoint acknowledgement
+- **Mark as Processed**: Mark rows after acknowledgement using a boolean column
+- **Multiple Tables**: Poll multiple tables sequentially
 - **Batch Processing**: Fetch data in configurable batch sizes
-- **Offset Tracking**: Resume incremental polling from the last acknowledged offset
+- **Offset Tracking**: Resume from acknowledged per-table offsets; retries can duplicate rows
 
 ## Configuration
 
+Use the broker credentials and main runtime configuration from the
+[source guide](https://iggy.apache.org/docs/connectors/sources/source/#configuration).
+Build from the matching checkout root:
+
+```bash
+cargo build --release -p iggy_connector_postgres_source
+```
+
+The examples use the `iggy` database and `iggy`/`iggy` credentials. Create the
+`users` and `orders` tables using the SQL on the
+[Postgres source page](https://iggy.apache.org/docs/connectors/sources/postgres/).
+Save one connector entry in the runtime's connector directory and run the runtime
+from the checkout root. Create its destination stream and topic before starting it.
+
 ```toml
+type = "source"
+key = "postgres"
+enabled = true
+version = 0
+name = "Postgres source"
+path = "target/release/libiggy_connector_postgres_source"
+plugin_config_format = "toml"
+
+[[streams]]
+stream = "user_events"
+topic = "users"
+schema = "json"
+batch_length = 100
+
 [plugin_config]
-connection_string = "postgresql://user:pass@localhost:5432/database"
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
 mode = "polling"
 tables = ["users", "orders"]
 poll_interval = "1s"
@@ -29,17 +57,17 @@ max_connections = 10
 snake_case_columns = false
 include_metadata = true
 
-# Payload extraction (optional)
-payload_column = "payload"
-payload_format = "bytea"
+# Payload extraction requires a matching column and stream schema.
+# payload_column = "payload"
+# payload_format = "bytea"
 
 # Delete/mark processed (optional)
 delete_after_read = false
-processed_column = "is_processed"
+# processed_column = "is_processed"
 primary_key_column = "id"
 
 # Custom query (optional)
-custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit"
+# custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit"
 
 # CDC options (only used when mode = "cdc")
 replication_slot = "iggy_slot"
@@ -53,25 +81,25 @@ cdc_backend = "builtin"
 | ------ | ---- | ------- | ----------- |
 | `connection_string` | string | required | PostgreSQL connection string |
 | `mode` | string | required | `polling` or `cdc` |
-| `tables` | array | required | List of tables to monitor |
-| `poll_interval` | string | `10s` | How often to poll (e.g., `1s`, `5m`) |
-| `batch_size` | u32 | `1000` | Max rows per poll |
+| `tables` | array | required | Polling tables; empty polls none. Empty captures all tables in CDC |
+| `poll_interval` | string | `10s` | Delay before each cycle; invalid values fall back to `10s` |
+| `batch_size` | u32 | `1000` | Limit per table in polling mode; CDC limits are checked at transaction boundaries |
 | `tracking_column` | string | `id` | Unique, non-null column for incremental updates |
-| `initial_offset` | string | none | Starting value for tracking column |
+| `initial_offset` | string | none | Exclusive starting value when a saved table offset is absent |
 | `max_connections` | u32 | `10` | Max database connections |
 | `snake_case_columns` | bool | `false` | Convert column names to snake_case |
-| `include_metadata` | bool | `true` | Wrap results with metadata |
+| `include_metadata` | bool | `true` | Polling layout; false currently adds `data.data` while retaining the envelope |
 | `payload_column` | string | none | Column to extract as payload |
-| `payload_format` | string | `bytea` | Format of payload_column: `bytea`, `text`, or `json_direct` |
-| `delete_after_read` | bool | `false` | Delete rows after reading; takes precedence over `processed_column` |
-| `processed_column` | string | none | Boolean column to mark as processed when `delete_after_read` is false |
+| `payload_format` | string | `json` | Selected-column format; see the schema pairings below |
+| `delete_after_read` | bool | `false` | Delete selected rows after Ack |
+| `processed_column` | string | none | Boolean column to filter on FALSE and mark after Ack |
 | `primary_key_column` | string | tracking_column | Unique, non-null key for delete/mark operations |
 | `custom_query` | string | none | Custom SQL with parameter substitution |
 | `replication_slot` | string | `iggy_slot` | Replication slot name (only used when `mode = "cdc"`) |
 | `capture_operations` | array | `["INSERT","UPDATE","DELETE"]` | CDC operations to capture |
-| `cdc_backend` | string | `builtin` | `builtin` or `pg_replicate` |
+| `cdc_backend` | string | `builtin` | Only `builtin` is implemented |
 | `verbose_logging` | bool | `false` | Log at info level instead of debug |
-| `max_retries` | u32 | `3` | Max attempts for transient errors; `0` and `1` both perform one attempt |
+| `max_retries` | u32 | `3` | Total attempts for transient errors, including the first; zero still makes one attempt |
 | `retry_delay` | string | `1s` | Base delay between retries (e.g., `500ms`, `2s`) |
 
 ## Delivery Failures
@@ -97,7 +125,7 @@ state before restarting.
 
 ### JSON Mode (Default)
 
-When `payload_column` is not set, each row is wrapped in a `DatabaseRecord` JSON structure:
+When `payload_column` is not set, polling wraps each row in a `DatabaseRecord` JSON structure:
 
 ```json
 {
@@ -113,19 +141,34 @@ When `payload_column` is not set, each row is wrapped in a `DatabaseRecord` JSON
 }
 ```
 
-The stream config should use `schema = "json"`.
+The stream config should use `schema = "json"`. With `include_metadata = false`,
+the envelope currently remains and the row moves to `data.data`. The timestamp
+is generated during polling. The runtime does not transfer the plugin's timestamp
+fields into broker message metadata.
 
 ### Payload Column Extraction
 
-When `payload_column` is set, the connector extracts that column directly as the Iggy message payload. The `payload_format` option determines how the column is read:
+In polling mode, an existing `payload_column` bypasses the envelope. The `payload_format` option determines how the column is read:
 
 | Format | Column Type | Schema | Description |
 | ------ | ----------- | ------ | ----------- |
 | `bytea` / `raw` | `BYTEA` | `raw` | Raw bytes passthrough |
 | `text` | `TEXT` | `text` | UTF-8 text |
-| `json_direct` / `jsonb` | `JSONB` | `json` | JSON object serialized to bytes |
+| `json_direct` / `jsonb` / `jsonb_direct` | `JSON`, `JSONB` | `json` | The JSON value serialized to bytes |
+| `json` (default) | `BYTEA` | `json` | Bytes must already contain valid JSON |
+
+Null BYTEA and TEXT payloads become empty bytes. Iggy rejects empty payloads,
+so the entire batch receives Nack and five consecutive failures stop polling.
+Use non-null, non-empty BYTEA/text payloads. Null JSON/JSONB becomes JSON
+`null` and can be delivered. Missing selected columns fall back to the envelope while retaining the
+selected format's schema. Type mismatches reject the poll. Without a selected
+column, every payload-format option emits whole-row JSON.
 
 ## Payload Format Examples
+
+Keep the connector-entry header from the configuration above, and replace its
+`[[streams]]` and `[plugin_config]` sections with one variant. Run the matching
+SQL first; insert rows with increasing unique IDs to produce messages.
 
 ### BYTEA (Raw Bytes)
 
@@ -146,6 +189,8 @@ schema = "raw"
 batch_length = 100
 
 [plugin_config]
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
+mode = "polling"
 tables = ["message_queue"]
 tracking_column = "id"
 payload_column = "payload"
@@ -171,6 +216,8 @@ schema = "text"
 batch_length = 100
 
 [plugin_config]
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
+mode = "polling"
 tables = ["logs"]
 tracking_column = "id"
 payload_column = "message"
@@ -196,6 +243,8 @@ schema = "json"
 batch_length = 100
 
 [plugin_config]
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
+mode = "polling"
 tables = ["events"]
 tracking_column = "id"
 payload_column = "data"
@@ -204,17 +253,23 @@ payload_format = "json_direct"
 
 ## Custom Query Parameters
 
-When using `custom_query`, these placeholders are available:
+A `custom_query` replaces the entire default query, including its ordering,
+limit and processed-row filter. These placeholders use textual substitution.
+The connector quotes and escapes `$offset` as a SQL value, including templates
+that already wrap it in single quotes. Other substitutions are inserted directly:
 
 | Placeholder | Replaced With |
 | ----------- | ------------- |
 | `$table` | Current table name |
-| `$offset` | Last processed offset (or `initial_offset`) |
+| `$offset` | Last acknowledged offset, `initial_offset`, or an empty string if neither exists |
 | `$limit` | `batch_size` value |
 | `$now` | Current UTC timestamp (RFC3339) |
 | `$now_unix` | Current Unix timestamp (seconds) |
 
-Example:
+This template requires a non-null, unique, increasing `created_at` column, an
+optional `scheduled_at` timestamp, and an RFC3339 `initial_offset` before the
+first row. Set `tracking_column = "created_at"` and save it as the
+`custom_query` string:
 
 ```sql
 SELECT * FROM $table
@@ -239,8 +294,7 @@ column lacks a valid single-column unique index or permits null values.
 
 ## Delete After Read / Mark as Processed
 
-Both options may be present for compatibility. When `delete_after_read` is
-`true`, rows are deleted and `processed_column` is ignored.
+Apply these options inside the existing `[plugin_config]` section.
 
 The resolved cleanup key is `primary_key_column`, or `tracking_column` when the
 former is unset. For every configured table, it must be a non-null column with
@@ -252,7 +306,7 @@ configuration instead of applying old work to a different column or action.
 
 ### Delete After Read
 
-Deletes rows from the source table only after Iggy acknowledges the batch:
+Deletes selected rows after the runtime forwards the batch, saves its checkpoint and sends Ack:
 
 ```toml
 [plugin_config]
@@ -262,7 +316,7 @@ primary_key_column = "id"
 
 ### Mark as Processed
 
-Updates a boolean column after Iggy acknowledges the batch instead of deleting:
+Updates a boolean column after Ack instead of deleting:
 
 ```toml
 [plugin_config]
@@ -270,25 +324,27 @@ processed_column = "is_processed"
 primary_key_column = "id"
 ```
 
-Your table needs the boolean column:
+Each configured table needs the boolean column:
 
 ```sql
 ALTER TABLE users ADD COLUMN is_processed BOOLEAN DEFAULT false;
+ALTER TABLE orders ADD COLUMN is_processed BOOLEAN DEFAULT false;
 ```
 
-When `processed_column` is set, the connector automatically adds a `WHERE is_processed = FALSE` filter to the polling query, so only unprocessed rows are fetched. This improves polling efficiency as the table grows.
+When `processed_column` is set, the default polling query adds an
+`is_processed = FALSE` condition. A custom query must add its own filter.
+`delete_after_read = true` takes precedence over marking. Cleanup keys are staged
+during polling and discarded on Nack or a failed poll, leaving rows available
+for replay. Cleanup runs after delivery and checkpointing. Unfinished cleanup
+is retried before polling more rows and restored from the checkpoint after a
+restart. Three consecutive cleanup failures stop the source. Cleanup across
+tables is not atomic.
 
 With the generated polling query, a row whose tracking value moves past the
 batch boundary between poll and acknowledgement is left unchanged and returns
-in a later poll. Custom queries do not apply this boundary because their result
-order is not guaranteed. Cleanup also matches the row version captured by the
-poll, so replay cannot delete or mark a replacement row that reused the same
-key.
-
-For generated polling queries, the connector persists the acknowledged offset
-before deleting or marking rows. If it stops in between, the rows have been
-delivered but may remain unchanged in PostgreSQL. The persisted offset prevents
-those rows from being selected again.
+in a later poll. Custom queries do not apply this boundary. Cleanup also matches
+the row version captured by the poll, so replay cannot delete or mark a
+replacement row that reused the same key.
 
 ## Supported Column Types
 
@@ -299,13 +355,21 @@ The connector handles these PostgreSQL types in JSON mode:
 | `BOOL` | boolean |
 | `INT2`, `INT4`, `INT8` | number |
 | `FLOAT4`, `FLOAT8` | number |
-| `NUMERIC` | string (exact decimal representation) |
-| `VARCHAR`, `TEXT`, `CHAR` | string |
-| `TIMESTAMP`, `TIMESTAMPTZ` | string (RFC3339) |
+| `NUMERIC` | exact decimal string; non-finite values become `"NaN"`, `"Infinity"`, or `"-Infinity"` |
+| `VARCHAR`, `TEXT`, `BPCHAR` (`CHAR(n)`), `NAME` | string |
+| `TIMESTAMP` | string without a timezone, such as `2024-01-15 10:30:00` |
+| `TIMESTAMPTZ` | RFC3339 string |
+| `DATE`, `TIME`, `TIMETZ`, `INTERVAL` | formatted string |
 | `UUID` | string |
-| `JSON`, `JSONB` | object |
+| `JSON`, `JSONB` | original JSON value, including scalars, arrays and null |
 | `BYTEA` | base64 string |
-| Other | string (fallback) |
+| Supported arrays | JSON array, preserving null elements |
+| Other | UTF-8 driver bytes if valid, otherwise base64; not a general semantic conversion |
+
+Finite NUMERIC values are decoded through BigDecimal without floating-point
+conversion, preserving exact tracking boundaries. SQL NULL remains JSON null.
+The array mappings cover boolean, integer/OID, floating-point, text, UUID,
+JSON/JSONB, date/time/timestamp and interval arrays.
 
 ## CDC Mode
 
@@ -313,7 +377,11 @@ CDC requires PostgreSQL 11 or newer and logical replication setup:
 
 1. Set `wal_level = logical` in `postgresql.conf`
 2. Restart PostgreSQL
-3. Use a direct connection (no pooler)
+3. Allow the login to use logical-decoding SQL functions and ensure `test_decoding` is installed and allowed
+
+The builtin backend uses ordinary SQL connections. A proxy must support its SQL
+and replication-slot operations; the connector does not open a replication-protocol
+connection. It does not create or require a publication.
 
 ```toml
 [plugin_config]
@@ -321,6 +389,19 @@ mode = "cdc"
 tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE", "DELETE"]
 ```
+
+The `pg_replicate` backend is not implemented. Without `cdc_pg_replicate`, startup
+rejects it; with the feature, polling returns an unimplemented-backend error.
+`capture_operations` accepts uppercase INSERT/UPDATE/DELETE, and an empty array
+emits none. An empty `tables` array captures all tables. Filters apply after the
+slot read, so acknowledged slot advances also pass excluded changes.
+
+CDC emits a JSON envelope rather than applying polling payload extraction.
+Quoted `test_decoding` values, including JSONB and arrays, remain strings.
+Deletes carry replica-identity columns; updates can include `old_data` from
+an old-key tuple. Unchanged TOAST values become null, which does not establish
+that the stored database value is null. The generated timestamp is polling time,
+not a transaction commit timestamp.
 
 The connector peeks at logical changes and advances the replication slot only
 after Iggy acknowledges the batch. A failed delivery leaves the slot unchanged
@@ -330,8 +411,6 @@ Advancing the slot fast-forwards through the WAL range that was just peeked, so
 each acknowledged batch is decoded twice. Poll and decode errors do not change
 the connector's runtime status. Monitor `confirmed_flush_lsn`, retained WAL, and
 replication slot lag in PostgreSQL to detect a stuck CDC poller.
-
-The `pg_replicate` backend requires the `cdc_pg_replicate` feature flag at build time.
 
 ### Slot Naming
 
@@ -367,11 +446,11 @@ schema = "json"
 batch_length = 100
 
 [plugin_config]
-connection_string = "postgresql://user:pass@localhost:5432/mydb"
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
 mode = "polling"
 tables = ["users"]
 poll_interval = "1s"
-tracking_column = "updated_at"
+tracking_column = "id"
 ```
 
 ### Raw Payload Passthrough
@@ -384,7 +463,7 @@ schema = "raw"
 batch_length = 100
 
 [plugin_config]
-connection_string = "postgresql://user:pass@localhost:5432/mydb"
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
 mode = "polling"
 tables = ["message_queue"]
 poll_interval = "100ms"
@@ -404,7 +483,7 @@ schema = "json"
 batch_length = 100
 
 [plugin_config]
-connection_string = "postgresql://user:pass@localhost:5432/mydb"
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
 mode = "polling"
 tables = ["events"]
 poll_interval = "1s"
@@ -423,7 +502,7 @@ schema = "json"
 batch_length = 100
 
 [plugin_config]
-connection_string = "postgresql://user:pass@localhost:5432/mydb"
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
 mode = "cdc"
 tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE"]
@@ -443,11 +522,43 @@ The connector stops after three consecutive row-cleanup or replication-slot adva
 
 ### SQL Injection Protection
 
-All table names, column names, and identifiers are properly quoted to prevent SQL injection attacks. User-provided values in tracking offsets are also safely escaped.
+The generated polling and cleanup queries quote table/column identifiers and
+escape value literals. PostgreSQL infers value types from the compared columns,
+so numeric-looking TEXT keys keep their exact values. Custom queries use raw
+text substitution except for the quoted and escaped `$offset` value. Keep
+templates and configured names trusted and quote other substitutions as required
+by their SQL context.
+
+### Cursor and Checkpoint Limits
+
+The default polling query uses `tracking_column > last_offset`, ascending order
+and a per-table limit. Tracking values must be non-null, unique and increasing
+in the database's sort order, with a valid single-column unique index checked
+at startup. Transactions must become visible in tracking-column order; late
+inserts or updates at or below the watermark can be missed. Polling does not
+capture deletions.
+
+Polling stages its per-table offsets, last-poll time and processed-row
+count until the runtime forwards the batch, saves its MessagePack checkpoint
+and sends Ack. Nack discards that candidate. Delivery followed by a failed
+checkpoint can duplicate messages; each poll assigns fresh random UUIDs.
+The default file checkpoint is `local_state/source_postgres.state`; the runtime
+also supports HTTP state storage. Missing or undecodable plugin state starts
+fresh, while storage access errors prevent startup. Stop the connector before
+resetting its checkpoint. Five consecutive Nacks stop the SDK polling loop.
+Delete/mark operations and CDC slot advances run after Ack, as described above.
 
 ## Usage with Sink Connector
 
-The source and sink connectors can work together for pass-through scenarios:
+The source and sink connectors can work together for pass-through scenarios.
+For incremental reads of a sink-created table, use one input stream/topic/partition,
+keep `include_metadata = true` on the sink, and set
+`tracking_column = "iggy_offset"` with `initial_offset = "-1"` on the source,
+so the first message at offset zero is included. Message IDs are not an increasing
+cursor, and offsets from different partitions are not globally unique.
+The source requires `iggy_offset` to be non-null and backed by a single-column
+unique index; enforce both constraints on the sink-created table before starting
+the source.
 
 ### Raw Bytes Pass-through
 
@@ -463,10 +574,10 @@ The source and sink connectors can work together for pass-through scenarios:
 
 In the default JSON mode (no `payload_column`), the Postgres source wraps each row in a
 `DatabaseRecord` envelope containing `table_name`, `operation_type`, `timestamp`, `data`, and
-`old_data`. Sinks like Iceberg and Delta expect flat JSON matching the target table schema, so
-the envelope must be unwrapped before the data reaches the sink.
+`old_data`. Sinks like Iceberg and Delta expect JSON matching the target table schema.
+For a table whose columns match the source row, unwrap the envelope before delivery.
 
-**Option A — use the `unwrap_envelope` transform** on the sink side to extract the `data` field:
+**Option A - use the `unwrap_envelope` transform** on the sink side to extract the `data` field:
 
 ```toml
 [transforms.unwrap_envelope]
@@ -474,5 +585,5 @@ enabled = true
 field = "data"
 ```
 
-**Option B — bypass the envelope** by configuring the source with `payload_column` and
+**Option B - bypass the envelope** by configuring the source with `payload_column` and
 `payload_format = "json_direct"` to emit raw JSONB directly (see Payload Column Extraction above).

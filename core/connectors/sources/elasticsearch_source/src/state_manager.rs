@@ -306,12 +306,9 @@ impl StateStorage for FileStateStorage {
     async fn save_source_state(&self, state: &SourceState) -> Result<(), Error> {
         use tokio::fs;
 
-        // Ensure directory exists
-        if let Some(parent) = self.base_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
-        }
+        fs::create_dir_all(&self.base_path)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
 
         let path = self.get_state_path(&state.id);
         let json = serde_json::to_string_pretty(state)
@@ -384,5 +381,36 @@ impl StateStorage for FileStateStorage {
         }
 
         Ok(states)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileStateStorage, SourceState, StateStorage};
+    use iggy_common::Utc;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn given_missing_storage_directory_should_save_and_restore_state() {
+        let directory = tempdir().unwrap();
+        let storage = FileStateStorage::new(directory.path().join("nested/states"));
+        let mut state = SourceState {
+            id: "source_1".to_string(),
+            last_updated: Utc::now(),
+            version: 1,
+            data: json!({"last_poll_timestamp": "2026-01-01T00:00:00Z"}),
+            metadata: None,
+        };
+
+        storage.save_source_state(&state).await.unwrap();
+        let restored = storage.load_source_state(&state.id).await.unwrap().unwrap();
+        assert_eq!(restored.data, state.data);
+        assert_eq!(storage.list_states().await.unwrap(), vec![state.id.clone()]);
+
+        state.data = json!({"last_poll_timestamp": "2026-01-02T00:00:00Z"});
+        storage.save_source_state(&state).await.unwrap();
+        let restored = storage.load_source_state(&state.id).await.unwrap().unwrap();
+        assert_eq!(restored.data, state.data);
     }
 }
