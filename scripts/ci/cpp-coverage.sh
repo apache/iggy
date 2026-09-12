@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-OUTPUT="${1:-../../reports/cpp-coverage.lcov}"
+OUTPUT="../../reports/cpp-coverage.lcov"
 COVERAGE_DIR="$(pwd)/target/cpp-coverage"
 BUILD_PROFRAW_DIR="$COVERAGE_DIR/build"
 PROFDATA="$COVERAGE_DIR/shim.profdata"
