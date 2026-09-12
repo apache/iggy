@@ -2,19 +2,19 @@
 
 Runtime is responsible for managing the lifecycle of the connectors and providing the necessary infrastructure for the connectors to run.
 
-The runtime uses a shared [Tokio runtime](https://tokio.rs) to manage the asynchronous tasks and events across all connectors. Additionally, it has built-in support for logging via [tracing](https://docs.rs/tracing/latest/tracing/) crate.
+The runtime uses a shared [Tokio runtime](https://tokio.rs) for its connector-management and forwarding tasks. Each loaded plugin library also has an SDK Tokio runtime shared by its instances. Additionally, it has built-in support for logging via [tracing](https://docs.rs/tracing/latest/tracing/) crate.
 
 The connector are implemented as Rust libraries, and these are loaded dynamically during the runtime initialization process.
 
-Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) provides a safe and efficient way of loading the plugins via C FFI.
+Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) loads plugin libraries and resolves their C FFI symbols. Plugins execute inside the runtime process.
 
 By default, runtime will look for the configuration file, to decide which connectors to load and how to configure them.
 
-To start the connector runtime, simply run `cargo run --bin iggy-connectors`.
+Set the broker credentials and connector configuration directory before starting the runtime. The embedded default has an empty connector directory and cannot start unchanged. Follow the [connector quick start](../README.md#quick-start) for a complete setup.
 
-The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect:edge`.
 
-The minimal viable configuration requires at least the Iggy credentials to create 2 separate instances of producer & consumer connections, the state directory path where source connectors can store their optional state, and the connectors configuration provider settings.
+The runtime opens two Iggy TCP clients, one for producers and one for consumers. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
 
 ```toml
 [iggy]
@@ -39,14 +39,20 @@ config_dir = "path/to/connectors"
 format = "text" # Options: "text" (default), "json"
 ```
 
-The path to the configuration can be overridden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
+Start it from the repository root:
+
+```bash
+IGGY_CONNECTORS_CONFIG_PATH=connectors.toml cargo run --bin iggy-connectors
+```
+
+Supported scalar fields and indexed list entries use environment variables with nested keys joined by underscores, for example `IGGY_CONNECTORS_IGGY_USERNAME`. Header and URL-template maps are configured in TOML. The runtime loads the first `.env` file found in the working directory or its parents, or the file specified by `IGGY_CONNECTORS_ENV_PATH`.
 
 ## State storage
 
-Source connectors checkpoint their progress (an opaque byte blob) through the runtime's state storage. The backend is selected via `state.storage`:
+Source plugins can supply optional checkpoint bytes. The runtime stores these opaque bytes using the backend selected by `state.storage`:
 
-- `file` (default): one file per source at `{state.path}/source_{key}.state`, written crash-atomically. Ties the cursor to the local disk.
-- `http`: one resource per source at `{state.http.url}/source_{key}` on any HTTP-speaking store (a sidecar in front of a database, an object-store gateway, a coordination service). Cursors survive node replacement and failover to another runtime instance.
+- `file` (default): one file at `{state.path}/source_{key}.state` for each source that supplies checkpoints. Writes use a temporary file, file synchronization and atomic rename. On Unix, the parent directory is synchronized too. Ties the cursor to the local disk.
+- `http`: one resource per source at `{state.http.url}/source_{key}` on any HTTP-speaking store (a sidecar in front of a database, an object-store gateway, a coordination service). A replacement runtime can read the same checkpoint from that state server; its durability and availability depend on the server.
 
 ```toml
 [state]
@@ -54,7 +60,7 @@ path = "local_state"      # used by storage = "file"
 storage = "http"          # "file" | "http"
 
 [state.http]
-url = "http://127.0.0.1:8080/connectors/state"  # base URL, no trailing slash
+url = "http://127.0.0.1:8080/connectors/state"
 load_method = "get"       # "get" (default) | "post"
 save_method = "put"       # "put" (default) | "post" | "patch"
 timeout = "5s"
@@ -83,7 +89,7 @@ The configured base URL may contain a query string, which is preserved when `sou
 
 - Every read uses the configured `load_method` and remembers the returned `ETag`. Every write uses the configured `save_method` and is conditional: `If-Match: <etag>` when a version is tracked, `If-None-Match: *` for the first-ever write. There is no unconditional overwrite path.
 - Every write carries an `Idempotency-Key` header, minted once per logical save and reused byte-identically across that save's retries, so a server that committed a write but lost the response can replay the original outcome instead of failing the retry with a spurious `412`.
-- State is sent and returned as opaque MessagePack bytes with `Content-Type: application/octet-stream`. The runtime never converts connector state to JSON, so each source retains its own compact state schema.
+- State is sent and returned as opaque bytes. The SDK provides MessagePack helpers. Writes use the bytes unchanged with `Content-Type: application/octet-stream`. The runtime never converts connector state to JSON, so each source retains its own compact state schema.
 - `425`/`429`/`503`/`5xx`, timeouts and connect failures are retried with exponential backoff (honoring `Retry-After`, capped at `max_backoff`) and classified transient when exhausted: the batch is Nacked and the plugin re-polls.
 - `412`/`409` (version conflict), `401`/`403` (authorization lost) and protocol violations are permanent: the provider latches and every later save fails fast without touching the network, until the connector is restarted. A permanent error means another writer took over or this writer's authority was revoked - retrying cannot help and would mask the original error.
 - Durability is the server's durability. The runtime guarantees only that the checkpoint is not advanced (the batch is not Acked) unless the server confirmed the write.
@@ -119,7 +125,7 @@ The runtime supports two types of configuration providers for managing connector
 
 ### Local File Provider
 
-The default configuration provider reads connector configurations from local files. Each connector (source or sink) is configured in its own separate file within the directory specified by `connectors.config_dir`. If `config_dir` is empty or the directory doesn't exist, no connectors will be loaded.
+The default configuration provider reads connector configurations from local files. Each connector (source or sink) is configured in its own separate file within the directory specified by `connectors.config_dir`. An empty `config_dir` is a fatal startup error. A missing directory is created automatically with a warning, and no connectors are loaded from it. Only nonhidden `*.toml` files directly inside the directory are read; `Cargo.toml` is skipped.
 
 ```toml
 [connectors]
@@ -129,7 +135,7 @@ config_dir = "path/to/connectors"
 
 ### HTTP Configuration Provider
 
-The HTTP configuration provider allows the runtime to fetch connector configurations from a remote HTTP/REST API. This enables centralized configuration management and dynamic configuration updates.
+The HTTP configuration provider allows the runtime to fetch connector configurations from a remote HTTP/REST API. The provider fetches active configurations at startup and handles configuration operations requested through the runtime API. It does not periodically poll for remote changes.
 
 ```toml
 [connectors]
@@ -142,7 +148,7 @@ api-key = "your-api-key"
 
 [connectors.retry]
 enabled = true
-max_attempts = 3
+max_attempts = 3 # Retries after the first request, up to four requests total
 initial_backoff = "1 s"
 max_backoff = "30 s"
 backoff_multiplier = 2
@@ -166,8 +172,8 @@ error_path = "error"      # Path to error in response (e.g., {"error": "..."})
 - **timeout** (optional): HTTP request timeout (default: 10s)
 - **request_headers** (optional): Custom headers to include in all HTTP requests (e.g., authentication headers)
 - **url_templates** (optional): Custom URL templates for API endpoints. Supports variable substitution with `{key}` and `{version}` placeholders.
-- **response.data_path** (optional): JSON path to extract response data from nested structures (e.g., "data.config")
-- **response.error_path** (optional): JSON path to check for errors in responses
+- **response.data_path** (optional): Dot-separated object keys or numeric array indexes used to extract data (e.g., `data.config` or `data.0`).
+- **response.error_path** (optional): A path with the same syntax. Any non-null value at this path is treated as an error, including `false` or an empty string.
 
 #### Default URL Templates
 
@@ -192,7 +198,7 @@ The HTTP provider expects the remote API to implement these endpoints and return
 
 ## HTTP API
 
-Connector runtime has an optional HTTP API that can be enabled by setting the `enabled` flag to `true` in the `[http]` section.
+The HTTP API is enabled by default at `127.0.0.1:8081`. Set `[http].enabled = false` to disable it.
 
 ```toml
 [http] # Optional HTTP API configuration
@@ -300,7 +306,7 @@ key_file = "core/certs/iggy_key.pem"
 Currently, it does expose the following endpoints:
 
 - `GET /`: welcome message.
-- `GET /health`: health status of the runtime.
+- `GET /health`: process liveness response. It does not check connector health; inspect `/stats`, `/sources` or `/sinks` for connector status.
 - `GET /stats`: runtime statistics including process info, memory/CPU usage, and connector status.
 - `GET {http.metrics.endpoint}` (default `/metrics`): Prometheus-formatted metrics, when `http.metrics.enabled` is `true`.
 - `GET /sinks`: list of sinks.
@@ -359,14 +365,15 @@ transport = "grpc" # Options: "grpc", "http"
 endpoint = "http://localhost:4317"
 ```
 
+For `transport = "http"`, use complete signal endpoints such as `http://localhost:4318/v1/logs` and `http://localhost:4318/v1/traces`. The runtime does not append those paths.
+
 ## Benchmark Mode
 
 Each connector configuration accepts an optional `benchmark` flag. When set to `true`, the runtime emits a per-batch `info!` event on the `iggy_connectors::benchmark` tracing target with stage timings in microseconds. This is opt-in and adds a single tracing call per processed batch.
 
+Set the flag before any section headers in an existing connector configuration:
+
 ```toml
-type = "sink"
-key = "stdout"
-# ... other fields ...
 benchmark = true
 ```
 

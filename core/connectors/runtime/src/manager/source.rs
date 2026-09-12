@@ -100,9 +100,14 @@ impl SourceManager {
         }
     }
 
-    pub async fn set_error(&self, key: &str, error_message: &str) {
+    pub async fn set_error(&self, key: &str, error_message: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(source) = self.sources.get(key) {
             let mut source = source.lock().await;
+            if source.info.status == ConnectorStatus::Running
+                && let Some(metrics) = metrics
+            {
+                metrics.decrement_sources_running();
+            }
             source.info.status = ConnectorStatus::Error;
             source.info.last_error = Some(ConnectorError::new(error_message));
         }
@@ -479,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_running() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Running, None)
@@ -494,7 +499,7 @@ mod tests {
     async fn should_set_error_status_and_message() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
 
-        manager.set_error("pg", "connection failed").await;
+        manager.set_error("pg", "connection failed", None).await;
 
         let source = manager.get("pg").await.unwrap();
         let details = source.lock().await;
@@ -557,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_stopped() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Stopped, None)
@@ -609,6 +614,46 @@ mod tests {
     async fn set_error_should_be_noop_for_unknown_key() {
         let manager = SourceManager::new(vec![]);
 
-        manager.set_error("nonexistent", "some error").await;
+        manager.set_error("nonexistent", "some error", None).await;
+    }
+
+    #[tokio::test]
+    async fn given_running_connector_when_error_repeats_should_decrement_once() {
+        const FAILED_KEY: &str = "failed";
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![
+            create_test_source_details(FAILED_KEY, 1),
+            create_test_source_details("healthy", 2),
+        ]);
+        metrics.increment_sources_running();
+        metrics.increment_sources_running();
+
+        manager
+            .set_error(FAILED_KEY, "first error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "the healthy connector remains running"
+        );
+
+        manager
+            .set_error(FAILED_KEY, "repeated error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "repeated errors must not decrement twice"
+        );
+
+        manager
+            .stop_connector(FAILED_KEY, &metrics)
+            .await
+            .expect("failed connector should stop");
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "stopping an errored connector must not decrement again"
+        );
     }
 }

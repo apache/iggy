@@ -64,6 +64,59 @@ mod tests {
     };
 
     #[test]
+    fn given_integer_and_float_fields_when_comparing_should_filter_all_numbers() {
+        let input = r#"{
+            "negative": -2,
+            "zero": 0,
+            "positive": 2,
+            "fraction": 2.5,
+            "unsigned": 18446744073709551615,
+            "text": "2",
+            "boolean": true,
+            "null": null
+        }"#;
+        for (pattern, included, excluded) in [
+            (
+                ValuePattern::GreaterThan(1.0),
+                r#"{"positive":2,"fraction":2.5,"unsigned":18446744073709551615}"#,
+                r#"{"negative":-2,"zero":0,"text":"2","boolean":true,"null":null}"#,
+            ),
+            (
+                ValuePattern::LessThan(1.0),
+                r#"{"negative":-2,"zero":0}"#,
+                r#"{"positive":2,"fraction":2.5,"unsigned":18446744073709551615,"text":"2","boolean":true,"null":null}"#,
+            ),
+            (
+                ValuePattern::Between(-2.0, 2.0),
+                r#"{"negative":-2,"zero":0,"positive":2}"#,
+                r#"{"fraction":2.5,"unsigned":18446744073709551615,"text":"2","boolean":true,"null":null}"#,
+            ),
+        ] {
+            for (include_matching, expected) in [(true, included), (false, excluded)] {
+                let transform = FilterFields::new(FilterFieldsConfig {
+                    keep_fields: vec![],
+                    patterns: vec![FilterPattern {
+                        key_pattern: None,
+                        value_pattern: Some(pattern.clone()),
+                    }],
+                    include_matching,
+                })
+                .expect("construct numeric filter");
+                let result = transform
+                    .transform(&create_test_topic_metadata(), create_test_message(input))
+                    .expect("filter numeric fields")
+                    .expect("preserve message");
+                let expected = create_test_message(expected);
+                assert_eq!(
+                    extract_json_object(&result),
+                    extract_json_object(&expected),
+                    "pattern={pattern:?}, include_matching={include_matching}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn should_keep_only_specified_fields_when_keep_list_provided() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec!["id".to_string(), "name".to_string()],

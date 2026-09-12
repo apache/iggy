@@ -100,9 +100,14 @@ impl SinkManager {
         }
     }
 
-    pub async fn set_error(&self, key: &str, error_message: &str) {
+    pub async fn set_error(&self, key: &str, error_message: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(sink) = self.sinks.get(key) {
             let mut sink = sink.lock().await;
+            if sink.info.status == ConnectorStatus::Running
+                && let Some(metrics) = metrics
+            {
+                metrics.decrement_sinks_running();
+            }
             sink.info.status = ConnectorStatus::Error;
             sink.info.last_error = Some(ConnectorError::new(error_message));
         }
@@ -444,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_running() {
         let manager = SinkManager::new(vec![create_test_sink_details("es", 1)]);
-        manager.set_error("es", "some error").await;
+        manager.set_error("es", "some error", None).await;
 
         manager
             .update_status("es", ConnectorStatus::Running, None)
@@ -459,7 +464,7 @@ mod tests {
     async fn should_set_error_status_and_message() {
         let manager = SinkManager::new(vec![create_test_sink_details("es", 1)]);
 
-        manager.set_error("es", "connection failed").await;
+        manager.set_error("es", "connection failed", None).await;
 
         let sink = manager.get("es").await.unwrap();
         let details = sink.lock().await;
@@ -527,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_stopped() {
         let manager = SinkManager::new(vec![create_test_sink_details("es", 1)]);
-        manager.set_error("es", "some error").await;
+        manager.set_error("es", "some error", None).await;
 
         manager
             .update_status("es", ConnectorStatus::Stopped, None)
@@ -579,6 +584,46 @@ mod tests {
     async fn set_error_should_be_noop_for_unknown_key() {
         let manager = SinkManager::new(vec![]);
 
-        manager.set_error("nonexistent", "some error").await;
+        manager.set_error("nonexistent", "some error", None).await;
+    }
+
+    #[tokio::test]
+    async fn given_running_connector_when_error_repeats_should_decrement_once() {
+        const FAILED_KEY: &str = "failed";
+        let metrics = Arc::new(Metrics::init());
+        let manager = SinkManager::new(vec![
+            create_test_sink_details(FAILED_KEY, 1),
+            create_test_sink_details("healthy", 2),
+        ]);
+        metrics.increment_sinks_running();
+        metrics.increment_sinks_running();
+
+        manager
+            .set_error(FAILED_KEY, "first error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sinks_running(),
+            1,
+            "the healthy connector remains running"
+        );
+
+        manager
+            .set_error(FAILED_KEY, "repeated error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sinks_running(),
+            1,
+            "repeated errors must not decrement twice"
+        );
+
+        manager
+            .stop_connector(FAILED_KEY, &metrics)
+            .await
+            .expect("failed connector should stop");
+        assert_eq!(
+            metrics.get_sinks_running(),
+            1,
+            "stopping an errored connector must not decrement again"
+        );
     }
 }
