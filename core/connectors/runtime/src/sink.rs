@@ -292,7 +292,7 @@ pub(crate) fn spawn_consume_tasks(
                 metrics.inc_errors_with_labels(&labels.counter);
                 context
                     .sinks
-                    .set_error(&plugin_key, &error.to_string())
+                    .set_error(&plugin_key, &error.to_string(), Some(&metrics))
                     .await;
             }
         });
@@ -605,12 +605,13 @@ async fn process_messages(
     let mut messages = Vec::with_capacity(decoded.len());
     for message in decoded {
         let mut current_message = Some(message);
+        let mut transform_failed = false;
         for transform in transforms.iter() {
             let Some(message) = current_message.take() else {
                 break;
             };
-            // Drop-and-continue on a single bad message, mirroring the source
-            // side - one malformed payload must not kill the whole batch.
+            // Sink batches can deliver valid siblings after a transform failure.
+            // Source batches instead reject the checkpoint for the entire batch.
             match transform.transform(topic_metadata, message) {
                 Ok(next) => current_message = next,
                 Err(error) => {
@@ -621,10 +622,13 @@ async fn process_messages(
                         topic_metadata.topic
                     );
                     error_count += 1;
-                    current_message = None;
+                    transform_failed = true;
                     break;
                 }
             }
+        }
+        if transform_failed {
+            continue;
         }
 
         // Filter contract: transform returning Ok(None) is an intentional drop.
@@ -737,7 +741,7 @@ async fn process_messages(
     })?;
 
     let ffi_start = Instant::now();
-    (consume)(
+    let result = (consume)(
         plugin_id,
         topic_meta.as_ptr(),
         topic_meta.len(),
@@ -747,6 +751,16 @@ async fn process_messages(
         messages.len(),
     );
     let ffi_elapsed = ffi_start.elapsed();
+    let processed_count = if result == 0 {
+        processed_count
+    } else {
+        error!(
+            "Failed to consume {processed_count} messages for sink connector with ID: {plugin_id}, stream: {}, topic: {}, status: {result}",
+            topic_metadata.stream, topic_metadata.topic
+        );
+        metrics.inc_errors_with_labels(&labels.counter);
+        0
+    };
 
     Ok(SinkBatchTiming {
         processed_count,

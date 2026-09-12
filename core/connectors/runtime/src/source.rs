@@ -532,7 +532,10 @@ pub(crate) async fn source_forwarding_loop(
                 matches!(pending_state_error.as_ref(), Some(SdkError::StateLatched))
                     || (pending_state_error.is_none() && state_latched);
             if !preserve_original_error {
-                context.sources.set_error(&plugin_key, &error_msg).await;
+                context
+                    .sources
+                    .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                    .await;
             }
         } else {
             context
@@ -573,7 +576,10 @@ pub(crate) async fn source_forwarding_loop(
                         );
                         error!("{error_msg}");
                         context.metrics.inc_errors_with_labels(&labels.counter);
-                        context.sources.set_error(&plugin_key, &error_msg).await;
+                        context
+                            .sources
+                            .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                            .await;
                     }
                 }
             } else {
@@ -602,7 +608,10 @@ pub(crate) async fn source_forwarding_loop(
                 );
                 error!("{error_msg}");
                 context.metrics.inc_errors_with_labels(&labels.counter);
-                context.sources.set_error(&plugin_key, &error_msg).await;
+                context
+                    .sources
+                    .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                    .await;
             }
         }
 

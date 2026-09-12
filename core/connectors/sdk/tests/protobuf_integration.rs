@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use base64::Engine;
 use iggy_connector_sdk::decoders::proto::{ProtoConfig, ProtoStreamDecoder};
 use iggy_connector_sdk::encoders::proto::{ProtoEncoderConfig, ProtoStreamEncoder};
 use iggy_connector_sdk::transforms::{ProtoConvert, ProtoConvertConfig, Transform};
@@ -23,6 +24,578 @@ use prost::Message;
 use prost_types::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+const INTEGER_SCHEMA: &str = r#"
+        syntax = "proto3";
+        message IntegerRecord {
+            int32 int32_value = 1;
+            int64 int64_value = 2;
+            uint32 uint32_value = 3;
+            uint64 uint64_value = 4;
+            sint32 sint32_value = 5;
+            sint64 sint64_value = 6;
+            fixed32 fixed32_value = 7;
+            fixed64 fixed64_value = 8;
+            sfixed32 sfixed32_value = 9;
+            sfixed64 sfixed64_value = 10;
+        }
+    "#;
+
+#[derive(Clone, PartialEq, Message)]
+struct ValueRecord {
+    #[prost(float, tag = "1")]
+    single: f32,
+    #[prost(double, tag = "2")]
+    double: f64,
+    #[prost(bytes, tag = "3")]
+    bytes: Vec<u8>,
+    #[prost(message, optional, tag = "4")]
+    nested: Option<String>,
+}
+
+#[test]
+fn given_float_and_binary_fields_when_converting_should_match_prost_values() {
+    let mut schema = protox_parse::parse(
+        "values.proto",
+        r#"
+        syntax = "proto3";
+        message Nested { string value = 1; }
+        message ValueRecord {
+            float single = 1;
+            double double = 2;
+            bytes bytes = 3;
+            Nested nested = 4;
+        }
+    "#,
+    )
+    .expect("parse scalar and binary schema");
+    let record_schema = schema
+        .message_type
+        .iter_mut()
+        .find(|message| message.name() == "ValueRecord")
+        .expect("find record schema");
+    let nested_field = record_schema
+        .field
+        .iter_mut()
+        .find(|field| field.name() == "nested")
+        .expect("find nested message field");
+    nested_field.r#type = Some(prost_types::field_descriptor_proto::Type::Message as i32);
+    nested_field.type_name = Some(".Nested".to_string());
+    let converter = ProtoConvert::new(ProtoConvertConfig {
+        source_format: Schema::Json,
+        target_format: Schema::Proto,
+        descriptor_set: Some(prost_types::FileDescriptorSet { file: vec![schema] }.encode_to_vec()),
+        message_type: Some("ValueRecord".to_string()),
+        ..ProtoConvertConfig::default()
+    });
+    for (single, double) in [(1.25, -2.5), (f32::MIN, f64::MIN), (f32::MAX, f64::MAX)] {
+        let expected = ValueRecord {
+            single,
+            double,
+            bytes: vec![0, 1, 255],
+            nested: Some("nested".to_string()),
+        };
+        let converted = converter.transform(
+            &iggy_connector_sdk::TopicMetadata { stream: "values".to_string(), topic: "values".to_string() },
+            iggy_connector_sdk::DecodedMessage {
+                id: None, offset: None, checksum: None, timestamp: None,
+                origin_timestamp: None, headers: None,
+                payload: Payload::Json(simd_json::json!({
+                    "single": single, "double": double,
+                    "bytes": base64::engine::general_purpose::STANDARD.encode(&expected.bytes),
+                    "nested": base64::engine::general_purpose::STANDARD.encode("nested".to_string().encode_to_vec()),
+                })),
+            },
+        ).expect("convert scalar and binary record").expect("preserve record");
+        let Payload::Raw(encoded) = converted.payload else {
+            panic!("expected schema-encoded protobuf bytes");
+        };
+        let decoded =
+            ValueRecord::decode(encoded.as_slice()).expect("decode converted values with prost");
+        assert_eq!(decoded, expected);
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct IntegerRecord {
+    #[prost(int32, tag = "1")]
+    int32_value: i32,
+    #[prost(int64, tag = "2")]
+    int64_value: i64,
+    #[prost(uint32, tag = "3")]
+    uint32_value: u32,
+    #[prost(uint64, tag = "4")]
+    uint64_value: u64,
+    #[prost(sint32, tag = "5")]
+    sint32_value: i32,
+    #[prost(sint64, tag = "6")]
+    sint64_value: i64,
+    #[prost(fixed32, tag = "7")]
+    fixed32_value: u32,
+    #[prost(fixed64, tag = "8")]
+    fixed64_value: u64,
+    #[prost(sfixed32, tag = "9")]
+    sfixed32_value: i32,
+    #[prost(sfixed64, tag = "10")]
+    sfixed64_value: i64,
+}
+
+#[test]
+fn given_nested_message_when_encoding_should_resolve_qualified_name() {
+    let encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+        descriptor_set: Some(nested_descriptor_set()),
+        message_type: Some("example.Outer.Middle.Inner".to_string()),
+        ..ProtoEncoderConfig::default()
+    });
+    let encoded = encoder
+        .encode(Payload::Json(simd_json::json!({"label": "nested"})))
+        .expect("encode nested message type");
+    let record =
+        FixedFieldRecord::decode(encoded.as_slice()).expect("decode nested record with prost");
+    assert_eq!(record.label, "nested");
+}
+
+#[test]
+fn given_nested_message_when_decoding_should_resolve_qualified_name() {
+    let decoder = ProtoStreamDecoder::new(ProtoConfig {
+        descriptor_set: Some(nested_descriptor_set()),
+        message_type: Some("example.Outer.Middle.Inner".to_string()),
+        ..ProtoConfig::default()
+    });
+    let record = FixedFieldRecord {
+        label: "nested".to_string(),
+        ..Default::default()
+    };
+    let Payload::Json(decoded) = decoder
+        .decode(record.encode_to_vec())
+        .expect("decode nested message type")
+    else {
+        panic!("expected nested message fields");
+    };
+    assert_eq!(decoded, simd_json::json!({"label": "nested"}));
+}
+
+#[test]
+fn given_nested_message_when_converting_should_resolve_qualified_name() {
+    let converter = ProtoConvert::new(ProtoConvertConfig {
+        source_format: Schema::Json,
+        target_format: Schema::Proto,
+        descriptor_set: Some(nested_descriptor_set()),
+        message_type: Some("example.Outer.Middle.Inner".to_string()),
+        ..ProtoConvertConfig::default()
+    });
+    let converted = converter
+        .transform(
+            &iggy_connector_sdk::TopicMetadata {
+                stream: "nested".to_string(),
+                topic: "nested".to_string(),
+            },
+            iggy_connector_sdk::DecodedMessage {
+                id: None,
+                offset: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                headers: None,
+                payload: Payload::Json(simd_json::json!({"label": "nested"})),
+            },
+        )
+        .expect("convert nested message type")
+        .expect("preserve message");
+    let Payload::Raw(encoded) = converted.payload else {
+        panic!("expected schema-encoded nested message");
+    };
+    let record =
+        FixedFieldRecord::decode(encoded.as_slice()).expect("decode nested record with prost");
+    assert_eq!(record.label, "nested");
+}
+
+#[test]
+fn given_loaded_encoder_when_config_changes_should_match_reload_setting() {
+    for reload_schema in [false, true] {
+        for schema_path in [
+            None,
+            Some(std::env::temp_dir().join(format!("{}.proto", uuid::Uuid::new_v4()))),
+        ] {
+            let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+                descriptor_set: Some(integer_descriptor_set()),
+                message_type: Some("IntegerRecord".to_string()),
+                ..ProtoEncoderConfig::default()
+            });
+            encoder
+                .update_config(
+                    ProtoEncoderConfig {
+                        schema_path,
+                        ..ProtoEncoderConfig::default()
+                    },
+                    reload_schema,
+                )
+                .expect("update encoder configuration");
+            let (record, json) = integer_cases()[2].clone();
+            let encoded = encoder
+                .encode(Payload::Json(json.clone()))
+                .expect("encode record");
+            if reload_schema {
+                let wrapped = Any::decode(encoded.as_slice()).expect("decode fallback Any");
+                let text = wrapped
+                    .to_msg::<String>()
+                    .expect("unpack fallback StringValue");
+                let decoded: simd_json::OwnedValue =
+                    simd_json::from_slice(&mut text.into_bytes()).expect("parse fallback JSON");
+                assert_eq!(decoded, json);
+            } else {
+                assert_eq!(IntegerRecord::decode(encoded.as_slice()).unwrap(), record);
+            }
+        }
+    }
+}
+
+#[test]
+fn given_loaded_decoder_when_config_changes_should_match_reload_setting() {
+    for reload_schema in [false, true] {
+        for schema_path in [
+            None,
+            Some(std::env::temp_dir().join(format!("{}.proto", uuid::Uuid::new_v4()))),
+        ] {
+            let mut decoder = ProtoStreamDecoder::new(ProtoConfig {
+                descriptor_set: Some(integer_descriptor_set()),
+                message_type: Some("IntegerRecord".to_string()),
+                ..ProtoConfig::default()
+            });
+            decoder
+                .update_config(
+                    ProtoConfig {
+                        schema_path,
+                        use_any_wrapper: false,
+                        ..ProtoConfig::default()
+                    },
+                    reload_schema,
+                )
+                .expect("update decoder configuration");
+            let (record, json) = integer_cases()[2].clone();
+            let encoded = record.encode_to_vec();
+            let decoded = decoder.decode(encoded.clone()).expect("decode record");
+            if reload_schema {
+                let Payload::Raw(bytes) = decoded else {
+                    panic!("expected configured raw fallback");
+                };
+                assert_eq!(bytes, encoded);
+            } else {
+                let Payload::Json(fields) = decoded else {
+                    panic!("expected retained schema");
+                };
+                assert_eq!(fields, json);
+            }
+        }
+    }
+}
+
+#[test]
+fn given_loaded_encoder_when_update_fails_should_preserve_configuration() {
+    let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+        descriptor_set: Some(integer_descriptor_set()),
+        message_type: Some("IntegerRecord".to_string()),
+        ..ProtoEncoderConfig::default()
+    });
+    assert!(
+        encoder
+            .update_config(
+                ProtoEncoderConfig {
+                    descriptor_set: Some(vec![0xff]),
+                    field_mappings: Some(HashMap::from([(
+                        "int32_value".to_string(),
+                        "renamed".to_string()
+                    )])),
+                    ..ProtoEncoderConfig::default()
+                },
+                true
+            )
+            .is_err()
+    );
+    let (record, json) = integer_cases()[2].clone();
+    let encoded = encoder
+        .encode(Payload::Json(json))
+        .expect("encode after failed update");
+    assert_eq!(IntegerRecord::decode(encoded.as_slice()).unwrap(), record);
+    encoder
+        .load_schema()
+        .expect("reload restored configuration");
+}
+
+#[test]
+fn given_loaded_decoder_when_update_fails_should_preserve_configuration() {
+    let mut decoder = ProtoStreamDecoder::new(ProtoConfig {
+        descriptor_set: Some(integer_descriptor_set()),
+        message_type: Some("IntegerRecord".to_string()),
+        ..ProtoConfig::default()
+    });
+    assert!(
+        decoder
+            .update_config(
+                ProtoConfig {
+                    descriptor_set: Some(vec![0xff]),
+                    field_mappings: Some(HashMap::from([(
+                        "int32_value".to_string(),
+                        "renamed".to_string()
+                    )])),
+                    ..ProtoConfig::default()
+                },
+                true
+            )
+            .is_err()
+    );
+    let (record, json) = integer_cases()[2].clone();
+    let Payload::Json(decoded) = decoder
+        .decode(record.encode_to_vec())
+        .expect("decode after failed update")
+    else {
+        panic!("expected retained schema");
+    };
+    assert_eq!(decoded, json);
+    decoder
+        .load_schema()
+        .expect("reload restored configuration");
+}
+
+#[test]
+fn given_loaded_schemas_when_file_changes_should_preserve_errors_and_clear_fallback() {
+    let directory = std::env::temp_dir();
+    let path = directory.join(format!("{}.proto", uuid::Uuid::new_v4()));
+    std::fs::write(&path, INTEGER_SCHEMA).expect("write owned schema fixture");
+    let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+        schema_path: Some(path.clone()),
+        message_type: Some("IntegerRecord".to_string()),
+        include_paths: vec![directory.clone()],
+        ..ProtoEncoderConfig::default()
+    });
+    let mut decoder = ProtoStreamDecoder::new(ProtoConfig {
+        schema_path: Some(path.clone()),
+        message_type: Some("IntegerRecord".to_string()),
+        include_paths: vec![directory.clone()],
+        use_any_wrapper: false,
+        ..ProtoConfig::default()
+    });
+    let mut converter = ProtoConvert::new(ProtoConvertConfig {
+        source_format: Schema::Json,
+        target_format: Schema::Proto,
+        schema_path: Some(path.clone()),
+        message_type: Some("IntegerRecord".to_string()),
+        include_paths: vec![directory],
+        ..ProtoConvertConfig::default()
+    });
+    std::fs::write(&path, "syntax = broken").expect("replace owned schema fixture");
+    let encoder_error = encoder.load_schema();
+    let decoder_error = decoder.load_schema();
+    let converter_error = converter.load_schema();
+    std::fs::remove_file(&path).expect("remove owned schema fixture");
+    assert!(encoder_error.is_err());
+    assert!(decoder_error.is_err());
+    assert!(converter_error.is_err());
+
+    let (record, json) = integer_cases()[2].clone();
+    let convert = |converter: &ProtoConvert| {
+        converter
+            .transform(
+                &iggy_connector_sdk::TopicMetadata {
+                    stream: "integers".to_string(),
+                    topic: "integers".to_string(),
+                },
+                iggy_connector_sdk::DecodedMessage {
+                    id: None,
+                    offset: None,
+                    checksum: None,
+                    timestamp: None,
+                    origin_timestamp: None,
+                    headers: None,
+                    payload: Payload::Json(json.clone()),
+                },
+            )
+            .expect("convert record")
+            .expect("preserve record")
+            .payload
+    };
+    let encoded = encoder
+        .encode(Payload::Json(json.clone()))
+        .expect("encode retained schema");
+    assert_eq!(IntegerRecord::decode(encoded.as_slice()).unwrap(), record);
+    let Payload::Json(decoded) = decoder
+        .decode(record.encode_to_vec())
+        .expect("decode retained schema")
+    else {
+        panic!("expected retained decoder schema");
+    };
+    assert_eq!(decoded, json);
+    let Payload::Raw(converted) = convert(&converter) else {
+        panic!("expected retained converter schema");
+    };
+    assert_eq!(IntegerRecord::decode(converted.as_slice()).unwrap(), record);
+
+    encoder
+        .load_schema()
+        .expect("missing file selects fallback");
+    decoder
+        .load_schema()
+        .expect("missing file selects fallback");
+    converter
+        .load_schema()
+        .expect("missing file selects fallback");
+    let encoded = encoder
+        .encode(Payload::Json(json.clone()))
+        .expect("encode fallback");
+    let any = Any::decode(encoded.as_slice()).expect("decode fallback Any");
+    let text = any.to_msg::<String>().expect("unpack fallback StringValue");
+    let decoded: simd_json::OwnedValue = simd_json::from_slice(&mut text.into_bytes()).unwrap();
+    assert_eq!(decoded, json);
+    let Payload::Raw(decoded) = decoder
+        .decode(record.encode_to_vec())
+        .expect("decode fallback")
+    else {
+        panic!("expected decoder raw fallback");
+    };
+    assert_eq!(decoded, record.encode_to_vec());
+    let Payload::Proto(text) = convert(&converter) else {
+        panic!("expected converter text fallback");
+    };
+    let decoded: simd_json::OwnedValue = simd_json::from_slice(&mut text.into_bytes()).unwrap();
+    assert_eq!(decoded, json);
+}
+
+#[test]
+fn given_integer_schema_when_encoding_should_match_prost_values() {
+    let encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+        descriptor_set: Some(integer_descriptor_set()),
+        message_type: Some("IntegerRecord".to_string()),
+        ..ProtoEncoderConfig::default()
+    });
+    for (expected, json) in integer_cases() {
+        let encoded = encoder
+            .encode(Payload::Json(json))
+            .expect("encode integer record");
+        let decoded =
+            IntegerRecord::decode(encoded.as_slice()).expect("decode integer record with prost");
+        assert_eq!(decoded, expected);
+    }
+}
+
+#[test]
+fn given_integer_schema_when_converting_should_match_prost_values() {
+    let converter = ProtoConvert::new(ProtoConvertConfig {
+        source_format: Schema::Json,
+        target_format: Schema::Proto,
+        descriptor_set: Some(integer_descriptor_set()),
+        message_type: Some("IntegerRecord".to_string()),
+        ..ProtoConvertConfig::default()
+    });
+    let metadata = iggy_connector_sdk::TopicMetadata {
+        stream: "integers".to_string(),
+        topic: "integers".to_string(),
+    };
+    for (expected, json) in integer_cases() {
+        let message = iggy_connector_sdk::DecodedMessage {
+            id: None,
+            offset: None,
+            checksum: None,
+            timestamp: None,
+            origin_timestamp: None,
+            headers: None,
+            payload: Payload::Json(json),
+        };
+        let converted = converter
+            .transform(&metadata, message)
+            .expect("convert integer record")
+            .expect("preserve message");
+        let Payload::Raw(encoded) = converted.payload else {
+            panic!("expected schema-encoded protobuf bytes");
+        };
+        let decoded = IntegerRecord::decode(encoded.as_slice())
+            .expect("decode converted integer record with prost");
+        assert_eq!(decoded, expected);
+    }
+}
+
+#[test]
+fn given_prost_integers_when_decoding_should_preserve_values() {
+    let decoder = ProtoStreamDecoder::new(ProtoConfig {
+        descriptor_set: Some(integer_descriptor_set()),
+        message_type: Some("IntegerRecord".to_string()),
+        ..ProtoConfig::default()
+    });
+    for (record, expected) in integer_cases() {
+        let encoded = record.encode_to_vec();
+        if encoded.is_empty() {
+            assert!(matches!(
+                decoder.decode(encoded),
+                Err(iggy_connector_sdk::Error::InvalidPayloadType)
+            ));
+            continue;
+        }
+        let Payload::Json(decoded) = decoder
+            .decode(encoded)
+            .expect("decode prost integer record")
+        else {
+            panic!("expected JSON integer fields");
+        };
+        assert_eq!(decoded, expected);
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FixedFieldRecord {
+    #[prost(fixed32, tag = "1")]
+    narrow: u32,
+    #[prost(fixed64, tag = "2")]
+    wide: u64,
+    #[prost(string, tag = "3")]
+    label: String,
+}
+
+#[test]
+fn given_unknown_fixed_fields_when_decoding_should_preserve_following_fields() {
+    let record = FixedFieldRecord {
+        narrow: 1,
+        wide: u64::MAX,
+        label: "after fixed fields".to_string(),
+    };
+    for preserve_unknown_fields in [false, true] {
+        let decoder = fixed_field_decoder(preserve_unknown_fields);
+        let Payload::Json(simd_json::OwnedValue::Object(decoded)) = decoder
+            .decode(record.encode_to_vec())
+            .expect("decode after unknown fixed fields")
+        else {
+            panic!("expected JSON object");
+        };
+        assert_eq!(decoded["label"], record.label);
+        assert_eq!(decoded.len(), if preserve_unknown_fields { 3 } else { 1 });
+        assert_eq!(
+            decoded.contains_key("unknown_field_1"),
+            preserve_unknown_fields
+        );
+        assert_eq!(
+            decoded.contains_key("unknown_field_2"),
+            preserve_unknown_fields
+        );
+    }
+}
+
+#[test]
+fn given_truncated_fixed_fields_when_decoding_should_reject_payload() {
+    for preserve_unknown_fields in [false, true] {
+        let decoder = fixed_field_decoder(preserve_unknown_fields);
+        for (tag, width) in [
+            (1 << 3 | 5, size_of::<u32>()),
+            (2 << 3 | 1, size_of::<u64>()),
+        ] {
+            for length in 0..width {
+                let mut truncated = vec![tag];
+                truncated.resize(1 + length, 0);
+                assert!(
+                    decoder.decode(truncated).is_err(),
+                    "tag={tag}, length={length}, preserve={preserve_unknown_fields}"
+                );
+            }
+        }
+    }
+}
 
 #[tokio::test]
 async fn should_transform_with_real_schema_and_field_mapping() {
@@ -424,4 +997,81 @@ async fn should_encode_complex_nested_data_with_any_wrapper() {
         "Successfully encoded complex nested message: {} bytes",
         encoded_bytes.len()
     );
+}
+
+fn integer_descriptor_set() -> Vec<u8> {
+    let schema =
+        protox_parse::parse("integers.proto", INTEGER_SCHEMA).expect("parse integer schema");
+    prost_types::FileDescriptorSet { file: vec![schema] }.encode_to_vec()
+}
+
+fn integer_cases() -> [(IntegerRecord, simd_json::OwnedValue); 5] {
+    [
+        (0, 0, 0, 0),
+        (-1, -1, 1, 1),
+        (150, 9_000_000_000, 150, 9_000_000_000),
+        (i32::MIN, i64::MIN, u32::MAX, u64::MAX),
+        (i32::MAX, i64::MAX, u32::MAX, u64::MAX),
+    ]
+    .map(|(signed32, signed64, unsigned32, unsigned64)| {
+        let expected = IntegerRecord {
+            int32_value: signed32,
+            int64_value: signed64,
+            uint32_value: unsigned32,
+            uint64_value: unsigned64,
+            sint32_value: signed32,
+            sint64_value: signed64,
+            fixed32_value: unsigned32,
+            fixed64_value: unsigned64,
+            sfixed32_value: signed32,
+            sfixed64_value: signed64,
+        };
+        let json = simd_json::json!({
+            "int32_value": signed32,
+            "int64_value": signed64,
+            "uint32_value": unsigned32,
+            "uint64_value": unsigned64,
+            "sint32_value": signed32,
+            "sint64_value": signed64,
+            "fixed32_value": unsigned32,
+            "fixed64_value": unsigned64,
+            "sfixed32_value": signed32,
+            "sfixed64_value": signed64,
+        });
+        (expected, json)
+    })
+}
+
+fn fixed_field_decoder(preserve_unknown_fields: bool) -> ProtoStreamDecoder {
+    let schema = protox_parse::parse(
+        "fixed.proto",
+        r#"
+        syntax = "proto3";
+        message FixedFieldRecord { string label = 3; }
+    "#,
+    )
+    .expect("parse schema without fixed fields");
+    ProtoStreamDecoder::new(ProtoConfig {
+        descriptor_set: Some(prost_types::FileDescriptorSet { file: vec![schema] }.encode_to_vec()),
+        message_type: Some("FixedFieldRecord".to_string()),
+        preserve_unknown_fields,
+        ..ProtoConfig::default()
+    })
+}
+
+fn nested_descriptor_set() -> Vec<u8> {
+    let schema = protox_parse::parse(
+        "nested.proto",
+        r#"
+        syntax = "proto3";
+        package example;
+        message Outer {
+            message Middle {
+                message Inner { string label = 3; }
+            }
+        }
+        "#,
+    )
+    .expect("parse nested message schema");
+    prost_types::FileDescriptorSet { file: vec![schema] }.encode_to_vec()
 }

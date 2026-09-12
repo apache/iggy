@@ -118,6 +118,29 @@ impl HttpSinkWireMockContainer {
         })
     }
 
+    pub async fn set_ingest_status(
+        &self,
+        status: reqwest::StatusCode,
+    ) -> Result<(), TestBinaryError> {
+        let url = format!("{}/__admin/mappings", self.base_url);
+        let client = reqwest::Client::new();
+        let mapping = serde_json::json!({
+            "request": { "method": "POST", "urlPath": "/ingest" },
+            "response": { "status": status.as_u16() }
+        });
+        // Deleting mappings also removes the bind-mounted fixture files.
+        client
+            .post(&url)
+            .json(&mapping)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!("Failed to set WireMock ingest response: {error}"),
+            })?;
+        Ok(())
+    }
+
     /// Query WireMock's admin API and return all received requests.
     pub async fn get_received_requests(&self) -> Result<Vec<WireMockRequest>, TestBinaryError> {
         let url = format!("{}/__admin/requests", self.base_url);

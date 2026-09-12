@@ -83,26 +83,32 @@ impl ProtoStreamDecoder {
     }
 
     pub fn update_config(&mut self, config: ProtoConfig, reload_schema: bool) -> Result<(), Error> {
-        self.config = config;
-        if reload_schema
-            && (self.config.schema_path.is_some() || self.config.descriptor_set.is_some())
-        {
-            self.load_schema()
-        } else {
-            Ok(())
+        let old_config = std::mem::replace(&mut self.config, config);
+        if reload_schema && let Err(error) = self.load_schema() {
+            self.config = old_config;
+            return Err(error);
         }
+        Ok(())
     }
 
     pub fn load_schema(&mut self) -> Result<(), Error> {
         let schema_path = self.config.schema_path.clone();
         let descriptor_set = self.config.descriptor_set.clone();
 
-        if let Some(path) = schema_path {
-            self.compile_schema_internal(&path)?;
+        let old_message_descriptor = self.message_descriptor.take();
+        let old_file_descriptor_set = self.file_descriptor_set.take();
+        let result = if let Some(path) = schema_path {
+            self.compile_schema_internal(&path)
         } else if let Some(descriptor_bytes) = descriptor_set {
-            self.load_descriptor_set_internal(&descriptor_bytes)?;
+            self.load_descriptor_set_internal(&descriptor_bytes)
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.message_descriptor = old_message_descriptor;
+            self.file_descriptor_set = old_file_descriptor_set;
         }
-        Ok(())
+        result
     }
 
     fn compile_schema_internal(&mut self, schema_path: &PathBuf) -> Result<(), Error> {
@@ -197,23 +203,24 @@ impl ProtoStreamDecoder {
         package: &str,
     ) -> Option<prost_types::DescriptorProto> {
         let parent_name = parent_message.name.as_deref().unwrap_or("");
-
-        let package_prefix = if package.is_empty() {
-            String::new()
+        let parent_prefix = if package.is_empty() {
+            parent_name.to_string()
         } else {
-            format!("{package}.")
+            format!("{package}.{parent_name}")
         };
 
         for nested_message in &parent_message.nested_type {
             let nested_name = nested_message.name.as_deref().unwrap_or("");
-            let full_name = format!("{package_prefix}{parent_name}.{nested_name}");
+            let full_name = format!("{parent_prefix}.{nested_name}");
 
             if full_name == target_type {
                 info!("Found nested message descriptor: {}", full_name);
                 return Some(nested_message.clone());
             }
 
-            if let Some(deeper) = self.find_nested_message(nested_message, target_type, package) {
+            if let Some(deeper) =
+                self.find_nested_message(nested_message, target_type, &parent_prefix)
+            {
                 return Some(deeper);
             }
         }
@@ -369,6 +376,22 @@ impl ProtoStreamDecoder {
         Err(Error::InvalidProtobufPayload)
     }
 
+    fn parse_fixed_integer(
+        data: &[u8],
+        cursor: usize,
+        wire_type: u8,
+    ) -> Result<(u64, usize), Error> {
+        let width = match wire_type {
+            1 => size_of::<u64>(),
+            5 => size_of::<u32>(),
+            _ => return Err(Error::InvalidProtobufPayload),
+        };
+        let end_cursor = Self::length_delimited_end(cursor, width as u64, data.len())?;
+        let mut bytes = [0; size_of::<u64>()];
+        bytes[..width].copy_from_slice(&data[cursor..end_cursor]);
+        Ok((u64::from_le_bytes(bytes), end_cursor))
+    }
+
     fn decode_field_value(
         &self,
         data: &[u8],
@@ -384,15 +407,29 @@ impl ProtoStreamDecoder {
                     Type::Bool => {
                         simd_json::OwnedValue::Static(simd_json::StaticNode::Bool(value != 0))
                     }
-                    Type::Int32 | Type::Sint32 | Type::Sfixed32 => {
-                        simd_json::OwnedValue::from(value as i32)
+                    Type::Int32 | Type::Sfixed32 => simd_json::OwnedValue::from(value as i32),
+                    Type::Int64 | Type::Sfixed64 => simd_json::OwnedValue::from(value as i64),
+                    Type::Sint32 => {
+                        let value = value as u32;
+                        simd_json::OwnedValue::from(((value >> 1) as i32) ^ -((value & 1) as i32))
                     }
-                    Type::Int64 | Type::Sint64 | Type::Sfixed64 => {
-                        simd_json::OwnedValue::from(value as i64)
+                    Type::Sint64 => {
+                        simd_json::OwnedValue::from(((value >> 1) as i64) ^ -((value & 1) as i64))
                     }
                     Type::Uint32 | Type::Fixed32 => simd_json::OwnedValue::from(value as u32),
                     Type::Uint64 | Type::Fixed64 => simd_json::OwnedValue::from(value),
                     _ => simd_json::OwnedValue::from(value),
+                };
+                Ok((json_value, new_cursor))
+            }
+            1 | 5 => {
+                let (value, new_cursor) = Self::parse_fixed_integer(data, cursor, wire_type)?;
+                let json_value = match (wire_type, field_desc.r#type()) {
+                    (1, Type::Fixed64) => simd_json::OwnedValue::from(value),
+                    (1, Type::Sfixed64) => simd_json::OwnedValue::from(value as i64),
+                    (5, Type::Fixed32) => simd_json::OwnedValue::from(value as u32),
+                    (5, Type::Sfixed32) => simd_json::OwnedValue::from(value as u32 as i32),
+                    _ => simd_json::OwnedValue::String("unsupported_wire_type".into()),
                 };
                 Ok((json_value, new_cursor))
             }
@@ -445,6 +482,10 @@ impl ProtoStreamDecoder {
                 let (value, new_cursor) = self.parse_simple_varint(data, cursor)?;
                 Ok((simd_json::OwnedValue::from(value), new_cursor))
             }
+            1 | 5 => {
+                let (_, new_cursor) = Self::parse_fixed_integer(data, cursor, wire_type)?;
+                Ok((simd_json::OwnedValue::String("unknown".into()), new_cursor))
+            }
             2 => {
                 let (length, mut new_cursor) = self.parse_simple_varint(data, cursor)?;
                 let end_cursor = Self::length_delimited_end(new_cursor, length, data.len())?;
@@ -463,6 +504,10 @@ impl ProtoStreamDecoder {
         match wire_type {
             0 => {
                 let (_, new_cursor) = self.parse_simple_varint(data, cursor)?;
+                Ok(new_cursor)
+            }
+            1 | 5 => {
+                let (_, new_cursor) = Self::parse_fixed_integer(data, cursor, wire_type)?;
                 Ok(new_cursor)
             }
             2 => {

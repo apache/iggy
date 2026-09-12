@@ -298,7 +298,7 @@ impl HttpStateProvider {
                     return Ok(LoadResponse::NotFound);
                 }
                 Ok(response) => return Ok(LoadResponse::Failure(response)),
-                Err(send_error) => TransientFailure::Send(send_error),
+                Err(send_error) => TransientFailure::Send(send_error.without_url()),
             };
             if attempt >= max_attempts {
                 return Err(Error::TransientState(failure.describe(
@@ -342,7 +342,7 @@ impl HttpStateProvider {
             let failure = match request.send().await {
                 Ok(response) if !is_transient_status(response.status()) => return Ok(response),
                 Ok(response) => TransientFailure::Status(response),
-                Err(send_error) => TransientFailure::Send(send_error),
+                Err(send_error) => TransientFailure::Send(send_error.without_url()),
             };
             if attempt >= max_attempts {
                 return Err(Error::TransientState(failure.describe(
@@ -729,6 +729,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     const RESOURCE_PATH: &str = "/source_test";
+    const STATE_URL_QUERY_SECRET: &str = "state-query-secret-not-for-logs";
 
     fn test_config(url: &str) -> HttpStateConfig {
         HttpStateConfig {
@@ -1140,15 +1141,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = test_config(&server.uri());
+        let mut config = test_config(&format!("{}?token={STATE_URL_QUERY_SECRET}", server.uri()));
         config.timeout = IggyDuration::new(Duration::from_millis(50));
         config.retry.enabled = false;
         let storage = storage_for(&config);
         storage.load().await.unwrap();
-        assert!(matches!(
-            storage.save(ConnectorState(vec![1, 2, 3])).await,
-            Err(Error::TransientState(_))
-        ));
+        let result = storage.save(ConnectorState(vec![1, 2, 3])).await;
+        assert!(
+            matches!(result, Err(Error::TransientState(_))),
+            "{result:?}"
+        );
+        let error_log = format!("{result:?}");
+        assert!(!error_log.contains(STATE_URL_QUERY_SECRET), "{error_log}");
         storage
             .resolve_pending()
             .await
