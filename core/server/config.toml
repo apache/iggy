@@ -907,6 +907,18 @@ clients_table_max = 8192
 # partition_wal_disk_bytes measures WAL file length, excluding referenced segment bodies.
 wal_bytes_max = "256 MiB"
 
+# Bounded wait for more prepares before a persisted partition's WAL writer
+# starts its durability barrier, in microseconds. 0 disables it. Max 10000.
+# Spends up to this much acknowledgment latency to cut device writes: one
+# barrier and one frontier write then cover a whole group of prepares instead of
+# a single one. Durability is unchanged, the same barrier runs over the same
+# bytes, later, and the quorum gate is untouched.
+# Skipped while prepares arrive further apart than the delay, so an idle
+# partition never waits. Earns nothing until the barrier completes faster than
+# prepares arrive, which is where the writer stops grouping by itself. Start
+# near the measured barrier duration.
+wal_group_commit_delay_micros = 0
+
 # Verify the checksum of batches read from segment storage. A mismatch is reported rather than served.
 validate_checksum = true
 

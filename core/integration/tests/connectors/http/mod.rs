@@ -16,5 +16,8 @@
 // under the License.
 
 mod http_sink;
+mod http_source;
 
 const TEST_MESSAGE_COUNT: usize = 3;
+const POLL_ATTEMPTS: usize = 100;
+const POLL_INTERVAL_MS: u64 = 50;
