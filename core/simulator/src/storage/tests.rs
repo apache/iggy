@@ -58,6 +58,11 @@ enum Mutation {
     Append,
     CertifyView,
     Checkpoint,
+    /// A checkpoint whose rewrite runs while the outgoing generation still
+    /// holds a buffered record. A torn publication leaves the older slot naming
+    /// that generation, so recovery walks its tail and must not read an
+    /// unsynced record there as damage.
+    CheckpointBufferedTail,
     Truncate,
     Reset,
     Purge,
@@ -123,6 +128,7 @@ fn wal_fault_sweep_preserves_acknowledged_history_at_every_io_boundary() {
             Mutation::Append,
             Mutation::CertifyView,
             Mutation::Checkpoint,
+            Mutation::CheckpointBufferedTail,
             Mutation::Truncate,
             Mutation::Reset,
             Mutation::Purge,
@@ -740,8 +746,8 @@ fn checkpoint_skips_duplicate_offset_sync_but_still_refuses_a_missing_path() {
                         .iter()
                         .filter(|operation| **operation == StorageOperation::FileSync)
                         .count(),
-                    3,
-                    "original offset writer, replacement WAL, frontier"
+                    4,
+                    "original offset writer, outgoing WAL, replacement WAL, frontier"
                 );
             }
         }
@@ -2058,7 +2064,7 @@ async fn mutate_owned_segments(
                 .append(owned_prepare(3, second.header().checksum, 2).into_frozen())
                 .await
         }
-        Mutation::Checkpoint => journal.checkpoint(2).await,
+        Mutation::Checkpoint | Mutation::CheckpointBufferedTail => journal.checkpoint(2).await,
         Mutation::Truncate => journal.truncate_from(2).await,
         Mutation::CertifyView => {
             journal
@@ -2289,7 +2295,7 @@ async fn mutate_referenced(
                 .certify_log_view(2, 2, second.header().checksum)
                 .await
         }
-        Mutation::Checkpoint => journal.checkpoint(2).await,
+        Mutation::Checkpoint | Mutation::CheckpointBufferedTail => journal.checkpoint(2).await,
         Mutation::Truncate => journal.truncate_from(2).await,
         Mutation::Reset => journal.reset(7, None).await,
         Mutation::Purge => {
@@ -2337,7 +2343,7 @@ async fn assert_referenced_recovery(
                 assert_eq!(journal.head(), 7, "{context}");
             }
         }
-        Mutation::Checkpoint => {
+        Mutation::Checkpoint | Mutation::CheckpointBufferedTail => {
             assert_eq!(journal.head(), 2, "{context}");
             assert!([0, 2].contains(&journal.checkpoint_op()), "{context}");
             if completed {
@@ -2422,6 +2428,17 @@ async fn mutate(
             replace(storage, Path::new("/partition/materialized"), b"1,2").await?;
             journal.checkpoint(2).await
         }
+        Mutation::CheckpointBufferedTail => {
+            let entries = journal.prepares().await?;
+            let last = bytemuck::checked::from_bytes::<PrepareHeader>(
+                &entries.last().unwrap().as_slice()[..size_of::<PrepareHeader>()],
+            );
+            journal
+                .append_buffered(prepare(4, last.checksum).into_frozen())
+                .await?;
+            replace(storage, Path::new("/partition/materialized"), b"1,2").await?;
+            journal.checkpoint(2).await
+        }
         Mutation::Truncate => journal.truncate_from(3).await,
         Mutation::Reset => {
             replace(storage, Path::new("/partition/materialized"), b"1-7").await?;
@@ -2458,6 +2475,16 @@ async fn replace(storage: &SimStorage, path: &Path, bytes: &[u8]) -> io::Result<
     storage.sync_directory(path.parent().unwrap()).await
 }
 
+/// The buffered record is acknowledged by nothing, so recovery may keep or drop
+/// it. Refusing the open is the failure this covers.
+fn assert_buffered_tail_checkpoint(journal: &PartitionPrepareJournal<SimStorage>, completed: bool) {
+    assert!((3..=4).contains(&journal.head()));
+    assert!([0, 2].contains(&journal.checkpoint_op()));
+    if completed {
+        assert_eq!(journal.checkpoint_op(), 2);
+    }
+}
+
 async fn assert_recovery(
     storage: &SimStorage,
     journal: &PartitionPrepareJournal<SimStorage>,
@@ -2480,6 +2507,7 @@ async fn assert_recovery(
                 assert_eq!(journal.head(), 4);
             }
         }
+        Mutation::CheckpointBufferedTail => assert_buffered_tail_checkpoint(journal, completed),
         Mutation::Checkpoint => {
             assert_eq!(journal.head(), 3);
             assert!([0, 2].contains(&journal.checkpoint_op()));
@@ -2550,7 +2578,12 @@ async fn assert_recovery(
     assert_eq!(
         entries.len() as u64,
         journal.head() - journal.checkpoint_op()
-            + u64::from(matches!(mutation, Mutation::Checkpoint) && journal.checkpoint_op() > 0)
+            + u64::from(
+                matches!(
+                    mutation,
+                    Mutation::Checkpoint | Mutation::CheckpointBufferedTail
+                ) && journal.checkpoint_op() > 0,
+            )
     );
 }
 
