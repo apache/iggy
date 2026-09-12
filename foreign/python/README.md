@@ -204,6 +204,161 @@ async def main():
 asyncio.run(main())
 ```
 
+## High-Level Producer
+
+The Python high-level producer API is a port of the Rust high-level producer
+API. For detailed producer semantics and configuration guidance, see the
+[Rust high-level SDK documentation](https://iggy.apache.org/docs/sdk/rust/high-level-sdk/).
+
+Use `IggyClient.producer()` when an application repeatedly publishes to one
+stream and topic. Producer creation is asynchronous because it initializes the
+destination before returning. By default, it creates a missing stream and topic,
+uses balanced partitioning, sends directly in batches of up to 1,000 messages,
+and retries failed sends up to three times with a one-second retry interval.
+
+The default mode is direct. Pass `BackgroundProducerConfig` to queue sends on
+background workers instead.
+
+```python
+import asyncio
+from datetime import timedelta
+
+from apache_iggy import DirectProducerConfig, IggyClient, Partitioning, SendMessage
+
+
+async def main():
+    client = IggyClient.from_connection_string(
+        "iggy+tcp://iggy:iggy@127.0.0.1:8090"
+    )
+    await client.connect()
+
+    producer = await client.producer(
+        "orders",
+        "created",
+        partitioning=Partitioning.balanced(),
+        mode=DirectProducerConfig(
+            batch_length=500,
+            linger_time=timedelta(milliseconds=5),
+        ),
+        create_stream_if_not_exists=True,
+        create_topic_if_not_exists=True,
+        topic_partitions_count=3,
+        topic_message_expiry=None,
+        topic_max_size=None,
+        send_retries=3,
+        send_retry_interval=timedelta(seconds=1),
+    )
+
+    async with producer:
+        await producer.send_one(SendMessage("order-1"))
+        response = await producer.send(
+            [SendMessage("order-2"), SendMessage("order-3")]
+        )
+        print(f"Received {len(response.confirmations)} partition confirmations")
+
+
+asyncio.run(main())
+```
+
+The producer is bound to the stream and topic passed to `producer()`. Use
+`send_with_partitioning(messages, partitioning)` to override its partitioning
+strategy for one call, or `send_to(stream, topic, messages, partitioning)` to
+send to another existing destination. `send_to()` does not create or initialize
+that destination.
+
+Direct sends use at-least-once delivery. A request can commit even when its
+response is lost, so any retry can write the same batch again. `send_retries`
+counts retries after the initial attempt. The first retry runs immediately, and
+`send_retry_interval` delays only later retries. Set `send_retries` to `None` or
+`0` to disable producer retries. Set `send_retry_interval` to `None` to run all
+enabled retries without a delay. A zero interval raises `ValueError`.
+
+Transport retries are separate from producer retries. For example, the default
+`HttpConfig(retries=3)` gives each producer attempt up to four HTTP attempts.
+
+A failed direct send raises `ProducerSendError`, which is a `RuntimeError`
+subclass. Its `cause` property contains the underlying error text. Its
+`committed` property contains confirmations from completed chunks, and `failed`
+contains the remaining unconfirmed messages. If encryption is enabled, the
+failed messages contain encrypted payloads. Restore the original payloads
+before submitting them to the same producer again.
+
+### Background Mode
+
+A successful background send means the dispatcher accepted the messages. The
+worker writes them later, so all four send methods return a
+`SendMessagesResponse` with an empty `confirmations` list. It does not mean the
+server has committed the messages.
+
+```python
+from datetime import timedelta
+
+from apache_iggy import (
+    BackgroundProducerConfig,
+    BackpressureMode,
+    ProducerSharding,
+    SendMessage,
+)
+
+producer = await client.producer(
+    "orders",
+    "created",
+    mode=BackgroundProducerConfig(
+        num_shards=4,
+        linger_time=timedelta(milliseconds=10),
+        batch_size=1024 * 1024,
+        batch_length=100,
+        max_buffer_size=32 * 1024 * 1024,
+        failure_mode=BackpressureMode.block_with_timeout(
+            timedelta(seconds=1)
+        ),
+        max_in_flight=4,
+        sharding=ProducerSharding.ORDERED,
+    ),
+)
+
+async with producer:
+    accepted = await producer.send_one(SendMessage("order-1"))
+    assert accepted.confirmations == []
+```
+
+Each shard flushes when any configured condition is met: `batch_length` queued
+send calls, `batch_size` reported bytes, or `linger_time` since the first send
+entered an empty buffer. `batch_length` counts calls, not individual messages.
+Zero disables either batching threshold, while a zero linger flushes as soon as
+the worker receives a send.
+
+`ProducerSharding.ORDERED` hashes the stream/topic destination so its sends use
+one sequential worker and retain dispatch order. `ProducerSharding.BALANCED`
+assigns consecutive sends round-robin across the shards for throughput; ordering
+for one destination is not guaranteed.
+
+`max_buffer_size` bounds bytes queued or in flight across the whole producer.
+When it is full, `BackpressureMode.block()` waits indefinitely,
+`block_with_timeout(duration)` waits up to that duration, and
+`fail_immediately()` raises `RuntimeError` without accepting the batch. A single
+batch larger than the whole budget always fails. A zero byte budget is
+unlimited. `max_in_flight` separately bounds concurrent write requests across
+all shards; zero uses the runtime maximum.
+
+Producer retries and transport reconnection happen inside background workers.
+The Python API does not currently expose a background error callback, so a write
+that still fails after its retries is logged by the Rust SDK and its unconfirmed
+messages are dropped.
+
+See the complete runnable
+[`background_producer.py`](../../examples/python/high-level/background_producer.py)
+example for all background configuration fields and deterministic shutdown.
+
+Cleanup is asynchronous and must be explicit. Prefer `async with`, as above, so
+shutdown runs on both successful and exceptional exits. Otherwise, call
+`await producer.shutdown()` in a `finally` block. Shutdown waits for active
+sends, is safe to call more than once, and rejects later sends with
+`RuntimeError`. In background mode it also drains every queue and flushes all
+accepted messages before returning. Object destruction does not perform
+asynchronous cleanup; dropping a background producer without `shutdown()` can
+lose buffered messages.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.

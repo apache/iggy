@@ -97,7 +97,7 @@ pub struct ProducerCore {
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
     default_partitioning: Arc<Partitioning>,
-    last_sent_at: Arc<AtomicU64>,
+    last_sent_at: AtomicU64,
     send_retries_count: Option<u32>,
     send_retries_interval: Option<NonZeroIggyDuration>,
     direct_config: Option<DirectConfig>,
@@ -831,7 +831,7 @@ impl IggyProducer {
             topic_message_expiry,
             topic_max_size,
             default_partitioning: Arc::new(Partitioning::balanced()),
-            last_sent_at: Arc::new(AtomicU64::new(0)),
+            last_sent_at: AtomicU64::new(0),
             send_retries_count,
             send_retries_interval,
             direct_config: match mode {
