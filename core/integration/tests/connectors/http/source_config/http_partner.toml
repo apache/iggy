@@ -1,0 +1,47 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Instance 2, joining the listener instance 1 binds. Everything the two must
+# agree on comes from the same env overrides.
+
+type = "source"
+key = "http_partner"
+enabled = true
+version = 0
+name = "HTTP source (partner)"
+path = "../../target/debug/libiggy_connector_http_source"
+plugin_config_format = "toml"
+
+[[streams]]
+stream = "test_stream"
+topic = "test_topic_2"
+schema = "raw"
+batch_length = 10
+linger_time = "5ms"
+
+[plugin_config]
+listen_addr = "127.0.0.1:0"
+admin_listen_addr = "127.0.0.1:0"
+instance_name = "http_partner"
+management_token = "mgmt-token-test"
+buffer_capacity = 128
+max_batch_size = 10
+
+[[plugin_config.endpoints]]
+endpoint_id = "0b7d9e2f4a6c8e1d3b5f7a9c2e4d6f81"
+auth_type = "bearer"
+auth_secret = "partner-token-test"

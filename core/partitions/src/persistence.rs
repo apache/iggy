@@ -1305,6 +1305,49 @@ mod tests {
     use server_common::{Message, iobuf::Owned};
     use tempfile::tempdir;
 
+    /// `io::ErrorKind::StorageFull` is still unstable, so match the raw errno.
+    const ENOSPC: i32 = 28;
+
+    /// A full disk is a refused write, not a torn one: the prior bytes are
+    /// intact and nothing is undefined. Latching it fences the partition for the
+    /// life of the process, and `drive_persistence` escalates that to a node
+    /// shutdown. The same function already treats open failures as retriable.
+    #[compio::test]
+    #[ignore = "PR #4092 review: a refused consumer-offset write latches an unclearable `failure`, retroactively reporting already-acked prepares as unwritten"]
+    async fn given_a_full_disk_when_the_offset_write_is_refused_then_persistence_should_not_fence()
+    {
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        persistence
+            .append(first.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_written(first.header()));
+
+        persistence.fail_operation(
+            io::Error::from_raw_os_error(ENOSPC),
+            Operation::StoreConsumerOffset,
+        );
+
+        assert!(
+            persistence.is_written(first.header()),
+            "an unrelated offset write reported an already-durable prepare as unwritten"
+        );
+        assert!(
+            persistence.failure().is_none(),
+            "ENOSPC on one consumer-offset record latched the partition; nothing clears `failure` (its only `None` is the constructor), so `is_written_through` stays false and `drive_persistence` raises FatalCommit"
+        );
+        assert!(
+            persistence.start(),
+            "the writer refuses to start again after a recoverable errno"
+        );
+    }
+
     #[compio::test]
     async fn completion_is_generation_scoped_and_buffered_work_does_not_ack_durability() {
         let directory = tempdir().unwrap();
