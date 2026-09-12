@@ -17,27 +17,40 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use iggy_common::ConsumerKind;
 
+static NEXT_POLL_HISTORY_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Identity of one serviceable message history. It is never serialized.
 ///
-/// The allocation identifies the history even if a rebuilt partition reuses
-/// its namespace and offsets. Pending reads keep it alive, preventing address
-/// reuse while they can still complete. `Arc` also keeps completion frames
-/// `Send`, as required by the shard inbox.
-/// `Default` creates a fresh identity. Only clones compare equal.
-#[derive(Clone, Debug, Default)]
-pub struct PollHistoryId(Arc<()>);
+/// A process counter gives each new history a unique value, even if a rebuilt
+/// partition reuses its namespace and offsets. Polls copy the value without
+/// accessing the counter. `Default` creates a fresh identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollHistoryId(u64);
 
-impl PartialEq for PollHistoryId {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+impl Default for PollHistoryId {
+    /// # Panics
+    /// Panics when the process counter is exhausted. It never wraps, so a
+    /// pending read cannot match a later history through identity reuse.
+    fn default() -> Self {
+        Self::allocate(&NEXT_POLL_HISTORY_ID)
     }
 }
 
-impl Eq for PollHistoryId {}
+impl PollHistoryId {
+    fn allocate(counter: &AtomicU64) -> Self {
+        // The counter provides uniqueness, not publication of partition state.
+        let id = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("poll history ID counter exhausted");
+        Self(id)
+    }
+}
 
 /// Lifetime accounting for one provisional consumer key.
 ///
@@ -150,14 +163,60 @@ impl Drop for AutoCommitReservation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::panic::catch_unwind;
+    use std::sync::Barrier;
+    use std::thread;
+
     use super::*;
 
     #[test]
-    fn histories_match_only_their_own_clones() {
+    fn histories_match_only_their_own_copies() {
         let history = PollHistoryId::default();
-        assert_eq!(history, history.clone());
+        let copied_history = history;
+        assert_eq!(history, copied_history);
         let other_history = PollHistoryId::default();
         assert_ne!(history, other_history);
+    }
+
+    #[test]
+    fn histories_created_on_different_threads_are_unique() {
+        const THREAD_COUNT: usize = 4;
+        const HISTORIES_PER_THREAD: usize = 128;
+        let start = Barrier::new(THREAD_COUNT);
+
+        let histories = thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREAD_COUNT)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        (0..HISTORIES_PER_THREAD)
+                            .map(|_| PollHistoryId::default())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .map(|history| history.0)
+                .collect::<HashSet<_>>()
+        });
+
+        assert_eq!(histories.len(), THREAD_COUNT * HISTORIES_PER_THREAD);
+    }
+
+    #[test]
+    fn exhausted_history_counter_never_reuses_an_identity() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let last_history = PollHistoryId::allocate(&counter);
+        assert_eq!(last_history.0, u64::MAX - 1);
+
+        // A failed allocation must leave the counter exhausted on later attempts.
+        for _ in 0..2 {
+            assert!(catch_unwind(|| PollHistoryId::allocate(&counter)).is_err());
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
     }
 
     #[test]

@@ -3013,7 +3013,7 @@ where
         }
         if self.consensus.pipeline_is_full() {
             let context = AutoCommitRequestContext {
-                history: self.poll_history.clone(),
+                history: self.poll_history,
                 reservation,
             };
             self.consensus
@@ -3786,7 +3786,7 @@ where
         // is fully synchronous, so the single load cannot drift mid-plan.
         let commit_offset = self.offsets().commit_offset;
         let context = PollContext {
-            history: self.poll_history.clone(),
+            history: self.poll_history,
             consumer,
             auto_commit: args.auto_commit,
         };
@@ -12077,7 +12077,7 @@ mod tests {
         }
         PollReadResult {
             context: PollContext {
-                history: partition.poll_history.clone(),
+                history: partition.poll_history,
                 consumer,
                 auto_commit,
             },
@@ -12401,7 +12401,7 @@ mod tests {
             .push_queued_request(consensus::RequestEntry::with_auto_commit(
                 automatic_request,
                 AutoCommitRequestContext {
-                    history: partition.poll_history.clone(),
+                    history: partition.poll_history,
                     reservation: automatic_reservation,
                 },
             ))
@@ -12445,7 +12445,7 @@ mod tests {
             .reserve_provisional(consumer_id, &partition.durable_consumer_offsets)
             .unwrap();
         let old_context = AutoCommitRequestContext {
-            history: partition.poll_history.clone(),
+            history: partition.poll_history,
             reservation: old_reservation,
         };
         let old_request = partition
@@ -16490,7 +16490,7 @@ mod purge_poll_tests {
             .push_queued_request(consensus::RequestEntry::with_auto_commit(
                 request,
                 AutoCommitRequestContext {
-                    history: partition.poll_history.clone(),
+                    history: partition.poll_history,
                     reservation,
                 },
             ))

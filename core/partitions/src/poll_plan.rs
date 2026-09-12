@@ -931,7 +931,7 @@ mod tests {
         let resident_plan = PollPlan {
             commit_offset: partition_commit_offset,
             context: PollContext {
-                history: snapshot_history.clone(),
+                history: snapshot_history,
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
             },

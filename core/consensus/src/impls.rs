@@ -4311,7 +4311,7 @@ mod request_queue_tests {
         // The queue stores these messages without interpreting their payloads.
         for request_number in 1..=2 {
             let context = AutoCommitRequestContext {
-                history: history.clone(),
+                history,
                 reservation: token.acquire(),
             };
             pipeline
