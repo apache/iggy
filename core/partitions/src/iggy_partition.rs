@@ -235,6 +235,8 @@ where
     #[cfg(test)]
     consumer_offset_dir_sync_fault: Cell<Option<usize>>,
     #[cfg(test)]
+    consumer_offset_dir_sync_fault_count: Cell<usize>,
+    #[cfg(test)]
     offset_dir_sync_count: Cell<usize>,
     /// Highest `PurgeTopic` generation this replica has locally applied (reset
     /// the partition to empty). The reconciler compares the committed metadata
@@ -603,6 +605,8 @@ where
             consumer_offset_dirs_touched: [Cell::new(None), Cell::new(None)],
             #[cfg(test)]
             consumer_offset_dir_sync_fault: Cell::new(None),
+            #[cfg(test)]
+            consumer_offset_dir_sync_fault_count: Cell::new(0),
             #[cfg(test)]
             offset_dir_sync_count: Cell::new(0),
             applied_purge_generation: 0,
@@ -6104,13 +6108,8 @@ where
             if !kinds[index] || !self.consumer_offset_dirs_dirty[index].get() {
                 continue;
             }
-            #[cfg(test)]
-            if self.consumer_offset_dir_sync_fault.get() == Some(index) {
-                failed[index] = true;
-                continue;
-            }
             if let Some(dir) = dir {
-                match crate::state_transfer::fsync_dir(dir).await {
+                match self.sync_consumer_offset_directory(index, dir).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         // The directory disappeared after the final unlink.
@@ -6150,6 +6149,24 @@ where
             self.consumer_offset_dirs_dirty[index].set(false);
         }
         failed
+    }
+
+    async fn sync_consumer_offset_directory(
+        &self,
+        kind_index: usize,
+        directory: &str,
+    ) -> std::io::Result<()> {
+        #[cfg(not(test))]
+        let _ = kind_index;
+        #[cfg(test)]
+        if self.consumer_offset_dir_sync_fault.get() == Some(kind_index) {
+            self.consumer_offset_dir_sync_fault_count
+                .set(self.consumer_offset_dir_sync_fault_count.get() + 1);
+            return Err(std::io::Error::other(
+                "injected consumer offset directory sync failure",
+            ));
+        }
+        crate::state_transfer::fsync_dir(directory).await
     }
 
     fn mark_consumer_offset_dir_dirty(&self, kind: ConsumerKind) {
@@ -7562,13 +7579,17 @@ where
         // failure, sharper than the partition-dir fsync above: the generation
         // write below still runs, so a crash would resurrect these files with
         // no boot re-purge left to clear them.
-        for dir in self
-            .consumer_offsets_path
-            .clone()
-            .into_iter()
-            .chain(self.consumer_group_offsets_path.clone())
+        for (index, directory) in [
+            self.consumer_offsets_path.as_deref(),
+            self.consumer_group_offsets_path.as_deref(),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            if let Err(error) = crate::state_transfer::fsync_dir(&dir).await {
+            let Some(dir) = directory else {
+                continue;
+            };
+            if let Err(error) = self.sync_consumer_offset_directory(index, dir).await {
                 warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
@@ -15842,5 +15863,133 @@ mod purge_floor_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod purge_offset_directory_sync_tests {
+    use iggy_common::{ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets};
+
+    use super::tests::{repair_config, test_partition};
+    use super::{PendingConsumerOffsetCommit, persist_offset, persist_purge_generation};
+    use crate::offset_storage::PURGE_GENERATION_FILE;
+    use crate::state_transfer::{consumer_kind_index, fsync_dir};
+
+    #[compio::test]
+    async fn given_consumer_directory_sync_failure_when_purging_should_keep_generation_pending() {
+        assert_purge_generation_after_offset_directory_sync(Some(ConsumerKind::Consumer)).await;
+    }
+
+    #[compio::test]
+    async fn given_group_directory_sync_failure_when_purging_should_keep_generation_pending() {
+        assert_purge_generation_after_offset_directory_sync(Some(ConsumerKind::ConsumerGroup))
+            .await;
+    }
+
+    #[compio::test]
+    async fn given_successful_offset_directory_sync_when_purging_should_record_generation() {
+        assert_purge_generation_after_offset_directory_sync(None).await;
+    }
+
+    async fn assert_purge_generation_after_offset_directory_sync(
+        failed_kind: Option<ConsumerKind>,
+    ) {
+        const PREVIOUS_GENERATION: u64 = 4;
+        const REQUESTED_GENERATION: u64 = 5;
+        const CREATED_REVISION: u64 = 7;
+
+        let directory = tempfile::tempdir().expect("create partition directory");
+        let partition_path = directory.path().to_str().expect("partition path is UTF-8");
+        let offset_directories = [
+            directory.path().join("consumer_offsets"),
+            directory.path().join("consumer_group_offsets"),
+        ];
+        let mut partition = Box::new(test_partition());
+        partition.set_partition_dir(partition_path.to_owned());
+        partition.set_created_revision(CREATED_REVISION);
+        partition.configure_consumer_offset_storage(
+            offset_directories[0].to_string_lossy().into_owned(),
+            offset_directories[1].to_string_lossy().into_owned(),
+            ConsumerOffsets::with_capacity(1),
+            ConsumerGroupOffsets::with_capacity(1),
+        );
+        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+            let path = partition
+                .persisted_offset_path(kind, 9)
+                .expect("configured offset path");
+            persist_offset(&path, 2, true)
+                .await
+                .expect("persist old consumer progress");
+            partition.apply_consumer_offset_commit(PendingConsumerOffsetCommit::upsert(kind, 9, 2));
+            fsync_dir(
+                offset_directories[consumer_kind_index(kind)]
+                    .to_str()
+                    .expect("offset directory is UTF-8"),
+            )
+            .await
+            .expect("make the old offset entry durable");
+        }
+        let generation_path = directory.path().join(PURGE_GENERATION_FILE);
+        persist_purge_generation(
+            generation_path.to_str().expect("generation path is UTF-8"),
+            PREVIOUS_GENERATION,
+            CREATED_REVISION,
+        )
+        .await
+        .expect("persist the previous applied generation");
+        partition
+            .hydrate_applied_purge_generation()
+            .await
+            .expect("hydrate the previous applied generation");
+        partition
+            .consumer_offset_dir_sync_fault
+            .set(failed_kind.map(consumer_kind_index));
+
+        let result = partition
+            .purge(&repair_config(), REQUESTED_GENERATION)
+            .await;
+
+        assert_eq!(
+            partition.consumer_offset_dir_sync_fault_count.get(),
+            usize::from(failed_kind.is_some()),
+            "the selected directory sync must reach the injected I/O failure"
+        );
+        for offset_directory in &offset_directories {
+            assert!(offset_directory.is_dir());
+            assert!(
+                !offset_directory.join("9").exists(),
+                "the real unlink must succeed before directory synchronization"
+            );
+        }
+
+        // A fresh partition must recover the previous generation after a failed
+        // barrier so reconciliation still owes cleanup.
+        // This tests the failed durability barrier, without simulating power loss.
+        let mut rebuilt = Box::new(test_partition());
+        rebuilt.set_partition_dir(partition_path.to_owned());
+        rebuilt.set_created_revision(CREATED_REVISION);
+        rebuilt
+            .hydrate_applied_purge_generation()
+            .await
+            .expect("recover the applied generation");
+        let expected_generation = if failed_kind.is_some() {
+            PREVIOUS_GENERATION
+        } else {
+            REQUESTED_GENERATION
+        };
+        assert_eq!(
+            (
+                result.is_ok(),
+                partition.applied_purge_generation(),
+                rebuilt.applied_purge_generation(),
+            ),
+            (
+                failed_kind.is_none(),
+                expected_generation,
+                expected_generation
+            ),
+            "purge must not succeed or record completion before offset deletions are durable; \
+             failed directory: {failed_kind:?}, purge result: {result:?}"
+        );
     }
 }
