@@ -28,9 +28,10 @@ pip install apache-iggy
 
 ### Prerequisites
 
-Python 3.10 or newer is required. Published wheels include the Rust extension;
-installing a wheel does not require Rust. Building from source and running the
-development checks below also requires:
+- Python 3.10+
+
+Published wheels include the Rust extension; installing a wheel does not require
+Rust. Building from source and running the development checks below also requires:
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`
