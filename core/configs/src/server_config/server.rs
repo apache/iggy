@@ -61,7 +61,12 @@ pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_SHARD_RUNTIME_CAPACITY",
     "IGGY_SHARD_EVENT_INTERVAL",
     "IGGY_CI_BUILD",
+    "IGGY_HOME",
+    "IGGY_USERNAME",
+    "IGGY_PASSWORD",
 ];
+
+pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] = &["IGGY_CONNECTORS_", "IGGY_MCP_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
@@ -261,6 +266,7 @@ impl ServerConfig {
                 .chain(SERVER_PROCESS_ENV_VARS.iter().copied())
                 .collect(),
         )
+        .with_allowed_env_prefixes(SERVER_ALLOWED_ENV_PREFIXES)
     }
 
     /// All recognised env var names for [`ServerConfig`].
