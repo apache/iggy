@@ -686,7 +686,8 @@ impl IggyClient {
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///     segment_size: Per-topic segment size in bytes as `int | None`.
-    ///     enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+    ///     durability: Message completion policy, defaulting to replicated.
+    ///     consumer_offset_durability: Independent offset policy, defaulting to replicated.
     ///     messages_required_to_save: Message-count flush threshold as `int | None`.
     ///     size_of_messages_required_to_save: Byte flush threshold as `int | None`.
     ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
@@ -703,7 +704,7 @@ impl IggyClient {
     ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
     ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, enforce_fsync = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
+        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -723,7 +724,11 @@ impl IggyClient {
             &MaxTopicSize,
         >,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] segment_size: Option<u64>,
-        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enforce_fsync: Option<bool>,
+        #[gen_stub(override_type(type_repr = "Durability | None"))] durability: Option<
+            &Bound<'_, PyAny>,
+        >,
+        #[gen_stub(override_type(type_repr = "Durability | None"))]
+        consumer_offset_durability: Option<&Bound<'_, PyAny>>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         messages_required_to_save: Option<u32>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))]
@@ -746,7 +751,11 @@ impl IggyClient {
             message_expiry: (expiry != RustIggyExpiry::ServerDefault).then_some(expiry),
             max_topic_size: (max_size != RustMaxTopicSize::ServerDefault).then_some(max_size),
             segment_size: segment_size.map(IggyByteSize::from),
-            enforce_fsync,
+            durability: crate::durability::Durability::try_from(durability)?.0,
+            consumer_offset_durability: crate::durability::Durability::try_from(
+                consumer_offset_durability,
+            )?
+            .0,
             messages_required_to_save,
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),

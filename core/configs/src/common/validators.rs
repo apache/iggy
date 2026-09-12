@@ -18,8 +18,7 @@
 use super::COMPONENT;
 use super::server::{DataMaintenanceConfig, MessagesMaintenanceConfig, TelemetryConfig};
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig};
-use super::system::SegmentConfig;
-use super::system::{LoggingConfig, PartitionConfig};
+use super::system::LoggingConfig;
 use crate::ConfigurationError;
 use cpu_allocation::{CpuAllocation, allowed_cpus};
 use err_trail::ErrContext;
@@ -50,23 +49,6 @@ impl Validatable<ConfigurationError> for TelemetryConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for PartitionConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        // The flush thresholds this used to check are per-topic creation
-        // options now; their bounds are enforced at admission.
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for SegmentConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        // Segment size is a per-topic creation option now; its ceiling, floor
-        // and 512 B-multiple rule are enforced by
-        // `iggy_common::validate_topic_segment_size` at admission.
         Ok(())
     }
 }
@@ -112,13 +94,13 @@ impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
 impl Validatable<ConfigurationError> for LoggingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if self.level.is_empty() {
-            eprintln!("system.logging.level is supposed be configured");
+            eprintln!("logging.level is supposed be configured");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.retention.as_secs() < 1 {
             eprintln!(
-                "Configured system.logging.retention {} is less than minimum 1 second",
+                "Configured logging.retention {} is less than minimum 1 second",
                 self.retention
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -126,7 +108,7 @@ impl Validatable<ConfigurationError> for LoggingConfig {
 
         if self.rotation_check_interval.as_secs() < 1 {
             eprintln!(
-                "Configured system.logging.rotation_check_interval {} is less than minimum 1 second",
+                "Configured logging.rotation_check_interval {} is less than minimum 1 second",
                 self.rotation_check_interval
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -137,7 +119,7 @@ impl Validatable<ConfigurationError> for LoggingConfig {
             && self.max_file_size.as_bytes_u64() > self.max_total_size.as_bytes_u64()
         {
             eprintln!(
-                "Configured system.logging.max_total_size {} is less than system.logging.max_file_size {}",
+                "Configured logging.max_total_size {} is less than logging.max_file_size {}",
                 self.max_total_size, self.max_file_size
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -150,9 +132,7 @@ impl Validatable<ConfigurationError> for LoggingConfig {
 impl Validatable<ConfigurationError> for MemoryPoolConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if self.enabled && self.size == 0 {
-            eprintln!(
-                "Configured system.memory_pool.enabled is true and system.memory_pool.size is 0"
-            );
+            eprintln!("Configured memory_pool.enabled is true and memory_pool.size is 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
@@ -162,7 +142,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && self.size < MIN_POOL_SIZE {
             eprintln!(
-                "Configured system.memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
+                "Configured memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
                 self.size.as_bytes_u64(),
                 self.size.as_bytes_u64() / (1024 * 1024),
                 MIN_POOL_SIZE,
@@ -173,7 +153,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && !self.size.as_bytes_u64().is_multiple_of(DEFAULT_PAGE_SIZE) {
             eprintln!(
-                "Configured system.memory_pool.size {} B is not a multiple of default page size {} B",
+                "Configured memory_pool.size {} B is not a multiple of default page size {} B",
                 self.size.as_bytes_u64(),
                 DEFAULT_PAGE_SIZE
             );
@@ -182,7 +162,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && self.bucket_capacity < MIN_BUCKET_CAPACITY {
             eprintln!(
-                "Configured system.memory_pool.buffers {} is less than minimum {}",
+                "Configured memory_pool.buffers {} is less than minimum {}",
                 self.bucket_capacity, MIN_BUCKET_CAPACITY
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -190,7 +170,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && !self.bucket_capacity.is_power_of_two() {
             eprintln!(
-                "Configured system.memory_pool.buffers {} is not a power of 2",
+                "Configured memory_pool.buffers {} is not a power of 2",
                 self.bucket_capacity
             );
             return Err(ConfigurationError::InvalidConfigurationValue);

@@ -53,6 +53,10 @@
 //! Java each assert independently, so a new encoder has a fixture to match
 //! rather than a description to interpret.
 
+mod durability;
+
+pub use durability::Durability;
+
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -206,9 +210,9 @@ pub mod topic_option_keys {
     /// Bounded: a 512-byte multiple within
     /// [`super::MIN_TOPIC_SEGMENT_SIZE`]..=the server's segment ceiling.
     pub const SEGMENT_SIZE: &str = "segment_size";
-    /// Whether writes to this topic's partitions fsync: `Bool`, or the
-    /// strings `true` / `false`.
-    pub const ENFORCE_FSYNC: &str = "enforce_fsync";
+    /// Message completion policy: `String`, either `replicated` or `persisted`.
+    pub const DURABILITY: &str = "durability";
+    pub const CONSUMER_OFFSET_DURABILITY: &str = "consumer_offset_durability";
     /// Flush the journal once it holds this many messages: `Uint32`.
     /// Must be non-zero.
     pub const MESSAGES_REQUIRED_TO_SAVE: &str = "messages_required_to_save";
@@ -226,7 +230,7 @@ pub mod topic_option_keys {
 /// Values an absent topic option resolves to at admission.
 ///
 /// These are the knobs' single source of truth: they used to live in
-/// `config.toml` (`[system.topic]`, `[system.partition]`, `[system.segment]`),
+/// topic creation options,
 /// which meant every one of them had two homes and an operator could not tell
 /// which won. A topic carries whatever it was created with; anything the
 /// client did not send resolves to the constant here and is persisted as a
@@ -235,17 +239,15 @@ pub mod topic_option_keys {
 /// Each value matches what the shipped `config.toml` carried, so removing the
 /// keys changed no behavior for a topic created without options.
 pub const DEFAULT_PARTITIONS_COUNT: u32 = 1;
-/// `MaxTopicSize::Unlimited` (was `[system.topic] max_size = "unlimited"`).
+/// `MaxTopicSize::Unlimited` (was `[topic] max_size = "unlimited"`).
 pub const DEFAULT_MAX_TOPIC_SIZE: u64 = u64::MAX;
-/// `IggyExpiry::NeverExpire` (was `[system.topic] message_expiry = "none"`).
+/// `IggyExpiry::NeverExpire` (was `[topic] message_expiry = "none"`).
 pub const DEFAULT_MESSAGE_EXPIRY: u64 = u64::MAX;
-/// 1 GiB (was `[system.segment] size = "1 GiB"`).
+/// 1 GiB.
 pub const DEFAULT_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
-/// Was `[system.partition] enforce_fsync = false`.
-pub const DEFAULT_ENFORCE_FSYNC: bool = false;
-/// Was `[system.partition] messages_required_to_save = 1024`.
+/// Was `[partition] messages_required_to_save = 1024`.
 pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
-/// Opt-in, unlike the `[system.segment] preallocate = true` this replaced.
+/// Preallocation is opt-in.
 ///
 /// That default was never actually in force: the reservation ran through
 /// `compio::spawn_blocking`, which panics the shard because shard executors
@@ -256,7 +258,7 @@ pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
 /// sweep reserved 393 GB before this was flipped. A topic that wants the
 /// latency benefit asks for it with `preallocate_segments`.
 pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
-/// 1 MiB (was `[system.partition] size_of_messages_required_to_save`).
+/// 1 MiB (was `[partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
 
 /// Every runtime knob at its default, for a partition built with no resolved
@@ -265,7 +267,8 @@ impl Default for TopicRuntimeDefaults {
     fn default() -> Self {
         Self {
             segment_size: IggyByteSize::from(DEFAULT_SEGMENT_SIZE),
-            enforce_fsync: DEFAULT_ENFORCE_FSYNC,
+            durability: Durability::default(),
+            consumer_offset_durability: Durability::default(),
             messages_required_to_save: DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
             size_of_messages_required_to_save: IggyByteSize::from(
                 DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
@@ -452,7 +455,8 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
     topic_option_keys::MESSAGE_EXPIRY,
     topic_option_keys::MAX_TOPIC_SIZE,
     topic_option_keys::SEGMENT_SIZE,
-    topic_option_keys::ENFORCE_FSYNC,
+    topic_option_keys::DURABILITY,
+    topic_option_keys::CONSUMER_OFFSET_DURABILITY,
     topic_option_keys::MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::PREALLOCATE_SEGMENTS,
@@ -466,7 +470,7 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
 /// caller meant to or not. As options they are patched: a key the client did
 /// not send keeps its current value.
 ///
-/// The partition runtime knobs (`segment_size`, `enforce_fsync`, both flush
+/// The partition runtime knobs (`segment_size`, both durability policies, both flush
 /// thresholds, `preallocate_segments`) stay out, and not only because nothing
 /// re-pushes them to a live partition. They describe how a partition's storage
 /// was laid down: changing `segment_size` mid-segment leaves one segment sized
@@ -590,38 +594,47 @@ impl UserUpdateOptions {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopicRuntimeDefaults {
     pub segment_size: IggyByteSize,
-    pub enforce_fsync: bool,
+    pub durability: Durability,
+    pub consumer_offset_durability: Durability,
     pub messages_required_to_save: u32,
     pub size_of_messages_required_to_save: IggyByteSize,
     pub preallocate_segments: bool,
 }
 
 /// A topic's resolved runtime knobs, as carried from the metadata plane to
-/// each of its partitions. `None` means "keep the shard-wide configured
-/// value": topics created without an options block (simulator, unit tests)
-/// have no resolved values to carry.
+/// each of its partitions. An unset segment size uses `DEFAULT_SEGMENT_SIZE`;
+/// other unset fields keep their shard defaults. Topics without an options
+/// block (simulator, unit tests) have no resolved values to carry.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TopicRuntimeOptions {
     pub segment_size: Option<IggyByteSize>,
-    pub enforce_fsync: Option<bool>,
+    pub durability: Durability,
+    pub consumer_offset_durability: Durability,
     pub messages_required_to_save: Option<u32>,
     pub size_of_messages_required_to_save: Option<IggyByteSize>,
     pub preallocate_segments: Option<bool>,
 }
 
 impl TopicRuntimeOptions {
+    #[must_use]
+    pub fn effective_segment_size(self) -> IggyByteSize {
+        self.segment_size
+            .unwrap_or_else(|| IggyByteSize::from(DEFAULT_SEGMENT_SIZE))
+    }
+
     /// Derive the runtime knobs from a topic's persisted options map.
     ///
     /// Degrades per key, not per map. An entry this build cannot interpret
     /// leaves its own knob unset and every other knob intact, so one key a
-    /// newer node wrote cannot silently drop a topic's `enforce_fsync` or
+    /// newer node wrote cannot silently drop a topic's durability or
     /// reset its segment size along with it.
     #[must_use]
     pub fn from_resource_options(options: &ResourceOptions) -> Self {
         let parsed = TopicCreateOptions::from_resource_options(options);
         Self {
             segment_size: parsed.segment_size,
-            enforce_fsync: parsed.enforce_fsync,
+            durability: parsed.durability,
+            consumer_offset_durability: parsed.consumer_offset_durability,
             messages_required_to_save: parsed.messages_required_to_save,
             size_of_messages_required_to_save: parsed.size_of_messages_required_to_save,
             preallocate_segments: parsed.preallocate_segments,
@@ -691,9 +704,10 @@ impl TopicUpdateOptions {
 
 /// Typed view of the known topic option keys, parsed from a wire block.
 ///
-/// `None` means the key was absent, which always means "resolve from server
-/// defaults at admission". Values that parse to their type's `ServerDefault`
-/// sentinel are normalized to `None` for the same reason.
+/// Optional fields left as `None` resolve from server defaults at admission.
+/// The two durability fields instead default independently to `Replicated`
+/// and are sent explicitly. Provenance describes the wire request, not whether
+/// application code assigned a field after constructing its default value.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicCreateOptions {
     /// Partitions to allocate. NOT an option key: it fills the `CreateTopic`
@@ -706,14 +720,14 @@ pub struct TopicCreateOptions {
     pub compression_algorithm: Option<CompressionAlgorithm>,
     pub message_expiry: Option<IggyExpiry>,
     pub max_topic_size: Option<MaxTopicSize>,
-    /// Per-topic segment size; `None` resolves against `[system.segment]
-    /// size` at admission. `0` is normalized to `None`.
+    /// Per-topic segment size. `None` resolves to 1 GiB at admission.
+    /// `0` is normalized to `None`.
     pub segment_size: Option<IggyByteSize>,
-    /// Per-topic fsync enforcement; `None` resolves against
-    /// `[system.partition] enforce_fsync`.
-    pub enforce_fsync: Option<bool>,
-    /// Per-topic message-count flush threshold; `None` resolves against
-    /// `[system.partition] messages_required_to_save`. `0` is rejected.
+    /// Message completion policy, independent of consumer-offset durability.
+    pub durability: Durability,
+    pub consumer_offset_durability: Durability,
+    /// Per-topic message-count flush threshold. `None` resolves to 1024.
+    /// `0` is rejected.
     pub messages_required_to_save: Option<u32>,
     /// Per-topic byte flush threshold; `None` resolves against
     /// [`DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE`].
@@ -730,6 +744,22 @@ pub struct TopicCreateOptions {
 }
 
 impl TopicCreateOptions {
+    pub fn to_explicit_wire(
+        &self,
+        is_supplied: impl Fn(&str) -> bool,
+    ) -> Result<WireOptions, IggyError> {
+        let mut options = self.to_option_map()?;
+        for key in [
+            topic_option_keys::DURABILITY,
+            topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+        ] {
+            if !is_supplied(key) {
+                options.remove(&HeaderKey::from_str(key).expect("catalog key is valid"));
+            }
+        }
+        crate::wire_conversions::resource_options_to_wire(&options, OptionsProvenance::All)
+    }
+
     /// Parse a wire options block against the topic catalog.
     ///
     /// # Errors
@@ -800,8 +830,11 @@ impl TopicCreateOptions {
                     let size = parse_byte_size(entry, key)?;
                     parsed.segment_size = (size != 0).then_some(IggyByteSize::from(size));
                 }
-                topic_option_keys::ENFORCE_FSYNC => {
-                    parsed.enforce_fsync = Some(parse_bool(entry, key)?);
+                topic_option_keys::DURABILITY => {
+                    parsed.durability = Self::durability_value(entry, key)?;
+                }
+                topic_option_keys::CONSUMER_OFFSET_DURABILITY => {
+                    parsed.consumer_offset_durability = Self::durability_value(entry, key)?;
                 }
                 topic_option_keys::MESSAGES_REQUIRED_TO_SAVE => {
                     let messages = parse_u32(entry, key)?;
@@ -843,7 +876,8 @@ impl TopicCreateOptions {
             message_expiry: self.message_expiry.or(defaults.message_expiry),
             max_topic_size: self.max_topic_size.or(defaults.max_topic_size),
             segment_size: self.segment_size.or(defaults.segment_size),
-            enforce_fsync: self.enforce_fsync.or(defaults.enforce_fsync),
+            durability: self.durability,
+            consumer_offset_durability: self.consumer_offset_durability,
             messages_required_to_save: self
                 .messages_required_to_save
                 .or(defaults.messages_required_to_save),
@@ -909,11 +943,25 @@ impl TopicCreateOptions {
                 OptionValue::explicit(HeaderValue::from(segment_size.as_bytes_u64())),
             );
         }
-        if let Some(enforce_fsync) = self.enforce_fsync {
+        for (key, policy) in [
+            (topic_option_keys::DURABILITY, self.durability),
+            (
+                topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+                self.consumer_offset_durability,
+            ),
+        ] {
+            let policy = self.raw.get(key).map_or(Ok(policy), |raw| {
+                let raw = raw
+                    .parse::<Durability>()
+                    .map_err(|_| IggyError::InvalidOptionValue(key.to_owned()))?;
+                if policy.is_persisted() && raw != policy {
+                    return Err(IggyError::InvalidOptionValue(key.to_owned()));
+                }
+                Ok(raw)
+            })?;
             options.insert(
-                HeaderKey::from_str(topic_option_keys::ENFORCE_FSYNC)
-                    .expect("catalog key is a valid header key"),
-                OptionValue::explicit(HeaderValue::from(enforce_fsync)),
+                HeaderKey::from_str(key).expect("catalog key is valid"),
+                OptionValue::explicit(HeaderValue::from_str(policy.as_ref())?),
             );
         }
         if let Some(messages_required_to_save) = self.messages_required_to_save {
@@ -949,8 +997,8 @@ impl TopicCreateOptions {
     /// The rest ride as strings and are parsed server-side by the same
     /// `FromStr` rules a config file value goes through, so a typed field
     /// survives the round trip rather than being silently dropped.
-    #[must_use]
-    pub fn to_string_options(&self) -> BTreeMap<String, String> {
+    pub fn to_string_options(&self) -> Result<BTreeMap<String, String>, IggyError> {
+        let resolved = self.to_option_map()?;
         // Typed fields are inserted over the raw entries, matching the
         // collision rule `to_wire` applies.
         let mut options = self.raw.clone();
@@ -960,12 +1008,20 @@ impl TopicCreateOptions {
                 segment_size.as_bytes_u64().to_string(),
             );
         }
-        if let Some(enforce_fsync) = self.enforce_fsync {
-            options.insert(
-                topic_option_keys::ENFORCE_FSYNC.to_owned(),
-                enforce_fsync.to_string(),
-            );
-        }
+        options.insert(
+            topic_option_keys::DURABILITY.to_owned(),
+            resolved[&HeaderKey::from_str(topic_option_keys::DURABILITY)
+                .expect("catalog key is valid")]
+                .value
+                .to_string_value(),
+        );
+        options.insert(
+            topic_option_keys::CONSUMER_OFFSET_DURABILITY.to_owned(),
+            resolved[&HeaderKey::from_str(topic_option_keys::CONSUMER_OFFSET_DURABILITY)
+                .expect("catalog key is valid")]
+                .value
+                .to_string_value(),
+        );
         if let Some(messages_required_to_save) = self.messages_required_to_save {
             options.insert(
                 topic_option_keys::MESSAGES_REQUIRED_TO_SAVE.to_owned(),
@@ -984,7 +1040,7 @@ impl TopicCreateOptions {
                 preallocate_segments.to_string(),
             );
         }
-        options
+        Ok(options)
     }
 
     /// Encode the resolved values for every key the client did NOT send into
@@ -1000,6 +1056,7 @@ impl TopicCreateOptions {
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
         runtime_defaults: TopicRuntimeDefaults,
+        supplied: &WireOptions,
     ) -> Result<WireOptions, IggyError> {
         let mut derived = ResourceOptions::new();
         if self.compression_algorithm.is_none() {
@@ -1035,12 +1092,22 @@ impl TopicCreateOptions {
                 )),
             );
         }
-        if self.enforce_fsync.is_none() {
-            derived.insert(
-                HeaderKey::from_str(topic_option_keys::ENFORCE_FSYNC)
-                    .expect("catalog key is a valid header key"),
-                OptionValue::derived(HeaderValue::from(runtime_defaults.enforce_fsync)),
-            );
+        for (key, policy) in [
+            (topic_option_keys::DURABILITY, runtime_defaults.durability),
+            (
+                topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+                runtime_defaults.consumer_offset_durability,
+            ),
+        ] {
+            if !supplied
+                .into_iter()
+                .any(|entry| entry.key == key.as_bytes())
+            {
+                derived.insert(
+                    HeaderKey::from_str(key).expect("catalog key is valid"),
+                    OptionValue::derived(HeaderValue::from_str(policy.as_ref())?),
+                );
+            }
         }
         if self.messages_required_to_save.is_none() {
             derived.insert(
@@ -1099,6 +1166,18 @@ impl TopicCreateOptions {
             let _ = parsed.absorb_strict(&entry, &key);
         }
         parsed
+    }
+    fn durability_value(
+        entry: &WireUserHeaderEntry<'_>,
+        key: &str,
+    ) -> Result<Durability, IggyError> {
+        if entry.value_kind.0 != HeaderKind::String.as_code() {
+            return Err(IggyError::InvalidOptionValue(key.to_owned()));
+        }
+        std::str::from_utf8(entry.value)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| IggyError::InvalidOptionValue(key.to_owned()))
     }
 }
 
@@ -1207,11 +1286,12 @@ mod tests {
             message_expiry: Some(IggyExpiry::from(5_000_000u64)),
             max_topic_size: Some(MaxTopicSize::from(2_000_000_000u64)),
             segment_size: Some(IggyByteSize::from(134_217_728u64)),
-            enforce_fsync: Some(true),
+            durability: Durability::Persisted,
             messages_required_to_save: Some(500),
             size_of_messages_required_to_save: Some(IggyByteSize::from(2_097_152u64)),
             preallocate_segments: Some(false),
             partitions_count: None,
+            consumer_offset_durability: Durability::Replicated,
             raw: BTreeMap::new(),
         };
         let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
@@ -1227,7 +1307,7 @@ mod tests {
             partitions_count: Some(7),
             ..TopicCreateOptions::default()
         };
-        assert!(options.to_wire().unwrap().is_empty());
+        assert_eq!(options.to_wire().unwrap().into_iter().count(), 2);
         // ...and the key is rejected if a client hand-rolls it into the block.
         let raw = TopicCreateOptions {
             raw: BTreeMap::from([("partitions_count".to_string(), "7".to_string())]),
@@ -1325,7 +1405,7 @@ mod tests {
             max_topic_size: Some(MaxTopicSize::from(0u64)),
             segment_size: Some(IggyByteSize::from(0u64)),
             size_of_messages_required_to_save: Some(IggyByteSize::from(0u64)),
-            enforce_fsync: Some(true),
+            durability: Durability::Persisted,
             ..TopicCreateOptions::default()
         };
         let parsed = TopicCreateOptions::parse(&sent.to_wire().unwrap()).unwrap();
@@ -1345,16 +1425,14 @@ mod tests {
             );
         }
         // A non-sentinel key alongside them still rides through untouched.
-        assert!(
-            stored.contains_key(&HeaderKey::from_str(topic_option_keys::ENFORCE_FSYNC).unwrap())
-        );
+        assert!(stored.contains_key(&HeaderKey::from_str(topic_option_keys::DURABILITY).unwrap()));
     }
 
     #[test]
     fn runtime_options_derive_from_the_persisted_map() {
         let options = TopicCreateOptions {
             segment_size: Some(IggyByteSize::from(2_097_152u64)),
-            enforce_fsync: Some(true),
+            durability: Durability::Persisted,
             messages_required_to_save: Some(9),
             ..TopicCreateOptions::default()
         };
@@ -1365,20 +1443,103 @@ mod tests {
                 .unwrap();
         let runtime = TopicRuntimeOptions::from_resource_options(&persisted);
         assert_eq!(runtime.segment_size, Some(IggyByteSize::from(2_097_152u64)));
-        assert_eq!(runtime.enforce_fsync, Some(true));
+        assert_eq!(runtime.durability, Durability::Persisted);
         assert_eq!(runtime.messages_required_to_save, Some(9));
         assert_eq!(runtime.size_of_messages_required_to_save, None);
     }
 
     #[test]
-    fn typed_field_wins_over_raw_entry_for_the_same_key() {
+    fn raw_durability_can_strengthen_the_replicated_default() {
         let options = TopicCreateOptions {
-            enforce_fsync: Some(true),
-            raw: BTreeMap::from([("enforce_fsync".to_string(), "false".to_string())]),
+            raw: BTreeMap::from([("durability".to_owned(), "persisted".to_owned())]),
             ..TopicCreateOptions::default()
         };
         let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
-        assert_eq!(parsed.enforce_fsync, Some(true));
+        assert_eq!(parsed.durability, Durability::Persisted);
+        assert_eq!(parsed.consumer_offset_durability, Durability::Replicated);
+        assert_eq!(
+            options.to_string_options().unwrap()["durability"],
+            "persisted"
+        );
+    }
+
+    #[test]
+    fn conflicting_durability_is_rejected_by_both_encoders() {
+        let options = TopicCreateOptions {
+            durability: Durability::Persisted,
+            raw: BTreeMap::from([("durability".to_string(), "replicated".to_string())]),
+            ..TopicCreateOptions::default()
+        };
+        assert!(options.to_wire().is_err());
+        assert!(options.to_string_options().is_err());
+    }
+
+    #[test]
+    fn omitted_durability_is_independent_and_remains_derived() {
+        for (key, other) in [
+            (
+                topic_option_keys::DURABILITY,
+                topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+            ),
+            (
+                topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+                topic_option_keys::DURABILITY,
+            ),
+        ] {
+            let supplied = crate::wire_conversions::resource_options_to_wire(
+                &ResourceOptions::from([(
+                    HeaderKey::from_str(key).unwrap(),
+                    OptionValue::explicit(HeaderValue::from_str("persisted").unwrap()),
+                )]),
+                OptionsProvenance::All,
+            )
+            .unwrap();
+            let parsed = TopicCreateOptions::parse(&supplied).unwrap();
+            let explicit = parsed
+                .to_explicit_wire(|key| {
+                    supplied
+                        .into_iter()
+                        .any(|entry| entry.key == key.as_bytes())
+                })
+                .unwrap();
+            assert_eq!(explicit.into_iter().count(), 1);
+            let derived = parsed
+                .derived_block(
+                    CompressionAlgorithm::default(),
+                    IggyExpiry::default(),
+                    MaxTopicSize::default(),
+                    TopicRuntimeDefaults::default(),
+                    &supplied,
+                )
+                .unwrap();
+            let entry = derived
+                .into_iter()
+                .find(|entry| entry.key == other.as_bytes())
+                .unwrap();
+            assert_eq!(entry.value, b"replicated");
+        }
+    }
+
+    #[test]
+    fn both_durability_defaults_are_emitted_and_legacy_key_is_refused() {
+        let options = TopicCreateOptions::default().to_option_map().unwrap();
+        for key in [
+            topic_option_keys::DURABILITY,
+            topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+        ] {
+            let value = &options[&HeaderKey::from_str(key).unwrap()];
+            assert_eq!(value.value.kind(), HeaderKind::String);
+            assert_eq!(value.value.as_bytes(), b"replicated");
+            assert!(value.explicit);
+        }
+        let legacy = TopicCreateOptions {
+            raw: BTreeMap::from([("enforce_fsync".to_string(), "true".to_string())]),
+            ..TopicCreateOptions::default()
+        };
+        assert!(matches!(
+            TopicCreateOptions::parse(&legacy.to_wire().unwrap()),
+            Err(IggyError::UnsupportedOptionKey(_))
+        ));
     }
 
     #[test]
@@ -1401,7 +1562,7 @@ mod tests {
         let options = TopicCreateOptions {
             raw: BTreeMap::from([
                 ("segment_size".to_string(), "128MiB".to_string()),
-                ("enforce_fsync".to_string(), "true".to_string()),
+                ("durability".to_string(), "replicated".to_string()),
                 (
                     "size_of_messages_required_to_save".to_string(),
                     "4KiB".to_string(),
@@ -1414,7 +1575,7 @@ mod tests {
             parsed.segment_size,
             Some(IggyByteSize::from(134_217_728u64))
         );
-        assert_eq!(parsed.enforce_fsync, Some(true));
+        assert_eq!(parsed.durability, Durability::Replicated);
         assert_eq!(
             parsed.size_of_messages_required_to_save,
             Some(IggyByteSize::from(4096u64))

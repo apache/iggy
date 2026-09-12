@@ -53,7 +53,7 @@ public sealed class ResourceOptionsConverterTests
                               "partitions_count": 1,
                               "partitions": [],
                               "options": {
-                                "enforce_fsync": { "value": "true", "explicit": true },
+                                "preallocate_segments": { "value": "true", "explicit": true },
                                 "segment_size": { "value": "134217728", "explicit": true },
                                 "messages_required_to_save": { "value": "1024", "explicit": false },
                                 "preallocate_segments": { "value": "false", "explicit": false }
@@ -70,7 +70,7 @@ public sealed class ResourceOptionsConverterTests
         Assert.NotNull(topic.DerivedOptions);
 
         Assert.Equal(2, topic.Options.Count);
-        Assert.Equal("true", topic.Options[HeaderKey.FromString("enforce_fsync")].ToString());
+        Assert.Equal("true", topic.Options[HeaderKey.FromString("preallocate_segments")].ToString());
         Assert.Equal("134217728", topic.Options[HeaderKey.FromString("segment_size")].ToString());
 
         Assert.Equal(2, topic.DerivedOptions.Count);
@@ -161,7 +161,7 @@ public sealed class ResourceOptionsConverterTests
                                 "max_topic_size": 0,
                                 "messages_count": 0,
                                 "partitions_count": 1,
-                                "options": { "enforce_fsync": { "value": "true", "explicit": true } }
+                                "options": { "preallocate_segments": { "value": "true", "explicit": true } }
                               },
                               {
                                 "id": 2,
@@ -171,7 +171,7 @@ public sealed class ResourceOptionsConverterTests
                                 "max_topic_size": 0,
                                 "messages_count": 0,
                                 "partitions_count": 1,
-                                "options": { "enforce_fsync": { "value": "false", "explicit": false } }
+                                "options": { "preallocate_segments": { "value": "false", "explicit": false } }
                               }
                             ]
                             """;

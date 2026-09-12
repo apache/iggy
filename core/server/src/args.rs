@@ -53,12 +53,12 @@ ENVIRONMENT VARIABLES:
     named by IGGY_ENV_PATH.
 
     Common examples:
-        IGGY_SYSTEM_PATH=/data/iggy                    # Data directory
+        IGGY_PATH=/data/iggy                    # Data directory
         IGGY_TCP_ADDRESS=127.0.0.1:8090                # TCP listener address
         IGGY_HTTP_ADDRESS=0.0.0.0:3000                 # HTTP listener address
         IGGY_NODE_ADVERTISED_ADDRESS=localhost         # Address clients dial, required
                                                        # when a listener binds a wildcard
-        IGGY_SYSTEM_LOGGING_LEVEL=debug                # Log level
+        IGGY_LOGGING_LEVEL=debug                # Log level
         IGGY_ROOT_USERNAME=iggy                        # Root user, set with the password
         IGGY_ROOT_PASSWORD=secret                      # Root password, set with the username
 
@@ -90,7 +90,7 @@ pub struct Args {
     /// Remove the system path before starting (WARNING: THIS WILL DELETE ALL DATA!)
     ///
     /// Deletes the configured system data directory ('local_data' by default,
-    /// see IGGY_SYSTEM_PATH) before the server boots, so it starts on empty
+    /// see IGGY_PATH) before the server boots, so it starts on empty
     /// state. Intended for clean development setups and testing.
     ///
     /// In cluster mode this wipes THIS replica only; it rejoins and refills by

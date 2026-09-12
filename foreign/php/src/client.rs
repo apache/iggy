@@ -27,6 +27,7 @@ use iggy::prelude::{
 use tokio::sync::Mutex;
 
 use crate::consumer::{AutoCommit, IggyConsumer};
+use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
@@ -136,7 +137,8 @@ impl IggyClient {
         message_expiry_micros: Option<u64>,
         max_topic_size: Option<u64>,
         segment_size: Option<u64>,
-        enforce_fsync: Option<bool>,
+        durability: Option<PhpDurability>,
+        consumer_offset_durability: Option<PhpDurability>,
         messages_required_to_save: Option<u32>,
         size_of_messages_required_to_save: Option<u64>,
         preallocate_segments: Option<bool>,
@@ -161,7 +163,8 @@ impl IggyClient {
             message_expiry: (expiry != IggyExpiry::ServerDefault).then_some(expiry),
             max_topic_size: (max_size != MaxTopicSize::ServerDefault).then_some(max_size),
             segment_size: segment_size.map(IggyByteSize::from),
-            enforce_fsync,
+            durability: durability.unwrap_or_default().into(),
+            consumer_offset_durability: consumer_offset_durability.unwrap_or_default().into(),
             messages_required_to_save,
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),

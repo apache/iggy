@@ -343,7 +343,7 @@ async fn wait_for_stream(harness: &TestHarness, stream: &str) -> IggyClient {
 // bulk creation is fast and the WAL is fully committed with no uncommitted suffix to
 // reconcile, exercising checkpoint and snapshot-fold recovery in isolation without an
 // election in the mix.
-#[iggy_harness(cluster_nodes = 1, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
 async fn given_checkpointed_metadata_when_solo_replica_restarts_should_recover_from_snapshot_and_wal(
     harness: &mut TestHarness,
 ) {
