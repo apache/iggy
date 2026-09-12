@@ -105,26 +105,32 @@ impl ProtoStreamEncoder {
         config: ProtoEncoderConfig,
         reload_schema: bool,
     ) -> Result<(), Error> {
-        self.config = config;
-        if reload_schema
-            && (self.config.schema_path.is_some() || self.config.descriptor_set.is_some())
-        {
-            self.load_schema()
-        } else {
-            Ok(())
+        let old_config = std::mem::replace(&mut self.config, config);
+        if reload_schema && let Err(error) = self.load_schema() {
+            self.config = old_config;
+            return Err(error);
         }
+        Ok(())
     }
 
     pub fn load_schema(&mut self) -> Result<(), Error> {
         let schema_path = self.config.schema_path.clone();
         let descriptor_set = self.config.descriptor_set.clone();
 
-        if let Some(path) = schema_path {
-            self.compile_schema_internal(&path)?;
+        let old_message_descriptor = self.message_descriptor.take();
+        let old_file_descriptor_set = self.file_descriptor_set.take();
+        let result = if let Some(path) = schema_path {
+            self.compile_schema_internal(&path)
         } else if let Some(descriptor_bytes) = descriptor_set {
-            self.load_descriptor_set_internal(&descriptor_bytes)?;
+            self.load_descriptor_set_internal(&descriptor_bytes)
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.message_descriptor = old_message_descriptor;
+            self.file_descriptor_set = old_file_descriptor_set;
         }
-        Ok(())
+        result
     }
 
     fn compile_schema_internal(&mut self, schema_path: &PathBuf) -> Result<(), Error> {
@@ -231,14 +237,15 @@ impl ProtoStreamEncoder {
         package: &str,
     ) -> Option<prost_types::DescriptorProto> {
         let parent_name = parent_message.name.as_deref().unwrap_or("");
+        let parent_prefix = if package.is_empty() {
+            parent_name.to_string()
+        } else {
+            format!("{package}.{parent_name}")
+        };
 
         for nested_message in &parent_message.nested_type {
             let nested_name = nested_message.name.as_deref().unwrap_or("");
-            let full_name = if package.is_empty() {
-                format!("{parent_name}.{nested_name}")
-            } else {
-                format!("{package}.{parent_name}.{nested_name}")
-            };
+            let full_name = format!("{parent_prefix}.{nested_name}");
 
             if full_name == target_type {
                 info!(
@@ -248,7 +255,9 @@ impl ProtoStreamEncoder {
                 return Some(nested_message.clone());
             }
 
-            if let Some(deeper) = self.find_nested_message(nested_message, target_type, package) {
+            if let Some(deeper) =
+                self.find_nested_message(nested_message, target_type, &parent_prefix)
+            {
                 return Some(deeper);
             }
         }
@@ -432,30 +441,58 @@ impl ProtoStreamEncoder {
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Int32 | Type::Sint32 | Type::Sfixed32 => {
+            Type::Int32 => {
                 let value = self.extract_i32_from_json(json_value)? as i64 as u64;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Int64 | Type::Sint64 | Type::Sfixed64 => {
+            Type::Int64 => {
                 let value = self.extract_i64_from_json(json_value)? as u64;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Uint32 | Type::Fixed32 => {
-                let value = self.extract_u32_from_json(json_value)? as u64;
+            Type::Uint32 => {
+                let value = Self::extract_u32_from_json(json_value)? as u64;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Uint64 | Type::Fixed64 => {
-                let value = self.extract_u64_from_json(json_value)?;
+            Type::Uint64 => {
+                let value = Self::extract_u64_from_json(json_value)?;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
+            Type::Sint32 => {
+                let value = self.extract_i32_from_json(json_value)?;
+                let zigzag = ((value << 1) ^ (value >> 31)) as u32;
+                let mut bytes = Vec::new();
+                self.encode_varint(&mut bytes, u64::from(zigzag));
+                Ok(bytes)
+            }
+            Type::Sint64 => {
+                let value = self.extract_i64_from_json(json_value)?;
+                let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+                let mut bytes = Vec::new();
+                self.encode_varint(&mut bytes, zigzag);
+                Ok(bytes)
+            }
+            Type::Fixed32 => Ok(Self::extract_u32_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Fixed64 => Ok(Self::extract_u64_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Sfixed32 => Ok(self
+                .extract_i32_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Sfixed64 => Ok(self
+                .extract_i64_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
             Type::String => {
                 let text = match json_value {
                     simd_json::OwnedValue::String(s) => s.as_str(),
@@ -468,33 +505,11 @@ impl ProtoStreamEncoder {
                 result.extend_from_slice(text_bytes);
                 Ok(result)
             }
-            Type::Bytes => {
-                let bytes = match json_value {
-                    simd_json::OwnedValue::String(s) => general_purpose::STANDARD
-                        .decode(s.as_str())
-                        .map_err(|_| Error::InvalidJsonPayload)?,
-                    _ => return Err(Error::InvalidJsonPayload),
-                };
+            Type::Bytes | Type::Message => {
+                let bytes = Self::extract_bytes_from_json(json_value)?;
                 let mut result = Vec::new();
-
                 self.encode_varint(&mut result, bytes.len() as u64);
                 result.extend_from_slice(&bytes);
-                Ok(result)
-            }
-            Type::Message => {
-                let message_bytes = match json_value {
-                    simd_json::OwnedValue::String(s) => general_purpose::STANDARD
-                        .decode(s.as_str())
-                        .map_err(|_| Error::InvalidJsonPayload)?,
-                    simd_json::OwnedValue::Object(_) => {
-                        return Err(Error::InvalidJsonPayload);
-                    }
-                    _ => return Err(Error::InvalidJsonPayload),
-                };
-                let mut result = Vec::new();
-
-                self.encode_varint(&mut result, message_bytes.len() as u64);
-                result.extend_from_slice(&message_bytes);
                 Ok(result)
             }
             _ => {
@@ -554,7 +569,18 @@ impl ProtoStreamEncoder {
         }
     }
 
-    fn extract_u32_from_json(&self, json_value: &simd_json::OwnedValue) -> Result<u32, Error> {
+    pub(crate) fn extract_bytes_from_json(
+        json_value: &simd_json::OwnedValue,
+    ) -> Result<Vec<u8>, Error> {
+        let simd_json::OwnedValue::String(value) = json_value else {
+            return Err(Error::InvalidJsonPayload);
+        };
+        general_purpose::STANDARD
+            .decode(value)
+            .map_err(|_| Error::InvalidJsonPayload)
+    }
+
+    pub(crate) fn extract_u32_from_json(json_value: &simd_json::OwnedValue) -> Result<u32, Error> {
         match json_value {
             simd_json::OwnedValue::String(s) => {
                 s.parse::<u32>().map_err(|_| Error::InvalidJsonPayload)
@@ -566,7 +592,7 @@ impl ProtoStreamEncoder {
         }
     }
 
-    fn extract_u64_from_json(&self, json_value: &simd_json::OwnedValue) -> Result<u64, Error> {
+    pub(crate) fn extract_u64_from_json(json_value: &simd_json::OwnedValue) -> Result<u64, Error> {
         match json_value {
             simd_json::OwnedValue::String(s) => {
                 s.parse::<u64>().map_err(|_| Error::InvalidJsonPayload)
@@ -588,7 +614,7 @@ impl ProtoStreamEncoder {
                         "{}/google.protobuf.StringValue",
                         self.config.format_options.type_url_prefix
                     ),
-                    json_string.into_bytes(),
+                    json_string.encode_to_vec(),
                 )
             }
             Payload::Text(text) => {
@@ -604,7 +630,7 @@ impl ProtoStreamEncoder {
                         "{}/google.protobuf.StringValue",
                         self.config.format_options.type_url_prefix
                     ),
-                    json_string.into_bytes(),
+                    json_string.encode_to_vec(),
                 )
             }
             Payload::Raw(data) => (
@@ -612,28 +638,28 @@ impl ProtoStreamEncoder {
                     "{}/google.protobuf.BytesValue",
                     self.config.format_options.type_url_prefix
                 ),
-                data,
+                data.encode_to_vec(),
             ),
             Payload::Proto(text) => (
                 format!(
                     "{}/google.protobuf.StringValue",
                     self.config.format_options.type_url_prefix
                 ),
-                text.into_bytes(),
+                text.encode_to_vec(),
             ),
             Payload::FlatBuffer(data) => (
                 format!(
                     "{}/google.protobuf.BytesValue",
                     self.config.format_options.type_url_prefix
                 ),
-                data,
+                data.encode_to_vec(),
             ),
             Payload::Avro(data) => (
                 format!(
                     "{}/google.protobuf.BytesValue",
                     self.config.format_options.type_url_prefix
                 ),
-                data,
+                data.encode_to_vec(),
             ),
         };
 
@@ -751,7 +777,19 @@ mod tests {
 
         let any = decoded_any.unwrap();
         assert!(any.type_url.contains("google.protobuf.StringValue"));
-        assert!(!any.value.is_empty());
+        let mut json_bytes = any
+            .to_msg::<String>()
+            .expect("unpack StringValue")
+            .into_bytes();
+        let decoded_json = simd_json::to_owned_value(&mut json_bytes).expect("decode JSON");
+        assert_eq!(
+            decoded_json,
+            simd_json::json!({
+                "user_id": 123,
+                "name": "John Doe",
+                "email": "john@example.com"
+            })
+        );
     }
 
     #[test]
@@ -765,7 +803,7 @@ mod tests {
         let encoded_bytes = result.unwrap();
 
         let decoded_any = Any::decode(encoded_bytes.as_slice()).unwrap();
-        let json_string = String::from_utf8(decoded_any.value).unwrap();
+        let json_string = decoded_any.to_msg::<String>().expect("unpack StringValue");
         let mut json_bytes = json_string.into_bytes();
         let json_value = simd_json::to_owned_value(&mut json_bytes).unwrap();
 
@@ -790,7 +828,10 @@ mod tests {
 
         let decoded_any = Any::decode(encoded_bytes.as_slice()).unwrap();
         assert!(decoded_any.type_url.contains("google.protobuf.BytesValue"));
-        assert_eq!(decoded_any.value, raw_data);
+        assert_eq!(
+            decoded_any.to_msg::<Vec<u8>>().expect("unpack BytesValue"),
+            raw_data
+        );
     }
 
     #[test]
@@ -805,7 +846,29 @@ mod tests {
 
         let decoded_any = Any::decode(encoded_bytes.as_slice()).unwrap();
         assert!(decoded_any.type_url.contains("google.protobuf.StringValue"));
-        assert_eq!(decoded_any.value, proto_text.as_bytes());
+        assert_eq!(
+            decoded_any.to_msg::<String>().expect("unpack StringValue"),
+            proto_text
+        );
+    }
+
+    #[test]
+    fn given_binary_payload_when_wrapped_should_unpack_bytes_value() {
+        let encoder = ProtoStreamEncoder::default();
+        for data in [Vec::new(), vec![0, 255, 128, 10]] {
+            for payload in [
+                Payload::Raw(data.clone()),
+                Payload::FlatBuffer(data.clone()),
+                Payload::Avro(data.clone()),
+            ] {
+                let encoded = encoder.encode(payload).expect("encode binary payload");
+                let wrapped = Any::decode(encoded.as_slice()).expect("decode Any");
+                assert_eq!(
+                    wrapped.to_msg::<Vec<u8>>().expect("unpack BytesValue"),
+                    data
+                );
+            }
+        }
     }
 
     #[test]

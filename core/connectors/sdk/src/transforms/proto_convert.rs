@@ -19,11 +19,13 @@ use base64::Engine;
 use iggy_common::IggyTimestamp;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use simd_json::prelude::ValueAsScalar;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{error, info};
 
 use super::{Transform, TransformType};
+use crate::encoders::proto::ProtoStreamEncoder;
 use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,12 +111,20 @@ impl ProtoConvert {
         let schema_path = self.config.schema_path.clone();
         let descriptor_set = self.config.descriptor_set.clone();
 
-        if let Some(path) = schema_path {
-            self.compile_schema_internal(&path)?;
+        let old_message_descriptor = self.message_descriptor.take();
+        let old_file_descriptor_set = self.file_descriptor_set.take();
+        let result = if let Some(path) = schema_path {
+            self.compile_schema_internal(&path)
         } else if let Some(descriptor_bytes) = descriptor_set {
-            self.load_descriptor_set_internal(&descriptor_bytes)?;
+            self.load_descriptor_set_internal(&descriptor_bytes)
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.message_descriptor = old_message_descriptor;
+            self.file_descriptor_set = old_file_descriptor_set;
         }
-        Ok(())
+        result
     }
 
     fn compile_schema_internal(&mut self, schema_path: &PathBuf) -> Result<(), Error> {
@@ -219,6 +229,11 @@ impl ProtoConvert {
         package: &str,
     ) -> Option<prost_types::DescriptorProto> {
         let parent_name = parent_message.name.as_deref().unwrap_or("");
+        let parent_prefix = if package.is_empty() {
+            parent_name.to_string()
+        } else {
+            format!("{package}.{parent_name}")
+        };
 
         let package_prefix = if package.is_empty() {
             String::new()
@@ -238,7 +253,9 @@ impl ProtoConvert {
                 return Some(nested_message.clone());
             }
 
-            if let Some(deeper) = self.find_nested_message(nested_message, target_type, package) {
+            if let Some(deeper) =
+                self.find_nested_message(nested_message, target_type, &parent_prefix)
+            {
                 return Some(deeper);
             }
         }
@@ -281,19 +298,21 @@ impl ProtoConvert {
                 let field_name = field_desc.name.as_deref().unwrap_or("");
 
                 if let Some(json_field_value) = json_map.get(field_name) {
+                    let field_data = match self
+                        .encode_field_value_for_conversion(json_field_value, field_desc)
+                    {
+                        Ok(field_data) => field_data,
+                        Err(error) => {
+                            error!("Failed to encode field {}: {}", field_name, error);
+                            continue;
+                        }
+                    };
                     let field_number = field_desc.number() as u64;
                     let wire_type = self.get_wire_type_for_conversion_field(field_desc);
                     let tag = (field_number << 3) | (wire_type as u64);
 
                     self.encode_varint_for_conversion(&mut buffer, tag);
-
-                    match self.encode_field_value_for_conversion(json_field_value, field_desc) {
-                        Ok(field_data) => buffer.extend_from_slice(&field_data),
-                        Err(e) => {
-                            error!("Failed to encode field {}: {}", field_name, e);
-                            continue;
-                        }
-                    }
+                    buffer.extend_from_slice(&field_data);
                 }
             }
 
@@ -343,18 +362,75 @@ impl ProtoConvert {
                     Err(Error::InvalidJsonPayload)
                 }
             }
-            Type::Int32 | Type::Sint32 => {
+            Type::Float => Ok(
+                (json_value.cast_f64().ok_or(Error::InvalidJsonPayload)? as f32)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            Type::Double => Ok(json_value
+                .cast_f64()
+                .ok_or(Error::InvalidJsonPayload)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Bytes | Type::Message => {
+                let bytes = ProtoStreamEncoder::extract_bytes_from_json(json_value)?;
+                let mut result = Vec::new();
+                self.encode_varint_for_conversion(&mut result, bytes.len() as u64);
+                result.extend_from_slice(&bytes);
+                Ok(result)
+            }
+            Type::Int32 => {
                 let value = self.extract_i32_from_json_for_conversion(json_value)?;
                 let mut result = Vec::new();
                 self.encode_varint_for_conversion(&mut result, value as u64);
                 Ok(result)
             }
-            Type::Int64 | Type::Sint64 => {
+            Type::Int64 => {
                 let value = self.extract_i64_from_json_for_conversion(json_value)?;
                 let mut result = Vec::new();
                 self.encode_varint_for_conversion(&mut result, value as u64);
                 Ok(result)
             }
+            Type::Sint32 => {
+                let value = self.extract_i32_from_json_for_conversion(json_value)?;
+                let zigzag = ((value << 1) ^ (value >> 31)) as u32;
+                let mut result = Vec::new();
+                self.encode_varint_for_conversion(&mut result, u64::from(zigzag));
+                Ok(result)
+            }
+            Type::Sint64 => {
+                let value = self.extract_i64_from_json_for_conversion(json_value)?;
+                let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+                let mut result = Vec::new();
+                self.encode_varint_for_conversion(&mut result, zigzag);
+                Ok(result)
+            }
+            Type::Uint32 => {
+                let value = ProtoStreamEncoder::extract_u32_from_json(json_value)?;
+                let mut result = Vec::new();
+                self.encode_varint_for_conversion(&mut result, u64::from(value));
+                Ok(result)
+            }
+            Type::Uint64 => {
+                let value = ProtoStreamEncoder::extract_u64_from_json(json_value)?;
+                let mut result = Vec::new();
+                self.encode_varint_for_conversion(&mut result, value);
+                Ok(result)
+            }
+            Type::Fixed32 => Ok(ProtoStreamEncoder::extract_u32_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Fixed64 => Ok(ProtoStreamEncoder::extract_u64_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Sfixed32 => Ok(self
+                .extract_i32_from_json_for_conversion(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Sfixed64 => Ok(self
+                .extract_i64_from_json_for_conversion(json_value)?
+                .to_le_bytes()
+                .to_vec()),
             Type::Bool => {
                 let value = if let simd_json::OwnedValue::Static(simd_json::StaticNode::Bool(b)) =
                     json_value
@@ -374,15 +450,6 @@ impl ProtoConvert {
                 Ok(result)
             }
             Type::Group => {
-                let json_string =
-                    simd_json::to_string(json_value).map_err(|_| Error::InvalidJsonPayload)?;
-                let bytes = json_string.as_bytes();
-                let mut result = Vec::new();
-                self.encode_varint_for_conversion(&mut result, bytes.len() as u64);
-                result.extend_from_slice(bytes);
-                Ok(result)
-            }
-            _ => {
                 let json_string =
                     simd_json::to_string(json_value).map_err(|_| Error::InvalidJsonPayload)?;
                 let bytes = json_string.as_bytes();
@@ -745,6 +812,64 @@ mod tests {
     use crate::{DecodedMessage, TopicMetadata};
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct StringRecord {
+        #[prost(string, tag = "1")]
+        first: String,
+        #[prost(string, tag = "2")]
+        second: String,
+    }
+
+    #[test]
+    fn given_invalid_field_when_converting_with_schema_should_keep_valid_wire_data() {
+        let descriptor = protox_parse::parse(
+            "record.proto",
+            r#"syntax = "proto3";
+            message StringRecord {
+                string first = 1;
+                string second = 2;
+            }"#,
+        )
+        .expect("test schema must parse");
+        let descriptor_set = prost_types::FileDescriptorSet {
+            file: vec![descriptor],
+        };
+        let converter = ProtoConvert::new(ProtoConvertConfig {
+            source_format: Schema::Json,
+            target_format: Schema::Proto,
+            message_type: Some("StringRecord".to_string()),
+            descriptor_set: Some(descriptor_set.encode_to_vec()),
+            ..ProtoConvertConfig::default()
+        });
+        for (payload, first, second) in [
+            (
+                simd_json::json!({"first": 123, "second": "kept"}),
+                "",
+                "kept",
+            ),
+            (
+                simd_json::json!({"first": "kept", "second": 123}),
+                "kept",
+                "",
+            ),
+        ] {
+            let converted = converter
+                .transform(
+                    &create_test_metadata(),
+                    create_test_message(Payload::Json(payload)),
+                )
+                .expect("invalid fields are skipped")
+                .expect("the valid sibling keeps the message");
+            let Payload::Raw(bytes) = converted.payload else {
+                panic!("a loaded schema must produce binary protobuf");
+            };
+            let decoded = StringRecord::decode(bytes.as_slice())
+                .expect("skipping a field must not leave an incomplete protobuf tag");
+            assert_eq!(decoded.first, first);
+            assert_eq!(decoded.second, second);
+        }
+    }
 
     fn create_test_message(payload: Payload) -> DecodedMessage {
         DecodedMessage {

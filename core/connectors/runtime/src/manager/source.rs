@@ -759,4 +759,44 @@ mod tests {
 
         manager.set_error("nonexistent", "some error", None).await;
     }
+
+    #[tokio::test]
+    async fn given_running_connector_when_error_repeats_should_decrement_once() {
+        const FAILED_KEY: &str = "failed";
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![
+            create_test_source_details(FAILED_KEY, 1),
+            create_test_source_details("healthy", 2),
+        ]);
+        metrics.increment_sources_running();
+        metrics.increment_sources_running();
+
+        manager
+            .set_error(FAILED_KEY, "first error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "the healthy connector remains running"
+        );
+
+        manager
+            .set_error(FAILED_KEY, "repeated error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "repeated errors must not decrement twice"
+        );
+
+        manager
+            .stop_connector(FAILED_KEY, &metrics)
+            .await
+            .expect("failed connector should stop");
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "stopping an errored connector must not decrement again"
+        );
+    }
 }
