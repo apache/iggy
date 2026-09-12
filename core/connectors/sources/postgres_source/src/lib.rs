@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use humantime::Duration as HumanDuration;
 use iggy_common::{DateTime, Utc};
+use iggy_connector_sdk::source::SourceBatchResult;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
@@ -26,6 +27,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::postgres::types::{Oid, PgInterval, PgTimeTz};
+use sqlx::types::BigDecimal;
 use sqlx::{Column, Pool, Postgres, Row, TypeInfo, ValueRef};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -45,6 +47,7 @@ pub struct PostgresSource {
     pool: Option<Pool<Postgres>>,
     config: PostgresSourceConfig,
     state: Mutex<State>,
+    pending_batch: Mutex<Option<PendingBatch>>,
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
@@ -97,11 +100,17 @@ impl PayloadFormat {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     last_poll_time: DateTime<Utc>,
     tracking_offsets: HashMap<String, String>,
     processed_rows: u64,
+}
+
+#[derive(Debug)]
+struct PendingBatch {
+    state: State,
+    cleanup_rows: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +171,7 @@ impl PostgresSource {
                 tracking_offsets: HashMap::new(),
                 processed_rows: 0,
             })),
+            pending_batch: Mutex::new(None),
             verbose,
             retry_delay,
             poll_interval,
@@ -221,16 +231,17 @@ impl Source for PostgresSource {
         let poll_interval = self.poll_interval;
         tokio::time::sleep(poll_interval).await;
 
+        let mut state = self.state.lock().await.clone();
+        let mut cleanup_rows = Vec::new();
         let messages = match self.config.mode.as_str() {
-            "polling" => self.poll_tables().await?,
-            "cdc" => self.poll_cdc().await?,
+            "polling" => self.poll_tables(&mut state, &mut cleanup_rows).await?,
+            "cdc" => self.poll_cdc(&mut state).await?,
             _ => {
                 error!("Invalid mode: {}", self.config.mode);
                 return Err(Error::InvalidConfig);
             }
         };
 
-        let state = self.state.lock().await;
         if self.verbose {
             info!(
                 "PostgreSQL source connector ID: {} produced {} messages. Total processed: {}",
@@ -254,12 +265,35 @@ impl Source for PostgresSource {
         };
 
         let persisted_state = self.serialize_state(&state);
+        *self.pending_batch.lock().await = Some(PendingBatch {
+            state,
+            cleanup_rows,
+        });
 
         Ok(ProducedMessages {
             schema,
             messages,
             state: persisted_state,
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let pending = self.pending_batch.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(batch) = pending
+        {
+            for (table, ids) in batch.cleanup_rows {
+                self.mark_or_delete_processed_rows(
+                    self.get_pool()?,
+                    &table,
+                    self.primary_key_column(),
+                    &ids,
+                )
+                .await?;
+            }
+            *self.state.lock().await = batch.state;
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -389,9 +423,9 @@ impl PostgresSource {
         Ok(())
     }
 
-    async fn poll_cdc(&self) -> Result<Vec<ProducedMessage>, Error> {
+    async fn poll_cdc(&self, state: &mut State) -> Result<Vec<ProducedMessage>, Error> {
         match self.config.cdc_backend.as_deref().unwrap_or("builtin") {
-            "builtin" => self.poll_cdc_builtin().await,
+            "builtin" => self.poll_cdc_builtin(state).await,
             "pg_replicate" => Err(Error::InitError(
                 "pg_replicate backend not yet implemented".to_string(),
             )),
@@ -399,7 +433,7 @@ impl PostgresSource {
         }
     }
 
-    async fn poll_cdc_builtin(&self) -> Result<Vec<ProducedMessage>, Error> {
+    async fn poll_cdc_builtin(&self, state: &mut State) -> Result<Vec<ProducedMessage>, Error> {
         let pool = self.get_pool()?;
 
         let slot_name = self
@@ -468,11 +502,7 @@ impl PostgresSource {
             }
         }
 
-        // Update state with minimal lock time
-        if !messages.is_empty() {
-            let mut state = self.state.lock().await;
-            state.processed_rows += messages.len() as u64;
-        }
+        state.processed_rows += messages.len() as u64;
 
         if self.verbose {
             info!("CDC: Fetched {} change records", messages.len());
@@ -482,17 +512,17 @@ impl PostgresSource {
         Ok(messages)
     }
 
-    async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
+    async fn poll_tables(
+        &self,
+        state: &mut State,
+        cleanup_rows: &mut Vec<(String, Vec<String>)>,
+    ) -> Result<Vec<ProducedMessage>, Error> {
         let pool = self.get_pool()?;
         let mut messages = Vec::new();
 
         let batch_size = self.config.batch_size.unwrap_or(1000);
         let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
-        let pk_column = self
-            .config
-            .primary_key_column
-            .as_deref()
-            .unwrap_or(tracking_column);
+        let pk_column = self.primary_key_column();
 
         let row_config = RowProcessingConfig {
             table: "",
@@ -504,21 +534,13 @@ impl PostgresSource {
             include_metadata: self.config.include_metadata.unwrap_or(true),
         };
 
-        // Collect state updates to apply after processing
-        let mut state_updates: Vec<(String, String)> = Vec::new();
-        let mut total_processed: u64 = 0;
-
         for table in &self.config.tables {
             let table_config = RowProcessingConfig {
                 table,
                 ..row_config
             };
 
-            // Get last offset with minimal lock time
-            let last_offset = {
-                let state = self.state.lock().await;
-                state.tracking_offsets.get(table).cloned()
-            };
+            let last_offset = state.tracking_offsets.get(table).cloned();
 
             let query = if let Some(custom_query) = &self.config.custom_query {
                 self.validate_custom_query(custom_query)?;
@@ -549,18 +571,17 @@ impl PostgresSource {
                 }
 
                 messages.push(processed.message);
-                total_processed += 1;
             }
 
-            // Database I/O without holding the lock
-            if !processed_ids.is_empty() {
-                self.mark_or_delete_processed_rows(pool, table, pk_column, &processed_ids)
-                    .await?;
+            if !processed_ids.is_empty()
+                && (self.config.delete_after_read.unwrap_or(false)
+                    || self.config.processed_column.is_some())
+            {
+                cleanup_rows.push((table.clone(), processed_ids));
             }
 
-            // Collect offset update for later
             if let Some(offset) = max_offset {
-                state_updates.push((table.clone(), offset));
+                state.tracking_offsets.insert(table.clone(), offset);
             }
 
             if self.verbose {
@@ -570,15 +591,8 @@ impl PostgresSource {
             }
         }
 
-        // Apply all state updates with a single lock acquisition
-        {
-            let mut state = self.state.lock().await;
-            state.processed_rows += total_processed;
-            for (table, offset) in state_updates {
-                state.tracking_offsets.insert(table, offset);
-            }
-            state.last_poll_time = Utc::now();
-        }
+        state.processed_rows += messages.len() as u64;
+        state.last_poll_time = Utc::now();
 
         Ok(messages)
     }
@@ -599,13 +613,7 @@ impl PostgresSource {
 
         let ids_list = ids
             .iter()
-            .map(|id| {
-                if id.parse::<i64>().is_ok() {
-                    id.clone()
-                } else {
-                    format!("'{}'", id.replace('\'', "''"))
-                }
-            })
+            .map(|id| format_offset_value(id))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -654,6 +662,14 @@ impl PostgresSource {
         self.pool
             .as_ref()
             .ok_or_else(|| Error::InitError("Database not connected".to_string()))
+    }
+
+    fn primary_key_column(&self) -> &str {
+        self.config
+            .primary_key_column
+            .as_deref()
+            .or(self.config.tracking_column.as_deref())
+            .unwrap_or("id")
     }
 
     fn payload_format(&self) -> PayloadFormat {
@@ -743,8 +759,8 @@ impl PostgresSource {
             .replace("$table", table)
             .replace("$offset", &offset_value)
             .replace("$limit", &batch_size.to_string())
-            .replace("$now", &now.to_rfc3339())
             .replace("$now_unix", &now.timestamp().to_string())
+            .replace("$now", &now.to_rfc3339())
     }
 
     fn parse_logical_replication_message(
@@ -830,7 +846,9 @@ impl PostgresSource {
             if !config.payload_col.is_empty() && column.name() == config.payload_col {
                 extracted_payload =
                     Some(self.extract_payload_column(row, i, config.payload_format)?);
-                continue;
+                if column.name() != config.tracking_column && column.name() != config.pk_column {
+                    continue;
+                }
             }
 
             let value = extract_column_value(row, i)?;
@@ -995,11 +1013,11 @@ fn extract_column_value(
                 .unwrap_or(serde_json::Value::Null))
         }
         "NUMERIC" => {
-            let value: Option<String> = row
+            let value: Option<BigDecimal> = row
                 .try_get(column_index)
                 .map_err(|_| Error::InvalidRecord)?;
             Ok(value
-                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(|value| value.to_string().parse::<f64>().ok())
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null))
         }
@@ -1453,11 +1471,8 @@ fn quote_qualified_identifier(name: &str) -> Result<String, Error> {
 }
 
 fn format_offset_value(value: &str) -> String {
-    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "''"))
-    }
+    // Let PostgreSQL infer the literal type from the compared column.
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn to_snake_case(input: &str) -> String {
@@ -1756,7 +1771,7 @@ mod tests {
             .expect("Failed to build query");
         assert_eq!(
             query,
-            "SELECT * FROM \"users\" WHERE \"id\" > 100 ORDER BY \"id\" ASC LIMIT 1000"
+            "SELECT * FROM \"users\" WHERE \"id\" > '100' ORDER BY \"id\" ASC LIMIT 1000"
         );
     }
 
@@ -1772,13 +1787,12 @@ mod tests {
     }
 
     #[test]
-    fn given_numeric_offset_should_not_quote_value() {
+    fn given_numeric_offset_should_allow_database_type_inference() {
         let src = PostgresSource::new(1, test_config(), None);
         let query = src
             .build_polling_query("users", "id", &Some("42".to_string()), 100)
             .expect("Failed to build query");
-        assert!(query.contains("\"id\" > 42"));
-        assert!(!query.contains("'42'"));
+        assert!(query.contains("\"id\" > '42'"));
     }
 
     #[test]
@@ -2441,11 +2455,20 @@ mod tests {
     fn given_custom_query_with_time_params_should_substitute_correctly() {
         let src = PostgresSource::new(1, test_config(), None);
 
-        let query = "SELECT * FROM $table WHERE created_at < '$now'";
+        let query = "SELECT '$now', $now_unix FROM $table";
         let result = src.substitute_query_params(query, "logs", &None, 100);
+        let values = result
+            .strip_prefix("SELECT '")
+            .and_then(|value| value.strip_suffix(" FROM logs"))
+            .expect("query structure and table placeholder must be preserved");
+        let (timestamp, unix_seconds) = values.split_once("', ").unwrap();
+        let timestamp = DateTime::parse_from_rfc3339(timestamp)
+            .expect("$now must expand to an RFC3339 timestamp");
+        let unix_seconds: i64 = unix_seconds
+            .parse()
+            .expect("$now_unix must expand to integer seconds");
 
-        assert!(result.contains("FROM logs"));
-        assert!(!result.contains("$now"));
+        assert_eq!(unix_seconds, timestamp.timestamp());
     }
 
     #[test]

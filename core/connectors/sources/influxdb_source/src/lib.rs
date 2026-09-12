@@ -33,10 +33,12 @@ use common::{
 use iggy_connector_sdk::retry::{
     CircuitBreaker, RetryPolicy, build_retry_client, check_connectivity_with_retry, parse_duration,
 };
+use iggy_connector_sdk::source::SourceBatchResult;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessages, Schema, Source, source_connector,
 };
 use reqwest::Url;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretBox};
 use std::sync::Arc;
@@ -72,6 +74,7 @@ pub struct InfluxDbSource {
     config: InfluxDbSourceConfig,
     client: Option<ClientWithMiddleware>,
     version_state: VersionState,
+    pending_state: Mutex<Option<PersistedState>>,
     payload_format: PayloadFormat,
     poll_interval: Duration,
     retry_delay: Duration,
@@ -112,6 +115,7 @@ impl InfluxDbSource {
             config,
             client: None,
             version_state,
+            pending_state: Mutex::new(None),
             payload_format,
             poll_interval,
             retry_delay,
@@ -406,7 +410,20 @@ impl Source for InfluxDbSource {
         }
 
         let timeout = parse_duration(self.config.timeout(), DEFAULT_TIMEOUT);
+        let token = self.config.token_secret().expose_secret();
+        let auth_header = SecretBox::new(Box::new(match &self.config {
+            InfluxDbSourceConfig::V2(_) => format!("Token {token}"),
+            InfluxDbSourceConfig::V3(_) => format!("Bearer {token}"),
+        }));
+        let mut authorization =
+            HeaderValue::from_str(auth_header.expose_secret()).map_err(|error| {
+                Error::InvalidConfigValue(format!("Invalid InfluxDB authorization header: {error}"))
+            })?;
+        authorization.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, authorization);
         let raw_client = reqwest::Client::builder()
+            .default_headers(headers)
             .timeout(timeout)
             .build()
             .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))?;
@@ -440,11 +457,7 @@ impl Source for InfluxDbSource {
             "InfluxDB",
         ));
 
-        let token = self.config.token_secret().expose_secret();
-        self.auth_header = Some(SecretBox::new(Box::new(match &self.config {
-            InfluxDbSourceConfig::V2(_) => format!("Token {token}"),
-            InfluxDbSourceConfig::V3(_) => format!("Bearer {token}"),
-        })));
+        self.auth_header = Some(auth_header);
 
         info!(
             "{CONNECTOR_NAME} ID: {} opened successfully (version={ver})",
@@ -499,7 +512,7 @@ impl Source for InfluxDbSource {
                     return Err(Error::InvalidState);
                 };
 
-                let state_snap = state_mu.lock().await.clone();
+                let mut state_snap = state_mu.lock().await.clone();
                 match v2::poll(
                     client,
                     cfg,
@@ -514,34 +527,26 @@ impl Source for InfluxDbSource {
                         self.circuit_breaker.record_success();
                         let messages = result.messages;
                         let schema = result.schema;
-                        let state_snap = {
-                            let mut state = state_mu.lock().await;
-                            state.processed_rows += messages.len() as u64;
-                            apply_v2_cursor_advance(
-                                &mut state,
-                                result.max_cursor,
-                                result.rows_at_max_cursor,
-                                result.skipped,
-                            );
-
-                            poll_event!(
-                                skipped = result.skipped,
-                                "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
-                                 Total: {}. Cursor: {:?}",
-                                self.id,
-                                messages.len(),
-                                state.processed_rows,
-                                state.last_timestamp.as_deref()
-                            );
-                            state.clone()
-                            // lock released here
-                        };
-
-                        let persisted = ConnectorState::serialize(
-                            &PersistedState::V2(state_snap),
-                            CONNECTOR_NAME,
-                            self.id,
+                        state_snap.processed_rows += messages.len() as u64;
+                        apply_v2_cursor_advance(
+                            &mut state_snap,
+                            result.max_cursor,
+                            result.rows_at_max_cursor,
+                            result.skipped,
                         );
+                        poll_event!(
+                            skipped = result.skipped,
+                            "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
+                             Total: {}. Cursor: {:?}",
+                            self.id,
+                            messages.len(),
+                            state_snap.processed_rows,
+                            state_snap.last_timestamp.as_deref()
+                        );
+                        let candidate = PersistedState::V2(state_snap);
+                        let persisted =
+                            ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id);
+                        *self.pending_state.lock().await = Some(candidate);
                         match &persisted {
                             Some(_) => {
                                 // Relaxed: the SDK drives poll() from a single select! loop —
@@ -616,29 +621,18 @@ impl Source for InfluxDbSource {
                         let messages = result.messages;
                         let schema = result.schema;
                         let msg_count = messages.len();
-                        // Clone before acquiring the lock so the String allocation is
-                        // outside the critical section; the original is moved into
-                        // the mutex, the clone is used for serialization.
-                        let for_serialize = new.clone();
-                        {
-                            let mut state = state_mu.lock().await;
-                            *state = new;
-                            poll_event!(
-                                "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
-                                 Total: {}. Cursor: {:?}",
-                                self.id,
-                                msg_count,
-                                state.processed_rows,
-                                state.last_timestamp.as_deref()
-                            );
-                            // lock released here
-                        }
-
-                        let persisted = ConnectorState::serialize(
-                            &PersistedState::V3(for_serialize),
-                            CONNECTOR_NAME,
+                        poll_event!(
+                            "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
+                             Total: {}. Cursor: {:?}",
                             self.id,
+                            msg_count,
+                            new.processed_rows,
+                            new.last_timestamp.as_deref()
                         );
+                        let candidate = PersistedState::V3(new);
+                        let persisted =
+                            ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id);
+                        *self.pending_state.lock().await = Some(candidate);
                         match &persisted {
                             Some(_) => {
                                 // Relaxed: the SDK drives poll() from a single select! loop —
@@ -679,6 +673,24 @@ impl Source for InfluxDbSource {
                 }
             }
         }
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let pending = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(pending) = pending
+        {
+            match (&self.version_state, pending) {
+                (VersionState::V2(state), PersistedState::V2(candidate)) => {
+                    *state.lock().await = candidate;
+                }
+                (VersionState::V3(state), PersistedState::V3(candidate)) => {
+                    *state.lock().await = candidate;
+                }
+                _ => return Err(Error::InvalidState),
+            }
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -867,6 +879,9 @@ fn apply_v2_cursor_advance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
     use common::{V2SourceConfig, V3SourceConfig};
     use secrecy::SecretString;
 
@@ -920,6 +935,185 @@ mod tests {
             circuit_breaker_cool_down: Some("30s".to_string()),
             stuck_batch_cap_factor: Some(10),
         })
+    }
+
+    #[tokio::test]
+    async fn open_authenticates_health_check() {
+        for (mut config, expected_auth) in [
+            (make_v2_config(), "Token test_token"),
+            (make_v3_config(), "Bearer test_token"),
+        ] {
+            let router = Router::new().route(
+                "/health",
+                get(move |headers: HeaderMap| async move {
+                    if headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(expected_auth)
+                    {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            );
+            let (url, server) = start_http_server(router).await;
+            match &mut config {
+                InfluxDbSourceConfig::V2(config) => {
+                    config.url = url;
+                    config.max_open_retries = Some(1);
+                }
+                InfluxDbSourceConfig::V3(config) => {
+                    config.url = url;
+                    config.max_open_retries = Some(1);
+                }
+            }
+            let mut source = InfluxDbSource::new(1, config, None);
+            let opened = source.open().await;
+            server.abort();
+            let _ = server.await;
+            assert!(
+                opened.is_ok(),
+                "health check must use the configured version's authentication: {opened:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_batches_preserve_cursor_and_tied_row_position() {
+        const TIMESTAMP: &str = "2026-01-01T00:00:00Z";
+        for mut config in [make_v2_config(), make_v3_config()] {
+            let is_v3 = matches!(config, InfluxDbSourceConfig::V3(_));
+            let endpoint = if is_v3 {
+                "/api/v3/query_sql"
+            } else {
+                "/api/v2/query"
+            };
+            let router = Router::new()
+                .route("/health", get(|| async { StatusCode::OK }))
+                .route(
+                    endpoint,
+                    post(move |Json(body): Json<serde_json::Value>| async move {
+                        if is_v3 {
+                            let query = body["q"].as_str().unwrap();
+                            let tokens: Vec<_> = query.split_whitespace().collect();
+                            let limit = tokens
+                                [tokens.iter().position(|token| *token == "LIMIT").unwrap() + 1]
+                                .parse::<usize>()
+                                .unwrap();
+                            let offset = tokens
+                                [tokens.iter().position(|token| *token == "OFFSET").unwrap() + 1]
+                                .parse::<usize>()
+                                .unwrap();
+                            if query.contains(TIMESTAMP) {
+                                String::new()
+                            } else {
+                                (0..2)
+                                    .skip(offset)
+                                    .take(limit)
+                                    .map(|row| {
+                                        serde_json::json!({"time": TIMESTAMP, "value": row})
+                                            .to_string()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            }
+                        } else {
+                            let query = body["query"].as_str().unwrap();
+                            let limit = query
+                                .rsplit_once("limit(n: ")
+                                .unwrap()
+                                .1
+                                .trim_end_matches(')')
+                                .parse::<usize>()
+                                .unwrap();
+                            let mut csv = String::from("_time,_value\n");
+                            for row in (0..2).take(limit) {
+                                csv.push_str(&format!("{TIMESTAMP},{row}\n"));
+                            }
+                            csv
+                        }
+                    }),
+                );
+            let (url, server) = start_http_server(router).await;
+            match &mut config {
+                InfluxDbSourceConfig::V2(config) => {
+                    config.url = url;
+                    config.batch_size = Some(1);
+                    config.poll_interval = Some("1ms".to_string());
+                }
+                InfluxDbSourceConfig::V3(config) => {
+                    config.url = url;
+                    config.batch_size = Some(1);
+                    config.poll_interval = Some("1ms".to_string());
+                }
+            }
+            let mut source = InfluxDbSource::new(1, config.clone(), None);
+            source.open().await.unwrap();
+            let first = source.poll().await.unwrap();
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .unwrap();
+            let retried = source.poll().await.unwrap();
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .unwrap();
+            let next = source.poll().await.unwrap();
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .unwrap();
+            let empty = source.poll().await.unwrap();
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .unwrap();
+            source.close().await.unwrap();
+
+            let has_checkpoint = empty.state.is_some();
+            let mut restored = InfluxDbSource::new(1, config, empty.state);
+            restored.open().await.unwrap();
+            let after_restart = restored.poll().await.unwrap();
+            restored.close().await.unwrap();
+            server.abort();
+            let _ = server.await;
+
+            assert_eq!(first.messages.len(), 1);
+            assert_eq!(
+                retried.messages.len(),
+                1,
+                "Nack must make the rejected batch eligible again"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&retried.messages[0].payload).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&first.messages[0].payload).unwrap(),
+                "Nack must preserve the position within the timestamp group"
+            );
+            assert_eq!(retried.messages[0].id, first.messages[0].id);
+            assert_eq!(
+                next.messages.len(),
+                1,
+                "Ack must advance to the second tied row"
+            );
+            assert_ne!(next.messages[0].payload, first.messages[0].payload);
+            assert!(empty.messages.is_empty());
+            assert!(has_checkpoint, "empty polls must retain the checkpoint");
+            assert!(
+                after_restart.messages.is_empty(),
+                "restoring the acknowledged state must not replay rows"
+            );
+        }
+    }
+
+    async fn start_http_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (url, server)
     }
 
     #[test]
