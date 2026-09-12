@@ -185,6 +185,9 @@ impl BackpressureMode {
 }
 
 /// Immutable configuration for the future background producer mode.
+///
+/// For detailed background-producer semantics, see
+/// https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
 #[derive(Clone)]
 #[gen_stub_pyclass]
 #[pyclass(frozen, from_py_object)]
@@ -253,42 +256,58 @@ impl BackgroundProducerConfig {
         })
     }
 
+    /// Number of background worker shards, each with its own queue.
+    /// A value of zero is treated as one shard.
     #[getter]
     fn num_shards(&self) -> usize {
         self.num_shards
     }
 
+    /// Maximum time a worker holds a non-empty buffer before flushing it.
+    /// A zero duration flushes as soon as the worker receives a send.
     #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
     #[getter]
     fn linger_time<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDelta>> {
         iggy_duration_to_py_delta(py, self.linger_time)
     }
 
+    /// Per-worker flush threshold in buffered bytes.
+    /// A value of zero disables this threshold.
     #[getter]
     fn batch_size(&self) -> usize {
         self.batch_size
     }
 
+    /// Per-worker flush threshold in queued sends, not individual messages.
+    /// A value of zero disables this threshold.
     #[getter]
     fn batch_length(&self) -> usize {
         self.batch_length
     }
 
+    /// Maximum bytes buffered or in flight across all worker shards.
+    /// A value of zero makes the byte budget unlimited.
     #[getter]
     fn max_buffer_size(&self) -> u64 {
         self.max_buffer_size.as_bytes_u64()
     }
 
+    /// Behavior when `max_buffer_size` is exhausted.
     #[getter]
     fn failure_mode(&self) -> BackpressureMode {
         self.failure_mode.clone()
     }
 
+    /// Maximum number of requests written concurrently across all workers.
+    /// A value of zero uses the runtime's maximum semaphore permit count.
     #[getter]
     fn max_in_flight(&self) -> usize {
         self.max_in_flight
     }
 
+    /// Strategy used to assign each send to a worker shard.
+    /// Ordered sharding preserves per-destination dispatch order, while balanced
+    /// sharding distributes sends round-robin and may reorder them.
     #[getter]
     fn sharding(&self) -> ProducerSharding {
         self.sharding
@@ -312,7 +331,10 @@ impl BackgroundProducerConfig {
     }
 }
 
-/// A producer bound to one stream and topic and ready to send messages.
+/// Python port of the Rust high-level producer API, bound to one stream and topic.
+///
+/// For detailed producer semantics, see
+/// https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
 #[derive(Clone)]
 #[gen_stub_pyclass]
 #[pyclass(from_py_object)]
@@ -480,29 +502,6 @@ pub(crate) enum ProducerMode {
 impl Default for ProducerMode {
     fn default() -> Self {
         Self::Direct(DirectProducerConfig::default())
-    }
-}
-
-impl PyStubType for ProducerMode {
-    fn type_output() -> TypeInfo {
-        DirectProducerConfig::type_output() | BackgroundProducerConfig::type_output()
-    }
-
-    fn type_input() -> TypeInfo {
-        DirectProducerConfig::type_input() | BackgroundProducerConfig::type_input()
-    }
-}
-
-impl<'py> IntoPyObject<'py> for ProducerMode {
-    type Target = PyAny;
-    type Output = Bound<'py, PyAny>;
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        match self {
-            Self::Direct(config) => Ok(config.into_pyobject(py)?.into_any()),
-            Self::Background(config) => Ok(config.into_pyobject(py)?.into_any()),
-        }
     }
 }
 

@@ -42,24 +42,36 @@ pip install .
 
 ## Basic Examples
 
-### High-Level Direct Producer
+### High-Level Producer and Consumer
+
+The Python high-level producer API is a port of the Rust high-level producer
+API. For detailed producer behavior and configuration, see the
+[Rust high-level SDK documentation](https://iggy.apache.org/docs/sdk/rust/high-level-sdk/).
 
 The high-level producer binds the destination once, initializes missing
 resources, applies producer-level batching and retry settings, and shuts down
-deterministically through an async context manager:
+deterministically through an async context manager. The high-level consumer
+joins a consumer group, polls all assigned partitions, invokes an async handler,
+and commits each message after it has been handled.
+
+Run the producer first. It creates the stream and topic and publishes 12
+messages for the consumer, which exits after receiving all of them:
 
 ```bash
 # Using uv
-uv run direct-producer/producer.py
+uv run high-level/producer.py
+uv run high-level/consumer.py
 
 # Without using uv
-python direct-producer/producer.py
+python high-level/producer.py
+python high-level/consumer.py
 ```
 
-Pass a different connection string as the optional argument. For example:
+Pass a different connection string to either program as the optional argument.
+For example:
 
 ```bash
-uv run direct-producer/producer.py \
+uv run high-level/producer.py \
   'iggy+tcp://iggy:iggy@127.0.0.1:8090'
 ```
 

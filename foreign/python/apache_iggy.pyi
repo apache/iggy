@@ -311,23 +311,58 @@ class AutoLogin:
 class BackgroundProducerConfig:
     r"""
     Immutable configuration for the future background producer mode.
+
+    For detailed background-producer semantics, see
+    https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
     """
     @property
-    def num_shards(self) -> builtins.int: ...
+    def num_shards(self) -> builtins.int:
+        r"""
+        Number of background worker shards, each with its own queue.
+        A value of zero is treated as one shard.
+        """
     @property
-    def linger_time(self) -> datetime.timedelta: ...
+    def linger_time(self) -> datetime.timedelta:
+        r"""
+        Maximum time a worker holds a non-empty buffer before flushing it.
+        A zero duration flushes as soon as the worker receives a send.
+        """
     @property
-    def batch_size(self) -> builtins.int: ...
+    def batch_size(self) -> builtins.int:
+        r"""
+        Per-worker flush threshold in buffered bytes.
+        A value of zero disables this threshold.
+        """
     @property
-    def batch_length(self) -> builtins.int: ...
+    def batch_length(self) -> builtins.int:
+        r"""
+        Per-worker flush threshold in queued sends, not individual messages.
+        A value of zero disables this threshold.
+        """
     @property
-    def max_buffer_size(self) -> builtins.int: ...
+    def max_buffer_size(self) -> builtins.int:
+        r"""
+        Maximum bytes buffered or in flight across all worker shards.
+        A value of zero makes the byte budget unlimited.
+        """
     @property
-    def failure_mode(self) -> BackpressureMode: ...
+    def failure_mode(self) -> BackpressureMode:
+        r"""
+        Behavior when `max_buffer_size` is exhausted.
+        """
     @property
-    def max_in_flight(self) -> builtins.int: ...
+    def max_in_flight(self) -> builtins.int:
+        r"""
+        Maximum number of requests written concurrently across all workers.
+        A value of zero uses the runtime's maximum semaphore permit count.
+        """
     @property
-    def sharding(self) -> ProducerSharding: ...
+    def sharding(self) -> ProducerSharding:
+        r"""
+        Strategy used to assign each send to a worker shard.
+        Ordered sharding preserves per-destination dispatch order, while balanced
+        sharding distributes sends round-robin and may reorder them.
+        """
     def __new__(
         cls,
         *,
@@ -1769,7 +1804,7 @@ class IggyClient:
         stream: builtins.str,
         topic: builtins.str,
         partitioning: Partitioning | None = None,
-        mode: DirectProducerConfig | BackgroundProducerConfig = ...,
+        mode: DirectProducerConfig | BackgroundProducerConfig | None = None,
         create_stream_if_not_exists: builtins.bool = True,
         create_topic_if_not_exists: builtins.bool = True,
         topic_partitions_count: builtins.int = 1,
@@ -1780,6 +1815,9 @@ class IggyClient:
     ) -> collections.abc.Awaitable[IggyProducer]:
         r"""
         Creates and initializes a high-level producer bound to a stream and topic.
+
+        This is a Python port of the Rust high-level producer API. For detailed
+        producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
         """
     def poll_messages(
         self,
@@ -1977,7 +2015,10 @@ class IggyExpiry:
 @typing.final
 class IggyProducer:
     r"""
-    A producer bound to one stream and topic and ready to send messages.
+    Python port of the Rust high-level producer API, bound to one stream and topic.
+
+    For detailed producer semantics, see
+    https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
     """
     def send(
         self, messages: list[SendMessage]

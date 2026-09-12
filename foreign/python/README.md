@@ -206,6 +206,10 @@ asyncio.run(main())
 
 ## High-Level Producer
 
+The Python high-level producer API is a port of the Rust high-level producer
+API. For detailed producer semantics and configuration guidance, see the
+[Rust high-level SDK documentation](https://iggy.apache.org/docs/sdk/rust/high-level-sdk/).
+
 Use `IggyClient.producer()` when an application repeatedly publishes to one
 stream and topic. Producer creation is asynchronous because it initializes the
 destination before returning. By default, it creates a missing stream and topic,
