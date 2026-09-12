@@ -17,14 +17,12 @@
 
 use std::{str::FromStr, sync::Arc};
 
-#[cfg(test)]
 use iggy::clients::producer_config::BackpressureMode as RustBackpressureMode;
-#[cfg(test)]
-use iggy::prelude::BackgroundConfig as RustBackgroundConfig;
 use iggy::prelude::{
-    DirectConfig as RustDirectConfig, Identifier, IggyByteSize, IggyDuration, IggyError,
-    IggyMessage as RustIggyMessage, IggyProducer as RustIggyProducer,
-    SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
+    BackgroundConfig as RustBackgroundConfig, BalancedSharding, DirectConfig as RustDirectConfig,
+    Identifier, IggyByteSize, IggyDuration, IggyError, IggyMessage as RustIggyMessage,
+    IggyProducer as RustIggyProducer, OrderedSharding,
+    SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse, Sharding,
 };
 use pyo3::IntoPyObjectExt;
 use pyo3::conversion::FromPyObject;
@@ -34,7 +32,7 @@ use pyo3::types::{PyAny, PyDelta, PyInt, PyList, PyString};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
 use pyo3_stub_gen::{PyStubType, TypeInfo};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
 use crate::partitioning::Partitioning;
@@ -123,6 +121,15 @@ pub enum ProducerSharding {
     Balanced,
 }
 
+impl From<ProducerSharding> for Box<dyn Sharding + Send + Sync> {
+    fn from(sharding: ProducerSharding) -> Self {
+        match sharding {
+            ProducerSharding::Ordered => Box::new(OrderedSharding),
+            ProducerSharding::Balanced => Box::new(BalancedSharding::default()),
+        }
+    }
+}
+
 /// What a background send does when the producer buffer is full.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[gen_stub_pyclass]
@@ -136,6 +143,16 @@ enum BackpressureKind {
     Block,
     BlockWithTimeout(IggyDuration),
     FailImmediately,
+}
+
+impl From<&BackpressureMode> for RustBackpressureMode {
+    fn from(mode: &BackpressureMode) -> Self {
+        match mode.kind {
+            BackpressureKind::Block => Self::Block,
+            BackpressureKind::BlockWithTimeout(timeout) => Self::BlockWithTimeout(timeout),
+            BackpressureKind::FailImmediately => Self::FailImmediately,
+        }
+    }
 }
 
 #[gen_stub_pymethods]
@@ -192,7 +209,7 @@ impl BackpressureMode {
     }
 }
 
-/// Immutable configuration for the future background producer mode.
+/// Immutable configuration for a producer that queues sends on background workers.
 ///
 /// For detailed background-producer semantics, see
 /// https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
@@ -225,10 +242,41 @@ impl Default for BackgroundProducerConfig {
     }
 }
 
+impl TryFrom<&BackgroundProducerConfig> for RustBackgroundConfig {
+    type Error = PyErr;
+
+    fn try_from(config: &BackgroundProducerConfig) -> PyResult<Self> {
+        let max_buffer_size = config.max_buffer_size.as_bytes_u64();
+        if max_buffer_size != 0 && max_buffer_size > Semaphore::MAX_PERMITS as u64 {
+            return Err(PyValueError::new_err(format!(
+                "'max_buffer_size' must not exceed {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if config.max_in_flight != 0 && config.max_in_flight > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(format!(
+                "'max_in_flight' must not exceed {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+
+        Ok(RustBackgroundConfig::builder()
+            .num_shards(config.num_shards)
+            .linger_time(config.linger_time)
+            .batch_size(config.batch_size)
+            .batch_length(config.batch_length)
+            .max_buffer_size(config.max_buffer_size)
+            .failure_mode((&config.failure_mode).into())
+            .max_in_flight(config.max_in_flight)
+            .sharding(config.sharding.into())
+            .build())
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl BackgroundProducerConfig {
-    /// Constructs the stable configuration surface for background mode.
+    /// Constructs background batching, capacity, backpressure, and sharding configuration.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -252,9 +300,10 @@ impl BackgroundProducerConfig {
         max_in_flight: i128,
         sharding: DefaultProducerSharding,
     ) -> PyResult<Self> {
+        let linger_time = linger_time.resolve(IggyDuration::from(1_000))?;
         Ok(Self {
             num_shards: usize_param(num_shards, "num_shards")?,
-            linger_time: linger_time.resolve(IggyDuration::from(1_000))?,
+            linger_time,
             batch_size: usize_param(batch_size, "batch_size")?,
             batch_length: usize_param(batch_length, "batch_length")?,
             max_buffer_size: IggyByteSize::from(u64_param(max_buffer_size, "max_buffer_size")?),
@@ -413,6 +462,11 @@ impl ProducerSendError {
 ///
 /// For detailed producer semantics, see
 /// https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+///
+/// Direct sends complete after the server responds and contain commit confirmations.
+/// Background sends complete once accepted by a worker and contain no confirmations.
+/// Always use the async context manager or call `shutdown()` explicitly; dropping a
+/// background producer can lose accepted buffered messages.
 #[derive(Clone)]
 #[gen_stub_pyclass]
 #[pyclass(from_py_object)]
@@ -432,6 +486,8 @@ impl IggyProducer {
 #[pymethods]
 impl IggyProducer {
     /// Sends a batch to the producer's bound stream and topic.
+    /// In background mode, success means accepted into the dispatcher and the
+    /// returned confirmation list is empty.
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send<'py>(
         &self,
@@ -456,6 +512,7 @@ impl IggyProducer {
     }
 
     /// Sends one message to the producer's bound stream and topic.
+    /// It has the same mode-dependent completion semantics as `send()`.
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_one<'py>(
         &self,
@@ -478,6 +535,7 @@ impl IggyProducer {
     }
 
     /// Sends a batch with an optional per-call partitioning override.
+    /// It has the same mode-dependent completion semantics as `send()`.
     #[pyo3(signature = (messages, partitioning=None))]
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_with_partitioning<'py>(
@@ -505,6 +563,8 @@ impl IggyProducer {
     }
 
     /// Sends a batch to another existing stream and topic.
+    /// It has the same mode-dependent completion semantics as `send()` and does
+    /// not create the alternate destination.
     #[pyo3(signature = (stream, topic, messages, partitioning=None))]
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_to<'py>(
@@ -547,6 +607,7 @@ impl IggyProducer {
     }
 
     /// Waits for active sends and closes the producer. Repeated calls are safe.
+    /// Background shutdown flushes every accepted buffered message before returning.
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -863,9 +924,44 @@ fn u64_param(value: i128, parameter: &str) -> PyResult<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use iggy::clients::producer::ProducerCoreBackend;
+    use iggy::clients::producer_dispatcher::ProducerDispatcher;
     use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
 
     use super::*;
+
+    #[derive(Debug)]
+    struct ConcurrencyTrackingBackend {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    }
+
+    impl ProducerCoreBackend for ConcurrencyTrackingBackend {
+        fn send_internal(
+            &self,
+            _stream: &Identifier,
+            _topic: &Identifier,
+            _messages: Vec<RustIggyMessage>,
+            _partitioning: Option<Arc<iggy::prelude::Partitioning>>,
+        ) -> impl Future<Output = Result<iggy::prelude::SendMessagesResponse, IggyError>> + Send
+        {
+            let active = self.active.clone();
+            let maximum = self.maximum.clone();
+            async move {
+                let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(active_now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(iggy::prelude::SendMessagesResponse {
+                    confirmations: Vec::new(),
+                })
+            }
+        }
+    }
 
     #[test]
     fn direct_defaults_match_rust() {
@@ -962,6 +1058,134 @@ mod tests {
         assert_eq!(python.max_in_flight, rust.max_in_flight);
         assert!(matches!(python.sharding, ProducerSharding::Ordered));
         assert_eq!(format!("{:?}", rust.sharding), "OrderedSharding");
+    }
+
+    #[test]
+    fn background_configuration_converts_every_field_to_rust() {
+        let python = BackgroundProducerConfig {
+            num_shards: 4,
+            linger_time: IggyDuration::from(2_000),
+            batch_size: 2_048,
+            batch_length: 32,
+            max_buffer_size: IggyByteSize::from(8_192),
+            failure_mode: BackpressureMode::fail_immediately(),
+            max_in_flight: 3,
+            sharding: ProducerSharding::Balanced,
+        };
+        let rust = RustBackgroundConfig::try_from(&python).unwrap();
+
+        assert_eq!(rust.num_shards, 4);
+        assert_eq!(rust.linger_time, IggyDuration::from(2_000));
+        assert_eq!(rust.batch_size, 2_048);
+        assert_eq!(rust.batch_length, 32);
+        assert_eq!(rust.max_buffer_size.as_bytes_u64(), 8_192);
+        assert!(matches!(
+            rust.failure_mode,
+            RustBackpressureMode::FailImmediately
+        ));
+        assert_eq!(rust.max_in_flight, 3);
+        assert_eq!(
+            format!("{:?}", rust.sharding),
+            "BalancedSharding { counter: 0 }"
+        );
+    }
+
+    #[test]
+    fn backpressure_modes_convert_to_rust() {
+        let block = RustBackpressureMode::from(&BackpressureMode::block());
+        let timeout = RustBackpressureMode::from(&BackpressureMode {
+            kind: BackpressureKind::BlockWithTimeout(IggyDuration::from(250_000)),
+        });
+        let immediate = RustBackpressureMode::from(&BackpressureMode::fail_immediately());
+
+        assert!(matches!(block, RustBackpressureMode::Block));
+        assert!(matches!(
+            timeout,
+            RustBackpressureMode::BlockWithTimeout(value)
+                if value == IggyDuration::from(250_000)
+        ));
+        assert!(matches!(immediate, RustBackpressureMode::FailImmediately));
+    }
+
+    #[test]
+    fn sharding_modes_convert_to_the_selected_rust_strategy() {
+        let messages = vec![RustIggyMessage::from_str("message").unwrap()];
+        let stream = Identifier::from_str("stream").unwrap();
+        let topic = Identifier::from_str("topic").unwrap();
+
+        let ordered = RustBackgroundConfig::try_from(&BackgroundProducerConfig {
+            num_shards: 4,
+            ..BackgroundProducerConfig::default()
+        })
+        .unwrap();
+        let first = ordered.sharding.pick_shard(4, &messages, &stream, &topic);
+        let second = ordered.sharding.pick_shard(4, &messages, &stream, &topic);
+        assert_eq!(first, second);
+
+        let balanced = RustBackgroundConfig::try_from(&BackgroundProducerConfig {
+            num_shards: 3,
+            sharding: ProducerSharding::Balanced,
+            ..BackgroundProducerConfig::default()
+        })
+        .unwrap();
+        let picked = (0..4)
+            .map(|_| balanced.sharding.pick_shard(3, &messages, &stream, &topic))
+            .collect::<Vec<_>>();
+        assert_eq!(picked, vec![0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn background_conversion_rejects_values_that_would_panic_semaphore() {
+        let invalid_max_buffer = BackgroundProducerConfig {
+            max_buffer_size: IggyByteSize::from(Semaphore::MAX_PERMITS as u64 + 1),
+            ..BackgroundProducerConfig::default()
+        };
+        let invalid_max_in_flight = BackgroundProducerConfig {
+            max_in_flight: Semaphore::MAX_PERMITS + 1,
+            ..BackgroundProducerConfig::default()
+        };
+
+        assert!(RustBackgroundConfig::try_from(&invalid_max_buffer).is_err());
+        assert!(RustBackgroundConfig::try_from(&invalid_max_in_flight).is_err());
+    }
+
+    #[tokio::test]
+    async fn converted_max_in_flight_limits_concurrent_background_writes() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(ConcurrencyTrackingBackend {
+            active,
+            maximum: maximum.clone(),
+        });
+        let config = RustBackgroundConfig::try_from(&BackgroundProducerConfig {
+            num_shards: 4,
+            linger_time: IggyDuration::from(0),
+            batch_size: 0,
+            batch_length: 1,
+            max_buffer_size: IggyByteSize::from(0),
+            failure_mode: BackpressureMode::block(),
+            max_in_flight: 2,
+            sharding: ProducerSharding::Balanced,
+        })
+        .unwrap();
+        let dispatcher = ProducerDispatcher::new(backend, config);
+        let stream = Arc::new(Identifier::numeric(1).unwrap());
+        let topic = Arc::new(Identifier::numeric(1).unwrap());
+
+        for index in 0..4 {
+            dispatcher
+                .dispatch(
+                    vec![RustIggyMessage::from_str(&index.to_string()).unwrap()],
+                    stream.clone(),
+                    topic.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        dispatcher.shutdown().await;
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
     }
 
     #[test]

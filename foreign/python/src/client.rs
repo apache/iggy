@@ -1330,6 +1330,12 @@ impl IggyClient {
     ///
     /// This is a Python port of the Rust high-level producer API. For detailed
     /// producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+    /// `None` selects direct mode. `BackgroundProducerConfig` starts background
+    /// workers and makes successful sends mean queue acceptance rather than a
+    /// server commit. The returned producer is ready to send.
+    ///
+    /// Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
+    /// when stream/topic initialization fails.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         stream,
@@ -1369,15 +1375,7 @@ impl IggyClient {
         send_retries: Option<i64>,
         send_retry_interval: RetryInterval,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let direct_config = match mode.unwrap_or_default() {
-            ProducerMode::Direct(config) => config,
-            ProducerMode::Background(config) => {
-                let _ = config;
-                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                    "background producer mode is not implemented",
-                ));
-            }
-        };
+        let mode = mode.unwrap_or_default();
 
         let topic_partitions_count =
             producer_u32_param(topic_partitions_count, "topic_partitions_count")?;
@@ -1399,8 +1397,12 @@ impl IggyClient {
             .inner
             .producer(stream, topic)
             .map_err(to_value_error)?
-            .direct((&direct_config).into())
             .send_retries(send_retries, send_retry_interval);
+
+        builder = match mode {
+            ProducerMode::Direct(config) => builder.direct((&config).into()),
+            ProducerMode::Background(config) => builder.background((&config).try_into()?),
+        };
 
         if let Some(partitioning) = partitioning {
             builder = builder.partitioning(partitioning.inner.as_ref().clone());
@@ -1420,8 +1422,10 @@ impl IggyClient {
             builder = builder.do_not_create_topic_if_not_exists();
         }
 
-        let producer = builder.build();
         future_into_py(py, async move {
+            // A background build starts Tokio worker tasks, so it must happen
+            // while this future is executing on the Rust runtime.
+            let producer = builder.build();
             producer.init().await.map_err(to_runtime_error)?;
             Ok(IggyProducer::new(producer))
         })
