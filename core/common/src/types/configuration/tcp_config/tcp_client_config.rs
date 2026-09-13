@@ -69,7 +69,7 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
             tls_enabled: connection_string.options().tls_enabled(),
             tls_domain: connection_string.options().tls_domain().into(),
             tls_ca_file: connection_string.options().tls_ca_file().to_owned(),
-            // Always validate TLS certificate for connection strings, we don't want to allow self-signed certificates for connection strings
+            // Require certificate verification, including when trusting a private CA.
             tls_validate_certificate: true,
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),

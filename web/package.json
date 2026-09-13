@@ -10,6 +10,7 @@
     "server": "vite server",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "test": "node --experimental-strip-types --test",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write ."
   },

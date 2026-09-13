@@ -218,16 +218,13 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
+    public async Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
-        return _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token)
-            .ContinueWith(async response =>
-            {
-                if (!response.Result.IsSuccessStatusCode)
-                {
-                    await HandleResponseAsync(response.Result);
-                }
-            }, token);
+        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token);
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
     }
 
     /// <inheritdoc />
@@ -952,6 +949,7 @@ public class HttpMessageStream : IIggyClient
     /// </summary>
     public void Dispose()
     {
+        _httpClient.Dispose();
     }
 
     /// <inheritdoc />
@@ -1102,7 +1100,7 @@ public class HttpMessageStream : IIggyClient
         return plaintext;
     }
 
-    private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
+    private async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
     {
         if (response.IsSuccessStatusCode)
         {
@@ -1119,7 +1117,7 @@ public class HttpMessageStream : IIggyClient
         ErrorResponse? errorModel = null;
         try
         {
-            errorModel = JsonSerializer.Deserialize<ErrorResponse>(err);
+            errorModel = JsonSerializer.Deserialize<ErrorResponse>(err, _jsonSerializerOptions);
         }
         catch (JsonException)
         {
