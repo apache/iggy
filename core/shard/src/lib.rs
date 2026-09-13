@@ -7565,9 +7565,14 @@ where
         }
 
         let mut persistence_metrics = partitions::PersistenceMetrics::default();
+        let mut repair_ring_entries = 0usize;
+        let mut repair_ring_bytes = 0u64;
         for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_mut_by_ns(namespace) {
                 partition.drive_persistence().await;
+                let (entries, bytes) = partition.repair_ring_occupancy();
+                repair_ring_entries += entries;
+                repair_ring_bytes += bytes;
                 if let Some(metrics) = partition.take_persistence_metrics() {
                     persistence_metrics.disk_bytes += metrics.disk_bytes;
                     persistence_metrics.retained_bytes += metrics.retained_bytes;
@@ -7576,12 +7581,15 @@ where
                     persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
                     persistence_metrics.completed_batches += metrics.completed_batches;
                     persistence_metrics.batched_prepares += metrics.batched_prepares;
+                    persistence_metrics.group_commit_waits += metrics.group_commit_waits;
                     persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
                     persistence_metrics.failed_writes += metrics.failed_writes;
                 }
             }
         }
         self.metrics.record_persistence(&persistence_metrics);
+        self.metrics
+            .set_repair_ring(repair_ring_entries, repair_ring_bytes);
 
         // Counted at most ONCE per sweep and only if a re-arm actually fires,
         // then tracked locally as arms land. Counting per namespace is a full

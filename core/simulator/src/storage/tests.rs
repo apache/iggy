@@ -36,6 +36,7 @@ use server_common::{
     Message,
     iobuf::{IOV_MAX, Owned},
 };
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
@@ -1209,6 +1210,7 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
         let (storage, mut journal) = baseline().await;
         storage.clear_trace();
         journal.checkpoint(2).await.unwrap();
+        journal.reclaim_obsolete().await;
         let unlink = storage
             .trace()
             .iter()
@@ -1218,6 +1220,7 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
             let (storage, mut journal) = baseline().await;
             storage.fail_at(unlink, FaultMode::Before);
             journal.checkpoint(2).await.unwrap();
+            journal.reclaim_obsolete().await;
             storage.clear_trace();
             let obsolete = Path::new("/partition/wal/prepares-0.wal");
             assert!(storage.exists(obsolete).await.unwrap());
@@ -1249,6 +1252,11 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
                     .append(prepare(4, parent).into_frozen())
                     .await
                     .unwrap();
+                // Reclamation is not on the append path: the append must not
+                // have waited on the retry, and the writer's own maintenance
+                // pass is what must still take it.
+                assert!(storage.exists(obsolete).await.unwrap());
+                journal.reclaim_obsolete().await;
             }
             assert!(!storage.exists(obsolete).await.unwrap());
             assert_eq!(journal.checkpoint_op(), 2);
@@ -1259,6 +1267,35 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
                 .op == 2
             }));
         }
+    });
+}
+
+#[test]
+fn checkpoint_notifies_before_reclaiming_its_obsolete_generation() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(4).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        storage.clear_trace();
+        let notified = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&notified);
+        let observed_storage = storage.clone();
+        persistence.set_notifier(Rc::new(move |_| {
+            assert!(!observed_storage.trace().contains(&StorageOperation::Unlink));
+            observed.set(true);
+        }));
+        persistence.checkpoint(2);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(notified.get());
+        assert!(storage.trace().contains(&StorageOperation::Unlink));
+        assert_eq!(persistence.checkpoint_op(), 2);
+        storage.crash(Crash::PowerLoss);
+        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+            .await
+            .unwrap();
+        assert_eq!(recovered.head(), 4);
+        assert_eq!(recovered.checkpoint_op(), 2);
     });
 }
 

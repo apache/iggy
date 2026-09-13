@@ -750,7 +750,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         references: Option<&[Option<SegmentReference>]>,
     ) -> io::Result<()> {
         self.ensure_healthy()?;
-        self.cleanup_obsolete().await;
         self.recovered_prepares.clear();
         let mut state = self.state;
         let mut retained_bytes = self.retained_bytes;
@@ -1073,6 +1072,24 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             }
         }
         Ok(())
+    }
+
+    /// Whether [`Self::reclaim_obsolete`] has anything left to remove.
+    #[must_use]
+    pub fn has_obsolete(&self) -> bool {
+        !self.obsolete.is_empty() || self.cleanup_directory_dirty
+    }
+
+    /// Remove a bounded batch of the files no published generation retains.
+    ///
+    /// Separate from the append path so an acknowledgement never waits on
+    /// unlinks and a directory barrier for history it does not depend on. Only
+    /// a checkpoint and the boot scan ever queue work here, and both do so
+    /// after the publication that excludes those files, so the queue holds
+    /// nothing a reader or a recovery could still need. The writer owns the
+    /// journal, so this runs between mutations and never beside one.
+    pub async fn reclaim_obsolete(&mut self) {
+        self.cleanup_obsolete().await;
     }
 
     async fn cleanup_obsolete(&mut self) {
@@ -1508,7 +1525,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.retain_active_segment_file();
         self.poisoned = false;
         self.obsolete.push_back(obsolete);
-        self.cleanup_obsolete().await;
         Ok(())
     }
 }
@@ -1826,6 +1842,41 @@ mod tests {
         }
     }
 
+    /// Reclamation used to run at the head of every append, so an unlink and a
+    /// directory barrier for a generation the append does not touch landed
+    /// inside the acknowledgement it was waiting on. The append must leave the
+    /// queue alone and the writer must drain it between mutations instead.
+    #[compio::test]
+    async fn append_leaves_obsolete_files_for_the_writer_to_reclaim() {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+
+        let stale = directory.join("prepares-6.wal");
+        std::fs::write(&stale, b"a generation a checkpoint replaced").unwrap();
+        journal.obsolete.push_back(stale.clone());
+
+        let prepare = prepare(1, 0);
+        journal
+            .append_batch_buffered(&[prepare.into_frozen()])
+            .await
+            .unwrap();
+        journal.sync().await.unwrap();
+
+        assert!(journal.has_obsolete());
+        assert!(
+            stale.exists(),
+            "the acknowledgement must not have waited on the unlink"
+        );
+
+        journal.reclaim_obsolete().await;
+
+        assert!(!journal.has_obsolete());
+        assert!(!stale.exists());
+    }
+
     #[compio::test]
     async fn referenced_bodies_survive_retention_and_checkpoint_without_wal_copies() {
         let partition = tempdir().unwrap();
@@ -1868,6 +1919,7 @@ mod tests {
         assert_eq!(recovered[1].as_slice(), second.as_slice());
         journal.checkpoint(2).await.unwrap();
         assert_eq!(journal.size_bytes(), PARTITION_WAL_BLOCK_SIZE as u64);
+        journal.reclaim_obsolete().await;
         assert!(!first_reference.path(&directory).exists());
         assert!(second_reference.path(&directory).exists());
         drop(journal);
@@ -2026,6 +2078,7 @@ mod tests {
         assert_eq!(journal.purge_marker(), (1, 2));
         journal.truncate_from(3).await.unwrap();
         assert!(first_reference.path(&directory).exists());
+        journal.reclaim_obsolete().await;
         assert!(!second_reference.path(&directory).exists());
         drop(journal);
         let journal = PartitionPrepareJournal::open(&directory, 42, 7)
@@ -2600,6 +2653,7 @@ mod tests {
             "purge must not fabricate a committed frontier"
         );
         assert_eq!(journal.retained_bytes(), retained_bytes);
+        journal.reclaim_obsolete().await;
         for reference in references {
             assert!(!reference.path(&directory).exists());
             std::fs::remove_file(
@@ -3224,6 +3278,7 @@ mod tests {
                 journal.prepares().await.unwrap()[0].as_slice(),
                 next.as_slice()
             );
+            journal.reclaim_obsolete().await;
             assert_eq!(checkpoint_reference.path(&directory).exists(), materialized);
             let expected = SegmentPosition {
                 length: initial.length + BODY_BYTES as u64,

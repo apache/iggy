@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -68,6 +69,98 @@ class MessagesBatchWireFormatTest {
         var batch = BytesSerializer.encodeBatch(messages);
 
         assertThat(ByteBufUtil.hexDump(batch)).isEqualTo(PRODUCE_BATCH_ONLY);
+    }
+
+    /**
+     * The send path encodes the batch straight after the request metadata
+     * instead of into its own buffer, so every absolute offset the encoder
+     * back-patches has to be relative to where the batch starts rather than to
+     * the buffer. A prefix of any length must leave the same bytes behind it.
+     */
+    @Test
+    void shouldEncodeTheSameBatchAfterAPrefix() {
+        var messages = List.of(message(100, 2000, "first", Map.of()), message(200, 2500, "second", Map.of()));
+        var standalone = BytesSerializer.toMessagesBatch(messages);
+
+        var prefixed = Unpooled.buffer();
+        prefixed.writeBytes("request-metadata".getBytes(StandardCharsets.UTF_8));
+        var batchStart = prefixed.writerIndex();
+        BytesSerializer.encodeMessagesBatchInto(prefixed, messages);
+
+        assertThat(ByteBufUtil.hexDump(prefixed, batchStart, prefixed.writerIndex() - batchStart))
+                .isEqualTo(ByteBufUtil.hexDump(standalone));
+        assertThat(prefixed.writerIndex()).isEqualTo(batchStart + standalone.readableBytes());
+    }
+
+    @Test
+    void shouldLeavePrefixAndIndexesUnchangedForInvalidTimestamps() {
+        var output = Unpooled.buffer();
+        try {
+            output.writeIntLE(0x12345678);
+            var invalid = List.of(message(1, 0, "a", Map.of()), message(2, 0x1_0000_0000L, "b", Map.of()));
+            assertThatThrownBy(() -> BytesSerializer.encodeMessagesBatchInto(output, invalid))
+                    .isInstanceOf(IggyInvalidArgumentException.class);
+            assertThat(output.writerIndex()).isEqualTo(Integer.BYTES);
+            assertThat(output.readerIndex()).isZero();
+            assertThat(output.getIntLE(0)).isEqualTo(0x12345678);
+            BytesSerializer.encodeMessagesBatchInto(output, List.of(message(1, 0, "valid", Map.of())));
+            assertThat(output.writerIndex()).isGreaterThan(Integer.BYTES);
+        } finally {
+            output.release();
+        }
+    }
+
+    @Test
+    void shouldRejectBatchSizeOverflowBeforeGrowingTheBuffer() {
+        var output = Unpooled.buffer(4);
+        try {
+            output.writeIntLE(0x12345678);
+            var message = new BytesSerializer.RawMessage(idBytes(1), BigInteger.ZERO, new byte[1 << 20], new byte[0]);
+            assertThatThrownBy(() -> BytesSerializer.encodeBatchInto(output, Collections.nCopies(2048, message)))
+                    .isInstanceOf(IggyInvalidArgumentException.class);
+            assertThat(output.capacity()).isEqualTo(4);
+            assertThat(output.writerIndex()).isEqualTo(4);
+            assertThat(output.getIntLE(0)).isEqualTo(0x12345678);
+        } finally {
+            output.release();
+        }
+    }
+
+    @Test
+    void shouldRejectInvalidUnsignedTimestampsBeforeWriting() {
+        for (var timestamp : List.of(BigInteger.valueOf(-1), BigInteger.ONE.shiftLeft(64))) {
+            var output = Unpooled.buffer();
+            try {
+                output.writeByte(42);
+                var messages = List.of(new BytesSerializer.RawMessage(idBytes(1), timestamp, new byte[0], new byte[0]));
+                assertThatThrownBy(() -> BytesSerializer.encodeBatchInto(output, messages))
+                        .isInstanceOf(IggyInvalidArgumentException.class);
+                assertThat(output.writerIndex()).isEqualTo(1);
+                assertThat(output.getByte(0)).isEqualTo((byte) 42);
+            } finally {
+                output.release();
+            }
+        }
+    }
+
+    @Test
+    void shouldEncodeUnsignedTimestampBoundaryIntoHeapAndDirectBuffers() {
+        var timestamp = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
+        var messages =
+                List.of(new BytesSerializer.RawMessage(idBytes(1), timestamp, new byte[] {1, 2, 3}, new byte[0]));
+        var heap = Unpooled.buffer();
+        var direct = Unpooled.directBuffer();
+        try {
+            heap.writeByte(42);
+            direct.writeByte(42);
+            BytesSerializer.encodeBatchInto(heap, messages);
+            BytesSerializer.encodeBatchInto(direct, messages);
+            assertThat(heap.getLongLE(1 + 24)).isEqualTo(-1L);
+            assertThat(ByteBufUtil.hexDump(direct)).isEqualTo(ByteBufUtil.hexDump(heap));
+        } finally {
+            heap.release();
+            direct.release();
+        }
     }
 
     @Test

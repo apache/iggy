@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.MessagesClient;
@@ -50,8 +51,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
 
+import static org.apache.iggy.serde.BytesSerializer.encodeMessagesBatchInto;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
-import static org.apache.iggy.serde.BytesSerializer.toMessagesBatch;
 
 /**
  * Async TCP implementation of MessagesClient using Netty for non-blocking I/O.
@@ -183,17 +184,24 @@ public class MessagesTcpClient implements MessagesClient {
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
 
         var metadataLength = streamId.getSize() + topicId.getSize() + partitioning.getSize() + 4;
-        var batch = toMessagesBatch(messages);
-        var payload = Unpooled.buffer(4 + metadataLength + batch.readableBytes());
+        // The batch is encoded straight after the metadata rather than into its
+        // own buffer and copied over, which is the whole payload once per send.
+        var payload = Unpooled.buffer(4 + metadataLength);
 
-        payload.writeIntLE(metadataLength);
-        payload.writeBytes(toBytes(streamId));
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(partitioning));
-        payload.writeIntLE(messages.size());
-        payload.writeBytes(batch);
-
-        return connection().send(CommandCode.Messages.SEND.getValue(), payload).thenApply(response -> {
+        CompletableFuture<ByteBuf> sent;
+        try {
+            payload.writeIntLE(metadataLength);
+            writeAndRelease(payload, toBytes(streamId));
+            writeAndRelease(payload, toBytes(topicId));
+            writeAndRelease(payload, toBytes(partitioning));
+            payload.writeIntLE(messages.size());
+            encodeMessagesBatchInto(payload, messages);
+            sent = connection().send(CommandCode.Messages.SEND.getValue(), payload);
+        } catch (RuntimeException | Error error) {
+            payload.release();
+            throw error;
+        }
+        return sent.thenApply(response -> {
             try {
                 return BytesDeserializer.readSendMessagesResponse(response);
             } catch (RuntimeException e) {
@@ -206,6 +214,14 @@ public class MessagesTcpClient implements MessagesClient {
                 response.release();
             }
         });
+    }
+
+    private static void writeAndRelease(ByteBuf destination, ByteBuf source) {
+        try {
+            destination.writeBytes(source);
+        } finally {
+            source.release();
+        }
     }
 
     /**

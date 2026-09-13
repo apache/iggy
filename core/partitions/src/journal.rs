@@ -340,6 +340,17 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         self.evicted_ring_bytes_max.set(bytes_max);
     }
 
+    /// Entries and bytes the repair ring currently pins, for the shard sweep.
+    ///
+    /// Both ceilings are per partition, so an operator raising them is really
+    /// raising `partitions * bytes_max` of anonymous memory on every replica,
+    /// held beside the same bytes in page cache. The configured ceiling says
+    /// nothing about what is actually retained; this does.
+    pub fn evicted_ring_occupancy(&self) -> (usize, u64) {
+        let ring = unsafe { &*self.evicted_ring.get() };
+        (ring.len(), self.evicted_ring_bytes.get())
+    }
+
     /// Resident (un-evicted) entry count; diagnostics only.
     pub fn resident_count(&self) -> usize {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };

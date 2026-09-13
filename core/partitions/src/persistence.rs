@@ -108,6 +108,11 @@ pub struct PersistenceMetrics {
     pub checkpoints_pending: u64,
     pub completed_batches: u64,
     pub batched_prepares: u64,
+    /// Durable groups that took the optional pre-barrier wait. Zero while the
+    /// delay is disabled, and zero with it enabled means the arrival gap never
+    /// cleared the guard, so a group-size change measured against the delay
+    /// alone would be attributing something else.
+    pub group_commit_waits: u64,
     pub completed_checkpoints: u64,
     pub failed_writes: u64,
 }
@@ -160,6 +165,7 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     last_append: Cell<Option<Instant>>,
     completed_batches: Cell<u64>,
     batched_prepares: Cell<u64>,
+    group_commit_waits: Cell<u64>,
     completed_checkpoints: Cell<u64>,
     failed_writes: Cell<u64>,
 }
@@ -543,6 +549,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             last_append: Cell::new(None),
             completed_batches: Cell::new(0),
             batched_prepares: Cell::new(0),
+            group_commit_waits: Cell::new(0),
             completed_checkpoints: Cell::new(0),
             failed_writes: Cell::new(0),
         });
@@ -981,6 +988,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             checkpoints_pending: u64::from(self.checkpoint_pending()),
             completed_batches: self.completed_batches.replace(0),
             batched_prepares: self.batched_prepares.replace(0),
+            group_commit_waits: self.group_commit_waits.replace(0),
             completed_checkpoints: self.completed_checkpoints.replace(0),
             failed_writes: self.failed_writes.replace(0),
         }
@@ -1140,47 +1148,64 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 break;
             }
             if epoch == self.epoch.get() && !self.retired.get() {
-                let mut references = self.segment_references.borrow_mut();
-                if rebuild_references {
-                    references.clear();
-                    references.extend(journal.written_segment_references(0));
-                } else if let Some(from_op) = self.written_head.get().checked_add(1) {
-                    references.extend(journal.written_segment_references(from_op));
-                }
-                drop(references);
-                self.disk_bytes.set(journal.size_bytes());
-                self.retained_bytes.set(journal.retained_bytes());
-                self.segment_checkpoint.set(journal.segment_checkpoint());
-                let advanced = journal.durable_op() != self.durable_head.get()
-                    || journal.checkpoint_op() != self.checkpoint.get()
-                    || journal.certified_log_view() != self.certified_log_view.get()
-                    || (journal.segment_checkpoint().is_some()
-                        && journal.head() != self.written_head.get());
-                self.certified_log_view.set(journal.certified_log_view());
-                if self
-                    .requested_log_view
-                    .get()
-                    .is_some_and(|(view, _, _)| Some(view) == self.certified_log_view.get())
-                {
-                    self.requested_log_view.set(None);
-                }
-                self.written_head.set(journal.head());
-                self.durable_head.set(journal.durable_op());
-                if journal.checkpoint_op() > self.checkpoint.get() {
-                    self.accepted
-                        .borrow_mut()
-                        .checkpoint(journal.checkpoint_op());
-                }
-                self.checkpoint.set(journal.checkpoint_op());
-                self.checkpoint_checksum.set(journal.checkpoint_checksum());
-                self.purge_generation.set(journal.purge_marker().0);
-                self.purge_floor.set(journal.purge_marker().1);
-                if advanced {
-                    self.notify();
-                }
+                self.publish_mutation(journal, rebuild_references);
+            }
+            // After the notification, never before the barrier it would delay.
+            // A checkpoint queues the generation it replaced, so reclaiming it
+            // here keeps the unlinks and the directory barrier out of the
+            // acknowledgement the next append is waiting on, while still
+            // running once per mutation so a busy partition reclaims as
+            // promptly as an idle one.
+            if journal.has_obsolete() {
+                journal.reclaim_obsolete().await;
             }
         }
         guard.complete = true;
+    }
+
+    /// Republish what the completed mutation moved, and wake the partition when
+    /// any of it advanced. Runs only while the writer still owns this epoch: a
+    /// retired or re-epoched writer must not overwrite the state its successor
+    /// published.
+    fn publish_mutation(&self, journal: &PartitionPrepareJournal<S>, rebuild_references: bool) {
+        let mut references = self.segment_references.borrow_mut();
+        if rebuild_references {
+            references.clear();
+            references.extend(journal.written_segment_references(0));
+        } else if let Some(from_op) = self.written_head.get().checked_add(1) {
+            references.extend(journal.written_segment_references(from_op));
+        }
+        drop(references);
+        self.disk_bytes.set(journal.size_bytes());
+        self.retained_bytes.set(journal.retained_bytes());
+        self.segment_checkpoint.set(journal.segment_checkpoint());
+        let advanced = journal.durable_op() != self.durable_head.get()
+            || journal.checkpoint_op() != self.checkpoint.get()
+            || journal.certified_log_view() != self.certified_log_view.get()
+            || (journal.segment_checkpoint().is_some()
+                && journal.head() != self.written_head.get());
+        self.certified_log_view.set(journal.certified_log_view());
+        if self
+            .requested_log_view
+            .get()
+            .is_some_and(|(view, _, _)| Some(view) == self.certified_log_view.get())
+        {
+            self.requested_log_view.set(None);
+        }
+        self.written_head.set(journal.head());
+        self.durable_head.set(journal.durable_op());
+        if journal.checkpoint_op() > self.checkpoint.get() {
+            self.accepted
+                .borrow_mut()
+                .checkpoint(journal.checkpoint_op());
+        }
+        self.checkpoint.set(journal.checkpoint_op());
+        self.checkpoint_checksum.set(journal.checkpoint_checksum());
+        self.purge_generation.set(journal.purge_marker().0);
+        self.purge_floor.set(journal.purge_marker().1);
+        if advanced {
+            self.notify();
+        }
     }
 
     async fn apply_mutation(
@@ -1274,6 +1299,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         // interval between arrivals groups nothing and every prepare pays its
         // own writes. This wait puts that grouping back under operator control.
         if durable && let Some(delay) = self.group_commit_wait(&batch, bytes) {
+            self.group_commit_waits
+                .set(self.group_commit_waits.get() + 1);
             compio::runtime::time::sleep(delay).await;
             self.collect_queued(&mut batch, &mut bytes, &mut durable, epoch);
             self.in_flight_bytes.set(bytes);

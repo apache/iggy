@@ -1107,6 +1107,11 @@ where
             .map(|persistence| persistence.take_metrics())
     }
 
+    /// Entries and bytes this partition's repair ring pins right now.
+    pub fn repair_ring_occupancy(&self) -> (usize, u64) {
+        self.log.journal().inner.evicted_ring_occupancy()
+    }
+
     fn persistence_checkpoint_pending(&self) -> bool {
         self.persistence
             .as_ref()
@@ -2972,9 +2977,10 @@ where
     }
 
     /// Admit an automatic commit without advancing this read's progress.
-    /// `Some` carries an assigned prepare. `None` means the request is queued,
-    /// the durable offset already covers it, or the current consensus role or
-    /// state cannot originate a prepare. Errors release any provisional guard.
+    /// `Some` carries an assigned prepare. `None` means the request is queued
+    /// or the durable offset already covers it, both of which leave the
+    /// caller free to apply local progress. Errors release any provisional
+    /// guard.
     fn admit_poll_auto_commit(
         &self,
         kind: ConsumerKind,
@@ -2987,12 +2993,18 @@ where
         self.check_local_poll_key(kind, consumer_id)
             .map_err(|error| self.poll_capacity_error(error))?;
         let consensus = self.consensus();
-        if !consensus.is_primary()
-            || !consensus.is_normal()
-            || consensus.is_transferring()
-            || self
-                .durable_consumer_offsets
-                .covers(kind, consumer_id, offset)
+        // A replica that cannot originate the prepare cannot record this
+        // progress anywhere a peer will ever see. `Ok(None)` would leave
+        // `complete_poll` applying the offset to local state alone, so the
+        // poll would report progress the group never agreed, and a later
+        // read on the primary would hand the same messages out again.
+        // Refusing keeps the outcome retriable on a replica that can commit.
+        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        if self
+            .durable_consumer_offsets
+            .covers(kind, consumer_id, offset)
         {
             return Ok(None);
         }
@@ -3905,6 +3917,7 @@ where
             start_position,
             namespace_raw: self.namespace().inner(),
             validate_checksum,
+            bytes_per_message: self.mean_encoded_message_size(),
         };
         // Snapshot the resident journal tail now (on the pump, under the
         // borrow) so the straddle splice runs off-task on owned data with no
@@ -4119,6 +4132,18 @@ where
             .segments()
             .iter()
             .any(|segment| segment.size.as_bytes_u64() > 0)
+    }
+
+    /// Mean encoded bytes per committed message, including its share of the
+    /// batch headers, or `None` while the partition has committed nothing.
+    ///
+    /// Both counters are relaxed loads that retention also decrements, so this
+    /// is a hint and nothing reads it as a bound. Its one consumer sizes the
+    /// first read of a disk poll, where being wrong costs an extra read.
+    fn mean_encoded_message_size(&self) -> Option<u32> {
+        let messages = self.stats.messages_count_inconsistent();
+        let bytes = self.stats.size_bytes_inconsistent();
+        (messages > 0).then(|| u32::try_from(bytes / messages).unwrap_or(u32::MAX))
     }
 
     /// Starting `(segment index, byte position)` for a disk poll, resolved
@@ -12143,6 +12168,60 @@ mod tests {
         assert_eq!(partition.consensus.pipeline_len(), 0);
     }
 
+    /// A backup answering a read cannot originate the offset prepare, so
+    /// admitting the commit would advance local progress alone. The primary
+    /// would still hold the old offset and hand the same messages out again.
+    #[test]
+    fn given_backup_when_auto_commit_poll_completes_should_reject_without_progress() {
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let read_result = poll_read_result(&partition, consumer, true, Some(9));
+
+        assert!(matches!(
+            partition.complete_poll(read_result),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(partition.get_consumer_offset(consumer), None);
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+    }
+
+    /// An empty read never reaches automatic-commit admission and mutates no
+    /// progress, so the refusal above must not spread to it: a backup has to
+    /// keep answering the tail of a partition it is caught up on.
+    #[test]
+    fn given_backup_when_empty_auto_commit_poll_completes_should_be_accepted() {
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let read_result = poll_read_result(&partition, consumer, true, None);
+
+        let completion = partition
+            .complete_poll(read_result)
+            .expect("an empty read admits no commit");
+        assert!(completion.replication.is_none());
+        assert_eq!(partition.get_consumer_offset(consumer), None);
+    }
+
+    #[test]
+    fn given_primary_when_role_changes_before_auto_commit_completion_should_reject_without_progress()
+     {
+        for transferring in [false, true] {
+            let (mut partition, _) = recording_partition_at(0, 3);
+            let consumer = PollingConsumer::ConsumerGroup(7, 0);
+            let read_result = poll_read_result(&partition, consumer, true, Some(9));
+            if transferring {
+                partition.consensus.begin_state_transfer_await();
+            } else {
+                partition.consensus.begin_view_probe();
+            }
+            assert!(matches!(
+                partition.complete_poll(read_result),
+                Err(IggyError::TransientNotAccepted)
+            ));
+            assert_eq!(partition.group_offset_state(7), (None, None));
+            assert_eq!(partition.consensus.pipeline_len(), 0);
+        }
+    }
+
     #[test]
     fn given_group_read_without_auto_commit_when_history_changes_should_not_record_last_polled() {
         let (mut partition, _) = recording_partition();
@@ -12340,12 +12419,12 @@ mod tests {
         ));
     }
 
+    /// Disk reads of one group can finish out of order, and each carries its
+    /// own automatic commit. Both are admitted, so ordering has to be settled
+    /// where progress is recorded rather than by the order they complete in.
     #[test]
     fn given_group_reads_completing_in_reverse_order_should_keep_progress_monotone() {
-        // A backup accepts local poll progress without assigning replication.
-        let backup_replica = 1;
-        let replica_count = 3;
-        let (mut partition, _) = recording_partition_at(backup_replica, replica_count);
+        let (mut partition, _) = recording_partition_at(0, 3);
         let group_id = 7;
         let member_id = 1;
         let auto_commit = true;
@@ -12359,11 +12438,15 @@ mod tests {
                 .complete_poll(later_result)
                 .expect("accept later poll")
                 .replication
-                .is_none()
+                .is_some()
         );
-        partition
-            .complete_poll(earlier_result)
-            .expect("accept earlier poll");
+        assert!(
+            partition
+                .complete_poll(earlier_result)
+                .expect("accept earlier poll")
+                .replication
+                .is_some()
+        );
         let (last_polled, committed) = partition.group_offset_state(group_id as u64);
         assert_eq!(
             last_polled,
@@ -12375,7 +12458,7 @@ mod tests {
             Some(9),
             "the slower read must not rewind its offset"
         );
-        assert_eq!(partition.consensus.pipeline_len(), 0);
+        assert_eq!(partition.consensus.pipeline_len(), 2);
     }
 
     #[test]
@@ -13818,6 +13901,7 @@ mod tests {
         // open exhausts retries -> the walk must fault-close before segment two.
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![
                 DiskSegment {
@@ -13849,6 +13933,77 @@ mod tests {
             matches!(outcome, DiskReadOutcome::Faulted),
             "unreadable first segment must fault-close, not skip forward to the later segment",
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sizing the first read from the requested count makes it routinely
+    /// narrower than one batch, which the walk answers by re-reading the same
+    /// position four times as wide. A partition whose mean message is small
+    /// and whose next batch is not must still serve that batch.
+    #[compio::test]
+    async fn read_disk_serves_a_batch_wider_than_the_sized_chunk() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-wide-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let payload = Bytes::from(vec![0x5Au8; 256 << 10]);
+        let record = build_segment_record_with_payload(namespace, 0, payload.clone());
+        let record_len = record.len() as u64;
+        let path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&path)
+                .await
+                .expect("create segment file");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment file");
+        }
+
+        // One byte per message floors the first read at 64 KiB, a quarter of
+        // the batch waiting at offset 0.
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir),
+            bytes_per_message: Some(1),
+            validate_checksum: true,
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: SealedSegmentHandle::default(),
+                sealed: false,
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+
+        let DiskReadOutcome::Matched {
+            fragments, matched, ..
+        } = outcome
+        else {
+            panic!("a batch wider than the first read must still be served");
+        };
+        assert_eq!(matched, 1);
+        let served: u64 = fragments.iter().map(|fragment| fragment.len() as u64).sum();
+        assert_eq!(served, record_len);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13906,6 +14061,7 @@ mod tests {
 
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![
                 DiskSegment {
@@ -13981,6 +14137,7 @@ mod tests {
 
         let plan = |validate_checksum| DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14020,6 +14177,7 @@ mod tests {
     async fn read_disk_serves_journal_when_partition_has_no_files() {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
+            bytes_per_message: None,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
@@ -14052,6 +14210,7 @@ mod tests {
     async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Unresolvable,
+            bytes_per_message: None,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
@@ -14119,6 +14278,7 @@ mod tests {
 
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14151,6 +14311,7 @@ mod tests {
 
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14212,6 +14373,7 @@ mod tests {
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14297,6 +14459,7 @@ mod tests {
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14397,6 +14560,7 @@ mod tests {
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14475,6 +14639,7 @@ mod tests {
         let handle = Rc::clone(&partition.log.sealed_read_state()[0]);
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14524,6 +14689,7 @@ mod tests {
         // unlinked pre-purge inode.
         let resumed = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,

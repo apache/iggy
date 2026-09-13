@@ -912,6 +912,9 @@ clients_table_max = 8192
 # completed batch, prepare, checkpoint and error counters.
 # partition_wal_retained_bytes plus queued_bytes and in_flight_bytes measures budget usage;
 # partition_wal_disk_bytes measures WAL file length, excluding referenced segment bodies.
+# partition_wal_prepares over partition_wal_batches is the prepares per durable group, and
+# partition_wal_group_commit_waits counts the groups that actually took the optional wait
+# below, so a delay that never fires is distinguishable from one that fires and buys nothing.
 wal_bytes_max = "256 MiB"
 
 # Bounded wait for more prepares before a persisted partition's WAL writer
@@ -998,6 +1001,10 @@ evicted_ring_capacity = 4096
 # Byte ceiling for the evicted ring per partition; whichever ring cap (this or
 # evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
 # large batches can pin. Must be > 0 and <= "256 MiB".
+# PER PARTITION and per replica, so the node-wide ceiling is this times the partitions it
+# hosts, pinned as anonymous memory beside the same bytes in page cache. Raising it on a
+# node with many partitions is a large memory decision; partition_repair_ring_bytes on the
+# metrics endpoint reports what the rings on each shard actually hold.
 evicted_ring_bytes_max = "16 MiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer

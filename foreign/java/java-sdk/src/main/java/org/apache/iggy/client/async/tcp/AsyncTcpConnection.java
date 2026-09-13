@@ -37,6 +37,7 @@ import io.netty.channel.pool.AbstractChannelPoolHandler;
 import io.netty.channel.pool.ChannelHealthChecker;
 import io.netty.channel.pool.FixedChannelPool;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.flush.FlushConsolidationHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
@@ -99,6 +100,13 @@ public class AsyncTcpConnection {
     static final int TRANSIENT_NOT_ACCEPTED = 58;
     // The pool holds one channel, and one channel lives on one loop.
     static final int DEFAULT_IO_THREADS = 1;
+    /**
+     * Writes consolidated into one flush inside a read loop. Netty's own
+     * default, which is tuned for exactly this shape: several requests written
+     * while one batch of replies is being dispatched.
+     */
+    private static final int FLUSH_CONSOLIDATION_MAX = 256;
+
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
     // A missing reply must not hold the single VSR-pinned channel forever.
@@ -1031,6 +1039,14 @@ public class AsyncTcpConnection {
                 ssl.setHandshakeTimeoutMillis(dialTimeoutMillis);
                 pipeline.addLast("ssl", ssl);
             }
+            // A pipelining producer's next request is usually written from the
+            // completion of the previous reply, so its flush lands inside the
+            // read loop that delivered it and several requests leave in one
+            // syscall instead of one each. Consolidation is confined to that
+            // read loop: with no read in progress every flush passes straight
+            // through, so a request on an otherwise idle connection is never
+            // waiting on later traffic to push it out.
+            pipeline.addLast("flushConsolidation", new FlushConsolidationHandler(FLUSH_CONSOLIDATION_MAX, false));
             pipeline.addLast("frameDecoder", new VsrFrameDecoder(maxVsrFrameSize));
             pipeline.addLast("responseHandler", new VsrResponseHandler(consensusSession, onEviction));
         }

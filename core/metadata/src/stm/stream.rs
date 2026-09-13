@@ -1586,11 +1586,8 @@ impl Streams {
             let stream = inner.items.get(stream_id)?;
             let topic = stream.topics.get(topic_id)?;
             let partition_id = usize::try_from(partition_id).ok()?;
-            topic
-                .partitions
-                .iter()
-                .any(|partition| partition.id == partition_id)
-                .then(|| IggyNamespace::new(stream_id, topic_id, partition_id))
+            find_partition(&topic.partitions, partition_id)
+                .map(|_| IggyNamespace::new(stream_id, topic_id, partition_id))
         })
     }
 
@@ -1632,17 +1629,7 @@ impl Streams {
         self.inner.read(|inner| {
             let stream = inner.items.get(namespace.stream_id())?;
             let topic = stream.topics.get(namespace.topic_id())?;
-            let partition_id = namespace.partition_id();
-            if let Some(partition) = topic.partitions.get(partition_id)
-                && partition.id == partition_id
-            {
-                return Some(read(partition));
-            }
-            topic
-                .partitions
-                .iter()
-                .find(|partition| partition.id == partition_id)
-                .map(read)
+            find_partition(&topic.partitions, namespace.partition_id()).map(read)
         })
     }
 
@@ -1838,6 +1825,22 @@ impl Streams {
 /// replicas disagree about their TOML.
 const fn admits_slab_key(vacant_key: usize, ceiling: usize) -> bool {
     vacant_key < ceiling
+}
+
+/// The partition carrying `partition_id`, or `None` when the topic has none.
+///
+/// A primary mints dense 0-based ids, so the vector index IS the id and the
+/// direct hit answers every ordinary topic. The scan exists only for a vector
+/// left sparse by a partition delete, where an index no longer names its id.
+fn find_partition(partitions: &[Partition], partition_id: usize) -> Option<&Partition> {
+    if let Some(partition) = partitions.get(partition_id)
+        && partition.id == partition_id
+    {
+        return Some(partition);
+    }
+    partitions
+        .iter()
+        .find(|partition| partition.id == partition_id)
 }
 
 /// Range and distinctness for the ABSOLUTE partition ids on a topic create,
@@ -4226,6 +4229,37 @@ mod tests {
             .find(|partition| partition.id == partition_id)
             .expect("committed partition")
             .clone()
+    }
+
+    /// A delete leaves every surviving id above the hole naming an index that
+    /// is no longer its own, so the direct hit has to fall through to the scan
+    /// or the survivor resolves to nothing and its namespace stops routing.
+    #[test]
+    fn given_sparse_partition_ids_when_resolving_should_fall_back_to_the_scan() {
+        let inner = inner_with_registered_partition();
+        let template = committed_partition(&inner, 0, 0, 0);
+        let partition = |id| Partition {
+            id,
+            ..template.clone()
+        };
+        let dense = vec![partition(0), partition(1)];
+        let sparse = vec![partition(3), partition(7)];
+
+        assert_eq!(
+            find_partition(&dense, 1).map(|partition| partition.id),
+            1.into()
+        );
+        assert_eq!(
+            find_partition(&sparse, 3).map(|partition| partition.id),
+            3.into()
+        );
+        assert_eq!(
+            find_partition(&sparse, 7).map(|partition| partition.id),
+            7.into()
+        );
+        assert!(find_partition(&sparse, 0).is_none());
+        assert!(find_partition(&sparse, 1).is_none());
+        assert!(find_partition(&dense, 2).is_none());
     }
 
     /// A checkpoint reads a stream's total and each of its topics' as separate
