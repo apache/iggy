@@ -25,7 +25,7 @@ pub(crate) enum PersonalAccessTokenAction {
     ///
     /// Create personal access token which allow authenticating the clients using
     /// a token, instead of the regular credentials (username and password)
-    /// In quiet mode only the personal access token name is printed
+    /// In quiet mode the raw token is printed unless --store-token is set
     ///
     /// Examples
     ///  iggy pat create name
@@ -63,7 +63,7 @@ pub(crate) struct PersonalAccessTokenCreateArgs {
     /// Generated token is stored in a platform-specific secure storage without revealing
     /// its content to the user. It can be used to authenticate on iggy server using
     /// associated name and -n/--token-name command line option instead of -u/--username
-    /// and -p/--password or -t/--token. In quiet mode only the token name is printed.
+    /// and -p/--password or -t/--token. Quiet mode prints no token or confirmation.
     /// This option can only be used for creating tokens which does not have expiry time set.
     #[clap(short, long, default_value_t = false, group = "store")]
     pub(crate) store_token: bool,

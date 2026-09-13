@@ -39,13 +39,15 @@ import java.util.Optional;
  * <p>Demonstrates consuming messages over a TLS-encrypted TCP connection
  * using custom certificates from core/certs/.
  *
- * <p>Prerequisites: Start the Iggy server with TLS enabled:
+ * <p>Start a disposable server from the repository root with no root credential overrides:
  * <pre>
  *   IGGY_TCP_TLS_ENABLED=true \
  *   IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
  *   IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
- *   cargo r --bin iggy-server
+ *   cargo run --bin iggy-server -- --fresh --with-default-root-credentials
  * </pre>
+ * <p>The fresh flag clears local replica data. Run the client from examples/java
+ * so its development CA certificate path resolves.
  */
 public final class TcpTlsConsumer {
 
@@ -115,12 +117,11 @@ public final class TcpTlsConsumer {
                 }
 
                 for (Message message : polledMessages.messages()) {
-                    handleMessage(message, offset);
+                    handleMessage(message, message.header().offset());
+                    offset = message.header().offset().add(BigInteger.ONE);
                 }
 
                 consumedBatches++;
-
-                offset = offset.add(BigInteger.valueOf(polledMessages.messages().size()));
 
                 Thread.sleep(INTERVAL_MS);
 

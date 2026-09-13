@@ -26,6 +26,7 @@ pub mod fs_utils;
 pub mod iobuf;
 pub mod log;
 mod memory_pool;
+pub mod poll;
 mod reactor_yield;
 mod segment_storage;
 pub mod send_messages;

@@ -1,0 +1,3128 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The listener every instance of this plugin shares, and the request path.
+//!
+//! One `.so` is loaded once no matter how many `[[source]]` entries reference
+//! it, so the listeners live in a process-global registry keyed by listen
+//! address rather than on any one instance. The first `open()` binds; later
+//! ones validate their config against the running server and join; the last
+//! `close()` releases the ports, which the runtime's stop-then-start restart
+//! flow depends on.
+
+use arc_swap::{ArcSwap, Guard};
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, serve};
+use iggy_common::{HeaderKey, HeaderValue};
+use iggy_connector_sdk::Error;
+use rand::RngExt;
+use ring::hmac;
+use secrecy::SecretString;
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex, Notify, watch};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, warn};
+
+use crate::auth::{
+    MAX_AUTH_SECRET_LEN, MAX_HMAC_HEADER_LEN, MAX_HMAC_PREFIX_LEN, is_usable_secret, secrets_match,
+    validate_bearer, validate_hmac,
+};
+use crate::management::MAX_REVOKE_REASON_LEN;
+use crate::metrics::{Metrics, PathKind, UNROUTED};
+use crate::routes::{Endpoint, EndpointOrigin, RouteLookup, RouteTable};
+use crate::types::{MAX_HEADER_VALUE_BYTES, QueuedMessage, clamp_header_value, unix_now_seconds};
+use crate::{CONNECTOR_NAME, EndpointAuthType, HttpSourceConfig, SharedState, management};
+
+/// Iggy header carrying the instance an accepted request was routed to.
+pub const INSTANCE_HEADER: &str = "iggy_source_instance";
+/// Iggy header carrying the peer address the request arrived from.
+pub const REMOTE_ADDR_HEADER: &str = "iggy_http_remote_addr";
+/// Iggy header carrying accept time, in microseconds since the Unix epoch.
+pub const RECEIVED_AT_HEADER: &str = "iggy_http_received_at";
+
+/// How long the last `close()` waits for in-flight requests before abandoning
+/// the listener tasks. Bounded so a wedged connection cannot stall shutdown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `Retry-After` on a 429, in seconds. Named because a test asserts it and a
+/// bare literal in two places drifts.
+const RETRY_AFTER_SECONDS: &str = "1";
+
+/// Worst case growth from JSON escaping, where one byte becomes `\u00XX`.
+///
+/// The field caps are on decoded bytes, so the JSON carrying a legal value can
+/// be this much larger than the value itself.
+const JSON_ESCAPE_EXPANSION: usize = 6;
+
+/// Largest body the admin listener will read.
+///
+/// Its own ceiling rather than `max_body_size_bytes`, which bounds an inbound
+/// webhook and has a floor of 1. Sharing it meant any small webhook cap made
+/// registration and rotation impossible, answering `invalid request body`
+/// while naming neither the field nor the cause, and `ensure_compatible`
+/// refuses a join that disagrees on that knob, so it could not be raised for
+/// one instance to get out of it either. Rotation is the one that matters:
+/// `RotateRequest` carries only `auth_secret`, so what a low cap blocked was
+/// replacing a secret that had leaked.
+///
+/// Derived rather than picked, so raising a field cap cannot quietly
+/// reintroduce that. A registration is the largest legal body, though not by
+/// much: a rotation carrying a maximal `auth_secret` is within a fifth of it.
+/// Every capped field the admin listener accepts is in the sum regardless, the
+/// revoke reason included, or raising that one cap would be exactly the gap
+/// this derivation exists to close. The kilobyte on top covers field names and
+/// punctuation.
+///
+/// `instance` is bounded by the same 255 as any other Iggy header value, which
+/// is what it becomes: it travels under the fixed `iggy_source_instance` key.
+const MAX_ADMIN_BODY_SIZE_BYTES: usize = JSON_ESCAPE_EXPANSION
+    * (MAX_AUTH_SECRET_LEN
+        + MAX_HMAC_HEADER_LEN
+        + MAX_HMAC_PREFIX_LEN
+        + MAX_HEADER_VALUE_BYTES
+        + MAX_REVOKE_REASON_LEN)
+    + 1024;
+
+/// How long a `join()` waits for a draining listener to release its address.
+/// Longer than [`SHUTDOWN_TIMEOUT`], since the drain it is waiting on is
+/// itself bounded by that.
+const DRAIN_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Registers an instance with the listener for its configured address,
+/// binding that listener if this is the first instance to ask for it.
+pub async fn join(instance: Arc<SharedState>) -> Result<(), Error> {
+    let listen_addr = instance.config.listen_addr.clone();
+    let mut servers = SERVERS.lock().await;
+
+    if let Some(server) = servers.get_mut(&listen_addr) {
+        if server.draining {
+            // A sibling is mid-shutdown. Failing here turns two concurrent
+            // restarts on one listener into one instance left stopped, so wait
+            // for the entry to go and try again. The waiter is enrolled before
+            // the guard is released, or the notify could fire into the gap and
+            // be missed.
+            let drained = Arc::clone(&server.drained);
+            let mut waiter = Box::pin(drained.notified());
+            waiter.as_mut().enable();
+            drop(servers);
+            if tokio::time::timeout(DRAIN_WAIT_TIMEOUT, waiter)
+                .await
+                .is_err()
+            {
+                return Err(Error::InitError(format!(
+                    "The {CONNECTOR_NAME} listener on {listen_addr} was still shutting down after {}s; retry the open once its port is released",
+                    DRAIN_WAIT_TIMEOUT.as_secs()
+                )));
+            }
+            return Box::pin(join(instance)).await;
+        }
+        server.ensure_compatible(&instance.config)?;
+        let mut instances = server.state.instances();
+        // Names address instances in the management API and label every
+        // metric series, so a duplicate would silently route registrations to
+        // whichever instance happens to sit first in the list. Both are scoped
+        // to this listener, which is why the check is too.
+        if instances
+            .iter()
+            .any(|joined| joined.instance_name == instance.instance_name)
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "instance_name '{}' is already used by another instance on {listen_addr}",
+                instance.instance_name
+            )));
+        }
+        instances.push(Arc::clone(&instance));
+        server.state.publish(instances)?;
+        info!(
+            "Joined {CONNECTOR_NAME} connector ID: {} to the listener on {listen_addr}",
+            instance.id
+        );
+        return Ok(());
+    }
+
+    // Build the routes before binding: a config that cannot produce a valid
+    // table must not leave a port bound behind it.
+    let state = Arc::new(ServerState::new(&instance.config));
+    state.publish(vec![Arc::clone(&instance)])?;
+    let server = SharedServer::start(&instance.config, state).await?;
+    servers.insert(listen_addr.clone(), server);
+    info!(
+        "Bound the {CONNECTOR_NAME} listener on {listen_addr} for connector ID: {}, admin listener on {}",
+        instance.id, instance.config.admin_listen_addr
+    );
+    Ok(())
+}
+
+/// Deregisters an instance's routes, and shuts the listeners down once the
+/// last instance has left.
+///
+/// `staged_dropped` is folded into the same shutdown loss metric as whatever
+/// is still queued in the bridge.
+pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
+    let listen_addr = &instance.config.listen_addr;
+    let mut servers = SERVERS.lock().await;
+    let Some(server) = servers.get_mut(listen_addr) else {
+        return;
+    };
+
+    let joined = server.state.instances();
+    if !joined.iter().any(|candidate| candidate.id == instance.id) {
+        // `SourceContainer::open` keeps the source even when `open()` failed,
+        // and stop closes unconditionally, so this runs for instances that
+        // never joined. Tearing down on their behalf rebuilds the route table
+        // for nothing and logs a deregistration that never happened.
+        //
+        // Deliberately untested, because the effects are not observable. The
+        // republished route set is unchanged, and the sampled gauges are
+        // rebuilt from the live instances on every scrape. A test written
+        // against those would pass with this guard removed.
+        return;
+    }
+
+    let remaining: Vec<Arc<SharedState>> = joined
+        .into_iter()
+        .filter(|candidate| candidate.id != instance.id)
+        .collect();
+    if let Err(error) = server.state.publish(remaining) {
+        // Dropping an instance cannot introduce a collision, so this is
+        // unreachable; serve nothing rather than stale routes if it happens.
+        error!(
+            "Failed to rebuild {CONNECTOR_NAME} routes after connector ID: {} left. {error}",
+            instance.id
+        );
+        server.state.serve_nothing();
+    }
+    // Read back rather than trusting the vec we hoped to publish, so the count
+    // describes what is actually being served. It is not what keeps the
+    // listener from leaking: `publish` is all-or-nothing, so on its failure
+    // branch the departed instance is still in `instances` either way. What
+    // makes that branch unreachable is that `remaining` is a subset of a table
+    // that already built, and dropping entries cannot introduce a path
+    // collision.
+    let remaining_count = server.state.instances().len();
+    info!(
+        "Deregistered {CONNECTOR_NAME} routes for connector ID: {}, instances left on {listen_addr}: {remaining_count}",
+        instance.id
+    );
+
+    // Flagged before the count, so a handler that got past the re-resolve gate
+    // and is still assembling its message sees this after its `try_send` and
+    // answers 503 rather than 200. Counting alone could not close that window:
+    // a message landing after this read is unreachable and the sender had
+    // already been told it was queued.
+    instance.mark_departed();
+    // The SDK stops the poll task before close(), so whatever is queued here is
+    // unreachable either way.
+    let dropped = instance.sender.len() as u64 + staged_dropped;
+    if dropped > 0 {
+        warn!(
+            "Dropped {dropped} queued messages closing {CONNECTOR_NAME} connector ID: {}",
+            instance.id
+        );
+        server
+            .state
+            .metrics
+            .record_dropped_on_close(&instance.instance_name, dropped);
+    }
+
+    if remaining_count == 0 {
+        // Mark the entry draining and take the tasks, but leave the entry in
+        // place while releasing the guard. Holding it across shutdown would
+        // deadlock against an in-flight management request parked on this
+        // lock; removing it outright would let a concurrent `join()` bind a
+        // port the listener is still draining. The tombstone does neither.
+        server.draining = true;
+        let signal = server.shutdown.clone();
+        let tasks = std::mem::take(&mut server.tasks);
+        drop(servers);
+
+        SharedServer::stop(signal, tasks, listen_addr).await;
+        let removed = SERVERS.lock().await.remove(listen_addr);
+        // After the removal, so a woken `join()` re-reads a map that no longer
+        // holds the drained entry and binds fresh.
+        if let Some(removed) = removed {
+            removed.drained.notify_waiters();
+        }
+    }
+}
+
+/// Every listener this process has bound, keyed by public listen address.
+///
+/// An async mutex because the guard is held across the bind and across the
+/// graceful shutdown await. Both are open/close operations, never requests.
+static SERVERS: LazyLock<Mutex<HashMap<String, SharedServer>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct SharedServer {
+    state: Arc<ServerState>,
+    shutdown: watch::Sender<()>,
+    tasks: Vec<JoinHandle<()>>,
+    /// Set while the listener is draining. The entry stays in the registry so
+    /// a concurrent `join()` cannot bind a port that is still held, but it can
+    /// no longer be joined.
+    draining: bool,
+    /// Fired once the drained entry has been removed from the registry, so a
+    /// `join()` that arrived mid-drain can retry instead of failing.
+    drained: Arc<Notify>,
+}
+
+/// The instance set and the routes serving it, published as one value so no
+/// reader can see them disagree.
+///
+/// The routes project only the instances that have polled, so `instances` is
+/// the wider of the two: an instance appears there from the moment it joins,
+/// and in `routes` from its first poll.
+#[derive(Debug, Default)]
+pub(crate) struct Published {
+    pub(crate) instances: Vec<Arc<SharedState>>,
+    pub(crate) routes: RouteTable,
+}
+
+impl Published {
+    /// Whether this listener should be taking traffic: a route can reach an
+    /// instance, and every instance that has started polling still is.
+    ///
+    /// Every such instance, not any. One load balancer fronts the whole
+    /// listener, so it can only take all of them in or out together. If one
+    /// instance's poll task has stopped while a sibling's is alive, `any` keeps
+    /// the address in rotation and the dead one's webhooks are accepted into a
+    /// bridge nobody drains, which is the exact failure this gate exists to
+    /// catch. Shedding the healthy sibling's traffic too costs availability
+    /// that senders recover by retrying; the alternative loses data already
+    /// answered 200.
+    ///
+    /// An instance that has never polled is not counted, because it is not the
+    /// same condition. `poll_is_live` is false both for a task that has stopped
+    /// and for one that has not started, and counting the second took every
+    /// healthy instance on a listener out of rotation for as long as one
+    /// restarting sibling spent setting up its producer. It contributes no
+    /// routes until it polls either, so nothing is accepted on its behalf in
+    /// the meantime, which is what makes ignoring it safe rather than merely
+    /// convenient.
+    ///
+    /// No separate emptiness check: routes are projected only from instances
+    /// that have polled, so `serves_anything` already answers false for a
+    /// listener where none has.
+    ///
+    /// Computed here so `/health` and `/admin/health` cannot answer differently
+    /// about the same listener, which is the one moment an operator reads both.
+    pub(crate) fn is_ready(&self, now_seconds: u64) -> bool {
+        self.routes.serves_anything(now_seconds)
+            && self
+                .instances
+                .iter()
+                .filter(|instance| instance.has_polled())
+                .all(|instance| instance.poll_is_live(now_seconds))
+    }
+}
+
+/// The part of a shared server the request handlers see.
+#[derive(Debug)]
+pub(crate) struct ServerState {
+    pub(crate) listen_addr: String,
+    /// Taken from the first instance to bind, like `management_token`.
+    /// `ensure_compatible` refuses a join that disagrees, so it is unambiguous.
+    pub(crate) admin_listen_addr: String,
+    /// Taken from the first instance to bind, like `management_token`.
+    /// `ensure_compatible` refuses a join that disagrees, so it is unambiguous.
+    /// Held here so a handler can read the body itself, after authorizing,
+    /// rather than letting an extractor buffer it first.
+    pub(crate) max_body_size_bytes: usize,
+    /// Taken from the first instance to bind. Every instance joining the same
+    /// listener must present the same token, so this is unambiguous.
+    pub(crate) management_token: Option<SecretString>,
+    pub(crate) metrics: Metrics,
+    /// Instances and the table built from them, swapped together.
+    ///
+    /// Two `ArcSwap`s let a reader land between the stores and resolve a
+    /// request against the old table while holding the new instance set, which
+    /// on a departure means routing into a bridge nobody drains. One swap makes
+    /// that unrepresentable rather than merely narrow.
+    published: ArcSwap<Published>,
+    started_at: Instant,
+}
+
+impl ServerState {
+    pub(crate) fn new(config: &HttpSourceConfig) -> Self {
+        ServerState {
+            listen_addr: config.listen_addr.clone(),
+            admin_listen_addr: config.admin_listen_addr.clone(),
+            max_body_size_bytes: config.max_body_size_bytes,
+            management_token: config.management_token.clone(),
+            metrics: Metrics::new(),
+            published: ArcSwap::from_pointee(Published::default()),
+            started_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn instances(&self) -> Vec<Arc<SharedState>> {
+        self.published.load().instances.clone()
+    }
+
+    /// One consistent view of both. Callers that need the instance set and the
+    /// routes to agree must read them from a single guard, not two loads.
+    pub(crate) fn published(&self) -> Guard<Arc<Published>> {
+        self.published.load()
+    }
+
+    pub(crate) fn instance(&self, instance_name: &str) -> Option<Arc<SharedState>> {
+        self.published()
+            .instances
+            .iter()
+            .find(|instance| instance.instance_name == instance_name)
+            .map(Arc::clone)
+    }
+
+    /// Serves nothing until the next successful publish. Used when a mutation
+    /// removes access but the table cannot be rebuilt: stale routes would keep
+    /// honouring a credential the operator believes is gone.
+    pub(crate) fn serve_nothing(&self) {
+        // `rcu`, not load-then-store. A `publish()` from join or leave landing
+        // between the two would be discarded, and because this keeps the
+        // instance set it would leave the listener bound and serving nothing
+        // with no record of the publish that went missing.
+        let dropped = self.published.rcu(|current| {
+            // Instances are kept: they are still joined and still own bridges,
+            // and it is only the routing that is being withdrawn.
+            Arc::new(Published {
+                instances: current.instances.clone(),
+                routes: RouteTable::default(),
+            })
+        });
+        error!(
+            "Serving no {CONNECTOR_NAME} routes on {}: dropped {} secret paths and {} named paths across {} instances until the next successful publish",
+            self.listen_addr,
+            dropped.routes.secret_path_count(),
+            dropped.routes.named_path_count(),
+            dropped.instances.len()
+        );
+    }
+
+    /// Swaps in a new instance set with the routes of those that can drain,
+    /// or leaves both untouched if the instances collide on a path.
+    ///
+    /// Two builds on purpose. The first is the check, and it has to see every
+    /// instance: a conflict between a joining instance and a sibling must
+    /// refuse the join, not lie dormant until the offender first polls and the
+    /// table suddenly fails to rebuild. The second is what gets served, and it
+    /// leaves out instances whose poll task has not started, because a route
+    /// to one of those accepts requests into a bridge with no reader.
+    ///
+    /// Neither build is on a request path. Both run on join, on leave, on a
+    /// management mutation, and on an instance's first poll.
+    fn publish(&self, instances: Vec<Arc<SharedState>>) -> Result<(), Error> {
+        RouteTable::build(&instances)
+            .map_err(|conflict| Error::InvalidConfigValue(conflict.to_string()))?;
+        let serving: Vec<Arc<SharedState>> = instances
+            .iter()
+            .filter(|instance| instance.has_polled())
+            .map(Arc::clone)
+            .collect();
+        let routes = RouteTable::build(&serving)
+            .map_err(|conflict| Error::InvalidConfigValue(conflict.to_string()))?;
+        self.published
+            .store(Arc::new(Published { instances, routes }));
+        Ok(())
+    }
+}
+
+/// Publishes an instance's routes, once its poll task is running and there is
+/// something to drain them.
+///
+/// Separate from `join` deliberately: see the call site in `poll()`. Failure is
+/// logged rather than returned, because the caller is a poll that has already
+/// started and has no way to refuse. A conflict here cannot be new, since
+/// `join` validated the same instance set against the same siblings.
+pub(crate) async fn serve_routes(instance: &Arc<SharedState>) {
+    let listen_addr = &instance.config.listen_addr;
+    let servers = SERVERS.lock().await;
+    // Claimed here, under the guard, rather than by the caller before it. The
+    // only suspension point on this path is the lock above, so the flag cannot
+    // be set by a poll that never reached the publish.
+    //
+    // Claimed before the lock, a cancelled poll left it set with nothing
+    // published, and two things followed. The sibling whose `publish` this
+    // call was queued behind read the flag and served the cancelled instance's
+    // routes on its behalf, so `enqueue` answered 200 into a bridge with no
+    // reader. And `PollGuard::drop` stamped `last_poll_at` on the way out, so
+    // the instance then read as one whose poll task had stopped rather than
+    // one that never started, and the readiness gate took its healthy siblings
+    // to 503 for it. Not a retry: the only thing that drops this future is
+    // shutdown, and the SDK breaks its loop on the same branch.
+    //
+    // Putting the flip and the publish in one critical section is what lets
+    // `Published::is_ready` say without qualification that a route cannot
+    // exist before something can drain it. The other half of that gate, an
+    // instance never counting as live before it has polled, rests on
+    // `poll_active` being set before any of this rather than on the lock.
+    if !instance.claim_first_poll() {
+        return;
+    }
+    let Some(server) = servers.get(listen_addr) else {
+        // Not reachable through the ordinary lifecycle: this instance joined
+        // during `open`, an entry only leaves `SERVERS` when its last instance
+        // does, and the SDK stops the poll task before `close`. Said out loud
+        // anyway, because the state it describes is an instance whose poll
+        // task is running against a listener that is no longer bound, and it
+        // will serve nothing for as long as it lives. Returning quietly would
+        // leave no trace of that at all.
+        warn!(
+            "The {CONNECTOR_NAME} listener on {listen_addr} was gone when connector ID: {} first polled, so it has no routes to serve",
+            instance.id
+        );
+        return;
+    };
+    if let Err(error) = server.state.publish(server.state.instances()) {
+        error!(
+            "Could not publish the routes of {CONNECTOR_NAME} connector ID: {} on its first poll: {error}",
+            instance.id
+        );
+        return;
+    }
+    info!(
+        "Serving the routes of {CONNECTOR_NAME} connector ID: {} on {listen_addr}, its poll task is running",
+        instance.id
+    );
+}
+
+/// Reprojects a listener's route table after a management mutation.
+///
+/// Takes `SERVERS` - the listener map, not the per-instance registry gate,
+/// which the caller has already released. A mutation and a join can therefore
+/// still interleave; that is safe because the rebuild reprojects from whatever
+/// instance set is current rather than patching the previous table.
+///
+/// Blocking on the registry here is safe because `leave()` releases it before
+/// awaiting graceful shutdown; holding it across that await would deadlock,
+/// since shutdown waits for the very request that is parked here.
+pub(crate) async fn refresh_routes(listen_addr: &str) -> Result<(), Error> {
+    let servers = SERVERS.lock().await;
+    let Some(server) = servers.get(listen_addr) else {
+        return Err(Error::InitError(format!(
+            "No {CONNECTOR_NAME} listener is bound to {listen_addr}"
+        )));
+    };
+    server.state.publish(server.state.instances())
+}
+
+impl SharedServer {
+    async fn start(config: &HttpSourceConfig, state: Arc<ServerState>) -> Result<Self, Error> {
+        let public = bind("listen_addr", &config.listen_addr).await?;
+        let admin = bind("admin_listen_addr", &config.admin_listen_addr).await?;
+        let (shutdown, _) = watch::channel(());
+
+        // The one place this plugin owns background tasks. The runtime cannot
+        // drive an HTTP listener for us, so the last close() shuts them down
+        // explicitly rather than leaving them to outlive the connector.
+        let tasks = vec![
+            tokio::spawn(run(
+                public,
+                public_router(Arc::clone(&state)),
+                shutdown.subscribe(),
+                "public",
+            )),
+            tokio::spawn(run(
+                admin,
+                admin_router(state.clone()),
+                shutdown.subscribe(),
+                "admin",
+            )),
+        ];
+
+        Ok(SharedServer {
+            state,
+            shutdown,
+            tasks,
+            draining: false,
+            drained: Arc::new(Notify::new()),
+        })
+    }
+
+    /// Refuses a join whose settings disagree with the running listener.
+    ///
+    /// Fails closed on purpose: first-instance-wins would leave an operator
+    /// with a body limit or admin address their TOML says they do not have.
+    fn ensure_compatible(&self, config: &HttpSourceConfig) -> Result<(), Error> {
+        if self.state.admin_listen_addr != config.admin_listen_addr {
+            return Err(Error::InvalidConfigValue(format!(
+                "admin_listen_addr '{}' does not match '{}' on the listener already bound to {}",
+                config.admin_listen_addr, self.state.admin_listen_addr, config.listen_addr
+            )));
+        }
+        if self.state.max_body_size_bytes != config.max_body_size_bytes {
+            return Err(Error::InvalidConfigValue(format!(
+                "max_body_size_bytes {} does not match {} on the listener already bound to {}",
+                config.max_body_size_bytes, self.state.max_body_size_bytes, config.listen_addr
+            )));
+        }
+        // The management API guards one shared listener, so instances cannot
+        // hold different opinions about who may call it.
+        if !same_token(&self.state.management_token, &config.management_token) {
+            return Err(Error::InvalidConfigValue(format!(
+                "management_token does not match the one on the listener already bound to {}",
+                config.listen_addr
+            )));
+        }
+        Ok(())
+    }
+
+    async fn stop(signal: watch::Sender<()>, mut tasks: Vec<JoinHandle<()>>, listen_addr: &str) {
+        let _ = signal.send(());
+
+        // One deadline over both listeners: applied per task in a loop, the
+        // real bound would be twice SHUTDOWN_TIMEOUT.
+        let graceful = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            for task in &mut tasks {
+                if let Err(error) = task.await {
+                    warn!("A {CONNECTOR_NAME} listener task on {listen_addr} failed. {error}");
+                }
+            }
+        })
+        .await;
+
+        if graceful.is_err() {
+            warn!(
+                "A {CONNECTOR_NAME} listener on {listen_addr} did not stop within {SHUTDOWN_TIMEOUT:?}, aborting"
+            );
+            // `abort()` only schedules cancellation. Awaiting the handle is
+            // what guarantees the future - and the TcpListener inside it - has
+            // actually been dropped, so the runtime's stop-then-start restart
+            // cannot race the bind and fail with EADDRINUSE.
+            for task in &mut tasks {
+                // Skip the ones the graceful loop already drove to completion:
+                // awaiting a finished `JoinHandle` a second time panics, and
+                // this runs inside the FFI close of a dlopened plugin.
+                if task.is_finished() {
+                    continue;
+                }
+                task.abort();
+                match task.await {
+                    Err(error) if error.is_cancelled() => {
+                        warn!("Aborted a wedged {CONNECTOR_NAME} listener task on {listen_addr}")
+                    }
+                    Err(error) => {
+                        warn!("A {CONNECTOR_NAME} listener task on {listen_addr} panicked. {error}")
+                    }
+                    Ok(()) => {}
+                }
+            }
+        }
+        info!("Released the {CONNECTOR_NAME} listener on {listen_addr}");
+    }
+}
+
+/// Binds one listener, naming the config field it came from.
+///
+/// Both the public and admin listeners come through here, so a message that
+/// always said `listen_addr` sent an operator to the wrong line of TOML when
+/// it was the admin port that collided.
+async fn bind(field: &str, address: &str) -> Result<TcpListener, Error> {
+    TcpListener::bind(address).await.map_err(|error| {
+        // Instances are grouped by the `listen_addr` string, so two spellings
+        // of the same socket, `0.0.0.0:9090` and `127.0.0.1:9090`, are two
+        // groups and the second one tries to bind a port the first already
+        // holds. The operator sees a bind failure for a field they believe is
+        // shared, so name that possibility rather than only the OS error.
+        let hint = if error.kind() == std::io::ErrorKind::AddrInUse {
+            format!(
+                ". If another {CONNECTOR_NAME} instance is meant to share this listener, its {field} must match this one exactly"
+            )
+        } else {
+            String::new()
+        };
+        Error::InitError(format!(
+            "Failed to bind the {CONNECTOR_NAME} listener for {field} to {address}. {error}{hint}"
+        ))
+    })
+}
+
+async fn run(
+    listener: TcpListener,
+    router: Router,
+    mut shutdown: watch::Receiver<()>,
+    label: &str,
+) {
+    let service = router.into_make_service_with_connect_info::<SocketAddr>();
+    let result = serve(listener, service)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
+        .await;
+    if let Err(error) = result {
+        error!("The {CONNECTOR_NAME} {label} listener stopped. {error}");
+    }
+}
+
+/// No `DefaultBodyLimit`: both POST handlers take the request whole and pass
+/// the operator's cap to `to_bytes` themselves, which is what lets them refuse
+/// a request before reading it.
+fn public_router(state: Arc<ServerState>) -> Router {
+    Router::new()
+        .route("/topics/{topic_path}", post(handle_named_path))
+        .route("/e/{endpoint_id}", post(handle_secret_path))
+        .route("/health", get(handle_health))
+        // Without these, a mistyped path got axum's empty-bodied 404 and a
+        // wrong method an undocumented 405, while every other response on this
+        // listener carries `{"error": ...}`. A sender parsing that field broke
+        // on exactly the two responses a misconfiguration produces.
+        //
+        // The admin listener deliberately keeps axum's bare fallback: an
+        // unconfigured management API is not mounted at all there, and
+        // answering with this crate's error shape would make "no token
+        // configured" look like a route that exists and refused.
+        .fallback(|| async { error_response(StatusCode::NOT_FOUND, "not found") })
+        .method_not_allowed_fallback(|| async {
+            error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        })
+        .with_state(state)
+}
+
+fn admin_router(state: Arc<ServerState>) -> Router {
+    Router::new()
+        .route("/admin/health", get(handle_admin_health))
+        .route("/admin/metrics", get(handle_admin_metrics))
+        .merge(management::router(Arc::clone(&state)))
+        // Explicit, because axum's 2 MiB default is not a decision anyone
+        // made. Its own ceiling rather than the webhook cap: see
+        // [`MAX_ADMIN_BODY_SIZE_BYTES`] for why sharing that one broke
+        // rotation.
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE_BYTES))
+        .with_state(state)
+}
+
+/// A request that resolved to no instance is still metered, under [`UNROUTED`],
+/// which is where a scan for live endpoint ids shows up.
+fn instance_label(instance: Option<&Arc<SharedState>>) -> &str {
+    instance.map_or(UNROUTED, |instance| instance.instance_name.as_str())
+}
+
+fn same_token(left: &Option<SecretString>, right: &Option<SecretString>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => secrets_match(left, right),
+        _ => false,
+    }
+}
+
+/// Takes the whole `Request` rather than a `Bytes` extractor, because axum runs
+/// extractors before the handler body: with one, an unauthenticated caller who
+/// guessed the operator-chosen `topic_path` could make the process buffer
+/// `max_body_size_bytes` before receiving its 401. The credential here is a
+/// header, so the body is only read once the request has earned it. The secret
+/// paths cannot do this for HMAC, whose signature covers the body, and there
+/// the endpoint id is itself a 128-bit secret the caller must already hold.
+async fn handle_named_path(
+    State(state): State<Arc<ServerState>>,
+    Path(topic_path): Path<String>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    let started = Instant::now();
+    let (instance, response) = named_path_outcome(&state, &topic_path, remote_addr, request).await;
+    state.metrics.record_request(
+        instance_label(instance.as_ref()),
+        PathKind::Named,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
+}
+
+async fn handle_secret_path(
+    State(state): State<Arc<ServerState>>,
+    Path(endpoint_id): Path<String>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    let started = Instant::now();
+    let (instance, response) =
+        secret_path_outcome(&state, &endpoint_id, remote_addr, request).await;
+    state.metrics.record_request(
+        instance_label(instance.as_ref()),
+        PathKind::Secret,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
+}
+
+/// The instance the request resolved to, for the caller to label metrics with.
+/// Returning the `Arc` the lookup already produced rather than a copy of its
+/// name keeps the label allocation-free on the request path; `None` is a
+/// request that resolved to no instance, counted under [`UNROUTED`].
+async fn named_path_outcome(
+    state: &ServerState,
+    topic_path: &str,
+    remote_addr: SocketAddr,
+    request: Request,
+) -> (Option<Arc<SharedState>>, Response) {
+    // `into_parts` hands them over owned, so nothing is cloned to survive the
+    // body being taken.
+    let (parts, body) = request.into_parts();
+    let request_headers = parts.headers;
+    let instance = {
+        let routes = &state.published().routes;
+        let Some(instance) = routes.lookup_named_path(topic_path) else {
+            return (None, error_response(StatusCode::NOT_FOUND, "not found"));
+        };
+        Arc::clone(instance)
+    };
+
+    // Before the body: the whole point of taking the request whole.
+    if let Some(expected) = &instance.config.auth_bearer_token
+        && !validate_bearer(bearer_header(&request_headers), expected)
+    {
+        return (
+            Some(instance),
+            error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
+        );
+    }
+
+    // Ahead of the read, not just ahead of the copy. `enqueue`'s gate spares
+    // the header map and the payload copy, but by the time it runs `to_bytes`
+    // has already buffered up to `max_body_size_bytes` off the wire, and
+    // `Retry-After: 1` has the sender upload every byte of it again. Relaxed
+    // by nature, so `try_send` stays the real gate; this only declines work
+    // whose answer is already known.
+    //
+    // Answering without draining costs the connection. Hyper makes one drain
+    // attempt and then closes the read half, and the threshold covers the head
+    // and body together rather than the body alone: near 32 KiB on a fresh
+    // connection, lower on a reused one as hyper's read strategy adapts, so a
+    // small body sent slowly enough loses the connection too.
+    //
+    // Whether the sender sees the 429 depends on the sender. One that reads
+    // while it writes usually does, since the write half stays open. One that
+    // writes the whole body first can take a reset instead and never see it,
+    // and at the default megabyte cap that is a real fraction of requests, so
+    // `Retry-After` is guidance for the senders that get it rather than a
+    // promise to all of them. Cutting the upload off is the point and this is
+    // what it costs; `Connection: close` was measured and does not help.
+    if instance.sender.is_full() {
+        let response = reject_bridge_full(&instance, &state.metrics);
+        return (Some(instance), response);
+    }
+
+    // `DefaultBodyLimit` guards the extractor, which is no longer in play, so
+    // the cap is applied here instead.
+    let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
+        Ok(body) => body,
+        Err(error) => return (Some(instance), oversized_body_response(&error)),
+    };
+    // Resolved again for the same reason the secret path does it: the answer
+    // above is stale by however long the client took to send its body, and
+    // nothing bounds that. An instance that left in the meantime still owns a
+    // bridge whose receiver lives in `HttpSource`, so `try_send` would succeed
+    // and answer 200 for a message no `poll()` will ever drain. `leave()` reads
+    // `sender.len()` for `dropped_on_close` before that message exists, so the
+    // loss would not even be counted. `ptr_eq` also covers the swap: one
+    // instance leaves and another joins claiming the same topic path, and this
+    // request was never authorized against that one.
+    let published = state.published();
+    let serving = match published.routes.lookup_named_path(topic_path) {
+        Some(serving) if Arc::ptr_eq(serving, &instance) => serving,
+        // 503, not the 404 the first lookup answers. This caller already passed
+        // bearer auth and the path it asked for does exist; what changed is
+        // which instance serves it, mid-request. A 404 tells a sender the
+        // resource is gone and conventional clients stop retrying, so a
+        // republish window silently drops traffic that would have succeeded a
+        // moment later. `management.rs` already answers 503 for this same
+        // condition. The secret path keeps its 404 deliberately: that caller is
+        // unauthenticated, and distinguishing "wrong id" from "busy" there
+        // would confirm which endpoint ids exist.
+        //
+        // "route unavailable" rather than the "instance is closing" the admin
+        // API uses, because this arm covers two conditions and only one of them
+        // is a closure: the lookup can return nothing because the path was
+        // withdrawn, or it can return a different instance that has taken the
+        // path over. Naming a closure would be wrong for the handover, and the
+        // caller's action is the same either way. It also says no more about
+        // the listener's topology than a retry needs.
+        _ => {
+            return (
+                Some(instance),
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "route unavailable"),
+            );
+        }
+    };
+    let response = enqueue(serving, &request_headers, remote_addr, body, &state.metrics);
+    (Some(instance), response)
+}
+
+async fn secret_path_outcome(
+    state: &ServerState,
+    endpoint_id: &str,
+    remote_addr: SocketAddr,
+    request: Request,
+) -> (Option<Arc<SharedState>>, Response) {
+    // `into_parts` hands the headers over owned; taking them as an extractor
+    // cloned the whole map on every request.
+    let (parts, body) = request.into_parts();
+    let request_headers = parts.headers;
+    // Scoped, so the published view is not pinned across the body read below.
+    // The read is paced by the client, so holding it would keep every route
+    // table and instance set reachable for as long as a caller cares to
+    // trickle, and would decide the outcome from a view taken before it began.
+    let instance = {
+        let published = state.published();
+        match published
+            .routes
+            .lookup_secret_path(endpoint_id, unix_now_seconds())
+        {
+            RouteLookup::Active(entry) => Arc::clone(&entry.instance),
+            // Both answer as if the endpoint never existed, so a leaked URL
+            // cannot be used to confirm it was once live: a 410 for the expired
+            // case would be returned before any credential is checked and would
+            // say exactly that. The metric still names the owning instance, so
+            // only a genuinely unknown path is `unrouted`.
+            RouteLookup::Revoked(entry) | RouteLookup::Expired(entry) => {
+                return (
+                    Some(Arc::clone(&entry.instance)),
+                    error_response(StatusCode::NOT_FOUND, "not found"),
+                );
+            }
+            RouteLookup::Unknown => {
+                return (None, error_response(StatusCode::NOT_FOUND, "not found"));
+            }
+        }
+    };
+    // The named path's pre-read check, and here it also spares the HMAC over a
+    // body that is about to be discarded. It runs before `authorize`, which it
+    // has to: the signature covers the body, so any gate placed after auth has
+    // already paid for the read it exists to avoid. The cost is that a caller
+    // holding a live endpoint id learns the bridge is full without proving it
+    // holds the secret. That id is the routing credential and an unknown one
+    // is already 404 above, so this tells such a caller nothing the 401 below
+    // does not.
+    if instance.sender.is_full() {
+        let response = reject_bridge_full(&instance, &state.metrics);
+        return (Some(instance), response);
+    }
+
+    // Only now, once the id resolved to something that is actually serving.
+    // An unknown or revoked id used to cost a full body read before its 404,
+    // which is free amplification on the public listener. HMAC still needs the
+    // body, so the read cannot move any earlier than this.
+    let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
+        Ok(body) => body,
+        Err(error) => return (Some(instance), oversized_body_response(&error)),
+    };
+    // Resolved again, because the first answer is stale by exactly as long as
+    // the body took. A revoke that lands mid-read publishes its tombstone and
+    // is reported accepted, so honouring the first lookup would keep serving a
+    // dead key for as many requests as a caller had already opened. `ptr_eq`
+    // covers the other half: the instance can leave and another can join owning
+    // the same id, and this request was never authorized against that one.
+    let published = state.published();
+    let entry = match published
+        .routes
+        .lookup_secret_path(endpoint_id, unix_now_seconds())
+    {
+        RouteLookup::Active(entry) if Arc::ptr_eq(&entry.instance, &instance) => entry,
+        _ => {
+            return (
+                Some(instance),
+                error_response(StatusCode::NOT_FOUND, "not found"),
+            );
+        }
+    };
+    if !authorize(
+        &entry.endpoint,
+        entry.hmac_key.as_ref(),
+        &request_headers,
+        &body,
+    ) {
+        return (
+            Some(instance),
+            error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
+        );
+    }
+    let response = enqueue(
+        &entry.instance,
+        &request_headers,
+        remote_addr,
+        body,
+        &state.metrics,
+    );
+    (Some(instance), response)
+}
+
+/// OpenMetrics text format. Unguarded like `/admin/health`: the admin
+/// listener defaults to loopback and scrapers do not carry bearer tokens.
+///
+/// The content type is set explicitly because the body carries an `# EOF`
+/// trailer, which is OpenMetrics, not the `text/plain` a bare `String` would
+/// have been served as.
+async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        state.metrics.encode(&state.instances()),
+    )
+        .into_response()
+}
+
+/// Readiness for a load balancer: unavailable until an instance is serving.
+///
+/// A joined instance is not the same as a polling one. The SDK stops the poll
+/// task after five consecutive NACKs without calling `close()`, so the instance
+/// stays joined and this kept answering 200 to the load balancer while handlers
+/// accepted into a bridge nobody drained, until it filled and 429d forever.
+/// Readiness needs all three: an instance, a route it can reach, and a poll
+/// task still running behind it.
+async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
+    let now = unix_now_seconds();
+    // One guard, so readiness cannot be computed from a route table and an
+    // instance set that were never published together.
+    let ready = state.published().is_ready(now);
+    if !ready {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(StatusResponse {
+                status: "unavailable",
+            }),
+        )
+            .into_response();
+    }
+    Json(StatusResponse { status: "ok" }).into_response()
+}
+
+async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response {
+    // One snapshot and one clock read for the whole answer. Loaded twice, the
+    // per-instance array and the status below could describe different
+    // publishes, which is the disagreement `Published` exists to prevent, and
+    // the clock was being read once per instance on top of that.
+    let now = unix_now_seconds();
+    let published = state.published();
+    let instances = published
+        .instances
+        .iter()
+        .map(|instance| {
+            let registry = instance.registry();
+            InstanceHealth {
+                instance: instance.instance_name.clone(),
+                topic_path: instance.config.topic_path.clone(),
+                buffer_used: instance.sender.len(),
+                buffer_capacity: instance.config.buffer_capacity,
+                endpoints_static: registry.serving_count_by_origin(EndpointOrigin::Static, now),
+                endpoints_dynamic: registry.serving_count_by_origin(EndpointOrigin::Dynamic, now),
+                endpoints_expired: registry.expired_count(now),
+                endpoints_revoked: registry.revoked_count(),
+                named_path: instance.config.topic_path.is_some(),
+                poll_is_live: instance.poll_is_live(now),
+                has_polled: instance.has_polled(),
+                // The registry is handed over whole, so an owed flush is the
+                // whole answer. Still not `persisted`: the flag clears when the
+                // state leaves the plugin, and the runtime's write landing is
+                // something no poll return value reports back.
+                state_submitted: !instance.has_pending_state(),
+                headers_dropped: state.metrics.headers_dropped(&instance.instance_name),
+                headers_clamped: state.metrics.headers_clamped(&instance.instance_name),
+            }
+        })
+        .collect();
+
+    // Derived, not a constant: this answered "ok" while `/health` was
+    // answering 503 for the same listener, which is the one moment an operator
+    // is looking at both.
+    let ready = published.is_ready(now);
+    Json(AdminHealth {
+        status: if ready { "ok" } else { "degraded" },
+        instances,
+        uptime_secs: state.started_at.elapsed().as_secs(),
+    })
+    .into_response()
+}
+
+/// Records and answers a request shed because its instance's bridge is full.
+///
+/// Shared by the pre-read check in both handlers and by `enqueue`'s own two
+/// gates, so a shed request cannot drift apart between them in status,
+/// `Retry-After`, body, metric, or log line.
+fn reject_bridge_full(instance: &SharedState, metrics: &Metrics) -> Response {
+    metrics.record_rejected_full(&instance.instance_name);
+    debug!(
+        "Rejected a request for {CONNECTOR_NAME} connector ID: {}, bridge is full at {} messages",
+        instance.id, instance.config.buffer_capacity
+    );
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, RETRY_AFTER_SECONDS)],
+        // Not the 503's wording: an operator grepping logs has to be able to
+        // tell a full bridge from a listener that is shutting down.
+        Json(ErrorResponse {
+            error: "too many requests",
+        }),
+    )
+        .into_response()
+}
+
+/// Hands an accepted request to its instance's bridge, or rejects it.
+///
+/// Never blocks on a full bridge: waiting would turn a slow Iggy into a pile
+/// of held-open connections and, once the sender times out, a retry storm.
+fn enqueue(
+    instance: &Arc<SharedState>,
+    request_headers: &HeaderMap,
+    remote_addr: SocketAddr,
+    body: Bytes,
+    metrics: &Metrics,
+) -> Response {
+    // Checked before the header map is built and the body copied, since a full
+    // bridge throws both away. Both handlers check once more before they read
+    // the body at all; this one catches a bridge that filled during the read.
+    // `is_full` is racy, which is why `try_send` below stays the real gate.
+    if instance.sender.is_full() {
+        return reject_bridge_full(instance, metrics);
+    }
+    let (headers, clamped, dropped) = message_headers(instance, request_headers, remote_addr);
+    let message = QueuedMessage {
+        // Minted here, at accept time, so a replay after a NACK carries the
+        // same id rather than a fresh one.
+        id: rand::rng().random(),
+        // `to_vec`, deliberately, not `Vec::from(body)`. The latter hands back
+        // hyper's read buffer, which at typical webhook sizes is several times
+        // the body, and the bridge is bounded by message count rather than
+        // bytes. Copying the exact length is what keeps `buffer_capacity`
+        // meaning what an operator thinks it means.
+        payload: body.to_vec(),
+        headers,
+    };
+    if let Err(error) = instance.sender.try_send(message) {
+        // A disconnected bridge is not a full one. It cannot happen while the
+        // route table holds an `Arc` to this `SharedState`, but reporting it as
+        // backpressure would tell a sender to retry into a channel that no
+        // longer has a receiver, and would file the loss under the wrong metric.
+        if matches!(error, crossfire::TrySendError::Disconnected(_)) {
+            metrics.record_rejected_disconnected(&instance.instance_name);
+            error!(
+                "Rejected a request for {CONNECTOR_NAME} connector ID: {}, its bridge has no receiver",
+                instance.id
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "service unavailable",
+                }),
+            )
+                .into_response();
+        }
+        return reject_bridge_full(instance, metrics);
+    }
+    // After the send, which is the only order that can see it: `leave()` sets
+    // this before it counts the bridge, so a message accepted past that point
+    // is one no `poll()` will ever drain. 200 would be a lie the sender cannot
+    // detect, and a 503 it retries.
+    //
+    // The message stays in the channel, and `dropped_on_close` may already have
+    // counted it. `leave()` sets the departed flag and then reads
+    // `sender.len()`, so a message landing between those two is counted while
+    // its sender is being told 503. Against that counter's own description,
+    // accepted messages still queued, that is an over-report by one.
+    //
+    // It cannot go the other way, and the reasoning is written out because it
+    // is easy to get backwards: a message answered 200 was sent before the
+    // flag was set, so it was already in the channel when the length was read.
+    //
+    // Preferable either way to the alternative, which is a sender that
+    // believes a lost request succeeded.
+    if instance.has_departed() {
+        error!(
+            "Refused a request for {CONNECTOR_NAME} connector ID: {}, it left the listener while the request was in flight",
+            instance.id
+        );
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing");
+    }
+    // Only now: a rejected request produced no message, so its header losses
+    // would otherwise be counted against messages that never existed.
+    metrics.record_headers(&instance.instance_name, clamped, dropped);
+    Json(StatusResponse { status: "queued" }).into_response()
+}
+
+fn authorize(
+    endpoint: &Endpoint,
+    hmac_key: Option<&hmac::Key>,
+    request_headers: &HeaderMap,
+    body: &[u8],
+) -> bool {
+    match endpoint.auth_type {
+        EndpointAuthType::None => true,
+        // `is_usable_secret` first: `constant_time_eq` on an empty expected
+        // token matches an empty presented one, so a stored `Some("")` would
+        // accept `Authorization: Bearer ` from anyone holding the URL. Same
+        // hole the HMAC arm has, and the same reason it is closed here rather
+        // than at restore, which must not fail an instance over one entry.
+        EndpointAuthType::Bearer => {
+            is_usable_secret(&endpoint.auth_secret)
+                && endpoint
+                    .auth_secret
+                    .as_ref()
+                    .is_some_and(|secret| validate_bearer(bearer_header(request_headers), secret))
+        }
+        EndpointAuthType::HmacSha256 | EndpointAuthType::HmacSha1 => {
+            // Absent only if the endpoint claims HMAC with no secret, which
+            // `validate()` and the management API both refuse. Fail closed.
+            let Some(key) = hmac_key else {
+                return false;
+            };
+            validate_hmac(
+                body,
+                header_str(request_headers, &endpoint.hmac_header),
+                &endpoint.hmac_prefix,
+                key,
+            )
+        }
+    }
+}
+
+/// Builds the Iggy headers an accepted request rides with.
+///
+/// Values Iggy would reject are dropped rather than failing the message: a
+/// webhook body is worth more than a `User-Agent`.
+///
+/// Returns the headers to attach plus the number of forwarded values that were
+/// truncated and dropped. The counts are returned rather than recorded here so
+/// a request that is ultimately rejected does not report losses for a message
+/// that was never produced.
+fn message_headers(
+    instance: &Arc<SharedState>,
+    request_headers: &HeaderMap,
+    remote_addr: SocketAddr,
+) -> (Option<BTreeMap<HeaderKey, HeaderValue>>, u64, u64) {
+    let mut headers = BTreeMap::new();
+    let mut dropped = 0;
+    let mut clamped = 0;
+    if instance.config.include_http_metadata {
+        insert_header(&mut headers, &INSTANCE_HEADER_KEY, &instance.instance_name);
+        insert_header(
+            &mut headers,
+            &REMOTE_ADDR_HEADER_KEY,
+            &remote_addr.ip().to_string(),
+        );
+        if let Some(received_at) = received_at_micros() {
+            insert_header(&mut headers, &RECEIVED_AT_HEADER_KEY, &received_at);
+        }
+    }
+
+    for (name, key) in &instance.forward_headers {
+        let Some(present) = request_headers.get(name) else {
+            continue;
+        };
+        // Present but unrepresentable is a loss; absent is not. `to_str`
+        // rejects any byte outside visible ASCII, which a UTF-8 User-Agent
+        // routinely carries.
+        let Ok(raw) = present.to_str() else {
+            dropped += 1;
+            continue;
+        };
+        let Some(value) = clamp_header_value(raw) else {
+            dropped += 1;
+            continue;
+        };
+        if value.len() < raw.len() {
+            clamped += 1;
+        }
+        match HeaderValue::from_str(value) {
+            Ok(value) => {
+                headers.insert(key.clone(), value);
+            }
+            Err(_) => dropped += 1,
+        }
+    }
+    ((!headers.is_empty()).then_some(headers), clamped, dropped)
+}
+
+/// The three metadata keys, parsed once. They are compile-time constants, so
+/// re-parsing them per request repeated validation that can only ever succeed,
+/// the same reason `forward_headers` is resolved at construction.
+static INSTANCE_HEADER_KEY: LazyLock<Option<HeaderKey>> =
+    LazyLock::new(|| HeaderKey::try_from(INSTANCE_HEADER).ok());
+static REMOTE_ADDR_HEADER_KEY: LazyLock<Option<HeaderKey>> =
+    LazyLock::new(|| HeaderKey::try_from(REMOTE_ADDR_HEADER).ok());
+static RECEIVED_AT_HEADER_KEY: LazyLock<Option<HeaderKey>> =
+    LazyLock::new(|| HeaderKey::try_from(RECEIVED_AT_HEADER).ok());
+
+fn insert_header(
+    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
+    key: &Option<HeaderKey>,
+    value: &str,
+) {
+    let (Some(key), Ok(value)) = (key.as_ref(), HeaderValue::from_str(value)) else {
+        return;
+    };
+    headers.insert(key.clone(), value);
+}
+
+/// `None` when the clock predates the epoch, which is the only way this fails.
+///
+/// Defaulting to 0 would stamp every message with the epoch, and the header
+/// exists so a consumer can measure queue latency, so a plausible wrong value
+/// is worse than an absent one. `unix_now_seconds` saturates instead because
+/// its callers gate on expiry, where failing closed is the safe direction.
+fn received_at_micros() -> Option<String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_micros().to_string())
+}
+
+pub(crate) fn bearer_header(request_headers: &HeaderMap) -> Option<&str> {
+    request_headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn header_str<'a>(request_headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    request_headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// `to_bytes` reports the cap and a truncated stream through the same error, so
+/// the status mirrors what the `Bytes` extractor would have returned: a body
+/// that ran past the limit is 413, anything else is a 400.
+fn oversized_body_response(error: &axum::Error) -> Response {
+    let too_large = error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("length limit exceeded");
+    if too_large {
+        error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large")
+    } else {
+        error_response(StatusCode::BAD_REQUEST, "bad request")
+    }
+}
+
+pub(crate) fn error_response(status: StatusCode, error: &'static str) -> Response {
+    (status, Json(ErrorResponse { error })).into_response()
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: &'static str,
+}
+
+#[derive(Serialize)]
+struct AdminHealth {
+    status: &'static str,
+    instances: Vec<InstanceHealth>,
+    uptime_secs: u64,
+}
+
+#[derive(Serialize)]
+struct InstanceHealth {
+    instance: String,
+    topic_path: Option<String>,
+    buffer_used: usize,
+    buffer_capacity: usize,
+    endpoints_static: usize,
+    endpoints_dynamic: usize,
+    endpoints_expired: usize,
+    endpoints_revoked: usize,
+    named_path: bool,
+    /// Whether a poll has run recently enough to believe one still will.
+    ///
+    /// `state_submitted` says a change was handed over; this says whether
+    /// anything is still there to hand the next one to. The SDK stops the poll
+    /// task after five consecutive NACKs without calling `close()`, so the
+    /// instance stays registered and keeps accepting mutations that will never
+    /// be persisted. See #3941.
+    ///
+    /// Read it with `has_polled`, which separates the two ways this can be
+    /// false. `has_polled` false alongside it is an instance still starting
+    /// up, and the listener is not held to that one. `has_polled` true
+    /// alongside it is a poll task that stopped, which is what takes the whole
+    /// listener out of rotation. This one true with `has_polled` false is
+    /// simply a first poll in flight.
+    poll_is_live: bool,
+    has_polled: bool,
+    state_submitted: bool,
+    /// Named to mirror the metric families exactly, so an operator reading
+    /// `/admin/health` and a Prometheus scrape is not looking at two spellings
+    /// of one thing.
+    headers_dropped: u64,
+    headers_clamped: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HttpSource;
+    use crate::test_support::{ENDPOINT_ONE, ENDPOINT_TWO, client, free_port};
+    use iggy_connector_sdk::Source;
+    use ring::hmac;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const STATIC_SECRET: &str = "whsec_static";
+
+    fn config(public_port: u16, admin_port: u16, endpoints: &[&str]) -> HttpSourceConfig {
+        let mut config = crate::test_support::config(Some("github"), endpoints);
+        config.listen_addr = format!("127.0.0.1:{public_port}");
+        config.admin_listen_addr = format!("127.0.0.1:{admin_port}");
+        config
+    }
+
+    /// Opens a source, retrying if another test took the port first.
+    ///
+    /// `free_port` binds, reads the port and releases it, so there is a window
+    /// before this bind where anything else on the machine can take it.
+    /// nextest runs each test in its own process, so no in-process bookkeeping
+    /// can close that window; retrying is what actually removes the flake.
+    async fn open(id: u32, mut config: HttpSourceConfig) -> HttpSource {
+        const ATTEMPTS: usize = 8;
+        for attempt in 1..=ATTEMPTS {
+            let mut source = HttpSource::new(id, config.clone(), None);
+            match source.open().await {
+                Ok(()) => {
+                    // The runtime starts a poll task right after `open`, and
+                    // an instance serves nothing until that runs.
+                    crate::server::serve_routes(&source.shared).await;
+                    return source;
+                }
+                Err(error) if attempt < ATTEMPTS && is_address_in_use(&error) => {
+                    config.listen_addr = format!("127.0.0.1:{}", free_port());
+                    config.admin_listen_addr = format!("127.0.0.1:{}", free_port());
+                }
+                Err(error) => panic!("open must succeed, got: {error}"),
+            }
+        }
+        unreachable!("the loop returns or panics on the last attempt")
+    }
+
+    /// The 413/400 split reads `to_bytes`'s error text, so a wording change
+    /// upstream would silently turn every oversized body into a 400. Pinned
+    /// here because axum does not expose the limit error as a type to match on.
+    #[tokio::test]
+    async fn given_an_oversized_body_when_read_should_still_say_length_limit_exceeded() {
+        let body = axum::body::Body::from(vec![0u8; 64]);
+        let error = axum::body::to_bytes(body, 8)
+            .await
+            .expect_err("a body past the limit must fail");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("length limit exceeded"),
+            "oversized_body_response splits 413 from 400 on this text, got: {error}"
+        );
+    }
+
+    fn is_address_in_use(error: &Error) -> bool {
+        format!("{error}").contains("Address already in use")
+    }
+
+    fn signature(body: &[u8]) -> String {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, STATIC_SECRET.as_bytes());
+        format!("sha256={}", hex::encode(hmac::sign(&key, body).as_ref()))
+    }
+
+    async fn post_signed(base: &str, endpoint_id: &str, body: &'static str) -> reqwest::Response {
+        client()
+            .post(format!("{base}/e/{endpoint_id}"))
+            .header(crate::DEFAULT_HMAC_HEADER, signature(body.as_bytes()))
+            .body(body)
+            .send()
+            .await
+            .expect("the request must reach the listener")
+    }
+
+    fn base_url(source: &HttpSource) -> String {
+        format!("http://{}", source.shared.config.listen_addr)
+    }
+
+    #[tokio::test]
+    async fn given_valid_signature_when_posted_to_secret_path_should_queue() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+
+        let response = post_signed(&base_url(&source), ENDPOINT_ONE, "{\"event\":\"push\"}").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(source.shared.sender.len(), 1);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_tampered_signature_when_posted_should_answer_unauthorized() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+
+        let response = client()
+            .post(format!("{}/e/{ENDPOINT_ONE}", base_url(&source)))
+            .header(crate::DEFAULT_HMAC_HEADER, signature(b"a different body"))
+            .body("{\"event\":\"push\"}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(source.shared.sender.len(), 0);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_body_to_unknown_endpoint_should_answer_not_found_not_payload_too_large()
+     {
+        // Guards the ordering against a return to buffering before routing.
+        // With the body as an extractor, axum size-checked it before the
+        // handler ran, so an unknown id answered 413 having already paid for
+        // the read. What this pins is the status an unknown id gets, which is
+        // what regresses if the read moves back ahead of the lookup and its
+        // failure is surfaced there. It does not, and over HTTP cannot, prove
+        // that no bytes were read.
+        // A small cap, and a body oversized only relative to it. At the
+        // default 1 MiB the request outgrew the socket buffer, so the server's
+        // early 404 reached the client mid-write and reqwest surfaced a
+        // BrokenPipe instead of the response: the refusal this test wants is
+        // exactly what made it flaky. A few KiB completes the write before the
+        // server can answer, and the cap is what "oversized" is measured
+        // against, so shrinking both pins the same ordering deterministically.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.max_body_size_bytes = 1024;
+        let oversized = "x".repeat(config.max_body_size_bytes + 1024);
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/e/{ENDPOINT_TWO}", base_url(&source)))
+            .body(oversized)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an unknown id must be refused before its body is read"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_unknown_endpoint_when_posted_should_answer_not_found() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+
+        let response = post_signed(&base_url(&source), ENDPOINT_TWO, "{}").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_revoked_endpoint_when_posted_should_answer_not_found() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+        source.shared.mutate_registry(|registry| {
+            registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1)
+        });
+        rebuild_routes(&source).await;
+
+        let response = post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a revoked endpoint must not be distinguishable from one that never existed"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_expired_endpoint_when_posted_should_answer_not_found() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+        source.shared.mutate_registry(|registry| {
+            registry
+                .endpoint_mut(ENDPOINT_ONE)
+                .expect("the static endpoint is registered")
+                .expires_at = Some(1);
+            true
+        });
+        rebuild_routes(&source).await;
+
+        let response = post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "expired must not be distinguishable from never-existed by an unauthenticated caller"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_body_when_posted_should_answer_payload_too_large() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.max_body_size_bytes = 16;
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/e/{ENDPOINT_ONE}", base_url(&source)))
+            .body("x".repeat(1024))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_unauthenticated_oversized_body_should_refuse_before_reading_it() {
+        // The status is the whole assertion. axum runs extractors before the
+        // handler body, so while the named path took a `Bytes` extractor an
+        // unauthenticated caller who guessed `topic_path` could make the
+        // process buffer up to `max_body_size_bytes` before its 401. If the
+        // body were still read first this would answer 413.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.auth_bearer_token = Some(SecretString::from("named-path-secret"));
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .header(header::AUTHORIZATION, "Bearer not-the-token")
+            .body("x".repeat(4096))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated caller must not reach the body reader"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_authenticated_oversized_body_should_answer_payload_too_large() {
+        // And the cap still applies once the request has earned the read.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.auth_bearer_token = Some(SecretString::from("named-path-secret"));
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .header(header::AUTHORIZATION, "Bearer named-path-secret")
+            .body("x".repeat(4096))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_full_bridge_when_posted_should_answer_too_many_requests() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        // Two, not one: at 1 the ring is degenerate, so a test cannot tell a
+        // real capacity bound from an off-by-one. `bounded_async` always builds
+        // an `Array` whatever the size, so the flavour is not what differs.
+        config.buffer_capacity = 2;
+        let mut source = open(1, config).await;
+        let base = base_url(&source);
+
+        for _ in 0..2 {
+            assert_eq!(
+                post_signed(&base, ENDPOINT_ONE, "{}").await.status(),
+                StatusCode::OK
+            );
+        }
+        let response = post_signed(&base, ENDPOINT_ONE, "{}").await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+            "a sender needs to be told when to come back, not just refused"
+        );
+        close(&mut source).await;
+    }
+
+    /// The ordering tests below use one discriminator: an oversized body sent
+    /// to a full bridge earns both a 413 and a 429, so whichever the handler
+    /// answers names the check that ran first. A 413 means `to_bytes` buffered
+    /// the whole body before anything looked at the bridge, which is the read
+    /// the pre-read gate exists to skip.
+    #[tokio::test]
+    async fn given_full_bridge_when_oversized_body_posted_should_refuse_before_reading_it() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.buffer_capacity = 2;
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+        let base = base_url(&source);
+
+        for _ in 0..2 {
+            assert_eq!(
+                post_signed(&base, ENDPOINT_ONE, "{}").await.status(),
+                StatusCode::OK
+            );
+        }
+        let oversized = "x".repeat(4096);
+        let response = client()
+            .post(format!("{base}/e/{ENDPOINT_ONE}"))
+            .header(crate::DEFAULT_HMAC_HEADER, signature(oversized.as_bytes()))
+            .body(oversized)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "413 here means the body was read, and hashed, before the bridge was checked"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_full_bridge_when_named_path_posted_oversized_should_refuse_before_reading_it() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.buffer_capacity = 2;
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+        let url = format!("{}/topics/github", base_url(&source));
+
+        for _ in 0..2 {
+            let accepted = client()
+                .post(&url)
+                .body("{}")
+                .send()
+                .await
+                .expect("the request must reach the listener");
+            assert_eq!(accepted.status(), StatusCode::OK);
+        }
+        let response = client()
+            .post(&url)
+            .body("x".repeat(4096))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "413 here means the body was read before the bridge was checked"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_bearer_token_when_named_path_posted_should_enforce_it() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.auth_bearer_token = Some(secrecy::SecretString::from("global-secret"));
+        let mut source = open(1, config).await;
+        let url = format!("{}/topics/github", base_url(&source));
+
+        let unauthorized = client()
+            .post(&url)
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        let authorized = client()
+            .post(&url)
+            .header(header::AUTHORIZATION, "Bearer global-secret")
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(source.shared.sender.len(), 1);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_forwarded_headers_when_posted_should_ride_on_the_message() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.forward_headers = vec!["x-github-delivery".to_string()];
+        let mut source = open(1, config).await;
+
+        client()
+            .post(format!("{}/e/{ENDPOINT_ONE}", base_url(&source)))
+            .header(crate::DEFAULT_HMAC_HEADER, signature(b"{}"))
+            .header("x-github-delivery", "72d3162e-cc78-11e3-81ab-4c9367dc0958")
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        let message = source
+            .receiver
+            .lock()
+            .await
+            .try_recv()
+            .expect("the request must have been queued");
+        let headers = message.headers.expect("metadata forwarding is on");
+        assert_eq!(
+            headers
+                .get(&HeaderKey::try_from("x-github-delivery").expect("valid key"))
+                .map(|value| value.as_str().expect("utf-8 value")),
+            Some("72d3162e-cc78-11e3-81ab-4c9367dc0958")
+        );
+        assert!(
+            headers.contains_key(&HeaderKey::try_from(INSTANCE_HEADER).expect("valid key")),
+            "instance identity must ride along so a consumer can tell sources apart"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_forwarded_header_when_posted_should_clamp_and_count() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.forward_headers = vec!["user-agent".to_string()];
+        let mut source = open(1, config).await;
+
+        client()
+            .post(format!("{}/e/{ENDPOINT_ONE}", base_url(&source)))
+            .header(crate::DEFAULT_HMAC_HEADER, signature(b"{}"))
+            .header(header::USER_AGENT, "u".repeat(400))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        let message = source
+            .receiver
+            .lock()
+            .await
+            .try_recv()
+            .expect("the request must have been queued");
+        let headers = message.headers.expect("metadata forwarding is on");
+        let forwarded = headers
+            .get(&HeaderKey::try_from("user-agent").expect("valid key"))
+            .and_then(|value| value.as_str().ok())
+            .expect("an oversized value is clamped, not dropped");
+        assert_eq!(forwarded.len(), crate::types::MAX_HEADER_VALUE_BYTES);
+        let (clamped, dropped) = metrics_snapshot(&source, &source.shared.instance_name).await;
+        assert_eq!(clamped, 1);
+        assert_eq!(dropped, 0, "an oversized value is clamped, never dropped");
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_serving_instance_when_admin_health_read_should_report_counts() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        config.buffer_capacity = 7;
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+        post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
+
+        let body: serde_json::Value = client()
+            .get(format!("{admin}/admin/health"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .json()
+            .await
+            .expect("admin health must be JSON");
+
+        // Derived from the same readiness `/health` reports, so the two cannot
+        // disagree. No poll has run here, which is exactly the state `/health`
+        // answers 503 for, so both say the listener is not ready.
+        let readiness = client()
+            .get(format!("{}/health", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener")
+            .status();
+        assert_eq!(readiness, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        let instance = &body["instances"][0];
+        assert_eq!(instance["instance"], "http_github");
+        assert_eq!(instance["buffer_used"], 1);
+        assert_eq!(instance["buffer_capacity"], 7);
+        assert_eq!(instance["endpoints_static"], 1);
+        assert_eq!(instance["endpoints_dynamic"], 0);
+        assert_eq!(instance["endpoints_revoked"], 0);
+        assert_eq!(instance["named_path"], true);
+        assert_eq!(instance["state_submitted"], true);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_revoked_endpoint_when_admin_health_read_should_report_it_as_revoked() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+        source.shared.mutate_registry(|registry| {
+            registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1)
+        });
+
+        let body: serde_json::Value = client()
+            .get(format!("{admin}/admin/health"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .json()
+            .await
+            .expect("admin health must be JSON");
+
+        let instance = &body["instances"][0];
+        assert_eq!(instance["endpoints_static"], 0);
+        assert_eq!(instance["endpoints_revoked"], 1);
+        assert_eq!(
+            instance["state_submitted"], false,
+            "a mutation not yet handed to the runtime must not read as durable"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_expired_endpoint_when_admin_health_read_should_not_count_it_as_serving() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+        source.shared.mutate_registry(|registry| {
+            registry
+                .endpoint_mut(ENDPOINT_ONE)
+                .expect("the static endpoint is registered")
+                .expires_at = Some(1);
+            true
+        });
+
+        let body: serde_json::Value = client()
+            .get(format!("{admin}/admin/health"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .json()
+            .await
+            .expect("admin health must be JSON");
+
+        let instance = &body["instances"][0];
+        assert_eq!(
+            instance["endpoints_static"], 0,
+            "an endpoint that answers 404 to everything is not serving"
+        );
+        assert_eq!(instance["endpoints_expired"], 1);
+        assert_eq!(instance["endpoints_revoked"], 0);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_metadata_enabled_when_posted_should_carry_peer_and_receive_time() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after 1970")
+            .as_micros();
+
+        post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
+
+        let message = source
+            .receiver
+            .lock()
+            .await
+            .try_recv()
+            .expect("the request must have been queued");
+        let headers = message.headers.expect("metadata forwarding is on");
+        assert_eq!(
+            headers
+                .get(&HeaderKey::try_from(REMOTE_ADDR_HEADER).expect("valid key"))
+                .and_then(|value| value.as_str().ok()),
+            Some("127.0.0.1")
+        );
+        let received_at: u128 = headers
+            .get(&HeaderKey::try_from(RECEIVED_AT_HEADER).expect("valid key"))
+            .and_then(|value| value.as_str().ok())
+            .expect("receive time must be present")
+            .parse()
+            .expect("receive time must be numeric microseconds");
+        assert!(
+            received_at >= before,
+            "receive time must not predate the request"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_metadata_disabled_when_posted_should_carry_no_headers() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.include_http_metadata = false;
+        let mut source = open(1, config).await;
+
+        post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
+
+        let message = source
+            .receiver
+            .lock()
+            .await
+            .try_recv()
+            .expect("the request must have been queued");
+        assert!(
+            message.headers.is_none(),
+            "no metadata and no forward_headers must mean no header map at all"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_two_instances_when_joined_should_share_one_listener() {
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first = open(1, config(public_port, admin_port, &[ENDPOINT_ONE])).await;
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.topic_path = Some("stripe".to_string());
+        let mut second = open(2, second_config).await;
+        let base = base_url(&first);
+
+        assert_eq!(
+            post_signed(&base, ENDPOINT_ONE, "{}").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_signed(&base, ENDPOINT_TWO, "{}").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(first.shared.sender.len(), 1);
+        assert_eq!(second.shared.sender.len(), 1);
+
+        close(&mut first).await;
+        assert_eq!(
+            post_signed(&base, ENDPOINT_ONE, "{}").await.status(),
+            StatusCode::NOT_FOUND,
+            "one instance leaving must not take the listener down with it"
+        );
+        assert_eq!(
+            post_signed(&base, ENDPOINT_TWO, "{}").await.status(),
+            StatusCode::OK
+        );
+        close(&mut second).await;
+    }
+
+    #[tokio::test]
+    async fn given_mismatched_body_limit_when_joined_should_reject() {
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first = open(1, config(public_port, admin_port, &[ENDPOINT_ONE])).await;
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.topic_path = Some("stripe".to_string());
+        second_config.max_body_size_bytes = 1;
+
+        let mut second = HttpSource::new(2, second_config, None);
+        let error = second
+            .open()
+            .await
+            .expect_err("a listener cannot serve two body limits at once");
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfigValue(message) if message.contains("max_body_size_bytes")
+        ));
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_mismatched_admin_address_when_joined_should_reject() {
+        let public_port = free_port();
+        let mut first = open(1, config(public_port, free_port(), &[ENDPOINT_ONE])).await;
+        let mut second_config = config(public_port, free_port(), &[ENDPOINT_TWO]);
+        second_config.topic_path = Some("stripe".to_string());
+
+        let mut second = HttpSource::new(2, second_config, None);
+        let error = second
+            .open()
+            .await
+            .expect_err("an instance must not silently get an admin listener it did not configure");
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfigValue(message) if message.contains("admin_listen_addr")
+        ));
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_mismatched_management_token_when_joined_should_reject() {
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.management_token = Some(SecretString::from("mgmt-secret"));
+        let mut first = open(1, first_config).await;
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.topic_path = Some("stripe".to_string());
+
+        let mut second = HttpSource::new(2, second_config, None);
+        let error = second
+            .open()
+            .await
+            .expect_err("one listener cannot answer to two management tokens");
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfigValue(message) if message.contains("management_token")
+        ));
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_colliding_topic_path_when_joined_should_reject() {
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first = open(1, config(public_port, admin_port, &[ENDPOINT_ONE])).await;
+
+        let mut second = HttpSource::new(2, config(public_port, admin_port, &[ENDPOINT_TWO]), None);
+        let error = second
+            .open()
+            .await
+            .expect_err("two instances cannot claim the same topic path");
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfigValue(message) if message.contains("topic_path")
+        ));
+        assert_eq!(
+            post_signed(&base_url(&first), ENDPOINT_TWO, "{}")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "a rejected join must leave no routes behind"
+        );
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_last_instance_when_left_should_release_the_port() {
+        let public_port = free_port();
+        let mut source = open(1, config(public_port, free_port(), &[ENDPOINT_ONE])).await;
+        close(&mut source).await;
+
+        TcpListener::bind(format!("127.0.0.1:{public_port}"))
+            .await
+            .expect("the last close must release the port for the runtime's restart flow");
+    }
+
+    #[tokio::test]
+    async fn given_served_traffic_when_metrics_scraped_should_report_it() {
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        config.buffer_capacity = 4;
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+        let base = base_url(&source);
+
+        post_signed(&base, ENDPOINT_ONE, "{}").await;
+        post_signed(&base, ENDPOINT_TWO, "{}").await;
+
+        let scraped = client()
+            .get(format!("{admin}/admin/metrics"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .text()
+            .await
+            .expect("the scrape must have a body");
+
+        assert!(scraped.contains(
+            "http_source_requests_total{instance=\"http_github\",kind=\"secret\",status=\"2xx\"} 1"
+        ));
+        assert!(
+            scraped.contains(
+                "http_source_requests_total{instance=\"unrouted\",kind=\"secret\",status=\"4xx\"} 1"
+            ),
+            "a probe for live endpoint ids must be countable even though it resolves to nothing"
+        );
+        assert!(scraped.contains("http_source_buffer_used{instance=\"http_github\"} 1"));
+        assert!(scraped.contains("http_source_buffer_capacity{instance=\"http_github\"} 4"));
+        assert!(
+            scraped.contains(
+                "http_source_endpoints_active{instance=\"http_github\",kind=\"static\"} 1"
+            )
+        );
+        close(&mut source).await;
+    }
+
+    #[test]
+    fn given_an_empty_bearer_secret_when_authorized_should_refuse_the_empty_token() {
+        // Driven through `authorize` rather than the listener on purpose. An
+        // empty presented token needs the header value to keep a trailing
+        // space, and HTTP strips it, so over the wire this cannot be reached -
+        // confirmed by mutation: removing the guard leaves the HTTP-level test
+        // passing. That makes the guard defence in depth for a caller that is
+        // not a browser or a proxy, and this is the only level that can show it
+        // working.
+        let endpoint = crate::routes::Endpoint {
+            endpoint_id: crate::test_support::endpoint_id(ENDPOINT_ONE),
+            auth_type: EndpointAuthType::Bearer,
+            auth_secret: Some(SecretString::from("")),
+            hmac_header: crate::DEFAULT_HMAC_HEADER.to_string(),
+            hmac_prefix: crate::DEFAULT_HMAC_PREFIX.to_string(),
+            expires_at: None,
+            origin: crate::routes::EndpointOrigin::Dynamic,
+            state: crate::routes::EndpointState::Active,
+        };
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("Authorization", "Bearer ".parse().expect("valid header"));
+
+        assert!(
+            !authorize(&endpoint, None, &request_headers, b"{}"),
+            "an empty stored secret matches an empty presented token, so it is not a second factor"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_stored_secret_when_signed_should_refuse_both_auth_types() {
+        // An empty key is valid for HMAC and an empty expected token compares
+        // equal to an empty presented one, so a stored `Some("")` used to make
+        // the endpoint signable by anyone holding the URL, on both auth types.
+        // `validate()` and `register_endpoint` refuse one, but restore takes
+        // whatever the state store hands it rather than failing the instance,
+        // so the refusal has to live where the credential is checked.
+        // HMAC only. An empty presented bearer token needs the header value to
+        // keep a trailing space and HTTP strips it, so the bearer arm cannot be
+        // reached from here and asserting it over the wire would pass whether
+        // or not the guard exists. That half is covered by the `authorize`
+        // test above, which is the level it is observable at.
+        for auth_type in [EndpointAuthType::HmacSha256] {
+            let mut config = config(free_port(), free_port(), &[]);
+            config.endpoints = vec![];
+            let mut source = open(1, config).await;
+            let shared = Arc::clone(&source.shared);
+            let _polling = shared.enter_poll();
+
+            assert!(
+                shared.mutate_registry(|registry| registry.insert(crate::routes::Endpoint {
+                    endpoint_id: crate::test_support::endpoint_id(ENDPOINT_ONE),
+                    auth_type,
+                    auth_secret: Some(SecretString::from("")),
+                    hmac_header: crate::DEFAULT_HMAC_HEADER.to_string(),
+                    hmac_prefix: crate::DEFAULT_HMAC_PREFIX.to_string(),
+                    expires_at: None,
+                    origin: crate::routes::EndpointOrigin::Dynamic,
+                    state: crate::routes::EndpointState::Active,
+                }))
+            );
+            rebuild_routes(&source).await;
+
+            let body = "{}";
+            let empty_key = hmac::Key::new(hmac::HMAC_SHA256, b"");
+            let response = client()
+                .post(format!("{}/e/{ENDPOINT_ONE}", base_url(&source)))
+                .header(
+                    crate::DEFAULT_HMAC_HEADER,
+                    format!(
+                        "sha256={}",
+                        hex::encode(hmac::sign(&empty_key, body.as_bytes()))
+                    ),
+                )
+                .body(body)
+                .send()
+                .await
+                .expect("the request must reach the listener");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{auth_type:?}: an empty stored secret is not a second factor"
+            );
+            assert_eq!(
+                shared.sender.len(),
+                0,
+                "{auth_type:?}: and nothing may reach the bridge"
+            );
+            close(&mut source).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn given_an_unrouted_request_when_answered_should_use_this_api_error_shape() {
+        // Every other response on the public listener carries `{"error": ...}`,
+        // and the README documents that shape for "unknown path". Without a
+        // fallback a mistyped path got axum's empty-bodied 404 and a wrong
+        // method an undocumented 405, so a sender parsing `error` broke on
+        // exactly the two responses a misconfiguration produces.
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+        let base = base_url(&source);
+
+        for (label, response) in [
+            (
+                "unknown path",
+                client()
+                    .post(format!("{base}/nope"))
+                    .body("{}")
+                    .send()
+                    .await
+                    .expect("the request must reach the listener"),
+            ),
+            (
+                "wrong method",
+                client()
+                    .get(format!("{base}/e/{ENDPOINT_ONE}"))
+                    .send()
+                    .await
+                    .expect("the request must reach the listener"),
+            ),
+        ] {
+            let status = response.status();
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                "{label}: unexpected status {status}"
+            );
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: body must be this API's json: {error}"));
+            assert!(
+                body.get("error").is_some(),
+                "{label}: every public response carries an `error` field, got: {body}"
+            );
+        }
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_a_departed_instance_when_posted_should_refuse_rather_than_queue() {
+        // What the re-resolve gate cannot reach. It passes, and `enqueue` then
+        // checks `is_full`, builds the header map and copies the body before
+        // `try_send`, any of which `leave()` can overtake. A message accepted
+        // after that is never drained, and 200 is a lie the sender cannot see.
+        //
+        // The flag is set directly rather than by racing a real `leave()`.
+        // Reproducing the interleaving needs `leave()` to land inside those few
+        // statements, and `leave()` on the last instance also tears the listener
+        // down, which would take the in-flight connection with it.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.topic_path = Some("github".to_string());
+        config.auth_bearer_token = None;
+        let mut source = open(1, config).await;
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        // Serving right now, so the refusal below cannot come from the route
+        // being absent.
+        let accepted = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let queued_before = shared.sender.len();
+
+        shared.mark_departed();
+        let refused = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            refused.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an instance that has left must refuse, not queue into a bridge no poll will drain"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before + 1,
+            "the message is already in the channel; the point is that the sender is told so"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_the_instance_swapped_during_the_body_read_should_refuse_the_named_path() {
+        // The `ptr_eq` half, which the withdrawn-route test does not reach: the
+        // second lookup SUCCEEDS there, just against a different instance. Each
+        // instance carries its own `auth_bearer_token`, so without the identity
+        // check a request authorized against the one that resolved first is
+        // delivered into a stranger's bridge and a stranger's topic.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.topic_path = Some("github".to_string());
+        config.auth_bearer_token = None;
+        let mut source = open(1, config).await;
+        let addr = source.shared.config.listen_addr.clone();
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        let body = "{}";
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("the listener must accept");
+        let head = format!(
+            "POST /topics/github HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{body}\r\n"
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head must be written");
+        stream.flush().await.expect("the head must be flushed");
+
+        let probe = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body(body)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(probe.status(), StatusCode::OK);
+        let queued_before = shared.sender.len();
+
+        // A different instance takes the same topic path. The lookup below will
+        // succeed; only the identity check can tell it is the wrong one.
+        //
+        // Its bridge is kept LIVE on purpose. With a dead receiver `enqueue`
+        // answers 503 for a disconnected bridge, which is now the same status
+        // the guard returns, so the refusal would be indistinguishable from the
+        // delivery it exists to prevent. Live, an unguarded request answers 200
+        // and leaves a message in the stranger's bridge.
+        let (rival, _rival_source) = crate::test_support::live_instance(2, Some("github"), &[]);
+        publish(&source, vec![Arc::clone(&rival)]).await;
+
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("the terminating chunk must be written");
+        stream.flush().await.expect("the body must be flushed");
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the response must arrive before the timeout")
+        .expect("the response must be readable");
+        // 503 specifically, and an empty stranger's bridge. The status alone no
+        // longer separates the guard from a disconnected bridge, which is why
+        // the rival's receiver is alive: unguarded, this is a 200 with the
+        // message sitting in that bridge.
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "a request authorized against one instance must be refused, not handed to another, got: {response}"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before,
+            "and it must not reach the original instance's bridge either"
+        );
+        assert_eq!(
+            rival.sender.len(),
+            0,
+            "least of all the stranger's live bridge"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_the_route_withdrawn_during_the_body_read_should_refuse_the_named_path() {
+        // The named path's version of the same window. Its instance can stop
+        // serving the path while the body is still arriving, and the bridge
+        // still accepts the message because the receiver lives in `HttpSource`
+        // until the runtime closes it. The sender would get 200 for something
+        // no poll will drain, and `leave()` already took its `dropped_on_close`
+        // count before the message existed, so nothing would record the loss.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.topic_path = Some("github".to_string());
+        config.auth_bearer_token = None;
+        let mut source = open(1, config).await;
+        let addr = source.shared.config.listen_addr.clone();
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        let body = "{}";
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("the listener must accept");
+        let head = format!(
+            "POST /topics/github HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{body}\r\n"
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head must be written");
+        stream.flush().await.expect("the head must be flushed");
+
+        // Still serving right now, so the parked handler resolved it as such
+        // and the refusal below cannot come from a withdrawal that landed too
+        // early. Doubles as the readiness gate.
+        let probe = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body(body)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(probe.status(), StatusCode::OK);
+        let queued_before = shared.sender.len();
+
+        // The instance stops serving the path.
+        publish(&source, vec![]).await;
+
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("the terminating chunk must be written");
+        stream.flush().await.expect("the body must be flushed");
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the response must arrive before the timeout")
+        .expect("the response must be readable");
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "a path withdrawn while the body streamed must be seen, got: {response}"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before,
+            "and nothing may reach a bridge no poll will drain"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_a_revoke_during_the_body_read_should_refuse_the_request() {
+        // The window this closes: the route lookup used to resolve once, before
+        // a body the client paces, and `authorize` and `enqueue` then ran on
+        // that stale entry. A revoke landing mid-read was reported accepted by
+        // the management API while this request still went through on the dead
+        // key, and a caller could hold as many trickling connections open as it
+        // liked. Chunked encoding is what makes the timing exact.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        let mut source = open(1, config).await;
+        let addr = source.shared.config.listen_addr.clone();
+        let base = base_url(&source);
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        let body = "{}";
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("the listener must accept");
+        // Head and one chunk. The handler now sits inside `to_bytes`, past the
+        // point the old code had already committed its routing decision.
+        let head = format!(
+            "POST /e/{ENDPOINT_ONE} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{}: {}\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{body}\r\n",
+            crate::DEFAULT_HMAC_HEADER,
+            signature(body.as_bytes())
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head must be written");
+        stream.flush().await.expect("the head must be flushed");
+
+        // Proves the endpoint is still live at this moment on a second
+        // connection, so the parked request above resolved it as Active too and
+        // the 404 below cannot come from a revoke that landed too early. Also
+        // serves as the readiness gate: the listener has answered a full
+        // request, so it has certainly read the head sent before it.
+        assert_eq!(
+            post_signed(&base, ENDPOINT_ONE, body).await.status(),
+            StatusCode::OK,
+            "the endpoint must still be serving when the revoke is issued"
+        );
+
+        assert!(shared.mutate_registry(|registry| registry.revoke(
+            ENDPOINT_ONE,
+            "compromised".to_string(),
+            1
+        )));
+        rebuild_routes(&source).await;
+        let queued_before = shared.sender.len();
+
+        // Only now does the body finish.
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("the terminating chunk must be written");
+        stream.flush().await.expect("the body must be flushed");
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the response must arrive before the timeout")
+        .expect("the response must be readable");
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "a revoke that landed while the body streamed must be seen, got: {response}"
+        );
+        assert_eq!(
+            shared.sender.len(),
+            queued_before,
+            "and nothing may reach the bridge on a key that is already dead"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_revoked_endpoint_when_posted_should_meter_it_against_its_owner() {
+        // `build` keeps revoked entries in the table so a leaked id 404s under
+        // the instance that owns it. Without that the id would fall through to
+        // `unrouted`, which is the endpoint-id-scan signal, and revoking a busy
+        // endpoint would look exactly like an attack in progress.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+        let base = base_url(&source);
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        assert!(shared.mutate_registry(|registry| registry.revoke(
+            ENDPOINT_ONE,
+            "compromised".to_string(),
+            1
+        )));
+        rebuild_routes(&source).await;
+
+        post_signed(&base, ENDPOINT_ONE, "{}").await;
+
+        let scraped = client()
+            .get(format!("{admin}/admin/metrics"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .text()
+            .await
+            .expect("the scrape must have a body");
+
+        assert!(
+            scraped.contains(
+                "http_source_requests_total{instance=\"http_github\",kind=\"secret\",status=\"4xx\"} 1"
+            ),
+            "a revoked endpoint is still the owning instance's traffic, got: {scraped}"
+        );
+        assert!(
+            !scraped.contains("instance=\"unrouted\""),
+            "attributing it to unrouted would forge the scan signal, got: {scraped}"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_queued_messages_when_instance_closes_should_count_the_loss() {
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.instance_name = Some("http_github".to_string());
+        let admin = format!("http://{}", first_config.admin_listen_addr);
+        let mut first = open(1, first_config).await;
+        // A sibling keeps the listener alive so the counter survives to be
+        // scraped; the last instance leaving takes the whole registry with it.
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.topic_path = Some("stripe".to_string());
+        second_config.instance_name = Some("http_stripe".to_string());
+        let mut second = open(2, second_config).await;
+
+        post_signed(&base_url(&first), ENDPOINT_ONE, "{}").await;
+        close(&mut first).await;
+
+        let scraped = client()
+            .get(format!("{admin}/admin/metrics"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .text()
+            .await
+            .expect("the scrape must have a body");
+
+        assert!(
+            scraped.contains("http_source_dropped_on_close_total{instance=\"http_github\"} 1"),
+            "messages accepted but never polled are lost, and the loss must be visible"
+        );
+        close(&mut second).await;
+    }
+
+    #[test]
+    fn given_constant_metadata_keys_when_parsed_should_all_resolve() {
+        // They are parsed once into `Option` rather than `expect`ed, because a
+        // panic in a `LazyLock` on the request path unwinds out of the cdylib
+        // and aborts the whole connectors process. That safety costs a silent
+        // skip if one is ever mistyped, so pin it here instead.
+        for (name, key) in [
+            (INSTANCE_HEADER, &*INSTANCE_HEADER_KEY),
+            (REMOTE_ADDR_HEADER, &*REMOTE_ADDR_HEADER_KEY),
+            (RECEIVED_AT_HEADER, &*RECEIVED_AT_HEADER_KEY),
+        ] {
+            assert!(
+                key.is_some(),
+                "{name} must be a valid Iggy header key, or it vanishes from every message in silence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_serving_instance_when_health_checked_should_report_ok() {
+        let mut source = open(1, config(free_port(), free_port(), &[])).await;
+        // Readiness needs a poll task behind the route, and nothing drives one
+        // in these tests, so stand in for the poll that would be in flight.
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        let response = client()
+            .get(format!("{}/health", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_one_stopped_instance_when_health_checked_should_report_unavailable() {
+        // One address fronts both instances, so a sibling whose poll task has
+        // stopped would keep receiving traffic into a bridge nothing drains.
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.instance_name = Some("http_github".to_string());
+        let mut first = open(1, first_config).await;
+
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.instance_name = Some("http_partner".to_string());
+        second_config.topic_path = Some("stripe".to_string());
+        let mut second = open(2, second_config).await;
+
+        let live = Arc::clone(&first.shared);
+        let _polling = live.enter_poll();
+
+        let response = client()
+            .get(format!("{}/health", base_url(&first)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "one instance polling is not enough when the listener is shared"
+        );
+        close(&mut second).await;
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_a_first_poll_cancelled_on_the_lock_should_not_claim_the_instance() {
+        // What moving the claim out of `poll()` and into `serve_routes` buys,
+        // and it was invisible to this suite until now: with the caller
+        // claiming, a poll dropped while parked on the registry lock left the
+        // flag set with nothing published. `PollGuard::drop` then stamped
+        // `last_poll_at` on the way out, so the instance read as one whose
+        // poll task had stopped rather than one that never started, and the
+        // readiness gate took its healthy siblings to 503 for it.
+        //
+        // `timeout` dropping the future is the cancellation; the SDK drops it
+        // the same way on shutdown.
+        let mut source = HttpSource::new(1, config(free_port(), free_port(), &[]), None);
+        source.open().await.expect("open must succeed");
+
+        let held = SERVERS.lock().await;
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), source.poll()).await;
+        drop(held);
+
+        assert!(
+            cancelled.is_err(),
+            "the poll must still have been parked on the registry lock"
+        );
+        assert!(
+            !source.shared.has_polled(),
+            "a poll dropped before it could publish must not leave the instance claimed"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_an_opened_instance_when_it_polls_should_publish_its_own_routes() {
+        // The production line, driven by `poll()` rather than by a test calling
+        // `serve_routes` itself. Every other request test in this crate reaches
+        // the listener through that helper call, so deleting the publish from
+        // `poll()` leaves all of them green; this one is what goes red.
+        //
+        // The permit is what lets the poll return at all: with an empty bridge
+        // and nothing dirty it would otherwise wait for traffic that cannot
+        // arrive until the routes it is about to publish exist.
+        let mut source = HttpSource::new(1, config(free_port(), free_port(), &[]), None);
+        source.open().await.expect("open must succeed");
+        let url = format!("{}/topics/github", base_url(&source));
+
+        let before = client()
+            .post(&url)
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            before.status(),
+            StatusCode::NOT_FOUND,
+            "an instance that has not polled serves nothing"
+        );
+
+        source.shared.state_flush.notify_one();
+        source.poll().await.expect("poll must succeed");
+
+        let after = client()
+            .post(&url)
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            after.status(),
+            StatusCode::OK,
+            "and polling is what publishes them"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_a_joining_instance_when_health_checked_should_keep_serving_its_siblings() {
+        // The complement of the stopped-instance case above, and the two must
+        // not be answered the same way. A poll task that has stopped has to
+        // take the listener out of rotation; one that has not started yet must
+        // not, or restarting a single instance drains every healthy sibling
+        // for the whole of its producer setup.
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.instance_name = Some("http_github".to_string());
+        let mut first = open(1, first_config).await;
+        let live = Arc::clone(&first.shared);
+        let _polling = live.enter_poll();
+
+        // Joined and not yet polling, which is where an instance sits for the
+        // whole of `setup_source_producer`. Built directly because the test
+        // helper stands in for the first poll.
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.instance_name = Some("http_partner".to_string());
+        second_config.topic_path = Some("stripe".to_string());
+        let mut second = HttpSource::new(2, second_config, None);
+        second.open().await.expect("the second instance must join");
+
+        let health = client()
+            .get(format!("{}/health", base_url(&first)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "an instance that has not polled must not take its healthy siblings out of rotation"
+        );
+
+        // And it is not quietly serving either, which is what would make the
+        // answer above a lie: its bridge has no reader yet.
+        let early = client()
+            .post(format!("{}/topics/stripe", base_url(&first)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            early.status(),
+            StatusCode::NOT_FOUND,
+            "a route may not exist before something can drain it"
+        );
+
+        crate::server::serve_routes(&second.shared).await;
+        let served = client()
+            .post(format!("{}/topics/stripe", base_url(&first)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "and once its poll task runs, the route appears"
+        );
+
+        close(&mut second).await;
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_all_endpoints_revoked_when_health_checked_should_report_unavailable() {
+        // `build` inserts revoked endpoints so a leaked id resolves to a 404
+        // attributed to its owner rather than to `unrouted`, which means a bare
+        // emptiness check on the table would call this instance routable.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.topic_path = None;
+        let mut source = open(1, config).await;
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        assert!(shared.mutate_registry(|registry| registry.revoke(
+            ENDPOINT_ONE,
+            "compromised".to_string(),
+            1
+        )));
+        rebuild_routes(&source).await;
+
+        let response = client()
+            .get(format!("{}/health", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an instance that would refuse every request is not ready"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_no_instances_when_health_checked_should_report_unavailable() {
+        let mut source = open(1, config(free_port(), free_port(), &[])).await;
+        // The window a load balancer must see: routes are gone but the last
+        // instance has not finished releasing the listener yet.
+        publish(&source, Vec::new()).await;
+
+        let response = client()
+            .get(format!("{}/health", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        close(&mut source).await;
+    }
+
+    /// Republishes the instance set so a registry mutation reaches the table.
+    /// The management API does this for real; these tests reach for it after
+    /// mutating the registry directly.
+    async fn rebuild_routes(source: &HttpSource) {
+        let instances = {
+            let servers = SERVERS.lock().await;
+            servers
+                .get(&source.shared.config.listen_addr)
+                .expect("the instance is joined")
+                .state
+                .instances()
+        };
+        publish(source, instances).await;
+    }
+
+    async fn publish(source: &HttpSource, instances: Vec<Arc<SharedState>>) {
+        let servers = SERVERS.lock().await;
+        servers
+            .get(&source.shared.config.listen_addr)
+            .expect("the instance is joined")
+            .state
+            .publish(instances)
+            .expect("republishing a known-good instance set cannot collide");
+    }
+
+    /// The metrics live on the listener, not the instance, so a test has to
+    /// go through the registry to read them.
+    async fn metrics_snapshot(source: &HttpSource, instance: &str) -> (u64, u64) {
+        let servers = SERVERS.lock().await;
+        let metrics = &servers
+            .get(&source.shared.config.listen_addr)
+            .expect("the instance is joined")
+            .state
+            .metrics;
+        (
+            metrics.headers_clamped(instance),
+            metrics.headers_dropped(instance),
+        )
+    }
+
+    #[test]
+    fn given_populated_routes_when_serving_nothing_should_drop_every_one() {
+        let state = ServerState::new(&config(free_port(), free_port(), &[ENDPOINT_ONE]));
+        state
+            .publish(vec![crate::test_support::instance(
+                1,
+                Some("github"),
+                &[ENDPOINT_ONE],
+            )])
+            .expect("a single instance cannot collide with itself");
+        assert_eq!(state.published().routes.secret_path_count(), 1);
+        assert_eq!(state.published().routes.named_path_count(), 1);
+
+        state.serve_nothing();
+
+        assert_eq!(state.published().routes.secret_path_count(), 0);
+        assert_eq!(state.published().routes.named_path_count(), 0);
+        assert_eq!(
+            state.instances().len(),
+            1,
+            "the instances stay joined; only the routes projecting them stop being served"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_no_bound_listener_when_routes_refreshed_should_name_the_address() {
+        let unbound = format!("127.0.0.1:{}", free_port());
+
+        let error = refresh_routes(&unbound)
+            .await
+            .expect_err("an address nothing is bound to cannot be reprojected");
+
+        assert!(matches!(
+            error,
+            Error::InitError(message) if message.contains(&unbound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_duplicate_instance_name_when_joined_should_reject() {
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.instance_name = Some("http_github".to_string());
+        let mut first = open(1, first_config).await;
+
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.instance_name = Some("http_github".to_string());
+        second_config.topic_path = Some("stripe".to_string());
+        let mut second = HttpSource::new(2, second_config, None);
+        let error = second
+            .open()
+            .await
+            .expect_err("a duplicate name would address two instances at once");
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfigValue(message) if message.contains("instance_name")
+        ));
+        assert_eq!(
+            post_signed(&base_url(&first), ENDPOINT_TWO, "{}")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "a rejected join must leave no routes behind"
+        );
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_unknown_named_path_when_posted_should_answer_not_found_as_unrouted() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.instance_name = Some("http_github".to_string());
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/unclaimed", base_url(&source)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let scraped = client()
+            .get(format!("{admin}/admin/metrics"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .text()
+            .await
+            .expect("the scrape must have a body");
+        assert!(
+            scraped.contains(
+                "http_source_requests_total{instance=\"unrouted\",kind=\"named\",status=\"4xx\"} 1"
+            ),
+            "a misconfigured sender posting to the wrong path is the thing an \
+             operator needs to see, so it cannot go uncounted: {scraped}"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_body_when_posted_to_a_named_path_should_answer_payload_too_large() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.max_body_size_bytes = 16;
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body("x".repeat(1024))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(source.shared.sender.len(), 0);
+        close(&mut source).await;
+    }
+
+    #[test]
+    fn given_unrepresentable_forwarded_values_when_headers_built_should_drop_and_count_them() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.include_http_metadata = false;
+        config.forward_headers = vec!["x-binary".to_string(), "x-blank".to_string()];
+        let source = HttpSource::new(1, config, None);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            axum::http::HeaderName::from_static("x-binary"),
+            axum::http::HeaderValue::from_bytes(&[0xff])
+                .expect("an opaque byte is a legal HTTP header value"),
+        );
+        request_headers.insert(
+            axum::http::HeaderName::from_static("x-blank"),
+            axum::http::HeaderValue::from_static(""),
+        );
+
+        let (headers, clamped, dropped) = message_headers(
+            &source.shared,
+            &request_headers,
+            "127.0.0.1:4444".parse().expect("a literal address parses"),
+        );
+
+        // Both are present but unrepresentable: one is not visible ASCII, the
+        // other clamps away to nothing. An absent header is not a loss, so a
+        // count above two would be silent over-reporting.
+        assert_eq!(dropped, 2);
+        assert_eq!(clamped, 0);
+        assert!(
+            headers.is_none(),
+            "with metadata off and both forwarded values dropped there is nothing to attach"
+        );
+    }
+
+    async fn close(source: &mut HttpSource) {
+        source.close().await.expect("close must succeed");
+    }
+}

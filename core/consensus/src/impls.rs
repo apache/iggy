@@ -36,6 +36,7 @@ use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::poll::{AutoCommitReservation, PollHistoryId};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -268,9 +269,20 @@ impl PipelineEntry {
     }
 }
 
+/// Identity and capacity held by a pending automatic commit.
+#[derive(Debug)]
+pub struct AutoCommitRequestContext {
+    /// History accepted with the poll, which must still match at promotion.
+    pub history: PollHistoryId,
+    /// Keeps this request's consumer key occupied through promotion and staging.
+    pub reservation: AutoCommitReservation,
+}
+
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
+    /// Automatic commit context owned by this entry until promotion or removal.
+    auto_commit: Option<AutoCommitRequestContext>,
     pub message: Message<RoutedRequestHeader>,
     /// When the request was parked, in microseconds from the consensus-injected
     /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
@@ -294,6 +306,30 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    /// Build an automatic commit entry that owns its capacity guard.
+    /// The context must match the consumer key encoded in `message`.
+    #[must_use]
+    pub fn with_auto_commit(
+        message: Message<RoutedRequestHeader>,
+        context: AutoCommitRequestContext,
+    ) -> Self {
+        let mut entry = Self::new(message);
+        entry.auto_commit = Some(context);
+        entry
+    }
+
+    /// Transfer the context without dropping its reservation.
+    /// Promotion must retain the returned context through replication staging.
+    pub const fn take_auto_commit(&mut self) -> Option<AutoCommitRequestContext> {
+        self.auto_commit.take()
+    }
+
+    /// Inspect the context without acquiring another reservation.
+    #[must_use]
+    pub const fn auto_commit(&self) -> Option<&AutoCommitRequestContext> {
+        self.auto_commit.as_ref()
+    }
+
     /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
@@ -322,6 +358,7 @@ impl RequestEntry {
         reply_sender: Option<Sender<Message<ReplyHeader>>>,
     ) -> Self {
         Self {
+            auto_commit: None,
             message,
             received_at: 0,
             reply_sender,
@@ -728,6 +765,13 @@ impl LocalPipeline {
         for entry in &mut self.prepare_queue {
             entry.reply_sender.take();
         }
+    }
+
+    /// Remove pending requests while preserving the order of those retained.
+    /// Removed entries drop their reply senders and automatic commit reservations.
+    /// Prepare entries are unaffected.
+    pub fn retain_requests(&mut self, mut keep: impl FnMut(&RequestEntry) -> bool) {
+        self.request_queue.retain(|request| keep(request));
     }
 
     /// Drop `request_queue` only; preserve `prepare_queue`. View-change reset.
@@ -1657,8 +1701,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.commit_min.set(commit_min);
     }
 
-    /// Maximum number of faulty replicas that can be tolerated.
-    /// For a cluster of 2f+1 replicas, this returns f.
+    /// `StartViewChange` votes needed from other replicas before sending `DoViewChange`.
+    /// This is f for 2f+1 replicas, not the failure bound for every quorum configuration.
     #[must_use]
     pub const fn max_faulty(&self) -> usize {
         (self.replica_count as usize - 1) / 2
@@ -4042,8 +4086,8 @@ where
         // cost on the produce path, and it would describe the WRONG bytes:
         // `stamp_prepare_for_persistence` rewrites the command header INSIDE this
         // sealed region before the entry is journaled. Leaving those prepares at `0`
-        // is the designed "nothing to verify" sentinel, so a future durable partition
-        // journal skips verification instead of failing every entry as corrupt.
+        // is the designed "nothing to verify" sentinel: partition prepares
+        // leave message-body integrity to the batch checksums.
         //
         // TODO(consensus): a partition prepare's `checksum` covers its header alone,
         // so two at one op with matching header fields are indistinguishable however
@@ -4053,8 +4097,8 @@ where
         // the zero. Two closures, both larger than they look:
         //
         // 1. The batch checksum, recomputed after `stamp_prepare_for_persistence`.
-        //    But stamping runs per replica after replication and folds `base_offset`
-        //    in, so identity would change at stamp time and the journaled entry would
+        //    But stamping runs after this projection and folds `base_offset` in,
+        //    so identity would change at stamp time and the journaled entry would
         //    no longer match the pipeline entry `handle_prepare_ok` compares.
         // 2. The stamp-invariant cover: everything past the 256-byte command header,
         //    which stamping never touches. Identical on every replica, safe to seal
@@ -4225,6 +4269,10 @@ mod fresh_group_start_tests {
 mod request_queue_tests {
     use super::*;
     use iggy_binary_protocol::{Command, Operation};
+    use iggy_common::ConsumerKind;
+    use server_common::poll::AutoCommitReservationToken;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
@@ -4242,6 +4290,58 @@ mod request_queue_tests {
             ..RoutedRequestHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn queued_contexts_keep_each_reservation_until_their_own_removal() {
+        let consumer_id = 7;
+        let client_id = 1;
+        let reclaim_epoch = Rc::new(Cell::new(0));
+        let active_keys = Rc::new(Cell::new(0));
+        let token = Rc::new(AutoCommitReservationToken::new(
+            ConsumerKind::Consumer,
+            consumer_id,
+            reclaim_epoch,
+            Rc::clone(&active_keys),
+        ));
+        let history = PollHistoryId::default();
+        let mut pipeline = LocalPipeline::new();
+
+        // Each queued request holds its own guard for the same consumer key.
+        // The queue stores these messages without interpreting their payloads.
+        for request_number in 1..=2 {
+            let context = AutoCommitRequestContext {
+                history,
+                reservation: token.acquire(),
+            };
+            pipeline
+                .push_request(RequestEntry::with_auto_commit(
+                    make_request(client_id, request_number),
+                    context,
+                ))
+                .expect("both requests fit in the queue");
+        }
+
+        // Removing the first entry transfers its context to the caller, as
+        // promotion would. Releasing it must preserve the second reservation.
+        let mut first_request = pipeline.pop_request().expect("first queued request");
+        let first_context = first_request
+            .take_auto_commit()
+            .expect("context follows first request");
+        assert_eq!(first_request.message.header().request, 1);
+        assert_eq!(first_context.history, history);
+        drop(first_context);
+        assert_eq!(token.active_count(), 1);
+        assert_eq!(
+            active_keys.get(),
+            1,
+            "the queued request still holds the key"
+        );
+
+        // Clearing the queue drops the remaining context and frees the key.
+        pipeline.clear_request_queue();
+        assert_eq!(token.active_count(), 0);
+        assert_eq!(active_keys.get(), 0);
     }
 
     #[test]

@@ -335,7 +335,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             if entry.reference.is_some() {
                 continue;
             }
-            let (header, _, prepare, _) = self.read_record(entry.position).await?;
+            let (header, _, prepare, _) =
+                self.read_record(entry.position, self.state.length).await?;
             if header.operation == Operation::SendMessages
                 && decode_batch(prepare.as_slice())?.base_offset
                     >= segments.tail.position.next_offset
@@ -425,22 +426,31 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .ok_or_else(|| invalid("segment writing handle is absent"))
     }
 
-    pub(super) async fn sync_segment_files(&mut self) -> io::Result<()> {
+    /// Barrier over every body and link this journal wrote, leaving the dirty
+    /// flags alone. Split out of [`Self::sync_segment_files`] so that
+    /// `PartitionPrepareJournal::sync` can overlap it with the WAL file's own
+    /// barrier and clear both flags once the pair has completed.
+    pub(super) async fn segment_barrier(&self) -> io::Result<()> {
         if self.segment_files_dirty {
             for file in self.segment_files.values() {
                 // Keep the writing handle: reopening after an errseq writeback error
                 // could turn a failed body barrier into a successful acknowledgment.
                 file.sync().await?;
             }
-            self.segment_files_dirty = false;
         }
         if self.segment_links_dirty {
             self.storage.sync_directory(&self.directory).await?;
             self.storage
                 .sync_directory(self.segment_directory()?)
                 .await?;
-            self.segment_links_dirty = false;
         }
+        Ok(())
+    }
+
+    pub(super) async fn sync_segment_files(&mut self) -> io::Result<()> {
+        self.segment_barrier().await?;
+        self.segment_files_dirty = false;
+        self.segment_links_dirty = false;
         Ok(())
     }
 

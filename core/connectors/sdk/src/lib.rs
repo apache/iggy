@@ -108,7 +108,7 @@ pub trait Source: Send + Sync {
     /// Invoked when the source is initialized, allowing it to perform any necessary setup.
     async fn open(&mut self) -> Result<(), Error>;
 
-    /// Invoked every time a batch of messages is produced to the configured stream and topic.
+    /// Retrieves the next batch for the runtime to process and deliver.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
 
     /// Invoked after the runtime has finished processing the most recently polled batch.

@@ -46,6 +46,7 @@ under the License.
     <ItemGroup>
         <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
         <ProjectReference Include="..\Shared\Shared.csproj" />
+        <Compile Include="../../../examples/csharp/src/Iggy_SDK.Examples.Shared/ExampleHelpers.cs" Link="Examples/ExampleHelpers.cs" />
     </ItemGroup>
 
 </Project>

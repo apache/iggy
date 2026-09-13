@@ -16,6 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
+use futures::FutureExt;
 use iggy_binary_protocol::ReplyHeader;
 use iggy_common::{IggyByteSize, PollingStrategy};
 use partitions::{PollingArgs, PollingConsumer};
@@ -66,6 +67,7 @@ fn main() {
     // Initialize partition on all replicas
     println!("[sim] Initializing test partition: {test_namespace:?}");
     sim.init_partition(test_namespace);
+    sim.register_client_with_primary(&client);
 
     // 1. Send messages to a partition
     println!("[sim] Sending messages to partition");
@@ -118,12 +120,21 @@ fn main() {
     // 4. Poll messages and check offsets on the leader
     let consumer = PollingConsumer::Consumer(1, 0);
     let args = PollingArgs::new(PollingStrategy::first(), 10, false);
-    match sim.poll_messages(leader as usize, test_namespace, consumer, &args) {
+    let poll = sim.poll_messages(leader as usize, test_namespace, consumer, &args);
+    futures::pin_mut!(poll);
+    // Drive the caller between steps so the owner can process a pending poll.
+    let poll_result = (0..100)
+        .find_map(|_| {
+            let result = poll.as_mut().now_or_never();
+            if result.is_none() {
+                sim.step();
+            }
+            result
+        })
+        .expect("poll should reply within the simulation budget");
+    match poll_result {
         Ok(fragments) => {
-            println!(
-                "[sim] Poll returned {} fragments (expected 4)",
-                fragments.len()
-            );
+            println!("[sim] Poll returned {} fragments", fragments.len());
         }
         Err(e) => {
             println!("[sim] Poll failed: {e}");
