@@ -17,7 +17,7 @@
 
 use iggy::prelude::{IggyClient, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
-    Consumer, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
+    Consumer, Durability, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
     PersonalAccessTokenExpiry, UserStatus,
 };
 use iggy_common::{
@@ -78,7 +78,7 @@ pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
             names::TOPIC,
             &TopicCreateOptions {
                 partitions_count: Some(1),
-                enforce_fsync: Some(true),
+                durability: Durability::Persisted,
                 messages_required_to_save: Some(1),
                 ..TopicCreateOptions::default()
             },
