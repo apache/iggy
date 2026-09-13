@@ -56,6 +56,44 @@ pip install ../../foreign/python .
 
 ## Basic Examples
 
+### High-Level Producer and Consumer
+
+The Python high-level producer API is a port of the Rust high-level producer
+API. For detailed producer behavior and configuration, see the
+[Rust high-level SDK documentation](https://iggy.apache.org/docs/sdk/rust/high-level-sdk/).
+
+The high-level producer binds the destination once, initializes missing
+resources, applies producer-level batching and retry settings, and shuts down
+deterministically through an async context manager. The high-level consumer
+joins a consumer group, polls all assigned partitions, invokes an async handler,
+and commits each message after it has been handled.
+
+Run either producer first. Both create the stream and topic and publish 12
+messages for the consumer, which exits after receiving all of them. `producer.py`
+uses direct mode and waits for server confirmations; `background_producer.py`
+uses bounded background workers and flushes them on context-manager exit:
+
+```bash
+# Using uv
+uv run high-level/producer.py
+uv run high-level/consumer.py
+
+# Or use the background producer before starting the same consumer
+uv run high-level/background_producer.py
+uv run high-level/consumer.py
+
+# Without using uv
+python high-level/producer.py
+python high-level/consumer.py
+
+# Or use the background producer before starting the same consumer
+python high-level/background_producer.py
+python high-level/consumer.py
+```
+
+The existing examples below use the low-level `IggyClient.send_messages()` API
+and remain useful when each call needs to specify its own destination.
+
 ### Getting Started
 
 Perfect introduction for newcomers to Iggy:

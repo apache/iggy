@@ -38,20 +38,26 @@ pub struct SendMessage {
 
 impl Clone for SendMessage {
     fn clone(&self) -> Self {
+        Self::clone_from_rust(&self.inner)
+    }
+}
+
+impl SendMessage {
+    pub(crate) fn clone_from_rust(message: &RustIggyMessage) -> Self {
         Self {
             inner: RustIggyMessage {
                 header: IggyMessageHeader {
-                    checksum: self.inner.header.checksum,
-                    id: self.inner.header.id,
-                    offset: self.inner.header.offset,
-                    timestamp: self.inner.header.timestamp,
-                    origin_timestamp: self.inner.header.origin_timestamp,
-                    user_headers_length: self.inner.header.user_headers_length,
-                    payload_length: self.inner.header.payload_length,
-                    reserved: self.inner.header.reserved,
+                    checksum: message.header.checksum,
+                    id: message.header.id,
+                    offset: message.header.offset,
+                    timestamp: message.header.timestamp,
+                    origin_timestamp: message.header.origin_timestamp,
+                    user_headers_length: message.header.user_headers_length,
+                    payload_length: message.header.payload_length,
+                    reserved: message.header.reserved,
                 },
-                payload: self.inner.payload.clone(),
-                user_headers: self.inner.user_headers.clone(),
+                payload: message.payload.clone(),
+                user_headers: message.user_headers.clone(),
             },
         }
     }
