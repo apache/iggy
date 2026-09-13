@@ -22,7 +22,7 @@ use iggy::prelude::{
     DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
     IggyMessage, IggyProducer, StreamClient, TopicClient, TopicCreateOptions,
 };
-use iggy_common::TopicRuntimeOptions;
+use iggy_common::{Durability, TopicRuntimeOptions};
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
@@ -520,7 +520,7 @@ async fn ensure_durable_source_topic(
                     topic_name,
                     &TopicCreateOptions {
                         partitions_count: Some(1),
-                        enforce_fsync: Some(true),
+                        durability: Durability::Persisted,
                         messages_required_to_save: Some(SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE),
                         ..TopicCreateOptions::default()
                     },
@@ -541,15 +541,15 @@ fn validate_source_topic_durability(
     topic_name: &str,
     options: TopicRuntimeOptions,
 ) -> Result<(), RuntimeError> {
-    if options.enforce_fsync == Some(true)
+    if options.durability == Durability::Persisted
         && options.messages_required_to_save == Some(SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE)
     {
         return Ok(());
     }
 
     Err(RuntimeError::InvalidConfiguration(format!(
-        "Source destination topic '{stream_name}/{topic_name}' must use enforce_fsync=true and messages_required_to_save={SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE}; found enforce_fsync={:?}, messages_required_to_save={:?}",
-        options.enforce_fsync, options.messages_required_to_save
+        "Source destination topic '{stream_name}/{topic_name}' must use durability=persisted and messages_required_to_save={SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE}; found durability={}, messages_required_to_save={:?}",
+        options.durability, options.messages_required_to_save
     )))
 }
 
@@ -1411,9 +1411,9 @@ mod tests {
     }
 
     #[test]
-    fn given_fsync_per_batch_topic_when_validating_source_destination_should_accept() {
+    fn given_persisted_per_batch_topic_when_validating_source_destination_should_accept() {
         let options = TopicRuntimeOptions {
-            enforce_fsync: Some(true),
+            durability: Durability::Persisted,
             messages_required_to_save: Some(1),
             ..TopicRuntimeOptions::default()
         };
@@ -1422,23 +1422,23 @@ mod tests {
     }
 
     #[test]
-    fn given_non_fsync_topic_when_validating_source_destination_should_reject() {
+    fn given_replicated_topic_when_validating_source_destination_should_reject() {
         let options = TopicRuntimeOptions {
-            enforce_fsync: Some(false),
+            durability: Durability::Replicated,
             messages_required_to_save: Some(1),
             ..TopicRuntimeOptions::default()
         };
 
         let error = validate_source_topic_durability("stream", "topic", options)
-            .expect_err("non-fsync topic must not receive checkpointed source data");
+            .expect_err("replicated topic must not receive checkpointed source data");
 
-        assert!(error.to_string().contains("enforce_fsync=Some(false)"));
+        assert!(error.to_string().contains("durability=replicated"));
     }
 
     #[test]
     fn given_buffered_topic_when_validating_source_destination_should_reject() {
         let options = TopicRuntimeOptions {
-            enforce_fsync: Some(true),
+            durability: Durability::Persisted,
             messages_required_to_save: Some(10),
             ..TopicRuntimeOptions::default()
         };

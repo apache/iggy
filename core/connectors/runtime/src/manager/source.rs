@@ -676,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn recover_from_error_should_restore_running_status_and_clear_error() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "connection failed").await;
+        manager.set_error("pg", "connection failed", None).await;
 
         manager.recover_from_error("pg").await;
 
