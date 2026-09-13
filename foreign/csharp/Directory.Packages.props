@@ -27,7 +27,6 @@ under the License.
         <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.11" />
         <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
-        <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.108" />
         <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.10.0" />
         <PackageVersion Include="Microsoft.Testing.Extensions.Retry" Version="2.3.3" />
         <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.3.3" />

@@ -19,10 +19,11 @@ use crate::benchmark;
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
-use crate::metrics::{Metrics, SinkLabels};
+use crate::metrics::{ConnectorType, Metrics, SinkLabels};
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer,
-    SinkConnectorPlugin, SinkConnectorWrapper, resolve_plugin_path, transform,
+    SinkConnectorPlugin, SinkConnectorWrapper, close_plugin_instance, resolve_plugin_path,
+    transform,
 };
 use dlopen2::wrapper::Container;
 use futures::StreamExt;
@@ -182,12 +183,8 @@ pub async fn init(
                 let connector = sink_connectors
                     .get_mut(&path)
                     .expect("sink connector was inserted above");
-                let close_result = (connector.container.iggy_sink_close)(plugin_id);
-                if close_result != 0 {
-                    warn!(
-                        "iggy_sink_close returned {close_result} while cleaning up failed sink connector with ID: {plugin_id} ({key})"
-                    );
-                }
+                let close = connector.container.iggy_sink_close;
+                close_plugin_instance(&|id| close(id), ConnectorType::Sink, plugin_id, &key);
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()
@@ -292,7 +289,7 @@ pub(crate) fn spawn_consume_tasks(
                 metrics.inc_errors_with_labels(&labels.counter);
                 context
                     .sinks
-                    .set_error(&plugin_key, &error.to_string())
+                    .set_error(&plugin_key, &error.to_string(), Some(&metrics))
                     .await;
             }
         });
@@ -605,12 +602,13 @@ async fn process_messages(
     let mut messages = Vec::with_capacity(decoded.len());
     for message in decoded {
         let mut current_message = Some(message);
+        let mut transform_failed = false;
         for transform in transforms.iter() {
             let Some(message) = current_message.take() else {
                 break;
             };
-            // Drop-and-continue on a single bad message, mirroring the source
-            // side - one malformed payload must not kill the whole batch.
+            // Sink batches can deliver valid siblings after a transform failure.
+            // Source batches instead reject the checkpoint for the entire batch.
             match transform.transform(topic_metadata, message) {
                 Ok(next) => current_message = next,
                 Err(error) => {
@@ -621,10 +619,13 @@ async fn process_messages(
                         topic_metadata.topic
                     );
                     error_count += 1;
-                    current_message = None;
+                    transform_failed = true;
                     break;
                 }
             }
+        }
+        if transform_failed {
+            continue;
         }
 
         // Filter contract: transform returning Ok(None) is an intentional drop.
@@ -737,7 +738,7 @@ async fn process_messages(
     })?;
 
     let ffi_start = Instant::now();
-    (consume)(
+    let result = (consume)(
         plugin_id,
         topic_meta.as_ptr(),
         topic_meta.len(),
@@ -747,6 +748,16 @@ async fn process_messages(
         messages.len(),
     );
     let ffi_elapsed = ffi_start.elapsed();
+    let processed_count = if result == 0 {
+        processed_count
+    } else {
+        error!(
+            "Failed to consume {processed_count} messages for sink connector with ID: {plugin_id}, stream: {}, topic: {}, status: {result}",
+            topic_metadata.stream, topic_metadata.topic
+        );
+        metrics.inc_errors_with_labels(&labels.counter);
+        0
+    };
 
     Ok(SinkBatchTiming {
         processed_count,

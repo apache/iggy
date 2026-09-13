@@ -75,8 +75,7 @@ fn main() -> Result<(), ServerError> {
     let bootstrap_result: Result<ServerConfig, ServerError> = bootstrap_runtime.block_on(async {
         let config = load_config().await?;
         prepare_runtime_dirs(&config, &mut logging, args.fresh).await?;
-        let memory_pool_settings =
-            server_common::MemoryPoolSettings::from(&config.system.memory_pool);
+        let memory_pool_settings = server_common::MemoryPoolSettings::from(&config.memory_pool);
         server_common::MemoryPool::init_pool(&memory_pool_settings);
 
         Ok(config)

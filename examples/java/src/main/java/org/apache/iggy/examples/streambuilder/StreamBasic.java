@@ -104,13 +104,12 @@ public final class StreamBasic {
                         message.header().offset(),
                         polledMessages.partitionId());
 
+                offset = message.header().offset().add(BigInteger.ONE);
                 consumedMessages++;
                 if (consumedMessages == EXPECTED_MESSAGES) {
                     break;
                 }
             }
-
-            offset = offset.add(BigInteger.valueOf(polledMessages.messages().size()));
         }
     }
 

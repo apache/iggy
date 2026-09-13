@@ -437,17 +437,19 @@ impl Logging {
         global::set_tracer_provider(tracer_provider.clone());
         global::set_text_map_propagator(TraceContextPropagator::new());
 
-        // Reload telemetry layers with actual implementations
+        // Layer constructors may log, so keep them outside the reload lock.
+        let otel_logs_layer = OpenTelemetryTracingBridge::new(&logger_provider).boxed();
+        let otel_traces_layer = OpenTelemetryLayer::new(tracer).boxed();
         self.otel_logs_reload_handle
             .as_ref()
             .ok_or(LogError::FilterReloadFailure)?
-            .modify(|layer| *layer = OpenTelemetryTracingBridge::new(&logger_provider).boxed())
+            .modify(|layer| *layer = otel_logs_layer)
             .expect("Failed to modify telemetry logs layer");
 
         self.otel_traces_reload_handle
             .as_ref()
             .ok_or(LogError::FilterReloadFailure)?
-            .modify(|layer| *layer = OpenTelemetryLayer::new(tracer).boxed())
+            .modify(|layer| *layer = otel_traces_layer)
             .expect("Failed to modify telemetry traces layer");
 
         info!(

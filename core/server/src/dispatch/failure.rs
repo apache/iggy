@@ -26,7 +26,7 @@
 //! | [`FrameChannel::TypedDeny`] | Reply, nonzero status + empty body, or a result-framed rejection body | rejections that must unblock the SDK's lockstep request slot: checksum, authz, pre-consensus rewrite, unknown or unsupported non-replicated code, unbound non-PING read, transient replay hints |
 //! | [`FrameChannel::Eviction`] | session-terminal Eviction frame with a typed reason | the client must register again: `NoSession`, `MalformedLogin`, heartbeat and login evictions. The reason rides the channel label, since one `context` covers four of them |
 //! | [`FrameChannel::ResyncSentinel`] | status-0 poll reply, body carries `RESYNC_REQUIRED_PARTITION_SENTINEL` | a fenced consumer-group poll: the consumer must re-sync its assignment; HTTP mirrors it as `resync_required_polled_messages` in `crate::http::wire` |
-//! | [`FrameChannel::EmptyFrame`] | status-0 fail-fast body, the 16-byte empty poll | the partition cannot answer yet; the SDK fails fast (empty poll) and retries. A permanent client error never rides this channel: an undecodable body, an unresolved target, and a request the resolve rejects all deny typed, because there is nothing to retry |
+//! | [`FrameChannel::EmptyFrame`] | status 0 with the 16-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
 //! | [`FrameChannel::Reply`] | status-0 success frame | host-built success replies: login/register, ping, logout, non-replicated read bodies, committed metadata replies |
 //! | silent drop | no frame | one deliberate case, a transient consensus submit failure: the SDK read-timeout replays the same request id, and a synthesized failure could contradict a write that commits moments later. A header `RequestHeader::validate` rejected also drops, but that one is a GAP, not a contract - the fields decode, so a deny could be echoed under the transport id, and the client instead waits out its read timeout |
 //! | HTTP status | HTTP status code | the HTTP spine maps the same rejections in `crate::http::error`; it never rides these frames |
@@ -372,7 +372,7 @@ mod tests {
     };
     use crate::responses::build_empty_reply;
     use crate::session_manager::SessionManager;
-    use configs::server::ServerSystemConfig;
+    use configs::server::ServerConfig;
     use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_common::RESYNC_REQUIRED_PARTITION_SENTINEL;
@@ -595,7 +595,7 @@ mod tests {
     async fn snapshot_reply_frame_unchanged() {
         let (bus, shard) = snapshot_shard();
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let system_config = Arc::new(ServerSystemConfig::default());
+        let server_config = Arc::new(ServerConfig::default());
         let request = request_message(Operation::NonReplicated, VSR_CLIENT, SESSION, REQUEST, &[])
             .transmute_header(|header, ping: &mut RoutedRequestHeader| {
                 *ping = header;
@@ -615,7 +615,7 @@ mod tests {
         handle_client_request(
             &shard,
             &sessions,
-            &system_config,
+            &server_config,
             1,
             TRANSPORT,
             request.into_generic(),

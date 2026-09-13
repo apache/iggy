@@ -47,7 +47,7 @@ sdk/src/
 ├── api.rs              ConnectorStatus, ConnectorStats (feature = "api").
 ├── convert.rs          owned_value_to_serde_json (simd_json ⇄ serde_json bridge).
 ├── log.rs              CallbackLayer for tracing across FFI.
-├── retry.rs            CircuitBreaker, HttpRetryMiddleware, exponential_backoff, jitter.
+├── retry.rs            retry_async + RetryPolicy, CircuitBreaker, HttpRetryMiddleware.
 ├── decoders/           One per schema: json, raw, text, proto, flatbuffer, avro.
 ├── encoders/           Mirror of decoders.
 └── transforms/         add_fields, delete_fields, update_fields, filter_fields,
@@ -149,8 +149,10 @@ Plugin authors call this on every consumed message. The implementation in `lib.r
 ## Retry helpers (`retry.rs`)
 
 - `CircuitBreaker`: threshold + cooldown, `try_lock()` on the success path to avoid hot-path contention.
+- `retry_async(policy, context, should_retry, op)`: the retry loop for anything failing as `Err`. Owns attempt counting, backoff and the per-retry log; returns `RetryFailure { error, attempts, exhausted }` so callers write their own terminal log.
+- `retry_backoff(base, retry, max)`: backoff only, for a loop that computes its own delay. `retry` is 1-based. `exponential_backoff` is the 0-based primitive underneath and applies no jitter, so call it directly only when the delay must be exact (`source.rs::nack_retry_delay`, whose tests assert exact values).
 - `HttpRetryMiddleware`: integrates with `reqwest-middleware`. Retries 429 + 5xx + network errors. Honors `Retry-After`.
-- `max_retries` = **total attempts** including the first try, not extra retries. Document if you change this convention.
+- `max_retries` = **total attempts** including the first try, not extra retries. Document if you change this convention. `meilisearch_sink` is the standing exception: its `max_retries` / `max_open_retries` count retries *after* the first, as its README states.
 - New helpers must take `Duration` (not `u64 millis`) on the public API. Internal computation uses `humantime` parsing of `String`.
 
 ## `ConnectorState`

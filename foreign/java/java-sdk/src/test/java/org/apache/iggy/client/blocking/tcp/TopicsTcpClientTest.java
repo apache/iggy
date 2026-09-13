@@ -53,10 +53,10 @@ class TopicsTcpClientTest extends TopicsClientBaseTest {
                 BigInteger.ZERO,
                 BigInteger.ZERO,
                 "canonical-kind-topic",
-                Map.of("enforce_fsync", HeaderValue.fromString("true")));
+                Map.of("durability", HeaderValue.fromString("persisted")));
 
         var topic = topicsClient.getTopic(STREAM_NAME, TopicId.of(created.id())).orElseThrow();
-        assertThat(topic.options().get("enforce_fsync").kind()).isEqualTo(HeaderKind.Bool);
+        assertThat(topic.options().get("durability").kind()).isEqualTo(HeaderKind.String);
     }
 
     @Test

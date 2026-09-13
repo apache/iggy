@@ -88,7 +88,25 @@ func (t *CreateTopic) options() ([]iggcon.HeaderEntry, error) {
 	if t.MaxTopicSize != 0 {
 		options = append(options, uint64Option(topicOptionMaxTopicSize, t.MaxTopicSize))
 	}
-	return mergeOptions(options, t.Options)
+	merged, err := mergeOptions(options, t.Options)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"durability", "consumer_offset_durability"} {
+		found := false
+		for _, entry := range merged {
+			if string(entry.Key.Value) == key {
+				found = true
+				if entry.Value.Kind != iggcon.String || (string(entry.Value.Value) != string(iggcon.DurabilityReplicated) && string(entry.Value.Value) != string(iggcon.DurabilityPersisted)) {
+					return nil, fmt.Errorf("invalid %s", key)
+				}
+			}
+		}
+		if !found {
+			merged = append(merged, stringOption(key, string(iggcon.DurabilityReplicated)))
+		}
+	}
+	return merged, nil
 }
 
 // mergeOptions appends the caller's entries to the ones the typed fields

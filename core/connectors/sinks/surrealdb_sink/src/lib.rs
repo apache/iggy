@@ -20,7 +20,7 @@ use base64::Engine;
 use base64::engine::general_purpose;
 use bytes::Bytes;
 use iggy_connector_sdk::convert::owned_value_to_serde_json;
-use iggy_connector_sdk::retry::{exponential_backoff, jitter, parse_duration};
+use iggy_connector_sdk::retry::{parse_duration, retry_backoff};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -773,11 +773,7 @@ impl SurrealDbSink {
                         }
                     }
 
-                    let delay = jitter(exponential_backoff(
-                        self.retry_delay,
-                        attempts.saturating_sub(1),
-                        self.max_retry_delay,
-                    ));
+                    let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
                     warn!(
                         "Transient SurrealDB write error for connector ID: {} (attempt {attempts}/{}): {error}. Retrying in {:?}.",
                         self.id, self.max_retries, delay

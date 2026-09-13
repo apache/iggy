@@ -28,19 +28,19 @@ public sealed class TopicOptionsTests
         var options = new TopicOptions
         {
             SegmentSize = 134217728,
-            EnforceFsync = true,
+            Durability = Apache.Iggy.Enums.Durability.Persisted,
             MessagesRequiredToSave = 1024,
             SizeOfMessagesRequiredToSave = 1048576,
             PreallocateSegments = false
         }.ToDictionary();
 
-        Assert.Equal(5, options.Count);
+        Assert.Equal(6, options.Count);
 
         Assert.Equal(HeaderKind.Uint64, options["segment_size"].Kind);
         Assert.Equal(134217728UL, options["segment_size"].ToUInt64());
 
-        Assert.Equal(HeaderKind.Bool, options["enforce_fsync"].Kind);
-        Assert.True(options["enforce_fsync"].ToBool());
+        Assert.Equal(HeaderKind.String, options["durability"].Kind);
+        Assert.Equal("persisted", options["durability"].ToString());
 
         Assert.Equal(HeaderKind.Uint32, options["messages_required_to_save"].Kind);
         Assert.Equal(1024U, options["messages_required_to_save"].ToUInt32());
@@ -55,16 +55,16 @@ public sealed class TopicOptionsTests
     [Fact]
     public void ToDictionary_EmitsOnlyTheKeysThatWereSet()
     {
-        var options = new TopicOptions { EnforceFsync = false }.ToDictionary();
+        var options = new TopicOptions { Durability = Apache.Iggy.Enums.Durability.Replicated }.ToDictionary();
 
-        var entry = Assert.Single(options);
-        Assert.Equal("enforce_fsync", entry.Key);
-        Assert.False(entry.Value.ToBool());
+        Assert.Equal(2, options.Count);
+        Assert.Equal("replicated", options["durability"].ToString());
+        Assert.Equal("replicated", options["consumer_offset_durability"].ToString());
     }
 
     [Fact]
-    public void ToDictionary_WithNothingSetIsEmpty()
+    public void ToDictionary_EmitsBothReplicatedDefaults()
     {
-        Assert.Empty(new TopicOptions().ToDictionary());
+        Assert.Equal(2, new TopicOptions().ToDictionary().Count);
     }
 }

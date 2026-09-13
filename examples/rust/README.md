@@ -4,6 +4,9 @@ This directory contains comprehensive sample applications that showcase various 
 
 ## Running Examples
 
+Run all commands from the repository root, with the server in a separate terminal.
+For unreleased changes, use the SDK and server from the same checkout.
+
 Iggy requires valid credentials to authenticate client requests. The examples assume that the server is using the default root credentials, which can be enabled in one of two ways:
 
 1. Start the server with default credentials:
@@ -33,7 +36,7 @@ Iggy requires valid credentials to authenticate client requests. The examples as
 
 By default, all server data is stored in the `local_data` directory (this can be changed via `system.path` in `config.toml`).
 
-Root credentials are applied **only on the very first startup**, when no data directory exists yet.
+Root credentials bootstrap a **new state**. Environment credentials override the default-credential flag; bootstrap settings do not replace recovered credentials.
 Once the server has created and populated the data directory, the existing stored credentials will always be used, and supplying the `--with-default-root-credentials` flag or setting the environment variables will no longer override them.
 
 If the server has already been started once and your example returns `Error: InvalidCredentials`, then this means the stored credentials differ from the defaults.
@@ -47,7 +50,7 @@ You can reset the credentials in one of two ways:
    cargo run --bin iggy-server -- --with-default-root-credentials --fresh
    ```
 
-   This will ignore any existing data directory and re-initialize it with the default credentials.
+   This deletes this replica's local data and re-initializes it. Use disposable development data. In a cluster, a fresh replica can recover credentials from peers; a new cluster requires explicit root credentials.
 
 For server configuration options and help:
 
@@ -59,7 +62,7 @@ You can also customize the server using environment variables:
 
 ```bash
 ## Example: Enable HTTP transport and set custom address
-IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server
+IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server
 ```
 
 You can run multiple producers and consumers simultaneously to observe how messages are distributed across clients. Most examples support configurable options via the [Args](https://github.com/apache/iggy/blob/master/examples/rust/src/shared/args.rs) struct, including transport protocol, stream/topic/partition settings, consumer ID, message size, and more.
@@ -77,7 +80,7 @@ cargo run --example getting-started-producer
 cargo run --example getting-started-consumer
 ```
 
-These examples use IggyClientBuilder with TCP transport and demonstrate automatic stream/topic creation with basic message handling.
+These examples use IggyClientBuilder with TCP transport and demonstrate stream/topic creation with basic message handling. Run the producer before the consumer on a fresh server: the consumer expects stream and topic IDs `0`.
 
 ### Basic Usage
 
@@ -88,7 +91,14 @@ cargo run --example basic-producer
 cargo run --example basic-consumer
 ```
 
-Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
+Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP/WebSocket protocols.
+
+To run the pair over HTTP:
+
+```bash
+cargo run --example basic-producer -- --transport http
+cargo run --example basic-consumer -- --transport http
+```
 
 ## Message Pattern Examples
 
@@ -160,7 +170,7 @@ Testing and benchmarking support:
 cargo run --example sink-data-producer
 ```
 
-Produces high-throughput data (1000 messages per batch) with realistic user records, configurable via environment variables for connection and stream settings.
+Produces 100 batches of 100 to 499 random user records, with a direct-send request limit of 1000 messages. Connection and stream settings are configurable via environment variables.
 
 ## Stream Builder Examples
 
@@ -202,8 +212,10 @@ These examples require a TLS-enabled Iggy server. Start the server with:
 IGGY_TCP_TLS_ENABLED=true \
 IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
 ```
+
+Use the test certificates only for local development. The `--fresh` data-reset and credential qualifications above apply.
 
 Uses `IggyClientBuilder` with TLS options (`with_tls_enabled`, `with_tls_domain`, `with_tls_ca_file`) to establish TLS-encrypted TCP connections with CA certificate verification.
 
@@ -211,7 +223,7 @@ Uses `IggyClientBuilder` with TLS options (`with_tls_enabled`, `with_tls_domain`
 
 All examples can be executed directly from the repository. Follow these steps:
 
-1. **Start the Iggy server**: `cargo run --bin iggy-server`
+1. **Start the Iggy server** using the credential setup above
 2. **Run desired example**: `cargo run --example EXAMPLE_NAME`
 3. **Check source code**: Examples include detailed comments explaining concepts and usage patterns
 

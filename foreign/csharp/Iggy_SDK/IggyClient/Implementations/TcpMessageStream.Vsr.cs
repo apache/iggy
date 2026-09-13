@@ -200,7 +200,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     /// <summary>
     ///     Whether the partitioning has to be resolved to an explicit partition id before the request is framed.
-    ///     The broker never picks a partition, so balanced and message-key kinds resolve client-side.
+    ///     This client resolves balanced and message-key kinds using its partition cache and cursor.
     /// </summary>
     private static bool NeedsClientSidePartitioning(Partitioning partitioning)
     {
@@ -217,8 +217,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     /// <summary>
     ///     Resolves balanced and message-key partitioning to an explicit partition id, mirroring
-    ///     <c>core/common/src/traits/binary_impls/messages.rs</c>. The VSR broker never picks a partition, so
-    ///     sending either kind on the wire would fail to route.
+    ///     <c>core/common/src/traits/binary_impls/messages.rs</c> and retaining the client's routing cursor.
     /// </summary>
     private async ValueTask<Partitioning> ResolvePartitioningAsync(Identifier streamId, Identifier topicId,
         Partitioning partitioning, CancellationToken token)

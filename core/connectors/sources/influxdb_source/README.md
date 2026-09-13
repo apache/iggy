@@ -108,10 +108,10 @@ verbose_logging      = false
 
 ```toml
 timeout                   = "10s"   # per-request timeout
-max_retries               = 3       # retries per query on transient errors (429/5xx)
+max_retries               = 3       # total query attempts, including the first (429/5xx)
 retry_delay               = "1s"    # initial backoff
 retry_max_delay           = "5s"    # backoff cap
-max_open_retries          = 10      # retries during open() health check
+max_open_retries          = 10      # total open() health-check attempts, including the first
 open_retry_max_delay      = "60s"   # backoff cap for open() retries
 circuit_breaker_threshold = 5       # consecutive failures before circuit trips
 circuit_breaker_cool_down = "30s"   # cool-down before half-open probe

@@ -17,6 +17,7 @@
 
 pub mod client;
 pub mod consumer;
+pub mod durability;
 pub mod error;
 pub mod identifier;
 pub mod message_iterator;
@@ -43,6 +44,7 @@ use crate::topic::TopicDetails;
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        .enumeration::<durability::Durability>()
         // Parent classes must be registered before subclasses because ext-php-rs resolves
         // the parent ClassEntry during child registration.
         .class::<IggyException>()

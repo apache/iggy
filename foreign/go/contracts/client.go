@@ -131,11 +131,11 @@ type Client interface {
 	//   - ErrConsumerGroupMemberNotFound: the client is not a member, for
 	//     example after an explicit LeaveConsumerGroup. JoinConsumerGroup
 	//     restores membership.
-	//   - err == nil with a real partition id: messages were read.
+	//   - err == nil with a real partition id: the poll completed; the batch may be empty.
 	//
-	// The returned message payloads and user headers alias the reply buffer,
-	// so retaining one message pins the whole reply; copy the bytes out when
-	// they outlive the poll.
+	// Uncompressed payloads and user headers alias the reply buffer; copy
+	// those bytes to retain only the message you need. S2 decompression
+	// allocates a separate payload buffer.
 	PollMessages(
 		ctx context.Context,
 		streamId Identifier,
@@ -241,7 +241,7 @@ type Client interface {
 	) (*ConsumerGroupAssignment, error)
 
 	// CreatePartitions create new N partitions for a topic by unique ID or name.
-	// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 1 to 5).
+	// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 0 to 4).
 	// Authentication is required, and the permission to manage the partitions.
 	CreatePartitions(
 		ctx context.Context,
@@ -251,7 +251,7 @@ type Client interface {
 	) error
 
 	// DeletePartitions delete last N partitions for a topic by unique ID or name.
-	// For example, given a topic with 5 partitions, if you delete 2 partitions, the topic will have 3 partitions left (from 1 to 3).
+	// For example, given a topic with 5 partitions, if you delete 2 partitions, the topic will have 3 partitions left (from 0 to 2).
 	// Authentication is required, and the permission to manage the partitions.
 	DeletePartitions(
 		ctx context.Context,

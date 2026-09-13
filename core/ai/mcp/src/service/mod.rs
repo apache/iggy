@@ -310,7 +310,9 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Poll messages")]
+    #[tool(
+        description = "Poll messages. Requires read permission; auto_commit=true or strategy=next also requires update permission because it stores the consumer offset."
+    )]
     pub async fn poll_messages(
         &self,
         Parameters(PollMessages {
@@ -327,7 +329,6 @@ impl IggyService {
         self.permissions.ensure_read()?;
         let offset = offset.unwrap_or(0);
         let count = count.unwrap_or(10);
-        let mut auto_commit = auto_commit.unwrap_or(false);
         let strategy = if let Some(strategy) = strategy {
             match strategy.as_str() {
                 "offset" => PollingStrategy::offset(offset),
@@ -342,8 +343,9 @@ impl IggyService {
         } else {
             PollingStrategy::offset(offset)
         };
-        if strategy.kind == PollingKind::Next {
-            auto_commit = true;
+        let auto_commit = auto_commit.unwrap_or(false) || strategy.kind == PollingKind::Next;
+        if auto_commit {
+            self.permissions.ensure_update()?;
         }
 
         request(
@@ -390,7 +392,7 @@ impl IggyService {
                         ErrorData::invalid_request(format!("Invalid messages key: {error}"), None)
                     })?
                 }
-                "partition" => Partitioning::partition_id(partition_id.unwrap_or(1)),
+                "partition" => Partitioning::partition_id(partition_id.unwrap_or(0)),
                 _ => Partitioning::balanced(),
             }
         } else {
@@ -573,7 +575,7 @@ impl IggyService {
             offset,
         }): Parameters<StoreConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_update()?;
         request(
             self.client
                 .store_consumer_offset(
@@ -596,7 +598,7 @@ impl IggyService {
             partition_id,
         }): Parameters<DeleteConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_delete()?;
         request(
             self.client
                 .delete_consumer_offset(
@@ -622,7 +624,7 @@ impl IggyService {
             CreatePersonalAccessToken,
         >,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_create()?;
         let expiry = expiry
             .and_then(|expiry| expiry.parse().ok())
             .unwrap_or_default();
@@ -638,7 +640,7 @@ impl IggyService {
         &self,
         Parameters(DeletePersonalAccessToken { name }): Parameters<DeletePersonalAccessToken>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
+        self.permissions.ensure_delete()?;
         request(self.client.delete_personal_access_token(&name).await)
     }
 

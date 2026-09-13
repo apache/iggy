@@ -261,6 +261,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
         IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
     {
+
+        options = TopicOptions.WithDurabilityDefaults(options);
         var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
         var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm,
             messageExpiryValue, maxTopicSize, options);

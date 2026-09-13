@@ -156,9 +156,47 @@ fn default_consumer_offsets_max() -> usize {
     PARTITION_CONSUMER_OFFSETS_DEFAULT
 }
 
+pub const DEFAULT_PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
+pub const MIN_PARTITION_WAL_BYTES_MAX: u64 = 2 * (64 * 1024 * 1024 + 4096);
+pub const MAX_PARTITION_WAL_BYTES_MAX: u64 = 4 * 1024 * 1024 * 1024;
+
+fn default_wal_bytes_max() -> IggyByteSize {
+    IggyByteSize::from(DEFAULT_PARTITION_WAL_BYTES_MAX)
+}
+
+/// Ceiling on the group-commit delay. A longer wait costs more than the
+/// barrier it is meant to amortize.
+pub const MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: u64 = 10_000;
+
+fn default_wal_group_commit_delay_micros() -> u64 {
+    0
+}
+
 /// Capacity tunables for the per-partition consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PartitionConfig {
+    /// Active WAL and pending prepare budget per persisted partition.
+    /// Temporary generation rewrites may require additional disk space.
+    #[serde(default = "default_wal_bytes_max")]
+    #[config_env(leaf)]
+    pub wal_bytes_max: IggyByteSize,
+    /// Bounded wait, in microseconds, for more prepares before a persisted
+    /// partition's WAL writer starts its durability barrier. Zero disables it.
+    ///
+    /// Spends up to this much acknowledgment latency to cut device writes: one
+    /// barrier and one frontier write then cover a whole group of prepares
+    /// instead of a single one. Durability is unchanged. The same barrier runs
+    /// over the same bytes, later, and the quorum gate is untouched.
+    ///
+    /// Skipped while prepares arrive further apart than the delay, so an idle
+    /// partition never waits. Earns nothing until the barrier completes faster
+    /// than prepares arrive, which is where the writer stops grouping by
+    /// itself. Start near the measured barrier duration.
+    #[serde(default = "default_wal_group_commit_delay_micros")]
+    #[config_env(leaf)]
+    pub wal_group_commit_delay_micros: u64,
+    #[serde(default = "default_validate_checksum")]
+    pub validate_checksum: bool,
     /// Depth of a partition's prepare queue: how many uncommitted produce /
     /// consumer-offset ops may be in flight at once for that partition.
     /// Submits beyond it are rejected with the transient prepare-queue-full
@@ -182,14 +220,6 @@ pub struct PartitionConfig {
     /// partition primary. Existing keys remain writable at the limit.
     #[serde(default = "default_consumer_offsets_max")]
     pub consumer_offsets_max: usize,
-
-    /// Whether consumer-offset files are written crash-safe: data-synced, then
-    /// renamed over the prior cursor, with the directory synced once per commit
-    /// walk. Independent of the topic's `enforce_fsync`, which governs message
-    /// and index files. Off, an offset file is rewritten in place with no sync.
-    /// A lost or torn cursor can cause replay from the earliest retained data.
-    #[serde(default)]
-    pub consumer_offset_enforce_fsync: bool,
 
     /// Offsets claimed in the superblock ahead of the mint counter before an
     /// append, so a crash-restarted replica resumes above what it confirmed.
@@ -251,6 +281,23 @@ pub struct PartitionConfig {
 
 impl Validatable<ConfigurationError> for PartitionConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        let wal_bytes = self.wal_bytes_max.as_bytes_u64();
+        if !(MIN_PARTITION_WAL_BYTES_MAX..=MAX_PARTITION_WAL_BYTES_MAX).contains(&wal_bytes)
+            || !wal_bytes.is_multiple_of(4096)
+        {
+            eprintln!(
+                "{COMPONENT} partition.wal_bytes_max must be a 4 KiB multiple between {MIN_PARTITION_WAL_BYTES_MAX} and {MAX_PARTITION_WAL_BYTES_MAX} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if self.wal_group_commit_delay_micros > MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS {
+            eprintln!(
+                "{COMPONENT} partition.wal_group_commit_delay_micros must not exceed {MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         if self.prepare_queue_depth == 0 {
             eprintln!("{COMPONENT} partition.prepare_queue_depth must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -304,7 +351,7 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         // The FLOOR on `transfer_artifact_bytes_max` cannot live here (it needs
-        // `system.segment.size` and the bus cap); it is enforced in the
+        // the topic's `segment_size` and the bus cap); it is enforced in the
         // `ServerConfig` validator, which is what turns that misconfiguration
         // into a boot error instead of a silent per-partition rejoin livelock.
         let served_cache = self.transfer_served_cache_bytes_max.as_bytes_u64();
@@ -338,9 +385,45 @@ impl Validatable<ConfigurationError> for PartitionConfig {
     }
 }
 
+const fn default_validate_checksum() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_capacity_requires_aligned_bounds_and_defaults_when_omitted() {
+        for bytes in [
+            0,
+            MIN_PARTITION_WAL_BYTES_MAX - 4096,
+            MIN_PARTITION_WAL_BYTES_MAX + 1,
+            MAX_PARTITION_WAL_BYTES_MAX + 4096,
+        ] {
+            let config = PartitionConfig {
+                wal_bytes_max: IggyByteSize::from(bytes),
+                ..PartitionConfig::default()
+            };
+            assert!(config.validate().is_err(), "accepted WAL capacity {bytes}");
+        }
+        for bytes in [
+            MIN_PARTITION_WAL_BYTES_MAX,
+            DEFAULT_PARTITION_WAL_BYTES_MAX,
+            MAX_PARTITION_WAL_BYTES_MAX,
+        ] {
+            let config = PartitionConfig {
+                wal_bytes_max: IggyByteSize::from(bytes),
+                ..PartitionConfig::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+        let config: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            config.wal_bytes_max.as_bytes_u64(),
+            DEFAULT_PARTITION_WAL_BYTES_MAX
+        );
+    }
 
     #[test]
     fn default_impl_validates() {

@@ -22,25 +22,21 @@ use Iggy\Client;
 use Iggy\PollingStrategy;
 use Iggy\SendMessage;
 
-function iggy_connection_string(): string
+function iggy_client(): Client
 {
     $configured = getenv('IGGY_CONNECTION_STRING');
     if ($configured !== false && $configured !== '') {
-        return $configured;
+        $client = Client::fromConnectionString($configured);
+        $client->connect();
+
+        return $client;
     }
 
     $host = getenv('IGGY_HOST') ?: '127.0.0.1';
     $port = getenv('IGGY_PORT') ?: '8090';
-    $username = rawurlencode(getenv('IGGY_USERNAME') ?: 'iggy');
-    $password = rawurlencode(getenv('IGGY_PASSWORD') ?: 'iggy');
-
-    return "iggy+tcp://{$username}:{$password}@{$host}:{$port}";
-}
-
-function iggy_client(): Client
-{
-    $client = Client::fromConnectionString(iggy_connection_string());
+    $client = new Client("{$host}:{$port}");
     $client->connect();
+    $client->loginUser(getenv('IGGY_USERNAME') ?: 'iggy', getenv('IGGY_PASSWORD') ?: 'iggy');
 
     return $client;
 }

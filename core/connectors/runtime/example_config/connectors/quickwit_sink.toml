@@ -53,13 +53,22 @@ fields = ["email", "created_at"]
 
 [plugin_config]
 url = "http://localhost:7280"
+verbose_logging = false
+# Total attempts including the first; 1 disables retries.
+# max_retries = 3
+# retry_delay = "1s"
+# retry_max_delay = "5s"
+# Total readiness probes including the first; 1 disables retries.
+# max_open_retries = 10
+# open_retry_max_delay = "30s"
+# timeout = "30s"
 index = """
 version: 0.9
 
 index_id: events
 
 doc_mapping:
-  mode: strict
+  mode: dynamic
   field_mappings:
     - name: timestamp
       type: datetime
@@ -93,12 +102,15 @@ doc_mapping:
       type: text
       tokenizer: default
 
-  timestamp_field: timestamp
+  # Enable timestamp sharding only when every document contains timestamp.
+  # Raw/text wrappers do not acquire fields from the add_fields transform.
+  # timestamp_field: timestamp
 
 indexing_settings:
   commit_timeout_secs: 10
 
-retention:
-  period: 7 days
-  schedule: daily
+# Retention requires timestamp_field above.
+# retention:
+#   period: 7 days
+#   schedule: daily
 """

@@ -19,6 +19,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum McpRuntimeError {
+    #[error("Failed to create async runtime: {0}")]
+    RuntimeCreation(#[source] std::io::Error),
+    #[error("Failed to register shutdown signal: {0}")]
+    SignalRegistration(#[source] std::io::Error),
     #[error("Failed to create service")]
     FailedToCreateService,
     #[error("Failed to start HTTP server")]

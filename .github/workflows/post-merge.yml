@@ -67,7 +67,7 @@ jobs:
       # Pinned for the same reason as .github/actions/rust/pre-merge/action.yml:
       # 0.24 dropped the `-f json` edge-affected-images.sh relies on.
       - name: Install cargo-rail
-        uses: taiki-e/install-action@v2.86.7
+        uses: taiki-e/install-action@v2.87.3
         with:
           tool: cargo-rail@0.23.0
 

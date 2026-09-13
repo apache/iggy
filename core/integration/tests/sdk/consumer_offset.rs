@@ -19,6 +19,7 @@ use std::str::FromStr;
 
 use futures::StreamExt;
 use iggy::prelude::*;
+use iggy::stream_builder::{IggyConsumerConfig, IggyStreamConsumer};
 use integration::iggy_harness;
 use tokio::time::{Duration, timeout};
 
@@ -117,6 +118,66 @@ async fn standalone_consumer_deletes_partition_zero_on_none_in_delete_offset(
     // this fails, since partition 0 got deleted
     stored_offset_p0 = fetch_stored_offset(&client, &stream_id, &topic_id, 0).await;
     assert_eq!(stored_offset_p0, Some(1));
+}
+
+#[iggy_harness]
+async fn given_standalone_stream_consumer_when_creating_topic_should_select_partition_independently(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.expect("Root client");
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+
+    for (partitions_count, partition_id) in [(1, None), (4, Some(ASSIGNED_PARTITION_ID))] {
+        let topic_name = format!("{TOPIC_NAME}-{partitions_count}");
+        let topic_id = Identifier::named(&topic_name).unwrap();
+        let config = IggyConsumerConfig::builder()
+            .stream_id(stream_id.clone())
+            .stream_name(STREAM_NAME)
+            .topic_id(topic_id.clone())
+            .topic_name(topic_name)
+            .consumer_name(CONSUMER_NAME)
+            .consumer_kind(ConsumerKind::Consumer)
+            .auto_commit(AutoCommit::Disabled)
+            .batch_length(1)
+            .create_stream_if_not_exists(true)
+            .create_topic_if_not_exists(true)
+            .partitions_count(partitions_count)
+            .maybe_partition_id(partition_id)
+            .polling_interval("1ms".parse().unwrap())
+            .polling_strategy(PollingStrategy::first())
+            .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
+            .init_retries(0)
+            .init_interval(NonZeroIggyDuration::ONE_SECOND)
+            .build();
+        let mut consumer = IggyStreamConsumer::build(&client, &config)
+            .await
+            .expect("Stream consumer should initialize");
+        let topic = client
+            .get_topic(&stream_id, &topic_id)
+            .await
+            .expect("Read created topic")
+            .expect("Topic should be created");
+        assert_eq!(topic.partitions_count, partitions_count);
+
+        let partition_id = partition_id.unwrap_or_default();
+        let mut messages = [IggyMessage::from_str(TOPIC_NAME).unwrap()];
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .expect("Send to selected partition");
+        timeout(POLL_TIMEOUT, consumer.next())
+            .await
+            .expect("Consumer should receive a message before timeout")
+            .expect("Consumer stream should remain open")
+            .expect("Consumer should poll the selected partition");
+        assert_eq!(consumer.partition_id(), partition_id);
+        consumer.shutdown().await.expect("Shut down consumer");
+    }
 }
 
 /// Read the offset the server has stored for the consumer.

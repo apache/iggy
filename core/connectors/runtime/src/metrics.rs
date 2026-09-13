@@ -39,7 +39,7 @@ pub enum ConnectorType {
 }
 
 impl ConnectorType {
-    fn as_label(&self) -> &'static str {
+    pub(crate) fn as_label(&self) -> &'static str {
         match self {
             ConnectorType::Source => "source",
             ConnectorType::Sink => "sink",

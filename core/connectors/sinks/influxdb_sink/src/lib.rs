@@ -23,8 +23,7 @@ use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use iggy_common::serde_secret::serialize_secret;
 use iggy_connector_sdk::retry::{
-    CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
-    parse_duration,
+    CircuitBreaker, RetryPolicy, build_retry_client, check_connectivity_with_retry, parse_duration,
 };
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
@@ -749,13 +748,13 @@ impl Sink for InfluxDbSink {
             self.config.build_health_url()?,
             "InfluxDB sink",
             self.id,
-            &ConnectivityConfig {
-                max_open_retries: self.config.max_open_retries(),
-                open_retry_max_delay: parse_duration(
+            RetryPolicy {
+                max_attempts: self.config.max_open_retries(),
+                base_delay: self.retry_delay,
+                max_delay: parse_duration(
                     self.config.open_retry_max_delay(),
                     DEFAULT_OPEN_RETRY_MAX_DELAY,
                 ),
-                retry_delay: self.retry_delay,
             },
         )
         .await?;

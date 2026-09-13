@@ -129,7 +129,7 @@ async fn login_root_within(
     }
 }
 
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_backup_when_a_client_signs_in_should_bind_the_session_there(
     harness: &TestHarness,
 ) {
@@ -149,7 +149,7 @@ async fn given_a_backup_when_a_client_signs_in_should_bind_the_session_there(
         .expect("the backup must serve an authenticated read on the session it bound");
 }
 
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_backup_bound_session_when_the_client_logs_out_should_remove_it_cluster_wide(
     harness: &TestHarness,
 ) {
@@ -174,7 +174,7 @@ async fn given_a_backup_bound_session_when_the_client_logs_out_should_remove_it_
     );
 }
 
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_backup_when_a_pat_login_arrives_should_bind_the_session_there(
     harness: &TestHarness,
 ) {
@@ -219,7 +219,7 @@ async fn given_a_backup_when_a_pat_login_arrives_should_bind_the_session_there(
         .expect("the backup must serve an authenticated read on the session it bound");
 }
 
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_backup_when_credentials_are_wrong_should_refuse_terminally(harness: &TestHarness) {
     let address = backup_address(harness).await;
     let client = connect_without_login(address).await;
@@ -243,7 +243,7 @@ async fn given_a_backup_when_credentials_are_wrong_should_refuse_terminally(harn
 /// Deliberately kills a FOLLOWER rather than the primary: killing the
 /// primary tests re-election, not this feature. The sibling test below
 /// covers the primary-kill path.
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_degraded_cluster_when_a_client_signs_in_at_a_backup_should_succeed(
     harness: &mut TestHarness,
 ) {
@@ -280,7 +280,7 @@ async fn given_a_degraded_cluster_when_a_client_signs_in_at_a_backup_should_succ
 /// starve on roughly half the runs before the view-start pipeline fix
 /// (a register admitted during the superblock persist panicked the pump);
 /// the deterministic interleaving is pinned by the simulator gate.
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_killed_primary_when_a_client_signs_in_at_a_survivor_should_succeed(
     harness: &mut TestHarness,
 ) {
@@ -310,7 +310,7 @@ async fn given_a_killed_primary_when_a_client_signs_in_at_a_survivor_should_succ
     assert_eq!(identity.user_id, 0, "root user should have id 0");
 }
 
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_backup_when_auto_login_dials_it_should_settle_on_the_leader(
     harness: &TestHarness,
 ) {

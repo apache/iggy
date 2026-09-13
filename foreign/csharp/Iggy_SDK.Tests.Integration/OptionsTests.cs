@@ -32,7 +32,8 @@ public class OptionsTests
         "message_expiry",
         "max_topic_size",
         "segment_size",
-        "enforce_fsync",
+        "durability",
+        "consumer_offset_durability",
         "messages_required_to_save",
         "size_of_messages_required_to_save",
         "preallocate_segments"
@@ -78,8 +79,10 @@ public class OptionsTests
         specs["segment_size"].Kind.ShouldBe(HeaderKind.Uint64);
         BitConverter.ToUInt64(specs["segment_size"].DefaultValue).ShouldBe(1024UL * 1024 * 1024);
 
-        specs["enforce_fsync"].Kind.ShouldBe(HeaderKind.Bool);
-        specs["enforce_fsync"].DefaultValue.ShouldBe([0]);
+        specs["durability"].Kind.ShouldBe(HeaderKind.String);
+        specs["consumer_offset_durability"].Kind.ShouldBe(HeaderKind.String);
+        Encoding.UTF8.GetString(specs["durability"].DefaultValue).ShouldBe("replicated");
+        Encoding.UTF8.GetString(specs["consumer_offset_durability"].DefaultValue).ShouldBe("replicated");
 
         specs["messages_required_to_save"].Kind.ShouldBe(HeaderKind.Uint32);
         BitConverter.ToUInt32(specs["messages_required_to_save"].DefaultValue).ShouldBe(1024u);
@@ -127,7 +130,7 @@ public class OptionsTests
         var typedKeys = new TopicOptions
         {
             SegmentSize = 1,
-            EnforceFsync = true,
+            Durability = Apache.Iggy.Enums.Durability.Persisted,
             MessagesRequiredToSave = 1,
             SizeOfMessagesRequiredToSave = 1,
             PreallocateSegments = true
@@ -148,7 +151,7 @@ public class OptionsTests
         IReadOnlyList<OptionSpec> catalog = await client.DescribeOptionsAsync(OptionsScope.Topic);
         Dictionary<string, HeaderValue> options = new TopicOptions
         {
-            EnforceFsync = true,
+            Durability = Apache.Iggy.Enums.Durability.Persisted,
             MessagesRequiredToSave = 7
         }.ToDictionary();
 
@@ -160,14 +163,14 @@ public class OptionsTests
         topic.DerivedOptions.ShouldNotBeNull();
 
         HashSet<string> explicitKeys = topic.Options!.Keys.Select(key => key.AsString()).ToHashSet();
-        explicitKeys.ShouldContain("enforce_fsync");
+        explicitKeys.ShouldContain("durability");
         explicitKeys.ShouldContain("messages_required_to_save");
-        AsBool(topic.Options.Single(kv => kv.Key.AsString() == "enforce_fsync").Value).ShouldBeTrue();
+        topic.Options.Single(kv => kv.Key.AsString() == "durability").Value.ToString().ShouldBe("persisted");
         topic.Options.Single(kv => kv.Key.AsString() == "messages_required_to_save").Value.ToString()
             .ShouldBe("7");
 
         HashSet<string> derivedKeys = topic.DerivedOptions!.Keys.Select(key => key.AsString()).ToHashSet();
-        derivedKeys.ShouldNotContain("enforce_fsync");
+        derivedKeys.ShouldNotContain("durability");
         derivedKeys.ShouldNotContain("messages_required_to_save");
         derivedKeys.ShouldContain("segment_size");
 
@@ -176,7 +179,7 @@ public class OptionsTests
 
         var fetched = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String("opts-topic"));
         fetched.ShouldNotBeNull();
-        AsBool(fetched.Options!.Single(kv => kv.Key.AsString() == "enforce_fsync").Value).ShouldBeTrue();
+        fetched.Options!.Single(kv => kv.Key.AsString() == "durability").Value.ToString().ShouldBe("persisted");
         fetched.DerivedOptions!.Keys.Select(key => key.AsString()).ShouldContain("segment_size");
     }
 
