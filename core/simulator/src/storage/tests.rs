@@ -58,6 +58,11 @@ enum Mutation {
     Append,
     CertifyView,
     Checkpoint,
+    /// A checkpoint whose rewrite runs while the outgoing generation still
+    /// holds a buffered record. A torn publication leaves the older slot naming
+    /// that generation, so recovery walks its tail and must not read an
+    /// unsynced record there as damage.
+    CheckpointBufferedTail,
     Truncate,
     Reset,
     Purge,
@@ -123,6 +128,7 @@ fn wal_fault_sweep_preserves_acknowledged_history_at_every_io_boundary() {
             Mutation::Append,
             Mutation::CertifyView,
             Mutation::Checkpoint,
+            Mutation::CheckpointBufferedTail,
             Mutation::Truncate,
             Mutation::Reset,
             Mutation::Purge,
@@ -740,8 +746,8 @@ fn checkpoint_skips_duplicate_offset_sync_but_still_refuses_a_missing_path() {
                         .iter()
                         .filter(|operation| **operation == StorageOperation::FileSync)
                         .count(),
-                    3,
-                    "original offset writer, replacement WAL, frontier"
+                    4,
+                    "original offset writer, outgoing WAL, replacement WAL, frontier"
                 );
             }
         }
@@ -974,33 +980,88 @@ fn queued_prepares_share_a_barrier_and_survive_power_loss_together() {
         Rc::clone(&persistence).run().await;
         assert!(persistence.failure().is_none());
         let trace = storage.trace();
-        assert_eq!(
+        let count = |wanted: StorageOperation| {
             trace
                 .iter()
-                .filter(|operation| **operation == StorageOperation::FileSync)
-                .count(),
-            4
-        );
-        assert_eq!(
-            trace
-                .iter()
-                .filter(|operation| **operation == StorageOperation::DirectorySync)
-                .count(),
-            2
-        );
-        assert_eq!(
-            trace
-                .iter()
-                .filter(|operation| **operation == StorageOperation::Write)
-                .count(),
-            4
-        );
+                .filter(|operation| **operation == wanted)
+                .count()
+        };
+        // One group: the WAL extent and the frontier slot, one barrier each.
+        assert_eq!(count(StorageOperation::Write), 2);
+        assert_eq!(count(StorageOperation::FileSync), 2);
+        // Publication overwrites a pre-existing slot in place, so an
+        // acknowledgment creates no file, renames nothing and leaves no
+        // directory to make durable. Those are the filesystem metadata
+        // transactions this path must never pay per batch.
+        assert_eq!(count(StorageOperation::Create), 0);
+        assert_eq!(count(StorageOperation::Rename), 0);
+        assert_eq!(count(StorageOperation::DirectorySync), 0);
         assert!(persistence.is_durable_through(65));
         storage.crash(Crash::PowerLoss);
         let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
             .await
             .unwrap();
         assert_eq!(recovered.prepares().await.unwrap().len(), 65);
+    });
+}
+
+#[test]
+fn queued_owned_prepares_share_three_file_barriers_without_directory_mutations() {
+    block_on(async {
+        for count in [65, 256, 257] {
+            let storage = storage_for_partition().await;
+            let (persistence, _) =
+                PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                    .await
+                    .unwrap();
+            persistence.enable_segment_storage(SegmentPosition::default(), 64 * 1024 * 1024);
+            let first = owned_prepare(1, 0, 0);
+            let mut parent = first.header().checksum;
+            persistence.append(first.into_frozen(), true).unwrap();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            assert!(persistence.failure().is_none());
+            persistence.take_metrics();
+            for index in 1..=count {
+                let prepare = owned_prepare(1, parent, index).transmute_header(
+                    |original, header: &mut PrepareHeader| {
+                        *header = original;
+                        header.op = index + 1;
+                        header.checksum = header.identity_checksum();
+                    },
+                );
+                parent = prepare.header().checksum;
+                persistence.append(prepare.into_frozen(), true).unwrap();
+            }
+            storage.clear_trace();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            assert!(persistence.failure().is_none());
+            let trace = storage.trace();
+            let operations = |wanted: StorageOperation| {
+                trace
+                    .iter()
+                    .filter(|operation| **operation == wanted)
+                    .count() as u64
+            };
+            let groups = count.div_ceil(256);
+            assert_eq!(operations(StorageOperation::Write), 3 * groups);
+            assert_eq!(operations(StorageOperation::FileSync), 3 * groups);
+            assert_eq!(operations(StorageOperation::Create), 0);
+            assert_eq!(operations(StorageOperation::Rename), 0);
+            assert_eq!(operations(StorageOperation::DirectorySync), 0);
+            let metrics = persistence.take_metrics();
+            assert_eq!(metrics.completed_batches, groups);
+            assert_eq!(metrics.batched_prepares, count);
+            assert!(persistence.is_durable_through(count + 1));
+            storage.crash(Crash::PowerLoss);
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.head(), count + 1);
+            assert_eq!(recovered.prepares().await.unwrap().len() as u64, count + 1);
+        }
     });
 }
 
@@ -2003,7 +2064,7 @@ async fn mutate_owned_segments(
                 .append(owned_prepare(3, second.header().checksum, 2).into_frozen())
                 .await
         }
-        Mutation::Checkpoint => journal.checkpoint(2).await,
+        Mutation::Checkpoint | Mutation::CheckpointBufferedTail => journal.checkpoint(2).await,
         Mutation::Truncate => journal.truncate_from(2).await,
         Mutation::CertifyView => {
             journal
@@ -2234,7 +2295,7 @@ async fn mutate_referenced(
                 .certify_log_view(2, 2, second.header().checksum)
                 .await
         }
-        Mutation::Checkpoint => journal.checkpoint(2).await,
+        Mutation::Checkpoint | Mutation::CheckpointBufferedTail => journal.checkpoint(2).await,
         Mutation::Truncate => journal.truncate_from(2).await,
         Mutation::Reset => journal.reset(7, None).await,
         Mutation::Purge => {
@@ -2282,7 +2343,7 @@ async fn assert_referenced_recovery(
                 assert_eq!(journal.head(), 7, "{context}");
             }
         }
-        Mutation::Checkpoint => {
+        Mutation::Checkpoint | Mutation::CheckpointBufferedTail => {
             assert_eq!(journal.head(), 2, "{context}");
             assert!([0, 2].contains(&journal.checkpoint_op()), "{context}");
             if completed {
@@ -2367,6 +2428,17 @@ async fn mutate(
             replace(storage, Path::new("/partition/materialized"), b"1,2").await?;
             journal.checkpoint(2).await
         }
+        Mutation::CheckpointBufferedTail => {
+            let entries = journal.prepares().await?;
+            let last = bytemuck::checked::from_bytes::<PrepareHeader>(
+                &entries.last().unwrap().as_slice()[..size_of::<PrepareHeader>()],
+            );
+            journal
+                .append_buffered(prepare(4, last.checksum).into_frozen())
+                .await?;
+            replace(storage, Path::new("/partition/materialized"), b"1,2").await?;
+            journal.checkpoint(2).await
+        }
         Mutation::Truncate => journal.truncate_from(3).await,
         Mutation::Reset => {
             replace(storage, Path::new("/partition/materialized"), b"1-7").await?;
@@ -2403,6 +2475,16 @@ async fn replace(storage: &SimStorage, path: &Path, bytes: &[u8]) -> io::Result<
     storage.sync_directory(path.parent().unwrap()).await
 }
 
+/// The buffered record is acknowledged by nothing, so recovery may keep or drop
+/// it. Refusing the open is the failure this covers.
+fn assert_buffered_tail_checkpoint(journal: &PartitionPrepareJournal<SimStorage>, completed: bool) {
+    assert!((3..=4).contains(&journal.head()));
+    assert!([0, 2].contains(&journal.checkpoint_op()));
+    if completed {
+        assert_eq!(journal.checkpoint_op(), 2);
+    }
+}
+
 async fn assert_recovery(
     storage: &SimStorage,
     journal: &PartitionPrepareJournal<SimStorage>,
@@ -2425,6 +2507,7 @@ async fn assert_recovery(
                 assert_eq!(journal.head(), 4);
             }
         }
+        Mutation::CheckpointBufferedTail => assert_buffered_tail_checkpoint(journal, completed),
         Mutation::Checkpoint => {
             assert_eq!(journal.head(), 3);
             assert!([0, 2].contains(&journal.checkpoint_op()));
@@ -2495,7 +2578,12 @@ async fn assert_recovery(
     assert_eq!(
         entries.len() as u64,
         journal.head() - journal.checkpoint_op()
-            + u64::from(matches!(mutation, Mutation::Checkpoint) && journal.checkpoint_op() > 0)
+            + u64::from(
+                matches!(
+                    mutation,
+                    Mutation::Checkpoint | Mutation::CheckpointBufferedTail
+                ) && journal.checkpoint_op() > 0,
+            )
     );
 }
 

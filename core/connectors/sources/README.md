@@ -9,6 +9,7 @@ Source connectors are responsible for ingesting data from external sources into 
 | Source | Description |
 | ------ | ----------- |
 | **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
+| **http_source** | Webhook gateway: an embedded HTTP server shared by every instance, with per-endpoint bearer/HMAC auth and a management API for endpoints registered at runtime |
 | **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
@@ -72,7 +73,7 @@ enabled = true # Toggle source on/off
 version = 0
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
-config_format = "toml"
+plugin_config_format = "toml"
 verbose = false # Log message processing at info level instead of debug
 benchmark = false # Emit per-batch timing events on `iggy_connectors::benchmark` target
 

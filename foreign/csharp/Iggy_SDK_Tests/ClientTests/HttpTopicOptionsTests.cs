@@ -18,8 +18,10 @@
 using System.Net;
 using System.Text;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Tests.ClientTests;
 
@@ -156,8 +158,60 @@ public sealed class HttpTopicOptionsTests
         Assert.Equal("/options/stream", handler.RequestPath);
     }
 
+    [Fact]
+    public async Task Dispose_Should_ReleaseTheOwnedHttpClient()
+    {
+        using var httpClient = new HttpClient(new StubHandler("[]"))
+        {
+            BaseAddress = new Uri("http://localhost")
+        };
+        var client = new HttpMessageStream(httpClient);
+        await client.DescribeOptionsAsync(OptionsScope.Stream, TestContext.Current.CancellationToken);
+
+        client.Dispose();
+        client.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            httpClient.GetAsync("/options/stream", TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task DeleteTopic_Should_PreserveServerStatus()
+    {
+        var handler = new StubHandler("""{"id":5,"code":"feature_unavailable","reason":"Delete disabled."}""")
+        {
+            StatusCode = HttpStatusCode.NotImplemented
+        };
+        using var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.DeleteTopicAsync(StreamId, Identifier.Numeric(2), TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
+        Assert.True(error.FromServer);
+    }
+
+    [Fact]
+    public async Task PurgeTopic_Should_SurfaceFailedResponse()
+    {
+        var handler = new StubHandler("""{"id":5,"code":"feature_unavailable","reason":"Purge disabled."}""")
+        {
+            StatusCode = HttpStatusCode.NotImplemented
+        };
+        using var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.PurgeTopicAsync(StreamId, Identifier.Numeric(2), TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
+        Assert.True(error.FromServer);
+        Assert.Equal("/streams/1/topics/2/purge", handler.RequestPath);
+    }
+
     private sealed class StubHandler(string json) : HttpMessageHandler
     {
+        internal HttpStatusCode StatusCode { get; init; } = HttpStatusCode.OK;
+
         internal string RequestBody { get; private set; } = string.Empty;
 
         internal string RequestPath { get; private set; } = string.Empty;
@@ -171,8 +225,9 @@ public sealed class HttpTopicOptionsTests
                 RequestBody = await request.Content.ReadAsStringAsync(ct);
             }
 
-            return new HttpResponseMessage(HttpStatusCode.OK)
+            return new HttpResponseMessage(StatusCode)
             {
+                RequestMessage = request,
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
         }

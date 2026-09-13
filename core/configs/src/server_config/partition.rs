@@ -164,6 +164,14 @@ fn default_wal_bytes_max() -> IggyByteSize {
     IggyByteSize::from(DEFAULT_PARTITION_WAL_BYTES_MAX)
 }
 
+/// Ceiling on the group-commit delay. A longer wait costs more than the
+/// barrier it is meant to amortize.
+pub const MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: u64 = 10_000;
+
+fn default_wal_group_commit_delay_micros() -> u64 {
+    0
+}
+
 /// Capacity tunables for the per-partition consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PartitionConfig {
@@ -172,6 +180,21 @@ pub struct PartitionConfig {
     #[serde(default = "default_wal_bytes_max")]
     #[config_env(leaf)]
     pub wal_bytes_max: IggyByteSize,
+    /// Bounded wait, in microseconds, for more prepares before a persisted
+    /// partition's WAL writer starts its durability barrier. Zero disables it.
+    ///
+    /// Spends up to this much acknowledgment latency to cut device writes: one
+    /// barrier and one frontier write then cover a whole group of prepares
+    /// instead of a single one. Durability is unchanged. The same barrier runs
+    /// over the same bytes, later, and the quorum gate is untouched.
+    ///
+    /// Skipped while prepares arrive further apart than the delay, so an idle
+    /// partition never waits. Earns nothing until the barrier completes faster
+    /// than prepares arrive, which is where the writer stops grouping by
+    /// itself. Start near the measured barrier duration.
+    #[serde(default = "default_wal_group_commit_delay_micros")]
+    #[config_env(leaf)]
+    pub wal_group_commit_delay_micros: u64,
     #[serde(default = "default_validate_checksum")]
     pub validate_checksum: bool,
     /// Depth of a partition's prepare queue: how many uncommitted produce /
@@ -264,6 +287,13 @@ impl Validatable<ConfigurationError> for PartitionConfig {
         {
             eprintln!(
                 "{COMPONENT} partition.wal_bytes_max must be a 4 KiB multiple between {MIN_PARTITION_WAL_BYTES_MAX} and {MAX_PARTITION_WAL_BYTES_MAX} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if self.wal_group_commit_delay_micros > MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS {
+            eprintln!(
+                "{COMPONENT} partition.wal_group_commit_delay_micros must not exceed {MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS}"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
