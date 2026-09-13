@@ -42,6 +42,7 @@ use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
+use crate::producer::{IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
@@ -63,6 +64,10 @@ pub struct IggyClient {
 /// Converts SDK errors to the RuntimeError exposed by the Python API.
 fn to_runtime_error<E: Display>(error: E) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+}
+
+fn to_value_error<E: Display>(error: E) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyValueError, _>(error.to_string())
 }
 
 /// Resolves the shared `create_topic`/`update_topic` parameters, applying
@@ -94,9 +99,9 @@ fn resolve_topic_params(
 #[pymethods]
 impl IggyClient {
     /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
-    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
-    /// new runtime for asynchronous operations.
-    /// Future versions might utilize asyncio for more Pythonic async.
+    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. Construction is
+    /// synchronous; async methods return asyncio awaitables backed by the shared
+    /// Tokio runtime.
     ///
     /// Args:
     ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
@@ -686,7 +691,8 @@ impl IggyClient {
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///     segment_size: Per-topic segment size in bytes as `int | None`.
-    ///     enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+    ///     durability: Message completion policy, defaulting to replicated.
+    ///     consumer_offset_durability: Independent offset policy, defaulting to replicated.
     ///     messages_required_to_save: Message-count flush threshold as `int | None`.
     ///     size_of_messages_required_to_save: Byte flush threshold as `int | None`.
     ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
@@ -703,7 +709,7 @@ impl IggyClient {
     ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
     ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, enforce_fsync = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
+        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -723,7 +729,11 @@ impl IggyClient {
             &MaxTopicSize,
         >,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] segment_size: Option<u64>,
-        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enforce_fsync: Option<bool>,
+        #[gen_stub(override_type(type_repr = "Durability | None"))] durability: Option<
+            &Bound<'_, PyAny>,
+        >,
+        #[gen_stub(override_type(type_repr = "Durability | None"))]
+        consumer_offset_durability: Option<&Bound<'_, PyAny>>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         messages_required_to_save: Option<u32>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))]
@@ -746,7 +756,11 @@ impl IggyClient {
             message_expiry: (expiry != RustIggyExpiry::ServerDefault).then_some(expiry),
             max_topic_size: (max_size != RustMaxTopicSize::ServerDefault).then_some(max_size),
             segment_size: segment_size.map(IggyByteSize::from),
-            enforce_fsync,
+            durability: crate::durability::Durability::try_from(durability)?.0,
+            consumer_offset_durability: crate::durability::Durability::try_from(
+                consumer_offset_durability,
+            )?
+            .0,
             messages_required_to_save,
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
@@ -1268,7 +1282,7 @@ impl IggyClient {
     /// Returns:
     ///     An awaitable that resolves to `SendMessagesResponse`. Its confirmations
     ///     report the committed partition and batch base offset. The list is empty
-    ///     when the server reports no offsets, including on the legacy server.
+    ///     when the server reports no offsets.
     ///
     /// Raises:
     ///     ValueError: If a string stream or topic identifier is invalid.
@@ -1309,6 +1323,111 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             Ok(PySendMessagesResponse::from(response))
+        })
+    }
+
+    /// Creates and initializes a high-level producer bound to a stream and topic.
+    ///
+    /// This is a Python port of the Rust high-level producer API. For detailed
+    /// producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+    /// `None` selects direct mode. `BackgroundProducerConfig` starts background
+    /// workers and makes successful sends mean queue acceptance rather than a
+    /// server commit. The returned producer is ready to send.
+    ///
+    /// Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
+    /// when stream/topic initialization fails.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        stream,
+        topic,
+        partitioning=None,
+        mode=None,
+        create_stream_if_not_exists=true,
+        create_topic_if_not_exists=true,
+        topic_partitions_count=1,
+        topic_message_expiry=None,
+        topic_max_size=None,
+        send_retries=Some(3),
+        send_retry_interval=RetryInterval::default(),
+    ))]
+    #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
+    fn producer<'a>(
+        &self,
+        py: Python<'a>,
+        stream: &str,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
+            &crate::partitioning::Partitioning,
+        >,
+        #[gen_stub(override_type(
+            type_repr = "DirectProducerConfig | BackgroundProducerConfig | None"
+        ))]
+        mode: Option<ProducerMode>,
+        create_stream_if_not_exists: bool,
+        create_topic_if_not_exists: bool,
+        topic_partitions_count: i64,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] topic_message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] topic_max_size: Option<
+            &MaxTopicSize,
+        >,
+        send_retries: Option<i64>,
+        send_retry_interval: RetryInterval,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let mode = mode.unwrap_or_default();
+
+        let topic_partitions_count =
+            producer_u32_param(topic_partitions_count, "topic_partitions_count")?;
+        let topic_message_expiry = topic_message_expiry
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .unwrap_or(RustIggyExpiry::ServerDefault);
+        let topic_max_size = topic_max_size
+            .map(RustMaxTopicSize::try_from)
+            .transpose()?
+            .unwrap_or(RustMaxTopicSize::ServerDefault);
+        let send_retries = send_retries
+            .map(|retries| producer_u32_param(retries, "send_retries"))
+            .transpose()?
+            .filter(|retries| *retries != 0);
+        let send_retry_interval = send_retry_interval.resolve()?;
+
+        let mut builder = self
+            .inner
+            .producer(stream, topic)
+            .map_err(to_value_error)?
+            .send_retries(send_retries, send_retry_interval);
+
+        builder = match mode {
+            ProducerMode::Direct(config) => builder.direct((&config).into()),
+            ProducerMode::Background(config) => builder.background((&config).try_into()?),
+        };
+
+        if let Some(partitioning) = partitioning {
+            builder = builder.partitioning(partitioning.inner.as_ref().clone());
+        }
+        if create_stream_if_not_exists {
+            builder = builder.create_stream_if_not_exists();
+        } else {
+            builder = builder.do_not_create_stream_if_not_exists();
+        }
+        if create_topic_if_not_exists {
+            builder = builder.create_topic_if_not_exists(
+                topic_partitions_count,
+                topic_message_expiry,
+                topic_max_size,
+            );
+        } else {
+            builder = builder.do_not_create_topic_if_not_exists();
+        }
+
+        future_into_py(py, async move {
+            // A background build starts Tokio worker tasks, so it must happen
+            // while this future is executing on the Rust runtime.
+            let producer = builder.build();
+            producer.init().await.map_err(to_runtime_error)?;
+            Ok(IggyProducer::new(producer))
         })
     }
 

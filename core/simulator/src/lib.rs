@@ -24,6 +24,7 @@ pub mod packet;
 pub mod ready_queue;
 pub mod replica;
 pub mod seeds;
+pub mod storage;
 pub mod workload;
 
 use bus::SimOutbox;
@@ -1049,6 +1050,16 @@ impl Simulator {
                     self.seed,
                     self.executor.schedule_hash(),
                 );
+                let pending_completions = shard.poll_completion_inbox_len();
+                assert_eq!(
+                    pending_completions,
+                    0,
+                    "lost wakeup: replica {replica_id} shard {} completion lane holds \
+                     {pending_completions} result(s) at quiescence (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
                 let pending_redispatch = shard.redispatched_frame_count();
                 assert_eq!(
                     pending_redispatch,
@@ -1374,45 +1385,46 @@ impl Simulator {
         self.run_pumps();
     }
 
-    /// Poll messages directly from a replica's partition.
+    /// Poll messages through a replica's partition owner.
+    ///
+    /// The returned future owns its request and shard handle, so it can run on
+    /// the simulator executor while the caller advances the simulation or
+    /// releases paused work. The owner accepts the read and replies before
+    /// awaiting replication of an automatic commit.
     ///
     /// # Errors
-    /// `IggyError::ResourceNotFound` if the namespace is not on this replica.
+    /// Returns routing and owner rejections, `IggyError::ResourceNotFound` if
+    /// the owner reports a missing partition, or `IggyError::ShardCommunicationError`
+    /// if a submitted request times out or loses its reply.
+    ///
+    /// # Panics
+    /// If `replica_idx` is out of bounds or the owner replies for a different read type.
+    #[allow(clippy::future_not_send)]
     pub fn poll_messages(
         &self,
         replica_idx: usize,
         namespace: IggyNamespace,
         consumer: PollingConsumer,
         args: &PollingArgs,
-    ) -> Result<PollFragments<4096>, IggyError> {
-        let shard = self.replicas[replica_idx].partition_shard(namespace);
-        // Build the owned poll plan synchronously, then execute off the borrow.
-        //
-        // The one `block_on` allowed to stay, and only because `plan.execute()`
-        // cannot suspend here: the sim's partitions are in-memory (no
-        // `partition_dir`), so the plan serves the resident journal tier with no disk
-        // IO and no `bus.sleep`. A suspending await would fail two ways. On the
-        // virtual clock it would hang this thread forever, the clock advancing only
-        // through `advance_time`, which does not run during `block_on`. On the retry
-        // path it would panic on the compio timer outside a compio runtime. Safe only
-        // because it runs between `run_pumps` calls, with the executor quiescent and
-        // no pump holding the partition commit lock in a suspended frame.
-        let Some(plan) = shard
-            .plane
-            .partitions()
-            .build_poll_snapshot(&namespace, consumer, args)
-        else {
-            return Err(IggyError::ResourceNotFound(format!(
-                "partition not found for namespace {namespace:?} on replica {replica_idx}"
-            )));
-        };
-        // Partitions are driven directly, so a poll's auto-commit is never
-        // replicated (the serving shard's job in the real server). Offset discarded.
-        let (fragments, _commit_offset, auto_commit) = futures::executor::block_on(plan.execute())?;
-        if let Some(applied) = auto_commit {
-            applied.admit(|_| Ok::<(), IggyError>(()))?;
+    ) -> impl Future<Output = Result<PollFragments<4096>, IggyError>> + use<> {
+        let owner = Rc::clone(self.replicas[replica_idx].partition_shard(namespace));
+        let args = args.clone();
+        async move {
+            match owner
+                .partition_read(namespace, shard::PartitionRead::Poll { consumer, args })
+                .await
+            {
+                Some(shard::PartitionReadReply::Poll { fragments, .. }) => Ok(fragments),
+                Some(shard::PartitionReadReply::Rejected(error)) => Err(error),
+                Some(shard::PartitionReadReply::NotFound) => {
+                    Err(IggyError::ResourceNotFound(format!(
+                        "partition not found for namespace {namespace:?} on replica {replica_idx}"
+                    )))
+                }
+                None => Err(IggyError::ShardCommunicationError),
+                Some(reply) => panic!("unexpected reply to a poll request: {reply:?}"),
+            }
         }
-        Ok(fragments)
     }
 
     /// Partition offsets from a replica.
@@ -1676,11 +1688,12 @@ mod tests {
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
     use consensus::Status;
+    use futures::FutureExt;
     use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
     use iggy_common::ConsumerKind;
     use server_common::sharding::IggyNamespace;
 
-    fn submit_and_wait_for_reply(
+    pub fn submit_and_wait_for_reply(
         sim: &mut Simulator,
         client_id: u128,
         target: u8,
@@ -1698,6 +1711,142 @@ mod tests {
             }
         }
         panic!("request {request_id} did not receive a reply");
+    }
+
+    /// The simulator helper must yield while its owner runs, then return the
+    /// accepted resident read even if the automatic commit's replica send stalls.
+    /// Releasing that send must let the same commit reach the other replicas.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_simulator_poll_when_replica_send_stalls_should_reply_and_resume_replication() {
+        // 1. Publish one message and let the cluster finish the initial work.
+        // The pause installed later must affect the poll's automatic commit.
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let client_id = 1u128;
+        let replica_count = 3u8;
+        let primary_replica = 0u8;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let mut simulator = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed: 0xC011_EC71,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        simulator.init_partition(namespace);
+        let client = SimClient::new(client_id);
+        simulator.register_client_with_primary(&client);
+        let append_reply = submit_and_wait_for_reply(
+            &mut simulator,
+            client_id,
+            primary_replica,
+            client.send_messages(
+                namespace,
+                &[Bytes::from_static(b"reply-before-replication")],
+            ),
+        );
+        assert_eq!(append_reply.header().status, 0);
+        simulator.run_pumps();
+
+        // 2. Confirm that the poll uses resident data. This scenario checks
+        // reply timing after inline acceptance, without a detached disk read.
+        let owner =
+            Rc::clone(simulator.replicas[usize::from(primary_replica)].partition_shard(namespace));
+        let consumer_id = 7;
+        let partition_id = 0;
+        let consumer = PollingConsumer::Consumer(consumer_id, partition_id);
+        let auto_commit = true;
+        let poll_args = PollingArgs::new(iggy_common::PollingStrategy::next(), 1, auto_commit);
+        let resident_plan = owner
+            .plane
+            .partitions()
+            .build_poll_snapshot(&namespace, consumer, &poll_args)
+            .expect("poll snapshot");
+        assert!(
+            !resident_plan.needs_off_pump_io(),
+            "fixture must exercise inline resident completion"
+        );
+        drop(resident_plan);
+
+        // 3. Run the poll task with the next replica send paused.
+        // The separate caller task lets the owner send a reply while
+        // its replication continuation is still waiting for release.
+        let resume_replication = owner.bus.delay_next_replica_send();
+        let (poll_result_sender, poll_result_receiver) = shard::channel(1);
+        let poll = simulator.poll_messages(
+            usize::from(primary_replica),
+            namespace,
+            consumer,
+            &poll_args,
+        );
+        simulator.executor.spawn(async move {
+            let _ = poll_result_sender.try_send(poll.await);
+        });
+        simulator.run_pumps();
+
+        // 4. The nonempty reply must already be available before releasing
+        // replication. Waiting for it asynchronously here would hide a stall.
+        let fragments = poll_result_receiver
+            .recv()
+            .now_or_never()
+            .expect("admitted poll replies while replication remains suspended")
+            .expect("reply channel is open")
+            .expect("owning shard accepted the poll");
+        assert!(!fragments.is_empty());
+
+        // 5. Before release, neither backup has received the automatic commit.
+        // Inspect backups because the stalled owner still borrows its partition.
+        for backup in &simulator.replicas[1..] {
+            let (consumer_offset, _) = backup
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .consumer_offset_read(&namespace, consumer)
+                .expect("partition exists on the backup");
+            assert_eq!(consumer_offset, None);
+        }
+        assert!(
+            resume_replication.send(()).is_ok(),
+            "replication must still be waiting after the poll reply"
+        );
+
+        // 6. Drive network delivery as well as the executor. A reply alone
+        // must not let the helper silently discard its replication continuation.
+        let replicated = (0..100).any(|_| {
+            simulator.step();
+            simulator.replicas.iter().all(|replica| {
+                replica
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .with_partition(&namespace, |partition| {
+                        partition.durable_consumer_offset_count(iggy_common::ConsumerKind::Consumer)
+                            == 1
+                    })
+                    == Some(true)
+            })
+        });
+        assert!(
+            replicated,
+            "automatic commit reaches every replica after release"
+        );
+        let (consumer_offset, _partition_commit_offset) = owner
+            .plane
+            .partitions()
+            .consumer_offset_read(&namespace, consumer)
+            .expect("partition exists");
+        assert_eq!(
+            consumer_offset,
+            Some(0),
+            "admission records the served cursor"
+        );
     }
 
     #[test]
@@ -2739,7 +2888,7 @@ mod tests {
         }
 
         // Poll through the dispatch shell (`on_client_request`, drain,
-        // `handle_poll_messages`, `partition_read`, `on_partition_read`), running as a
+        // `handle_poll_messages`, `partition_read`, the owning shard), running as a
         // task the executor interleaves with the pump.
         let poll = client.poll_messages(ns, 10);
         sim.submit_request(client_id, 0, poll.into_generic());
@@ -2756,7 +2905,7 @@ mod tests {
 
     /// A `SimClient` poll returns the produced messages through the real dispatch
     /// read path (`on_client_request`, `handle_poll_messages`, `partition_read`,
-    /// `on_partition_read`), running as a task the executor interleaves with the pump,
+    /// the owning shard), running as a task the executor interleaves with the pump,
     /// and the whole login/produce/poll round-trip replays byte-for-byte on one seed.
     #[test]
     fn shell_poll_returns_produced_messages_deterministically() {
@@ -2794,7 +2943,7 @@ mod tests {
             .count()
     }
 
-    fn retained_prepare(
+    pub fn retained_prepare(
         sim: &Simulator,
         replica: usize,
         namespace: IggyNamespace,
@@ -3035,8 +3184,8 @@ mod tests {
     /// Injected through the synthetic `hold_borrow_across_await` rather than the real
     /// read, because the production read has no borrow-holding suspension to seed: the
     /// journal read is a synchronous memory copy, and `with_partition` returns an owned
-    /// `PollPlan` before the only awaits (disk read, offset persist) run off the borrow
-    /// in `spawn_poll_io`.
+    /// `PollPlan` before disk reads run off the borrow. Completion returns to the owner
+    /// before consumer progress changes.
     ///
     /// TODO: once storage faults are modelled, the disk-tier read
     /// (`PollPlan::execute`, `read_disk`) becomes a real seedable await in the read
@@ -4535,6 +4684,84 @@ mod tests {
     /// finds two replicas at the same op passes in silence, so `ops_compared` counts
     /// only ops witnessed on more than one replica, the subset that exercised the
     /// property.
+    /// A replica prepares an op and stays down. One survivor holds its header
+    /// without the body, the other never had it, and the merge must read that as
+    /// proof both are outside the ack set. Otherwise it waits for the crashed
+    /// replica: on this seed the cluster reached view 103 against `log_view` 3 with
+    /// both survivors caught up and one request retried 266 times unanswered.
+    ///
+    /// Asserts the drain, so it fails as the fuzzer does with the outstanding-request
+    /// report attached.
+    #[test]
+    fn view_change_completes_without_the_replica_that_prepared_the_head() {
+        use crate::workload::{
+            self, FaultInjector, Workload,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        // `workload-fuzz --seed 211 --replicas 3 --ticks 4000 --plane metadata
+        // --journal-slots 80 --crash-prob 0.02 --restart-prob 0.08 --crash-primary`.
+        let seed = 211u64;
+        let root = tempfile::tempdir().expect("temp dir for the simulator's snapshots");
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        // A bounded journal is what drives the WAL drain behind the header-only sender.
+        let mut sim = Simulator::with_checkpoints(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+            false,
+            root.path(),
+        );
+        sim.set_metadata_journal_slots(80);
+
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
+        options.client_count = 1;
+        options.crash_per_tick_ratio = 0.02;
+        options.restart_per_tick_ratio = 0.08;
+        options.spare_primary = false;
+        options.weights = ActionWeights::metadata_only();
+        let mut workload = Workload::new(options);
+
+        let clients = [client];
+        let mut injector = FaultInjector::new(seed, replica_count);
+        let _ = workload::run_with_faults(
+            &mut sim,
+            &mut workload,
+            &clients,
+            4_000,
+            u64::MAX,
+            &mut injector,
+        );
+
+        assert!(
+            injector.crashes() > 0,
+            "no replica crashed, so no view change ran and this proves nothing"
+        );
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &workload),
+        );
+    }
+
     #[test]
     fn committed_metadata_agrees_across_replicas() {
         use crate::workload::{
@@ -5485,9 +5712,11 @@ mod partition_repair_driver_tests {
     use bytes::Bytes;
     use consensus::Status;
     use iggy_binary_protocol::{
-        CommitHeader, PrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader,
+        CommitHeader, ConsensusHeader, PrepareHeader, RepairRangeReplyHeader,
+        RequestPreparesHeader, StartViewHeader,
     };
     use packet::Packet;
+    use server_common::MessageBag;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Chain replication runs 0 -> 1 -> 2 and stops before the primary, so
@@ -5715,6 +5944,204 @@ mod partition_repair_driver_tests {
                     || partition.consensus().state_transfer_stage()
                         != consensus::StateTransferStage::Idle
             })
+    }
+
+    #[test]
+    fn given_a_resident_repair_window_when_commit_walk_is_bounded_should_drain_without_repair() {
+        const OPS: usize = partitions::COMMIT_WALK_OPS_MAX + 2;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = resident_repair_window(namespace, OPS, OPS);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+
+        deliver_commit(shard, namespace, OPS as u64);
+
+        let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(commit_min, partitions::COMMIT_WALK_OPS_MAX as u64);
+        assert_eq!(commit_max, OPS as u64);
+        for op in commit_min + 1..=commit_max {
+            assert!(journal_holds(&sim, LAGGING, namespace, op));
+        }
+        assert!(
+            shard
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .repair
+                .is_none(),
+            "resident operations must not consume a repair session while waiting for the next walk"
+        );
+        assert!(repair_requests(&sim).is_empty());
+
+        let mut namespace_scratch = Vec::new();
+        assert!(
+            futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch)).is_none()
+        );
+        assert_eq!(
+            group_state(&sim, LAGGING, namespace),
+            (Status::Normal, 0, OPS as u64, OPS as u64),
+            "the existing tick must finish the resident backlog without peer repair"
+        );
+        assert!(repair_requests(&sim).is_empty());
+    }
+
+    #[test]
+    fn given_a_resident_prefix_when_a_later_op_is_missing_should_repair_and_drain() {
+        const RESIDENT_OPS: usize = partitions::COMMIT_WALK_OPS_MAX + 1;
+        const OPS: usize = RESIDENT_OPS + 1;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = resident_repair_window(namespace, OPS, RESIDENT_OPS);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+
+        deliver_commit(shard, namespace, OPS as u64);
+
+        let (_, _, commit_min, _) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(commit_min, partitions::COMMIT_WALK_OPS_MAX as u64);
+        assert!(journal_holds(&sim, LAGGING, namespace, commit_min + 1));
+        assert!(!journal_holds(&sim, LAGGING, namespace, OPS as u64));
+        let requests = repair_requests(&sim);
+        assert_eq!(
+            requests.len(),
+            1,
+            "a later hole must still open peer repair"
+        );
+        assert_eq!(requests[0].from_op, commit_min + 1);
+        assert_eq!(requests[0].to_op, OPS as u64);
+
+        let prepare = tests::retained_prepare(&sim, 0, namespace, OPS as u64);
+        let partition = shard.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        futures::executor::block_on(partition.apply_repaired_prepare(prepare));
+        assert!(journal_holds(&sim, LAGGING, namespace, OPS as u64));
+        let mut namespace_scratch = Vec::new();
+        assert!(
+            futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch)).is_none()
+        );
+        assert_eq!(
+            group_state(&sim, LAGGING, namespace),
+            (Status::Normal, 0, OPS as u64, OPS as u64)
+        );
+    }
+
+    #[test]
+    fn given_a_resident_committed_window_when_an_adopted_suffix_is_missing_should_fetch_above_commit_max()
+     {
+        const COMMITTED_OPS: usize = partitions::COMMIT_WALK_OPS_MAX + 1;
+        const OPS: usize = COMMITTED_OPS + 1;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = resident_repair_window(namespace, OPS, COMMITTED_OPS);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+        let missing = tests::retained_prepare(&sim, 0, namespace, OPS as u64);
+        let header_size = size_of::<StartViewHeader>();
+        let total_size = header_size + size_of::<PrepareHeader>();
+        let mut start_view = Message::<StartViewHeader>::new(total_size);
+        start_view.as_mut_slice()[header_size..]
+            .copy_from_slice(bytemuck::bytes_of(missing.header()));
+        let body_checksum = u128::from(iggy_common::calculate_checksum(
+            &start_view.as_slice()[header_size..],
+        ));
+        let start_view = start_view.transmute_header(|_, header: &mut StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = 1;
+            header.replica = 0;
+            header.group = namespace.inner();
+            header.op = OPS as u64;
+            header.commit = COMMITTED_OPS as u64;
+            header.size = u32::try_from(total_size).unwrap();
+            header.checksum_body = body_checksum;
+            header.seal();
+        });
+        futures::executor::block_on(shard.on_message(MessageBag::StartView(start_view)));
+
+        let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(commit_min, partitions::COMMIT_WALK_OPS_MAX as u64);
+        assert_eq!(commit_max, COMMITTED_OPS as u64);
+        assert!(journal_holds(&sim, LAGGING, namespace, commit_min + 1));
+        let requests = repair_requests(&sim);
+        assert_eq!(
+            requests.len(),
+            1,
+            "adopted headers do not supply the missing body"
+        );
+        assert_eq!(requests[0].from_op, commit_min + 1);
+        assert_eq!(requests[0].to_op, OPS as u64);
+
+        let partition = shard.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        futures::executor::block_on(partition.apply_repaired_prepare(missing));
+        assert!(journal_holds(&sim, LAGGING, namespace, OPS as u64));
+        deliver_commit(shard, namespace, OPS as u64);
+        assert_eq!(
+            group_state(&sim, LAGGING, namespace),
+            (Status::Normal, 0, OPS as u64, OPS as u64)
+        );
+    }
+
+    fn resident_repair_window(
+        namespace: IggyNamespace,
+        total_ops: usize,
+        resident_ops: usize,
+    ) -> Simulator {
+        let (mut sim, client) = cluster(0x5EED_0240);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        sim.replica_crash(LAGGING);
+        for _ in 0..total_ops {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                CLIENT_ID,
+                0,
+                client.send_messages(namespace, &[Bytes::from_static(b"resident-repair")]),
+            );
+            assert_eq!(reply.header().status, 0);
+        }
+        assert_eq!(group_state(&sim, 0, namespace).2, total_ops as u64);
+
+        // Replay real prepares without running the crashed backup's pump so its
+        // resident backlog reaches the commit edge in one bounded walk.
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+        for op in 1..=resident_ops as u64 {
+            let prepare = tests::retained_prepare(&sim, 0, namespace, op);
+            let partition = shard.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+            futures::executor::block_on(partition.on_replicate(prepare));
+            assert!(journal_holds(&sim, LAGGING, namespace, op));
+        }
+        assert_eq!(group_state(&sim, LAGGING, namespace).2, 0);
+        sim.outboxes[usize::from(LAGGING)].drain();
+        sim
+    }
+
+    fn deliver_commit(shard: &Replica, namespace: IggyNamespace, commit: u64) {
+        let message = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
+            |_, header: &mut CommitHeader| {
+                header.command = Command::Commit;
+                header.cluster = 1;
+                header.replica = 0;
+                header.group = namespace.inner();
+                header.commit = commit;
+                header.timestamp_monotonic = commit;
+                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
+                header.seal();
+            },
+        );
+        futures::executor::block_on(shard.on_message(MessageBag::Commit(message)));
+    }
+
+    fn repair_requests(sim: &Simulator) -> Vec<RequestPreparesHeader> {
+        sim.outboxes[usize::from(LAGGING)]
+            .drain()
+            .into_iter()
+            .filter_map(|envelope| match envelope.payload {
+                bus::EnvelopePayload::Replica(message)
+                    if message.header().command == Command::RequestPrepares =>
+                {
+                    let header = *bytemuck::checked::from_bytes::<RequestPreparesHeader>(
+                        &message.as_slice()[..size_of::<RequestPreparesHeader>()],
+                    );
+                    assert_eq!(envelope.to_replica, Some(0));
+                    Some(header)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -7503,5 +7930,58 @@ mod metadata_read_frontier_tests {
             .as_ref()
             .expect("shard 0 owns metadata consensus")
             .commit_min()
+    }
+}
+
+#[cfg(test)]
+mod review_4092_dst_tests {
+    //! The deterministic simulator is this repo's strongest correctness tool and
+    //! it is hard-asserted out of the feature this PR adds: `init_partition`
+    //! (`core/shard/src/lib.rs:4193-4198`) panics for any topic whose durability
+    //! or consumer-offset durability is persisted. So `PrepareOk` gating, log-view
+    //! certification, commit ordering and quorum durability have no fault
+    //! coverage at any granularity.
+
+    use super::*;
+
+    #[test]
+    #[ignore = "PR #4092 review: no simulator API can seed a persisted topic, and `init_partition` asserts them out of the cluster simulator entirely"]
+    fn given_the_cluster_simulator_when_seeding_a_topic_then_a_persisted_policy_should_be_expressible()
+     {
+        let replica_count = 3u8;
+        let client: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(replica_count as usize, [client].into_iter(), network_opts);
+        for _ in 0..100 {
+            sim.step();
+        }
+
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.seed_stream_topic_partition(namespace);
+
+        let options = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| {
+                inner
+                    .items
+                    .get(namespace.stream_id())
+                    .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                    .map(|topic| {
+                        iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                    })
+                    .unwrap_or_default()
+            });
+
+        assert!(
+            options.durability.is_persisted() || options.consumer_offset_durability.is_persisted(),
+            "no simulator API can seed a persisted topic, so the durability guarantee this PR adds is unreachable from the deterministic simulator and `init_partition` asserts it out anyway"
+        );
     }
 }

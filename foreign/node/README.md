@@ -19,8 +19,10 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 ## install
 
 ```bash
-npm i --save apache-iggy
+npm i --save apache-iggy@edge
 ```
+
+Use the `edge` package with server 0.9.0 or `edge`. Stable Node SDK 0.8.0 uses the older wire protocol. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -49,12 +51,9 @@ Codes absent from the SDK command table use `Operation::NonReplicated` and
 carry the command code in the request header's reserved field. The server
 remains authoritative for classifying or rejecting extension commands.
 
-Sends must use explicit `Partitioning.PartitionId` partitioning: the client
-routes each request to a partition-scoped namespace, so broker-side balancing
-(`Partitioning.Balanced`) and key hashing (`Partitioning.MessageKey`) are
-rejected before the request is sent.
-<!-- TODO(hubcio): Balanced and MessageKey partitioning to be implemented;
-not decided yet whether it'll be on server side or client side. -->
+Sends encode `Partitioning.PartitionId`, `Partitioning.Balanced` or
+`Partitioning.MessageKey` in the payload. The server resolves the target
+partition at admission.
 
 VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 
@@ -69,8 +68,9 @@ The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
 `heartbeatInterval` also accepts a duration expression such as `"10s"` or
 `"1h 30m"`, like the Rust SDK.
-The server evicts a connection silent for 36 s, which is 1.2 x its 30 s
-heartbeat interval. Raising the client interval past that window, or setting it
+With the default heartbeat settings, a group member becomes eligible for
+eviction after 36 s of silence (1.2 x the 30 s interval); the verifier checks
+once per interval. Raising the client interval past that window, or setting it
 to 0 to disable client heartbeats, exposes an idle consumer-group member to
 eviction; a connection holding no group membership is left alone. Any other
 unusable value is rejected instead of silently disabling the heartbeat.

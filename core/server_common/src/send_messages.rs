@@ -519,10 +519,10 @@ fn admit_wire_request(
     let header_size = std::mem::size_of::<RoutedRequestHeader>();
     let total_size = header_size + batch.header.total_size();
     request_header.size = u32::try_from(total_size).map_err(|_| IggyError::InvalidCommand)?;
-    let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total_size);
+    let mut buffer = Owned::<MESSAGE_ALIGN>::with_capacity(total_size);
+    buffer.extend_from_slice(bytemuck::bytes_of(&request_header));
+    buffer.extend_from_slice(batch_bytes);
     let bytes = buffer.as_mut_slice();
-    bytes[0..header_size].copy_from_slice(bytemuck::bytes_of(&request_header));
-    bytes[header_size..total_size].copy_from_slice(batch_bytes);
 
     // The producer hashed `partition_id = 0`; stamp the resolved partition
     // and restamp (or clear, for the stamp-fills-it path) the batch checksum.
@@ -564,8 +564,8 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<BatchRef<'_>, IggyError> {
 /// INVARIANT: `bytes` MUST be node-local self-stamped -
 /// [`stamp_prepare_for_persistence`] recomputed the batch checksum over the
 /// exact blob on the local node - or already integrity-checked at network
-/// ingress. There is no consensus-layer blob validation: the `PrepareHeader`
-/// integrity fields are inert zeros. Replicated and repaired prepares are
+/// ingress. The partition `PrepareHeader` identity covers only the header; its
+/// body checksum is zero. Replicated and repaired message batches are
 /// validated via [`decode_prepare_slice`] before the bytes reach any trusted
 /// decode. Calling this on unvalidated network bytes would let a corrupted blob
 /// pass undetected. The full-body per-message checksum pass dominates

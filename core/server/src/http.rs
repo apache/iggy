@@ -58,7 +58,7 @@ use axum::routing::{delete, get, post, put};
 use compio::net::TcpListener;
 use configs::cluster::{ClusterConfig, http_forwarding_key_material};
 use configs::http::{HttpConfig, HttpCorsConfig};
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use iggy_common::IggyError;
 use message_bus::client_listener;
 use send_wrapper::SendWrapper;
@@ -203,7 +203,7 @@ pub fn start(
     http_config: &HttpConfig,
     clients_table_max: usize,
     max_tokens_per_user: u32,
-    system_config: Arc<ServerSystemConfig>,
+    server_config: Arc<ServerConfig>,
     roster: Rc<ClusterRoster>,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
@@ -223,7 +223,7 @@ pub fn start(
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
         jwt,
-        system_config,
+        server_config,
         sessions: RefCell::new(HashMap::new()),
         registrations: RegistrationBarrier::default(),
         roster,

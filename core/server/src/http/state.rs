@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_common::{ClusterMetadata, IggyTimestamp};
@@ -160,7 +160,7 @@ pub(in crate::http) struct HttpInner {
     /// Read-only server config for the snapshot collector (log directory +
     /// runtime config paths); the shard does not expose config on the read
     /// path.
-    pub(in crate::http) system_config: Arc<ServerSystemConfig>,
+    pub(in crate::http) server_config: Arc<ServerConfig>,
     /// Per-credential VSR sessions keyed by JWT `jti` / PAT hash. `RefCell` is
     /// sound here - shard 0 is single-threaded and the `SendWrapper` state
     /// bridge tolerates the `!Sync` interior - but the guard must never be held

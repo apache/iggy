@@ -57,30 +57,19 @@
 //! unseals the last segment, so a chain that ends on a rotation boundary
 //! would only ever hand that path an empty file.
 //!
-//! # The configuration is held constant across the swap
+//! # Each binary reads its own configuration schema
 //!
-//! Both boots read the BASELINE's `core/server/config.toml`, extracted next
-//! to the baseline binary by `scripts/ci/storage-compat.sh`. Neither side may
-//! fall back to the server's relative default path: figment resolves that by
-//! walking up from the test process's directory, so the BASELINE parses THIS
-//! branch's file, and a key added under a `deny_unknown_fields` table (every
-//! `[cluster]` and `[node]` one) fails its extraction with
-//! `Config(CannotLoadConfiguration)`. That reads as a compatibility break and
-//! is not one.
+//! The baseline uses its extracted config and a test-only launcher that maps
+//! current harness environment names to the baseline's system-prefixed names.
+//! On replacement, the fixture copies supported values into the current schema
+//! and switches IGGY_CONFIG_PATH before restarting. Removed settings stay out
+//! of the replacement config. This isolates storage compatibility from the
+//! deliberately breaking public configuration rename.
 //!
-//! One file across the swap leaves the binary as the only variable, and it
-//! pins the two rules the config plane already carries: a field this branch
-//! adds needs its `#[serde(default)]`, because the build under test boots on
-//! a file written before the field existed, and a key this branch takes away
-//! needs its `RelocatedKey` entry. Deleting a key from a
-//! `deny_unknown_fields` table, or relocating one, makes the SECOND boot
-//! refuse the file; strip that key from the extracted copy when it happens.
-//!
-//! The overrides below reach both binaries as `IGGY_*` variables, and
-//! `resolve_config_paths` checks them against the catalog of the build under
-//! test only. [`assert_overrides_known_to_the_baseline`] covers the other
-//! side, where an unknown `IGGY_*` name trips a `debug_assert` and takes the
-//! debug binary down at boot.
+//! Topic creation likewise uses the baseline options block. The new durability
+//! keys are omitted. Retired durable settings are deliberately not seeded. After the
+//! swap, retired metadata options are discarded and both new policies derive
+//! their independent replicated defaults. Production SDKs gain no fallback.
 //!
 //! `IGGY_TEST_VERBOSE` makes the harness inherit the server's stdout instead
 //! of capturing it, which would make the tombstone check vacuous. The
@@ -89,12 +78,20 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::primitives::identifier::WireName;
+use iggy_binary_protocol::requests::topics::create_topic::CreateTopicRequest;
+use iggy_common::OptionsProvenance;
+use iggy_common::wire_conversions::{
+    identifier_to_wire, resource_options_from_wire, resource_options_to_wire,
+};
 use integration::harness::{
     TestHarness, TestServerConfig, USER_PASSWORD, disk, resolve_config_paths,
 };
 use serial_test::parallel;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -108,8 +105,8 @@ use tokio::time::sleep;
 /// `debug_assert` and kills the debug build this test runs against.
 const BASELINE_SERVER_ENV: &str = "COMPAT_BASELINE_SERVER";
 
-/// Absolute path to the baseline's `core/server/config.toml`, which both
-/// boots read. Same naming rule as [`BASELINE_SERVER_ENV`].
+/// Absolute path to the baseline's `core/server/config.toml`.
+/// Same naming rule as [`BASELINE_SERVER_ENV`].
 const BASELINE_CONFIG_ENV: &str = "COMPAT_BASELINE_CONFIG";
 
 /// Selects the server's config file, ahead of the relative default path the
@@ -285,6 +282,23 @@ const GRACEFUL_SHUTDOWN_MARKER: &str = "server shutdown complete";
 async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     let baseline = baseline_server_binary();
     let baseline_config = baseline_server_config();
+    let fixture = tempfile::tempdir().unwrap();
+    let baseline_document: toml::Value =
+        toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
+    let launcher = baseline_launcher(fixture.path(), &baseline, &baseline_document);
+    let replacement_config = fixture.path().join("replacement.toml");
+    let current_document: toml::Value =
+        toml::from_str(include_str!("../../../server/config.toml")).unwrap();
+    fs::write(
+        &replacement_config,
+        toml::to_string(&replacement_configuration(
+            &baseline_document,
+            current_document,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
     let overrides = HashMap::from([(
         "metadata.journal_slots".to_string(),
         JOURNAL_SLOTS.to_string(),
@@ -292,15 +306,14 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     assert_overrides_known_to_the_baseline(&overrides, &baseline_config);
     let mut envs = resolve_config_paths(&overrides)
         .expect("metadata.journal_slots resolves against the live config catalog");
-    // `extra_envs` is re-applied on every `start()`, so the swapped-in binary
-    // reads this same file.
+    // The baseline reads its own schema until the explicit replacement below.
     envs.insert(CONFIG_PATH_ENV.to_string(), baseline_config.clone());
 
     let mut harness = TestHarness::builder()
         .cluster_nodes(1)
         .server(
             TestServerConfig::builder()
-                .executable_path(baseline.clone())
+                .executable_path(launcher.to_string_lossy().into_owned())
                 .extra_envs(envs)
                 .build(),
         )
@@ -322,10 +335,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     //    partition directory looks empty until shutdown.
     let data_stream_details = client.create_stream(DATA_STREAM).await.unwrap();
     let data_stream = Identifier::numeric(data_stream_details.id).unwrap();
-    let data_topic_details = client
-        .create_topic(&data_stream, DATA_TOPIC, &data_topic_options())
-        .await
-        .unwrap();
+    let data_topic_details =
+        create_baseline_topic(&client, &data_stream, DATA_TOPIC, &data_topic_options())
+            .await
+            .unwrap();
     let data_topic = Identifier::numeric(data_topic_details.id).unwrap();
     let partition = partition_dir(
         &data_path,
@@ -468,10 +481,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     //    segment chain, so it must not touch the one above.
     let purge_stream_details = client.create_stream(PURGE_STREAM).await.unwrap();
     let purge_stream = Identifier::numeric(purge_stream_details.id).unwrap();
-    let purge_topic_details = client
-        .create_topic(&purge_stream, PURGE_TOPIC, &purge_topic_options())
-        .await
-        .unwrap();
+    let purge_topic_details =
+        create_baseline_topic(&client, &purge_stream, PURGE_TOPIC, &purge_topic_options())
+            .await
+            .unwrap();
     let purge_topic = Identifier::numeric(purge_topic_details.id).unwrap();
     let mut purged_batch: Vec<IggyMessage> = (0..PURGED_MESSAGES)
         .map(|index| seeded_message(index, Bytes::from(format!("compat-purged-{index}"))))
@@ -573,10 +586,14 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     // 8. One more of each rich type past the checkpoint, so the WAL encodings
     //    are exercised as well: a topic with every option key, a user with
     //    permissions, a token, a group whose membership churned, and streams.
-    let tail_topic_details = client
-        .create_topic(&data_stream, WAL_TAIL_TOPIC, &wal_tail_topic_options())
-        .await
-        .unwrap();
+    let tail_topic_details = create_baseline_topic(
+        &client,
+        &data_stream,
+        WAL_TAIL_TOPIC,
+        &wal_tail_topic_options(),
+    )
+    .await
+    .unwrap();
     let tail_permissions = seeded_permissions(data_stream_details.id, tail_topic_details.id);
     client
         .create_user(
@@ -710,6 +727,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
 
     // The swap: `None` selects the cargo-built binary of the crate under test.
     harness.server_mut().set_executable_path(None);
+    harness.server_mut().add_env(
+        CONFIG_PATH_ENV,
+        replacement_config.to_string_lossy().into_owned(),
+    );
     harness.restart_server().await.unwrap_or_else(|error| {
         panic!(
             "the server under test did not restart on the data directory the baseline wrote. \
@@ -999,6 +1020,79 @@ fn config_key<'a>(doc: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
     path.split('.').try_fold(doc, |node, key| node.get(key))
 }
 
+async fn create_baseline_topic(
+    client: &IggyClient,
+    stream: &Identifier,
+    name: &str,
+    options: &TopicCreateOptions,
+) -> Result<TopicDetails, IggyError> {
+    let legacy = resource_options_from_wire(&options.to_explicit_wire(|_| false)?, true)?;
+    let request = CreateTopicRequest {
+        stream_id: identifier_to_wire(stream)?,
+        partitions_count: options.partitions_count.unwrap_or(1),
+        name: WireName::new(name).unwrap(),
+        options: resource_options_to_wire(&legacy, OptionsProvenance::All)?,
+    };
+    client
+        .send_binary_request(
+            iggy_binary_protocol::codes::CREATE_TOPIC_CODE,
+            request.to_bytes(),
+        )
+        .await?;
+    Ok(client
+        .get_topic(stream, &Identifier::named(name)?)
+        .await?
+        .expect("baseline-created topic"))
+}
+
+fn replacement_configuration(baseline: &toml::Value, mut replacement: toml::Value) -> toml::Value {
+    fn overlay(node: &mut toml::Value, path: &str, baseline: &toml::Value) {
+        if let toml::Value::Table(table) = node {
+            for (key, value) in table {
+                let path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                overlay(value, &path, baseline);
+            }
+        } else if let Some(value) =
+            config_key(baseline, path).or_else(|| config_key(baseline, &format!("system.{path}")))
+        {
+            *node = value.clone();
+        }
+    }
+    overlay(&mut replacement, "", baseline);
+    replacement
+}
+
+fn baseline_launcher(directory: &Path, binary: &str, baseline: &toml::Value) -> PathBuf {
+    fn mappings(value: &toml::Value, path: &str, output: &mut String) {
+        if let toml::Value::Table(table) = value {
+            for (key, value) in table {
+                mappings(value, &format!("{path}_{key}"), output);
+            }
+        } else {
+            let suffix = path.to_uppercase();
+            let current = format!("IGGY{suffix}");
+            let legacy = format!("IGGY_SYSTEM{suffix}");
+            output.push_str(&format!("if [ \"${{{current}+set}}\" = set ]; then export {legacy}=\"${{{current}}}\"; unset {current}; fi\n"));
+        }
+    }
+    let mut script = String::from("#!/bin/sh\n");
+    if let Some(system) = baseline.get("system") {
+        mappings(system, "", &mut script);
+    }
+    script.push_str(&format!(
+        "exec '{}' \"$@\"\n",
+        binary.replace('\'', "'\\''")
+    ));
+    let path = directory.join("baseline-server");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 /// Options of the topic that carries the segment chain. Every key but
 /// `compression_algorithm` is sent, so that one must come back derived while
 /// the rest come back explicit.
@@ -1012,7 +1106,7 @@ fn data_topic_options() -> TopicCreateOptions {
             MAX_TOPIC_SIZE_BYTES,
         ))),
         segment_size: Some(IggyByteSize::from(SEGMENT_SIZE_BYTES)),
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         messages_required_to_save: Some(1),
         size_of_messages_required_to_save: Some(IggyByteSize::from(FLUSH_SIZE_BYTES)),
         // Left at the default, so only its provenance flag can tell a
@@ -1027,7 +1121,7 @@ fn data_topic_options() -> TopicCreateOptions {
 /// Options of the topic created after the checkpoint. Different values from
 /// [`data_topic_options`] where a key has a usable one, so a record attributed
 /// to the wrong topic cannot pass, and a different unsent key
-/// (`enforce_fsync`) for the provenance check.
+/// (`durability`) for the provenance check.
 fn wal_tail_topic_options() -> TopicCreateOptions {
     TopicCreateOptions {
         partitions_count: Some(PARTITIONS_COUNT),
@@ -1319,7 +1413,8 @@ async fn assert_topic_recovered(
         message_expiry: seed.message_expiry.map(|_| topic.message_expiry),
         max_topic_size: seed.max_topic_size.map(|_| topic.max_topic_size),
         segment_size: seed.segment_size.and(recovered.segment_size),
-        enforce_fsync: seed.enforce_fsync.and(recovered.enforce_fsync),
+        durability: recovered.durability,
+        consumer_offset_durability: recovered.consumer_offset_durability,
         messages_required_to_save: seed
             .messages_required_to_save
             .and(recovered.messages_required_to_save),
@@ -1332,7 +1427,12 @@ async fn assert_topic_recovered(
         raw: BTreeMap::new(),
     };
     assert_eq!(
-        &recovered, seed,
+        &recovered,
+        &TopicCreateOptions {
+            durability: Durability::Replicated,
+            consumer_offset_durability: Durability::Replicated,
+            ..seed.clone()
+        },
         "{name}: every seeded value must read back as the baseline stored it (recovered left, \
          seed right); a lost key silently reverts to the shard-wide default with no log line"
     );
@@ -1351,10 +1451,6 @@ async fn assert_topic_recovered(
             seed.max_topic_size.is_some(),
         ),
         (topic_option_keys::SEGMENT_SIZE, seed.segment_size.is_some()),
-        (
-            topic_option_keys::ENFORCE_FSYNC,
-            seed.enforce_fsync.is_some(),
-        ),
         (
             topic_option_keys::MESSAGES_REQUIRED_TO_SAVE,
             seed.messages_required_to_save.is_some(),
@@ -1552,4 +1648,42 @@ async fn wait_until(what: &str, mut probe: impl AsyncFnMut() -> Result<(), Strin
             }
         }
     }
+}
+
+#[test]
+fn baseline_configuration_translation_preserves_supported_values_and_removes_retired_keys() {
+    let baseline: toml::Value = toml::from_str(
+        r#"
+[system]
+path = "baseline-data"
+[system.partition]
+path = "custom-partitions"
+validate_checksum = false
+[system.segment]
+archive_expired = false
+[partition]
+consumer_offset_enforce_fsync = true
+prepare_queue_depth = 8
+"#,
+    )
+    .unwrap();
+    let current: toml::Value = toml::from_str(include_str!("../../../server/config.toml")).unwrap();
+    let translated = replacement_configuration(&baseline, current);
+    assert!(translated.get("system").is_none());
+    assert_eq!(translated["path"].as_str(), Some("baseline-data"));
+    assert!(translated["partition"].get("path").is_none());
+    assert_eq!(
+        translated["partition"]["prepare_queue_depth"].as_integer(),
+        Some(8)
+    );
+    assert_eq!(
+        translated["partition"]["validate_checksum"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        translated["partition"]
+            .get("consumer_offset_enforce_fsync")
+            .is_none()
+    );
+    assert!(translated.get("segment").is_none());
 }

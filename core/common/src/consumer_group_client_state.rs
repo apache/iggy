@@ -17,8 +17,7 @@
 
 //! Client-side consumer-group + partitioning state for the VSR transport.
 //!
-//! Under VSR the client routes partition ops by namespace, so it resolves
-//! partitioning locally (the broker never picks a partition, matching Kafka):
+//! The SDK resolves partition operations locally before encoding their namespace:
 //! - consumer-group polls select the next of the member's assigned partitions
 //!   (round-robin) from the cached assignment synced from the coordinator;
 //! - `Balanced` produce round-robins per topic; `MessagesKey` hashes the key.

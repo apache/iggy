@@ -21,11 +21,11 @@ use iggy::prelude::Identifier;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ConsumerGroupAction {
-    /// Create consumer group with given ID and name for given stream ID and topic ID.
+    /// Create consumer group with given name for given stream ID and topic ID.
     ///
     /// Stream ID can be specified as a stream name or ID
     /// Topic ID can be specified as a topic name or ID
-    /// If group ID is not provided then the server will automatically assign it
+    /// The server assigns the group ID. The legacy --group-id flag is ignored.
     ///
     /// Examples:
     ///  iggy consumer-group create 1 1 prod
@@ -94,7 +94,7 @@ pub(crate) struct ConsumerGroupCreateArgs {
     /// Topic ID can be specified as a topic name or ID
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
-    /// Consumer group ID to create
+    /// Legacy consumer group ID flag (ignored)
     #[clap(short, long)]
     pub(crate) group_id: Option<u32>,
     /// Consumer group name to create

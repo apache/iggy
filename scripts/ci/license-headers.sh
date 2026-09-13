@@ -79,9 +79,11 @@ if ! command -v hawkeye &> /dev/null; then
   exit 1
 fi
 
+# Only the major version must match the pin, so a newer local minor or
+# patch release does not block commits.
 INSTALLED_HAWKEYE_VERSION="$(hawkeye -V | awk '{print $2}')"
-if [ "$INSTALLED_HAWKEYE_VERSION" != "$HAWKEYE_VERSION" ]; then
-  echo "❌ hawkeye $HAWKEYE_VERSION is required, found ${INSTALLED_HAWKEYE_VERSION:-unknown}"
+if [ "${INSTALLED_HAWKEYE_VERSION%%.*}" != "${HAWKEYE_VERSION%%.*}" ]; then
+  echo "❌ hawkeye ${HAWKEYE_VERSION%%.*}.x is required, found ${INSTALLED_HAWKEYE_VERSION:-unknown}"
   echo "💡 Install HawkEye: cargo install hawkeye --version $HAWKEYE_VERSION --locked --force"
   exit 1
 fi

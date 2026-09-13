@@ -50,14 +50,14 @@ public class IggyPublisherConfig
     public bool CreateIggyClient { get; set; }
 
     /// <summary>
-    ///     Gets or sets the protocol to use for communication (TCP, QUIC, or HTTP).
+    ///     Gets or sets the protocol to use for communication (TCP or HTTP).
     ///     Only used when <see cref="CreateIggyClient" /> is true.
     /// </summary>
     public Protocol Protocol { get; set; }
 
     /// <summary>
     ///     Gets or sets the server address to connect to.
-    ///     Format depends on protocol (e.g., "localhost:8090" for TCP/QUIC, "http://localhost:3000" for HTTP).
+    ///     Format depends on protocol (e.g., "localhost:8090" for TCP, "http://localhost:3000" for HTTP).
     ///     Only used when <see cref="CreateIggyClient" /> is true.
     /// </summary>
     public string Address { get; set; } = string.Empty;
@@ -219,14 +219,14 @@ public class IggyPublisherConfig
     public TimeSpan BackgroundDisposalTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    ///     Gets or sets a value indicating whether retry is enabled for failed sends.
-    ///     When enabled, failed send operations will be retried according to the retry policy.
+    ///     Gets or sets a value indicating whether retry is enabled for failed background sends.
+    ///     When enabled, failed background sends follow the retry policy; direct sends surface errors.
     ///     Default is true.
     /// </summary>
     public bool EnableRetry { get; set; } = true;
 
     /// <summary>
-    ///     Gets or sets the maximum number of retry attempts.
+    ///     Gets or sets the total send attempts, including the first send.
     ///     After this many failed attempts, the operation will fail permanently.
     ///     Only used when <see cref="EnableRetry" /> is true.
     ///     Default is 3 attempts.

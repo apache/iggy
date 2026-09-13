@@ -108,7 +108,7 @@ fn stream_names(body: &Value) -> Vec<String> {
 /// follower-to-primary forwarding is off, so the follower answers its own
 /// requests instead of relaying them (see `http_view_header`, which pins both
 /// halves of that switch).
-#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_a_follower_when_its_register_binds_a_committed_epoch_should_not_read_below_it(
     harness: &TestHarness,
 ) {
@@ -170,7 +170,7 @@ async fn given_a_follower_when_its_register_binds_a_committed_epoch_should_not_r
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
         http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
     )

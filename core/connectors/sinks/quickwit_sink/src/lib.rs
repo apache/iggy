@@ -20,7 +20,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use iggy_connector_sdk::retry::{
-    ConnectivityConfig, build_retry_client, check_connectivity_with_retry, is_transient_status,
+    RetryPolicy, build_retry_client, check_connectivity_with_retry, is_transient_status,
 };
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
@@ -374,14 +374,14 @@ impl Sink for QuickwitSink {
                 endpoint_url(&base_url, &["health", "readyz"])?,
                 "Quickwit sink",
                 self.id,
-                &ConnectivityConfig {
-                    max_open_retries: self
+                RetryPolicy {
+                    max_attempts: self
                         .config
                         .max_open_retries
                         .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
                         .max(1),
-                    open_retry_max_delay,
-                    retry_delay,
+                    base_delay: retry_delay,
+                    max_delay: open_retry_max_delay,
                 },
             )
             .await?;

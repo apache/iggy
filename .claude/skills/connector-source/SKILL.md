@@ -27,8 +27,8 @@ successful send.
 
 ## STOP and ask the user before
 
-- Changing the SDK trait surface (`Source::open` / `poll` / `close`) - that's an SDK change.
-- Adding a long-running side task in the plugin - the runtime owns lifecycle. orphans survive `close()`.
+- Changing the SDK trait surface (`Source::open` / `poll` / `on_batch_result` / `close`) - that's an SDK change.
+- Adding a long-running side task in the plugin - the runtime owns lifecycle, and orphans survive `close()`. Sanctioned only where the source is itself a server the runtime cannot drive, as in `http_source`'s listener, and then only with an explicit shutdown in the last `close()` that awaits its tasks before returning.
 - Persisting unbounded state - `State` is rewritten every batch.
 - Adding a source that requires authoritative offsets external to Apache Iggy without coordinating retention.
 
@@ -57,13 +57,47 @@ let persisted = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
 *self.pending.lock().await = Some(candidate);
 ```
 
+### Delivery acknowledgment
+
+`on_batch_result` (added by #3855) is how a source learns what happened to the batch it just
+returned. The SDK keeps exactly one batch in flight: it will not call `poll()` again until this
+returns, and it stops the source after `MAX_CONSECUTIVE_NACKS` (5) consecutive NACKs, roughly 1.5s
+of backoff, without calling `close()`.
+
+- `Ack` means the runtime sent the batch **and** persisted its state. `Nack` means it could not
+  confirm both, which is **not** the same as neither happening: a batch that reached the topic but
+  whose state save failed is NACKed, and the SDK NACKs on its own result timeout while the send may
+  still have landed. A source that replays on `Nack` is at-least-once, not exactly-once.
+- The trait has a **default no-op**, which suits only a source with no staged cursor and no
+  destructive work. If `poll()` advances a cursor, deletes rows, or drains an in-memory buffer,
+  omitting this loses data silently and nothing will tell you. `random_source` and `http_source`
+  implement it; the other shipped sources take the default and skip rows on a NACK.
+- Stage in `poll()`, apply on `Ack`, discard or replay on `Nack`. A source whose input is pushed to
+  it, rather than re-readable upstream, has to hold the batch itself: see `http_source`'s staging.
+- Returning `Err` from it stops the source immediately, so it is not a retry signal.
+
 ### State persistence
 
-- `ConnectorState` is `Vec<u8>` via MessagePack (`rmp_serde`). Use `ConnectorState::serialize(&state, NAME, id)` + `ConnectorState::deserialize::<State>(NAME, id)`.
-- `poll()` must not commit cursors or destructive work. Return messages with candidate state and keep the corresponding work staged.
-- The runtime sends the batch, persists its candidate state, then calls `on_batch_result(Ack)`. Commit staged in-memory state and external delete/mark operations only on ACK. A NACK discards the candidate so the same data can be polled again.
-- Return `state: None` for an empty poll when no watermark changed. If an empty poll advances a watermark, stage and return the new state through the same ACK handshake.
-- Treat candidate-state serialization failure as a poll error. Do not send messages without the state needed to resume them safely.
+- `ConnectorState` is `Vec<u8>` via MessagePack (`rmp_serde`). Use
+  `ConnectorState::serialize(&state, NAME, id)` and
+  `ConnectorState::deserialize::<State>(NAME, id)`.
+- `poll()` must not commit cursors or destructive work. Return messages with candidate state and
+  keep the corresponding work staged.
+- The runtime sends the batch, saves its candidate state to
+  `{state_path}/source_{key}.state`, then calls `on_batch_result(Ack)`. Commit staged in-memory
+  state and external delete or mark operations only on ACK. A NACK discards the candidate so the
+  same data can be polled again.
+- A crash between `poll()` returning and state persistence leaves the prior cursor for the next
+  poll, so downstream must tolerate at-least-once delivery.
+- Cursor sources that stage state until `on_batch_result` can attach state to the corresponding
+  message batch. Control-plane state that is independent of a publish can ride an empty batch
+  instead.
+- Return `state: None` for an empty poll when no watermark changed. If an empty poll advances a
+  watermark, stage and return the new state through the same ACK handshake.
+- The runtime can still NACK an empty batch when state storage is latched or a pending checkpoint
+  cannot resolve. Never treat hand-off as durable; `on_batch_result` reports the outcome.
+- Treat candidate-state serialization failure as a poll error. Do not send messages without the
+  state needed to resume them safely.
 - Keep `State` small - rewritten every batch. No unbounded vecs.
 
 The SDK allows one in-flight batch. Five consecutive NACKs stop the source and
@@ -89,14 +123,15 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 
 ### IDs and timestamps
 
-- `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). Apache Iggy can dedupe on this.
+- `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). It rides the wire as the message id, which is what a **consumer** can dedupe an at-least-once duplicate on.
+- **Iggy itself does not dedupe on that id.** The server's only read of the field is `core/server/src/http/wire.rs`, which mints a fresh uuid when the incoming id is 0 and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
 - `origin_timestamp: Option<u64>` - source-system event time in nanoseconds. Lets downstream sinks reason about lag.
 - `timestamp` and `checksum` are Iggy-side - leave `None`.
 
 ### Concurrency
 
 - Runtime spawns ONE `poll()` task per source. No concurrent `poll()`.
-- Don't spawn your own long-running Tokio tasks - runtime owns lifecycle.
+- Don't spawn your own long-running Tokio tasks: the runtime owns lifecycle. The exception is a source that listens rather than polls, which has to own its listener; `http_source` is the worked example, and it shuts its tasks down in the last `close()` rather than leaving them to outlive the connector.
 
 ### Errors
 
@@ -140,8 +175,8 @@ Iggy consumer-loop labels use literal API names (`offset=`, `current_offset=`).
 4. Committing a cursor or deleting source data in `poll()` - stage it and wait for ACK.
 5. Unbounded data in `State` - rewritten every batch. keep O(constant).
 6. `std::sync::Mutex` - blocks the executor. Use `tokio::sync::Mutex`.
-7. Not setting `ProducedMessage.id` when a stable ID exists - loses idempotency.
-8. Spawning side tasks - the runtime owns the scheduler.
+7. Not setting `ProducedMessage.id` when a stable ID exists - leaves a consumer nothing to dedupe a replayed duplicate on. It does not make the write idempotent server-side, because nothing there reads it.
+8. Spawning side tasks - the runtime owns the scheduler. The one exception is a source that listens rather than polls and must own its listener (see [Concurrency](#concurrency) and the STOP list); it owes an explicit shutdown in the last `close()` that awaits its tasks.
 
 ## Tests
 

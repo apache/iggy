@@ -262,16 +262,11 @@ impl PartitionJournalMemStorage {
     /// storage never hits the reactor (it copies from an in-memory `Vec`), so
     /// the read can run under a partition borrow without crossing an `.await`
     /// - the property that keeps poll-read sound.
-    fn read_at_sync(&self, offset: usize) -> JournalBuffer {
+    fn read_at_sync(&self, offset: usize) -> Option<JournalBuffer> {
         let offset_to_index = unsafe { &*self.offset_to_index.get() };
-        let Some(&index) = offset_to_index.get(&offset) else {
-            return Owned::<4096>::zeroed(0).into();
-        };
+        let index = *offset_to_index.get(&offset)?;
         let entries = unsafe { &*self.entries.get() };
-        entries
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| Owned::<4096>::zeroed(0).into())
+        entries.get(index).cloned()
     }
 
     fn entries(&self) -> Vec<JournalBuffer> {
@@ -351,6 +346,14 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         op_to_storage_offset.len()
     }
 
+    /// Restore the materialized commit point for elections and body repair.
+    pub fn restore_checkpoint_prepare(&self, op: u64, prepare: JournalBuffer) {
+        let ring = unsafe { &mut *self.evicted_ring.get() };
+        debug_assert!(ring.is_empty());
+        self.evicted_ring_bytes.set(prepare.len() as u64);
+        ring.push_back((op, prepare));
+    }
+
     /// Entry bytes for `op`, from the resident journal or the evicted ring.
     /// `None` when the op predates the ring (bulk-sync territory) or was
     /// never journaled here.
@@ -359,7 +362,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
             if let Some(&storage_offset) = op_to_storage_offset.get(&op) {
                 let inner = unsafe { &*self.inner.get() };
-                return Some(inner.storage.read_at_sync(storage_offset));
+                return inner.storage.read_at_sync(storage_offset);
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
@@ -476,7 +479,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
             let bytes = {
                 let inner = unsafe { &*self.inner.get() };
-                inner.storage.read_at_sync(storage_offset)
+                let Some(bytes) = inner.storage.read_at_sync(storage_offset) else {
+                    break;
+                };
+                bytes
             };
 
             try_push_resident_entry(

@@ -2,7 +2,7 @@
 
 The highly performant and modular runtime for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. Create your own Rust plugins by simply implementing either the `Source` or `Sink` trait and build custom pipelines for the data processing.
 
-The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect:edge`.
 
 ## Features
 
@@ -20,24 +20,45 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 
 ## Quick Start
 
-1. Build the project in release mode (or debug, and update the connectors paths in the config accordingly), and make sure that the plugins specified in `core/connectors/runtime/example_config/connectors/` directory under `path` are available. The configuration must be provided in `toml` format, with files following the `{connector_name}_{type}[_v{N}].toml` naming convention.
+Run these commands from the root of the same Iggy source checkout used for the server and plugins. This guide targets server 0.9.0, including its edge builds.
 
-2. Run `docker compose up -d` from `/examples/rust/src/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
-
-3. Set environment variable `IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/example_config/config.toml` (adjust the path as needed) pointing to the runtime configuration file.
-
-4. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
+1. Build the server, CLI, runtime and quick-start plugins:
 
     ```bash
-    iggy --username iggy --password iggy stream create example_stream
-    iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
-    iggy --username iggy --password iggy stream create qw
-    iggy --username iggy --password iggy topic create qw records 1 none 1d
+    cargo build --release -p server -p iggy-cli -p iggy-connectors \
+      -p iggy_connector_random_source -p iggy_connector_stdout_sink \
+      -p iggy_connector_quickwit_sink
     ```
 
-5. Execute `cargo run --example sink-data-producer -r` which will start the example data producer application, sending the messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
+    For a debug build, omit `--release` and replace `target/release` with `target/debug` in both the commands and plugin paths. Make sure that the plugins specified in `core/connectors/runtime/example_config/connectors/` directory under `path` are available. The configuration must be provided in `toml` format.
+    The example directory also enables connectors for ClickHouse, Delta Lake, Apache Doris, Apache Iceberg, and InfluxDB. Without their backing services (or their compiled plugins) these are reported with the `Error` status, but they don't block the remaining connectors. Set `enabled = false` in their files to skip them entirely.
 
-6. Start the connector runtime `cargo run --bin iggy-connectors -r` - you should be able to browse Quickwit UI with records being constantly added to the `events` index. At the same time, you should see the new messages being added to the `example` stream and `topic1` topic by the test source connector - you can use Iggy Web UI to browse the data. The messages will have applied the basic fields transformations.
+2. Run `docker compose -f examples/rust/src/sink-data-producer/docker-compose.yml up -d`, which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
+
+3. In the terminal that will run the connectors, set the runtime configuration path:
+
+    ```bash
+    export IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/example_config/config.toml
+    ```
+
+4. Start the Iggy server in a separate terminal with credentials matching the sample connector configuration:
+
+    ```bash
+    IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server --release
+    ```
+
+    With the server running, create the example streams and topics using the CLI from this checkout. An existing server must have these credentials, or you must adjust the commands and connector configuration to match it.
+
+    ```bash
+    target/release/iggy --username iggy --password iggy stream create example_stream
+    target/release/iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
+    target/release/iggy --username iggy --password iggy stream create qw
+    target/release/iggy --username iggy --password iggy topic create qw records 1 none 1d
+    ```
+
+5. Execute `cargo run --example sink-data-producer --release`, which sends 100 batches of messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
+
+6. Start the connector runtime `cargo run --bin iggy-connectors --release` in the terminal configured in step 3. The Quickwit sink indexes the produced records in the `events` index. At the same time, you should see the new messages being added to the `example_stream` stream and `example_topic` topic by the Random source connector - you can [start the Iggy Web UI](https://iggy.apache.org/docs/web_ui/start) to browse the data. The messages will have applied the basic fields transformations.
 
 ## Runtime
 
@@ -94,7 +115,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 
 ## Source
 
-Sources are responsible for producing the messages to the configured stream(s) and topic(s). For example, the Test source connector will generate the random messages that will be then sent to the configured stream and topic.
+Sources produce messages to an Iggy stream and topic. Configure one `[[streams]]` entry per source instance: the runtime retains only the last configured producer. For example, the Random source generates messages for that stream and topic.
 
 Please refer to the **[Source documentation](https://github.com/apache/iggy/tree/master/core/connectors/sources)** for the details about the configuration and the sample implementation.
 
@@ -106,10 +127,10 @@ Please refer to the **[Source documentation](https://github.com/apache/iggy/tree
 
 ## Building the connectors
 
-New connector can be built simply by implementing either `Sink` or `Source` trait. Please check the **[sink](https://github.com/apache/iggy/tree/master/core/connectors/sinks)** or **[source](https://github.com/apache/iggy/tree/master/core/connectors/sources)** documentation, as well as the existing examples under `/sinks` and `/sources` directories.
+New connector can be built simply by implementing either `Sink` or `Source` trait. Please check the **[sink](https://github.com/apache/iggy/tree/master/core/connectors/sinks)** or **[source](https://github.com/apache/iggy/tree/master/core/connectors/sources)** documentation, as well as the existing examples under `core/connectors/sinks` and `core/connectors/sources`.
 
 ## Transformations
 
-Field transformations (depending on the supported payload formats) can be applied to the messages either before they are sent to the specified topic (e.g. when produced by the source connectors), or before consumed by the sink connectors. To add the new transformation, simply implement the `Transform` trait and extend the existing `load` function. Each transform may have its own, custom configuration.
+Field transformations (depending on the supported payload formats) can be applied to the messages either before they are sent to the specified topic (e.g. when produced by the source connectors), or before consumed by the sink connectors. To add a transformation, implement the `Transform` trait in the SDK, add its `TransformType` variant and extend `transforms::from_config`. Each transform may have its own, custom configuration.
 
 To find out more about the transforms, stream decoders or encoders, please refer to the **[SDK documentation](https://github.com/apache/iggy/tree/master/core/connectors/sdk)**.

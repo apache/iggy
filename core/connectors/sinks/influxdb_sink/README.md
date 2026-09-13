@@ -69,10 +69,10 @@ verbose_logging           = false
 
 ```toml
 timeout                   = "30s"   # per-request timeout
-max_retries               = 3       # retries per write on transient errors (429/5xx)
+max_retries               = 3       # total write attempts, including the first (429/5xx)
 retry_delay               = "1s"    # initial backoff between retries
 retry_max_delay           = "5s"    # backoff cap
-max_open_retries          = 10      # retries during open() health check
+max_open_retries          = 10      # total open() health-check attempts, including the first
 open_retry_max_delay      = "60s"   # backoff cap for open() retries
 circuit_breaker_threshold = 5       # consecutive failures before circuit trips
 circuit_breaker_cool_down = "30s"   # how long circuit stays open before half-open probe
@@ -119,6 +119,6 @@ circuit_breaker_cool_down = "15s"
 The sink uses a layered design:
 
 - **Batch accumulator**: messages are serialised to line protocol and buffered until `batch_size` is reached, then flushed in a single HTTP POST.
-- **Retry middleware**: `reqwest-retry` with exponential backoff handles 429 and 5xx responses automatically before the connector-level retry logic runs.
+- **Retry middleware**: `iggy_connector_sdk::retry::HttpRetryMiddleware` retries 429, 5xx and network errors with exponential backoff and jitter.
 - **Circuit breaker**: after `circuit_breaker_threshold` consecutive failures the connector stops issuing writes and waits for the cool-down window before probing again.
 - **Precision mapping**: V3's `/api/v3/write_lp` endpoint requires full English words (`nanosecond`, `microsecond`, `millisecond`, `second`); the connector maps the short forms automatically.

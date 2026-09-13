@@ -34,7 +34,7 @@
 //! compio reactor contexts. Each shard owns its own instance, and the server
 //! exposes every shard's instance through the `[http.metrics]` scrape
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
-//! sub-registry per shard); every drop site also logs via `tracing`.
+//! sub-registry per shard). Drop-site tracing supplements the counters.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -107,12 +107,10 @@ pub mod frame_drop_variant {
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
     pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
-    /// A poll's auto-commit submit refused by the owning shard's own inbox.
-    ///
-    /// Its own series, not `PARTITION`: the poll is answered with a retriable
-    /// status and no frame of the client's was dropped, so counting it with
-    /// shed frames would read as a routing loss.
-    pub const PARTITION_AUTO_COMMIT: &str = "partition_auto_commit";
+    pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
+    /// A disk poll could not reserve completion capacity or return its result
+    /// to the owning shard.
+    pub const PARTITION_POLL_COMPLETION: &str = "partition_poll_completion";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -157,11 +155,10 @@ pub mod frame_drop_reason {
     pub const SUBMIT_TIMEOUT: &str = "submit_timeout";
 }
 
-// The tables only index the lazy fast-path cache below; a `{variant, reason}`
+// The tables only index the lazy cache below. A `{variant, reason}`
 // pair enters the `Family` (and therefore the scrape) the first time a drop
-// site actually produces it, so the unreachable corners of the 7 x 9 cross
-// product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 8;
+// site produces it, so unproduced combinations never enter the scrape.
+const VARIANT_COUNT: usize = 9;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -172,7 +169,8 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::FORWARD_REPLICA_SEND,
     frame_drop_variant::METADATA_COMMIT_TICK,
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
-    frame_drop_variant::PARTITION_AUTO_COMMIT,
+    frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
+    frame_drop_variant::PARTITION_POLL_COMPLETION,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
@@ -222,8 +220,16 @@ const fn consumer_kind_index(kind: ConsumerKind) -> usize {
 /// resolved at scrape time via the per-shard registry, not as a label.
 #[derive(Clone)]
 pub struct ShardMetrics {
-    frame_drops_total: Family<FrameDropLabel, Counter>,
-    cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
+    partition_wal_disk_bytes: Gauge,
+    partition_wal_retained_bytes: Gauge,
+    partition_wal_queued_bytes: Gauge,
+    partition_wal_in_flight_bytes: Gauge,
+    partition_wal_checkpoints_pending: Gauge,
+    partition_wal_batches: Counter,
+    partition_wal_prepares: Counter,
+    partition_wal_checkpoints: Counter,
+    partition_wal_errors: Counter,
+    frame_drops: FrameDropMetrics,
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
@@ -282,8 +288,19 @@ impl ShardMetrics {
             .clone();
         let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
-            frame_drops_total,
-            cached_counters,
+            partition_wal_disk_bytes: Gauge::default(),
+            partition_wal_retained_bytes: Gauge::default(),
+            partition_wal_queued_bytes: Gauge::default(),
+            partition_wal_in_flight_bytes: Gauge::default(),
+            partition_wal_checkpoints_pending: Gauge::default(),
+            partition_wal_batches: Counter::default(),
+            partition_wal_prepares: Counter::default(),
+            partition_wal_checkpoints: Counter::default(),
+            partition_wal_errors: Counter::default(),
+            frame_drops: FrameDropMetrics {
+                total: frame_drops_total,
+                cached_counters,
+            },
             partitions_materialised_total: Counter::default(),
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
@@ -304,9 +321,74 @@ impl ShardMetrics {
         }
     }
 
-    /// Best effort: counts explicit client denials read off the reply status
-    /// and the poll-side reservation refusals. A denial the pump answers to an
-    /// auto-commit submit has no client reply to read and is not counted.
+    pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
+        self.partition_wal_disk_bytes
+            .set(i64::try_from(metrics.disk_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_retained_bytes
+            .set(i64::try_from(metrics.retained_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_queued_bytes
+            .set(i64::try_from(metrics.queued_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_in_flight_bytes
+            .set(i64::try_from(metrics.in_flight_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_checkpoints_pending
+            .set(i64::try_from(metrics.checkpoints_pending).unwrap_or(i64::MAX));
+        self.partition_wal_batches.inc_by(metrics.completed_batches);
+        self.partition_wal_prepares.inc_by(metrics.batched_prepares);
+        self.partition_wal_checkpoints
+            .inc_by(metrics.completed_checkpoints);
+        self.partition_wal_errors.inc_by(metrics.failed_writes);
+    }
+
+    fn register_persistence(&self, registry: &mut Registry) {
+        registry.register(
+            "partition_wal_disk_bytes",
+            "active partition WAL bytes",
+            self.partition_wal_disk_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_retained_bytes",
+            "retained partition prepare bytes charged to the WAL budget",
+            self.partition_wal_retained_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_queued_bytes",
+            "queued partition WAL bytes",
+            self.partition_wal_queued_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_in_flight_bytes",
+            "partition WAL bytes being written",
+            self.partition_wal_in_flight_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_checkpoints_pending",
+            "partition checkpoints awaiting storage completion",
+            self.partition_wal_checkpoints_pending.clone(),
+        );
+        registry.register(
+            "partition_wal_batches",
+            "completed partition WAL durability batches",
+            self.partition_wal_batches.clone(),
+        );
+        registry.register(
+            "partition_wal_prepares",
+            "prepares covered by completed partition WAL batches",
+            self.partition_wal_prepares.clone(),
+        );
+        registry.register(
+            "partition_wal_checkpoints",
+            "completed partition WAL checkpoints",
+            self.partition_wal_checkpoints.clone(),
+        );
+        registry.register(
+            "partition_wal_errors",
+            "partition WAL writer failures",
+            self.partition_wal_errors.clone(),
+        );
+    }
+
+    /// Count consumer offset capacity denials from explicit client requests
+    /// and automatic commit admission during poll completion.
     pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
         self.consumer_offset_denied_counters[consumer_kind_index(kind)].inc();
     }
@@ -373,19 +455,12 @@ impl ShardMetrics {
     /// path so accounting is preserved even if a future caller forgets
     /// to extend the const tables above.
     pub fn record_frame_drop(&self, variant: &'static str, reason: &'static str) {
-        if let (Some(v_idx), Some(r_idx)) = (variant_index(variant), reason_index(reason)) {
-            self.cached_counters[v_idx][r_idx]
-                .get_or_init(|| {
-                    self.frame_drops_total
-                        .get_or_create(&FrameDropLabel { variant, reason })
-                        .clone()
-                })
-                .inc();
-        } else {
-            self.frame_drops_total
-                .get_or_create(&FrameDropLabel { variant, reason })
-                .inc();
-        }
+        self.frame_drops.record(variant, reason);
+    }
+
+    /// The completion lane shares these handles once during shard setup.
+    pub(crate) const fn frame_drop_metrics(&self) -> &FrameDropMetrics {
+        &self.frame_drops
     }
 
     /// Bumped on the owning shard each time the partition reconciliation
@@ -468,10 +543,31 @@ impl ShardMetrics {
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
     pub fn frame_drops_value(&self) -> u64 {
-        self.cached_counters
+        self.frame_drops
+            .cached_counters
             .iter()
             .flatten()
             .filter_map(OnceLock::get)
+            .map(prometheus_client::metrics::counter::Counter::get)
+            .sum()
+    }
+
+    /// One `reason` summed over every variant, for the assertions that are about
+    /// the reason alone: `unroutable` and `misrouted` must stay at zero however
+    /// the drop was classified, while `full` and `disconnected` are what a
+    /// crashed inbox produces and cannot be asserted on. Listing variants at the
+    /// call site would let a new drop site under an unlisted one escape.
+    /// Unknown reasons read as zero, as in [`Self::frame_drop_count`].
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn frame_drop_count_for_reason(&self, reason: &'static str) -> u64 {
+        let Some(reason_idx) = reason_index(reason) else {
+            return 0;
+        };
+        self.frame_drops
+            .cached_counters
+            .iter()
+            .filter_map(|variant| variant[reason_idx].get())
             .map(prometheus_client::metrics::counter::Counter::get)
             .sum()
     }
@@ -623,7 +719,7 @@ impl ShardMetrics {
     #[must_use]
     pub fn frame_drop_count(&self, variant: &'static str, reason: &'static str) -> u64 {
         match (variant_index(variant), reason_index(reason)) {
-            (Some(v_idx), Some(r_idx)) => self.cached_counters[v_idx][r_idx]
+            (Some(v_idx), Some(r_idx)) => self.frame_drops.cached_counters[v_idx][r_idx]
                 .get()
                 .map_or(0, prometheus_client::metrics::counter::Counter::get),
             _ => 0,
@@ -636,10 +732,11 @@ impl ShardMetrics {
     /// `_total` suffix; the prometheus text exposition appends it for
     /// counters.
     pub fn register(&self, registry: &mut Registry) {
+        self.register_persistence(registry);
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",
-            self.frame_drops_total.clone(),
+            self.frame_drops.total.clone(),
         );
         registry.register(
             "partitions_materialised",
@@ -721,6 +818,35 @@ impl ShardMetrics {
     }
 }
 
+/// Frame drop accounting shared with the registered shard metrics.
+/// Clones retain the same family and lazy cache, so detached work records
+/// visible drops without carrying unrelated counters or creating unused series.
+#[derive(Clone)]
+pub(crate) struct FrameDropMetrics {
+    total: Family<FrameDropLabel, Counter>,
+    cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
+}
+
+impl FrameDropMetrics {
+    pub(crate) fn record(&self, variant: &'static str, reason: &'static str) {
+        if let (Some(variant_index), Some(reason_index)) =
+            (variant_index(variant), reason_index(reason))
+        {
+            self.cached_counters[variant_index][reason_index]
+                .get_or_init(|| {
+                    self.total
+                        .get_or_create(&FrameDropLabel { variant, reason })
+                        .clone()
+                })
+                .inc();
+        } else {
+            self.total
+                .get_or_create(&FrameDropLabel { variant, reason })
+                .inc();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,7 +863,8 @@ mod tests {
 
         let count = |variant, reason| {
             metrics
-                .frame_drops_total
+                .frame_drops
+                .total
                 .get_or_create(&FrameDropLabel { variant, reason })
                 .get()
         };
@@ -754,6 +881,54 @@ mod tests {
             ),
             1,
             "a distinct reason gets its own counter",
+        );
+    }
+
+    #[test]
+    fn frame_drop_count_for_reason_sums_one_reason_across_variants() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE);
+        metrics.record_frame_drop(frame_drop_variant::PARTITION, frame_drop_reason::UNROUTABLE);
+        metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
+
+        assert_eq!(
+            metrics.frame_drop_count_for_reason(frame_drop_reason::UNROUTABLE),
+            2,
+            "one reason sums across every variant that recorded it",
+        );
+        assert_eq!(
+            metrics.frame_drop_count_for_reason(frame_drop_reason::MISROUTED),
+            0,
+            "an unproduced reason reads as zero, not as the total",
+        );
+        assert_eq!(
+            metrics.frame_drops_value(),
+            3,
+            "the per-reason view must not disturb the total",
+        );
+    }
+
+    #[test]
+    fn persistence_scrape_distinguishes_retained_budget_from_wal_file_bytes() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_persistence(&partitions::PersistenceMetrics {
+            disk_bytes: 4096,
+            retained_bytes: 65536,
+            ..Default::default()
+        });
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_disk_bytes 4096")
+        );
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_retained_bytes 65536")
         );
     }
 
@@ -790,7 +965,8 @@ mod tests {
             metrics.record_frame_drop(frame_drop_variant::PARTITION, frame_drop_reason::UNROUTABLE);
         }
         let from_family = metrics
-            .frame_drops_total
+            .frame_drops
+            .total
             .get_or_create(&FrameDropLabel {
                 variant: frame_drop_variant::PARTITION,
                 reason: frame_drop_reason::UNROUTABLE,
@@ -836,7 +1012,8 @@ mod tests {
         let metrics = ShardMetrics::for_shard();
         metrics.record_frame_drop("unexpected_variant", "unexpected_reason");
         let from_family = metrics
-            .frame_drops_total
+            .frame_drops
+            .total
             .get_or_create(&FrameDropLabel {
                 variant: "unexpected_variant",
                 reason: "unexpected_reason",
