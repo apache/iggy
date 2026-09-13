@@ -159,7 +159,7 @@ impl IggyBridge {
     ///
     /// Returns [`BridgeError::Iggy`] if the underlying client reports a shutdown failure (e.g. the
     /// socket was already in a state that rejects a clean shutdown), or if it takes longer than
-    /// [`REQUEST_TIMEOUT`].
+    /// `REQUEST_TIMEOUT`.
     pub async fn close(self) -> Result<(), BridgeError> {
         with_request_timeout(self.client.shutdown()).await
     }
@@ -204,7 +204,7 @@ impl IggyBridge {
     ///
     /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
     /// topic-naming rules. Returns [`BridgeError::Iggy`] for connectivity/auth failures, or if a
-    /// call takes longer than [`REQUEST_TIMEOUT`]. Returns [`BridgeError::PartitionCountMismatch`]
+    /// call takes longer than `REQUEST_TIMEOUT`. Returns [`BridgeError::PartitionCountMismatch`]
     /// if the topic already exists with a different partition count than `partition_count`.
     pub async fn ensure_stream_and_topic(
         &self,
@@ -417,7 +417,7 @@ impl IggyBridge {
     /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
     /// topic-naming rules. Returns [`BridgeError::Iggy`] if the mapped stream doesn't exist (see
     /// the note above on which resource is actually missing), or if the call takes longer than
-    /// [`REQUEST_TIMEOUT`]. Returns [`BridgeError::PartitionOutOfRange`] if any requested
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::PartitionOutOfRange`] if any requested
     /// partition is beyond the topic's partition count.
     pub async fn high_watermarks(
         &self,

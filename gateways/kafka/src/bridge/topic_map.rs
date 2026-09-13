@@ -136,7 +136,7 @@ pub struct TopicOverride {
 /// Fields are private and every value is validated (empty/whitespace/length/injectivity - see
 /// [`new`](Self::new)) on the only two ways to build one: [`new`](Self::new) and
 /// [`from_toml_str`](Self::from_toml_str) (which deserializes into a private, unchecked
-/// [`RawTopicMapping`] first, then calls `new`). Public fields plus `#[derive(Deserialize)]`
+/// `RawTopicMapping` first, then calls `new`). Public fields plus `#[derive(Deserialize)]`
 /// directly on this type would let any caller construct or mutate one straight from TOML or a
 /// literal, skipping every check below - which is exactly what happened before this type had a
 /// checked constructor: `bridge::config`'s no-file path built one by hand and needed its own
@@ -169,7 +169,7 @@ impl TopicMapping {
     /// Returns [`BridgeError::InvalidConfig`] if `default_stream` or any override's `stream`/
     /// `topic` is empty, has leading/trailing whitespace, or exceeds `MAX_IDENTIFIER_LEN`; if any
     /// override key fails Kafka's own topic-naming rules (see
-    /// [`validate_kafka_topic_name`]); or if two override entries are not injective (see
+    /// `validate_kafka_topic_name`); or if two override entries are not injective (see
     /// [`resolve`](Self::resolve)).
     pub fn new(
         default_stream: String,
