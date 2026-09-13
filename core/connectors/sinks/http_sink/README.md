@@ -68,13 +68,15 @@ IGGY_CONNECTORS_CONFIG_PATH=/tmp/http-sink-test/config.toml ./target/debug/iggy-
 ./target/debug/iggy -u iggy -p iggy message send demo_stream demo_topic '{"hello":"http"}'
 ```
 
-Expected output on the Python receiver:
+Example receiver output (message IDs and timestamps vary):
 
 ```json
 {
   "metadata": {
     "iggy_id": "00000000000000000000000000000001",
     "iggy_offset": 0,
+    "iggy_timestamp": 1710064800000000,
+    "iggy_partition_id": 0,
     "iggy_stream": "demo_stream",
     "iggy_topic": "demo_topic"
   },
@@ -88,7 +90,16 @@ Cleanup: `rm -rf /tmp/http-sink-test`
 
 ## Quick Start
 
+Use the runtime setup from [Try It](#try-it), replace the URL with your receiver, and save this connector entry in its connector directory:
+
 ```toml
+type = "sink"
+key = "http"
+enabled = true
+version = 0
+name = "HTTP sink"
+path = "target/debug/libiggy_connector_http_sink"
+
 [[streams]]
 stream = "events"
 topics = ["notifications"]
@@ -132,7 +143,8 @@ batch_mode = "ndjson"
 
 One HTTP request per message. Best for webhooks and endpoints that accept single events.
 
-> With `batch_length = 50`, this produces 50 sequential HTTP round trips per poll cycle.
+> A full poll with `batch_length = 50` can produce 50 sequential requests before retries.
+> Shorter polls, serialization or size failures, and the consecutive-failure abort can produce fewer.
 > For production throughput, use `ndjson` or `json_array`.
 
 ```text
@@ -170,7 +182,7 @@ POST /ingest  Content-Type: application/octet-stream
 
 ## Message Flow: What Goes In vs. What Comes Out
 
-The connector does **not** require or expect any particular message structure. It receives raw bytes from the Iggy runtime — whatever you published to the topic is what arrives in `consume()`. The `{metadata: {}, payload: {}}` envelope is something the **sink adds on the way out**, not something it expects on the way in.
+The connector does **not** expect a metadata envelope from producers. The runtime decodes the configured stream schema and applies transforms before passing messages to the plugin. The `{metadata: {}, payload: {}}` envelope is something the **sink adds on the way out**. Producers must supply payloads accepted by the configured decoder and destination.
 
 ```text
 Your app publishes:  {"order_id": 123, "amount": 9.99}
@@ -179,7 +191,7 @@ Your app publishes:  {"order_id": 123, "amount": 9.99}
 Iggy stores:         raw bytes of that JSON
                           |
                           v
-Runtime delivers:    those same raw bytes to consume()
+Runtime delivers:    decoded/transformed payload to consume()
                           |
                           v
 HTTP sink wraps:     {"metadata": {"iggy_offset": 0, ...},
@@ -189,21 +201,21 @@ HTTP sink wraps:     {"metadata": {"iggy_offset": 0, ...},
 HTTP endpoint gets:  the wrapped envelope
 ```
 
-With `include_metadata = false`, the sink skips wrapping — your original message goes through as-is:
+With `include_metadata = false`, the sink skips wrapping. JSON values are still reserialized, so original bytes and whitespace are not preserved:
 
 ```text
 HTTP endpoint gets:  {"order_id": 123, "amount": 9.99}
 ```
 
-The `schema` field in `[[streams]]` controls how the sink **interprets** the incoming bytes for output formatting:
+The runtime first applies `schema` decoding and any configured transforms. The sink formats the resulting payload variants in JSON batch modes as follows:
 
-| Schema | Interpretation | Payload in envelope |
+| Payload variant | Interpretation | Payload in envelope |
 | ------ | -------------- | ------------------- |
-| `json` | Parses bytes as JSON | Embedded as JSON value |
-| `text` | Treats bytes as UTF-8 string | Embedded as string |
-| `raw` / `flatbuffer` / `proto` | Opaque binary | Base64-encoded with `"iggy_payload_encoding": "base64"` |
+| `json` | JSON value | Embedded as JSON value |
+| `text` | UTF-8 string | Embedded as string |
+| `raw` / `flatbuffer` / `proto` / `avro` | Payload bytes | Base64-encoded with `"iggy_payload_encoding": "base64"` |
 
-You can publish any struct serialized in any format (JSON, protobuf, raw bytes). Set the matching `schema` in `[[streams]]`, and choose whether you want the metadata envelope (`include_metadata`) or not.
+For opaque byte forwarding, use `schema = "raw"`, `batch_mode = "raw"`, and no transforms. Other schemas have decoder-specific requirements; see the connector SDK format documentation.
 
 ## Metadata Envelope
 
@@ -219,15 +231,17 @@ When `include_metadata = true` (default), payloads are wrapped:
     "iggy_topic": "my_topic",
     "iggy_partition_id": 0
   },
-  "payload": { ... }
+  "payload": {"key": "value"}
 }
 ```
 
 - **`iggy_id`**: Message ID formatted as 32-character lowercase hex string (no dashes)
-- **Non-JSON payloads** (Raw, FlatBuffer, Proto): base64-encoded with `"iggy_payload_encoding": "base64"` in payload
-- **JSON/Text payloads**: Embedded as-is
+- **Non-JSON payload variants** (Raw, FlatBuffer, Proto, Avro): base64-encoded with `"iggy_payload_encoding": "base64"` in payload
+- **JSON/Text payloads**: JSON values are reserialized; text becomes a JSON string.
+- **Timestamps**: `iggy_timestamp` and optional `iggy_origin_timestamp` use Unix epoch microseconds.
+- **Optional metadata**: `include_checksum` and `include_origin_timestamp` default to false. Nonempty message headers are included as `iggy_headers`.
 
-Set `include_metadata = false` to send the raw payload without wrapping.
+Set `include_metadata = false` to omit the envelope; payload formatting still follows the selected batch mode.
 
 ## Retry Strategy
 
@@ -235,10 +249,12 @@ Uses `reqwest-middleware` with `RetryTransientMiddleware` for automatic exponent
 
 ```text
 Initial request: no delay
-Retry 1: retry_delay = 1s
-Retry 2: retry_delay * backoff = 2s
-Retry 3: retry_delay * backoff^2 = min(4s, 30s) = 4s
+Retry 1: full jitter from 0 to retry_delay = 1s
+Retry 2: full jitter from 0 to retry_delay * backoff = 2s
+Retry 3: full jitter from 0 to min(retry_delay * backoff^2, 30s) = 4s
 ```
+
+`max_retries` counts additional attempts after the initial request, so the default allows at most four attempts.
 
 A custom `HttpSinkRetryStrategy` respects user-configured `success_status_codes` — codes in the success set are never retried, even if normally transient (e.g., 429 configured as "queued").
 
@@ -246,7 +262,7 @@ A custom `HttpSinkRetryStrategy` respects user-configured `success_status_codes`
 
 **Non-transient errors** (fail immediately): HTTP 400, 401, 403, 404, 405, etc.
 
-**HTTP 429 `Retry-After`**: The middleware does not natively support `Retry-After` headers. When a response carries `Retry-After`, a warning is logged with the header value. The middleware uses computed exponential backoff instead.
+**HTTP 429 `Retry-After`**: The middleware does not natively support `Retry-After` headers. When an unsuccessful response carries `Retry-After`, a warning is logged with the header value. The middleware uses computed exponential backoff instead.
 
 **Partial delivery** (`individual`/`raw` modes): If a message fails after exhausting retries, subsequent messages continue processing. After 3 consecutive HTTP failures, the remaining batch is aborted to avoid hammering a dead endpoint.
 
@@ -342,7 +358,7 @@ Authorization = "Bearer observability-token"
 
 ## Authentication
 
-The HTTP sink supports authentication via custom headers in `[plugin_config.headers]`. All headers are sent with every request, including health checks.
+The HTTP sink supports authentication via custom headers in `[plugin_config.headers]`. Custom headers are sent with data requests and health checks, except `Content-Type`: configured values are ignored, and the data request content type comes from the batch mode.
 
 ### Bearer Token
 
@@ -388,18 +404,18 @@ X-Client-Version = "iggy-http-sink/0.1"
 
 ### Connector Runtime Model
 
-A **connector instance** is a single OS process — the `iggy-connectors` binary loading one shared library (`libiggy_connector_http_sink.so`/`.dylib`) with one config file. Each process reads exactly one `config.toml` (set via `IGGY_CONNECTORS_CONFIG_PATH`), which defines one `[plugin_config]` block — including the target `url`, authentication headers, batch mode, and retry settings.
+A **connector instance** is one configured plugin loaded by an `iggy-connectors` process. The runtime reads its main configuration from `IGGY_CONNECTORS_CONFIG_PATH`; the local provider loads connector TOML files from `connectors.config_dir`. One process can host multiple connector instances, each with its own key, `[plugin_config]`, destination URL and HTTP client.
 
-Within that single process, the runtime spawns one async task per topic listed in `[[streams]]`. All tasks share the same plugin instance (and therefore the same HTTP client and `[plugin_config]`). There is no built-in orchestrator, no multi-connector-in-one-process mode, and no routing table that maps different topics to different URLs.
+For each instance, the runtime spawns one async consumer task per configured stream/topic. Those tasks share that plugin instance and can consume concurrently. One HTTP sink instance has one destination URL; use multiple entries with distinct keys and URLs for multiple destinations.
 
 How this works in the runtime source code:
 
-- **One consumer per topic**: `setup_sink_consumers()` in [`runtime/src/sink.rs`](../../../runtime/src/sink.rs) iterates `for topic in stream.topics.iter()` and creates a separate `IggyConsumer` for each topic.
-- **One async task per consumer**: `spawn_consume_tasks()` in [`runtime/src/sink.rs`](../../../runtime/src/sink.rs) wraps each consumer in `tokio::spawn`, so topics are consumed concurrently within the same process.
+- **One consumer per topic**: `setup_sink_consumers()` in [`runtime/src/sink.rs`](../../runtime/src/sink.rs) iterates `for topic in stream.topics.iter()` and creates a separate `IggyConsumer` for each topic.
+- **One async task per consumer**: `spawn_consume_tasks()` in [`runtime/src/sink.rs`](../../runtime/src/sink.rs) wraps each consumer in `tokio::spawn`, so topics are consumed concurrently within the same process.
 - **One plugin instance per ID**: The `sink_connector!` macro in [`sdk/src/sink.rs`](../../sdk/src/sink.rs) creates a `static INSTANCES: DashMap<u32, SinkContainer>` — each `plugin_id` passed to `iggy_sink_open` gets its own entry, and all topic tasks call `consume()` on the same instance.
-- **Sequential consume within each topic**: `consume_messages()` in [`runtime/src/sink.rs`](../../../runtime/src/sink.rs) awaits `consume()` before polling the next batch — there is no pipelining within a single topic task.
+- **Sequential consume within each topic**: `consume_messages()` in [`runtime/src/sink.rs`](../../runtime/src/sink.rs) awaits `consume()` before polling the next batch — there is no pipelining within a single topic task.
 
-**"Deploying multiple instances"** means running N separate `iggy-connectors` processes — each with its own config directory, its own `[plugin_config]` (and therefore its own destination URL, headers, batch mode, etc.). In Docker or Kubernetes, this means N containers from the same image with different config mounts or environment variables. In systemd, N service units. In ECS, N task definitions.
+**"Deploying multiple instances"** can mean multiple connector entries in one runtime, or separate processes with their own configuration directories. Separate containers, service units or task definitions are optional when process isolation is needed.
 
 ### What's Achievable Today vs. Not
 
@@ -407,12 +423,12 @@ How this works in the runtime source code:
 | ------- | :-: | --- |
 | Single destination, single topic | Yes | One connector instance, one `[[streams]]` entry |
 | Single destination, multiple topics | Yes | One connector instance, multiple topics in `[[streams]]` |
-| Multiple destinations (topic-per-destination) | Yes | N connector instances, one per destination, each a separate OS process |
+| Multiple destinations (topic-per-destination) | Yes | N connector entries with distinct keys and URLs, in one or more processes |
 | Fan-out (same topic to multiple destinations) | Yes | N connector instances consuming same topic with different `consumer_group` names |
 | Per-topic URL routing within one instance | **No** | Not supported — each instance has exactly one `url`. Requires N instances. See [Known Limitations](#known-limitations) item 6 |
 | OAuth2 / OIDC token refresh | **No** | Static headers only. Use an auth proxy |
 | mTLS client certificates | **No** | Use a sidecar proxy for mTLS termination |
-| Environment variable expansion in config values | **No** | Use env var overrides at the process level (see [Environment Variable Overrides](#environment-variable-overrides)) |
+| Environment variable expansion in config values | **No** | Flat fields support env overrides; header tables require a configuration file (see [Environment Variable Overrides](#environment-variable-overrides)) |
 
 ### Single Destination, Multiple Topics
 
@@ -469,9 +485,9 @@ Authorization = "Bearer shared-token"
 
 ### Multiple Destinations (One Connector Per Destination)
 
-*Achievable today — requires N separate OS processes.*
+*Achievable with multiple connector entries, in one or more processes.*
 
-When different topics need to go to different services, deploy separate connector instances. Each gets its own config directory and runs as a **separate `iggy-connectors` process** (not a config option within one process — see [Connector Runtime Model](#connector-runtime-model)).
+When different topics need to go to different services, configure separate connector instances. They can share a runtime using distinct keys. The example below chooses separate configuration directories and processes for isolation.
 
 ```text
 ┌───────────────────┐
@@ -593,9 +609,9 @@ IGGY_CONNECTORS_CONFIG_PATH=/opt/connectors/slack/config.toml    iggy-connectors
 
 ### Fan-Out: One Topic to Multiple Destinations
 
-*Achievable today — requires N separate OS processes with different consumer groups.*
+*Achievable with separate connector entries and different consumer groups.*
 
-When a single topic needs to be delivered to multiple HTTP endpoints (e.g., send order events to both the billing service AND an analytics pipeline), deploy multiple connector instances that consume from the **same topic with different consumer groups**. Each instance is a separate `iggy-connectors` process (see [Connector Runtime Model](#connector-runtime-model)).
+When a single topic needs to be delivered to multiple HTTP endpoints (e.g., send order events to both the billing service AND an analytics pipeline), deploy multiple connector instances that consume from the **same topic with different consumer groups**. The instances can share a runtime using distinct keys, or run in separate processes (see [Connector Runtime Model](#connector-runtime-model)).
 
 ```text
                               connector-billing  ──▶ billing-api.example.com
@@ -607,7 +623,7 @@ When a single topic needs to be delivered to multiple HTTP endpoints (e.g., send
                              (consumer_group: analytics_sink)
 ```
 
-Each consumer group maintains its own offset, so both connectors independently receive every message. This is the standard Iggy fan-out pattern — not an antipattern.
+Each consumer group maintains its own offset, so both connectors can independently consume the retained messages. The delivery limits below still apply.
 
 **Key requirement**: Each connector instance MUST use a **different `consumer_group`**. If they share a consumer group, messages are load-balanced (split) across instances rather than duplicated.
 
@@ -643,13 +659,13 @@ batch_mode = "ndjson"
 
 *Achievable today.*
 
-Each connector instance maps naturally to one container (one process = one container). Share the compiled `.so`/`.dylib` via a volume mount or bake it into the image:
+A container can run one runtime process with one or more connector entries. Share the compiled `.so`/`.dylib` via a volume mount or bake it into the image:
 
 ```dockerfile
 FROM rust:latest AS builder
 WORKDIR /app
 COPY . .
-RUN cargo build -p iggy_connector_http_sink --release
+RUN cargo build -p iggy_connector_http_sink -p iggy-connectors --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -682,12 +698,11 @@ services:
 
 ### Environment Variable Overrides
 
-The connector runtime supports overriding any config field via environment variables using the convention `IGGY_CONNECTORS_SINK_{KEY}_<SECTION>_<FIELD>`. This is useful for keeping secrets out of config files:
+The local provider accepts flat plugin overrides with `IGGY_CONNECTORS_SINK_{KEY}_PLUGIN_CONFIG_<FIELD>`, such as the destination URL. It does not support nested headers or JSON objects: `HEADERS_AUTHORIZATION` creates an unused field, and a JSON object passed through `HEADERS` becomes a string and fails plugin initialization. Supply header secrets through a protected connector TOML file.
 
 ```bash
-# Override the URL and auth token at runtime
+# Override a flat plugin field at runtime
 export IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_URL="https://prod-api.example.com/ingest"
-export IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_HEADERS_AUTHORIZATION="Bearer prod-token"
 iggy-connectors
 ```
 
@@ -695,7 +710,7 @@ iggy-connectors
 
 ### Batch Mode Selection
 
-The connector runtime calls `consume()` **sequentially** — the next poll cycle does not start until the current batch completes. Batch mode choice directly impacts throughput:
+The connector runtime calls `consume()` **sequentially within each topic task**. The task does not process its next batch until the current call completes. Request counts below assume a nonempty batch with no retries or skipped messages. Batch mode choice directly impacts throughput:
 
 | Mode | HTTP Requests per Poll | Latency per Poll | Best For |
 | ---- | ---------------------- | ----------------- | -------- |
@@ -704,7 +719,7 @@ The connector runtime calls `consume()` **sequentially** — the next poll cycle
 | `json_array` | 1 | 1 × round-trip | APIs expecting array payloads |
 | `raw` | N (one per message) | N × round-trip | Binary payloads (protobuf, avro) |
 
-With `batch_length=50` in `individual` mode, each poll cycle performs 50 sequential HTTP round trips. If each takes 100ms, the poll cycle takes 5 seconds — during which no new messages are consumed from that topic. Use `ndjson` or `json_array` to collapse this to a single round trip.
+For a full 50-message batch in `individual` mode, without retries or skipped messages, 50 sequential 100ms HTTP round trips take 5 seconds before other processing costs. The topic task does not process the next batch during those requests. Use `ndjson` or `json_array` to collapse this to a single round trip.
 
 ### Memory
 
@@ -720,19 +735,19 @@ reqwest uses HTTP/1.1 persistent connections (keep-alive) by default. The connec
 - **TCP keep-alive** (30s) — Sends TCP keep-alive probes on idle connections to detect silent drops by cloud load balancers. Without this, a connection silently closed by an intermediate LB (AWS ALB drops idle connections after ~60s, GCP after ~600s) would only be discovered on the next HTTP request, causing a failed attempt and retry delay.
 - **Pool idle timeout** (90s) — Closes connections unused for 90 seconds to prevent stale connection accumulation in the pool.
 
-Because `reqwest::Client` clones are cheap (they share the same connection pool via `Arc`), all topic tasks within a single connector process share one pool. This means multi-topic connectors benefit from connection reuse when all topics target the same host — a connection returned to the pool by topic A's task can be reused by topic B's task.
+Because `reqwest::Client` clones are cheap (they share the same connection pool via `Arc`), all topic tasks within a single connector instance share one pool. This means multi-topic connectors benefit from connection reuse when all topics target the same host — a connection returned to the pool by topic A's task can be reused by topic B's task.
 
-For multiple connector instances (separate processes), each process has its own independent `reqwest::Client` and its own connection pool. There is no cross-process connection sharing.
+Each connector instance has its own `reqwest::Client` and connection pool, even when several instances share a process. Separate processes do not share pools.
 
 ### Retry Impact on Throughput
 
-Each failed message in `individual`/`raw` mode burns through the retry budget (default: 3 retries with exponential backoff up to 30s) before moving to the next message. The backoff delays are 1s + 2s + 4s = 7 seconds per message, but each attempt also incurs the request timeout (default 30s) for a dead endpoint. Worst case per message: 4 attempts × 30s timeout + 7s backoff = 127 seconds.
+Each transiently failing message in `individual`/`raw` mode can use the retry budget (default: 3 retries with exponential backoff up to 30s) before moving to the next message. The jittered backoff delays total at most 1s + 2s + 4s = 7 seconds per message, but each attempt also incurs the request timeout (default 30s) for a dead endpoint. Worst case per message: 4 attempts × 30s timeout + 7s backoff = 127 seconds.
 
-The consecutive failure abort (`MAX_CONSECUTIVE_FAILURES = 3`) mitigates this: after 3 consecutive HTTP failures, remaining messages in the batch are skipped. This limits worst-case blocking to: 3 × (4 × 30s + 1s + 2s + 4s) = 381 seconds with default timeout, or 3 × 7s = 21 seconds of backoff delay alone.
+The consecutive failure abort (`MAX_CONSECUTIVE_FAILURES = 3`) mitigates this: after 3 consecutive HTTP failures, remaining messages in the batch are skipped. This limits worst-case blocking to: 3 × (4 × 30s + 1s + 2s + 4s) = 381 seconds with default timeout, or at most 3 × 7s = 21 seconds of backoff delay alone.
 
 ### Multiple Instances vs. Single Instance
 
-Multiple connector instances (one per destination) provide:
+Separate runtime processes (one per destination) can provide:
 
 - **Performance isolation**: A slow destination doesn't block other topics
 - **Failure isolation**: One dead endpoint doesn't affect unrelated connectors
@@ -781,21 +796,21 @@ cargo test -p iggy_connector_http_sink
 Integration tests (requires Docker for WireMock container):
 
 ```bash
-cargo test -p integration --test connectors -- http_sink
+cargo test -p integration -- connectors::http::http_sink::
 ```
 
 ## Delivery Semantics
 
-All retry logic lives inside `consume()`. The connector runtime invokes `consume()` via an FFI callback that returns an `i32` status code. The runtime does not inspect this return value (see `process_messages()` in `runtime/src/sink.rs`), so errors logged by the sink are not propagated to the runtime's retry or alerting mechanisms. Additionally, consumer group offsets are committed before processing ([runtime issue #1](#known-limitations)). This means:
+All retry logic lives inside `consume()`. The connector runtime invokes `consume()` via an FFI callback that returns an `i32` status code. A nonzero result is logged and increments the runtime error counter; that batch contributes no processed messages. The runtime continues polling without retrying the failed batch. Consumer group offsets are committed before processing ([runtime issue #2](#known-limitations)). This means:
 
 - Failed messages are **not retried by the runtime** — only by the sink's internal retry loop
 - Messages are committed **before delivery** — a crash after commit but before delivery loses messages
 
-The effective delivery guarantee is **at-most-once** at the runtime level. The sink's internal retries provide best-effort delivery within each `consume()` call.
+A failed batch may already be partially delivered, and a retry after an ambiguous response can duplicate delivery. There is no end-to-end at-least-once or exactly-once guarantee. A successful HTTP status is accepted without inspecting the response body for per-item failures.
 
 ## Known Limitations
 
-1. **Runtime ignores `consume()` status**: The connector runtime invokes `consume()` via an FFI callback returning `i32`. The `process_messages()` function in `runtime/src/sink.rs` does not inspect the return value. Errors are logged internally by the sink but do not trigger runtime-level retry or alerting. ([#2927](https://github.com/apache/iggy/issues/2927))
+1. **No runtime batch retry**: Nonzero `consume()` results are logged and counted as errors, but the runtime does not retry the batch. A failed batch may have been partially delivered; the FFI result does not report a per-message outcome.
 
 2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
 
@@ -809,4 +824,4 @@ The effective delivery guarantee is **at-most-once** at the runtime level. The s
 
 7. **No OAuth2 token refresh**: Bearer tokens are static. Use an auth proxy for services requiring automatic token rotation.
 
-8. **No environment variable expansion in config values**: Secrets in `[plugin_config.headers]` are stored as plaintext. Use environment variable overrides (see [Environment Variable Overrides](#environment-variable-overrides)) or mount secrets from a secrets manager.
+8. **No environment variable expansion in config values**: Secrets in `[plugin_config.headers]` are stored as plaintext. Mount or generate a protected connector TOML file containing the header values; nested header environment overrides are unsupported.

@@ -127,7 +127,7 @@ under the License.
     confirmationOpen = false;
 
     if (result) {
-      const { ok } = await fetchRouteApi({
+      const { data, ok } = await fetchRouteApi({
         method: 'DELETE',
         path: `/streams/${stream.id}`
       });

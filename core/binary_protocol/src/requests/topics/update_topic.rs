@@ -28,16 +28,10 @@ use bytes::BytesMut;
 /// `[stream_id:WireIdentifier][topic_id:WireIdentifier][name_len:u8][name:N]
 ///  [options TLV to end]`
 ///
-/// Identity and the new name are the only fixed fields; every SETTING rides the
-/// options block, which mirrors `CreateTopic`'s and carries the same catalog.
-/// A knob added there is updatable here without another layout change, and no
-/// setting has two homes to disagree between.
-///
-/// Keys absent from the block are LEFT ALONE rather than reset to their
-/// defaults. A client built before a key existed cannot send it, so treating
-/// the block as the topic's complete option set would let an old client wipe a
-/// newer knob just by updating the name -- the same forward-compatibility
-/// argument that makes unknown keys survive a round trip.
+/// The options block shares `CreateTopic`'s encoding, but the server validates
+/// which keys can be updated. Supporting a key at creation does not make it
+/// mutable. Absent keys are left unchanged, so updating the name does not erase
+/// settings introduced after the client was built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateTopicRequest {
     pub stream_id: WireIdentifier,

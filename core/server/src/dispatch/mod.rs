@@ -897,6 +897,9 @@ mod tests {
     /// A test shard wired to its own lanes (the held sender feeds them),
     /// for the reply-lane pump tests below.
     fn reply_lane_test_shard(name: &str) -> (SpyBus, shard::TaggedSender, Rc<TestShard>) {
+        // These tests do not dispatch disk polls, so keep that lane minimal.
+        const POLL_COMPLETION_CAPACITY: usize = 1;
+
         let bus = SpyBus::default();
         let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
@@ -921,12 +924,12 @@ mod tests {
             Rc::new(|_, _| {}),
             Rc::new(|_| {}),
             Rc::new(|_| {}),
-            Rc::new(|_, _, _| {}),
             metadata,
             partitions,
             vec![sender],
             inbox_rx,
             reply_inbox_rx,
+            POLL_COMPLETION_CAPACITY,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,

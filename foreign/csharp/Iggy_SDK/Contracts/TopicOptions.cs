@@ -57,19 +57,19 @@ public sealed class TopicOptions
     public Durability ConsumerOffsetDurability { get; init; } = Durability.Replicated;
 
     /// <summary>
-    ///     Flush the journal once it holds this many messages. Must be non-zero.
+    ///     Attempt a flush after this many messages accumulate in a partition buffer. Must be non-zero.
     /// </summary>
     public uint? MessagesRequiredToSave { get; init; }
 
     /// <summary>
-    ///     Flush the journal once it holds this many bytes. Paired with
-    ///     <see cref="MessagesRequiredToSave" />: whichever threshold trips first flushes.
+    ///     Attempt a flush after this many bytes accumulate in a partition buffer. Paired with
+    ///     <see cref="MessagesRequiredToSave" />; either threshold triggers an attempt.
     /// </summary>
     public ulong? SizeOfMessagesRequiredToSave { get; init; }
 
     /// <summary>
-    ///     Reserve a segment's bytes up front on a filesystem that supports it. Reserves exactly
-    ///     <see cref="SegmentSize" />, so the two belong to one decision.
+    ///     Request filesystem preallocation when creating a segment. The server may fall back
+    ///     to extending the file when preallocation is unavailable.
     /// </summary>
     public bool? PreallocateSegments { get; init; }
 

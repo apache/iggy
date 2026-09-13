@@ -120,7 +120,7 @@ impl Transform for AvroConvert {
                 let encoder_config = AvroEncoderConfig {
                     schema_path: self.config.schema_path.clone(),
                     schema_json: self.config.schema_json.clone(),
-                    field_mappings: self.config.field_mappings.clone(),
+                    field_mappings: None,
                 };
                 let encoder = AvroStreamEncoder::new(encoder_config);
                 let encoded_bytes = encoder.encode(message.payload)?;
@@ -184,6 +184,10 @@ impl Default for AvroConvert {
 
 #[cfg(test)]
 mod tests {
+    use apache_avro::{
+        Schema as AvroSchema, reader::datum::GenericDatumReader, types::Value as AvroValue,
+    };
+
     use super::*;
     use crate::TopicMetadata;
 
@@ -231,6 +235,48 @@ mod tests {
             .unwrap()
             .write_value_to_vec(record)
             .unwrap()
+    }
+
+    #[test]
+    fn given_chained_field_names_when_encoding_should_apply_each_mapping_once() {
+        let schema_json = create_test_schema_json();
+        let schema = AvroSchema::parse_str(&schema_json).expect("parse User schema");
+        let converter = AvroConvert::new(AvroConvertConfig {
+            source_format: Schema::Json,
+            target_format: Schema::Avro,
+            schema_json: Some(schema_json),
+            field_mappings: Some(HashMap::from([
+                ("old_name".to_string(), "name".to_string()),
+                ("name".to_string(), "archived_name".to_string()),
+            ])),
+            ..AvroConvertConfig::default()
+        });
+        let message = create_test_message(Payload::Json(simd_json::json!({
+            "old_name": "Alice",
+            "age": 30,
+        })));
+        let transformed = converter
+            .transform(&create_test_metadata(), message)
+            .expect("encode with one field rename")
+            .expect("preserve message");
+        let Payload::Avro(data) = transformed.payload else {
+            panic!("expected Avro datum");
+        };
+        let reader = GenericDatumReader::builder(&schema)
+            .build()
+            .expect("create Avro reader");
+        let mut bytes = data.as_slice();
+        let decoded = reader
+            .read_value(&mut bytes)
+            .expect("decode transformed datum");
+        assert_eq!(
+            decoded,
+            AvroValue::Record(vec![
+                ("name".to_string(), AvroValue::String("Alice".to_string())),
+                ("age".to_string(), AvroValue::Int(30)),
+            ])
+        );
+        assert!(bytes.is_empty());
     }
 
     #[test]

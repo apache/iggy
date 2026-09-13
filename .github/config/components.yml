@@ -529,7 +529,7 @@ components:
   web-ui:
     paths:
       - "web/**"
-    tasks: ["lint", "build"]
+    tasks: ["lint", "test", "build"]
 
   helm:
     paths:

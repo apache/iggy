@@ -564,8 +564,8 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<BatchRef<'_>, IggyError> {
 /// INVARIANT: `bytes` MUST be node-local self-stamped -
 /// [`stamp_prepare_for_persistence`] recomputed the batch checksum over the
 /// exact blob on the local node - or already integrity-checked at network
-/// ingress. There is no consensus-layer blob validation: the `PrepareHeader`
-/// integrity fields are inert zeros. Replicated and repaired prepares are
+/// ingress. The partition `PrepareHeader` identity covers only the header; its
+/// body checksum is zero. Replicated and repaired message batches are
 /// validated via [`decode_prepare_slice`] before the bytes reach any trusted
 /// decode. Calling this on unvalidated network bytes would let a corrupted blob
 /// pass undetected. The full-body per-message checksum pass dominates

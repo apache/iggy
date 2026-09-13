@@ -594,6 +594,16 @@ macro_rules! source_connector {
                 log_callback,
                 <$type>::new,
             );
+            if result != 0 {
+                // Rolled back rather than registered. `open` stores the
+                // instance on the container whatever it returns, so a failed
+                // one would sit here for the life of the process: the runtime
+                // gets an error back before it has recorded the id, so nothing
+                // outside can name it to close it. Dropping the container is
+                // the rollback, and it releases whatever the plugin took
+                // before it failed.
+                return result;
+            }
             INSTANCES.insert(id, container);
             result
         }

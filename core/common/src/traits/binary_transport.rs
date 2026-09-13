@@ -33,8 +33,7 @@ pub trait BinaryTransport {
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve
-    /// partitioning client-side under VSR (the broker never picks a
-    /// partition). Shared via `Arc` so a refresh task can hold it.
+    /// partitioning client-side under VSR. Shared via `Arc` so a refresh task can hold it.
     fn consumer_group_state(&self) -> Arc<crate::ConsumerGroupClientState>;
 }
 

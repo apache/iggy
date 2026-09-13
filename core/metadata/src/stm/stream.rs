@@ -67,6 +67,7 @@ use iggy_common::wire_conversions::{resource_options_from_wire, resource_options
 use iggy_common::{
     CompressionAlgorithm, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats,
     ResourceOptions, StreamStats, TopicCreateOptions, TopicRuntimeOptions, TopicStats,
+    topic_option_keys,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -2234,20 +2235,23 @@ impl StateHandler for UpdateTopicRequest {
 
         // Decoded before any mutation: a malformed block must leave the topic
         // untouched rather than half-renamed.
-        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
+        let Ok(mut updated_options) = resource_options_from_wire(&self.options, true) else {
             return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
         };
         // Read leniently, like every other committed op: a key this build does
         // not know is skipped rather than failing an operation its peers
         // accepted.
         let updated = TopicCreateOptions::parse_committed(&self.options);
+        // Default sentinels leave both the effective value and its provenance
+        // unchanged, just as an omitted key does.
+        updated_options.retain(|key, _| match key.as_str() {
+            Ok(topic_option_keys::MESSAGE_EXPIRY) => updated.message_expiry.is_some(),
+            Ok(topic_option_keys::MAX_TOPIC_SIZE) => updated.max_topic_size.is_some(),
+            _ => true,
+        });
 
         stream.topic_index.remove(&topic.name);
         topic.name = new_name_arc.clone();
-        // Settings arrive only through the options block now, so the typed
-        // fields are a projection of it and cannot drift. Absent means absent:
-        // a client that sends just a rename leaves every setting alone, and one
-        // built before a key existed cannot erase it.
         if let Some(compression_algorithm) = updated.compression_algorithm {
             topic.compression_algorithm = compression_algorithm;
         }
@@ -2751,7 +2755,7 @@ mod tests {
         CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
-    use iggy_common::{HeaderKey, HeaderKind, topic_option_keys};
+    use iggy_common::{HeaderKey, HeaderKind, TopicUpdateOptions, topic_option_keys};
     use std::str::FromStr;
 
     #[test]
@@ -2954,6 +2958,89 @@ mod tests {
             &10_000_000_000u64.to_le_bytes(),
             "the map must carry the resolved value, not the sentinel"
         );
+    }
+
+    #[test]
+    fn update_topic_sentinels_preserve_effective_options_and_provenance() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let message_expiry = IggyExpiry::from(5_000_000u64);
+        let max_topic_size = MaxTopicSize::from(10_000_000_000u64);
+        let create = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic").unwrap(),
+                options: TopicCreateOptions {
+                    message_expiry: Some(message_expiry),
+                    ..TopicCreateOptions::default()
+                }
+                .to_explicit_wire(|key| key == topic_option_keys::MESSAGE_EXPIRY)
+                .unwrap(),
+            },
+            derived_options: TopicCreateOptions {
+                max_topic_size: Some(max_topic_size),
+                ..TopicCreateOptions::default()
+            }
+            .to_wire()
+            .unwrap(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&create, &mut inner, IggyTimestamp::from(1)).code,
+            0
+        );
+        let original_options = inner
+            .items
+            .get(0)
+            .unwrap()
+            .topics
+            .get(0)
+            .unwrap()
+            .options
+            .clone();
+
+        for options in [
+            TopicUpdateOptions::default(),
+            TopicUpdateOptions {
+                message_expiry: Some(IggyExpiry::ServerDefault),
+                max_topic_size: Some(MaxTopicSize::ServerDefault),
+                ..TopicUpdateOptions::default()
+            },
+            TopicUpdateOptions {
+                raw: [
+                    topic_option_keys::MESSAGE_EXPIRY,
+                    topic_option_keys::MAX_TOPIC_SIZE,
+                ]
+                .into_iter()
+                .map(|key| (key.to_owned(), "server_default".to_owned()))
+                .collect(),
+                ..TopicUpdateOptions::default()
+            },
+        ] {
+            let update = UpdateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("renamed").unwrap(),
+                options: options.to_wire().unwrap(),
+            };
+            assert_eq!(
+                StateHandler::apply(&update, &mut inner, IggyTimestamp::from(2)).code,
+                0
+            );
+            let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+            assert_eq!(topic.name.as_ref(), "renamed");
+            assert_eq!(topic.message_expiry, message_expiry);
+            assert_eq!(topic.max_topic_size, max_topic_size);
+            assert_eq!(
+                topic.options, original_options,
+                "update {options:?} must preserve values and provenance"
+            );
+        }
     }
 
     #[test]

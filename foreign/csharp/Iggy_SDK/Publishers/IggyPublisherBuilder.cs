@@ -105,7 +105,7 @@ public class IggyPublisherBuilder
     ///     Configures the connection settings for the publisher's Iggy client.
     ///     Only used when the builder creates its own client.
     /// </summary>
-    /// <param name="protocol">The protocol to use (TCP, QUIC, or HTTP).</param>
+    /// <param name="protocol">The protocol to use (TCP or HTTP).</param>
     /// <param name="address">The server address to connect to (format depends on protocol).</param>
     /// <param name="login">The login username for authentication.</param>
     /// <param name="password">The password for authentication.</param>
@@ -138,7 +138,7 @@ public class IggyPublisherBuilder
     /// <summary>
     ///     Configures the connection settings using a personal access token instead of a username and password.
     /// </summary>
-    /// <param name="protocol">The protocol to use for the connection (e.g., TCP, UDP).</param>
+    /// <param name="protocol">The protocol to use for the connection (TCP or HTTP).</param>
     /// <param name="address">The address of the server to connect to.</param>
     /// <param name="personalAccessToken">The personal access token to authenticate with.</param>
     /// <param name="receiveBufferSize">
@@ -264,11 +264,11 @@ public class IggyPublisherBuilder
 
 
     /// <summary>
-    ///     Configures retry behavior for failed message sends.
+    ///     Configures retry behavior for failed background message sends.
     ///     Uses exponential backoff with configurable parameters.
     /// </summary>
     /// <param name="enabled">Whether retry is enabled. Default is true.</param>
-    /// <param name="maxAttempts">The maximum number of retry attempts. Default is 3.</param>
+    /// <param name="maxAttempts">The total send attempts, including the first send. Default is 3.</param>
     /// <param name="initialDelay">The initial delay before the first retry. Default is 100ms.</param>
     /// <param name="maxDelay">The maximum delay between retries. Default is 10 seconds.</param>
     /// <param name="backoffMultiplier">The multiplier for exponential backoff. Default is 2.0.</param>
@@ -324,9 +324,9 @@ public class IggyPublisherBuilder
 
     /// <summary>
     ///     Builds and returns a configured <see cref="IggyPublisher" /> instance.
-    ///     Creates the Iggy client if needed, wires up all event handlers, and initializes the publisher.
+    ///     Creates the Iggy client if needed and wires up event handlers. Call InitAsync before sending.
     /// </summary>
-    /// <returns>A fully configured <see cref="IggyPublisher" /> instance ready to send messages.</returns>
+    /// <returns>A configured <see cref="IggyPublisher" /> instance that still requires InitAsync.</returns>
     /// <exception cref="ArgumentNullException">Thrown when IggyClient is null and CreateIggyClient is false.</exception>
     /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
     public IggyPublisher Build()
