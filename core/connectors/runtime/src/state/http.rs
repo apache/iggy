@@ -291,7 +291,9 @@ impl HttpStateProvider {
                     let etag = required_etag(&response, "load", &self.resource_label)?;
                     match response.bytes().await {
                         Ok(bytes) => return Ok(LoadResponse::Found { etag, bytes }),
-                        Err(read_error) => TransientFailure::Read(read_error.to_string()),
+                        Err(read_error) => {
+                            TransientFailure::Read(read_error.without_url().to_string())
+                        }
                     }
                 }
                 Ok(response) if response.status() == StatusCode::NOT_FOUND => {
@@ -725,6 +727,8 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Instant;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -969,6 +973,52 @@ mod tests {
             matches!(result, Err(Error::TransientState(_))),
             "a timed-out request must be transient, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn given_truncated_body_when_loaded_should_redact_url_secrets() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind state server");
+        let address = listener.local_addr().expect("state server address");
+        let mut config = test_config(&format!("http://{address}?token={STATE_URL_QUERY_SECRET}"));
+        config.retry.enabled = false;
+        let storage = storage_for(&config);
+        let respond = async {
+            let (socket, _) = listener.accept().await.expect("accept state request");
+            let mut connection = BufReader::new(socket);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = connection
+                    .read_line(&mut line)
+                    .await
+                    .expect("read request headers");
+                assert_ne!(read, 0, "request must include complete headers");
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx")
+                .await
+                .expect("send truncated state body");
+            connection.shutdown().await.expect("close state response");
+        };
+        let (_, result) = tokio::time::timeout(config.timeout.get_duration(), async {
+            tokio::join!(respond, storage.load())
+        })
+        .await
+        .expect("state request must finish");
+        let Err(Error::TransientState(message)) = result else {
+            panic!("body-read failure must be transient, got {result:?}");
+        };
+        assert!(
+            message.contains("while reading the response body"),
+            "{message}"
+        );
+        assert!(message.contains(RESOURCE_PATH), "{message}");
+        assert!(!message.contains(STATE_URL_QUERY_SECRET), "{message}");
     }
 
     #[tokio::test]

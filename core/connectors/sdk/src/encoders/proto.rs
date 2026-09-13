@@ -143,14 +143,8 @@ impl ProtoStreamEncoder {
             schema_path
         );
 
-        let proto_content = match fs::read_to_string(schema_path) {
-            Ok(content) => content,
-            Err(e) => {
-                error!("Failed to read proto file: {}", e);
-                error!("Falling back to Any wrapper mode");
-                return Ok(());
-            }
-        };
+        let proto_content = fs::read_to_string(schema_path)
+            .map_err(|error| Error::InitError(format!("Failed to read proto file: {error}")))?;
 
         let parsed_file = parse(&schema_path.to_string_lossy(), &proto_content)
             .map_err(|e| Error::InitError(format!("Failed to parse proto file: {e}")))?;
@@ -187,11 +181,9 @@ impl ProtoStreamEncoder {
                 self.file_descriptor_set = Some(file_descriptor_set);
                 Ok(())
             }
-            Err(e) => {
-                error!("Failed to compile proto schema: {}", e);
-                error!("Falling back to Any wrapper mode");
-                Ok(())
-            }
+            Err(error) => Err(Error::InitError(format!(
+                "Failed to compile proto schema: {error}"
+            ))),
         }
     }
 
@@ -964,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn load_schema_should_handle_missing_proto_file_gracefully() {
+    fn given_missing_proto_file_when_loading_schema_should_return_error() {
         let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
             schema_path: Some(PathBuf::from("nonexistent.proto")),
             message_type: Some("com.example.Test".to_string()),
@@ -972,10 +964,7 @@ mod tests {
         });
 
         let result = encoder.load_schema();
-        assert!(
-            result.is_ok(),
-            "Should handle missing proto file gracefully"
-        );
+        assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
     }
 
     #[test]

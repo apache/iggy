@@ -137,14 +137,8 @@ impl ProtoConvert {
             schema_path
         );
 
-        let proto_content = match fs::read_to_string(schema_path) {
-            Ok(content) => content,
-            Err(e) => {
-                error!("Failed to read proto file: {}", e);
-                error!("Falling back to basic conversion methods");
-                return Ok(());
-            }
-        };
+        let proto_content = fs::read_to_string(schema_path)
+            .map_err(|error| Error::InitError(format!("Failed to read proto file: {error}")))?;
 
         let parsed_file = parse(&schema_path.to_string_lossy(), &proto_content)
             .map_err(|e| Error::InitError(format!("Failed to parse proto file: {e}")))?;
@@ -181,12 +175,9 @@ impl ProtoConvert {
                 self.file_descriptor_set = Some(file_descriptor_set);
                 Ok(())
             }
-            Err(e) => {
-                error!("Failed to compile proto schema: {}", e);
-                error!("Falling back to basic conversion methods");
-
-                Ok(())
-            }
+            Err(error) => Err(Error::InitError(format!(
+                "Failed to compile proto schema: {error}"
+            ))),
         }
     }
 
@@ -1223,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn load_schema_should_log_warning_for_unimplemented_schema_compilation() {
+    fn given_missing_proto_file_when_loading_schema_should_return_error() {
         let mut converter = ProtoConvert::new(ProtoConvertConfig {
             schema_path: Some(PathBuf::from("test.proto")),
             message_type: Some("com.example.Test".to_string()),
@@ -1232,10 +1223,7 @@ mod tests {
 
         let result = converter.load_schema();
 
-        assert!(
-            result.is_ok(),
-            "Should handle unimplemented schema compilation gracefully"
-        );
+        assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
     }
 
     #[test]
