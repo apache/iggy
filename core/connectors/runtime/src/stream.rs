@@ -24,6 +24,9 @@ use crate::error::RuntimeError;
 
 const TOKEN_FILE_PREFIX: &str = "file:";
 
+/// `address` must match the suffix of `connection_string`. It is inspected
+/// separately because credentials may contain `?`, which does not start the
+/// address query string.
 fn append_query_parameters(connection_string: &str, address: &str, parameters: &str) -> String {
     let separator = if address.contains('?') { '&' } else { '?' };
     format!("{connection_string}{separator}{parameters}")

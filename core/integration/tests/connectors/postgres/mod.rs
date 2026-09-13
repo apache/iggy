@@ -58,6 +58,18 @@ async fn source_stats(http: &Client, api_url: &str) -> Option<ConnectorStats> {
         .find(|connector| connector.key == SOURCE_KEY)
 }
 
+async fn wait_for_source_status(http: &Client, api_url: &str, expected: ConnectorStatus) {
+    for _ in 0..POLL_ATTEMPTS {
+        if let Some(source) = source_stats(http, api_url).await
+            && source.status == expected
+        {
+            return;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    panic!("Source connector did not reach {expected:?} status in time");
+}
+
 async fn wait_for_source_errors(
     http: &Client,
     api_url: &str,

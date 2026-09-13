@@ -17,7 +17,7 @@
 
 use super::{
     API_KEY, DEFAULT_SLOT, POLL_ATTEMPTS, POLL_INTERVAL_MS, SOURCE_KEY, source_stats,
-    wait_for_source_errors,
+    wait_for_source_errors, wait_for_source_status,
 };
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
@@ -26,7 +26,7 @@ use crate::connectors::fixtures::{
 use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
-use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
+use iggy_connector_sdk::api::ConnectorStatus;
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
@@ -285,6 +285,11 @@ async fn idle_cdc_source_advances_slot_to_current_wal(
     harness: &TestHarness,
     fixture: PostgresSourceCdcFixture,
 ) {
+    let state_path = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .state_path()
+        .join("source_postgres.state");
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
@@ -313,6 +318,10 @@ async fn idle_cdc_source_advances_slot_to_current_wal(
         .await
         .expect("Failed to read replication slot position");
         if reached {
+            assert!(
+                !state_path.exists(),
+                "Idle CDC polling should not rewrite an unchanged checkpoint"
+            );
             pool.close().await;
             return;
         }
@@ -525,27 +534,6 @@ async fn given_delivery_failure_when_iggy_restarts_should_redeliver_cdc_without_
     wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
 
     pool.close().await;
-}
-
-async fn wait_for_source_status(
-    http: &Client,
-    api_url: &str,
-    expected: ConnectorStatus,
-) -> SourceInfoResponse {
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(resp) = http
-            .get(format!("{api_url}/sources/{SOURCE_KEY}"))
-            .header("api-key", API_KEY)
-            .send()
-            .await
-            && let Ok(info) = resp.json::<SourceInfoResponse>().await
-            && info.status == expected
-        {
-            return info;
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-    panic!("Source connector did not reach {expected:?} status in time");
 }
 
 async fn get_active_source_config(http: &Client, api_url: &str) -> serde_json::Value {

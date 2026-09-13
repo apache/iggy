@@ -81,7 +81,8 @@ pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
     PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture,
     PostgresSourceDeleteFixture, PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceNumericTrackingFixture,
+    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
+    PostgresSourceNonUniqueTrackingFixture, PostgresSourceNumericTrackingFixture,
     PostgresSourceOps,
 };
 pub use quickwit::{

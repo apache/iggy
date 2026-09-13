@@ -56,7 +56,7 @@ cdc_backend = "builtin"
 | `tables` | array | required | List of tables to monitor |
 | `poll_interval` | string | `10s` | How often to poll (e.g., `1s`, `5m`) |
 | `batch_size` | u32 | `1000` | Max rows per poll |
-| `tracking_column` | string | `id` | Column for incremental updates |
+| `tracking_column` | string | `id` | Unique, non-null column for incremental updates |
 | `initial_offset` | string | none | Starting value for tracking column |
 | `max_connections` | u32 | `10` | Max database connections |
 | `snake_case_columns` | bool | `false` | Convert column names to snake_case |
@@ -65,7 +65,7 @@ cdc_backend = "builtin"
 | `payload_format` | string | `bytea` | Format of payload_column: `bytea`, `text`, or `json_direct` |
 | `delete_after_read` | bool | `false` | Delete rows after reading; takes precedence over `processed_column` |
 | `processed_column` | string | none | Boolean column to mark as processed when `delete_after_read` is false |
-| `primary_key_column` | string | tracking_column | PK for delete/mark operations |
+| `primary_key_column` | string | tracking_column | Unique, non-null key for delete/mark operations |
 | `custom_query` | string | none | Custom SQL with parameter substitution |
 | `replication_slot` | string | `iggy_slot` | Replication slot name (only used when `mode = "cdc"`) |
 | `capture_operations` | array | `["INSERT","UPDATE","DELETE"]` | CDC operations to capture |
@@ -80,6 +80,11 @@ Delivery is at-least-once, so consumers must tolerate duplicates. A failed send
 NACKs the batch and leaves its database progress uncommitted for redelivery.
 After five consecutive NACKs, the source stops and requires a manual connector
 restart.
+
+Cleanup work and replication-slot advances are stored with the acknowledged
+checkpoint before they run. After a restart, the connector replays that work
+before polling new rows and then saves a state-only checkpoint to retire it.
+Checkpoints created by older connector versions remain compatible.
 
 ## Output Modes
 
@@ -212,14 +217,26 @@ ORDER BY created_at
 LIMIT $limit
 ```
 
-Custom queries do not advance the connector-managed offset because their result
-order cannot be inferred safely. Use `delete_after_read`, `processed_column`, or
-an external cursor condition when the query must exclude acknowledged rows.
+Custom queries containing `$offset` advance the connector-managed offset after
+the batch is acknowledged. The tracking column must be unique and non-null, and
+the query must return rows ordered by that column in ascending order. Custom
+queries without `$offset` do not advance the connector-managed offset. Cleanup
+operations remain bounded by the selected primary keys rather than by the custom
+query's cursor.
+
+The generated polling query also uses this scalar cursor. At startup, the
+connector rejects any generated query or `$offset` custom query whose tracking
+column lacks a valid single-column unique index or permits null values.
 
 ## Delete After Read / Mark as Processed
 
 Both options may be present for compatibility. When `delete_after_read` is
 `true`, rows are deleted and `processed_column` is ignored.
+
+The resolved cleanup key is `primary_key_column`, or `tracking_column` when the
+former is unset. For every configured table, it must be a non-null column with
+a valid single-column unique index. The connector validates this requirement
+at startup before enabling delete or mark operations.
 
 ### Delete After Read
 
@@ -406,9 +423,9 @@ The connector automatically retries transient database errors (connection issues
 
 Polling operations use the complete configured retry schedule. Database work performed after an ACK, such as deleting or marking rows and advancing a replication slot, uses the same schedule but shares a 10-second deadline across the batch. When the configured schedule exceeds that window, unfinished ACK operations remain staged and are retried before the connector polls new rows.
 
-Every PostgreSQL statement has a 9-second server-side timeout so a stalled backend is cancelled before the 10-second ACK callback backstop expires.
+ACK statements use a transaction-local 9-second server-side timeout so a stalled backend is cancelled before the 10-second ACK callback backstop expires. Polling and CDC reads retain the PostgreSQL connection's configured timeout.
 
-The connector stops after three consecutive replication-slot advance failures so repeated changes cannot be delivered indefinitely while WAL continues to grow.
+The connector stops after three consecutive row-cleanup or replication-slot advance failures. This prevents permanent cleanup errors from stalling polling while the connector continues to report healthy progress, and prevents repeated CDC delivery while WAL continues to grow.
 
 ### SQL Injection Protection
 

@@ -19,9 +19,10 @@ use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
 use iggy::prelude::{
-    DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
-    IggyProducer,
+    DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
+    IggyMessage, IggyProducer, StreamClient, TopicClient, TopicCreateOptions,
 };
+use iggy_common::TopicRuntimeOptions;
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
@@ -54,6 +55,7 @@ use prometheus_client::metrics::counter::Counter;
 use tokio::task::JoinHandle;
 
 const MAX_FAILED_TAIL_RETRIES: u32 = 3;
+const SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE: u32 = 1;
 
 pub(crate) struct SourceSenderEntry {
     pub(crate) sender: Sender<ProducedBatch>,
@@ -336,9 +338,14 @@ pub(crate) async fn setup_source_producer(
             .map_err(|error| {
                 RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
             })?;
+        ensure_durable_source_topic(iggy_client, &stream.stream, &stream.topic).await?;
         let batch_length = stream.batch_length.unwrap_or(1000);
         let producer = iggy_client
             .producer(&stream.stream, &stream.topic)?
+            // The topic was validated above. If it disappears before init,
+            // recreating it with producer defaults would drop the durability guarantee.
+            .do_not_create_stream_if_not_exists()
+            .do_not_create_topic_if_not_exists()
             .direct(
                 DirectConfig::builder()
                     .batch_length(batch_length)
@@ -375,6 +382,59 @@ pub(crate) async fn setup_source_producer(
     })?;
 
     Ok((producer, encoder, transforms))
+}
+
+async fn ensure_durable_source_topic(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+) -> Result<(), RuntimeError> {
+    let stream_id = Identifier::try_from(stream_name)?;
+    if client.get_stream(&stream_id).await?.is_none() {
+        client.create_stream(stream_name).await?;
+    }
+
+    let topic_id = Identifier::try_from(topic_name)?;
+    let topic = match client.get_topic(&stream_id, &topic_id).await? {
+        Some(topic) => topic,
+        None => {
+            client
+                .create_topic(
+                    &stream_id,
+                    topic_name,
+                    &TopicCreateOptions {
+                        partitions_count: Some(1),
+                        enforce_fsync: Some(true),
+                        messages_required_to_save: Some(SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE),
+                        ..TopicCreateOptions::default()
+                    },
+                )
+                .await?
+        }
+    };
+
+    validate_source_topic_durability(
+        stream_name,
+        topic_name,
+        TopicRuntimeOptions::from_resource_options(&topic.options),
+    )
+}
+
+fn validate_source_topic_durability(
+    stream_name: &str,
+    topic_name: &str,
+    options: TopicRuntimeOptions,
+) -> Result<(), RuntimeError> {
+    if options.enforce_fsync == Some(true)
+        && options.messages_required_to_save == Some(SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE)
+    {
+        return Ok(());
+    }
+
+    Err(RuntimeError::InvalidConfiguration(format!(
+        "Source destination topic '{stream_name}/{topic_name}' must use enforce_fsync=true and messages_required_to_save={SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE}; found enforce_fsync={:?}, messages_required_to_save={:?}",
+        options.enforce_fsync, options.messages_required_to_save
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -604,7 +664,7 @@ pub(crate) async fn source_forwarding_loop(
                 context.metrics.inc_errors_with_labels(&labels.counter);
                 context.sources.set_error(&plugin_key, &error_msg).await;
             }
-        } else if batch_result == SourceBatchResult::Ack {
+        } else if should_recover_source(batch_result, sent_count) {
             context.sources.recover_from_error(&plugin_key).await;
         }
 
@@ -638,6 +698,10 @@ pub(crate) async fn source_forwarding_loop(
             Some(&context.metrics),
         )
         .await;
+}
+
+fn should_recover_source(batch_result: SourceBatchResult, sent_count: usize) -> bool {
+    batch_result == SourceBatchResult::Ack && sent_count > 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1041,6 +1105,64 @@ mod tests {
         assert_eq!(
             handle_produced_messages(plugin_id, 1, serialized.as_ptr(), serialized.len()),
             -1
+        );
+    }
+
+    #[test]
+    fn given_acknowledged_nonempty_batch_when_recovering_should_restore_source_status() {
+        assert!(should_recover_source(SourceBatchResult::Ack, 1));
+    }
+
+    #[test]
+    fn given_acknowledged_empty_batch_when_recovering_should_preserve_source_error() {
+        assert!(!should_recover_source(SourceBatchResult::Ack, 0));
+    }
+
+    #[test]
+    fn given_rejected_nonempty_batch_when_recovering_should_preserve_source_error() {
+        assert!(!should_recover_source(SourceBatchResult::Nack, 1));
+    }
+
+    #[test]
+    fn given_fsync_per_batch_topic_when_validating_source_destination_should_accept() {
+        let options = TopicRuntimeOptions {
+            enforce_fsync: Some(true),
+            messages_required_to_save: Some(1),
+            ..TopicRuntimeOptions::default()
+        };
+
+        assert!(validate_source_topic_durability("stream", "topic", options).is_ok());
+    }
+
+    #[test]
+    fn given_non_fsync_topic_when_validating_source_destination_should_reject() {
+        let options = TopicRuntimeOptions {
+            enforce_fsync: Some(false),
+            messages_required_to_save: Some(1),
+            ..TopicRuntimeOptions::default()
+        };
+
+        let error = validate_source_topic_durability("stream", "topic", options)
+            .expect_err("non-fsync topic must not receive checkpointed source data");
+
+        assert!(error.to_string().contains("enforce_fsync=Some(false)"));
+    }
+
+    #[test]
+    fn given_buffered_topic_when_validating_source_destination_should_reject() {
+        let options = TopicRuntimeOptions {
+            enforce_fsync: Some(true),
+            messages_required_to_save: Some(10),
+            ..TopicRuntimeOptions::default()
+        };
+
+        let error = validate_source_topic_durability("stream", "topic", options)
+            .expect_err("buffered topic must not precede source cleanup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("messages_required_to_save=Some(10)")
         );
     }
 

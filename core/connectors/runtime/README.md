@@ -41,6 +41,8 @@ format = "text" # Options: "text" (default), "json"
 
 The path to the configuration can be overridden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
 
+Source destination topics must persist every acknowledged batch before the runtime checkpoints the source or invokes its Ack hook. Missing topics are therefore created with `enforce_fsync = true` and `messages_required_to_save = 1`. An existing topic with different effective values prevents that source from starting; recreate it with those creation options before enabling the source.
+
 ## State storage
 
 Source connectors checkpoint their progress (an opaque byte blob) through the runtime's state storage. The backend is selected via `state.storage`:

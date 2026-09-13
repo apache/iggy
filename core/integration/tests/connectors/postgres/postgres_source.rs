@@ -27,14 +27,48 @@ use tokio::time::sleep;
 
 use super::{
     DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT, source_stats,
-    wait_for_source_errors,
+    wait_for_source_errors, wait_for_source_status,
 };
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     PostgresOps, PostgresSourceByteaFixture, PostgresSourceDeleteFixture,
     PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture, PostgresSourceJsonbFixture,
-    PostgresSourceMarkFixture, PostgresSourceNumericTrackingFixture, PostgresSourceOps,
+    PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
+    PostgresSourceNonUniqueTrackingFixture, PostgresSourceNumericTrackingFixture,
+    PostgresSourceOps,
 };
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_non_unique_cleanup_key_when_source_opens_should_reject_config(
+    harness: &TestHarness,
+    _fixture: PostgresSourceNonUniqueCleanupFixture,
+) {
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    wait_for_source_status(&Client::new(), &api_url, ConnectorStatus::Error).await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_non_unique_tracking_column_when_source_opens_should_reject_config(
+    harness: &TestHarness,
+    _fixture: PostgresSourceNonUniqueTrackingFixture,
+) {
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    wait_for_source_status(&Client::new(), &api_url, ConnectorStatus::Error).await;
+}
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
@@ -348,18 +382,6 @@ async fn given_delivery_failure_when_iggy_restarts_should_redeliver_without_runt
     pool.close().await;
 }
 
-async fn wait_for_source_status(http: &Client, api_url: &str, expected: ConnectorStatus) {
-    for _ in 0..POLL_ATTEMPTS {
-        if let Some(source) = source_stats(http, api_url).await
-            && source.status == expected
-        {
-            return;
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-    panic!("Source connector did not reach {expected:?} status in time");
-}
-
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
     seed = seeds::connector_stream
@@ -624,6 +646,76 @@ async fn numeric_tracking_source_preserves_exact_ack_boundary(
     assert_eq!(
         remaining_rows, 0,
         "Exact NUMERIC tracking boundary should allow ACK cleanup"
+    );
+
+    pool.close().await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_numeric_nan_when_source_polls_should_deliver_and_clean_up_row(
+    harness: &TestHarness,
+    fixture: PostgresSourceNumericTrackingFixture,
+) {
+    const TRACKING_VALUE: &str = "NaN";
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+    fixture.insert_row(&pool, TRACKING_VALUE).await;
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "numeric_nan_consumer".try_into().unwrap();
+    let mut received = None;
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                1,
+                true,
+            )
+            .await
+        {
+            for message in polled.messages {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&message.payload) {
+                    received = Some(record);
+                    break;
+                }
+            }
+            if received.is_some() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let received = received.expect("NUMERIC NaN tracking row should be delivered");
+    assert_eq!(
+        received["data"]["tracking_value"],
+        serde_json::json!(TRACKING_VALUE),
+        "NUMERIC NaN should remain a string in the payload"
+    );
+
+    let mut remaining_rows = fixture.count_rows(&pool).await;
+    for _ in 0..POLL_ATTEMPTS {
+        if remaining_rows == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        remaining_rows = fixture.count_rows(&pool).await;
+    }
+    assert_eq!(
+        remaining_rows, 0,
+        "NUMERIC NaN boundary should allow ACK cleanup"
     );
 
     pool.close().await;

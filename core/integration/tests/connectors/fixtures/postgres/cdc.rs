@@ -211,6 +211,14 @@ pub struct PostgresSourceCdcSlowPollFixture {
     inner: PostgresSourceCdcFixture,
 }
 
+impl std::ops::Deref for PostgresSourceCdcSlowPollFixture {
+    type Target = PostgresSourceCdcFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl PostgresOps for PostgresSourceCdcSlowPollFixture {
     fn container(&self) -> &PostgresContainer {
         self.inner.container()
@@ -220,28 +228,6 @@ impl PostgresOps for PostgresSourceCdcSlowPollFixture {
 impl PostgresSourceOps for PostgresSourceCdcSlowPollFixture {
     fn table_name(&self) -> &str {
         self.inner.table_name()
-    }
-}
-
-impl PostgresSourceCdcSlowPollFixture {
-    pub async fn create_table(&self, pool: &Pool<Postgres>) {
-        self.inner.create_table(pool).await;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert_row(
-        &self,
-        pool: &Pool<Postgres>,
-        id: i32,
-        name: &str,
-        count: i32,
-        amount: f64,
-        active: bool,
-        timestamp: i64,
-    ) {
-        self.inner
-            .insert_row(pool, id, name, count, amount, active, timestamp)
-            .await;
     }
 }
 

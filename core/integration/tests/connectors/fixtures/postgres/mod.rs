@@ -26,5 +26,6 @@ pub use sink::{PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFi
 pub use source::{
     PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceDeleteSlowPollFixture,
     PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
+    PostgresSourceNonUniqueCleanupFixture, PostgresSourceNonUniqueTrackingFixture,
     PostgresSourceNumericTrackingFixture,
 };
