@@ -91,14 +91,6 @@ python high-level/background_producer.py
 python high-level/consumer.py
 ```
 
-Pass a different connection string to either program as the optional argument.
-For example:
-
-```bash
-uv run high-level/producer.py \
-  'iggy+tcp://iggy:iggy@127.0.0.1:8090'
-```
-
 The existing examples below use the low-level `IggyClient.send_messages()` API
 and remain useful when each call needs to specify its own destination.
 

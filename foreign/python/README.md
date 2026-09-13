@@ -232,9 +232,7 @@ from apache_iggy import DirectProducerConfig, IggyClient, Partitioning, SendMess
 
 
 async def main():
-    client = IggyClient.from_connection_string(
-        "iggy+tcp://iggy:iggy@127.0.0.1:8090"
-    )
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
     await client.connect()
 
     producer = await client.producer(
@@ -256,9 +254,7 @@ async def main():
 
     async with producer:
         await producer.send_one(SendMessage("order-1"))
-        response = await producer.send(
-            [SendMessage("order-2"), SendMessage("order-3")]
-        )
+        response = await producer.send([SendMessage("order-2"), SendMessage("order-3")])
         print(f"Received {len(response.confirmations)} partition confirmations")
 
 
@@ -314,9 +310,7 @@ producer = await client.producer(
         batch_size=1024 * 1024,
         batch_length=100,
         max_buffer_size=32 * 1024 * 1024,
-        failure_mode=BackpressureMode.block_with_timeout(
-            timedelta(seconds=1)
-        ),
+        failure_mode=BackpressureMode.block_with_timeout(timedelta(seconds=1)),
         max_in_flight=4,
         sharding=ProducerSharding.ORDERED,
     ),
