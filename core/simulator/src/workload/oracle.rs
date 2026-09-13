@@ -435,10 +435,20 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
         }
     }
 
+    // Partition-plane twin of the walk above: that one bounds how much each
+    // replica committed, this compares what they committed.
+    let partition_ops_compared =
+        state_checker::assert_partition_prefixes_agree(sim, &workload.options.namespaces, seed);
+    tracing::info!(
+        partition_ops_compared,
+        "committed partition entries agree across every live replica"
+    );
+
     let replicas_compared = assert_committed_metadata_agrees(sim, &live, seed);
 
     let report = ConvergenceReport {
         ops_compared,
+        partition_ops_compared,
         replicas_compared,
         namespaces_checked,
     };
@@ -491,6 +501,10 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
 pub struct ConvergenceReport {
     /// Committed metadata ops witnessed by more than one live replica.
     pub ops_compared: usize,
+    /// Committed partition ops witnessed by more than one live replica, summed over
+    /// every namespace. Separate from `ops_compared`: a partition-plane run commits
+    /// almost no metadata and would otherwise read as having compared nothing.
+    pub partition_ops_compared: usize,
     /// Live replicas whose committed metadata CONTENT was compared against a peer
     /// sharing its commit point. Zero on a solo cluster.
     pub replicas_compared: usize,

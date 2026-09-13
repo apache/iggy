@@ -162,11 +162,12 @@ impl BinaryTransport for QuicClient {
             && self.config.reconnection.enabled
             && !matches!(self.config.auto_login, AutoLogin::Disabled)
         {
-            let _routing_guard =
+            let routing_guard =
                 match tokio::time::timeout_at(roster_deadline, self.routing_lock.lock()).await {
                     Ok(guard) => guard,
                     Err(_) => return Err(IggyError::TransientNotAccepted),
                 };
+            let mut routing_guard = Some(routing_guard);
             let overall_deadline = roster_deadline;
             // A concurrent refused request may have completed the movement
             // while this request waited for the gate.
@@ -217,8 +218,17 @@ impl BinaryTransport for QuicClient {
                     (target, false)
                 } else if let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) {
                     (next, true)
+                } else if roster_walk
+                    .as_ref()
+                    .is_some_and(RosterWalk::is_single_endpoint)
+                {
+                    // A single-node roster can still be converging a newly
+                    // committed partition. Retry this explicitly unadmitted
+                    // request on the current endpoint within the same budget.
+                    drop(routing_guard.take());
+                    (current, false)
                 } else {
-                    break;
+                    return Err(IggyError::TransientNotAccepted);
                 };
 
                 loop {
@@ -400,6 +410,12 @@ impl iggy_common::VsrSessionControl for QuicClient {
         }
 
         consensus_session.bind(session);
+        drop(consensus_session);
+        // Every fresh client identity passes through here, including one that
+        // replaces a session the transport never reset: a connection lost
+        // mid-request can leave the old session in place until this sign-in
+        // re-mints it.
+        self.consumer_group_state.clear_session_scoped();
         Ok(())
     }
 
@@ -408,6 +424,7 @@ impl iggy_common::VsrSessionControl for QuicClient {
             .consensus_session
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
+        self.consumer_group_state.clear_session_scoped();
         Ok(())
     }
 

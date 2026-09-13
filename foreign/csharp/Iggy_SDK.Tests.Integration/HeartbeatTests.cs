@@ -56,7 +56,7 @@ public class HeartbeatTests
 
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(1);
+        me.ConsumerGroupsCount.ShouldBe(1u);
     }
 
     [Test]
@@ -78,7 +78,7 @@ public class HeartbeatTests
         // fresh, auto-logged-in session.
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0);
+        me.ConsumerGroupsCount.ShouldBe(0u);
     }
 
     [Test]
@@ -101,7 +101,7 @@ public class HeartbeatTests
 
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0);
+        me.ConsumerGroupsCount.ShouldBe(0u);
     }
 
     /// <summary>
@@ -128,7 +128,7 @@ public class HeartbeatTests
         // that belonged to it is gone.
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0);
+        me.ConsumerGroupsCount.ShouldBe(0u);
     }
 
     private Task<IIggyClient> CreateClient(TimeSpan heartbeatInterval, bool autoLogin = true)

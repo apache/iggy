@@ -22,6 +22,7 @@ use common::{header_only, install_wss_clients_locally, loopback};
 use compio::net::TcpStream;
 use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
+use message_bus::BusMessage;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::wss::{bind, run};
 use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
@@ -30,7 +31,7 @@ use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, MessageBusConfig, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use server_common::Message;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,7 +79,7 @@ async fn wss_client_listener_accepts_and_round_trips() {
     let client_tcp = TcpStream::connect(server_addr).await.expect("client dial");
     let conn = WssTransportConn::new_client(client_tcp, client_cfg, server_name);
 
-    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
+    let (out_tx, out_rx) = bounded::<BusMessage>(8);
     let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
     let (client_shutdown, client_token) = Shutdown::new();
     let ctx = ActorContext {
@@ -94,7 +95,7 @@ async fn wss_client_listener_accepts_and_round_trips() {
     let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
     let request = header_only(Command::Request, 7, 0).into_frozen();
-    out_tx.send(request).await.expect("client send");
+    out_tx.send(request.into()).await.expect("client send");
 
     let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
         .await

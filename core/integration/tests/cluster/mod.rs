@@ -17,6 +17,7 @@
 
 mod client_table_adversarial;
 mod client_table_restart;
+mod consumer_offset_quota;
 mod crash_durability;
 mod crash_offset_reuse;
 mod crash_recovery_corruption;
@@ -26,6 +27,7 @@ mod metadata_checkpoint_restart;
 mod metadata_state_transfer;
 mod multi_shard_partition_convergence;
 mod parked_frame_redispatch;
+mod partition_dedup;
 mod partition_primary_routing;
 mod partition_state_transfer;
 mod register_forwarding;

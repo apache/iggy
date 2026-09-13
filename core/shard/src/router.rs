@@ -31,6 +31,7 @@ use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
 use std::future::poll_fn;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
@@ -273,6 +274,10 @@ where
     /// the bounded pump drain that turn a stalled flush into a timed-out
     /// non-zero exit instead of a process that reports healthy forever.
     #[allow(clippy::future_not_send)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the owner select loop and its shutdown sequence together"
+    )]
     pub async fn run_message_pump(
         &self,
         stop: Receiver<()>,
@@ -285,6 +290,21 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
+        let _completion_pump = self.poll_completions.pump_guard();
+        if let Some(sender) = self.senders.get(self.id as usize).cloned() {
+            let metrics = self.metrics.clone();
+            self.plane
+                .partitions()
+                .set_persistence_notifier(Rc::new(move |completion| {
+                    let frame = LifecycleFrame::PartitionPersistenceCompleted(completion);
+                    if let Err(error) = sender.try_send(ShardFrame::lifecycle(frame)) {
+                        metrics.record_frame_drop(
+                            frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
+                            crate::coordinator::classify_try_send_err(&error),
+                        );
+                    }
+                }));
+        }
         // Reused across every pump iteration; pre-size to skip the
         // first-drain reallocation.
         let mut loopback_buf = Vec::with_capacity(64);
@@ -303,6 +323,9 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        // Keep the receive registered: recreating it repeats Crossfire's initial
+        // backoff on every pump turn while the shutdown channel is empty.
+        let mut stop_signal = std::pin::pin!(stop.recv().fuse());
         let mut fatal: Option<FatalCommit> = None;
         loop {
             // `select_biased!`, not `select!`: the unbiased macro draws its
@@ -311,13 +334,12 @@ where
             // intended priority anyway: stop, then tick, redispatch, then
             // newly received frames.
             futures::select_biased! {
-                _ = stop.recv().fuse() => break,
+                _ = stop_signal.as_mut() => break,
                 () = consensus_tick.as_mut() => {
-                    // Sharing the pump task is what keeps `tick_partitions`
-                    // borrow-safe, but it bounds the tick's worst-case delay
-                    // to one main frame body's longest `.await` (replication
-                    // append + commit_journal fsync/rotate + reply) plus the
-                    // one reply-lane bus send drained per main frame.
+                    // Sharing the pump task keeps `tick_partitions` borrows
+                    // safe, but a tick can wait for a main frame's processing
+                    // (replication, journal fsync or rotation, and reply), plus
+                    // one reply and one poll completion, including its loopback.
                     // TODO(hubcio): if a load test shows tick starvation,
                     // make `tick_partitions` borrow-free so the tick can be
                     // decoupled from the pump again without reintroducing the
@@ -351,13 +373,13 @@ where
                     self.apply_reconcile_ops();
                     consensus_tick.set(rearm_tick());
                 }
-                (message, provenance) = poll_fn(|_| {
+                frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
                 }).fuse() => {
                     // One frame per select iteration. Ranking this arm above
                     // the inbox preserves park order without making a full
                     // queue stall ticks and commit broadcasts for other groups.
-                    self.dispatch_message(message, Some(provenance)).await;
+                    self.dispatch_redispatched_frame(frame).await;
                     // A request handled by a solo primary self-acks here. If
                     // loopback waited for another inbox frame, the request
                     // would remain uncommitted indefinitely on a quiet shard.
@@ -371,6 +393,7 @@ where
                     {
                         self.process_frame(reply).await;
                     }
+                    self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
                 }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
@@ -379,6 +402,8 @@ where
                                 self.process_frame(frame).await;
                                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
+                                // Anything it stages is served by the arm above
+                                // on the next pass, before this arm can run again.
                                 self.apply_reconcile_ops();
                             }
                             // Guaranteed reply-lane service: `select_biased!`
@@ -394,6 +419,7 @@ where
                             {
                                 self.process_frame(reply).await;
                             }
+                            self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
                         }
                         Err(_) => break,
                     }
@@ -407,12 +433,25 @@ where
                             if self.accept_frame_for_self(&frame) {
                                 self.process_frame(frame).await;
                             }
+                            self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                completion = self.poll_completions.recv().fuse() => {
+                    match completion {
+                        Ok(completion) => {
+                            self.on_poll_completed(*completion).await;
+                            self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                            self.apply_reconcile_ops();
                         }
                         Err(_) => break,
                     }
                 }
             }
         }
+
+        self.poll_completions.close();
 
         // A stop can win the select immediately after a frame fenced a
         // partition, before the next tick observes it. Preserve that fault so
@@ -463,6 +502,27 @@ where
         fatal
     }
 
+    /// A busy ordinary lane yields one completion per frame. Keeping this
+    /// service bounded lets ordinary work progress under a completion flood.
+    #[allow(clippy::future_not_send)]
+    async fn process_one_poll_completion(
+        &self,
+        loopback_buf: &mut Vec<Message<GenericHeader>>,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        if let Ok(completion) = self.poll_completions.try_recv() {
+            self.on_poll_completed(*completion).await;
+            self.process_loopback(loopback_buf, namespace_scratch).await;
+            self.apply_reconcile_ops();
+        }
+    }
+
     /// Process queued work after the select loop has stopped. Redispatch keeps
     /// its live-pump rank over the inbox, and every delivered frame gets its
     /// loopback before another frame can run.
@@ -480,15 +540,31 @@ where
         M: RestorableMetadataStm,
     {
         loop {
-            while let Some((message, provenance)) = self.pop_redispatched_frame() {
-                self.dispatch_message(message, Some(provenance)).await;
+            while let Some(frame) = self.pop_redispatched_frame() {
+                self.dispatch_redispatched_frame(frame).await;
                 self.process_loopback(loopback_buf, namespace_scratch).await;
                 self.apply_reconcile_ops();
                 if let Some(fault) = self.first_partition_commit_fault() {
                     return Some(fault);
                 }
+                self.process_one_poll_completion(loopback_buf, namespace_scratch)
+                    .await;
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
             }
             let Ok(frame) = self.inbox.try_recv() else {
+                if let Ok(completion) = self.poll_completions.try_recv() {
+                    self.on_poll_completed(*completion).await;
+                    self.process_loopback(loopback_buf, namespace_scratch).await;
+                    self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        return Some(fault);
+                    }
+                    // Completion processing can stage ordinary work. Return
+                    // to the main drain before accepting another completion.
+                    continue;
+                }
                 break;
             };
             if self.accept_frame_for_self(&frame) {
@@ -498,6 +574,11 @@ where
                 if let Some(fault) = self.first_partition_commit_fault() {
                     return Some(fault);
                 }
+            }
+            self.process_one_poll_completion(loopback_buf, namespace_scratch)
+                .await;
+            if let Some(fault) = self.first_partition_commit_fault() {
+                return Some(fault);
             }
         }
 
@@ -528,6 +609,15 @@ where
                 .get_by_ns(namespace)
                 .and_then(|partition| partition.fatal().cloned())
         })
+    }
+
+    /// `first_partition_commit_fault` for the simulator's lost-wakeup
+    /// tripwire: a fenced pump and a missed wake both leave frames undrained, and
+    /// only the second is a channel bug. Test/simulator only, like `inbox_len`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fenced_partition_fault(&self) -> Option<FatalCommit> {
+        self.first_partition_commit_fault()
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through
@@ -710,13 +800,15 @@ where
                 read,
                 reply,
             } => {
-                // Addressed to the shard owning `namespace` (the sender
-                // resolved it via the shards table). The handler (wired by
-                // the server) runs the read against this shard's partitions
-                // plane and pushes the result over `reply`; a dropped
-                // sender means the read is skipped and the gather side
-                // times out.
-                (self.on_partition_read)(namespace, read, reply);
+                self.on_partition_read(namespace, read, reply).await;
+            }
+            LifecycleFrame::PartitionSubmit { request, reply } => {
+                // Addressed to the shard owning the request's namespace (the
+                // sender resolved it via the shards table, same fallback as
+                // `route_typed`). Every refusal answers on `reply`, so the
+                // awaiting shard never waits out its budget on a decision
+                // already made.
+                self.on_partition_submit(request, reply).await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
@@ -733,6 +825,12 @@ where
                         shard = self.id,
                         "metadata commit tick received before reconciler handler installed; dropping"
                     );
+                }
+            }
+            LifecycleFrame::PartitionPersistenceCompleted(completion) => {
+                let namespace = IggyNamespace::from_raw(completion.group);
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    partition.on_persistence_completed(completion).await;
                 }
             }
             LifecycleFrame::ReconcileApply => {

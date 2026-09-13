@@ -471,7 +471,7 @@ mod tests {
     use crate::client_table::{REGISTER_REQUEST_ID, REPLY_RING_RETENTION_BYTES};
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
     use iggy_binary_protocol::{Command, Operation, ReplyHeader};
-    use message_bus::SendError;
+    use message_bus::{BusMessage, SendError};
 
     /// Acting user for register fixtures; these tests exercise preflight /
     /// replay, not user resolution, so the exact value is immaterial.
@@ -502,9 +502,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            data: Frozen<MESSAGE_ALIGN>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
-            self.client_sends.borrow_mut().push((client_id, data));
+            self.client_sends
+                .borrow_mut()
+                .push((client_id, data.into().into_contiguous()));
             Ok(())
         }
 

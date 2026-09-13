@@ -261,6 +261,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
         IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
     {
+
+        options = TopicOptions.WithDurabilityDefaults(options);
         var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
         var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm,
             messageExpiryValue, maxTopicSize, options);
@@ -1066,8 +1068,15 @@ public sealed partial class TcpMessageStream : IIggyClient
             try
             {
                 socket = new Socket(ServerAddress.AddressFamilyOf(host), SocketType.Stream, ProtocolType.Tcp);
-                socket.SendBufferSize = _configuration.SendBufferSize;
-                socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
+                if (_configuration.SendBufferSize.HasValue)
+                {
+                    socket.SendBufferSize = _configuration.SendBufferSize.Value;
+                }
+
+                if (_configuration.ReceiveBufferSize.HasValue)
+                {
+                    socket.ReceiveBufferSize = _configuration.ReceiveBufferSize.Value;
+                }
 
                 // The protocol is request/reply, so a write is always the last one before
                 // the client blocks on the answer and Nagle has nothing to coalesce it with - it only delays the

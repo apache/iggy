@@ -68,14 +68,14 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Thread per core shared nothing design** together with `io_uring` guarantee the best possible performance on modern `Linux` systems.
 - **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
-- Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
+- Configurable server features (e.g. caching and transport protocols), plus per-topic segment size, durability and flush thresholds
 - Server-side storage of **consumer offsets**
 - Multiple ways of polling the messages:
   - By offset (using the indexes)
   - By timestamp (using the time indexes)
   - First/Last N messages
   - Next N messages for the specific consumer
-- Possibility of **auto committing the offset** (e.g. to achieve *at-most-once* delivery)
+- Optional **poll auto-commit**; processing guarantees depend on application processing and offset-commit ordering
 - **Consumer groups** providing the message ordering and horizontal scaling across the connected clients
 - **Message expiry** with auto deletion based on the configurable **retention policy**
 - Additional features such as **server side message deduplication**
@@ -89,10 +89,10 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
   are reserved for future disk/network compression support; use message headers
   for manual compression today (see `examples/rust/src/message-headers/message-compression`).
 - Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
-- Support for **OpenTelemetry** logs & traces + Prometheus metrics
+- Prometheus metrics for the server and connectors runtime, plus **OpenTelemetry** logs & traces in the connectors runtime. Server OTLP export is unavailable pending runtime integration.
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
-- **Single binary deployment** (no external dependencies)
+- **Single binary deployment** without an external broker or database; dynamically linked builds still require operating-system libraries
 - Running as a single node or as a **cluster**, with data replication based on **[Viewstamped Replication (VSR)](https://github.com/apache/iggy/blob/master/assets/vsr.pdf)**
 
 ![server](assets/server.png)
@@ -126,13 +126,13 @@ We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/igg
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) is work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) and [PHP](https://github.com/apache/iggy/tree/master/foreign/php) are work in progress.
 
 ---
 
 ## CLI
 
-The interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
+The interactive CLI is implemented under `core/cli`, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
 
 Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed by typing `iggy` in your terminal.
 
@@ -231,6 +231,18 @@ The configuration file is loaded from the current working directory, but you can
 
 When config file is not found, the default values from embedded `config.toml` file are used.
 
+Topic creation accepts two independent policies: `durability` for message acknowledgments and `consumer_offset_durability` for explicit offset stores and deletes. Both default to `replicated`. This means VSR quorum commit without waiting for stable storage. `persisted` also requires recoverable stable-storage copies on the replication quorum. Both policies normally store data on disk. Poll auto-commit remains asynchronous and is not covered by the poll response's completion.
+
+The data directory is configured with `path` or `IGGY_PATH`. The layout beneath it is `streams/<stream>/topics/<topic>/partitions/<partition>`, with fixed directory names.
+
+The HTTP `Iggy-Durability` header reports `replicated` or `persisted` for awaited writes, and `none` for early dispatch acceptance.
+
+Segment flush thresholds control scheduling, independently of acknowledgment durability.
+
+Rust HTTP callers can use `HttpClient::send_messages_with_durability` to read the advertised guarantee alongside confirmations.
+
+The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
+
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 
 ---
@@ -271,7 +283,7 @@ Start the server:
 
 `cargo run --bin iggy-server`
 
-All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `system.path` in `config.toml`).
+All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `path` in `config.toml`).
 
 One can use default root credentials with optional `--with-default-root-credentials`.
 This flag is equivalent to setting `IGGY_ROOT_USERNAME=iggy` and `IGGY_ROOT_PASSWORD=iggy`, plus
@@ -291,7 +303,7 @@ You can also use environment variables to override any configuration setting:
    `IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server`
 
 - Set custom data path
-   `IGGY_SYSTEM_PATH=/data/iggy cargo run --bin iggy-server`
+   `IGGY_PATH=/data/iggy cargo run --bin iggy-server`
 
 - Enable HTTP transport
    `IGGY_HTTP_ENABLED=true cargo run --bin iggy-server`
@@ -317,7 +329,7 @@ Get `dev` stream details:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> stream get dev`
 
-Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), no topic compression (`none`), and disabled message expiry (skipped optional parameter). Other compression values are reserved for future server-side support:
+Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 0 and 1), no topic compression (`none`), and disabled message expiry (skipped optional parameter). Other compression values are reserved for future server-side support:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic create dev sample 2 none`
 
@@ -329,17 +341,17 @@ Get topic details for topic `sample` in stream `dev`:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic get dev sample`
 
-Send a message 'hello world' (message ID 1) to the stream `dev` to topic `sample` and partition 1:
+Send the first message 'hello world' to the stream `dev` to topic `sample` and partition 0:
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "hello world"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 0 dev sample "hello world"`
 
-Send another message 'lorem ipsum' (message ID 2) to the same stream, topic and partition:
+Send a second message 'lorem ipsum' to the same stream, topic and partition:
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "lorem ipsum"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 0 dev sample "lorem ipsum"`
 
-Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 1, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
+Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 0, starting with offset 0, messages count 2, with auto commit (storing consumer offset on server):
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 0`
 
 Finally, restart the server to see it is able to load the persisted data.
 
@@ -430,7 +442,7 @@ To benchmark the project, first build the project in release mode:
 cargo build --release
 ```
 
-Then, run the benchmarking app with the desired options:
+Start `iggy-server` separately, then run the benchmarking app with the desired options:
 
 1. Sending (writing) benchmark
 
@@ -474,13 +486,25 @@ Then, run the benchmarking app with the desired options:
    cargo run --bin iggy-bench -r -- end-to-end-producing-consumer tcp
    ```
 
-These benchmarks would start the server with the default configuration, create a stream, topic and partition, and then send or poll the messages. The default configuration is optimized for the best performance, so you might want to tweak it for your needs. If you need more options, please refer to `iggy-bench` subcommands `help` and `examples`.
+8. End to end producing and consuming through a consumer group:
 
-For example, to run the benchmark for the already started server, provide the additional argument `--server-address 0.0.0.0:8090`.
+   ```bash
+   cargo run --bin iggy-bench -r -- end-to-end-producing-consumer-group tcp
+   ```
+
+The benchmark connects to a running server and creates the streams, topics, and partitions needed by the selected workload. Use `iggy-bench --help` and `iggy-bench examples` for all benchmark variants, transports, and topic-option examples. Both message and consumer-offset durability independently default to `replicated`.
+
+For example, to run the benchmark for the already started server, provide the additional argument `--server-address 127.0.0.1:8090`.
 
  **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `websocket`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
 
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
+
+### Host preparation
+
+Check `io_uring` access, process limits, memory headroom, CPU/NUMA placement, and sustained disk/network capacity before comparing runs. Measure host-tuning changes with the same workload and durability policies.
+
+Use the [benchmark host checklist](core/bench/README.md#host-preparation) for practical setup and repeatable measurements. The [Linux tuning guide](https://iggy.apache.org/docs/server/linux-tuning) explains swappiness, huge pages, writeback, CPU placement, and networking, with commands and upstream references.
 
 ---
 

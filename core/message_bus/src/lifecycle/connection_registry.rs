@@ -34,7 +34,7 @@
 
 use compio::runtime::JoinHandle;
 use futures::channel::oneshot;
-use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
+use server_common::ResponseBacking;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as HmEntry;
@@ -70,12 +70,14 @@ pub const READER_DRAIN_FLOOR: Duration = Duration::from_millis(250);
 
 /// Payload type carried over every per-peer queue.
 ///
-/// Consensus messages are `Frozen<MESSAGE_ALIGN>` by the time they hit
-/// this queue: the dispatch layer freezes once and fan-out becomes a
-/// refcount bump per target. The writer task reads `Frozen` out of the
-/// queue and passes it straight to `write_vectored_all`, so no
-/// conversion happens on the hot path.
-pub type BusMessage = Frozen<MESSAGE_ALIGN>;
+/// One frame as a list of `Frozen<MESSAGE_ALIGN>` fragments written back
+/// to back. Consensus messages and most replies are a single fragment: the
+/// dispatch layer freezes once and fan-out becomes a refcount bump per
+/// target. A poll reply is a header fragment followed by the stored batch
+/// buffers as they are, so record bytes are never copied. The writer task
+/// hands the fragments straight to the socket write, so no conversion
+/// happens on the hot path.
+pub type BusMessage = ResponseBacking;
 
 /// Producer side of a per-peer queue. Cloned out of the registry by
 /// `send_to_*` and used with `try_send`.
@@ -960,6 +962,7 @@ mod tests {
                 h.size = HEADER_SIZE as u32;
             })
             .into_frozen()
+            .into()
     }
 
     fn spawn_dummy_writer(rx: BusReceiver) -> JoinHandle<()> {
@@ -1289,7 +1292,7 @@ mod tests {
         // Receiver drains the message; closing the writer's rx end via
         // close_peer is not necessary for this assertion.
         let received = rx.recv().await.expect("queue had message");
-        assert_eq!(received.len(), HEADER_SIZE);
+        assert_eq!(received.total_len(), HEADER_SIZE);
     }
 
     /// No slot for `key`: the message is handed back to the caller so the
@@ -1298,13 +1301,13 @@ mod tests {
     async fn try_send_or_return_returns_msg_when_slot_missing() {
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
         let msg = make_bus_msg();
-        let original_len = msg.len();
+        let original_len = msg.total_len();
 
         let outcome = reg.try_send_or_return(99u8, msg);
         let ReplyRoute::NoSlot(returned) = outcome else {
             panic!("missing slot should return msg");
         };
-        assert_eq!(returned.len(), original_len);
+        assert_eq!(returned.total_len(), original_len);
     }
 
     /// Slot present but queue full: inner `Err(TrySendError::Full(msg))` so
@@ -1345,11 +1348,11 @@ mod tests {
     async fn replica_try_send_or_return_returns_msg_when_slot_missing() {
         let reg = ReplicaRegistry::new();
         let msg = make_bus_msg();
-        let original_len = msg.len();
+        let original_len = msg.total_len();
 
         let outcome = reg.try_send_or_return(7u8, msg);
         let returned = outcome.expect_err("missing slot should return msg");
-        assert_eq!(returned.len(), original_len);
+        assert_eq!(returned.total_len(), original_len);
     }
 
     /// End-to-end registry seam: install entry + slot, route, fire, await.
@@ -1366,7 +1369,7 @@ mod tests {
         reg.fire_in_process(1u8, 42, msg).expect("waiter present");
 
         let received = reply_rx.await.expect("reply delivered");
-        assert_eq!(received.len(), HEADER_SIZE);
+        assert_eq!(received.total_len(), HEADER_SIZE);
         drop(guard);
         assert!(reg.contains(1u8), "guard drop must not remove the entry");
     }
@@ -1418,7 +1421,10 @@ mod tests {
 
         reg.fire_in_process(1u8, 42, make_bus_msg())
             .expect("first waiter still registered");
-        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
+        assert_eq!(
+            reply_rx.await.expect("reply delivered").total_len(),
+            HEADER_SIZE
+        );
     }
 
     /// Reply for a request id nobody waits on: handed back, no panic, and
@@ -1430,15 +1436,18 @@ mod tests {
         let (_guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
 
         let msg = make_bus_msg();
-        let original_len = msg.len();
+        let original_len = msg.total_len();
         let returned = reg
             .fire_in_process(1u8, 7, msg)
             .expect_err("no waiter for request 7");
-        assert_eq!(returned.len(), original_len);
+        assert_eq!(returned.total_len(), original_len);
 
         reg.fire_in_process(1u8, 42, make_bus_msg())
             .expect("slot 42 untouched");
-        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
+        assert_eq!(
+            reply_rx.await.expect("reply delivered").total_len(),
+            HEADER_SIZE
+        );
     }
 
     /// Timeout / cancellation path: dropping the guard removes the slot,
@@ -1473,7 +1482,10 @@ mod tests {
             .expect("waiter present");
         drop(guard);
 
-        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
+        assert_eq!(
+            reply_rx.await.expect("reply delivered").total_len(),
+            HEADER_SIZE
+        );
         let (_guard, _reply_rx) = reg
             .install_reply_slot(1u8, 42)
             .expect("request id reusable after fire + drop");
@@ -1497,6 +1509,9 @@ mod tests {
         drop(stale_guard);
         reg.fire_in_process(1u8, 42, make_bus_msg())
             .expect("stale guard must not evict the new slot");
-        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
+        assert_eq!(
+            reply_rx.await.expect("reply delivered").total_len(),
+            HEADER_SIZE
+        );
     }
 }

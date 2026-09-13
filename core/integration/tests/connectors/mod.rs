@@ -29,6 +29,7 @@ mod meilisearch;
 mod mongodb;
 mod postgres;
 mod quickwit;
+mod rabbitmq;
 mod random;
 mod random_source_liveness;
 mod redshift;

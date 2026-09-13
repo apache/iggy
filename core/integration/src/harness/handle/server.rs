@@ -42,6 +42,10 @@ use toml::Value;
 const SLEEP_INTERVAL_MS: u64 = 20;
 const MAX_PORT_WAIT_DURATION_S: u64 = 60;
 const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
+/// The server truncates the dump and then writes it in one go, so a read in
+/// between parses as valid TOML with sections or keys missing; readiness
+/// retries on this message.
+const INCOMPLETE_DUMP_MESSAGE: &str = "Failed to parse server config: the dump is incomplete";
 
 #[derive(Debug, Clone)]
 struct ServerProtocolAddr {
@@ -277,7 +281,7 @@ impl ServerHandle {
     fn build_envs(&mut self) -> Result<(), TestBinaryError> {
         // Pass through IGGY_* env vars from parent process, except those critical for test isolation.
         const PROTECTED_PREFIXES: &[&str] = &[
-            "IGGY_SYSTEM_PATH",
+            "IGGY_PATH",
             "IGGY_TCP_ADDRESS",
             "IGGY_HTTP_ADDRESS",
             "IGGY_QUIC_ADDRESS",
@@ -305,8 +309,14 @@ impl ServerHandle {
             Err(_) => "0..4".to_string(),
         };
         self.envs
-            .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
+            .entry("IGGY_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
+        // On a 4-core CI runner every server computes the same `0..4` range, so
+        // pinned shards of concurrently running tests pile onto the same cores
+        // and starve each other. Leave thread placement to the scheduler.
+        self.envs
+            .entry("IGGY_SHARDING_PIN_CORES".to_string())
+            .or_insert_with(|| "false".to_string());
 
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())
@@ -316,10 +326,8 @@ impl ServerHandle {
             .or_insert_with(|| DEFAULT_ROOT_PASSWORD.to_string());
 
         let data_path = self.data_path();
-        self.envs.insert(
-            "IGGY_SYSTEM_PATH".to_string(),
-            data_path.display().to_string(),
-        );
+        self.envs
+            .insert("IGGY_PATH".to_string(), data_path.display().to_string());
 
         // Protocol enablement (special handling for defaults)
         if !self.config.quic_enabled {
@@ -341,10 +349,10 @@ impl ServerHandle {
         // Encryption (special handling for key injection)
         if let Some(ref enc) = self.config.encryption {
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string())
+                .entry("IGGY_ENCRYPTION_ENABLED".to_string())
                 .or_insert_with(|| "true".to_string());
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_KEY".to_string())
+                .entry("IGGY_ENCRYPTION_KEY".to_string())
                 .or_insert_with(|| enc.key.clone());
         }
 
@@ -401,6 +409,30 @@ impl ServerHandle {
                     || self.addrs.websocket.is_some(),
                 "port_reserver set but no addresses configured"
             );
+            return Ok(());
+        }
+
+        // Ephemeral ports: every enabled transport binds `:0` and
+        // `verify_bound_ports` adopts what the OS chose from the dumped runtime
+        // config. Ahead of the restart branch so a restart discovers afresh
+        // instead of pinning a port the OS may have handed out elsewhere since.
+        if self.config.ephemeral_ports {
+            self.addrs = ServerProtocolAddr::empty();
+            let unbound = SocketAddr::new(self.config.ip_kind.loopback(), 0).to_string();
+            self.envs
+                .insert("IGGY_TCP_ADDRESS".to_string(), unbound.clone());
+            if self.config.http_enabled {
+                self.envs
+                    .insert("IGGY_HTTP_ADDRESS".to_string(), unbound.clone());
+            }
+            if self.config.quic_enabled {
+                self.envs
+                    .insert("IGGY_QUIC_ADDRESS".to_string(), unbound.clone());
+            }
+            if self.config.websocket_enabled {
+                self.envs
+                    .insert("IGGY_WEBSOCKET_ADDRESS".to_string(), unbound);
+            }
             return Ok(());
         }
 
@@ -503,7 +535,11 @@ impl ServerHandle {
         })
     }
 
-    fn verify_bound_ports(&self, config_path: &Path) -> Result<(), TestBinaryError> {
+    /// Reconcile the dumped runtime config with the addresses this handle
+    /// holds: a pre-reserved address must be the one the server bound, and an
+    /// address the handle does not know yet (`ephemeral_ports`) is adopted
+    /// from the dump.
+    fn verify_bound_ports(&mut self, config_path: &Path) -> Result<(), TestBinaryError> {
         let content =
             fs::read_to_string(config_path).map_err(|e| TestBinaryError::InvalidState {
                 message: format!(
@@ -517,32 +553,21 @@ impl ServerHandle {
                 message: format!("Failed to parse server config: {e}"),
             })?;
 
-        let bound_tcp = Self::extract_address(&config, "tcp");
-        let bound_http = Self::extract_address(&config, "http");
-        let bound_quic = Self::extract_address(&config, "quic");
-        let bound_websocket = Self::extract_address(&config, "websocket");
-
+        let transports = [
+            ("TCP", "tcp", &mut self.addrs.tcp),
+            ("HTTP", "http", &mut self.addrs.http),
+            ("QUIC", "quic", &mut self.addrs.quic),
+            ("WebSocket", "websocket", &mut self.addrs.websocket),
+        ];
         let mut mismatches = Vec::new();
-
-        if let (Some(expected), Some(bound)) = (self.addrs.tcp, bound_tcp)
-            && expected != bound
-        {
-            mismatches.push(format!("TCP: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.http, bound_http)
-            && expected != bound
-        {
-            mismatches.push(format!("HTTP: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.quic, bound_quic)
-            && expected != bound
-        {
-            mismatches.push(format!("QUIC: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.websocket, bound_websocket)
-            && expected != bound
-        {
-            mismatches.push(format!("WebSocket: expected {expected}, got {bound}"));
+        for (label, section, expected) in transports {
+            match (*expected, Self::extract_address(&config, section)?) {
+                (Some(expected), Some(bound)) if expected != bound => {
+                    mismatches.push(format!("{label}: expected {expected}, got {bound}"));
+                }
+                (None, Some(bound)) => *expected = Some(bound),
+                _ => {}
+            }
         }
 
         if !mismatches.is_empty() {
@@ -557,8 +582,38 @@ impl ServerHandle {
         Ok(())
     }
 
-    fn extract_address(config: &Value, protocol: &str) -> Option<SocketAddr> {
-        config.get(protocol)?.get("address")?.as_str()?.parse().ok()
+    /// The address a transport section reports, when it marks the transport
+    /// enabled: a disabled transport keeps its configured address in the dump
+    /// without ever binding it. Every section is serialized with both keys
+    /// whether or not the transport is enabled, so a section or key still
+    /// absent is a dump being written, not a disabled transport.
+    fn extract_address(
+        config: &Value,
+        protocol: &str,
+    ) -> Result<Option<SocketAddr>, TestBinaryError> {
+        let incomplete = || TestBinaryError::InvalidState {
+            message: INCOMPLETE_DUMP_MESSAGE.to_string(),
+        };
+        let section = config.get(protocol).ok_or_else(incomplete)?;
+        let enabled = section
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(incomplete)?;
+        if !enabled {
+            return Ok(None);
+        }
+        let address = section
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(incomplete)?;
+        address
+            .parse()
+            .map(Some)
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!(
+                    "Server config {protocol}.address {address:?} is not a socket address: {error}"
+                ),
+            })
     }
 
     fn start_watchdog(&mut self) {
@@ -667,6 +722,17 @@ impl ServerHandle {
     /// Set the test transport (used by harness builder).
     pub fn set_test_transport(&mut self, transport: iggy_common::TransportProtocol) {
         self.test_transport = Some(transport);
+    }
+
+    /// Point the next `start()` at a different server binary.
+    ///
+    /// `start()` re-reads `config.executable_path` on every call, so a test
+    /// can boot one build, then restart the SAME data directory under another
+    /// one. `None` restores the cargo-built binary of the crate under test,
+    /// which is why this takes an explicit `Option` rather than
+    /// `impl Into<String>`.
+    pub fn set_executable_path(&mut self, path: Option<String>) {
+        self.config.executable_path = path;
     }
 
     /// Configure MCP server for this iggy server.
@@ -883,7 +949,7 @@ impl TestBinary for ServerHandle {
             })?
         };
 
-        command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
+        command.env("IGGY_PATH", data_path.display().to_string());
         // VSR multi-node tests spawn N shards per node * M nodes per test;
         // the 4096-entry per-ring default exhausts dev memlock budgets
         // (`ulimit -l` is commonly 8 MiB). Shrink unless the caller already
@@ -898,11 +964,7 @@ impl TestBinary for ServerHandle {
         // ambient value could silently filter out markers the test asserts.
         // A caller that explicitly puts `RUST_LOG` in `extra_envs` adds it back
         // through `command.envs` below.
-        if self
-            .config
-            .extra_envs
-            .contains_key("IGGY_SYSTEM_LOGGING_LEVEL")
-        {
+        if self.config.extra_envs.contains_key("IGGY_LOGGING_LEVEL") {
             command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);
@@ -1069,6 +1131,16 @@ impl ServerHandle {
         }
         Ok(())
     }
+
+    /// Names this node in the log dumps. A cluster failure prints every
+    /// node's logs back to back and the server never logs its own identity,
+    /// so without this the reader cannot tell which replica wrote what.
+    fn log_label(&self) -> String {
+        match self.addrs.tcp {
+            Some(tcp) => format!("Iggy server replica {} (tcp {tcp})", self.server_id),
+            None => format!("Iggy server replica {}", self.server_id),
+        }
+    }
 }
 
 impl Drop for ServerHandle {
@@ -1077,11 +1149,12 @@ impl Drop for ServerHandle {
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
+        let label = self.log_label();
         if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
             if std::thread::panicking() {
                 // Ahead of the full dump, which buries these lines under the
                 // complete stdout of every node.
-                eprintln!("Iggy server panicked:\n{report}");
+                eprintln!("{label} panicked:\n{report}");
             } else {
                 // A dead task leaves the process alive and the test green;
                 // failing here is the only thing that surfaces it. The panic
@@ -1089,12 +1162,12 @@ impl Drop for ServerHandle {
                 // print this node's logs first.
                 let (stdout, stderr) =
                     super::common::collect_logs(&self.stdout_path, &self.stderr_path);
-                eprintln!("Iggy server stdout:\n{stdout}");
-                eprintln!("Iggy server stderr:\n{stderr}");
-                panic!("Iggy server panicked:\n{report}");
+                eprintln!("{label} stdout:\n{stdout}");
+                eprintln!("{label} stderr:\n{stderr}");
+                panic!("{label} panicked:\n{report}");
             }
         }
-        super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
+        super::common::dump_logs_on_panic(&label, &self.stdout_path, &self.stderr_path);
     }
 }
 

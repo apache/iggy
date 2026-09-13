@@ -29,7 +29,8 @@ use tracing::{Level, event};
 pub struct SendMessagesCmd {
     stream_id: Identifier,
     topic_id: Identifier,
-    partitioning: Partitioning,
+    partition_id: Option<u32>,
+    message_key: Option<String>,
     messages: Option<Vec<String>>,
     headers: Vec<(HeaderKey, HeaderValue)>,
     input_file: Option<String>,
@@ -45,19 +46,11 @@ impl SendMessagesCmd {
         headers: Vec<(HeaderKey, HeaderValue)>,
         input_file: Option<String>,
     ) -> Self {
-        let partitioning = match (partition_id, message_key) {
-            (Some(_), Some(_)) => unreachable!(),
-            (Some(partition_id), None) => Partitioning::partition_id(partition_id),
-            (None, Some(message_key)) => Partitioning::messages_key_str(message_key.as_str())
-                .unwrap_or_else(|_| {
-                    panic!("Failed to create Partitioning with {message_key} string message key")
-                }),
-            (None, None) => Partitioning::default(),
-        };
         Self {
             stream_id,
             topic_id,
-            partitioning,
+            partition_id,
+            message_key,
             messages,
             headers,
             input_file,
@@ -90,6 +83,12 @@ impl CliCommand for SendMessagesCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
+        let partitioning = match (self.partition_id, self.message_key.as_deref()) {
+            (Some(_), Some(_)) => unreachable!(),
+            (Some(partition_id), None) => Partitioning::partition_id(partition_id),
+            (None, Some(message_key)) => Partitioning::messages_key_str(message_key)?,
+            (None, None) => Partitioning::default(),
+        };
         let mut messages = if let Some(input_file) = &self.input_file {
             let mut file = tokio::fs::OpenOptions::new()
                 .read(true)
@@ -165,7 +164,7 @@ impl CliCommand for SendMessagesCmd {
             .send_messages(
                 &self.stream_id,
                 &self.topic_id,
-                &self.partitioning,
+                &partitioning,
                 &mut messages,
             )
             .await

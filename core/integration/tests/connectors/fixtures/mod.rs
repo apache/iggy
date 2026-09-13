@@ -28,6 +28,7 @@ mod meilisearch;
 mod mongodb;
 mod postgres;
 mod quickwit;
+mod rabbitmq;
 mod redshift;
 mod s3;
 mod surrealdb;
@@ -59,8 +60,10 @@ pub use doris::{
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
-    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
-    HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
+    GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkIndividualFixture,
+    HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture, HttpSinkNdjsonFixture,
+    HttpSinkNoMetadataFixture, HttpSinkRawFixture, HttpSourceFixture, MANAGEMENT_TOKEN,
+    PARTNER_BEARER_TOKEN, PARTNER_ENDPOINT_ID, PARTNER_INSTANCE,
 };
 pub use iceberg::{
     DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
@@ -82,7 +85,15 @@ pub use postgres::{
     PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
     PostgresSourceOps,
 };
-pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+pub use quickwit::{
+    QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,
+    QuickwitTextFixture,
+};
+pub use rabbitmq::{
+    RabbitMqOps, RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
+    RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
+    RabbitMqSinkWithoutMetadataFixture,
+};
 pub use redshift::{
     RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
     RedshiftSinkVarbyteFixture,

@@ -45,7 +45,7 @@ const PARTITION_ID: u32 = 0;
 const CONSUMER_ID: u32 = 1;
 
 const DURABILITY_HEADER: &str = "iggy-durability";
-const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
+const DURABILITY_REPLICATED: &str = "replicated";
 const DURABILITY_NONE: &str = "none";
 
 /// `?ack=none` answers before the commit; poll until visible, never unbounded.
@@ -297,7 +297,7 @@ async fn given_http_session_when_producing_and_polling_should_round_trip(harness
         StatusCode::CREATED,
         "produce must commit"
     );
-    assert_eq!(durability(&response), DURABILITY_REPLICATED_MEMORY);
+    assert_eq!(durability(&response), DURABILITY_REPLICATED);
 
     let polled = http
         .poll("http-stream", "http-topic", PARTITION_ID, 0, 10)
@@ -353,7 +353,7 @@ async fn given_one_session_when_producing_concurrently_should_not_cross_talk(
             "concurrent produce {i} must commit"
         );
         assert_eq!(
-            durability, DURABILITY_REPLICATED_MEMORY,
+            durability, DURABILITY_REPLICATED,
             "concurrent produce {i} must attest a replicated commit"
         );
     }
@@ -735,6 +735,104 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
     }
 }
 
+/// The FIRST send to a partition that has never minted an offset, on both
+/// produce routes, against the only cluster shape where the offset reservation
+/// runs at all.
+///
+/// `cluster_nodes = 1` is load-bearing, not a speed-up: `request_mint_ceiling`
+/// returns `None` above one replica, so this suite's three-node default leaves
+/// the whole reservation path as dead code and proves nothing here.
+///
+/// What it guards is the BOUNCE REMOVAL. A first send used to be answered
+/// `TransientNotAccepted` so the shard tick would claim the block off the
+/// request pump, and neither HTTP route can carry a retryable refusal back to
+/// the caller: the acked route has no transient replay loop, and `?ack=none`
+/// never reads a reply at all, so that bounce answered 202 and dropped the
+/// message.
+///
+/// It is NOT sensitive to where the claim is taken. With the bounce gone the
+/// inline fence at the mint writes the same block on the first send, so both
+/// routes still commit with the create-time claim deleted;
+/// `given_a_fresh_solo_partition_when_building_should_record_its_first_claim`
+/// in `core/server/src/partition_helpers.rs` reads the durable record and is
+/// the test that fails without it.
+///
+/// Both partitions are produced to exactly once, so a per-partition regression
+/// cannot hide behind a second send.
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_a_solo_topic_when_producing_its_first_http_messages_should_commit_them(
+    harness: &TestHarness,
+) {
+    const ACKED_PARTITION: u32 = 0;
+    const UNACKED_PARTITION: u32 = 1;
+
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-first-send", "first", 2)
+        .await;
+
+    let response = http
+        .produce(
+            "http-first-send",
+            "first",
+            ACKED_PARTITION,
+            vec![text_message(1, "first-acked".to_string())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the first acked send to a never-minted partition must commit, not be refused"
+    );
+    let polled = http
+        .poll("http-first-send", "first", ACKED_PARTITION, 0, 10)
+        .await;
+    assert_eq!(polled.messages.len(), 1, "the first acked send is durable");
+    assert_eq!(
+        polled.messages[0].payload,
+        bytes::Bytes::from("first-acked")
+    );
+
+    let response = http
+        .produce_with_query(
+            "http-first-send",
+            "first",
+            UNACKED_PARTITION,
+            vec![text_message(2, "first-unacked".to_string())],
+            "?ack=none",
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "ack=none must answer before the commit"
+    );
+
+    // 202 says nothing about the commit, which is the whole hazard: a refusal
+    // on this route is answered the same way and leaves no trace. Only the poll
+    // proves the message survived.
+    let deadline = Instant::now() + ASYNC_COMMIT_TIMEOUT;
+    loop {
+        if let Some(polled) = http
+            .try_poll("http-first-send", "first", UNACKED_PARTITION, 0, 10)
+            .await
+            && !polled.messages.is_empty()
+        {
+            assert_eq!(polled.messages.len(), 1, "exactly one message was produced");
+            assert_eq!(
+                polled.messages[0].payload,
+                bytes::Bytes::from("first-unacked"),
+                "the first ack=none send to a never-minted partition must not be dropped"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first ack=none send never became pollable within {ASYNC_COMMIT_TIMEOUT:?}"
+        );
+        sleep(ASYNC_COMMIT_RETRY_INTERVAL).await;
+    }
+}
+
 /// End-to-end RBAC proof: an ungranted user is 403 on a metadata read and on a
 /// data-plane produce, root stays 200/201, and the auth-only cluster-metadata
 /// route is never gated. Exercises the HTTP per-op gates (read + partition
@@ -892,4 +990,156 @@ async fn given_garbage_or_empty_token_when_refreshing_should_reject_401(harness:
             "refresh with an invalid token ({token:?}) must be 401"
         );
     }
+}
+
+#[iggy_harness]
+async fn given_independent_durability_policies_when_producing_should_attest_message_policy(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.create_stream("durability-http").await.unwrap();
+    let stream = Identifier::named("durability-http").unwrap();
+    let http = HttpClient::login_root(harness).await;
+    for (index, (message_policy, offset_policy)) in [
+        (Durability::Replicated, Durability::Replicated),
+        (Durability::Replicated, Durability::Persisted),
+        (Durability::Persisted, Durability::Replicated),
+        (Durability::Persisted, Durability::Persisted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let topic = format!("policy-{index}");
+        let created = http
+            .client
+            .post(http.url("/streams/durability-http/topics"))
+            .bearer_auth(&http.token)
+            .json(&CreateTopic {
+                name: topic.clone(),
+                options: BTreeMap::from([
+                    ("durability".to_string(), message_policy.to_string()),
+                    (
+                        "consumer_offset_durability".to_string(),
+                        offset_policy.to_string(),
+                    ),
+                ]),
+                ..CreateTopic::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "{}",
+            created.text().await.unwrap()
+        );
+        let details = client
+            .get_topic(&stream, &Identifier::named(&topic).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let policies = iggy_common::TopicRuntimeOptions::from_resource_options(&details.options);
+        assert_eq!(policies.durability, message_policy);
+        assert_eq!(policies.consumer_offset_durability, offset_policy);
+        for (query, status, expected) in [
+            ("", StatusCode::CREATED, message_policy.as_ref()),
+            (
+                "?ack=replicated",
+                StatusCode::CREATED,
+                message_policy.as_ref(),
+            ),
+            ("?ack=none", StatusCode::ACCEPTED, "none"),
+        ] {
+            let message = IggyMessage::builder()
+                .payload("policy".into())
+                .build()
+                .unwrap();
+            let response = http
+                .produce_with_query(
+                    "durability-http",
+                    &topic,
+                    PARTITION_ID,
+                    vec![message],
+                    query,
+                )
+                .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(durability(&response), expected);
+        }
+    }
+}
+
+#[iggy_harness]
+async fn given_one_http_durability_option_when_creating_should_derive_the_other_as_replicated(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-policy-defaults", "initial", 1)
+        .await;
+    for key in ["durability", "consumer_offset_durability"] {
+        let response = http
+            .client
+            .post(http.url("/streams/http-policy-defaults/topics"))
+            .bearer_auth(&http.token)
+            .json(&CreateTopic {
+                name: key.to_string(),
+                options: BTreeMap::from([(key.to_string(), "persisted".to_string())]),
+                ..CreateTopic::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let topic: serde_json::Value = response.json().await.unwrap();
+        for policy in ["durability", "consumer_offset_durability"] {
+            assert_eq!(
+                topic["options"][policy]["value"],
+                if policy == key {
+                    "persisted"
+                } else {
+                    "replicated"
+                }
+            );
+            assert_eq!(topic["options"][policy]["explicit"], policy == key);
+        }
+    }
+}
+
+#[iggy_harness]
+async fn given_http_sdk_when_sending_should_expose_the_advertised_durability(
+    harness: &TestHarness,
+) {
+    let address = harness.server().http_addr().unwrap();
+    let client = iggy::http::http_client::HttpClient::new(&format!("http://{address}")).unwrap();
+    client.login_user("iggy", "iggy").await.unwrap();
+    client.create_stream("sdk-durability").await.unwrap();
+    let stream = Identifier::named("sdk-durability").unwrap();
+    client
+        .create_topic(
+            &stream,
+            "persisted",
+            &TopicCreateOptions {
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut messages = vec![
+        IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"durable"))
+            .build()
+            .unwrap(),
+    ];
+    let (response, durability) = client
+        .send_messages_with_durability(
+            &stream,
+            &Identifier::named("persisted").unwrap(),
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+    assert_eq!(durability, Some(Durability::Persisted));
+    assert_eq!(response.confirmations.len(), 1);
 }

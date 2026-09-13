@@ -32,9 +32,9 @@
 //! non-vacuous: a chain nothing was compared against passes silently.
 
 use crate::Simulator;
-use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use journal::Journal;
+use server_common::sharding::IggyNamespace;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One op of the canonical committed chain.
@@ -104,7 +104,7 @@ impl StateChecker {
                 continue;
             }
             let replica = &sim.replicas[usize::from(replica_idx)];
-            let Some(consensus) = replica.shards[0].plane.metadata().consensus.as_ref() else {
+            let Some(consensus) = sim.metadata_consensus(usize::from(replica_idx)) else {
                 continue;
             };
             let committed = consensus.commit_min();
@@ -254,7 +254,7 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
             continue;
         }
         let replica = &sim.replicas[usize::from(replica_idx)];
-        let Some(consensus) = replica.shards[0].plane.metadata().consensus.as_ref() else {
+        let Some(consensus) = sim.metadata_consensus(usize::from(replica_idx)) else {
             continue;
         };
         let committed = consensus.commit_min();
@@ -291,6 +291,71 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
     witnesses.values().filter(|&&count| count > 1).count()
 }
 
+/// Assert every live replica's committed partition prefix agrees, op for op.
+///
+/// Partition-plane counterpart of [`assert_committed_prefixes_agree`], and the only
+/// check comparing what replicas committed on this plane rather than how much. The
+/// quiesce oracle otherwise bounds only that no backup committed past its leader.
+///
+/// Two differences from the metadata twin, both from the partition journal evicting
+/// its committed prefix as it flushes to segments:
+///
+/// * A missing header is ordinary, not a hole, so this compares only the ops two
+///   replicas both still hold. `evict_prefix` moves a flushed entry to the repair
+///   ring rather than dropping it, so that set is the ring plus whatever is still
+///   resident: the recently committed tail, where a bad repair or a mis-decided
+///   view change lands.
+/// * Identity, not the sealed checksum. `restamp_prepare_view` rewrites the view on
+///   retransmit, so `identity_checksum` compares the entry, not the delivery.
+///
+/// Returns ops witnessed by more than one replica, summed over every namespace.
+///
+/// # Panics
+/// If two live replicas hold different entries at the same committed partition op.
+#[must_use]
+pub fn assert_partition_prefixes_agree(
+    sim: &Simulator,
+    namespaces: &[IggyNamespace],
+    seed: u64,
+) -> usize {
+    let mut compared = 0;
+    for &namespace in namespaces {
+        let mut canonical: BTreeMap<u64, (u128, u8)> = BTreeMap::new();
+        let mut witnesses: BTreeMap<u64, usize> = BTreeMap::new();
+        for replica_idx in 0..sim.replica_count {
+            if sim.is_crashed(replica_idx) {
+                continue;
+            }
+            let idx = usize::from(replica_idx);
+            let Some(state) = sim.partition_consensus_state(idx, namespace) else {
+                continue;
+            };
+            let Some(headers) =
+                sim.partition_journaled_headers(idx, namespace, 1..=state.commit_min)
+            else {
+                continue;
+            };
+            for (op, header) in headers {
+                let identity = header.identity_checksum();
+                if let Some(&(expected, owner)) = canonical.get(&op) {
+                    assert_eq!(
+                        identity, expected,
+                        "at quiesce replica {replica_idx} and replica {owner} disagree on \
+                         committed partition op {op} of ns {namespace:?}: {identity:#x} vs \
+                         {expected:#x} (seed={seed:#x})",
+                    );
+                    *witnesses.entry(op).or_insert(1) += 1;
+                } else {
+                    canonical.insert(op, (identity, replica_idx));
+                    witnesses.insert(op, 1);
+                }
+            }
+        }
+        compared += witnesses.values().filter(|&&count| count > 1).count();
+    }
+    compared
+}
+
 /// Whether a committed op having no journal header is legitimate rather than a
 /// hole.
 ///
@@ -320,6 +385,7 @@ mod tests {
     use super::*;
     use crate::client::SimClient;
     use crate::packet::PacketSimulatorOptions;
+    use consensus::PartitionsHandle;
 
     const SEED: u64 = 0x5C11;
 
@@ -359,11 +425,8 @@ mod tests {
     #[should_panic(expected = "a hole in the committed log")]
     fn a_missing_committed_head_above_the_snapshot_floor_is_a_hole() {
         let sim = cluster_with_committed_ops();
-        let committed = sim.replicas[1].shards[0]
-            .plane
-            .metadata()
-            .consensus
-            .as_ref()
+        let committed = sim
+            .metadata_consensus(1)
             .expect("shard 0 owns metadata consensus")
             .commit_min();
         assert!(
@@ -404,6 +467,97 @@ mod tests {
             "op 2 must be journaled for this test to damage anything"
         );
         checker.check(&sim, SEED);
+    }
+
+    /// A three-replica cluster with committed partition ops flushed to segments.
+    ///
+    /// The state the partition comparison has to work in: `evict_prefix` clears the
+    /// resident header vec on flush, so a resident-only read sees nothing.
+    fn cluster_with_flushed_partition_ops() -> (Simulator, IggyNamespace) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let client_id: u128 = 1;
+        let mut sim = Simulator::new(
+            3,
+            std::iter::once(client_id),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: SEED,
+                ..PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(client_id);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        for sequence in 0..6u32 {
+            let msg = client.send_messages(
+                namespace,
+                &[bytes::Bytes::from(format!("wl-part-{sequence}"))],
+            );
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..60 {
+                sim.step();
+            }
+        }
+
+        for replica_idx in 0..3usize {
+            let shard = sim.replicas[replica_idx].partition_shard(namespace);
+            let partitions = shard.plane.partitions();
+            let config = partitions.config();
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            futures::executor::block_on(partition.flush_committed_messages(config))
+                .expect("the in-memory flush must succeed");
+        }
+        (sim, namespace)
+    }
+
+    /// The partition comparison must survive a flush.
+    ///
+    /// `header_by_op` reads the resident header vec, which `evict_prefix` clears as
+    /// the committed prefix flushes, so a resident-only read compares zero ops at
+    /// quiescence and the check passes over nothing.
+    #[test]
+    fn a_flushed_partition_prefix_is_still_compared() {
+        let (sim, namespace) = cluster_with_flushed_partition_ops();
+
+        let committed = sim
+            .partition_consensus_state(1, namespace)
+            .expect("replica 1 hosts the namespace")
+            .commit_min;
+        assert!(
+            committed > 1,
+            "the cluster committed {committed} partition op(s), so there is nothing \
+             for two replicas to agree on"
+        );
+
+        let resident = sim.replicas[1]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("replica 1 hosts the namespace")
+            .log
+            .journal()
+            .inner
+            .header_by_op(1);
+        assert!(
+            resident.is_none(),
+            "op 1 is still resident, so this test does not exercise the flushed path"
+        );
+
+        let compared = assert_partition_prefixes_agree(&sim, &[namespace], SEED);
+        assert!(
+            compared > 0,
+            "no committed partition op was witnessed by more than one replica after \
+             the flush, so the check passed over an empty set"
+        );
     }
 
     /// An undamaged prefix passes the recheck: the reset must turn a restart into a

@@ -28,7 +28,7 @@ public sealed class StatsResponse
     /// <summary>
     ///     Process identifier.
     /// </summary>
-    public required int ProcessId { get; init; }
+    public required uint ProcessId { get; init; }
 
     /// <summary>
     ///     CPU usage of the process.
@@ -90,22 +90,22 @@ public sealed class StatsResponse
     /// <summary>
     ///     Total number of streams.
     /// </summary>
-    public required int StreamsCount { get; init; }
+    public required uint StreamsCount { get; init; }
 
     /// <summary>
     ///     Total number of topics.
     /// </summary>
-    public required int TopicsCount { get; init; }
+    public required uint TopicsCount { get; init; }
 
     /// <summary>
     ///     Total number of partitions.
     /// </summary>
-    public required int PartitionsCount { get; init; }
+    public required uint PartitionsCount { get; init; }
 
     /// <summary>
     ///     Total number of segments.
     /// </summary>
-    public required int SegmentsCount { get; init; }
+    public required uint SegmentsCount { get; init; }
 
     /// <summary>
     ///     Total number of messages.
@@ -115,12 +115,12 @@ public sealed class StatsResponse
     /// <summary>
     ///     Total number of connected clients.
     /// </summary>
-    public required int ClientsCount { get; init; }
+    public required uint ClientsCount { get; init; }
 
     /// <summary>
     ///     Total number of consumer groups.
     /// </summary>
-    public required int ConsumerGroupsCount { get; init; }
+    public required uint ConsumerGroupsCount { get; init; }
 
     /// <summary>
     ///     Hostname of the server.
@@ -148,7 +148,7 @@ public sealed class StatsResponse
     public required string IggyServerVersion { get; init; }
 
     /// <summary>
-    ///     Semantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 100200300 (major * 1000000 + minor * 1000 +
+    ///     Semantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 1002003 (major * 1000000 + minor * 1000 +
     ///     patch).
     /// </summary>
     public uint IggyServerSemver { get; init; }

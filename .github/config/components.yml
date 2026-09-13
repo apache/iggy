@@ -23,6 +23,7 @@ components:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
+      - ".config/**" # nextest + cargo-rail config gate every Rust test job
 
   # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and chain-publishes
@@ -134,6 +135,43 @@ components:
       - "core/metadata/**"
       - "core/message_bus/**"
       - "core/partitions/**"
+
+  # On-disk format backwards compatibility. Boots a server built from the
+  # master tip the PR merges onto, seeds a data directory, then swaps in a
+  # HEAD-built binary and asserts it reads everything back. Paths are the
+  # crates that own the on-disk representation plus the boot path that reads
+  # it back; a change to any of them can silently break rollforward for
+  # existing deployments, which no other check covers. Matching is literal
+  # glob with no crate-graph expansion, so every crate has to be spelled out:
+  # `core/server/**` does not cover `core/server_common/**`.
+  # `breaking:storage` on the PR skips it (see .github/workflows/_test.yml).
+  rust-storage-compat:
+    depends_on:
+      - "rust-workspace"
+      - "rust-configs" # partition/metadata on-disk schema knobs and their defaults
+      - "ci-infrastructure" # action.yml/workflow edits should re-run the check
+    paths:
+      - "core/server/**"
+      - "core/server_common/**" # per-message segment record + segment readers/writers
+      - "core/binary_protocol/**"
+      - "core/common/**"
+      - "core/consensus/**" # VsrState is the superblock payload
+      - "core/journal/**"
+      - "core/metadata/**"
+      - "core/partitions/**"
+      - "core/shard/**" # drives the shutdown flush and boot-time partition recovery
+      - "scripts/ci/storage-compat.sh"
+      # The check itself, so weakening it re-runs it. Scoped to the test, the
+      # module wiring that keeps it compiled in, the crate manifest and the
+      # harness it drives rather than `core/integration/**`, which would fire
+      # this lane on every unrelated integration test change.
+      - "core/integration/Cargo.toml"
+      - "core/integration/tests/mod.rs"
+      - "core/integration/tests/data_integrity/mod.rs"
+      - "core/integration/tests/data_integrity/storage_compat.rs"
+      - "core/integration/src/harness/**"
+    tasks:
+      - "test-storage-compat"
 
   # Standalone simulation tool, does NOT affect server binary or foreign SDKs.
   # Split from rust-cluster to avoid triggering SDK tests on simulator-only changes.
@@ -491,7 +529,7 @@ components:
   web-ui:
     paths:
       - "web/**"
-    tasks: ["lint", "build"]
+    tasks: ["lint", "test", "build"]
 
   helm:
     paths:

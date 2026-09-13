@@ -34,7 +34,12 @@ use crate::clients::producer_error_callback::ErrorCtx;
 /// Implementors of this trait define how to choose a shard for a given batch of messages.
 /// This allows customizing message routing based on message content, stream/topic identifiers,
 /// or round-robin load balancing.
+///
+/// [`pick_shard`](Self::pick_shard) must return an index smaller than `num_shards`. The dispatcher
+/// normalizes a configured shard count of zero to one, so `num_shards` passed here is never zero.
+/// Returning an out-of-range index makes dispatch panic when it indexes the shard list.
 pub trait Sharding: Send + Sync + std::fmt::Debug + 'static {
+    /// Chooses the zero-based shard index for one batch.
     fn pick_shard(
         &self,
         num_shards: usize,
@@ -90,11 +95,19 @@ impl Sharding for OrderedSharding {
     }
 }
 
+/// One producer send after the dispatcher has selected its destination metadata.
+///
+/// A sharding strategy sees the messages, stream, and topic before this value is queued. The
+/// optional partitioning value overrides the producer's configured partitioning for this send.
 #[derive(Debug)]
 pub struct ShardMessage {
+    /// Target stream.
     pub stream: Arc<Identifier>,
+    /// Target topic.
     pub topic: Arc<Identifier>,
+    /// Messages carried by this send.
     pub messages: Vec<IggyMessage>,
+    /// Per-send partitioning override, or `None` to use the producer configuration.
     pub partitioning: Option<Arc<Partitioning>>,
 }
 
@@ -113,7 +126,13 @@ impl Sizeable for ShardMessage {
     }
 }
 
+/// A [`ShardMessage`] together with its charge against the dispatcher's byte budget.
+///
+/// The optional permit is acquired before the message enters a shard queue and remains owned by
+/// this value until the worker finishes the write or drops the message. Keeping permits from merged
+/// messages separate avoids the `u32` permit-count limit in Tokio's semaphore API.
 pub struct ShardMessageWithPermit {
+    /// Routed send and destination metadata.
     pub inner: ShardMessage,
     size_bytes: u64,
     bytes_permit: Option<OwnedSemaphorePermit>,
@@ -121,6 +140,9 @@ pub struct ShardMessageWithPermit {
 }
 
 impl ShardMessageWithPermit {
+    /// Wraps `msg` with its previously acquired byte-budget permit.
+    ///
+    /// `bytes_permit` is `None` when the dispatcher's byte budget is unbounded.
     pub fn new(msg: ShardMessage, bytes_permit: Option<OwnedSemaphorePermit>) -> Self {
         let size_bytes = msg.get_size_bytes().as_bytes_u64();
         Self {
@@ -141,6 +163,36 @@ impl ShardMessageWithPermit {
     }
 }
 
+/// Represents one background worker of a
+/// [`ProducerDispatcher`](crate::clients::producer_dispatcher::ProducerDispatcher),
+/// together with the channel (queue) that feeds it.
+///
+/// Each shard owns a task that buffers sends routed to it, merges adjacent sends that share a
+/// destination, and writes them through [`ProducerCoreBackend::send_internal`].
+///
+/// The dispatcher enqueues a batch by sending it on that channel, which returns once the batch is
+/// queued. Shards are created and owned by the dispatcher, so they are rarely handled directly.
+///
+/// # Worker loop
+///
+/// The task selects over three sources:
+///
+/// - **An enqueued send.** [`ShardMessageWithPermit`]s are appended to the buffer, which is flushed
+///   once it reaches [`batch_length`](BackgroundConfig::batch_length) queued sends or
+///   [`batch_size`](BackgroundConfig::batch_size) reported bytes. Either threshold is disabled when
+///   configured as `0`.
+/// - **The linger deadline.** Armed when a send enters an empty buffer and due
+///   [`linger_time`](BackgroundConfig::linger_time) later, it flushes the buffer whether or not
+///   either batching threshold was reached. An empty buffer arms nothing, so an idle shard does not
+///   wake up.
+/// - **The stop broadcast** sent by the dispatcher on shutdown. Marks the shard closed
+///   so later sends fail with [`IggyError::ProducerClosed`], drains what is still
+///   queued, flushes once, then ends the loop. A send that races the stop signal can be queued
+///   after that drain and is lost without an error.
+///   Dropping the [`ProducerDispatcher`] instead of shutting it down provides no completion
+///   guarantee and can lose buffered messages.
+///
+/// [`ProducerDispatcher`]: crate::clients::producer_dispatcher::ProducerDispatcher
 pub struct Shard {
     tx: flume::Sender<ShardMessageWithPermit>,
     closed: Arc<AtomicBool>,
@@ -148,6 +200,7 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// Spawns the worker task described in the [`Shard`] type documentation.
     pub fn new(
         core: Arc<impl ProducerCoreBackend>,
         config: Arc<BackgroundConfig>,
@@ -162,14 +215,18 @@ impl Shard {
         let handle = tokio::spawn(async move {
             let mut buffer = Vec::new();
             let mut buffer_bytes = 0;
-            let mut last_flush = tokio::time::Instant::now();
+            // Armed by the first send buffered after a flush and polled only while the buffer is
+            // non-empty, so an idle shard never wakes up and a zero linger cannot spin.
+            let mut linger_deadline = tokio::time::Instant::now();
 
             loop {
-                let deadline = last_flush + config.linger_time.get_duration();
                 tokio::select! {
                     maybe_msg = rx.recv_async() => {
                         match maybe_msg {
                             Ok(msg) => {
+                                if buffer.is_empty() {
+                                    linger_deadline = tokio::time::Instant::now() + config.linger_time.get_duration();
+                                }
                                 buffer_bytes += msg.size_bytes as usize;
                                 buffer.push(msg);
                                 debug!(
@@ -196,18 +253,13 @@ impl Shard {
                                         new_buffer_bytes = buffer_bytes,
                                         "Buffer flushed"
                                     );
-
-                                    last_flush = tokio::time::Instant::now();
                                 }
                             }
                             Err(_) => break,
                         }
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        if !buffer.is_empty() {
-                            Self::flush_buffer(&core, &slots_permit, &mut buffer, &mut buffer_bytes, &err_sender).await;
-                        }
-                        last_flush = tokio::time::Instant::now();
+                    _ = tokio::time::sleep_until(linger_deadline), if !buffer.is_empty() => {
+                        Self::flush_buffer(&core, &slots_permit, &mut buffer, &mut buffer_bytes, &err_sender).await;
                     }
                     _ = stop_rx.recv() => {
                         closed_clone.store(true, Ordering::Release);
@@ -297,6 +349,10 @@ impl Shard {
         *buffer_bytes = 0;
     }
 
+    /// Queues one [`ShardMessageWithPermit`] on this worker.
+    ///
+    /// Returns [`IggyError::ProducerClosed`] after graceful shutdown has closed the shard, or
+    /// [`IggyError::BackgroundSendError`] if its worker channel is disconnected.
     pub(crate) async fn send(&self, message: ShardMessageWithPermit) -> Result<(), IggyError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(IggyError::ProducerClosed);
@@ -642,6 +698,63 @@ mod tests {
         shard.send(wrapped).await.unwrap();
 
         sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn test_shard_flushes_at_once_with_zero_linger() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sends_seen_by_mock = sends.clone();
+        let mut mock = MockProducerCoreBackend::new();
+        mock.expect_send_internal().returning(move |_, _, _, _| {
+            sends_seen_by_mock.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(no_confirmations()) })
+        });
+
+        let config = Arc::new(
+            BackgroundConfig::builder()
+                .batch_length(10)
+                .batch_size(10_000)
+                .linger_time(IggyDuration::from(0))
+                .build(),
+        );
+        let permit_bytes = Arc::new(Semaphore::new(10_000));
+        let slots_permit = Arc::new(Semaphore::new(100));
+
+        let (stop_tx, stop_rx) = broadcast::channel(1);
+        let shard = Shard::new(
+            Arc::new(mock),
+            config,
+            slots_permit,
+            flume::unbounded().0,
+            stop_rx,
+        );
+
+        let message = ShardMessage {
+            stream: dummy_identifier(),
+            topic: dummy_identifier(),
+            messages: vec![dummy_message(1)],
+            partitioning: None,
+        };
+        let wrapped = ShardMessageWithPermit::new(
+            message,
+            Some(permit_bytes.clone().acquire_many_owned(1).await.unwrap()),
+        );
+        shard.send(wrapped).await.unwrap();
+
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "a zero linger must flush without waiting for a batching threshold"
+        );
+
+        stop_tx.send(()).unwrap();
+        shard.handle.await.unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "the stop flush must find nothing left"
+        );
     }
 
     #[tokio::test]

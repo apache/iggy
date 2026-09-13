@@ -21,8 +21,8 @@
 //! core so they do not fight over CPU time. This module reads the
 //! operator's choice ([`CpuAllocation`] from the config), looks at the
 //! real machine with `hwloc`, and hands back one [`ShardInfo`] per
-//! shard. On Linux it also pins each shard's thread to its core and
-//! pins memory to the right NUMA node, so memory stays close and fast.
+//! shard. With pinning enabled on Linux, it binds shard threads to CPUs.
+//! NUMA allocation modes also bind memory to the selected node.
 
 use cpu_allocation::{CpuAllocation, NumaConfig, allowed_cpus};
 use hwlocality::Topology;
@@ -210,6 +210,14 @@ pub struct ShardInfo {
 impl ShardInfo {
     /// Pin the calling thread to this shard's cores. On non-Linux this
     /// does nothing (no-op). Empty core set also does nothing.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "Keep the same API as the fallible Linux binding implementation"
+        )
+    )]
     pub fn bind_cpu(&self) -> Result<(), ShardingError> {
         #[cfg(target_os = "linux")]
         {
@@ -241,6 +249,14 @@ impl ShardInfo {
     /// Pin the calling thread's memory to this shard's NUMA node so
     /// allocations stay local and fast. Does nothing if no node is set.
     /// On non-Linux this does nothing (no-op), mirroring [`Self::bind_cpu`].
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "Keep the same API as the fallible Linux binding implementation"
+        )
+    )]
     pub fn bind_memory(&self) -> Result<(), ShardingError> {
         #[cfg(target_os = "linux")]
         {

@@ -88,7 +88,19 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     <c>RESYNC_REQUIRED_PARTITION_SENTINEL</c> (<c>u32::MAX</c>). The reply header carries no status for an
     ///     empty poll, so the sentinel is the only channel the coordinator has to ask for a re-sync.
     /// </summary>
-    private const int VsrResyncRequiredPartitionSentinel = -1;
+    private const uint VsrResyncRequiredPartitionSentinel = uint.MaxValue;
+
+    /// <summary>
+    ///     Shared empty poll result for a group member that currently owns no partition, carrying
+    ///     <see cref="PolledMessages.NoAssignedPartition" /> so a consumer can back off instead of re-polling at
+    ///     once. Same ownership rules as <see cref="EmptyPolledMessages" />.
+    /// </summary>
+    private static readonly PolledMessagesRental NoAssignedPartitionPolledMessages = new(EmptyMemoryOwner.Instance)
+    {
+        PartitionId = PolledMessages.NoAssignedPartition,
+        CurrentOffset = 0,
+        Messages = []
+    };
 
     /// <summary>
     ///     Shared empty poll result. An idle consumer loop returns one on every iteration, and the instance owns
@@ -158,7 +170,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 response.ServerVersion, response.ServerProtocolVersion);
             SetConnectionState(ConnectionState.Authenticated);
 
-            var authResponse = new AuthResponse((int)response.UserId, null);
+            var authResponse = new AuthResponse(response.UserId, null);
             if (IsConnecting)
             {
                 return authResponse;
@@ -188,7 +200,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     /// <summary>
     ///     Whether the partitioning has to be resolved to an explicit partition id before the request is framed.
-    ///     The broker never picks a partition, so balanced and message-key kinds resolve client-side.
+    ///     This client resolves balanced and message-key kinds using its partition cache and cursor.
     /// </summary>
     private static bool NeedsClientSidePartitioning(Partitioning partitioning)
     {
@@ -205,8 +217,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     /// <summary>
     ///     Resolves balanced and message-key partitioning to an explicit partition id, mirroring
-    ///     <c>core/common/src/traits/binary_impls/messages.rs</c>. The VSR broker never picks a partition, so
-    ///     sending either kind on the wire would fail to route.
+    ///     <c>core/common/src/traits/binary_impls/messages.rs</c> and retaining the client's routing cursor.
     /// </summary>
     private async ValueTask<Partitioning> ResolvePartitioningAsync(Identifier streamId, Identifier topicId,
         Partitioning partitioning, CancellationToken token)
@@ -227,7 +238,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 $"Partitioning kind {partitioning.Kind} cannot be resolved to a partition id.")
         };
 
-        return Partitioning.PartitionId((int)partition);
+        return Partitioning.PartitionId(partition);
     }
 
     private async ValueTask<uint> TopicPartitionCountAsync(Identifier streamId, Identifier topicId,
@@ -274,7 +285,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                         $"Client is not a member of consumer group {consumer.ConsumerId} on topic {topicId}.");
                 }
 
-                return EmptyPolledMessages;
+                return NoAssignedPartitionPolledMessages;
             }
 
             PolledMessagesRental? rental = null;
@@ -307,7 +318,9 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
         }
 
-        return EmptyPolledMessages;
+        // Running out of attempts mid-rebalance is not a failure: report it like a member that owns nothing
+        // yet, so the consumer backs off and polls again.
+        return NoAssignedPartitionPolledMessages;
     }
 
     /// <summary>

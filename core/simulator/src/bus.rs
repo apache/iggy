@@ -18,13 +18,16 @@
 use crate::deps::SimClock;
 use crate::executor::{PendingSpawns, TimerHandle};
 use clock::Clock;
+#[cfg(test)]
+use futures::channel::oneshot;
 use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    ClientConnectionLostFn, ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn, SendError,
+    BusMessage, ClientConnectionLostFn, ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn,
+    SendError,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
@@ -88,6 +91,8 @@ pub struct SimOutbox {
     /// fires it via `notify_client_connection_lost` to drive the real
     /// session-removal + logout path when it models a client disconnect.
     client_lost_fn: RefCell<Option<ClientConnectionLostFn>>,
+    #[cfg(test)]
+    next_replica_send: RefCell<Option<oneshot::Receiver<()>>>,
 }
 
 impl std::fmt::Debug for SimOutbox {
@@ -118,7 +123,17 @@ impl SimOutbox {
             spawns,
             client_metas: RefCell::new(HashMap::new()),
             client_lost_fn: RefCell::new(None),
+            #[cfg(test)]
+            next_replica_send: RefCell::new(None),
         }
+    }
+
+    /// Suspend the next replica send so tests can inspect owner reply ordering.
+    #[cfg(test)]
+    pub(crate) fn delay_next_replica_send(&self) -> oneshot::Sender<()> {
+        let (resume, wait) = oneshot::channel();
+        assert!(self.next_replica_send.borrow_mut().replace(wait).is_none());
+        resume
     }
 
     /// Drain all staged messages from this outbox.
@@ -189,7 +204,7 @@ impl MessageBus for SimOutbox {
     async fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         if !self.clients.borrow().contains(&client_id) {
             return Err(SendError::ClientNotFound(client_id));
@@ -199,7 +214,7 @@ impl MessageBus for SimOutbox {
             from_replica: Some(self.self_id),
             to_replica: None,
             to_client: Some(client_id),
-            payload: EnvelopePayload::Client(frozen_to_message(&data)),
+            payload: EnvelopePayload::Client(frozen_to_message(&data.into().into_contiguous())),
         });
 
         Ok(())
@@ -212,6 +227,14 @@ impl MessageBus for SimOutbox {
     ) -> Result<(), SendError> {
         if !self.replicas.borrow().contains(&replica) {
             return Err(SendError::ReplicaNotConnected(replica));
+        }
+
+        #[cfg(test)]
+        {
+            let wait = self.next_replica_send.borrow_mut().take();
+            if let Some(wait) = wait {
+                let _ = wait.await;
+            }
         }
 
         self.pending_messages.borrow_mut().push_back(Envelope {
@@ -264,7 +287,7 @@ impl MessageBus for SharedSimOutbox {
     async fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         self.0.send_to_client(client_id, data).await
     }

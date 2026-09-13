@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
-    SendMessagesResponse,
+    Consumer, ConsumerKind, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages,
+    PollingStrategy, SendMessagesResponse,
 };
 use async_trait::async_trait;
 
@@ -29,6 +29,41 @@ pub trait MessageClient {
     /// Authentication is required, and the permission to poll the messages.
     ///
     /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
+    /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
+    ///
+    /// With automatic commits enabled, a new consumer offset key can be
+    /// rejected with `TooManyConsumerOffsets` at the partition's configured
+    /// limit. That poll returns no messages. Existing keys remain writable,
+    /// and polling without automatic commits does not allocate a stored offset.
+    /// A refused automatic commit submission returns `TransientNotAccepted` with no
+    /// messages and may be retried. A capacity error requires capacity to be freed.
+    /// Local cursors without a committed offset can be evicted at the limit.
+    /// Their next `Next` poll resumes from the earliest retained messages,
+    /// which can redeliver messages from earlier polls.
+    ///
+    /// # Recovering from a missing response
+    ///
+    /// A timeout or communication failure does not establish that the server
+    /// rejected the poll. With `auto_commit` enabled, the server can advance its
+    /// consumer cursor before the caller receives the messages. Retrying with
+    /// [`PollingStrategy::next()`] can then skip messages from the missing response.
+    /// Even a successful poll response does not acknowledge a durable offset commit.
+    ///
+    /// Keep a checkpoint for each partition: one past the last message successfully
+    /// processed in order, or the intended starting offset if none was processed.
+    /// Recover with [`PollingStrategy::offset(checkpoint)`](PollingStrategy::offset)
+    /// and advance the checkpoint only after processing the returned messages.
+    /// Use each message's header offset, not [`PolledMessages::current_offset`],
+    /// which reports the partition's current offset rather than the last message
+    /// returned. Persist checkpoints if recovery must survive a client restart.
+    ///
+    /// Continue using explicit offsets until all messages through the server's
+    /// cursor have been processed: replay does not rewind an advanced cursor.
+    /// For a consumer group, recover each partition with its own checkpoint and
+    /// respect the current assignment. [`Self::poll_messages_with_strategy_for`]
+    /// selects the strategy after the partition is known.
+    /// Recovery assumes the same partition message history and requires the
+    /// messages to remain retained. It can repeat messages already processed.
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages(
         &self,
@@ -40,6 +75,42 @@ pub trait MessageClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError>;
+
+    /// [`poll_messages`](Self::poll_messages) whose strategy is chosen once the partition is
+    /// known. A consumer-group poll without a partition picks one of the member's assigned
+    /// partitions first and then asks `strategy_for` for it, so a caller can continue every
+    /// partition from its own position. Any other poll has its partition up front and asks
+    /// `strategy_for` for that one, or for `0` when none was given, which is the partition the
+    /// server reads then.
+    ///
+    /// The default implementation is for transports that cannot pick a partition client-side:
+    /// a consumer-group poll without a partition fails with `FeatureUnavailable`.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_messages_with_strategy_for(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+    ) -> Result<PolledMessages, IggyError> {
+        if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
+            return Err(IggyError::FeatureUnavailable);
+        }
+        let strategy = strategy_for(partition_id.unwrap_or(0));
+        self.poll_messages(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            &strategy,
+            count,
+            auto_commit,
+        )
+        .await
+    }
 
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///
@@ -53,9 +124,9 @@ pub trait MessageClient {
     /// A reported `base_offset` is where the batch's first message landed, with
     /// two limits. Delivery is at-least-once, so an earlier retry may already
     /// have committed the same batch at a lower offset and the value never
-    /// implies uniqueness. A batch is confirmed once it is committed in memory,
-    /// not once it is fsynced, so a crash-restart can stamp a later batch with
-    /// an offset a client has already recorded.
+    /// implies uniqueness. Confirmation follows VSR quorum commit. Persisted
+    /// message durability also requires recoverable stable-storage copies on
+    /// the quorum.
     async fn send_messages(
         &self,
         stream_id: &Identifier,

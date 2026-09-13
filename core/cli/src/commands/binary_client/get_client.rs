@@ -73,7 +73,7 @@ impl CliCommand for GetClientCmd {
 
         if client_details.consumer_groups_count > 0 {
             let mut consumer_groups = Table::new();
-            consumer_groups.load_preset(ASCII_NO_BORDERS);
+            consumer_groups.load_style(ASCII_NO_BORDERS);
             consumer_groups.set_header(vec!["Stream ID", "Topic ID", "Consumer Group ID"]);
             for consumer_group in client_details.consumer_groups {
                 consumer_groups.add_row(vec![

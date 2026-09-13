@@ -344,6 +344,12 @@ impl iggy_common::VsrSessionControl for TcpClient {
         }
 
         consensus_session.bind(session);
+        drop(consensus_session);
+        // Every fresh client identity passes through here, including one that
+        // replaces a session the transport never reset: a connection lost
+        // mid-request can leave the old session in place until this sign-in
+        // re-mints it.
+        self.consumer_group_state.clear_session_scoped();
         Ok(())
     }
 
@@ -352,6 +358,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
             .consensus_session
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
+        self.consumer_group_state.clear_session_scoped();
         Ok(())
     }
 
@@ -1273,8 +1280,23 @@ impl TcpClient {
                         return Err(IggyError::TransientNotAccepted);
                     }
 
+                    if roster_walk
+                        .as_ref()
+                        .is_some_and(RosterWalk::is_single_endpoint)
+                    {
+                        // Discovery already proved there is no routing choice.
+                        // Retry without reacquiring the lock so reconnects and
+                        // unrelated requests do not wait out this deadline.
+                        drop(routing_guard.take());
+                        continue;
+                    }
+
                     if routing_guard.is_none() {
-                        routing_guard = Some(self.routing_lock.lock().await);
+                        routing_guard = Some(
+                            tokio::time::timeout_at(overall_deadline, self.routing_lock.lock())
+                                .await
+                                .map_err(|_| IggyError::TransientNotAccepted)?,
+                        );
                         // A concurrent refused request may have moved the
                         // shared client while this request waited.
                         continue;
@@ -1316,6 +1338,16 @@ impl TcpClient {
                         // hops would bounce the request between two nodes and
                         // never reach the rest of the roster.
                         (next, true)
+                    } else if roster_walk
+                        .as_ref()
+                        .is_some_and(RosterWalk::is_single_endpoint)
+                    {
+                        // Partition materialisation can outlast the short retry
+                        // window on a single node. No routing change is needed.
+                        // Subsequent refusals take the lock-free local retry
+                        // branch above rather than reacquiring this guard.
+                        drop(routing_guard.take());
+                        continue;
                     } else {
                         return Err(IggyError::TransientNotAccepted);
                     };

@@ -42,12 +42,12 @@ public sealed class ClientResponse
     /// <summary>
     ///     Transport protocol used by the client.
     /// </summary>
-    public required Protocol Transport { get; init; }
+    public required ClientTransport Transport { get; init; }
 
     /// <summary>
     ///     Number of consumer groups the client is part of.
     /// </summary>
-    public required int ConsumerGroupsCount { get; init; }
+    public required uint ConsumerGroupsCount { get; init; }
 
     /// <summary>
     ///     List of consumer groups the client is part of.

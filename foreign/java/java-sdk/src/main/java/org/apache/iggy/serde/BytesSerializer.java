@@ -33,7 +33,6 @@ import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
-import org.apache.iggy.message.UuidMessageId;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.StreamPermissions;
@@ -45,7 +44,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.UUID;
 
 /**
  * Unified serializer for both blocking and async clients.
@@ -63,6 +61,9 @@ public final class BytesSerializer {
      */
     private static final int MAX_HEADER_FIELD_LENGTH = 255;
 
+    /** Bound on a u8-length-prefixed wire string, in encoded bytes. */
+    private static final int MAX_U8_STRING_LENGTH = 255;
+
     /** The timestamp delta is a u32 microsecond offset from the batch origin timestamp. */
     private static final BigInteger MAX_TIMESTAMP_DELTA_MICROS = BigInteger.valueOf(0xFFFF_FFFFL);
 
@@ -79,21 +80,7 @@ public final class BytesSerializer {
     }
 
     public static ByteBuf toBytes(Identifier identifier) {
-        if (identifier.getKind() == 1) {
-            ByteBuf buffer = Unpooled.buffer(6);
-            buffer.writeByte(1);
-            buffer.writeByte(4);
-            buffer.writeIntLE(identifier.getId().intValue());
-            return buffer;
-        } else if (identifier.getKind() == 2) {
-            ByteBuf buffer = Unpooled.buffer(2 + identifier.getName().length());
-            buffer.writeByte(2);
-            buffer.writeByte(identifier.getName().length());
-            buffer.writeBytes(identifier.getName().getBytes());
-            return buffer;
-        } else {
-            throw new IggyInvalidArgumentException("Unknown identifier kind: " + identifier.getKind());
-        }
+        return identifier.toBytes();
     }
 
     public static ByteBuf toBytes(Partitioning partitioning) {
@@ -209,10 +196,22 @@ public final class BytesSerializer {
         return buffer;
     }
 
-    public static ByteBuf toBytes(String value) {
-        int bufferLength = 1 + value.length();
-        ByteBuf buffer = Unpooled.buffer(bufferLength);
+    /** A u8-length-prefixed wire string; {@code field} names it in the error when it does not fit. */
+    public static ByteBuf toBytes(String value, String field) {
+        return toBytes(value, field, 1, MAX_U8_STRING_LENGTH);
+    }
+
+    /**
+     * A u8-length-prefixed wire string bounded to {@code [minLength, maxLength]} UTF-8 bytes, for
+     * fields the server holds to a tighter range than the prefix allows.
+     */
+    public static ByteBuf toBytes(String value, String field, int minLength, int maxLength) {
         byte[] stringBytes = value.getBytes(StandardCharsets.UTF_8);
+        if (stringBytes.length < minLength || stringBytes.length > maxLength) {
+            throw new IggyInvalidArgumentException("Invalid " + field + " length: " + stringBytes.length
+                    + " bytes when UTF-8 encoded, must be between " + minLength + " and " + maxLength);
+        }
+        ByteBuf buffer = Unpooled.buffer(1 + stringBytes.length);
         buffer.writeByte(stringBytes.length);
         buffer.writeBytes(stringBytes);
         return buffer;
@@ -340,7 +339,7 @@ public final class BytesSerializer {
      */
     private static byte[] encodedMessageId(MessageId id) {
         if (id.toBigInteger().signum() == 0) {
-            return readAllBytes(new UuidMessageId(UUID.randomUUID()).toBytes());
+            return MessageIdGenerator.mint();
         }
         return readAllBytes(id.toBytes());
     }

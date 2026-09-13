@@ -18,13 +18,12 @@
 #![allow(clippy::future_not_send)]
 
 mod args;
+mod banner;
 
 use args::Args;
 use clap::Parser;
 use configs::server::ServerConfig;
-use server::bootstrap::{
-    apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs,
-};
+use server::boot::{apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs};
 use server::server_error::ServerError;
 use server_common::log::Logging;
 use system_stats::capture_allowed_cpus;
@@ -39,6 +38,7 @@ fn main() -> Result<(), ServerError> {
     // visible. `create_shard_executor` also reads its capacity knob from the
     // environment, which is why the `.env` load has to precede it.
     let args = Args::parse();
+    banner::print(server::VERSION);
     // `logging` owns the tracing appender worker guards; it must outlive the
     // shard threads or every log line after bootstrap is silently dropped.
     let mut logging = Logging::new(server::VERSION);
@@ -75,8 +75,7 @@ fn main() -> Result<(), ServerError> {
     let bootstrap_result: Result<ServerConfig, ServerError> = bootstrap_runtime.block_on(async {
         let config = load_config().await?;
         prepare_runtime_dirs(&config, &mut logging, args.fresh).await?;
-        let memory_pool_settings =
-            server_common::MemoryPoolSettings::from(&config.system.memory_pool);
+        let memory_pool_settings = server_common::MemoryPoolSettings::from(&config.memory_pool);
         server_common::MemoryPool::init_pool(&memory_pool_settings);
 
         Ok(config)
@@ -98,7 +97,7 @@ fn main() -> Result<(), ServerError> {
     let joined = shards.join_all();
     #[cfg(feature = "systemd")]
     if let Err(error) = &joined {
-        server::systemd::notify_shutdown_failure(error);
+        server::boot::systemd::notify_shutdown_failure(error);
     }
     joined?;
     info!("server shutdown complete");

@@ -31,6 +31,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -232,12 +233,16 @@ public final class AsyncConsumer {
                             int messageCount = polled.messages().size();
 
                             if (messageCount > 0) {
-                                // Update offset for next poll
-                                offset.updateAndGet(current -> current.add(BigInteger.valueOf(messageCount)));
-                                consumedBatches.incrementAndGet();
-
                                 return processMessages(polled, totalReceived, processingPool)
-                                        .thenRun(() -> emptyPolls.set(0));
+                                        .thenRun(() -> {
+                                            offset.set(polled.messages()
+                                                    .get(messageCount - 1)
+                                                    .header()
+                                                    .offset()
+                                                    .add(BigInteger.ONE));
+                                            consumedBatches.incrementAndGet();
+                                            emptyPolls.set(0);
+                                        });
                             } else {
                                 int empty = emptyPolls.incrementAndGet();
                                 if (empty >= MAX_EMPTY_POLLS) {
@@ -312,7 +317,7 @@ public final class AsyncConsumer {
                     int messageCount = polled.messages().size();
 
                     for (Message message : polled.messages()) {
-                        String payload = new String(message.payload());
+                        String payload = new String(message.payload(), StandardCharsets.UTF_8);
 
                         // Simulate message processing (in real app: parse, validate, store, etc.)
                         // This could be CPU-intensive or involve blocking I/O (database, HTTP calls)

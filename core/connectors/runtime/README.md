@@ -2,19 +2,19 @@
 
 Runtime is responsible for managing the lifecycle of the connectors and providing the necessary infrastructure for the connectors to run.
 
-The runtime uses a shared [Tokio runtime](https://tokio.rs) to manage the asynchronous tasks and events across all connectors. Additionally, it has built-in support for logging via [tracing](https://docs.rs/tracing/latest/tracing/) crate.
+The runtime uses a shared [Tokio runtime](https://tokio.rs) for its connector-management and forwarding tasks. Each loaded plugin library also has an SDK Tokio runtime shared by its instances. Additionally, it has built-in support for logging via [tracing](https://docs.rs/tracing/latest/tracing/) crate.
 
 The connector are implemented as Rust libraries, and these are loaded dynamically during the runtime initialization process.
 
-Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) provides a safe and efficient way of loading the plugins via C FFI.
+Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) loads plugin libraries and resolves their C FFI symbols. Plugins execute inside the runtime process.
 
 By default, runtime will look for the configuration file, to decide which connectors to load and how to configure them.
 
-To start the connector runtime, simply run `cargo run --bin iggy-connectors`.
+Set the broker credentials and connector configuration directory before starting the runtime. The embedded default has an empty connector directory and cannot start unchanged. Follow the [connector quick start](../README.md#quick-start) for a complete setup.
 
 The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available via `docker pull apache/iggy-connect`. It ships in two flavors: a default image with every connector plugin bundled, and a `-slim` runtime-only image.
 
-The minimal viable configuration requires at least the Iggy credentials to create 2 separate instances of producer & consumer connections, the state directory path where source connectors can store their optional state, and the connectors configuration provider settings.
+The runtime opens two Iggy TCP clients, one for producers and one for consumers. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
 
 ```toml
 [iggy]
@@ -39,14 +39,20 @@ config_dir = "path/to/connectors"
 format = "text" # Options: "text" (default), "json"
 ```
 
-The path to the configuration can be overridden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
+Start it from the repository root:
+
+```bash
+IGGY_CONNECTORS_CONFIG_PATH=connectors.toml cargo run --bin iggy-connectors
+```
+
+Supported scalar fields and indexed list entries use environment variables with nested keys joined by underscores, for example `IGGY_CONNECTORS_IGGY_USERNAME`. Header and URL-template maps are configured in TOML. The runtime loads the first `.env` file found in the working directory or its parents, or the file specified by `IGGY_CONNECTORS_ENV_PATH`.
 
 ## State storage
 
-Source connectors checkpoint their progress (an opaque byte blob) through the runtime's state storage. The backend is selected via `state.storage`:
+Source plugins can supply optional checkpoint bytes. The runtime stores these opaque bytes using the backend selected by `state.storage`:
 
-- `file` (default): one file per source at `{state.path}/source_{key}.state`, written crash-atomically. Ties the cursor to the local disk.
-- `http`: one resource per source at `{state.http.url}/source_{key}` on any HTTP-speaking store (a sidecar in front of a database, an object-store gateway, a coordination service). Cursors survive node replacement and failover to another runtime instance.
+- `file` (default): one file at `{state.path}/source_{key}.state` for each source that supplies checkpoints. Writes use a temporary file, file synchronization and atomic rename. On Unix, the parent directory is synchronized too. Ties the cursor to the local disk.
+- `http`: one resource per source at `{state.http.url}/source_{key}` on any HTTP-speaking store (a sidecar in front of a database, an object-store gateway, a coordination service). A replacement runtime can read the same checkpoint from that state server; its durability and availability depend on the server.
 
 ```toml
 [state]
@@ -54,7 +60,7 @@ path = "local_state"      # used by storage = "file"
 storage = "http"          # "file" | "http"
 
 [state.http]
-url = "http://127.0.0.1:8080/connectors/state"  # base URL, no trailing slash
+url = "http://127.0.0.1:8080/connectors/state"
 load_method = "get"       # "get" (default) | "post"
 save_method = "put"       # "put" (default) | "post" | "patch"
 timeout = "5s"
@@ -83,7 +89,7 @@ The configured base URL may contain a query string, which is preserved when `sou
 
 - Every read uses the configured `load_method` and remembers the returned `ETag`. Every write uses the configured `save_method` and is conditional: `If-Match: <etag>` when a version is tracked, `If-None-Match: *` for the first-ever write. There is no unconditional overwrite path.
 - Every write carries an `Idempotency-Key` header, minted once per logical save and reused byte-identically across that save's retries, so a server that committed a write but lost the response can replay the original outcome instead of failing the retry with a spurious `412`.
-- State is sent and returned as opaque MessagePack bytes with `Content-Type: application/octet-stream`. The runtime never converts connector state to JSON, so each source retains its own compact state schema.
+- State is sent and returned as opaque bytes. The SDK provides MessagePack helpers. Writes use the bytes unchanged with `Content-Type: application/octet-stream`. The runtime never converts connector state to JSON, so each source retains its own compact state schema.
 - `425`/`429`/`503`/`5xx`, timeouts and connect failures are retried with exponential backoff (honoring `Retry-After`, capped at `max_backoff`) and classified transient when exhausted: the batch is Nacked and the plugin re-polls.
 - `412`/`409` (version conflict), `401`/`403` (authorization lost) and protocol violations are permanent: the provider latches and every later save fails fast without touching the network, until the connector is restarted. A permanent error means another writer took over or this writer's authority was revoked - retrying cannot help and would mask the original error.
 - Durability is the server's durability. The runtime guarantees only that the checkpoint is not advanced (the batch is not Acked) unless the server confirmed the write.
@@ -119,7 +125,7 @@ The runtime supports two types of configuration providers for managing connector
 
 ### Local File Provider
 
-The default configuration provider reads connector configurations from local files. Each connector (source or sink) is configured in its own separate file within the directory specified by `connectors.config_dir`. If `config_dir` is empty or the directory doesn't exist, no connectors will be loaded.
+The default configuration provider reads connector configurations from local files. Each connector (source or sink) is configured in its own separate file within the directory specified by `connectors.config_dir`. An empty `config_dir` is a fatal startup error. A missing directory is created automatically with a warning, and no connectors are loaded from it. Only nonhidden `*.toml` files directly inside the directory are read; `Cargo.toml` is skipped.
 
 ```toml
 [connectors]
@@ -129,7 +135,7 @@ config_dir = "path/to/connectors"
 
 ### HTTP Configuration Provider
 
-The HTTP configuration provider allows the runtime to fetch connector configurations from a remote HTTP/REST API. This enables centralized configuration management and dynamic configuration updates.
+The HTTP configuration provider allows the runtime to fetch connector configurations from a remote HTTP/REST API. The provider fetches active configurations at startup and handles configuration operations requested through the runtime API. It does not periodically poll for remote changes.
 
 ```toml
 [connectors]
@@ -142,7 +148,7 @@ api-key = "your-api-key"
 
 [connectors.retry]
 enabled = true
-max_attempts = 3
+max_attempts = 3 # Retries after the first request, up to four requests total
 initial_backoff = "1 s"
 max_backoff = "30 s"
 backoff_multiplier = 2
@@ -166,8 +172,8 @@ error_path = "error"      # Path to error in response (e.g., {"error": "..."})
 - **timeout** (optional): HTTP request timeout (default: 10s)
 - **request_headers** (optional): Custom headers to include in all HTTP requests (e.g., authentication headers)
 - **url_templates** (optional): Custom URL templates for API endpoints. Supports variable substitution with `{key}` and `{version}` placeholders.
-- **response.data_path** (optional): JSON path to extract response data from nested structures (e.g., "data.config")
-- **response.error_path** (optional): JSON path to check for errors in responses
+- **response.data_path** (optional): Dot-separated object keys or numeric array indexes used to extract data (e.g., `data.config` or `data.0`).
+- **response.error_path** (optional): A path with the same syntax. Any non-null value at this path is treated as an error, including `false` or an empty string.
 
 #### Default URL Templates
 
@@ -192,15 +198,22 @@ The HTTP provider expects the remote API to implement these endpoints and return
 
 ## HTTP API
 
-Connector runtime has an optional HTTP API that can be enabled by setting the `enabled` flag to `true` in the `[http]` section.
+The HTTP API is enabled by default at `127.0.0.1:8081`. Set `[http].enabled = false` to disable it.
 
 ```toml
 [http] # Optional HTTP API configuration
 enabled = true
+# Loopback on purpose: the configuration endpoints return plugin credentials in
+# plaintext and also accept writes. Set api_key in the same edit if you move
+# this off loopback, and http.tls unless cleartext is acceptable.
 address = "127.0.0.1:8081"
-api_key = "" # Optional API key for authentication to be passed as `api-key` header
+api_key = "" # Optional API key for authentication to be passed as `api-key` header; empty disables authentication
 
 [http.cors] # Optional CORS configuration for HTTP API
+# Enabling this with the shipped allowed_origins = ["*"] lets any page the
+# operator visits read these endpoints cross-origin, whatever address is bound.
+# Pin the origins you own, or set api_key, before turning it on.
+# "*" is honored only as the first entry; anywhere else it panics at startup.
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 allowed_origins = ["*"]
@@ -219,30 +232,120 @@ cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 ```
 
+> [!IMPORTANT]
+> **Treat this API as privileged. It reads and it writes.**
+>
+> The configuration endpoints return plugin configuration exactly as stored,
+> credentials included - a database connection string, an S3 secret key, a
+> webhook signing secret. Nothing redacts them on the way out. The runtime
+> masks the `api-key` in its own logs and redacts the state-store headers when
+> it serializes them, but no such path exists for plugin configuration.
+>
+> The exposure is not limited to disclosure. Publishing a configuration with
+> `POST /{sinks,sources}/{key}/configs` and then calling `POST .../restart` is
+> enough to repoint a connector at a destination of the caller's choosing,
+> because `restart` re-reads the stored configuration and starts the connector
+> from it - on the local provider that is whatever version was published last,
+> with no activation step in between. The runtime then forwards the operator's
+> topic data using its own Iggy credentials. `PUT .../configs/active` and
+> `DELETE .../configs` sit behind the same key.
+>
+> A rewritten plugin `path` is not loaded by the restart. `start_connector`
+> reuses the container `dlopen`ed at boot and only re-runs the plugin's init
+> with the new configuration, so a hostile path sits in the stored config until
+> the next time the runtime process starts, which makes it deferred code
+> execution rather than immediate.
+>
+> `api_key` is empty by default, which means authentication is **off** by
+> default. Only `/` and `/health` are exempt once it is set, so everything above
+> sits behind that one empty string, and the loopback default `address` is what
+> confines it to local processes.
+>
+> Three edits take that containment away:
+>
+> - **Moving `address` off loopback.** Set `api_key` in the same edit. The
+>   runtime warns at startup when the address resolves beyond loopback with no
+>   key configured, but nothing prevents it.
+> - **Enabling `[http.cors]` with the shipped `allowed_origins = ["*"]`.** That
+>   becomes `AllowOrigin::any()`, and the CORS layer wraps *outside*
+>   authentication, so tower-http answers the preflight before `resolve_api_key`
+>   runs. A browser is a local process, so with a wildcard origin and no key any
+>   page the operator visits gets a green preflight for a configuration `POST`
+>   and can then read *and rewrite* configuration cross-origin - the whole
+>   publish-then-restart repoint above, not just disclosure. The rewrite half
+>   needs the method on `allowed_methods` and `content-type` on
+>   `allowed_headers`, both of which the shipped block grants.
+>
+>   Setting `api_key` closes it, since an attacker's page cannot supply the
+>   header. Pinning `allowed_origins` to origins the operator owns closes the
+>   cross-origin *read*, and no startup warning fires for that case. One fires
+>   for `null`, which is narrower than `*` but not owned by anyone: a browser
+>   sends it from a sandboxed iframe, a `data:` URL and a `file://` page, all of
+>   which an attacker can produce, so pinning it buys nothing. No origin setting
+>   closes the CORS-simple route below; `api_key` does.
+> - **Leaving `http.tls.enabled = false`.** It ships disabled, so the `api-key`
+>   header and the credential-bearing responses both travel in cleartext. Enable
+>   TLS alongside `api_key` whenever this API leaves loopback. The runtime warns
+>   at startup whenever the address resolves beyond loopback with TLS off, and
+>   keeps warning after `api_key` is set, because the key crosses in the clear
+>   too. Terminating TLS at an ingress or a service mesh is a valid answer to
+>   that warning; the runtime cannot see it, so the line stays.
+>
+> And one that needs no edit at all. `POST .../restart` carries no body and no
+> content type, which makes it a CORS-simple request: a page can issue it with
+> `mode: 'no-cors'` and the browser sends it whatever `[http.cors]` says,
+> because CORS gates reading a response rather than issuing a request. So on the
+> shipped keyless default, any page the operator visits can restart any
+> connector, and no startup warning covers it because it is true of the defaults
+> rather than of an edit. Chrome's private network access blocks the
+> public-origin case; Firefox and Safari do not, a page served from a local
+> origin bypasses it everywhere, and setting `allow_private_network = true`
+> hands back the case Chrome would otherwise block. `api_key` is what closes
+> this one.
+
 Currently, it does expose the following endpoints:
 
 - `GET /`: welcome message.
-- `GET /health`: health status of the runtime.
+- `GET /health`: process liveness response. It does not check connector health; inspect `/stats`, `/sources` or `/sinks` for connector status.
 - `GET /stats`: runtime statistics including process info, memory/CPU usage, and connector status.
-- `GET /metrics`: Prometheus-formatted metrics (when `http.metrics.enabled` is `true`).
+- `GET {http.metrics.endpoint}` (default `/metrics`): Prometheus-formatted metrics, when `http.metrics.enabled` is `true`.
 - `GET /sinks`: list of sinks.
 - `GET /sinks/{key}`: sink details.
 - `GET /sinks/{key}/configs`: list of configuration versions for the sink.
 - `POST /sinks/{key}/configs`: add a new configuration version for the sink.
+- `DELETE /sinks/{key}/configs`: delete one configuration version for the sink - the `version` query parameter, or on the local provider the active version when it is omitted.
 - `GET /sinks/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sinks/{key}/configs/active`: active configuration details.
 - `PUT /sinks/{key}/configs/active`: activate a specific configuration version for the sink.
 - `GET /sinks/{key}/configs/plugin`: sink plugin config, including the optional `format` query parameter to specify the config format.
+- `POST /sinks/{key}/restart`: stop the sink and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sinks/{key}/transforms`: sink transforms to be applied to the fields.
 - `GET /sources`: list of sources.
 - `GET /sources/{key}`: source details.
 - `GET /sources/{key}/configs`: list of configuration versions for the source.
 - `POST /sources/{key}/configs`: add a new configuration version for the source.
+- `DELETE /sources/{key}/configs`: delete one configuration version for the source - the `version` query parameter, or on the local provider the active version when it is omitted.
 - `GET /sources/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sources/{key}/configs/active`: active configuration details.
 - `PUT /sources/{key}/configs/active`: activate a specific configuration version for the source.
 - `GET /sources/{key}/configs/plugin`: source plugin config, including the optional `format` query parameter to specify the config format.
+- `POST /sources/{key}/restart`: stop the source and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.
+
+`{key}` is the connector key: at most 128 bytes of ASCII letters, digits, `-`,
+`_` and `.`, starting with a letter or digit. A decoded segment outside that
+rule, such as `..%2F..%2Fpwned`, is answered with `400 Bad Request` and the
+error code `invalid_connector_key` before the request reaches the configuration
+provider, because on the local provider the key becomes part of a filename under
+`config_dir`, and on the HTTP provider part of a URL. An unencoded `/` splits
+the path and matches no route, so it is a `404`.
+
+Keys loaded from configuration files or the HTTP provider are not rejected, so
+existing deployments keep starting, but a key outside the rule is logged at
+startup and cannot be addressed through the API. Keys are case-sensitive to the
+runtime while the local provider maps them to filenames, so on a
+case-insensitive filesystem two keys that differ only by case share one file;
+prefer lowercase.
 
 ## Telemetry
 
@@ -262,14 +365,15 @@ transport = "grpc" # Options: "grpc", "http"
 endpoint = "http://localhost:4317"
 ```
 
+For `transport = "http"`, use complete signal endpoints such as `http://localhost:4318/v1/logs` and `http://localhost:4318/v1/traces`. The runtime does not append those paths.
+
 ## Benchmark Mode
 
 Each connector configuration accepts an optional `benchmark` flag. When set to `true`, the runtime emits a per-batch `info!` event on the `iggy_connectors::benchmark` tracing target with stage timings in microseconds. This is opt-in and adds a single tracing call per processed batch.
 
+Set the flag before any section headers in an existing connector configuration:
+
 ```toml
-type = "sink"
-key = "stdout"
-# ... other fields ...
 benchmark = true
 ```
 

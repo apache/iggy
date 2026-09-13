@@ -41,7 +41,12 @@ public interface IIggyConsumer
     /// <param name="count">The maximum number of messages to retrieve.</param>
     /// <param name="autoCommit">If true, automatically commit the offset after polling.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
-    /// <returns>A task that represents the asynchronous operation and returns the polled messages.</returns>
+    /// <returns>
+    ///     A task that represents the asynchronous operation and returns the polled messages. A consumer-group
+    ///     poll whose member currently owns no partition returns an empty batch whose
+    ///     <see cref="PolledMessages.PartitionId" /> is <see cref="PolledMessages.NoAssignedPartition" />; do
+    ///     not key offsets on it, back off and poll again.
+    /// </returns>
     Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
         CancellationToken token = default);
@@ -52,7 +57,10 @@ public interface IIggyConsumer
     /// </summary>
     /// <remarks>
     ///     The returned rental must be disposed when the caller is done reading the payload and raw header memory.
-    ///     Payload and raw header slices are invalidated once the rental is disposed.
+    ///     Payload and raw header slices are invalidated once the rental is disposed. A consumer-group poll whose
+    ///     member currently owns no partition returns an empty batch whose
+    ///     <see cref="PolledMessagesRental.PartitionId" /> is <see cref="PolledMessages.NoAssignedPartition" />;
+    ///     do not key offsets on it, back off and poll again.
     /// </remarks>
     Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,

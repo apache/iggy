@@ -34,7 +34,7 @@
 
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
-use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
+use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStatus, SourceInfoResponse};
 use integration::harness::config::TestServerConfig;
 use integration::harness::{TestBinaryError, TestFixture, TestHarness, seeds};
 use integration::iggy_harness;
@@ -56,6 +56,7 @@ const RUNTIME_CONFIG_PATH: &str = "tests/connectors/runtime/http_state.toml";
 const WAIT_DEADLINE: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
+const STATE_URL_QUERY_SECRET: &str = "state-query-secret-not-for-logs";
 
 /// In-memory state server backing the wiremock responder. Enforces the
 /// conditional-write contract and exposes counters plus injectable failure
@@ -255,7 +256,10 @@ async fn given_unavailable_state_store_when_booting_should_fail_startup() {
     // Bound but never accepted, so every state request times out instead of
     // racing other tests for a recycled port.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
-    let state_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let state_url = format!(
+        "http://127.0.0.1:{}?token={STATE_URL_QUERY_SECRET}",
+        listener.local_addr().unwrap().port()
+    );
 
     let mut command = Command::cargo_bin("iggy-connectors").expect("iggy-connectors binary");
     command
@@ -287,6 +291,10 @@ async fn given_unavailable_state_store_when_booting_should_fail_startup() {
     assert!(
         logs.contains("failed to load state") || logs.contains("StateLoadFailed"),
         "startup failure should point at the state load, got:\n{logs}"
+    );
+    assert!(
+        !logs.contains(STATE_URL_QUERY_SECRET),
+        "runtime startup and state-load failures must not log URL query secrets:\n{logs}"
     );
 }
 
@@ -325,6 +333,26 @@ async fn given_conflict_mid_stream_should_nack_and_latch(
 
     fixture.store.conflict_mode.store(true, Ordering::SeqCst);
     wait_for_status(harness, ConnectorStatus::Error).await;
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+    let stats: ConnectorRuntimeStats = Client::new()
+        .get(format!("{api_url}/stats"))
+        .send()
+        .await
+        .expect("stats request should complete")
+        .error_for_status()
+        .expect("stats endpoint should succeed")
+        .json()
+        .await
+        .expect("stats response should decode");
+    assert_eq!(stats.sources_total, 1);
+    assert_eq!(
+        stats.sources_running, 0,
+        "a latched source has Error status and must not count as running"
+    );
 
     let version_after_conflict = fixture.store.version.load(Ordering::SeqCst);
     let puts_after_conflict = fixture.store.put_count.load(Ordering::SeqCst);

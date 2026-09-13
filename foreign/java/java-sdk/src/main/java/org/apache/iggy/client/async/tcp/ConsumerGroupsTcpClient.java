@@ -104,13 +104,9 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     @Override
     public CompletableFuture<ConsumerGroupDetails> createConsumerGroup(
             StreamId streamId, TopicId topicId, String name) {
-        var streamIdBytes = BytesSerializer.toBytes(streamId);
-        var topicIdBytes = BytesSerializer.toBytes(topicId);
-        var payload = Unpooled.buffer(1 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
-
-        payload.writeBytes(streamIdBytes);
-        payload.writeBytes(topicIdBytes);
-        payload.writeBytes(BytesSerializer.toBytes(name));
+        var payload = BytesSerializer.toBytes(streamId);
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
+        payload.writeBytes(BytesSerializer.toBytes(name, "name"));
 
         log.debug("Creating consumer group - Stream: {}, Topic: {}, Name: {}", streamId, topicId, name);
 

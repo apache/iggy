@@ -35,12 +35,19 @@ impl Display for ServerConfig {
         write!(
             f,
             "{{ consumer_group: {}, data_maintenance: {}, \
-             heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, \
+             heartbeat: {}, path: {}, runtime: {{ path: {} }}, logging: {}, \
+             encryption: {}, memory_pool: {:?}, sharding: {:?}, \
+             quic: {}, tcp: {}, http: {}, telemetry: {}, \
              metadata: {}, message_bus: {}, partition: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
-            self.system,
+            self.path,
+            self.runtime.path,
+            self.logging,
+            self.encryption,
+            self.memory_pool,
+            self.sharding,
             self.quic,
             self.tcp,
             self.http,
@@ -56,10 +63,17 @@ impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, evicted_ring_capacity: {}, \
-             evicted_ring_bytes_max: {}, transfer_served_cache_bytes_max: {}, \
-             transfer_artifact_bytes_max: {} }}",
+            "{{ wal_bytes_max: {}, wal_group_commit_delay_micros: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
+             offset_reservation_lease: {}, \
+             evicted_ring_capacity: {}, evicted_ring_bytes_max: {}, \
+             transfer_served_cache_bytes_max: {}, transfer_artifact_bytes_max: {} }}",
+            self.wal_bytes_max,
+            self.wal_group_commit_delay_micros,
+            self.validate_checksum,
             self.prepare_queue_depth,
+            self.dedup_clients_max,
+            self.consumer_offsets_max,
+            self.offset_reservation_lease,
             self.evicted_ring_capacity,
             self.evicted_ring_bytes_max,
             self.transfer_served_cache_bytes_max,

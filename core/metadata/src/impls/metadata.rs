@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::MuxStateMachine;
+use crate::applied_frontier::AppliedFrontier;
 use crate::stm::authz::gated_apply;
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
@@ -66,6 +67,7 @@ use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 fn freeze_client_reply(
@@ -216,6 +218,20 @@ impl IggySnapshot {
 /// accepted (unverified, loudly) while a PRESENT but mismatching one refuses boot. A
 /// bare checksum could not tell those apart, and guessing wrong in either direction is
 /// unacceptable: silently accepting corruption, or bricking a healthy node.
+/// Committed ops one [`IggyMetadata::commit_journal`] call applies before
+/// returning to the pump.
+///
+/// The twin of `partitions::COMMIT_WALK_OPS_MAX`, and needed for the same
+/// reason: the walk reads a WAL body and applies it per op with no await the
+/// pump can interleave, and the resident `(commit_min, commit_max]` run is the
+/// whole backlog after a repair or a rejoin, not the pipeline depth.
+///
+/// Every caller is re-driven, so a truncated walk resumes rather than losing
+/// anything: `tick_metadata`'s walk backstop covers a follower and
+/// `resume_stranded_commits` covers the primary, both level-triggered on
+/// `commit_min < commit_max` every tick.
+const COMMIT_WALK_OPS_MAX: usize = 64;
+
 const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
 
 /// `magic` + the payload's [`checkpoint_checksum`].
@@ -677,7 +693,7 @@ pub fn apply_committed_prepare<M>(
 pub type CommitNotifier = std::rc::Rc<dyn Fn(Operation)>;
 
 pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
-    /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
+    /// `Some` on shard 0, `None` on other shards. Server bootstrap
     /// holds the invariant: only shard 0 owns the metadata consensus
     /// replica; every other shard reconstructs `mux_stm` from the
     /// `MetadataHandoff::Waiter` factory bundle broadcast by shard 0
@@ -688,7 +704,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// the WAL at all. They receive a `MetadataHandoff::Waiter` factory
     /// bundle from shard 0 over the bootstrap broadcast channel and
     /// reconstruct `mux_stm` from the in-memory snapshot it carries (see
-    /// `server/src/bootstrap.rs` `await_metadata_bundle` /
+    /// `server/src/boot/handoff.rs` `await_metadata_bundle` /
     /// `broadcast_metadata_bundle`).
     pub journal: Option<J>,
     /// `Some` on shard 0, `None` on other shards.
@@ -734,8 +750,13 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// policy.
     superblock_write_failures: Cell<u64>,
     superblock_retry_after_micros: Cell<u64>,
-    /// State machine - lives on all shards
-    pub mux_stm: M,
+    /// State machine - lives on all shards.
+    ///
+    /// Shared so shard 0's bootstrap can keep a clone alive past every
+    /// fallible step that owns this struct: the peer shards read through
+    /// handles minted off this writer, and dropping it makes their
+    /// `LeftRight::read` panic. See `server/src/boot::shard_main`.
+    pub mux_stm: Rc<M>,
     pub allocator: ConsensusGroupAllocator,
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
@@ -769,6 +790,38 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// whole snapshot on shard 0's pump, and hands each requester its own
     /// multi-MB copy.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
+    /// Prepares the backup gap check destroyed since `tick_metadata` last
+    /// drained the count into `metadata_prepare_gap_drops_total`. What it does
+    /// and does not prove is `IggyPartition::prepare_gap_drops`, verbatim; what
+    /// differs is the frontier the check runs against, the journal head rather
+    /// than the sequencer, so this also counts the ops that fall outside what
+    /// metadata repair can refill (an interior hole below the head, a forward
+    /// gap above `commit_max`).
+    ///
+    /// `Cell` because every method on this type takes `&self`.
+    prepare_gap_drops: Cell<u64>,
+    /// Highest metadata op whose apply has been PUBLISHED on this node, plus
+    /// the reads parked on it. Shared by every shard; see
+    /// [`AppliedFrontier`] for the ordering and the wake contract.
+    applied_frontier: Arc<AppliedFrontier>,
+}
+
+impl<B, J, S, M, SB> IggyMetadata<VsrConsensus<B>, J, S, M, SB>
+where
+    B: MessageBus,
+{
+    /// Resume the applied frontier where recovery left the state machine.
+    ///
+    /// Recovery replays the committed WAL prefix before any listener binds, so
+    /// without this the frontier reads zero on a rebooted node and every read
+    /// whose caller holds a pre-restart commit parks until its deadline. A
+    /// no-op on a peer shard, which owns no consensus and shares shard 0's
+    /// cell.
+    pub fn seed_applied_frontier_from_consensus(&self) {
+        if let Some(consensus) = self.consensus.as_ref() {
+            self.advance_applied_frontier(consensus.commit_min());
+        }
+    }
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
@@ -785,9 +838,10 @@ where
         journal: Option<J>,
         snapshot: Option<S>,
         superblock: Option<Rc<SB>>,
-        mux_stm: M,
+        mux_stm: impl Into<Rc<M>>,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let mux_stm = mux_stm.into();
         let allocator =
             ConsensusGroupAllocator::new(mux_stm.streams().highest_partition_consensus_group_id());
         let coordinator = data_dir.map(|dir| SnapshotCoordinator::new(dir, IggySnapshot::create));
@@ -808,11 +862,49 @@ where
             commit_notifier: RefCell::new(None),
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
+            prepare_gap_drops: Cell::new(0),
+            applied_frontier: Arc::default(),
         }
     }
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
+    /// Take and clear the gap-drop count (`prepare_gap_drops`).
+    #[must_use = "dropping the count loses the only record those prepares existed"]
+    pub const fn take_prepare_gap_drops(&self) -> u64 {
+        self.prepare_gap_drops.replace(0)
+    }
+
+    /// Share one process-wide applied frontier with every other shard.
+    ///
+    /// Consumed at construction rather than swapped in later: a shard that
+    /// served a read against its own private cell would gate on a number that
+    /// never moves. Shard 0 mints the cell in bootstrap, before any shard is
+    /// built, and hands each shard a clone.
+    #[must_use]
+    pub fn with_applied_frontier(mut self, applied_frontier: Arc<AppliedFrontier>) -> Self {
+        self.applied_frontier = applied_frontier;
+        self
+    }
+
+    /// The node-wide applied frontier, readable on every shard. Reads gate on
+    /// it so a client cannot be served state older than a write it already saw
+    /// acked, and park on its wait when it is behind.
+    #[must_use]
+    pub const fn applied_frontier(&self) -> &Arc<AppliedFrontier> {
+        &self.applied_frontier
+    }
+
+    /// Publish `op` as applied and wake the reads waiting at or below it.
+    /// Monotone, so a lower value is a no-op.
+    ///
+    /// Must run AFTER the apply's `publish()` and, on the commit path, in the
+    /// same await-free region as `advance_commit_min`: a reader that sees the
+    /// frontier must be guaranteed to see the op's effects.
+    pub fn advance_applied_frontier(&self, op: u64) {
+        self.applied_frontier.advance(op);
+    }
+
     /// Slot capacity of the LIVE client table, i.e. the largest transferred
     /// table this replica can absorb.
     ///
@@ -836,7 +928,7 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     }
 
     /// Install (or replace) the post-commit notifier. Passing `None`
-    /// removes any previous one. Server-ng bootstrap calls this on shard 0
+    /// removes any previous one. Server bootstrap calls this on shard 0
     /// only; peer shards never commit metadata locally.
     pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
         *self.commit_notifier.borrow_mut() = notifier;
@@ -845,7 +937,7 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// Seed the coordinator's last-checkpoint pairing at boot from the recovered
     /// snapshot, so the first post-boot view-change superblock write records the real
     /// `(checkpoint_op, checksum)` instead of `(0, 0)`. No-op without a coordinator
-    /// (peer shards, the simulator). Server-ng bootstrap calls this on shard 0 after
+    /// (peer shards, the simulator). Server bootstrap calls this on shard 0 after
     /// cross-checking the pairing.
     pub fn seed_checkpoint_ref(&self, checkpoint_op: u64, checkpoint_checksum: u128) {
         if let Some(coordinator) = &self.coordinator {
@@ -1219,6 +1311,8 @@ where
                     sequencer_op = current_op,
                     "on_replicate: dropping out-of-order prepare (gap)"
                 );
+                self.prepare_gap_drops
+                    .set(self.prepare_gap_drops.get().saturating_add(1));
                 return;
             }
         } else {
@@ -1270,6 +1364,12 @@ where
             }
             return;
         }
+
+        // Paired with the append, not with the sequencer advance below: a backup
+        // repairing under a `StartView` it already adopted is at the announced head
+        // already, so the entry arriving moves neither number the suffix snapshot
+        // is otherwise tagged by.
+        consensus.note_journal_mutation();
 
         // Journal mutation done; wire traffic below must not hold the gate.
         drop(journal_gate);
@@ -1474,10 +1574,15 @@ impl std::error::Error for StateTransferUnavailable {
 /// invites a caller to treat a completed install as a failure and redo it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallOutcome {
-    /// The receiver's new applied frontier, `max(snapshot_seq,
+    /// The receiver's applied position after the install, `max(snapshot_seq,
     /// local_applied)`. These differ whenever a serving peer offered a
     /// snapshot BEHIND this replica and the local state machine was kept.
-    pub applied_frontier: u64,
+    ///
+    /// Named apart from [`IggyMetadata::applied_frontier`] deliberately: that
+    /// one is the node-wide cell the read gate consults, which the install
+    /// raises to `snapshot_seq` alone, so the two carry different numbers
+    /// exactly when a behind-snapshot was kept.
+    pub installed_frontier: u64,
     /// Whether the transferred checkpoint's `(checkpoint_op, checksum)`
     /// pairing reached the durable superblock.
     ///
@@ -1611,7 +1716,7 @@ where
     /// reconciler's periodic full diff against the committed STM, which
     /// reads the restored state on its next tick.
     ///
-    /// Returns an [`InstallOutcome`]: the new applied frontier, plus whether
+    /// Returns an [`InstallOutcome`]: the installed frontier, plus whether
     /// the transferred checkpoint's pairing reached the durable superblock.
     ///
     /// # Errors
@@ -1754,10 +1859,10 @@ where
                 .await
                 .map_err(SnapshotError::Io)?;
             if removed > 0 {
-                // The DVC snapshot's `(op, commit)` tag does not move when
-                // entries are removed under it; left stale it would advertise
+                // The DVC snapshot's head and commit point do not move when
+                // entries are removed under them; left stale it would advertise
                 // headers this replica can no longer serve.
-                consensus.invalidate_local_dvc_suffix();
+                consensus.note_journal_mutation();
                 tracing::warn!(
                     snapshot_seq,
                     removed,
@@ -1839,6 +1944,7 @@ where
             if snapshot_seq > consensus.sequencer().current_sequence() {
                 consensus.sequencer().set_sequence(snapshot_seq);
             }
+            self.advance_applied_frontier(snapshot_seq);
         }
         // Before the superblock write, so the durable record carries the frontier
         // this transfer just established rather than the pre-transfer one.
@@ -1868,7 +1974,7 @@ where
         }
 
         Ok(InstallOutcome {
-            applied_frontier: snapshot_seq.max(local_applied),
+            installed_frontier: snapshot_seq.max(local_applied),
             pairing_durable,
         })
     }
@@ -2799,7 +2905,7 @@ where
                 // Normal op: apply SM, commit_reply. `Err` is decode/corruption
                 // only; a business rejection commits as a deterministic no-op
                 // whose `code` rides the reply body, replayed on retry.
-                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
+                let apply = gated_apply(&*self.mux_stm, prepare).unwrap_or_else(|err| {
                     panic!(
                         "on_ack: committed metadata op={} failed to apply: {err}",
                         prepare_header.op
@@ -2827,6 +2933,10 @@ where
                 reply
             };
             consensus.advance_commit_min(prepare_header.op);
+            // Paired with the counter bump, and before the reply leaves: a
+            // client that holds this reply may re-home onto any shard and read,
+            // and the read gate admits it only once the frontier covers the op.
+            self.advance_applied_frontier(prepare_header.op);
             emit_sim_event(SimEventKind::OperationCommitted, &event);
 
             // Fire subscriber BEFORE wire send. Slot already updated
@@ -3206,7 +3316,7 @@ where
         // (see the phantom-op comment at the call site).
         let client_table = self.client_table.borrow().to_snapshot();
         let checksum = match coordinator.persist_snapshot(
-            &self.mux_stm,
+            &*self.mux_stm,
             snap_op,
             created_at,
             Some(client_table),
@@ -3250,7 +3360,12 @@ where
             }
         }
 
-        if let Err(e) = coordinator.drain(journal, snap_op).await {
+        let drained = coordinator.drain(journal, snap_op).await;
+        // On the error path too: a drain that fails part-way still removed
+        // whatever it reached, and a snapshot left offering those bodies strands
+        // the peer that picks this replica as a repair source.
+        consensus.note_journal_mutation();
+        if let Err(e) = drained {
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -3361,7 +3476,12 @@ where
                 // node default is by then, not the value resolved at creation.
                 // Re-encoding also canonicalizes kinds (a `"128MiB"` string
                 // becomes `Uint64`), so the stored map reads back uniformly.
-                request.options = explicit.to_wire()?;
+                let supplied_options = request.options.clone();
+                request.options = explicit.to_explicit_wire(|key| {
+                    supplied_options
+                        .into_iter()
+                        .any(|entry| entry.key == key.as_bytes())
+                })?;
                 let resolved_segment_size = explicit
                     .segment_size
                     .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
@@ -3390,9 +3510,8 @@ where
                     resolved_max_topic_size,
                     TopicRuntimeDefaults {
                         segment_size: resolved_segment_size,
-                        enforce_fsync: explicit
-                            .enforce_fsync
-                            .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC),
+                        durability: iggy_common::Durability::default(),
+                        consumer_offset_durability: iggy_common::Durability::default(),
                         messages_required_to_save: explicit
                             .messages_required_to_save
                             .unwrap_or(iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE),
@@ -3407,6 +3526,7 @@ where
                             .preallocate_segments
                             .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
                     },
+                    &supplied_options,
                 )?;
                 let partitions = self
                     .allocator
@@ -3537,15 +3657,44 @@ where
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
+        let mut applied = 0usize;
         while consensus.commit_min() < consensus.commit_max() {
+            if applied == COMMIT_WALK_OPS_MAX {
+                debug!(
+                    "commit_journal: stopping at op={} after {applied} ops; resuming next tick",
+                    consensus.commit_min()
+                );
+                break;
+            }
+            applied += 1;
             let op = consensus.commit_min() + 1;
+
+            // Never apply the op the pipeline holds: `on_ack` pops that entry
+            // and advances past it, so applying it here strands it below
+            // `peek_committable_head`'s floor. Nothing pops it after that (the
+            // only `pop_committed_prepare` sits inside that loop), so its wire
+            // reply is never built and its `reply_sender` neither fires nor drops.
+            //
+            // Compared per op, not hoisted: the body read below awaits and a
+            // sibling driver can move the head. Comparing against `op` also gets
+            // the two edge cases right for free -- an absent head is a backup's
+            // empty pipeline and caps nothing, and a head at or below `commit_min`
+            // is already stranded and must not freeze the walk on top of that.
+            if consensus
+                .pipeline_head_header()
+                .is_some_and(|head| head.op == op)
+            {
+                break;
+            }
 
             let Some(header) = journal.handle().header(op as usize) else {
                 // Gap-stop: the walk halts at the first missing prepare and
-                // resumes once it is refilled. Live drops refill via the
-                // primary's prepare retransmit; a replica behind at recovery
-                // or after StartView adoption arms a `MetadataRepairSession`
-                // (shard) that re-requests the missing window.
+                // resumes once it is refilled -- by the primary's retransmit
+                // while the op still lacks quorum, otherwise by a
+                // `MetadataRepairSession` (shard), armed at recovery, at
+                // StartView adoption, or by `tick_metadata`'s gap detector,
+                // which is the only one of those a live drop under sustained
+                // traffic reaches.
                 break;
             };
             let header = *header;
@@ -3567,13 +3716,14 @@ where
             // table, while their state-machine effects still have to replay
             // (the snapshot sits at a lower op).
             apply_committed_prepare(
-                &self.mux_stm,
+                &*self.mux_stm,
                 &self.client_table,
                 self.client_table_mutation_allowed(header.op),
                 |operation| self.fire_commit_notifier(operation),
                 prepare,
             );
             consensus.advance_commit_min(op);
+            self.advance_applied_frontier(op);
             debug!("commit_journal: committed op={op}");
         }
     }
@@ -4056,7 +4206,9 @@ mod tests {
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_common::variadic;
     use journal::prepare_journal::PrepareJournal;
-    use message_bus::{ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError};
+    use message_bus::{
+        BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError,
+    };
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
     use std::cell::RefCell;
@@ -4177,6 +4329,20 @@ mod tests {
     /// touches their methods.
     fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
         IggyMetadata::new(None, None, None, None, TestMux::default(), None)
+    }
+
+    #[test]
+    fn take_prepare_gap_drops_drains_the_count() {
+        let md = peer_metadata();
+        assert_eq!(md.take_prepare_gap_drops(), 0);
+
+        md.prepare_gap_drops.set(2);
+        assert_eq!(md.take_prepare_gap_drops(), 2);
+        assert_eq!(
+            md.take_prepare_gap_drops(),
+            0,
+            "a second drain must not re-report drops the metrics already counted"
+        );
     }
 
     #[test]
@@ -4389,7 +4555,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -4545,7 +4711,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             if self.stall.get() {
                 self.stall_hits.set(self.stall_hits.get() + 1);
@@ -4958,6 +5124,93 @@ mod tests {
             "backup dropped the prepare its journal needed next because its sequencer \
              was ahead; the primary's retransmit of this op can never be accepted, so \
              the op never commits and its client never gets a reply"
+        );
+    }
+
+    /// The walk cap bounds ONE `commit_journal` call, not the backlog.
+    ///
+    /// The resident `(commit_min, commit_max]` run after a repair window or a
+    /// rejoin is the whole backlog, and the walk applies each op with no await
+    /// the pump can interleave, so an uncapped call holds the shard for all of
+    /// it. Every caller is re-driven every tick, so stopping short loses
+    /// nothing; a cap that did NOT resume would pin `commit_min` until the next
+    /// op to commit trips `advance_commit_min`'s sequential assert.
+    #[compio::test]
+    async fn commit_journal_stops_at_the_walk_cap_and_resumes_on_the_next_call() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// The cap, as an op count.
+        const CAP: u64 = COMMIT_WALK_OPS_MAX as u64;
+        /// One op past the cap, so the first call must stop short and the
+        /// second must have something left to finish.
+        const OPS: u64 = CAP + 1;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0: a backup, so `on_replicate` journals each
+        // prepare without the primary's pipeline commit path running under it.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        for request in 1..=OPS {
+            let prepare = md
+                .prepare_request(create_stream_request(
+                    CLIENT,
+                    request,
+                    &format!("s{request}"),
+                ))
+                .expect("CreateStream is client-allowed");
+            md.on_replicate(prepare).await;
+        }
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(journal.last_op(), Some(OPS), "every op must be resident");
+        assert_eq!(consensus.commit_min(), 0, "no commit heartbeat has landed");
+
+        // What a repair window or a rejoin leaves behind: the whole run
+        // committed by the group and resident here, none of it walked.
+        consensus.advance_commit_max(OPS);
+
+        md.commit_journal().await;
+        assert_eq!(
+            consensus.commit_min(),
+            CAP,
+            "one call walked the whole backlog; the pump is blocked for as long \
+             as the resident run is, however long that is"
+        );
+
+        md.commit_journal().await;
+        assert_eq!(
+            consensus.commit_min(),
+            OPS,
+            "the walk did not resume where it stopped, so `commit_min` is pinned \
+             below `commit_max` with no other re-driver"
         );
     }
 
@@ -5671,6 +5924,12 @@ mod tests {
         assert!(
             journal_handle.header(1).is_some() && journal_handle.header(2).is_some(),
             "ops at or below the floor stay for the walk and tail repair"
+        );
+        assert_eq!(
+            md.applied_frontier().get(),
+            SNAPSHOT_SEQ,
+            "the snapshot IS ops up to its sequence applied, so the read gate has \
+             to admit reads at the floor the install jumped to"
         );
     }
 

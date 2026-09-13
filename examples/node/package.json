@@ -21,7 +21,8 @@
     "test:stream-builder": "tsx src/stream-builder/example.ts",
     "test:sink-data-producer": "tsx src/sink-data-producer/producer.ts",
     "test:tcp-tls:producer": "tsx src/tcp-tls/producer.ts",
-    "test:tcp-tls:consumer": "tsx src/tcp-tls/consumer.ts"
+    "test:tcp-tls:consumer": "tsx src/tcp-tls/consumer.ts",
+    "test:unit": "node --import tsx --experimental-test-module-mocks --test tests/*.test.mjs"
   },
   "keywords": [
     "iggy",
@@ -39,9 +40,9 @@
   "devDependencies": {
     "@types/debug": "^4.1.12",
     "@types/node": "^22.9.3",
-    "eslint": "^10.8.1",
+    "eslint": "^10.9.1",
     "jiti": "^2.7.0",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.13",
     "typescript-eslint": "^8.47.0"
   },
   "overrides": {

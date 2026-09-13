@@ -48,14 +48,14 @@ testcontainers = "2.0.5"
 netty = "4.2.17.Final"
 
 # Spotbugs
-spotbugs = "4.10.3"
+spotbugs = "4.10.4"
 
 # Config
 typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.10.0"
+spotless = "8.10.1"
 shadow = "9.6.1"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"

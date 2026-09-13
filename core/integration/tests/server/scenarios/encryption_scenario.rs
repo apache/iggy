@@ -482,7 +482,7 @@ fn encryption_disabled() -> bool {
 /// the segment files directly. Both knobs are topic creation options now.
 fn eager_flush_options() -> TopicCreateOptions {
     TopicCreateOptions {
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         messages_required_to_save: Some(1),
         ..TopicCreateOptions::default()
     }
@@ -492,12 +492,9 @@ fn build_server_config(encryption: bool) -> TestServerConfig {
     let mut extra_envs = HashMap::new();
 
     if encryption {
+        extra_envs.insert("IGGY_ENCRYPTION_ENABLED".to_string(), "true".to_string());
         extra_envs.insert(
-            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
-            "true".to_string(),
-        );
-        extra_envs.insert(
-            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
+            "IGGY_ENCRYPTION_KEY".to_string(),
             "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
         );
     }

@@ -18,8 +18,10 @@
 using System.Net;
 using System.Text;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Tests.ClientTests;
 
@@ -38,7 +40,7 @@ public sealed class HttpTopicOptionsTests
                                                "partitions_count": 1,
                                                "partitions": [],
                                                "options": {
-                                                 "enforce_fsync": { "value": "true", "explicit": true },
+                                                 "preallocate_segments": { "value": "true", "explicit": true },
                                                  "segment_size": { "value": "134217728", "explicit": false }
                                                }
                                              }
@@ -63,10 +65,10 @@ public sealed class HttpTopicOptionsTests
                                                   "description": "Segment size in bytes"
                                                 },
                                                 {
-                                                  "key": "enforce_fsync",
+                                                  "key": "preallocate_segments",
                                                   "kind": "bool",
                                                   "default_value": [0],
-                                                  "description": "Whether writes to this topic's partitions fsync"
+                                                  "description": "Message completion policy: replicated or persisted"
                                                 }
                                               ]
                                               """;
@@ -84,7 +86,7 @@ public sealed class HttpTopicOptionsTests
 
         Assert.NotNull(topic);
         var explicitOption = Assert.Single(topic.Options!);
-        Assert.Equal("enforce_fsync", explicitOption.Key.AsString());
+        Assert.Equal("preallocate_segments", explicitOption.Key.AsString());
         Assert.Equal("true", explicitOption.Value.ToString());
 
         var derivedOption = Assert.Single(topic.DerivedOptions!);
@@ -93,16 +95,17 @@ public sealed class HttpTopicOptionsTests
     }
 
     [Fact]
-    public async Task CreateTopic_SendsABoolOptionAsTheWordTheServerParses()
+    public async Task CreateTopic_SendsDurabilityAndIndependentOffsetDefault()
     {
         var handler = new StubHandler(TopicResponseJson);
         var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
 
         await client.CreateTopicAsync(StreamId, "topic", 1,
-            options: new TopicOptions { EnforceFsync = true, SegmentSize = 134217728 }.ToDictionary(),
+            options: new TopicOptions { Durability = Apache.Iggy.Enums.Durability.Persisted, SegmentSize = 134217728 }.ToDictionary(),
             token: TestContext.Current.CancellationToken);
 
-        Assert.Contains("\"enforce_fsync\":\"true\"", handler.RequestBody);
+        Assert.Contains("\"durability\":\"persisted\"", handler.RequestBody);
+        Assert.Contains("\"consumer_offset_durability\":\"replicated\"", handler.RequestBody);
         Assert.Contains("\"segment_size\":\"134217728\"", handler.RequestBody);
     }
 
@@ -138,7 +141,7 @@ public sealed class HttpTopicOptionsTests
         Assert.Equal(HeaderKind.Uint64, specs[1].Kind);
         Assert.Equal(1073741824UL, BitConverter.ToUInt64(specs[1].DefaultValue));
 
-        Assert.Equal("enforce_fsync", specs[2].Key);
+        Assert.Equal("preallocate_segments", specs[2].Key);
         Assert.Equal(HeaderKind.Bool, specs[2].Kind);
         Assert.Equal([0], specs[2].DefaultValue);
     }
@@ -155,8 +158,60 @@ public sealed class HttpTopicOptionsTests
         Assert.Equal("/options/stream", handler.RequestPath);
     }
 
+    [Fact]
+    public async Task Dispose_Should_ReleaseTheOwnedHttpClient()
+    {
+        using var httpClient = new HttpClient(new StubHandler("[]"))
+        {
+            BaseAddress = new Uri("http://localhost")
+        };
+        var client = new HttpMessageStream(httpClient);
+        await client.DescribeOptionsAsync(OptionsScope.Stream, TestContext.Current.CancellationToken);
+
+        client.Dispose();
+        client.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            httpClient.GetAsync("/options/stream", TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task DeleteTopic_Should_PreserveServerStatus()
+    {
+        var handler = new StubHandler("""{"id":5,"code":"feature_unavailable","reason":"Delete disabled."}""")
+        {
+            StatusCode = HttpStatusCode.NotImplemented
+        };
+        using var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.DeleteTopicAsync(StreamId, Identifier.Numeric(2), TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
+        Assert.True(error.FromServer);
+    }
+
+    [Fact]
+    public async Task PurgeTopic_Should_SurfaceFailedResponse()
+    {
+        var handler = new StubHandler("""{"id":5,"code":"feature_unavailable","reason":"Purge disabled."}""")
+        {
+            StatusCode = HttpStatusCode.NotImplemented
+        };
+        using var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.PurgeTopicAsync(StreamId, Identifier.Numeric(2), TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
+        Assert.True(error.FromServer);
+        Assert.Equal("/streams/1/topics/2/purge", handler.RequestPath);
+    }
+
     private sealed class StubHandler(string json) : HttpMessageHandler
     {
+        internal HttpStatusCode StatusCode { get; init; } = HttpStatusCode.OK;
+
         internal string RequestBody { get; private set; } = string.Empty;
 
         internal string RequestPath { get; private set; } = string.Empty;
@@ -170,8 +225,9 @@ public sealed class HttpTopicOptionsTests
                 RequestBody = await request.Content.ReadAsStringAsync(ct);
             }
 
-            return new HttpResponseMessage(HttpStatusCode.OK)
+            return new HttpResponseMessage(StatusCode)
             {
+                RequestMessage = request,
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
         }

@@ -30,9 +30,10 @@ use axum::response::{IntoResponse, Response};
 use chrono::Local;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
-    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
+    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
+    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
@@ -118,12 +119,8 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
-use crate::auth::{verify_login_credentials, verify_pat_credentials};
-use crate::dispatch::{
-    resolve_consumer_offset_request, resolve_poll_request, validate_option_keys,
-    validate_topic_bounds, validate_topic_size_floor, warn_unenforceable_topic_size,
-    warn_unenforceable_topic_size_on_partition_add,
-};
+use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
@@ -131,8 +128,8 @@ use crate::http::error::{
 use crate::http::extractor::{Authenticated, Identity};
 use crate::http::metrics::gauge_value;
 use crate::http::reads::{
-    authorize_data_plane, authorize_read, read_local, resolve_gate_stream, resolve_gate_topic,
-    resolve_gate_topic_ids, resolve_gate_user,
+    authorize_data_plane, gate_local_read, read_local, resolve_gate_stream, resolve_gate_topic,
+    resolve_gate_topic_ids, resolve_gate_user, topic_durability,
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
@@ -149,6 +146,10 @@ use crate::http::wire::{
 use crate::responses::{
     build_polled_messages_body, build_raw_pat_reply, connected_client_to_response,
 };
+use crate::rewrite::{
+    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
+    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
+};
 use crate::snapshot;
 
 /// `GET /ping` response body, matching the legacy HTTP server's health probe.
@@ -164,11 +165,10 @@ const PONG: &str = "pong";
 const HTTP_READ_CLIENT_ID: u128 = 0;
 
 /// Response header attesting what durability a produce response proves:
-/// [`DURABILITY_REPLICATED_MEMORY`] after an awaited quorum commit,
-/// [`DURABILITY_NONE`] for a `?ack=none` fire-and-forget.
-const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
-
-const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
+/// The completed topic policy after an awaited quorum commit. If namespace
+/// replacement prevents attesting its incarnation, report the proven quorum
+/// guarantee. [`DURABILITY_NONE`] means `?ack=none` dispatch acceptance.
+pub(super) const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
 
 const DURABILITY_NONE: &str = "none";
 
@@ -334,9 +334,6 @@ pub(in crate::http) async fn get_stream(
 ) -> Result<Json<StreamDetails>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
-    // Resolve for the gate; a miss leaves it a pass-through so the read renders
-    // the existing 404 rather than a 403.
-    let scope = resolve_gate_stream(&state, &wire_stream_id);
     let request = GetStreamRequest {
         stream_id: wire_stream_id,
     };
@@ -347,8 +344,14 @@ pub(in crate::http) async fn get_stream(
         query.consistency,
         GET_STREAM_CODE,
         &body,
+        // Resolved when the rule RUNS, not here: `read_local` can park for the
+        // read-your-writes frontier, and an entity created during that wait
+        // would resolve to nothing on a pre-wait pass, where a miss is a
+        // pass-through. A miss still leaves the gate a pass-through so the read
+        // renders the existing 404 rather than a 403.
         |permissioner, uid| {
-            scope.map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
+            resolve_gate_stream(&state, &request.stream_id)
+                .map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
         },
     ))
     .await?;
@@ -370,7 +373,6 @@ pub(in crate::http) async fn get_topics(
 ) -> Result<Json<Vec<Topic>>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_stream(&state, &wire_stream_id);
     let request = GetTopicsRequest {
         stream_id: wire_stream_id,
     };
@@ -382,7 +384,8 @@ pub(in crate::http) async fn get_topics(
         GET_TOPICS_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
+            resolve_gate_stream(&state, &request.stream_id)
+                .map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
         },
     ))
     .await?;
@@ -406,7 +409,6 @@ pub(in crate::http) async fn get_topic(
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
     let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetTopicRequest {
         stream_id: wire_stream_id,
         topic_id: wire_topic_id,
@@ -419,9 +421,10 @@ pub(in crate::http) async fn get_topic(
         GET_TOPIC_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.get_topic(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_topic(uid, stream_id, topic_id)
+                })
         },
     ))
     .await?;
@@ -473,7 +476,6 @@ pub(in crate::http) async fn get_user(
         let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
         identifier_to_wire(&user_id).map_err(ReadError::Rejected)?
     };
-    let is_self = resolve_gate_user(&state, &wire_user_id) == Some(identity.user_id as usize);
     let request = GetUserRequest {
         user_id: wire_user_id,
     };
@@ -485,6 +487,9 @@ pub(in crate::http) async fn get_user(
         GET_USER_CODE,
         &body,
         |permissioner, uid| {
+            #[allow(clippy::cast_possible_truncation)]
+            let is_self =
+                resolve_gate_user(&state, &request.user_id) == Some(identity.user_id as usize);
             if is_self {
                 Ok(())
             } else {
@@ -513,7 +518,6 @@ pub(in crate::http) async fn get_cgs(
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
     let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetConsumerGroupsRequest {
         stream_id: wire_stream_id,
         topic_id: wire_topic_id,
@@ -526,9 +530,10 @@ pub(in crate::http) async fn get_cgs(
         GET_CONSUMER_GROUPS_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.get_consumer_groups(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_consumer_groups(uid, stream_id, topic_id)
+                })
         },
     ))
     .await?;
@@ -552,7 +557,6 @@ pub(in crate::http) async fn get_cg(
     let group_id = Identifier::from_str_value(&group_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
     let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetConsumerGroupRequest {
         stream_id: wire_stream_id,
         topic_id: wire_topic_id,
@@ -566,9 +570,10 @@ pub(in crate::http) async fn get_cg(
         GET_CONSUMER_GROUP_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.get_consumer_group(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_consumer_group(uid, stream_id, topic_id)
+                })
         },
     ))
     .await?;
@@ -670,21 +675,28 @@ pub(in crate::http) async fn get_metrics(
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP
 /// download with the same headers the legacy server sets.
 ///
-/// Gated on the snapshot rule (`read_servers || manage_servers`) via the
-/// shared [`authorize_read`] gate. Collection shells out to system tools on a
-/// dedicated OS thread (see `snapshot::collect`); this handler only awaits the
-/// result handoff, which is `Send`, so no `SendWrapper` bridge is needed.
+/// Gated on the snapshot rule (`read_servers || manage_servers`) through the
+/// shared [`gate_local_read`], which also serves it behind the post-restart
+/// barrier; the archive itself carries no metadata answer to hold. Collection
+/// shells out to system tools on a dedicated OS thread (see
+/// `snapshot::collect`); this handler only awaits the result handoff, which is
+/// `Send`, so no `SendWrapper` bridge is needed.
 pub(in crate::http) async fn get_snapshot(
     State(state): State<HttpState>,
     identity: Identity,
     Query(query): Query<ConsistencyQuery>,
     Json(command): Json<GetSnapshot>,
 ) -> Result<(HeaderMap, Body), ReadError> {
-    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
-        permissioner.get_snapshot(uid)
-    })?;
+    SendWrapper::new(gate_local_read(
+        &state,
+        &identity,
+        query.consistency,
+        GET_SNAPSHOT_FILE_CODE,
+        Permissioner::get_snapshot,
+    ))
+    .await?;
     let archive = snapshot::collect(
-        Arc::clone(&state.system_config),
+        Arc::clone(&state.server_config),
         command.compression,
         command.snapshot_types,
     )
@@ -727,18 +739,23 @@ pub(in crate::http) async fn get_cluster_metadata(
 /// Unlike the entity reads, connections live in each shard's session manager,
 /// not the metadata STM, so this scatter-gathers over the shard mesh
 /// (`list_all_clients`) instead of going through [`read_local`]. It still runs
-/// the identical per-op + consistency gate via [`authorize_read`], so its
-/// authorization matches every metadata read. The gather future is `!Send`,
-/// bridged onto shard 0's thread by `SendWrapper` exactly as the write path
-/// bridges its submit.
+/// the identical gates via [`gate_local_read`] - the consumer-group counts it
+/// reports come off the streams STM, so its binary twin holds it for the read
+/// frontier too. The gather future is `!Send`, bridged onto shard 0's thread by
+/// `SendWrapper` exactly as the write path bridges its submit.
 pub(in crate::http) async fn get_clients(
     State(state): State<HttpState>,
     identity: Identity,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<ClientInfo>>, ReadError> {
-    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
-        permissioner.get_clients(uid)
-    })?;
+    SendWrapper::new(gate_local_read(
+        &state,
+        &identity,
+        query.consistency,
+        GET_CLIENTS_CODE,
+        Permissioner::get_clients,
+    ))
+    .await?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     let response = GetClientsResponse {
         clients: infos
@@ -763,9 +780,14 @@ pub(in crate::http) async fn get_client(
     Path(client_id): Path<u32>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<ClientInfoDetails>, ReadError> {
-    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
-        permissioner.get_client(uid)
-    })?;
+    SendWrapper::new(gate_local_read(
+        &state,
+        &identity,
+        query.consistency,
+        GET_CLIENT_CODE,
+        Permissioner::get_client,
+    ))
+    .await?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     // The wire client id is the u32 seq tail of the u128 transport id.
     #[allow(clippy::cast_possible_truncation)]
@@ -918,7 +940,27 @@ pub(in crate::http) async fn create_topic(
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     // Rejects empty/oversized name and partitions_count > MAX.
     command.validate().map_err(WriteError::Rejected)?;
+    let durability = command
+        .options
+        .get(iggy_common::topic_option_keys::DURABILITY)
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| WriteError::Rejected(IggyError::InvalidOptionValue("durability".to_string())))?
+        .unwrap_or_default();
+    let consumer_offset_durability = command
+        .options
+        .get(iggy_common::topic_option_keys::CONSUMER_OFFSET_DURABILITY)
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| {
+            WriteError::Rejected(IggyError::InvalidOptionValue(
+                "consumer_offset_durability".to_string(),
+            ))
+        })?
+        .unwrap_or_default();
     let options = TopicCreateOptions {
+        durability,
+        consumer_offset_durability,
         partitions_count: Some(command.partitions_count),
         compression_algorithm: (command.compression_algorithm != CompressionAlgorithm::default())
             .then_some(command.compression_algorithm),
@@ -929,7 +971,9 @@ pub(in crate::http) async fn create_topic(
         raw: command.options,
         ..TopicCreateOptions::default()
     };
-    let wire_options = options.to_wire().map_err(WriteError::Rejected)?;
+    let wire_options = options
+        .to_explicit_wire(|key| options.raw.contains_key(key))
+        .map_err(WriteError::Rejected)?;
     // Re-parse the encoded block so `--set`-style raw string entries get the
     // same typed pre-consensus checks as native fields; unknown keys deny
     // here with the key name.
@@ -1216,17 +1260,19 @@ pub(in crate::http) async fn poll_messages(
 ) -> Result<Json<PolledMessages>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic_ids(&state, &stream_id, &topic_id);
-    authorize_read(
+    SendWrapper::new(gate_local_read(
         &state,
         &identity,
         consistency.consistency,
+        POLL_MESSAGES_CODE,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.poll_messages(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic_ids(&state, &stream_id, &topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.poll_messages(uid, stream_id, topic_id)
+                })
         },
-    )?;
+    ))
+    .await?;
     let wire = poll_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
     let (namespace, partition_id, consumer, args) =
         match resolve_poll_request(&state.shard, &wire, HTTP_READ_CLIENT_ID) {
@@ -1271,6 +1317,7 @@ pub(in crate::http) async fn poll_messages(
             ))
         }
         Some(PartitionReadReply::NotFound) => Err(ReadError::NotFound),
+        Some(PartitionReadReply::Rejected(error)) => Err(ReadError::Rejected(error)),
         Some(_) => Err(ReadError::Rejected(IggyError::InvalidCommand)),
         None => Err(ReadError::Timeout),
     }
@@ -1295,21 +1342,24 @@ pub(in crate::http) async fn get_consumer_offset(
 ) -> Result<Json<ConsumerOffsetInfo>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic_ids(&state, &stream_id, &topic_id);
-    authorize_read(
+    SendWrapper::new(gate_local_read(
         &state,
         &identity,
         consistency.consistency,
+        GET_CONSUMER_OFFSET_CODE,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.get_consumer_offset(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic_ids(&state, &stream_id, &topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_consumer_offset(uid, stream_id, topic_id)
+                })
         },
-    )?;
+    ))
+    .await?;
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
-    let (namespace, partition_id, consumer) =
-        resolve_consumer_offset_request(&state.shard, &wire).map_err(|_| ReadError::NotFound)?;
+    let (namespace, partition_id, consumer) = resolve_consumer_offset_request(&state.shard, &wire)
+        .map_err(|_| ReadError::NotFound)?
+        .ok_or(ReadError::NotFound)?;
     let reply = SendWrapper::new(
         state
             .shard
@@ -1328,6 +1378,7 @@ pub(in crate::http) async fn get_consumer_offset(
         Some(
             PartitionReadReply::ConsumerOffset { stored: None, .. } | PartitionReadReply::NotFound,
         ) => Err(ReadError::NotFound),
+        Some(PartitionReadReply::Rejected(error)) => Err(ReadError::Rejected(error)),
         Some(_) => Err(ReadError::Rejected(IggyError::InvalidCommand)),
         None => Err(ReadError::Timeout),
     }
@@ -1342,7 +1393,7 @@ pub(in crate::http) async fn get_consumer_offset(
 /// consensus (at-least-once, no dedup, no session gate - concurrent produces
 /// on one credential are legal), and the committed reply comes back through
 /// the session's in-process reply slot rather than a submit return value.
-/// The default answers 201 + `Iggy-Durability: replicated-memory` only
+/// The default answers 201 with the completed message durability only
 /// after the quorum commit, with the commit's per-partition confirmations as
 /// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
 /// after dispatch and can carry no confirmation, having awaited none.
@@ -1372,6 +1423,13 @@ pub(in crate::http) async fn send_messages(
     .map_err(PartitionWriteError::Rejected)?;
     // Rejects an oversized partitioning key and an empty or oversized batch.
     command.validate().map_err(PartitionWriteError::Rejected)?;
+    let policy = topic_durability(&state, &stream_id, &topic_id);
+    // Names can be reused while the session gate is held by another request.
+    let (stream_id, topic_id) = policy
+        .map(super::reads::TopicDurability::identifiers)
+        .transpose()
+        .map_err(PartitionWriteError::Rejected)?
+        .unwrap_or((stream_id, topic_id));
     let body = encode_send_messages(&stream_id, &topic_id, &command)
         .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
@@ -1383,10 +1441,10 @@ pub(in crate::http) async fn send_messages(
                 &body,
             ))
             .await?;
-            let durability = [(
-                DURABILITY_HEADER,
-                HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
-            )];
+            let policy = policy.map_or(iggy_common::Durability::Replicated, |policy| {
+                policy.confirmed_policy(&state)
+            });
+            let durability = [(DURABILITY_HEADER, HeaderValue::from_static(policy.into()))];
             // An unreadable confirmation still answers 201: the batch committed,
             // only its offsets did not survive the reply.
             let confirmations = send_confirmations(&reply, &header)
@@ -1438,13 +1496,26 @@ pub(in crate::http) async fn store_consumer_offset(
     let request = store_offset_wire_request(&stream_id, &topic_id, &command)
         .map_err(PartitionWriteError::Rejected)?;
     let body = request.to_bytes();
-    SendWrapper::new(partition_write_replicated(
+    let consumer_kind = command.consumer.kind;
+    let result = SendWrapper::new(partition_write_replicated(
         &state,
         &identity.session,
         Operation::StoreConsumerOffset,
         &body,
     ))
-    .await?;
+    .await;
+    if matches!(
+        &result,
+        Err(PartitionWriteError::Rejected(
+            IggyError::TooManyConsumerOffsets
+        ))
+    ) {
+        state
+            .shard
+            .metrics()
+            .record_consumer_offset_denied(consumer_kind);
+    }
+    result?;
     Ok(StatusCode::NO_CONTENT)
 }
 

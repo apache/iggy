@@ -21,7 +21,7 @@
 //! [`ShellBus`] bound, the [`ShellHandlers`] slot struct, and the
 //! `[cluster]` timer-to-tick translation every consensus group boots with.
 //! Everything here is type- and config-level; construction (wiring the
-//! handlers against a live bus) stays in [`crate::bootstrap`].
+//! handlers against a live bus) stays in [`crate::boot`].
 
 use crate::session_manager::SessionManager;
 use configs::server::ServerConfig;
@@ -39,7 +39,7 @@ use metadata::stm::mux::WithFactory;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use shard::shards_table::PapayaShardsTable;
-use shard::{IggyShard, ListClientsHandler, MetadataSubmitHandler, PartitionReadHandler};
+use shard::{IggyShard, ListClientsHandler, MetadataSubmitHandler};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -82,7 +82,7 @@ impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
 /// [`SessionManager`] the request-plane pair shares.
 ///
 /// Both production (`build_shard_for_thread`) and the simulator's shell
-/// mode construct these through [`crate::bootstrap::wire_shell_handlers`],
+/// mode construct these through [`crate::boot::wire_shell_handlers`],
 /// so the request plane is wired one way. The simulator's shell-off fast
 /// path uses [`ShellHandlers::noop`] instead.
 pub struct ShellHandlers {
@@ -90,7 +90,6 @@ pub struct ShellHandlers {
     pub on_client_request: RequestHandler,
     pub on_metadata_submit: MetadataSubmitHandler,
     pub on_list_clients: ListClientsHandler,
-    pub on_partition_read: PartitionReadHandler,
     /// Bound by the client-request handler, read by the get-clients
     /// handler; the caller keeps it to reach locally-homed sessions.
     pub sessions: Rc<RefCell<SessionManager>>,
@@ -108,7 +107,6 @@ impl ShellHandlers {
             on_client_request: Rc::new(|_, _| {}),
             on_metadata_submit: Rc::new(|_| {}),
             on_list_clients: Rc::new(|_| {}),
-            on_partition_read: Rc::new(|_, _, _| {}),
             sessions: Rc::new(RefCell::new(SessionManager::new())),
         }
     }
@@ -197,6 +195,19 @@ pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
 pub(crate) fn repair_retry_ticks(config: &ServerConfig) -> u32 {
     u32::try_from(duration_to_ticks(
         config.cluster.repair_retry_interval.get_duration(),
+    ))
+    .unwrap_or(u32::MAX)
+}
+
+/// `[cluster] repair_gap_debounce_interval` in consensus ticks: how long a
+/// backup holds a hole before the tick opens a repair session for it, on either
+/// plane. Deliberately NOT the retry interval above: that one paces an open
+/// stream, and pairing them means quieting retry chatter also widens how long a
+/// replication hole stays open. The shard applies
+/// [`shard::REPAIR_GAP_DEBOUNCE_TICKS_MIN`] as a floor on top.
+pub(crate) fn repair_gap_debounce_ticks(config: &ServerConfig) -> u32 {
+    u32::try_from(duration_to_ticks(
+        config.cluster.repair_gap_debounce_interval.get_duration(),
     ))
     .unwrap_or(u32::MAX)
 }

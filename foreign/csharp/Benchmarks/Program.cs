@@ -44,16 +44,6 @@ for (var i = 0; i < producerCount; i++)
         BaseAddress = "127.0.0.1:8090",
         Protocol = Protocol.Tcp,
         LoggerFactory = loggerFactory,
-#if OS_LINUX
-        ReceiveBufferSize = Int32.MaxValue,
-        SendBufferSize = Int32.MaxValue,
-#elif OS_WINDOWS
-        ReceiveBufferSize = int.MaxValue,
-        SendBufferSize = int.MaxValue,
-#elif OS_MAC
-        ReceiveBufferSize = 7280 * 1024,
-        SendBufferSize = 7280 * 1024,
-#endif
     });
 
     await bus.LoginUserAsync("iggy", "iggy");

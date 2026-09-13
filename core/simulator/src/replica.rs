@@ -19,7 +19,7 @@ use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
@@ -30,9 +30,9 @@ use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::RestoreSnapshot;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
-use metadata::{IggyMetadata, apply_committed_prepare};
+use metadata::{AppliedFrontier, IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
-use server::bootstrap::wire_shell_handlers;
+use server::boot::wire_shell_handlers;
 use server::shell::{ShellHandlers, ShellShardHandle};
 use server_common::crypto;
 use server_common::sharding::{METADATA_GROUP, ShardId};
@@ -157,6 +157,7 @@ pub fn new_shard(
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
     seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
+    applied_frontier: Arc<AppliedFrontier>,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
@@ -304,7 +305,8 @@ pub fn new_shard(
         superblock,
         mux,
         data_dir,
-    );
+    )
+    .with_applied_frontier(applied_frontier);
 
     // Both halves are load-bearing: the pairing keeps a later view-change superblock
     // write from regressing to `(0, 0)`, and the folded table is the floor the replayed
@@ -360,7 +362,7 @@ pub fn new_shard(
             // every op above the floor must mutate the table. A frontier only fences a
             // LIVE table a state transfer just replaced.
             apply_committed_prepare(
-                &metadata.mux_stm,
+                &*metadata.mux_stm,
                 &metadata.client_table,
                 true,
                 |_| {},
@@ -368,6 +370,8 @@ pub fn new_shard(
             );
         }
     }
+    // Same seed the server bootstrap runs after its own replay.
+    metadata.seed_applied_frontier_from_consensus();
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
     // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.
     let metadata_bundle = (shard_idx == 0).then(|| metadata.mux_stm.factory_bundle());
@@ -375,9 +379,9 @@ pub fn new_shard(
     let partitions_config = PartitionsConfig {
         messages_required_to_save: 1000,
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
-        enforce_fsync: false, //Disable fsync for simulation
+
         validate_checksum: true,
-        segment_size: IggyByteSize::from(1024 * 1024 * 1024),
+        segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
         preallocate_segments: false,
         encryptor: None,
         path_layout: PartitionPathLayout::default(),
@@ -403,14 +407,13 @@ pub fn new_shard(
         on_client_request,
         on_metadata_submit,
         on_list_clients,
-        on_partition_read,
         // Step 6 keeps this to register client sessions; unused shell-off.
         sessions: _,
     } = if shell {
         wire_shell_handlers(
             &SharedSimOutbox(Rc::clone(bus)),
             &shard_handle,
-            Arc::new(ServerSystemConfig::default()),
+            Arc::new(ServerConfig::default()),
             // Default-config PAT cap, like the system config above, so sim
             // ingress admits exactly what a default-configured server does.
             PersonalAccessTokenConfig::default().max_tokens_per_user,
@@ -427,12 +430,12 @@ pub fn new_shard(
             on_client_request,
             on_metadata_submit,
             on_list_clients,
-            on_partition_read,
             metadata,
             partitions,
             senders,
             inbox,
             reply_inbox,
+            ServerConfig::default().sharding.poll_completion_capacity,
             PapayaShardsTable::new(),
             shard::PartitionConsensusConfig::with_clock(
                 CLUSTER_ID,

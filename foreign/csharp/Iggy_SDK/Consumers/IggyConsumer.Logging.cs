@@ -122,6 +122,11 @@ public partial class IggyConsumer
         Message = "Waiting for {Remaining} milliseconds before polling messages")]
     private partial void LogWaitingBeforePolling(long remaining);
 
+    [LoggerMessage(EventId = 203,
+        Level = LogLevel.Debug,
+        Message = "No partition assigned to this group member, backing off for {BackoffMs} milliseconds")]
+    private partial void LogNoPartitionAssignedBackingOff(int backoffMs);
+
     [LoggerMessage(EventId = 301,
         Level = LogLevel.Warning,
         Message = "PartitionId is ignored when ConsumerType is ConsumerGroup")]

@@ -59,7 +59,7 @@ public class BasicMessagingOperationsSteps
         var loginResult = await _context.IggyClient.LoginUserAsync(TestEnvironment.RootUsername, TestEnvironment.RootPassword);
 
         loginResult.ShouldNotBeNull();
-        loginResult.UserId.ShouldBe(0);
+        loginResult.UserId.ShouldBe(0u);
     }
 
     [Given(@"I have no streams in the system")]

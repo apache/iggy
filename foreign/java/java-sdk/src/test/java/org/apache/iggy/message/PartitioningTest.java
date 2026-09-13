@@ -25,6 +25,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.charset.StandardCharsets;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -57,6 +59,64 @@ class PartitioningTest {
     void messagesKeyThrowsIggyInvalidArgumentExceptionWhenGivenValueThatIsTooLong() {
         var id = "0".repeat(256);
         assertThatThrownBy(() -> Partitioning.messagesKey(id)).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void messagesKeyThrowsIggyInvalidArgumentExceptionWhenEncodedValueExceeds255BytesEvenIfUnder255Chars() {
+        var id = "あ".repeat(100);
+        assertThat(id.length()).isLessThan(255);
+        assertThatThrownBy(() -> Partitioning.messagesKey(id))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("300");
+    }
+
+    @Test
+    void constructorThrowsIggyInvalidArgumentExceptionWhenValueExceeds255Bytes() {
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.MessagesKey, new byte[256]))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("256");
+    }
+
+    @Test
+    void constructorThrowsIggyInvalidArgumentExceptionWhenMessagesKeyValueIsEmpty() {
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.MessagesKey, new byte[0]))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("1..255");
+    }
+
+    @Test
+    void constructorThrowsIggyInvalidArgumentExceptionWhenBalancedValueIsNotEmpty() {
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.Balanced, new byte[] {1}))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("Balanced");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 3, 5})
+    void constructorThrowsIggyInvalidArgumentExceptionWhenPartitionIdValueIsNotFourBytes(int length) {
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.PartitionId, new byte[length]))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("must be 4 bytes");
+    }
+
+    @Test
+    void constructorThrowsIggyInvalidArgumentExceptionWhenKindOrValueIsNull() {
+        assertThatThrownBy(() -> new Partitioning(null, new byte[0])).isInstanceOf(IggyInvalidArgumentException.class);
+        assertThatThrownBy(() -> new Partitioning(PartitioningKind.MessagesKey, null))
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void partitionIdThrowsIggyInvalidArgumentExceptionWhenIdIsNull() {
+        assertThatThrownBy(() -> Partitioning.partitionId(null)).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void messagesKeyEncodesValueAsUtf8() {
+        var result = Partitioning.messagesKey("世界");
+
+        assertThat(result.value()).isEqualTo("世界".getBytes(StandardCharsets.UTF_8));
+        assertThat(result.getSize()).isEqualTo(2 + 6);
     }
 
     @Test

@@ -19,6 +19,14 @@
   {{- if hasKey .Values.server "podSecurityContext" }}
     {{- fail "server.podSecurityContext has been moved to podSecurityContext (root level). Please update your values." }}
   {{- end }}
+  {{- if gt (int .Values.server.replicaCount) 1 }}
+    {{- fail "server.replicaCount > 1 is refused: the replicas share one PVC at one subPath and one advertised address, so they would run as independent servers writing the same data directory, and the server takes no lock against that. Run cluster mode instead: one release per node, each with server.cluster.enabled and its own server.cluster.selfReplicaId. See the Cluster Mode section of the chart README." }}
+  {{- end }}
+  {{- if .Values.server.cluster.enabled }}
+    {{- include "iggy.validateCluster" . }}
+  {{- end }}
+  {{- include "iggy.validateSecrets" . }}
+  {{- $ports := include "iggy.serverPorts" . | fromJson }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -27,17 +35,38 @@ metadata:
   labels:
     {{- include "iggy.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.server.replicaCount }}
+  {{- if .Values.server.strategy }}
+  strategy:
+    {{- toYaml .Values.server.strategy | nindent 4 }}
+  {{- else if .Values.server.hostNetwork }}
+  strategy:
+    type: Recreate
   {{- end }}
   selector:
     matchLabels:
       {{- include "iggy.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-  {{- with .Values.podAnnotations }}
+  {{- $secretsChecksum := "" }}
+  {{- if (include "iggy.createsSecret" .) }}
+    {{- $secretsChecksum = (include (print $.Template.BasePath "/server-secrets.yaml") . | sha256sum) }}
+  {{- end }}
+  {{- $rootChecksum := "" }}
+  {{- if and .Values.server.users.root.createSecret (not .Values.server.users.root.existingSecret.name) }}
+    {{- $rootChecksum = (include (print $.Template.BasePath "/root-user-credentials.yaml") . | sha256sum) }}
+  {{- end }}
+  {{- if or $secretsChecksum $rootChecksum .Values.podAnnotations }}
       annotations:
+    {{- if $secretsChecksum }}
+        checksum/server-secrets: {{ $secretsChecksum }}
+    {{- end }}
+    {{- if $rootChecksum }}
+        checksum/root-user-credentials: {{ $rootChecksum }}
+    {{- end }}
+    {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+    {{- end }}
   {{- end }}
       labels:
         {{- include "iggy.labels" . | nindent 8 }}
@@ -47,6 +76,11 @@ spec:
         {{- toYaml . | nindent 8 }}
   {{- end }}
       serviceAccountName: {{ include "iggy.serviceAccountName" . }}
+      enableServiceLinks: false
+  {{- if .Values.server.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+  {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -55,16 +89,34 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.server.image.pullPolicy }}
+  {{- if or .Values.server.cluster.enabled .Values.server.extraArgs }}
+          args:
+    {{- if .Values.server.cluster.enabled }}
+            - "--replica-id"
+            - {{ .Values.server.cluster.selfReplicaId | quote }}
+    {{- end }}
+    {{- range .Values.server.extraArgs }}
+            - {{ . | quote }}
+    {{- end }}
+  {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.server.ports.http }}
+              containerPort: {{ int $ports.http }}
               protocol: TCP
             - name: tcp
-              containerPort: {{ .Values.server.ports.tcp }}
+              containerPort: {{ int $ports.tcp }}
+              protocol: TCP
+            - name: websocket
+              containerPort: {{ int $ports.websocket }}
               protocol: TCP
             - name: quic
-              containerPort: {{ .Values.server.ports.quic }}
+              containerPort: {{ int $ports.quic }}
+              protocol: UDP
+  {{- if .Values.server.cluster.enabled }}
+            - name: tcp-replica
+              containerPort: {{ int $ports.tcpReplica }}
               protocol: TCP
+  {{- end }}
           env:
   {{- if .Values.server.users.root.existingSecret.name }}
             - name: IGGY_ROOT_USERNAME
@@ -98,12 +150,21 @@ spec:
       {{- $declaredInEnv = true }}
     {{- end }}
   {{- end }}
+  {{- if and .Values.server.cluster.enabled .Values.server.advertisedAddress }}
+    {{- fail "server.advertisedAddress is set together with server.cluster.enabled. In cluster mode the server ignores IGGY_NODE_ADVERTISED_ADDRESS and publishes the roster entry's ip, or its advertisedAddress when one is given, so set it on this node's server.cluster.nodes entry instead." }}
+  {{- end }}
   {{- if and $declaredInEnv .Values.server.advertisedAddress }}
     {{- fail "IGGY_NODE_ADVERTISED_ADDRESS is set in server.env and server.advertisedAddress is also set. The server.env entry wins and server.advertisedAddress is ignored. Please set only one." }}
   {{- end }}
-  {{- if not $declaredInEnv }}
+  {{- if and (not $declaredInEnv) (not .Values.server.cluster.enabled) }}
             - name: IGGY_NODE_ADVERTISED_ADDRESS
               value: {{ .Values.server.advertisedAddress | default (printf "%s.%s.svc.cluster.local" (include "iggy.fullname" .) .Release.Namespace) | quote }}
+  {{- end }}
+  {{- if .Values.server.cluster.enabled }}
+            {{- include "iggy.clusterEnv" . | nindent 12 }}
+  {{- end }}
+  {{- with (include "iggy.secretEnv" . | trim) }}
+            {{- . | nindent 12 }}
   {{- end }}
   {{- if .Values.server.env }}
     {{- range .Values.server.env }}
@@ -173,7 +234,7 @@ spec:
         {{- toYaml . | nindent 8 }}
   {{- end }}
       labels:
-        {{- include "iggy-ui.labels" . | nindent 8 }}-ui
+        {{- include "iggy-ui.labels" . | nindent 8 }}
     spec:
   {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
