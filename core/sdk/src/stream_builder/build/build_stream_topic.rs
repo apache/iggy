@@ -29,8 +29,7 @@ use tracing::{trace, warn};
 /// topic only when [`create_topic_if_not_exists()`] is set. When the switch is off, the function
 /// logs a warning and returns `Ok(())`. So you can decide how a missing stream or topic should be handled.
 ///
-/// A missing stream with the switch off leaves the topic alone as well, because the call returns
-/// at that point. A topic created here gets [`partitions_count()`] partitions, and takes the server
+/// A topic created here gets [`partitions_count()`] partitions, and takes the server
 /// defaults for message expiry and maximum size.
 ///
 /// # Errors
