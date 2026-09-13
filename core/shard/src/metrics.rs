@@ -107,14 +107,9 @@ pub mod frame_drop_variant {
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
     pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
-    /// A poll's auto-commit submit refused by the owning shard's own inbox.
-    ///
-    /// Its own series, not `PARTITION`: the poll is answered with a retriable
-    /// status and no frame of the client's was dropped, so counting it with
-    /// shed frames would read as a routing loss.
-    pub const PARTITION_AUTO_COMMIT: &str = "partition_auto_commit";
     pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
-    /// A completed disk poll could not enter the owner's inbox.
+    /// A disk poll could not reserve completion capacity or return its result
+    /// to the owning shard.
     pub const PARTITION_POLL_COMPLETION: &str = "partition_poll_completion";
 }
 
@@ -160,11 +155,10 @@ pub mod frame_drop_reason {
     pub const SUBMIT_TIMEOUT: &str = "submit_timeout";
 }
 
-// The tables only index the lazy fast-path cache below; a `{variant, reason}`
+// The tables only index the lazy cache below. A `{variant, reason}`
 // pair enters the `Family` (and therefore the scrape) the first time a drop
-// site actually produces it, so the unreachable corners of the 7 x 9 cross
-// product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 10;
+// site produces it, so unproduced combinations never enter the scrape.
+const VARIANT_COUNT: usize = 9;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -175,7 +169,6 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::FORWARD_REPLICA_SEND,
     frame_drop_variant::METADATA_COMMIT_TICK,
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
-    frame_drop_variant::PARTITION_AUTO_COMMIT,
     frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
     frame_drop_variant::PARTITION_POLL_COMPLETION,
 ];
@@ -394,9 +387,8 @@ impl ShardMetrics {
         );
     }
 
-    /// Best effort: counts explicit client denials read off the reply status
-    /// and the poll-side reservation refusals. A denial the pump answers to an
-    /// auto-commit submit has no client reply to read and is not counted.
+    /// Count consumer offset capacity denials from explicit client requests
+    /// and automatic commit admission during poll completion.
     pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
         self.consumer_offset_denied_counters[consumer_kind_index(kind)].inc();
     }

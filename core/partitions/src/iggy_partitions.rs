@@ -489,9 +489,10 @@ where
     }
 
     /// Validate and accept a poll synchronously on the owning pump.
-    /// Send the reply before driving any returned continuation through
-    /// [`Self::replicate_poll_completion`]. Success does not acknowledge a
-    /// durable offset commit.
+    /// Attempt the reply synchronously, then immediately await any returned
+    /// continuation through [`Self::replicate_poll_completion`] on the same pump.
+    /// Do not suspend between acceptance and that call or discard the continuation.
+    /// Success does not acknowledge a durable offset commit.
     ///
     /// Acceptance is independent of reply delivery. A caller that stopped
     /// waiting does not cancel completion: an accepted read can still advance
@@ -516,16 +517,24 @@ where
 
     /// Drive an accepted poll's replication on the owning pump after its reply.
     /// Use the continuation returned by [`Self::complete_poll`] for this namespace.
+    /// Begin this call immediately after the synchronous reply attempt, with no
+    /// intervening suspension. Dropping the assigned prepare would leave an
+    /// unjournaled operation in the pipeline and prevent later commits.
     /// This call may suspend with a partition borrow, so it must remain on the
-    /// owning pump. A missing or tombstoned namespace drops the continuation.
+    /// owning pump.
+    ///
+    /// # Panics
+    /// Panics if the namespace is missing or tombstoned. Its availability cannot
+    /// change between acceptance and this call in the same synchronous owner turn.
     pub async fn replicate_poll_completion(
         &self,
         namespace: &IggyNamespace,
         replication: PollReplication,
     ) {
-        if let Some(partition) = self.get_mut_by_ns(namespace) {
-            partition.replicate_poll_completion(replication).await;
-        }
+        let partition = self
+            .get_mut_by_ns(namespace)
+            .expect("IggyPartitions invariant: accepted poll namespace missing or tombstoned");
+        partition.replicate_poll_completion(replication).await;
     }
 
     /// Read a consumer's stored offset + the partition commit offset. Fully
@@ -786,14 +795,17 @@ mod tests {
     use bytes::Bytes;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::Operation;
-    use iggy_common::{IggyByteSize, PartitionStats};
+    use iggy_common::{IggyByteSize, PartitionStats, PollingStrategy};
     use journal::Journal as _;
     use message_bus::IggyMessageBus;
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, PREPARE_SPLIT_POINT, SendMessagesOwned,
         stamp_prepare_for_persistence,
     };
-    use server_common::{Message, iobuf::Frozen};
+    use server_common::{
+        Message,
+        iobuf::{Frozen, Owned},
+    };
     use std::sync::Arc;
 
     const TEST_CLUSTER: u128 = 1;
@@ -1089,5 +1101,59 @@ mod tests {
             .is_none(),
             "no committed message at or after offset 3, so the poll is empty",
         );
+    }
+
+    #[compio::test]
+    #[should_panic(expected = "accepted poll namespace missing or tombstoned")]
+    async fn given_accepted_poll_when_namespace_is_tombstoned_should_trip_invariant() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let config = PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
+            validate_checksum: false,
+            segment_size: IggyByteSize::from(1024 * 1024),
+            preallocate_segments: false,
+            encryptor: None,
+            path_layout: crate::PartitionPathLayout::default(),
+        };
+        let partitions = IggyPartitions::new(ShardId::new(0), config);
+        partitions.insert(namespace, build_partition());
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let auto_commit = true;
+        let mut read_result = partitions
+            .build_poll_snapshot(
+                &namespace,
+                consumer,
+                &PollingArgs::new(PollingStrategy::next(), 1, auto_commit),
+            )
+            .expect("snapshot the current history")
+            .execute_resident();
+
+        // Supply a nonempty result with the captured history so acceptance
+        // assigns an automatic commit, without needing message I/O for this test.
+        read_result
+            .fragments
+            .push(crate::Fragment::whole(Owned::<4096>::zeroed(8).into()));
+        read_result.last_matching_offset = Some(0);
+        let replication = partitions
+            .complete_poll(&namespace, read_result)
+            .expect("accept automatic commit")
+            .replication
+            .expect("assign a prepare");
+        let partition = partitions.get_by_ns(&namespace).expect("partition exists");
+        let prepare_header = partition
+            .consensus()
+            .pipeline_head_header()
+            .expect("acceptance queued the prepare");
+        assert_eq!(prepare_header.operation, Operation::StoreConsumerOffset);
+        assert!(!partition.log.journal().inner.holds_op(prepare_header.op));
+
+        // A future caller that yields after acceptance could permit this
+        // tombstone. The partition still exists and must not lose its prepare.
+        partitions.tombstone(namespace);
+        assert!(partitions.local_idx(&namespace).is_some());
+        partitions
+            .replicate_poll_completion(&namespace, replication)
+            .await;
     }
 }

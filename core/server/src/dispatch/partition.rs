@@ -502,12 +502,12 @@ where
                 IggyError::ShardCommunicationError,
             ))
         }
-        other => {
+        Some(other) => {
             warn!(
                 transport_client_id,
                 namespace = namespace.inner(),
-                reply_was_none = other.is_none(),
-                "partition read failed; replying empty poll"
+                reply = ?other,
+                "unexpected partition poll reply; replying empty poll"
             );
             Err(ReadPolledMessagesError::Fallback(empty_poll_fallback(
                 partition_id,
