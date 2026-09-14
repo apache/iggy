@@ -46,6 +46,11 @@ harness = false
 required-features = ["bdd"]
 
 [[test]]
+name = "stream_topic_purge"
+harness = false
+required-features = ["bdd"]
+
+[[test]]
 name = "raw_command"
 harness = false
 required-features = ["bdd"]
