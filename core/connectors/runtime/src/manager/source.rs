@@ -103,12 +103,11 @@ impl SourceManager {
         }
     }
 
-    pub async fn recover_from_error(&self, key: &str) {
+    pub async fn recover_from_error(&self, key: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(source) = self.sources.get(key) {
             let mut source = source.lock().await;
             if source.info.status == ConnectorStatus::Error {
-                source.info.status = ConnectorStatus::Running;
-                source.info.last_error = None;
+                source.apply_status(ConnectorStatus::Running, metrics);
             }
         }
     }
@@ -666,7 +665,7 @@ mod tests {
         details.info.status = ConnectorStatus::Stopping;
         let manager = SourceManager::new(vec![details]);
 
-        manager.recover_from_error("pg").await;
+        manager.recover_from_error("pg", None).await;
 
         let source = manager.get("pg").await.unwrap();
         let details = source.lock().await;
@@ -678,7 +677,7 @@ mod tests {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
         manager.set_error("pg", "connection failed", None).await;
 
-        manager.recover_from_error("pg").await;
+        manager.recover_from_error("pg", None).await;
 
         let source = manager.get("pg").await.unwrap();
         let details = source.lock().await;

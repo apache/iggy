@@ -76,15 +76,22 @@ cdc_backend = "builtin"
 
 ## Delivery Failures
 
-Delivery is at-least-once, so consumers must tolerate duplicates. A failed send
-NACKs the batch and leaves its database progress uncommitted for redelivery.
+Each batch selected by the polling query is delivered at least once, so
+consumers must tolerate duplicates. Complete polling capture additionally
+requires transactions to become visible in tracking-column order. A transaction
+that commits below an already acknowledged cursor is not selected by a later
+poll, even when the tracking column is unique. A failed send NACKs the batch and
+leaves its database progress uncommitted for redelivery.
 After five consecutive NACKs, the source stops and requires a manual connector
 restart.
 
 Cleanup work and replication-slot advances are stored with the acknowledged
 checkpoint before they run. After a restart, the connector replays that work
 before polling new rows and then saves a state-only checkpoint to retire it.
-Checkpoints created by older connector versions remain compatible.
+Checkpoints created by older connector versions remain compatible unless they
+contain unfinished row cleanup without the row-version receipt required for
+safe replay. In that case, verify the affected rows and clear the connector
+state before restarting.
 
 ## Output Modes
 
@@ -222,7 +229,9 @@ the batch is acknowledged. The tracking column must be unique and non-null, and
 the query must return rows ordered by that column in ascending order. Custom
 queries without `$offset` do not advance the connector-managed offset. Cleanup
 operations remain bounded by the selected primary keys rather than by the custom
-query's cursor.
+query's cursor. When cleanup is enabled, the query result must include the
+resolved cleanup key. The connector joins the result to the configured source
+table in the same PostgreSQL snapshot to capture each selected row's version.
 
 The generated polling query also uses this scalar cursor. At startup, the
 connector rejects any generated query or `$offset` custom query whose tracking
@@ -237,6 +246,9 @@ The resolved cleanup key is `primary_key_column`, or `tracking_column` when the
 former is unset. For every configured table, it must be a non-null column with
 a valid single-column unique index. The connector validates this requirement
 at startup before enabling delete or mark operations.
+The resolved key, tracking column, cleanup action, and selected row versions are
+stored in the acknowledged checkpoint. A restart rejects incompatible cleanup
+configuration instead of applying old work to a different column or action.
 
 ### Delete After Read
 
@@ -269,7 +281,9 @@ When `processed_column` is set, the connector automatically adds a `WHERE is_pro
 With the generated polling query, a row whose tracking value moves past the
 batch boundary between poll and acknowledgement is left unchanged and returns
 in a later poll. Custom queries do not apply this boundary because their result
-order is not guaranteed.
+order is not guaranteed. Cleanup also matches the row version captured by the
+poll, so replay cannot delete or mark a replacement row that reused the same
+key.
 
 For generated polling queries, the connector persists the acknowledged offset
 before deleting or marking rows. If it stops in between, the rows have been

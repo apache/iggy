@@ -541,15 +541,13 @@ fn validate_source_topic_durability(
     topic_name: &str,
     options: TopicRuntimeOptions,
 ) -> Result<(), RuntimeError> {
-    if options.durability == Durability::Persisted
-        && options.messages_required_to_save == Some(SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE)
-    {
+    if options.durability == Durability::Persisted {
         return Ok(());
     }
 
     Err(RuntimeError::InvalidConfiguration(format!(
-        "Source destination topic '{stream_name}/{topic_name}' must use durability=persisted and messages_required_to_save={SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE}; found durability={}, messages_required_to_save={:?}",
-        options.durability, options.messages_required_to_save
+        "Source destination topic '{stream_name}/{topic_name}' must use durability=persisted; found durability={}",
+        options.durability
     )))
 }
 
@@ -790,7 +788,10 @@ pub(crate) async fn source_forwarding_loop(
                     .await;
             }
         } else if should_recover_source(batch_result, sent_count) {
-            context.sources.recover_from_error(&plugin_key).await;
+            context
+                .sources
+                .recover_from_error(&plugin_key, Some(&context.metrics))
+                .await;
         }
 
         let total_elapsed = total_start.elapsed();
@@ -1436,21 +1437,14 @@ mod tests {
     }
 
     #[test]
-    fn given_buffered_topic_when_validating_source_destination_should_reject() {
+    fn given_persisted_buffered_topic_when_validating_source_destination_should_accept() {
         let options = TopicRuntimeOptions {
             durability: Durability::Persisted,
             messages_required_to_save: Some(10),
             ..TopicRuntimeOptions::default()
         };
 
-        let error = validate_source_topic_durability("stream", "topic", options)
-            .expect_err("buffered topic must not precede source cleanup");
-
-        assert!(
-            error
-                .to_string()
-                .contains("messages_required_to_save=Some(10)")
-        );
+        assert!(validate_source_topic_durability("stream", "topic", options).is_ok());
     }
 
     #[test]

@@ -389,11 +389,11 @@ async fn handle_messages<T, F>(
                                 plugin_id,
                                 policy.max_consecutive_nacks,
                             ).await,
-                            PendingBatchClearResult::ResultReceived => result_receiver
+                            PendingBatchClearResult::ResultReceived
+                            | PendingBatchClearResult::Unavailable => result_receiver
                                 .as_mut()
                                 .await
                                 .unwrap_or(BatchCompletion::Stop),
-                            PendingBatchClearResult::Unavailable => BatchCompletion::Stop,
                         };
                         (completion, true)
                     },
@@ -413,11 +413,11 @@ async fn handle_messages<T, F>(
                                 plugin_id,
                                 policy.max_consecutive_nacks,
                             ).await,
-                            PendingBatchClearResult::ResultReceived => result_receiver
+                            PendingBatchClearResult::ResultReceived
+                            | PendingBatchClearResult::Unavailable => result_receiver
                                 .as_mut()
                                 .await
                                 .unwrap_or(BatchCompletion::Stop),
-                            PendingBatchClearResult::Unavailable => BatchCompletion::Stop,
                         };
                         (completion, false)
                     }

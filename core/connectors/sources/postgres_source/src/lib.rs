@@ -51,6 +51,7 @@ const MIN_CDC_POSTGRES_VERSION_NUM: i32 = 110_000;
 const NUMERIC_NAN_SIGN: u16 = 0xC000;
 const NUMERIC_POSITIVE_INFINITY_SIGN: u16 = 0xD000;
 const NUMERIC_NEGATIVE_INFINITY_SIGN: u16 = 0xF000;
+const ROW_VERSION_COLUMN: &str = "__iggy_row_version";
 
 #[derive(Debug)]
 pub struct PostgresSource {
@@ -142,10 +143,27 @@ enum PendingOperation {
         table: String,
         ids: Vec<String>,
         tracking_boundary: Option<String>,
+        #[serde(default)]
+        target: Option<CleanupTarget>,
+        #[serde(default)]
+        row_versions: Vec<String>,
     },
     AdvanceReplicationSlot {
         lsn: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CleanupTarget {
+    key_column: String,
+    tracking_column: String,
+    action: CleanupAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum CleanupAction {
+    Delete,
+    MarkProcessed { column: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,6 +190,7 @@ struct ProcessedRow {
     message: ProducedMessage,
     max_offset: Option<String>,
     row_pk: Option<String>,
+    row_version: Option<String>,
 }
 
 const CONNECTOR_NAME: &str = "PostgreSQL source";
@@ -260,6 +279,7 @@ impl Source for PostgresSource {
                 );
             }
             "polling" => {
+                self.validate_pending_cleanup()?;
                 self.validate_polling_keys().await?;
                 info!(
                     "PostgreSQL polling mode enabled for connector ID: {}",
@@ -283,14 +303,30 @@ impl Source for PostgresSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        let poll_interval = self.poll_interval;
-        tokio::time::sleep(poll_interval).await;
-
         let schema = match self.payload_format() {
             PayloadFormat::Bytea => Schema::Raw,
             PayloadFormat::Text => Schema::Text,
             PayloadFormat::JsonDirect | PayloadFormat::Json => Schema::Json,
         };
+
+        {
+            let pending = self.pending_batch.lock().await;
+            if let Some(pending) = pending
+                .as_ref()
+                .filter(|pending| pending.retiring_operations)
+            {
+                let state = self.serialize_state(&pending.state).ok_or_else(|| {
+                    Error::Serialization("failed to serialize PostgreSQL source state".to_string())
+                })?;
+                return Ok(ProducedMessages {
+                    schema,
+                    messages: Vec::new(),
+                    state: Some(state),
+                });
+            }
+        }
+
+        tokio::time::sleep(self.poll_interval).await;
 
         {
             let pending = self.pending_batch.lock().await;
@@ -474,6 +510,46 @@ impl PostgresSource {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_pending_cleanup(&mut self) -> Result<(), Error> {
+        let configured_target = self.cleanup_target();
+        for operation in &self.state.get_mut().pending_operations {
+            let PendingOperation::ProcessRows {
+                ids,
+                target,
+                row_versions,
+                ..
+            } = operation
+            else {
+                continue;
+            };
+
+            if ids.is_empty() {
+                continue;
+            }
+            let Some(target) = target else {
+                return Err(Error::InitError(
+                    "the restored PostgreSQL cleanup operation predates row-version safety; \
+                     clear the connector state only after verifying the rows manually"
+                        .to_string(),
+                ));
+            };
+            if row_versions.len() != ids.len() {
+                return Err(Error::InitError(
+                    "the restored PostgreSQL cleanup operation has incomplete row-version data"
+                        .to_string(),
+                ));
+            }
+            if configured_target.as_ref() != Some(target) {
+                return Err(Error::InitError(format!(
+                    "the PostgreSQL cleanup configuration changed while acknowledged cleanup is \
+                     pending; restore key '{}', tracking column '{}', and action {:?}",
+                    target.key_column, target.tracking_column, target.action
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -763,6 +839,11 @@ impl PostgresSource {
             } else {
                 self.build_polling_query(table, tracking_column, &last_offset, batch_size)?
             };
+            let query = if self.should_process_rows() {
+                self.attach_row_versions(&query, table, pk_column, tracking_column)?
+            } else {
+                query
+            };
 
             // Database I/O without holding the lock
             let rows = with_retry(
@@ -781,13 +862,15 @@ impl PostgresSource {
 
             let mut max_offset: Option<String> = None;
             let mut processed_ids = Vec::with_capacity(rows.len());
+            let mut row_versions = Vec::with_capacity(rows.len());
             let mut table_processed = 0;
 
             for row in rows {
                 let processed = self.process_row(&row, &table_config)?;
 
-                if let Some(pk) = processed.row_pk {
+                if let (Some(pk), Some(row_version)) = (processed.row_pk, processed.row_version) {
                     processed_ids.push(pk);
+                    row_versions.push(row_version);
                 }
                 if let Some(offset) = processed.max_offset {
                     max_offset = Some(offset);
@@ -806,6 +889,8 @@ impl PostgresSource {
                     table: table.clone(),
                     ids: processed_ids,
                     tracking_boundary: cleanup_boundary,
+                    target: self.cleanup_target(),
+                    row_versions,
                 });
             }
 
@@ -894,7 +979,13 @@ impl PostgresSource {
         deadline: tokio::time::Instant,
     ) -> Result<Vec<PendingOperation>, Error> {
         let mut failed_operations = Vec::new();
-        for operation in operations {
+        let mut operations = operations.into_iter();
+        while let Some(operation) = operations.next() {
+            if tokio::time::Instant::now() >= deadline {
+                failed_operations.push(operation);
+                failed_operations.extend(operations);
+                break;
+            }
             if !self.apply_pending_operation(&operation, deadline).await? {
                 failed_operations.push(operation);
             }
@@ -913,12 +1004,20 @@ impl PostgresSource {
                     table,
                     ids,
                     tracking_boundary,
+                    target,
+                    row_versions,
                 } => {
+                    if ids.is_empty() {
+                        return Ok(());
+                    }
+                    let target = target.as_ref().ok_or(Error::InvalidState)?;
                     let pool = self.get_pool()?;
                     self.mark_or_delete_processed_rows(
                         pool,
                         table,
                         ids,
+                        row_versions,
+                        target,
                         tracking_boundary.as_deref(),
                     )
                     .await
@@ -1010,6 +1109,8 @@ impl PostgresSource {
         pool: &Pool<Postgres>,
         table: &str,
         ids: &[String],
+        row_versions: &[String],
+        target: &CleanupTarget,
         tracking_boundary: Option<&str>,
     ) -> Result<(), Error> {
         if ids.is_empty() {
@@ -1017,16 +1118,13 @@ impl PostgresSource {
         }
 
         let quoted_table = quote_qualified_identifier(table)?;
-        let quoted_pk = quote_identifier(self.cleanup_key_column())?;
+        let row_condition = build_row_version_condition(&target.key_column, ids, row_versions)?;
         let tracking_condition =
-            build_tracking_condition(self.tracking_column(), tracking_boundary)?;
+            build_tracking_condition(&target.tracking_column, tracking_boundary)?;
 
-        let ids_list = format_cleanup_ids(ids);
-
-        if self.config.delete_after_read.unwrap_or(false) {
-            let delete_query = format!(
-                "DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list}){tracking_condition}"
-            );
+        if target.action == CleanupAction::Delete {
+            let delete_query =
+                format!("DELETE FROM {quoted_table} WHERE ({row_condition}){tracking_condition}");
 
             if self.verbose {
                 info!("Deleting {} processed rows from '{table}'", ids.len());
@@ -1041,11 +1139,11 @@ impl PostgresSource {
             )
             .await
             .map_err(|e| Error::Connection(format!("failed to delete processed rows: {e}")))?;
-        } else if let Some(processed_col) = &self.config.processed_column {
-            let quoted_processed = quote_identifier(processed_col)?;
+        } else if let CleanupAction::MarkProcessed { column } = &target.action {
+            let quoted_processed = quote_identifier(column)?;
             let update_query = format!(
                 "UPDATE {quoted_table} SET {quoted_processed} = TRUE \
-                 WHERE {quoted_pk} IN ({ids_list}){tracking_condition}"
+                 WHERE ({row_condition}){tracking_condition}"
             );
 
             if self.verbose {
@@ -1087,6 +1185,21 @@ impl PostgresSource {
 
     fn should_process_rows(&self) -> bool {
         self.config.delete_after_read.unwrap_or(false) || self.config.processed_column.is_some()
+    }
+
+    fn cleanup_target(&self) -> Option<CleanupTarget> {
+        let action = if self.config.delete_after_read.unwrap_or(false) {
+            CleanupAction::Delete
+        } else {
+            CleanupAction::MarkProcessed {
+                column: self.config.processed_column.clone()?,
+            }
+        };
+        Some(CleanupTarget {
+            key_column: self.cleanup_key_column().to_string(),
+            tracking_column: self.tracking_column().to_string(),
+            action,
+        })
     }
 
     fn cleanup_boundary(&self, max_offset: Option<String>) -> Option<String> {
@@ -1172,6 +1285,31 @@ impl PostgresSource {
 
         Ok(format!(
             "{base_query}{where_clause}{order_clause}{limit_clause}"
+        ))
+    }
+
+    fn attach_row_versions(
+        &self,
+        query: &str,
+        table: &str,
+        key_column: &str,
+        tracking_column: &str,
+    ) -> Result<String, Error> {
+        let quoted_table = quote_qualified_identifier(table)?;
+        let quoted_key = quote_identifier(key_column)?;
+        let quoted_tracking = quote_identifier(tracking_column)?;
+        let query = query.trim().trim_end_matches(';');
+        let order_clause = if self.uses_tracking_cursor() {
+            format!(" ORDER BY __iggy_rows.{quoted_tracking} ASC")
+        } else {
+            String::new()
+        };
+
+        Ok(format!(
+            "SELECT __iggy_rows.*, __iggy_source.xmin::text AS \"{ROW_VERSION_COLUMN}\" \
+             FROM ({query}) AS __iggy_rows \
+             JOIN {quoted_table} AS __iggy_source \
+               ON __iggy_source.{quoted_key} = __iggy_rows.{quoted_key}{order_clause}"
         ))
     }
 
@@ -1284,11 +1422,21 @@ impl PostgresSource {
         config: &RowProcessingConfig,
     ) -> Result<ProcessedRow, Error> {
         let mut row_pk: Option<String> = None;
+        let mut row_version: Option<String> = None;
         let mut max_offset: Option<String> = None;
         let mut extracted_payload: Option<Vec<u8>> = None;
         let mut data = serde_json::Map::new();
 
         for (i, column) in row.columns().iter().enumerate() {
+            if column.name() == ROW_VERSION_COLUMN {
+                row_version = Some(row.try_get(i).map_err(|error| {
+                    Error::InvalidRecordValue(format!(
+                        "failed to decode PostgreSQL row version: {error}"
+                    ))
+                })?);
+                continue;
+            }
+
             let column_name = if config.snake_case_columns {
                 to_snake_case(column.name())
             } else {
@@ -1311,6 +1459,14 @@ impl PostgresSource {
             }
 
             data.insert(column_name, value);
+        }
+
+        if self.should_process_rows() && (row_pk.is_none() || row_version.is_none()) {
+            return Err(Error::InvalidRecordValue(format!(
+                "polling cleanup requires query results to include key column '{}' and the \
+                 source row version",
+                config.pk_column
+            )));
         }
 
         let payload = if let Some(bytes) = extracted_payload {
@@ -1351,6 +1507,7 @@ impl PostgresSource {
             message,
             max_offset,
             row_pk,
+            row_version,
         })
     }
 
@@ -1952,11 +2109,27 @@ fn format_offset_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn format_cleanup_ids(ids: &[String]) -> String {
-    ids.iter()
-        .map(|id| format_offset_value(id))
+fn build_row_version_condition(
+    key_column: &str,
+    ids: &[String],
+    row_versions: &[String],
+) -> Result<String, Error> {
+    if ids.len() != row_versions.len() {
+        return Err(Error::InvalidState);
+    }
+    let quoted_key = quote_identifier(key_column)?;
+    Ok(ids
+        .iter()
+        .zip(row_versions)
+        .map(|(id, row_version)| {
+            format!(
+                "({quoted_key} = {} AND xmin = {}::xid)",
+                format_offset_value(id),
+                format_offset_value(row_version)
+            )
+        })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(" OR "))
 }
 
 fn substitute_query_tokens(query: &str, replacements: &[(&str, &str)]) -> String {
@@ -2440,10 +2613,39 @@ mod tests {
     }
 
     #[test]
-    fn given_cleanup_ids_when_formatting_should_quote_text_and_escape_apostrophes() {
+    fn given_cleanup_receipts_should_match_keys_and_row_versions() {
         let ids = vec!["100".to_string(), "O'Reilly".to_string()];
+        let row_versions = vec!["42".to_string(), "43".to_string()];
 
-        assert_eq!(format_cleanup_ids(&ids), "'100', 'O''Reilly'");
+        assert_eq!(
+            build_row_version_condition("id", &ids, &row_versions)
+                .expect("Failed to build row-version condition"),
+            "(\"id\" = '100' AND xmin = '42'::xid) OR \
+             (\"id\" = 'O''Reilly' AND xmin = '43'::xid)"
+        );
+    }
+
+    #[test]
+    fn given_cleanup_query_should_capture_row_versions_in_the_same_snapshot() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        config.primary_key_column = Some("id".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        let query = src
+            .attach_row_versions(
+                "SELECT * FROM \"users\" ORDER BY \"updated_at\" ASC LIMIT 500",
+                "users",
+                "id",
+                "updated_at",
+            )
+            .expect("Failed to attach row versions");
+
+        assert!(query.contains("__iggy_source.xmin::text AS \"__iggy_row_version\""));
+        assert!(query.contains(
+            "ON __iggy_source.\"id\" = __iggy_rows.\"id\" ORDER BY \
+             __iggy_rows.\"updated_at\" ASC"
+        ));
     }
 
     #[test]
@@ -3327,6 +3529,8 @@ mod tests {
                 table: "users".to_string(),
                 ids: Vec::new(),
                 tracking_boundary: Some("3".to_string()),
+                target: None,
+                row_versions: Vec::new(),
             }],
         };
         let connector_state =
@@ -3380,6 +3584,63 @@ mod tests {
             .await
             .expect("retirement checkpoint should complete");
         assert!(src.pending_batch.lock().await.is_none());
+    }
+
+    #[test]
+    fn given_pending_cleanup_when_cleanup_target_changes_should_reject_restart() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        config.primary_key_column = Some("id".to_string());
+        let state = State {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::new(),
+            processed_rows: 1,
+            pending_operations: vec![PendingOperation::ProcessRows {
+                table: "users".to_string(),
+                ids: vec!["1".to_string()],
+                tracking_boundary: None,
+                target: Some(CleanupTarget {
+                    key_column: "legacy_id".to_string(),
+                    tracking_column: "updated_at".to_string(),
+                    action: CleanupAction::Delete,
+                }),
+                row_versions: vec!["42".to_string()],
+            }],
+        };
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+        let mut src = PostgresSource::new(1, config, Some(connector_state));
+
+        assert!(matches!(
+            src.validate_pending_cleanup(),
+            Err(Error::InitError(_))
+        ));
+    }
+
+    #[test]
+    fn given_legacy_pending_cleanup_without_row_versions_should_reject_restart() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        let state = State {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::new(),
+            processed_rows: 1,
+            pending_operations: vec![PendingOperation::ProcessRows {
+                table: "users".to_string(),
+                ids: vec!["1".to_string()],
+                tracking_boundary: None,
+                target: None,
+                row_versions: Vec::new(),
+            }],
+        };
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+        let mut src = PostgresSource::new(1, config, Some(connector_state));
+
+        assert!(matches!(
+            src.validate_pending_cleanup(),
+            Err(Error::InitError(_))
+        ));
     }
 
     #[tokio::test]
@@ -3448,6 +3709,8 @@ mod tests {
                 table: "users".to_string(),
                 ids: vec!["3".to_string()],
                 tracking_boundary: Some("3".to_string()),
+                target: None,
+                row_versions: Vec::new(),
             },
             PendingOperation::AdvanceReplicationSlot {
                 lsn: "0/16D32A0".to_string(),
@@ -3510,6 +3773,12 @@ mod tests {
             table: "public.".to_string(),
             ids: vec!["3".to_string()],
             tracking_boundary: Some("3".to_string()),
+            target: Some(CleanupTarget {
+                key_column: "updated_at".to_string(),
+                tracking_column: "updated_at".to_string(),
+                action: CleanupAction::Delete,
+            }),
+            row_versions: vec!["1".to_string()],
         }];
         *src.pending_batch.lock().await = Some(PendingBatch {
             state: candidate_state,
@@ -3558,6 +3827,12 @@ mod tests {
             table: "public.".to_string(),
             ids: vec!["3".to_string()],
             tracking_boundary: Some("3".to_string()),
+            target: Some(CleanupTarget {
+                key_column: "updated_at".to_string(),
+                tracking_column: "updated_at".to_string(),
+                action: CleanupAction::Delete,
+            }),
+            row_versions: vec!["1".to_string()],
         }];
         *src.pending_batch.lock().await = Some(PendingBatch {
             state: candidate_state,
@@ -3597,6 +3872,8 @@ mod tests {
             table: "users".to_string(),
             ids: Vec::new(),
             tracking_boundary: None,
+            target: None,
+            row_versions: Vec::new(),
         };
 
         assert!(
@@ -3627,6 +3904,8 @@ mod tests {
             table: "users".to_string(),
             ids: Vec::new(),
             tracking_boundary: None,
+            target: None,
+            row_versions: Vec::new(),
         }];
         *src.pending_batch.lock().await = Some(PendingBatch {
             state: candidate_state,
