@@ -137,6 +137,13 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             return;
         }
         int replyOperation = VsrHeaders.readReplyOperation(msg);
+        if (VsrHeaders.peekCommand(msg) == VsrHeaders.COMMAND_REPLY
+                && (VsrOperation.isMetadata(replyOperation)
+                        || replyOperation == VsrOperation.REGISTER
+                        || replyOperation == VsrOperation.LOGOUT)
+                && replyOperation != VsrOperation.TRUNCATE_PARTITION) {
+            session.observeMetadata(msg.getLongLE(msg.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
+        }
         RequestKey key =
                 new RequestKey(VsrOperation.correlationOperation(replyOperation), VsrHeaders.readReplyRequestId(msg));
         CompletableFuture<ByteBuf> future = pendingRequests.remove(key);

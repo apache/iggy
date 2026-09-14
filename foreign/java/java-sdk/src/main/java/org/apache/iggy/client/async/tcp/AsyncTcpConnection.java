@@ -59,12 +59,14 @@ import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.exception.IggyTlsException;
+import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLException;
 import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -124,6 +126,7 @@ public class AsyncTcpConnection {
     private final AtomicBoolean isClosed = new AtomicBoolean(false);
     private final AtomicLong authGeneration = new AtomicLong(0);
     private final VsrRequestEncoder vsrEncoder;
+    private final ConsensusSession consensusSession;
     private final TransientFailoverHandler transientFailoverHandler;
     private final IntConsumer sessionResetListener;
     private final Consumer<Throwable> connectionFailureListener;
@@ -136,6 +139,7 @@ public class AsyncTcpConnection {
 
     private volatile int loginCommandCode;
     private volatile boolean authenticated = false;
+    private volatile long authenticatedUserId;
 
     public AsyncTcpConnection(
             String host,
@@ -193,7 +197,7 @@ public class AsyncTcpConnection {
             }
         }
 
-        ConsensusSession consensusSession = new ConsensusSession();
+        this.consensusSession = new ConsensusSession();
         this.vsrEncoder = new VsrRequestEncoder(consensusSession);
         this.ownsEventLoopGroup = sharedEventLoopGroup.isEmpty();
         this.eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> new MultiThreadIoEventLoopGroup(
@@ -334,6 +338,22 @@ public class AsyncTcpConnection {
         return eventLoop;
     }
 
+    IoEventLoopGroup eventLoopGroup() {
+        return eventLoopGroup;
+    }
+
+    long metadataWatermark() {
+        return consensusSession.metadataWatermark();
+    }
+
+    long sessionGeneration() {
+        return consensusSession.generation();
+    }
+
+    boolean isAuthenticated() {
+        return authenticated;
+    }
+
     public <T> CompletableFuture<T> exchangeForEntity(
             CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
         return send(commandCode, payload).thenApply(response -> {
@@ -402,7 +422,9 @@ public class AsyncTcpConnection {
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
         CompletableFuture<ByteBuf> callerFuture = new CompletableFuture<>();
         ByteBuf failoverPayload =
-                transientFailoverHandler != null && !isLoginCode(commandCode) ? payload.retainedDuplicate() : null;
+                transientFailoverHandler != null && !isLoginCode(commandCode) && !isPollRoutingCode(commandCode)
+                        ? payload.retainedDuplicate()
+                        : null;
 
         channelPool.acquire().addListener((FutureListener<Channel>) f -> {
             if (!f.isSuccess()) {
@@ -411,6 +433,19 @@ public class AsyncTcpConnection {
                 notifyConnectionFailure(f.cause());
                 callerFuture.completeExceptionally(mapAcquireException(f.cause()));
                 return;
+            }
+            if (callerFuture.isCancelled()) {
+                payload.release();
+                releaseIfPresent(failoverPayload);
+                releaseChannel(f.getNow());
+                return;
+            }
+            if (isPollRoutingCode(commandCode)) {
+                callerFuture.whenComplete((response, error) -> {
+                    if (callerFuture.isCancelled()) {
+                        f.getNow().close();
+                    }
+                });
             }
             dispatchAcquiredChannel(
                     f.getNow(),
@@ -581,7 +616,7 @@ public class AsyncTcpConnection {
             ByteBuf response,
             Throwable error) {
         try {
-            handlePostResponse(channel, commandCode, isLoginCommand, error);
+            handlePostResponse(channel, commandCode, isLoginCommand, response, error);
         } catch (RuntimeException bookkeepingError) {
             log.error("Post-response bookkeeping failed: {}", bookkeepingError.getMessage());
         }
@@ -700,6 +735,12 @@ public class AsyncTcpConnection {
                 || commandCode == CommandCode.PersonalAccessToken.LOGIN.getValue();
     }
 
+    private static boolean isPollRoutingCode(int commandCode) {
+        return commandCode == CommandCode.System.ATTACH_CONSUMER_SESSION.getValue()
+                || commandCode == CommandCode.Messages.GET_POLL_ROUTING.getValue()
+                || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue();
+    }
+
     private static boolean mutatesSessionState(int commandCode) {
         return isLoginCode(commandCode) || commandCode == CommandCode.User.LOGOUT.getValue();
     }
@@ -791,7 +832,8 @@ public class AsyncTcpConnection {
             }
         });
         attempt.whenComplete((response, error) -> {
-            if (shouldRetryTransient(error, deadlineNanos, notAcceptedDeadlineNanos) && channel.isActive()) {
+            if (shouldRetryTransient(commandCode, error, deadlineNanos, notAcceptedDeadlineNanos)
+                    && channel.isActive()) {
                 try {
                     channel.eventLoop()
                             .schedule(
@@ -877,8 +919,9 @@ public class AsyncTcpConnection {
         }
     }
 
-    private static boolean shouldRetryTransient(Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos) {
-        if (!(error instanceof IggyServerException serverError)) {
+    private static boolean shouldRetryTransient(
+            int commandCode, Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos) {
+        if (isPollRoutingCode(commandCode) || !(error instanceof IggyServerException serverError)) {
             return false;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED) {
@@ -890,10 +933,12 @@ public class AsyncTcpConnection {
         return false;
     }
 
-    private void handlePostResponse(Channel channel, int commandCode, boolean isLoginOp, Throwable ex) {
+    private void handlePostResponse(
+            Channel channel, int commandCode, boolean isLoginOp, ByteBuf response, Throwable ex) {
         if (isLoginOp) {
             if (ex == null) {
                 authenticated = true;
+                authenticatedUserId = response.getUnsignedIntLE(response.readerIndex());
                 long generation = authGeneration.incrementAndGet();
                 IggyAuthenticator.setAuthGeneration(channel, generation);
             } else {
@@ -904,6 +949,7 @@ public class AsyncTcpConnection {
             authenticated = false;
             authGeneration.incrementAndGet();
             IggyAuthenticator.clearAuthGeneration(channel);
+            releaseLoginPayload();
         }
     }
 
@@ -949,6 +995,29 @@ public class AsyncTcpConnection {
             return Optional.empty();
         }
         return Optional.of(new AuthenticationSnapshot(loginCommandCode, loginPayload.retainedDuplicate()));
+    }
+
+    synchronized Optional<String> refreshCredentials(
+            UserId user, Optional<String> username, Optional<String> password) {
+        if (!authenticated || loginPayload == null || loginCommandCode != CommandCode.User.LOGIN.getValue()) {
+            return Optional.empty();
+        }
+        ByteBuf current = loginPayload.duplicate();
+        String oldUsername = current.readCharSequence(current.readUnsignedByte(), StandardCharsets.UTF_8)
+                .toString();
+        if (!(user.getId() != null ? user.getId() == authenticatedUserId : oldUsername.equals(user.getName()))) {
+            return Optional.empty();
+        }
+        String oldPassword = current.readCharSequence(current.readUnsignedByte(), StandardCharsets.UTF_8)
+                .toString();
+        byte[] nextUsername = username.orElse(oldUsername).getBytes(StandardCharsets.UTF_8);
+        byte[] nextPassword = password.orElse(oldPassword).getBytes(StandardCharsets.UTF_8);
+        ByteBuf next = Unpooled.buffer(2 + nextUsername.length + nextPassword.length);
+        next.writeByte(nextUsername.length).writeBytes(nextUsername);
+        next.writeByte(nextPassword.length).writeBytes(nextPassword);
+        loginPayload.release();
+        loginPayload = next;
+        return Optional.of(oldUsername);
     }
 
     private synchronized void releaseLoginPayload() {

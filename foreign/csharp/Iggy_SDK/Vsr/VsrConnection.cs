@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Net.Sockets;
 using Apache.Iggy.Exceptions;
 using Microsoft.Extensions.Logging;
@@ -42,6 +43,7 @@ internal sealed class VsrConnection : IDisposable
     ///     transport's job to ignore the call when a reconnect already replaced this connection.
     /// </summary>
     private readonly Action<VsrConnection> _onDropped;
+    private readonly Action<ulong>? _observeMetadataCommit;
 
     /// <summary>
     ///     Bodies up to this size go out as one write: header and body coalesced in
@@ -61,7 +63,7 @@ internal sealed class VsrConnection : IDisposable
     private readonly Stream _stream;
 
     internal VsrConnection(Stream stream, ConsensusSession session, long maxResponseFrameSize, int requestTimeoutMs,
-        Action<VsrConnection> onDropped, ILogger logger)
+        Action<VsrConnection> onDropped, ILogger logger, Action<ulong>? observeMetadataCommit = null)
     {
         _stream = stream;
         _session = session;
@@ -69,6 +71,7 @@ internal sealed class VsrConnection : IDisposable
         _requestTimeoutMs = requestTimeoutMs;
         _onDropped = onDropped;
         _logger = logger;
+        _observeMetadataCommit = observeMetadataCommit;
     }
 
     public void Dispose()
@@ -91,7 +94,8 @@ internal sealed class VsrConnection : IDisposable
     ///     which also guards the reuse of the per-connection frame buffer.
     /// </summary>
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token)
+        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
+        bool retryTransient = true)
     {
         var encoded = false;
         var requestStarted = false;
@@ -135,7 +139,7 @@ internal sealed class VsrConnection : IDisposable
 
                     return VsrAttempt.Ok(response, this);
                 }
-                catch (IggyInvalidStatusCodeException e) when (IsReplayableTransient(e, transientDeadline,
+                catch (IggyInvalidStatusCodeException e) when (retryTransient && IsReplayableTransient(e, transientDeadline,
                                                                    readDeadline))
                 {
                     var governingDeadline = e.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED
@@ -237,6 +241,7 @@ internal sealed class VsrConnection : IDisposable
 
         if (bodySize == 0)
         {
+            ObserveMetadataCommit();
             VsrReplyDecoder.Decode(_replyHeaderBuffer, ReadOnlyMemory<byte>.Empty);
 
             return EmptyMemoryOwner.Instance;
@@ -246,6 +251,7 @@ internal sealed class VsrConnection : IDisposable
         try
         {
             await ReadExactAsync(buffer.AsMemory(0, bodySize), readCancellation.Token, token);
+            ObserveMetadataCommit();
             ReadOnlyMemory<byte> decoded = VsrReplyDecoder.Decode(_replyHeaderBuffer, buffer.AsMemory(0, bodySize));
             if (decoded.IsEmpty)
             {
@@ -262,6 +268,21 @@ internal sealed class VsrConnection : IDisposable
         {
             ArrayPool<byte>.Shared.Return(buffer, clearSensitiveReply);
             throw;
+        }
+    }
+
+    private void ObserveMetadataCommit()
+    {
+        if (_observeMetadataCommit is null)
+        {
+            return;
+        }
+
+        var operation = VsrHeader.ReadReplyOperation(_replyHeaderBuffer);
+        if (operation.IsMetadata() || operation is VsrOperation.Register or VsrOperation.Logout)
+        {
+            _observeMetadataCommit(BinaryPrimitives.ReadUInt64LittleEndian(
+                _replyHeaderBuffer.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
         }
     }
 

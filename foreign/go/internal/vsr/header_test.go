@@ -48,6 +48,37 @@ func TestEncodeRequestHeader_WritesEveryFieldAtItsCanonicalOffset(t *testing.T) 
 	assert.Zero(t, binary.LittleEndian.Uint64(header[requestOffsetTimestamp:]), "timestamp stays zero")
 }
 
+func TestMetadataCommitDoesNotUsePartitionOrReadReplyIndexes(t *testing.T) {
+	for _, test := range []struct {
+		operation Operation
+		metadata  bool
+	}{
+		{OperationRegister, true},
+		{OperationLogout, true},
+		{OperationPurgeTopic, true},
+		{OperationJoinConsumerGroup, true},
+		{OperationNonReplicated, false},
+		{OperationSendMessages, false},
+		{OperationStoreConsumerOffset, false},
+		{OperationDeleteConsumerOffset, false},
+		{OperationDeleteSegments, false},
+		{OperationTruncatePartition, false},
+		{Operation(255), false},
+	} {
+		var header [HeaderSize]byte
+		header[replyOffsetCommand] = byte(FrameReply)
+		header[replyOffsetOperation] = byte(test.operation)
+		binary.LittleEndian.PutUint64(header[replyOffsetCommit:], 42)
+		if test.metadata {
+			assert.Equal(t, uint64(42), MetadataCommit(&header), "operation %d", test.operation)
+		} else {
+			assert.Zero(t, MetadataCommit(&header), "operation %d", test.operation)
+		}
+		header[replyOffsetCommand] = byte(FrameEviction)
+		assert.Zero(t, MetadataCommit(&header))
+	}
+}
+
 func TestEncodeRequestHeader_LeavesEveryUnwrittenByteZero(t *testing.T) {
 	var header [HeaderSize]byte
 	EncodeRequestHeader(&header, RequestFields{

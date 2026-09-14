@@ -1378,7 +1378,7 @@ internal static class BinaryMapper
         };
     }
 
-    private static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload, ref int position)
+    internal static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload, ref int position)
     {
         var name = ReadString(payload, ref position, "Cluster node name");
         var ip = ReadString(payload, ref position, "Cluster node ip");

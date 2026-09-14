@@ -158,7 +158,7 @@ func (c *IggyTcpClient) pollPartition(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
-	buffer, err := c.do(ctx, &command.PollMessages{
+	request := &command.PollMessages{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
@@ -166,7 +166,15 @@ func (c *IggyTcpClient) pollPartition(
 		Strategy:    strategy,
 		Count:       count,
 		PartitionId: partitionId,
-	})
+	}
+	routed := autoCommit && c.clustered.Load()
+	var buffer []byte
+	var err error
+	if routed {
+		buffer, err = c.pollPrimary(ctx, request)
+	} else {
+		buffer, err = c.do(ctx, request)
+	}
 	if err != nil {
 		return nil, err
 	}

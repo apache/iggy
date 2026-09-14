@@ -31,6 +31,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -112,7 +113,12 @@ type IggyTcpClient struct {
 	// that configures auto-login, which is a surprising difference between
 	// two ways of doing the same thing. Cleared on sign-out; guarded by
 	// c.mtx.
-	rememberedLogin AutoLogin
+	rememberedLogin   AutoLogin
+	sessionUserID     uint32
+	clustered         atomic.Bool
+	metadataWatermark atomic.Uint64
+	pollSession       atomic.Pointer[activePollSession]
+	polls             pollRouter
 	// groups caches the consumer-group assignments this client polls with.
 	groups groupAssignmentCache
 	// topics caches what a send needs to resolve a partition locally.
@@ -596,6 +602,9 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 // What remains is a replicated request whose reply was lost in transit, and
 // its unknown outcome makes the replay unsafe.
 func canReplay(code uint32, err error) bool {
+	if code == uint32(command.PollMessagesOnPrimaryCode) {
+		return false
+	}
 	if isRegisterCode(code) {
 		return true
 	}
@@ -648,6 +657,14 @@ func (c *IggyTcpClient) sendFrame(
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
+	}
+	if code == uint32(command.PollMessagesOnPrimaryCode) ||
+		code == uint32(command.GetPollRoutingCode) ||
+		code == uint32(command.AttachConsumerSessionCode) {
+		response, _, generation, err := c.attempt(
+			context.WithValue(ctx, singlePollExchange{}, struct{}{}), code, frame,
+			false, time.Now(), time.Now().Add(responseReadTimeout))
+		return response, generation, err
 	}
 
 	deadline := time.Now().Add(responseReadTimeout)
@@ -742,8 +759,17 @@ func (c *IggyTcpClient) attempt(
 	stamped bool,
 	transientDeadline, readDeadline time.Time,
 ) ([]byte, bool, uint64, error) {
-	c.mtx.Lock()
+	if ctx.Value(singlePollExchange{}) != nil {
+		if err := c.lockPollExchange(ctx); err != nil {
+			return nil, stamped, 0, err
+		}
+	} else {
+		c.mtx.Lock()
+	}
 	defer c.mtx.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, stamped, c.connGeneration, err
+	}
 
 	generation := c.connGeneration
 	switch c.transportState {
@@ -789,7 +815,13 @@ func (c *IggyTcpClient) attempt(
 		defer stop()
 	}
 
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(readDeadline) {
+		readDeadline = deadline
+	}
 	deadlineMu.Lock()
+	if ctx.Err() != nil {
+		readDeadline = time.Now()
+	}
 	_ = conn.SetDeadline(readDeadline)
 	deadlineMu.Unlock()
 
@@ -847,6 +879,15 @@ func (c *IggyTcpClient) exchangeLocked(
 		}
 
 		response, err := vsr.DecodeReply(&c.respHeader, body)
+		if commit := vsr.MetadataCommit(&c.respHeader); commit > c.metadataWatermark.Load() {
+			c.metadataWatermark.Store(commit)
+		}
+		if ctx.Value(singlePollExchange{}) != nil {
+			if err != nil {
+				c.handleReplyFailureLocked(err)
+			}
+			return response, err
+		}
 		switch {
 		case errors.Is(err, ierror.ErrTransientNotCommitted) && time.Now().Before(readDeadline):
 			// The outcome is unknown, so only a replay of the same request id
@@ -950,6 +991,7 @@ func (c *IggyTcpClient) invalidateConnLocked() {
 	c.transportState = iggcon.TransportStateDisconnected
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
+	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()
 }
@@ -1153,6 +1195,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 	// The server fence does not survive the old socket, so the new connection
 	// starts from a fresh client identity.
 	c.session.Reset()
+	c.clearPollSession()
 	clientAddress := c.clientAddress
 	serverAddress := c.currentServerAddress
 	c.mtx.Unlock()
@@ -1323,11 +1366,11 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool
 // signInCredentials reports the credentials a reconnect signs in with: the
 // configured ones, or else the ones a manual sign-in succeeded with.
 func (c *IggyTcpClient) signInCredentials() (Credentials, bool) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	if c.config.autoLogin.enabled {
 		return c.config.autoLogin.credentials, true
 	}
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
 	return c.rememberedLogin.credentials, c.rememberedLogin.enabled
 }
 
@@ -1338,6 +1381,7 @@ func (c *IggyTcpClient) rememberLogin(credentials Credentials) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	c.rememberedLogin = NewAutoLogin(credentials)
+	c.publishPollSession()
 }
 
 // forgetLogin drops them: after an explicit sign-out there is no session to
@@ -1446,6 +1490,7 @@ func (c *IggyTcpClient) disconnectLocked() error {
 	c.transportState = iggcon.TransportStateDisconnected
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
+	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()
 
@@ -1479,6 +1524,7 @@ func (c *IggyTcpClient) shutdown() error {
 	c.transportState = iggcon.TransportStateShutdown
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
+	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()
 	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))

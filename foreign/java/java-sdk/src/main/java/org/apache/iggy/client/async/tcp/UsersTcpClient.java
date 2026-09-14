@@ -128,7 +128,11 @@ public class UsersTcpClient implements UsersClient {
         // server reads an absent block as empty. Settings will ride one here,
         // as topics do.
 
-        return connection().sendAndRelease(CommandCode.User.UPDATE, payload);
+        AsyncTcpConnection current = connection();
+        return current.sendAndRelease(CommandCode.User.UPDATE, payload).thenRun(() -> {
+            current.refreshCredentials(userId, username, Optional.empty())
+                    .ifPresent(previous -> routingHook.refreshLogin(previous, username, Optional.empty()));
+        });
     }
 
     @Override
@@ -153,7 +157,12 @@ public class UsersTcpClient implements UsersClient {
         payload.writeBytes(toBytes(currentPassword, "current password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
         payload.writeBytes(toBytes(newPassword, "new password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
 
-        return connection().sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload);
+        AsyncTcpConnection current = connection();
+        return current.sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload).thenRun(() -> {
+            current.refreshCredentials(userId, Optional.empty(), Optional.of(newPassword))
+                    .ifPresent(
+                            previous -> routingHook.refreshLogin(previous, Optional.empty(), Optional.of(newPassword)));
+        });
     }
 
     @Override

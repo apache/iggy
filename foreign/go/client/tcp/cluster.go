@@ -34,5 +34,6 @@ func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.Cluster
 	if err != nil {
 		return nil, err
 	}
+	c.clustered.Store(len(metadata.Nodes) > 1)
 	return &metadata, nil
 }

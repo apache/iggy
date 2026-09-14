@@ -59,6 +59,13 @@ confirms replication, while `persisted` also waits for the required replicas
 to persist the message data. An empty confirmation list is a valid success
 but does not by itself prove that new messages were appended.
 
+In a cluster, auto-commit polls use persistent connections to partition
+primaries while the coordinator keeps the consumer's group membership.
+Servers must support primary poll routing and consumer-session attachment.
+Only a poll refused before admission is retried. `ErrTransientNotCommitted`
+or cancellation after sending a poll can mean its offset advanced without
+a reply; the SDK does not replay that poll automatically.
+
 ## Testing
 
 Unit tests need nothing running:
@@ -76,6 +83,17 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 go test ./tests
 
 Add `IGGY_TCP_TLS_ENABLED=true` to run the TLS cases against a server started
 with `IGGY_TCP_TLS_ENABLED=true` and the certificate pair in `core/certs`.
+
+The split-primary regression needs an existing topic with eight messages
+per partition, seeded before only metadata leadership moves. It verifies
+that the coordinator differs from the partition primary:
+
+```bash
+IGGY_TCP_ADDRESS=127.0.0.1:20016 \
+IGGY_POLL_ROUTING_STREAM=sdk-primary-routing \
+IGGY_POLL_ROUTING_TOPIC=go \
+go test ./tests -run TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership
+```
 
 ## Contributing
 

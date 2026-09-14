@@ -54,6 +54,7 @@ const (
 const (
 	replyOffsetSize      = 48
 	replyOffsetCommand   = 60
+	replyOffsetCommit    = 184
 	replyOffsetRequest   = 200
 	replyOffsetOperation = 208
 	replyOffsetStatus    = 216
@@ -180,6 +181,20 @@ func ReadReplyOperation(header *[HeaderSize]byte) Operation {
 // in flight.
 func ReadReplyRequestID(header *[HeaderSize]byte) uint64 {
 	return binary.LittleEndian.Uint64(header[replyOffsetRequest:])
+}
+
+// MetadataCommit excludes partition replies, whose commit indexes belong to
+// different consensus groups and cannot fence a metadata read.
+func MetadataCommit(header *[HeaderSize]byte) uint64 {
+	operation := ReadReplyOperation(header)
+	if PeekCommand(header) != FrameReply || !IsKnownOperation(operation) {
+		return 0
+	}
+	if operation != OperationRegister && operation != OperationLogout &&
+		(!IsMetadata(operation) || operation == OperationTruncatePartition) {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(header[replyOffsetCommit:])
 }
 
 // StampedRequestID reads the request id back out of a stamped request frame.

@@ -24,6 +24,7 @@ internal static class CommandCodes
     internal const int GET_SNAPSHOT_CODE = 11;
     internal const int GET_CLUSTER_METADATA_CODE = 12;
     internal const int DESCRIBE_OPTIONS_CODE = 13;
+    internal const int ATTACH_CONSUMER_SESSION_CODE = 14;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;
@@ -45,6 +46,8 @@ internal static class CommandCodes
     internal const int POLL_MESSAGES_CODE = 100;
     internal const int SEND_MESSAGES_CODE = 101;
     internal const int FLUSH_UNSAVED_BUFFER_CODE = 102;
+    internal const int GET_POLL_ROUTING_CODE = 103;
+    internal const int POLL_MESSAGES_ON_PRIMARY_CODE = 104;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;
