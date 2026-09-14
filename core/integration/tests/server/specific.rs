@@ -100,7 +100,7 @@ async fn full_cluster_restart_recovers_and_serves(harness: &mut TestHarness) {
 
 // Exercises `RangeEvicted` + the commit floor: the rejoin window exceeds the
 // peers' evicted ring, so journal repair alone cannot cover it.
-#[iggy_harness]
+#[iggy_harness(server(partition.evicted_ring_capacity = 4096))]
 async fn rejoin_window_exceeding_evicted_ring(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_ring_overflow_rejoin(harness).await;
 }

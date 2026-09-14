@@ -79,6 +79,14 @@ dependencies {
 
 ## Quick Start
 
+Cluster auto-commit polling over TCP/TLS keeps group membership on the
+coordinator and uses separate connections to partition primaries. It requires
+server support for binary commands 14, 103 and 104. Pause binary auto-commit
+consumers for the whole upgrade: upgrade every server first, then the SDKs,
+and restart consumers so they rejoin their groups. Older SDKs can lose membership
+when a backup refuses an offset commit; the new SDK does not fall back to legacy
+polling. Use `Iggy.tcpClientBuilder()` to get this routing and session management.
+
 Start the server with the [example prerequisites](../../examples/java/#running-examples) and matching credentials. The following snippets show alternative clients. Close a blocking client with `close()` or an async client with `close().join()` when finished.
 
 ### TCP Client (Blocking)

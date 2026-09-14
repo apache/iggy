@@ -61,7 +61,7 @@ const REPLICATION_BUDGET: Duration = Duration::from_secs(15);
 /// `AutoLogin::Disabled` on purpose: `connect()` must not sign in or settle
 /// leadership, so the login below is the first and only thing the node is
 /// asked to do.
-async fn connect_without_login(address: SocketAddr) -> TcpClient {
+pub(super) async fn connect_without_login(address: SocketAddr) -> TcpClient {
     let config = TcpClientConfig {
         server_address: address.to_string(),
         nodelay: true,

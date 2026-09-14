@@ -69,9 +69,9 @@ pub fn install_client_conn<C: TransportConn>(
     on_request: RequestHandler,
 ) {
     let client_id = meta.client_id;
-    let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
+    let (tx, rx) = async_channel::bounded(bus.config().client_queue_capacity);
     let (in_tx, in_rx) =
-        async_channel::bounded::<Message<GenericHeader>>(bus.peer_queue_capacity());
+        async_channel::bounded::<Message<GenericHeader>>(bus.config().client_queue_capacity);
 
     // If the registry insert below loses a race for `client_id`, the
     // losing reader must NOT invoke `on_request` (it would route

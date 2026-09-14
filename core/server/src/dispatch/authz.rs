@@ -419,10 +419,12 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE,
-        GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
-        LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE,
-        POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+        ATTACH_CONSUMER_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
+        GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE,
+        GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
+        LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+        LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+        SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
@@ -491,6 +493,22 @@ mod tests {
                 invalid_command,
             ),
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
+            (
+                ATTACH_CONSUMER_SESSION_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (GET_POLL_ROUTING_CODE, invalid_command, invalid_command),
+            (
+                POLL_MESSAGES_ON_PRIMARY_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (
+                GET_CONSUMER_OFFSET_ROUTING_CODE,
+                invalid_command,
+                invalid_command,
+            ),
             (
                 FLUSH_UNSAVED_BUFFER_CODE,
                 feature_unavailable,

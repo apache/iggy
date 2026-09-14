@@ -227,6 +227,9 @@ pub struct ShardMetrics {
     partition_wal_checkpoints_pending: Gauge,
     partition_wal_batches: Counter,
     partition_wal_prepares: Counter,
+    partition_wal_group_commit_waits: Counter,
+    partition_repair_ring_entries: Gauge,
+    partition_repair_ring_bytes: Gauge,
     partition_wal_checkpoints: Counter,
     partition_wal_errors: Counter,
     frame_drops: FrameDropMetrics,
@@ -295,6 +298,9 @@ impl ShardMetrics {
             partition_wal_checkpoints_pending: Gauge::default(),
             partition_wal_batches: Counter::default(),
             partition_wal_prepares: Counter::default(),
+            partition_wal_group_commit_waits: Counter::default(),
+            partition_repair_ring_entries: Gauge::default(),
+            partition_repair_ring_bytes: Gauge::default(),
             partition_wal_checkpoints: Counter::default(),
             partition_wal_errors: Counter::default(),
             frame_drops: FrameDropMetrics {
@@ -334,6 +340,8 @@ impl ShardMetrics {
             .set(i64::try_from(metrics.checkpoints_pending).unwrap_or(i64::MAX));
         self.partition_wal_batches.inc_by(metrics.completed_batches);
         self.partition_wal_prepares.inc_by(metrics.batched_prepares);
+        self.partition_wal_group_commit_waits
+            .inc_by(metrics.group_commit_waits);
         self.partition_wal_checkpoints
             .inc_by(metrics.completed_checkpoints);
         self.partition_wal_errors.inc_by(metrics.failed_writes);
@@ -376,6 +384,21 @@ impl ShardMetrics {
             self.partition_wal_prepares.clone(),
         );
         registry.register(
+            "partition_wal_group_commit_waits",
+            "durable groups that took the optional pre-barrier wait",
+            self.partition_wal_group_commit_waits.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_entries",
+            "committed entries this shard's partitions retain for peer repair",
+            self.partition_repair_ring_entries.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_bytes",
+            "payload bytes this shard's partitions retain for peer repair, excluding allocation overhead",
+            self.partition_repair_ring_bytes.clone(),
+        );
+        registry.register(
             "partition_wal_checkpoints",
             "completed partition WAL checkpoints",
             self.partition_wal_checkpoints.clone(),
@@ -385,6 +408,18 @@ impl ShardMetrics {
             "partition WAL writer failures",
             self.partition_wal_errors.clone(),
         );
+    }
+
+    /// Republished by every partition sweep: what the repair rings on this
+    /// shard actually hold, which the configured per-partition ceilings do not
+    /// say. The ceilings multiply by the partition count on every replica, so
+    /// this is the only place an operator can see the real cost of raising
+    /// them.
+    pub fn set_repair_ring(&self, entries: usize, bytes: u64) {
+        self.partition_repair_ring_entries
+            .set(i64::try_from(entries).unwrap_or(i64::MAX));
+        self.partition_repair_ring_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
     }
 
     /// Count consumer offset capacity denials from explicit client requests
