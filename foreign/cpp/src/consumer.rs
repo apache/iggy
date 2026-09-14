@@ -21,20 +21,3 @@ use iggy::prelude::IggyConsumer as RustIggyConsumer;
 pub struct Consumer {
     pub inner: RustIggyConsumer,
 }
-
-/// Releases a consumer previously returned by `create_consumer` or
-/// `create_consumer_group`.
-///
-/// # Safety
-///
-/// - Passing the pointer to this function more than once is undefined
-///   behaviour (double-free).
-/// - Using the pointer after this function has been called is undefined
-///   behaviour (use-after-free).
-pub unsafe fn delete_consumer(consumer: *mut Consumer) {
-    if !consumer.is_null() {
-        unsafe {
-            drop(Box::from_raw(consumer));
-        }
-    }
-}

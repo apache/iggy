@@ -42,8 +42,6 @@
 namespace iggy {
 
 class IggyBlockingClient;
-class IggyBlockingConsumer;
-class IggyBlockingProducer;
 class LoginInfo;
 class Partition;
 class Topic;
@@ -1619,48 +1617,6 @@ class PollingStrategy final {
     std::uint64_t polling_strategy_value_;
 };
 
-class IggyBlockingConsumer final {
-  public:
-    IggyBlockingConsumer(const IggyBlockingConsumer &)            = delete;
-    IggyBlockingConsumer &operator=(const IggyBlockingConsumer &) = delete;
-
-    IggyBlockingConsumer(IggyBlockingConsumer &&other) noexcept;
-    IggyBlockingConsumer &operator=(IggyBlockingConsumer &&other) noexcept;
-
-    ~IggyBlockingConsumer();
-
-  private:
-    explicit IggyBlockingConsumer(ffi::Consumer *consumer);
-
-    [[nodiscard]] ffi::Consumer *Handle() const;
-    void Reset() noexcept;
-
-    friend class IggyBlockingClient;
-
-    ffi::Consumer *consumer_;
-};
-
-class IggyBlockingProducer final {
-  public:
-    IggyBlockingProducer(const IggyBlockingProducer &)            = delete;
-    IggyBlockingProducer &operator=(const IggyBlockingProducer &) = delete;
-
-    IggyBlockingProducer(IggyBlockingProducer &&other) noexcept;
-    IggyBlockingProducer &operator=(IggyBlockingProducer &&other) noexcept;
-
-    ~IggyBlockingProducer();
-
-  private:
-    explicit IggyBlockingProducer(ffi::Producer *producer);
-
-    [[nodiscard]] ffi::Producer *Handle() const;
-    void Reset() noexcept;
-
-    friend class IggyBlockingClient;
-
-    ffi::Producer *producer_;
-};
-
 /**
  * @brief Owning client connection to an Apache Iggy server.
  *
@@ -2103,19 +2059,102 @@ class IggyBlockingClient final {
      */
     void DeletePartitions(const Identifier &stream, const Identifier &topic, std::uint32_t partitions_count);
 
+    /**
+     * @brief Creates a consumer group for a topic.
+     *
+     * The group name must be unique within the topic, non-empty, and no more
+     * than 255 UTF-8 bytes. The new group initially has no members.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param name Unique consumer group name within @p topic.
+     * @return Details of the newly created consumer group.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier or the name is invalid; the stream or topic does
+     *         not exist; the name is already in use; the caller lacks
+     *         stream- or topic-management permission; or the request fails.
+     */
     ConsumerGroupDetails CreateConsumerGroup(const Identifier &stream, const Identifier &topic, std::string name);
-    ConsumerGroupDetails GetConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
-    std::vector<ConsumerGroup> GetConsumerGroups(const Identifier &stream, const Identifier &topic);
-    void DeleteConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
-    void JoinConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
-    void LeaveConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
 
-    IggyBlockingConsumer CreateConsumer(std::string name,
-                                        const Identifier &stream,
-                                        const Identifier &topic,
-                                        std::uint32_t partition_id);
-    IggyBlockingConsumer CreateGroupConsumer(std::string name, const Identifier &stream, const Identifier &topic);
-    IggyBlockingProducer CreateProducer(const Identifier &stream, const Identifier &topic);
+    /**
+     * @brief Retrieves one consumer group and its current members.
+     *
+     * The returned details are a snapshot. Membership and partition
+     * assignments can change immediately after this call returns.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param group Consumer group to retrieve, addressed by numeric ID or name.
+     * @return Consumer group metadata and member details.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier is invalid; the stream, topic, or consumer group
+     *         does not exist; the caller lacks read permission; or the
+     *         metadata read fails.
+     */
+    ConsumerGroupDetails GetConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+
+    /**
+     * @brief Lists consumer group summaries for a topic.
+     *
+     * The summaries include member and partition counts but omit individual
+     * member details. Use GetConsumerGroup() to retrieve those details.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @return Consumer group summaries for the requested topic.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier is invalid; the stream or topic does not exist;
+     *         the caller lacks read permission; or the metadata read fails.
+     */
+    std::vector<ConsumerGroup> GetConsumerGroups(const Identifier &stream, const Identifier &topic);
+
+    /**
+     * @brief Deletes a consumer group from a topic.
+     *
+     * A failed or unknown transport outcome can leave the deletion committed.
+     * Query the topic's consumer groups before retrying this request.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param group Consumer group to delete, addressed by numeric ID or name.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier is invalid; the stream, topic, or consumer group
+     *         does not exist; the caller lacks stream- or topic-management
+     *         permission; or the request fails.
+     */
+    void DeleteConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+
+    /**
+     * @brief Joins the current client to a consumer group.
+     *
+     * The server assigns topic partitions among the group's members. Joining
+     * the same group again does not add a second membership for this client.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param group Consumer group to join, addressed by numeric ID or name.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier is invalid; the stream, topic, or consumer group
+     *         does not exist; the caller lacks read permission; the transport
+     *         does not support group membership; or the request fails.
+     */
+    void JoinConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+
+    /**
+     * @brief Removes the current client from a consumer group.
+     *
+     * The server reassigns partitions among the remaining group members.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param group Consumer group to leave, addressed by numeric ID or name.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier is invalid; the stream, topic, or consumer group
+     *         does not exist; this client is not a member; the caller lacks
+     *         read permission; the transport does not support group
+     *         membership; or the request fails.
+     */
+    void LeaveConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);

@@ -303,29 +303,6 @@ void IggyBlockingClient::LeaveConsumerGroup(const Identifier &stream,
     });
 }
 
-IggyBlockingConsumer IggyBlockingClient::CreateConsumer(std::string name,
-                                                        const Identifier &stream,
-                                                        const Identifier &topic,
-                                                        std::uint32_t partition_id) {
-    return RethrowAsIggyException([this, &name, &stream, &topic, partition_id] {
-        return IggyBlockingConsumer(Handle()->create_consumer(name, stream.ToFfi(), topic.ToFfi(), partition_id));
-    });
-}
-
-IggyBlockingConsumer IggyBlockingClient::CreateGroupConsumer(std::string name,
-                                                             const Identifier &stream,
-                                                             const Identifier &topic) {
-    return RethrowAsIggyException([this, &name, &stream, &topic] {
-        return IggyBlockingConsumer(Handle()->create_group_consumer(name, stream.ToFfi(), topic.ToFfi()));
-    });
-}
-
-IggyBlockingProducer IggyBlockingClient::CreateProducer(const Identifier &stream, const Identifier &topic) {
-    return RethrowAsIggyException([this, &stream, &topic] {
-        return IggyBlockingProducer(Handle()->create_producer(stream.ToFfi(), topic.ToFfi()));
-    });
-}
-
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
     if (client_ == nullptr) {
         throw IggyException("Could not create Iggy client");

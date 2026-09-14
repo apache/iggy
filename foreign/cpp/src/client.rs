@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::consumer::Consumer as BridgeConsumer;
-use crate::producer::Producer as BridgeProducer;
 use crate::{RUNTIME, ffi, type_conversion::ffi_options_to_raw};
 use bytes::Bytes;
 use iggy::prelude::{
@@ -1245,69 +1243,6 @@ impl Client {
                 .map_err(|error| format!("Could not send raw command '{code}': {error}"))?;
             Ok(Vec::from(response))
         })
-    }
-
-    pub fn create_consumer(
-        &self,
-        name: String,
-        stream_id: ffi::Identifier,
-        topic_id: ffi::Identifier,
-        partition_id: u32,
-    ) -> Result<*mut BridgeConsumer, String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not create consumer '{name}': {error}"))?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not create consumer '{name}': {error}"))?;
-        let consumer = self
-            .inner
-            .consumer(
-                &name,
-                &rust_stream_id.as_string(),
-                &rust_topic_id.as_string(),
-                partition_id,
-            )
-            .map_err(|error| format!("Could not create consumer '{name}': {error}"))?
-            .build();
-        Ok(Box::into_raw(Box::new(BridgeConsumer { inner: consumer })))
-    }
-
-    pub fn create_group_consumer(
-        &self,
-        name: String,
-        stream_id: ffi::Identifier,
-        topic_id: ffi::Identifier,
-    ) -> Result<*mut BridgeConsumer, String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not create consumer group member '{name}': {error}"))?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not create consumer group member '{name}': {error}"))?;
-        let consumer = self
-            .inner
-            .consumer_group(
-                &name,
-                &rust_stream_id.as_string(),
-                &rust_topic_id.as_string(),
-            )
-            .map_err(|error| format!("Could not create consumer group member '{name}': {error}"))?
-            .build();
-        Ok(Box::into_raw(Box::new(BridgeConsumer { inner: consumer })))
-    }
-
-    pub fn create_producer(
-        &self,
-        stream_id: ffi::Identifier,
-        topic_id: ffi::Identifier,
-    ) -> Result<*mut BridgeProducer, String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not create producer: {error}"))?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not create producer: {error}"))?;
-        let producer = self
-            .inner
-            .producer(&rust_stream_id.as_string(), &rust_topic_id.as_string())
-            .map_err(|error| format!("Could not create producer: {error}"))?
-            .build();
-        Ok(Box::into_raw(Box::new(BridgeProducer { inner: producer })))
     }
 }
 
