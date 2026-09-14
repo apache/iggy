@@ -23,7 +23,7 @@ use elasticsearch::{
     http::{Url, request::JsonBody, transport::TransportBuilder},
 };
 use iggy_common::IggyTimestamp;
-use iggy_connector_sdk::retry::RetryPolicy;
+use iggy_connector_sdk::retry::{RetryPolicy, parse_duration};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -37,11 +37,9 @@ use tracing::{error, info, warn};
 sink_connector!(ElasticsearchSink);
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
-const BULK_RETRY_POLICY: RetryPolicy = RetryPolicy {
-    max_attempts: 3,
-    base_delay: Duration::from_secs(1),
-    max_delay: Duration::from_secs(5),
-};
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_RETRY_DELAY: &str = "1s";
+const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
 
 #[derive(Deserialize)]
 struct BulkResponse {
@@ -80,6 +78,11 @@ pub struct ElasticsearchSinkConfig {
     /// a timeout on consume drops the batch after the poll offset is already
     /// committed.
     pub timeout_seconds: Option<u64>,
+    /// Total attempts for explicitly rejected bulk items, including the first.
+    /// Defaults to 3; values of 0 and 1 both disable retries.
+    pub max_retries: Option<u32>,
+    pub retry_delay: Option<String>,
+    pub retry_max_delay: Option<String>,
     pub create_index_if_not_exists: Option<bool>,
     pub index_mapping: Option<serde_json::Value>,
 }
@@ -89,15 +92,22 @@ pub struct ElasticsearchSink {
     id: u32,
     config: ElasticsearchSinkConfig,
     client: Option<Elasticsearch>,
+    retry_policy: RetryPolicy,
     state: Mutex<State>,
 }
 
 impl ElasticsearchSink {
     pub fn new(id: u32, config: ElasticsearchSinkConfig) -> Self {
+        let retry_policy = RetryPolicy {
+            max_attempts: config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES).max(1),
+            base_delay: parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY),
+            max_delay: parse_duration(config.retry_max_delay.as_deref(), DEFAULT_RETRY_MAX_DELAY),
+        };
         ElasticsearchSink {
             id,
             config,
             client: None,
+            retry_policy,
             state: Mutex::new(State {
                 invocations_count: 0,
                 documents_indexed: 0,
@@ -271,7 +281,7 @@ impl ElasticsearchSink {
             if retry_documents.is_empty() {
                 break;
             }
-            if attempt >= BULK_RETRY_POLICY.max_attempts {
+            if attempt >= self.retry_policy.max_attempts {
                 self.state.lock().await.errors_count += retry_documents.len();
                 return Err(Error::CannotStoreData(format!(
                     "Elasticsearch indexed {documents_indexed} of {total_documents} documents in index '{}'; {} transient rejections remain after {attempt} attempts, {permanent_rejections} permanent rejections",
@@ -279,11 +289,11 @@ impl ElasticsearchSink {
                     retry_documents.len()
                 )));
             }
-            let delay = BULK_RETRY_POLICY.backoff(attempt);
+            let delay = self.retry_policy.backoff(attempt);
             warn!(
                 "Retrying {} rejected Elasticsearch documents after {delay:?}, attempt {attempt}/{}",
                 retry_documents.len(),
-                BULK_RETRY_POLICY.max_attempts
+                self.retry_policy.max_attempts
             );
             tokio::time::sleep(delay).await;
             documents = retry_documents;
@@ -460,8 +470,54 @@ mod tests {
             password: None,
             batch_size: None,
             timeout_seconds: Some(1),
+            max_retries: None,
+            retry_delay: None,
+            retry_max_delay: None,
             create_index_if_not_exists: Some(false),
             index_mapping: None,
+        }
+    }
+
+    #[test]
+    fn given_omitted_retry_settings_when_loading_should_preserve_defaults() {
+        let config = serde_json::from_value(json!({
+            "url": "http://localhost:9200",
+            "index": "test"
+        }))
+        .expect("Existing configurations should remain valid");
+        let sink = ElasticsearchSink::new(1, config);
+
+        assert_eq!(sink.retry_policy.max_attempts, 3);
+        assert_eq!(sink.retry_policy.base_delay, Duration::from_secs(1));
+        assert_eq!(sink.retry_policy.max_delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn given_configured_retry_delays_when_loading_should_parse_or_fall_back() {
+        for (delay, max_delay, expected_delay, expected_max) in [
+            (
+                "200ms",
+                "2s",
+                Duration::from_millis(200),
+                Duration::from_secs(2),
+            ),
+            ("0s", "0s", Duration::ZERO, Duration::ZERO),
+            (
+                "invalid",
+                "invalid",
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+        ] {
+            let config = ElasticsearchSinkConfig {
+                retry_delay: Some(delay.to_string()),
+                retry_max_delay: Some(max_delay.to_string()),
+                ..test_config()
+            };
+            let sink = ElasticsearchSink::new(1, config);
+
+            assert_eq!(sink.retry_policy.base_delay, expected_delay, "{delay}");
+            assert_eq!(sink.retry_policy.max_delay, expected_max, "{max_delay}");
         }
     }
 
@@ -533,7 +589,7 @@ mod tests {
                             "error": {"type": "es_rejected_execution_exception"}
                         }})],
                     })))
-                    .expect(u64::from(BULK_RETRY_POLICY.max_attempts))
+                    .expect(u64::from(DEFAULT_MAX_RETRIES))
                     .mount(&server)
                     .await;
                 let mut config = test_config();
@@ -552,6 +608,47 @@ mod tests {
                     matches!(result, Err(Error::CannotStoreData(_))),
                     "status {status}: {result:?}"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn given_configured_attempts_when_indexing_should_limit_transient_retries() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            for (max_retries, expected_attempts) in [(0, 1), (1, 1), (2, 2), (4, 4)] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/_bulk"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "items": [{"index": {"status": 429}}]
+                    })))
+                    .expect(expected_attempts)
+                    .mount(&server)
+                    .await;
+                let mut config = serde_json::to_value(test_config()).expect("serialize config");
+                config["url"] = json!(server.uri());
+                config["max_retries"] = json!(max_retries);
+                config["retry_delay"] = json!("1ms");
+                config["retry_max_delay"] = json!("2ms");
+                let config = serde_json::from_value(config).expect("deserialize config");
+                let sink = ElasticsearchSink::new(1, config);
+                let client = sink
+                    .create_client()
+                    .await
+                    .expect("client should initialize");
+
+                let result = sink
+                    .bulk_index_documents(&client, vec![simd_json::json!({"id": 1})])
+                    .await;
+
+                assert!(
+                    matches!(result, Err(Error::CannotStoreData(_))),
+                    "{result:?}"
+                );
+                let state = sink.state.lock().await;
+                assert_eq!(state.documents_indexed, 0);
+                assert_eq!(state.errors_count, 1);
             }
         });
     }

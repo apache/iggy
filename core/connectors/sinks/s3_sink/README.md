@@ -111,7 +111,7 @@ The pinned `aws-creds` chain tries these sources in order:
 
 For temporary key pairs, supply the token through the environment or shared credentials file. This is not the AWS SDK credential chain.
 
-Startup writes an empty object at `<prefix>/.iggy-sink-probe` (bucket root when `prefix` is empty) using the upload retry policy, and then attempts deletion. It requires `PutObject` on the probe key, not `ListBucket`; a permanent error or exhausted retries prevent startup. Delete permission is optional and cleanup errors are ignored. Reserve this key: any existing object there is overwritten and, if cleanup succeeds, deleted.
+Startup validates configuration and loads credentials without writing probe objects. Bucket access is checked by the first real upload, so missing buckets, denied writes and endpoint failures surface then. The sink requires `PutObject` on data and loss-marker keys; neither `ListBucket` nor `DeleteObject` is required.
 
 ## Output Example
 
@@ -162,7 +162,7 @@ secret_access_key = "..."
 
 The runtime auto-commits while polling, logs/counts a failed plugin callback, and continues without replaying that batch. A successful callback may only mean that messages were buffered; processed counts do not establish S3 delivery. A crash loses unflushed buffers.
 
-The sink retries HTTP 408, 429 and 5xx responses, plus rust-s3 request errors, using exponential backoff with jitter capped at 60 seconds. Other HTTP statuses stop that upload. `Retry-After` is not parsed. The S3 library also retries transport errors once internally and has a 60-second request timeout, so `max_attempts` counts outer `PutObject` calls, not individual network requests or a total time budget. The startup probe uses the same upload retry loop.
+The sink retries HTTP 408, 429 and 5xx responses, plus rust-s3 request errors, using exponential backoff with jitter capped at 60 seconds. Other HTTP statuses stop that upload. `Retry-After` is not parsed. The S3 library also retries transport errors once internally and has a 60-second request timeout, so `max_attempts` counts outer `PutObject` calls, not individual network requests or a total time budget.
 
 ## Known Limitations
 

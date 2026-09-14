@@ -27,7 +27,6 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const PROBE_KEY: &str = ".iggy-sink-probe";
 
 struct FlushPayload {
     data: Vec<u8>,
@@ -44,36 +43,7 @@ impl Sink for S3Sink {
 
         self.validate_and_parse_config()?;
 
-        let bucket = crate::client::create_bucket(&self.config).await?;
-
-        let prefix = self
-            .config
-            .prefix
-            .as_deref()
-            .unwrap_or_default()
-            .trim_matches('/');
-        let probe_key = if prefix.is_empty() {
-            PROBE_KEY.to_string()
-        } else {
-            format!("{prefix}/{PROBE_KEY}")
-        };
-        // Probe the same write scope as data uploads without requiring ListBucket.
-        self.upload_with_retry(&bucket, &probe_key, &[])
-            .await
-            .map_err(|error| {
-                Error::InitError(format!(
-                    "S3 bucket '{}' write probe failed: {error}",
-                    bucket.name
-                ))
-            })?;
-        let _ = bucket.delete_object(&probe_key).await;
-
-        info!(
-            "S3 sink ID: {} connected to bucket '{}' in region '{}'",
-            self.id, self.config.bucket, self.config.region
-        );
-
-        self.bucket = Some(bucket);
+        self.bucket = Some(crate::client::create_bucket(&self.config).await?);
 
         info!(
             "S3 sink ID: {} opened. format={}, rotation={}, max_file_size={}, template='{}'",
@@ -457,50 +427,111 @@ mod tests {
     }
 
     #[test]
-    fn startup_probe_uses_prefix_and_retries_transient_failures() {
+    fn given_put_only_permissions_when_opening_should_write_only_uploaded_data() {
         let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
         runtime.block_on(async {
-            for prefix in [None, Some(""), Some("/"), Some("/allowed/events/")] {
-                for status in [200, 403, 404, 408, 429, 503] {
-                    let server = MockServer::start().await;
-                    let probe_path = if prefix == Some("/allowed/events/") {
-                        "/test-bucket/allowed/events/.iggy-sink-probe"
-                    } else {
-                        "/test-bucket/.iggy-sink-probe"
-                    };
-                    Mock::given(method("PUT"))
-                        .and(path(probe_path))
-                        .respond_with(ResponseTemplate::new(status))
-                        .up_to_n_times(1)
-                        .expect(1)
-                        .mount(&server)
-                        .await;
-                    Mock::given(method("PUT"))
-                        .and(path(probe_path))
-                        .respond_with(ResponseTemplate::new(200))
-                        .expect(u64::from(matches!(status, 408 | 429 | 503)))
-                        .mount(&server)
-                        .await;
-                    let config = S3SinkConfig {
-                        prefix: prefix.map(str::to_string),
-                        endpoint: Some(server.uri()),
-                        access_key_id: Some("test-access-key".into()),
-                        secret_access_key: Some("test-secret-key".into()),
-                        max_attempts: Some(2),
-                        retry_delay: Some("1ms".to_string()),
-                        ..test_config()
-                    };
-                    let mut sink = S3Sink::new(1, config);
-                    let result = sink.open().await;
-                    if matches!(status, 403 | 404) {
-                        assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
-                        assert!(sink.bucket.is_none());
-                    } else {
-                        assert!(
-                            result.is_ok(),
-                            "prefix {prefix:?}, status {status}: {result:?}"
-                        );
-                    }
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let config = S3SinkConfig {
+                prefix: Some("/allowed/events/".to_string()),
+                endpoint: Some(server.uri()),
+                access_key_id: Some("test-access-key".into()),
+                secret_access_key: Some("test-secret-key".into()),
+                path_template: "{topic}".to_string(),
+                file_rotation: FileRotation::Messages,
+                max_messages_per_file: Some(1),
+                output_format: "raw".to_string(),
+                ..test_config()
+            };
+            let mut sink = S3Sink::new(1, config);
+            sink.open().await.expect("Sink should initialize");
+            assert!(
+                server.received_requests().await.expect("record requests").is_empty(),
+                "Opening the sink must not create probe objects or require other S3 permissions"
+            );
+
+            sink.consume(
+                &TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "messages".to_string(),
+                },
+                MessagesMetadata {
+                    partition_id: 0,
+                    current_offset: 0,
+                    schema: Schema::Raw,
+                },
+                vec![ConsumedMessage {
+                    id: 1,
+                    offset: 0,
+                    checksum: 0,
+                    timestamp: 1_000_000,
+                    origin_timestamp: 0,
+                    headers: None,
+                    payload: Payload::Raw(b"message".to_vec()),
+                }],
+            )
+            .await
+            .expect("PutObject-only access should allow data uploads");
+            sink.close().await.expect("Sink should close");
+
+            let requests = server.received_requests().await.expect("record requests");
+            assert_eq!(requests.len(), 1, "Only the data object should be written");
+            assert_eq!(requests[0].body, b"message");
+            assert_eq!(
+                requests[0].url.path(),
+                "/test-bucket/allowed/events/messages/00000-00000000000000000000-00000000000000000000.bin"
+            );
+            let state = sink.state.lock().await;
+            assert_eq!(state.messages_uploaded, 1);
+            assert_eq!(state.messages_lost, 0);
+        });
+    }
+
+    #[test]
+    fn given_upload_status_when_writing_should_retry_only_transient_failures() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for status in [200, 403, 404, 408, 429, 503] {
+                let server = MockServer::start().await;
+                Mock::given(method("PUT"))
+                    .and(path("/test-bucket/data/message.bin"))
+                    .respond_with(ResponseTemplate::new(status))
+                    .up_to_n_times(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path("/test-bucket/data/message.bin"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(u64::from(matches!(status, 408 | 429 | 503)))
+                    .mount(&server)
+                    .await;
+                let config = S3SinkConfig {
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    max_attempts: Some(2),
+                    retry_delay: Some("1ms".to_string()),
+                    ..test_config()
+                };
+                let mut sink = S3Sink::new(1, config);
+                sink.open()
+                    .await
+                    .expect("Sink should initialize before uploading");
+                let bucket = sink.bucket.as_ref().expect("S3 client should be available");
+                let result = sink
+                    .upload_with_retry(bucket, "data/message.bin", b"payload")
+                    .await;
+                if matches!(status, 403 | 404) {
+                    assert!(
+                        matches!(result, Err(Error::CannotStoreData(_))),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(result.is_ok(), "status {status}: {result:?}");
                 }
             }
         });
@@ -515,11 +546,6 @@ mod tests {
         runtime.block_on(async {
             for previously_buffered in [0, 1] {
                 let server = MockServer::start().await;
-                Mock::given(method("PUT"))
-                    .and(path("/test-bucket/data/.iggy-sink-probe"))
-                    .respond_with(ResponseTemplate::new(200))
-                    .mount(&server)
-                    .await;
                 let config = S3SinkConfig {
                     endpoint: Some(server.uri()),
                     access_key_id: Some("test-access-key".into()),
@@ -531,7 +557,7 @@ mod tests {
                     ..test_config()
                 };
                 let mut sink = S3Sink::new(1, config);
-                sink.open().await.expect("Successful startup probe");
+                sink.open().await.expect("Sink should initialize");
                 let topic = TopicMetadata {
                     stream: "events".to_string(),
                     topic: "messages".to_string(),
