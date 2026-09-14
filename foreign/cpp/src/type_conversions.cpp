@@ -42,6 +42,10 @@ ffi::Identifier Identifier::ToFfi() const {
     return identifier;
 }
 
+ConsumerOffsetInfo ConsumerOffsetInfo::FromFfi(ffi::ConsumerOffsetInfo offset) {
+    return ConsumerOffsetInfo(offset.partition_id, offset.current_offset, offset.stored_offset);
+}
+
 HeaderField HeaderField::FromFfi(ffi::HeaderField field) {
     return HeaderField(static_cast<HeaderKind>(field.kind),
                        std::vector<std::uint8_t>(field.value.begin(), field.value.end()));

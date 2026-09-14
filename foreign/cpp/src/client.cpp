@@ -303,6 +303,37 @@ void IggyBlockingClient::LeaveConsumerGroup(const Identifier &stream,
     });
 }
 
+void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
+                                             const Identifier &stream,
+                                             const Identifier &topic,
+                                             const std::uint64_t offset,
+                                             const std::uint32_t partition_id) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, offset, partition_id] {
+        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
+                                        consumer.Id().ToFfi(), offset);
+    });
+}
+
+ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consumer,
+                                                         const Identifier &stream,
+                                                         const Identifier &topic,
+                                                         const std::uint32_t partition_id) {
+    return RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id] {
+        return ConsumerOffsetInfo::FromFfi(Handle()->get_consumer_offset(
+            stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi()));
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerOffset(const Consumer &consumer,
+                                              const Identifier &stream,
+                                              const Identifier &topic,
+                                              const std::uint32_t partition_id) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id] {
+        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
+                                         consumer.Id().ToFfi());
+    });
+}
+
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
     if (client_ == nullptr) {
         throw IggyException("Could not create Iggy client");

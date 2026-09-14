@@ -41,6 +41,8 @@
 
 namespace iggy {
 
+class Consumer;
+class ConsumerOffsetInfo;
 class IggyBlockingClient;
 class LoginInfo;
 class Partition;
@@ -176,6 +178,73 @@ class Identifier final {
 
     Kind kind_;
     std::variant<std::uint32_t, std::string> value_;
+};
+
+/**
+ * @brief Identifies a single consumer or consumer group for offset operations.
+ */
+class Consumer final {
+  public:
+    enum class Kind { Single, Group };
+
+    /**
+     * @brief Identifies an individual consumer.
+     * @param id Consumer ID or name.
+     * @return Individual consumer identity.
+     */
+    static Consumer Single(Identifier id) { return Consumer(Kind::Single, std::move(id)); }
+
+    /**
+     * @brief Identifies a consumer group.
+     * @param id Consumer group ID or name.
+     * @return Consumer group identity.
+     */
+    static Consumer Group(Identifier id) { return Consumer(Kind::Group, std::move(id)); }
+
+    /** @brief Returns whether this identity represents a single consumer or a group. */
+    [[nodiscard]] Kind Type() const noexcept { return kind_; }
+
+    /** @brief Returns the consumer or consumer group identifier. */
+    [[nodiscard]] const Identifier &Id() const noexcept { return id_; }
+
+  private:
+    Consumer(Kind kind, Identifier id) : kind_(kind), id_(std::move(id)) {}
+
+    [[nodiscard]] std::string_view KindName() const noexcept {
+        return kind_ == Kind::Single ? "consumer" : "consumer_group";
+    }
+
+    friend class IggyBlockingClient;
+
+    Kind kind_;
+    Identifier id_;
+};
+
+/**
+ * @brief Consumer offset state returned by GetConsumerOffset().
+ */
+class ConsumerOffsetInfo final {
+  public:
+    /** @brief Returns the partition associated with the stored offset. */
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /** @brief Returns the partition's current message offset. */
+    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+
+    /** @brief Returns the offset stored for the consumer identity. */
+    [[nodiscard]] std::uint64_t StoredOffset() const noexcept { return stored_offset_; }
+
+  private:
+    ConsumerOffsetInfo(std::uint32_t partition_id, std::uint64_t current_offset, std::uint64_t stored_offset)
+        : partition_id_(partition_id), current_offset_(current_offset), stored_offset_(stored_offset) {}
+
+    static ConsumerOffsetInfo FromFfi(ffi::ConsumerOffsetInfo offset);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t partition_id_;
+    std::uint64_t current_offset_;
+    std::uint64_t stored_offset_;
 };
 
 /**
@@ -2155,6 +2224,59 @@ class IggyBlockingClient final {
      *         membership; or the request fails.
      */
     void LeaveConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
+
+    /**
+     * @brief Stores an offset for a consumer or consumer group.
+     *
+     * @param consumer Consumer identity that owns the offset.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param offset Message offset to store.
+     * @param partition_id Partition whose offset is stored.
+     * @throws IggyException if an identifier, partition, or offset is invalid;
+     *         the resource does not exist; the client is unauthenticated; the
+     *         caller lacks permission; or the request fails.
+     */
+    void StoreConsumerOffset(const Consumer &consumer,
+                             const Identifier &stream,
+                             const Identifier &topic,
+                             std::uint64_t offset,
+                             std::uint32_t partition_id);
+
+    /**
+     * @brief Retrieves the stored offset for a consumer or consumer group.
+     *
+     * @param consumer Consumer identity that owns the offset.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param partition_id Partition whose offset is retrieved.
+     * @return Partition state and the stored consumer offset.
+     * @throws IggyException if an identifier or partition is invalid; the
+     *         resource or stored offset does not exist; the client is
+     *         unauthenticated; the caller lacks permission; or the request
+     *         fails.
+     */
+    ConsumerOffsetInfo GetConsumerOffset(const Consumer &consumer,
+                                         const Identifier &stream,
+                                         const Identifier &topic,
+                                         std::uint32_t partition_id);
+
+    /**
+     * @brief Deletes the stored offset for a consumer or consumer group.
+     *
+     * @param consumer Consumer identity that owns the offset.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param partition_id Partition whose offset is deleted.
+     * @throws IggyException if an identifier or partition is invalid; the
+     *         resource or stored offset does not exist; the client is
+     *         unauthenticated; the caller lacks permission; or the request
+     *         fails.
+     */
+    void DeleteConsumerOffset(const Consumer &consumer,
+                              const Identifier &stream,
+                              const Identifier &topic,
+                              std::uint32_t partition_id);
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);
