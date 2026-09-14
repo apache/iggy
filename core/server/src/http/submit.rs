@@ -413,6 +413,7 @@ pub(in crate::http) async fn partition_write_replicated(
         session.session,
         session.client_id,
         Some(session.user_id),
+        None,
     )
     .await;
     drop(next_data_request_id);
@@ -469,6 +470,7 @@ pub(in crate::http) async fn produce_unacked(
         session.session,
         session.client_id,
         Some(session.user_id),
+        None,
     )
     .await;
     drop(next_data_request_id);

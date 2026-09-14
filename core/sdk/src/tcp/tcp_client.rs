@@ -20,7 +20,9 @@ use crate::leader_aware::{
     check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
     read_transport_endpoints,
 };
-use crate::poll_routing::{PollRouter, PollTransport, matches_session_user};
+use crate::poll_routing::{
+    PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code, matches_session_user,
+};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
 use crate::session::ConsensusSession;
@@ -31,7 +33,6 @@ use crate::vsr::replay_after_session_reset_is_safe;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::{
     GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
 };
@@ -80,11 +81,6 @@ const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// roster and fail over to the leader. Bounded by `RESPONSE_READ_TIMEOUT`
 /// overall.
 const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Bound on the roster read that follows a sign-in the caller ran itself. The
-/// read is a convenience for a failover that may never happen, so a cluster
-/// that answers it slowly must not hold up the sign-in.
-const ROSTER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bound on one dial while the client has other endpoints to try. A host
 /// that drops the SYN -- powered off, or partitioned away -- takes the OS
@@ -195,18 +191,23 @@ impl Client for TcpClient {
 
 #[async_trait]
 impl BinaryTransport for TcpClient {
+    async fn send_offset_write_with_response(
+        &self,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        if self.poll_router.is_clustered(self).await? {
+            self.poll_router.write_offset(self, code, payload).await
+        } else {
+            self.send_raw_with_response(code, payload).await
+        }
+    }
+
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
     ) -> Result<Bytes, IggyError> {
-        if request.auto_commit && self.roster_endpoints.lock().await.len() > 1 {
-            return self.poll_router.poll(self, request).await;
-        }
-        self.send_raw_with_response(
-            iggy_binary_protocol::codes::POLL_MESSAGES_CODE,
-            request.to_bytes(),
-        )
-        .await
+        self.poll_router.poll(self, request).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -223,12 +224,7 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        if matches!(
-            code,
-            iggy_binary_protocol::codes::ATTACH_CONSUMER_SESSION_CODE
-                | iggy_binary_protocol::codes::GET_POLL_ROUTING_CODE
-                | iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE
-        ) {
+        if is_poll_routing_code(code) {
             return self.send_poll_request(code, payload).await;
         }
         let result = self.send_raw(code, payload.clone()).await;
@@ -418,12 +414,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
                 else {
                     return None;
                 };
-                let targets_session_user = match user.kind {
-                    IdKind::Numeric => user.get_u32_value().is_ok_and(|id| id == sign_in.user_id),
-                    IdKind::String => user
-                        .get_cow_str_value()
-                        .is_ok_and(|name| name.as_ref() == username),
-                };
+                let targets_session_user = matches_session_user(user, sign_in.user_id, username);
                 if targets_session_user {
                     *password = SecretString::from(new_password.to_owned());
                 }
@@ -523,7 +514,7 @@ impl PollTransport for TcpClient {
     async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
         let now = tokio::time::Instant::now();
         let (_, result) = self
-            .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT)
+            .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT, false)
             .await;
         if matches!(result, Err(IggyError::Disconnected | IggyError::TcpError)) {
             self.set_state(ClientState::Disconnected).await;
@@ -945,6 +936,9 @@ impl TcpClient {
         // stop being dialed. The configured seeds are kept separately and
         // outlive it.
         if !leader_check.endpoints.is_empty() {
+            self.poll_router
+                .roster_size
+                .store(leader_check.node_count, Ordering::Release);
             *self.roster_endpoints.lock().await = leader_check.endpoints;
         }
 
@@ -1077,7 +1071,8 @@ impl TcpClient {
         }
 
         let read = read_transport_endpoints(self, TransportProtocol::Tcp);
-        let Ok(endpoints) = tokio::time::timeout(ROSTER_READ_TIMEOUT, read).await else {
+        let Ok((node_count, endpoints)) = tokio::time::timeout(ROSTER_READ_TIMEOUT, read).await
+        else {
             warn!("Reading the cluster roster took longer than {ROSTER_READ_TIMEOUT:?}");
             return;
         };
@@ -1089,6 +1084,9 @@ impl TcpClient {
             "{NAME} client learned {} endpoint(s) to fail over to.",
             endpoints.len()
         );
+        self.poll_router
+            .roster_size
+            .store(node_count, Ordering::Release);
         *self.roster_endpoints.lock().await = endpoints;
     }
 
@@ -1364,6 +1362,7 @@ impl TcpClient {
                     None,
                     transient_deadline,
                     overall_deadline,
+                    true,
                 )
                 .await;
             match result {
@@ -1505,6 +1504,7 @@ impl TcpClient {
         preencoded: Option<iggy_binary_protocol::consensus::RequestHeader>,
         transient_deadline: tokio::time::Instant,
         read_deadline: tokio::time::Instant,
+        retry_transient: bool,
     ) -> (
         Option<iggy_binary_protocol::consensus::RequestHeader>,
         Result<Bytes, IggyError>,
@@ -1620,6 +1620,7 @@ impl TcpClient {
                     frame_complete = true;
                     crate::vsr::observe_metadata_reply(&metadata_watermark, &response_header);
                     match crate::vsr::decode_response_split(&response_header, body) {
+                        Err(error) if !retry_transient => return Err(error),
                         // `TransientNotCommitted`: the op's outcome is unknown
                         // (e.g. a view change canceled it in flight) -- ONLY a
                         // same-session replay of the same request id is safe
@@ -1718,6 +1719,7 @@ mod tests {
             None,
             tokio::time::Instant::now(),
             deadline,
+            false,
         ));
         let mut request = [0; HEADER_SIZE];
         tokio::select! {
@@ -1780,49 +1782,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_primary_poll_with_an_unknown_outcome_is_not_replayed() {
-        let (listener, address) = live_endpoint().await;
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let response = ReplyHeader {
-                command: Command::Reply,
-                operation: Operation::NonReplicated,
-                size: u32::try_from(HEADER_SIZE).unwrap(),
-                status: IggyError::TransientNotCommitted.as_code(),
-                ..Default::default()
-            };
-            let mut requests = 0;
-            let mut header = [0; HEADER_SIZE];
-            while stream.read_exact(&mut header).await.is_ok() {
-                requests += 1;
-                if stream
-                    .write_all(bytemuck::bytes_of(&response))
-                    .await
-                    .is_err()
-                {
-                    break;
+    async fn a_routed_consumer_operation_with_an_unknown_outcome_is_not_replayed() {
+        for code in [
+            iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE,
+            iggy_binary_protocol::codes::STORE_CONSUMER_OFFSET_CODE,
+            iggy_binary_protocol::codes::DELETE_CONSUMER_OFFSET_CODE,
+        ] {
+            let (listener, address) = live_endpoint().await;
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let response = ReplyHeader {
+                    command: Command::Reply,
+                    operation: Operation::NonReplicated,
+                    size: u32::try_from(HEADER_SIZE).unwrap(),
+                    status: IggyError::TransientNotCommitted.as_code(),
+                    ..Default::default()
+                };
+                let mut requests = 0;
+                let mut header = [0; HEADER_SIZE];
+                while stream.read_exact(&mut header).await.is_ok() {
+                    requests += 1;
+                    if stream
+                        .write_all(bytemuck::bytes_of(&response))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-            requests
-        });
-        let client = client_with(&address);
-        Client::connect(&client).await.unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            client.send_poll_request(
-                iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE,
-                Bytes::new(),
-            ),
-        )
-        .await
-        .expect("an unknown poll outcome must return without entering a retry window");
-        assert!(matches!(result, Err(IggyError::TransientNotCommitted)));
-        Client::shutdown(&client).await.unwrap();
-        assert_eq!(
-            peer.await.unwrap(),
-            1,
-            "a poll cannot be deduplicated by its request header"
-        );
+                requests
+            });
+            let client = client_with(&address);
+            Client::connect(&client).await.unwrap();
+            client.bind_vsr_session(1).await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.send_poll_request(code, Bytes::new()),
+            )
+            .await
+            .expect("an unknown outcome must return without entering a retry window");
+            assert!(
+                matches!(result, Err(IggyError::TransientNotCommitted)),
+                "code {code}: {result:?}"
+            );
+            Client::shutdown(&client).await.unwrap();
+            assert_eq!(
+                peer.await.unwrap(),
+                1,
+                "an unknown outcome must not become a later non-admission"
+            );
+        }
     }
 
     #[test]

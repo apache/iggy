@@ -37,12 +37,14 @@ import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
 import org.apache.iggy.client.async.tcp.LeaderAwareness.LeaderRedirectionState;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.slf4j.Logger;
@@ -185,6 +187,9 @@ public class AsyncIggyTcpClient {
      * remembered while the connection was still healthy.
      */
     private volatile List<ConnectionInfo> rosterTargets = List.of();
+
+    // Zero is unknown; peers without TCP still count toward a clustered topology.
+    private volatile int rosterSize;
     /**
      * The login a successful sign-in ran, replayed after a redial so the
      * session is re-established on whichever node answers. The supplier
@@ -299,7 +304,7 @@ public class AsyncIggyTcpClient {
         return newConnection.connect().thenRun(() -> {
             log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
             messagesClient =
-                    new MessagesTcpClient(currentConnection, routingState, pollRouter, () -> rosterTargets.size() > 1);
+                    new MessagesTcpClient(currentConnection, routingState, pollRouter, this::isClusteredForPoll);
             consumerGroupsClient = new ConsumerGroupsTcpClient(currentConnection);
             consumerOffsetsClient = new ConsumerOffsetsTcpClient(currentConnection);
             streamsClient = new StreamsTcpClient(currentConnection);
@@ -498,11 +503,13 @@ public class AsyncIggyTcpClient {
      * @return a {@link CompletableFuture} that completes when all resources are released
      */
     public CompletableFuture<Void> close() {
-        closed = true;
         // Closing is caller intent, like a logout: connect() clears `closed`
         // again, and a session the caller ended must not come back with the
         // credentials the earlier sign-in used.
-        rememberedLogin = null;
+        synchronized (this) {
+            closed = true;
+            rememberedLogin = null;
+        }
         AsyncTcpConnection currentConnection = connection.get();
         CompletableFuture<Void> dataClosed = pollRouter.clearSession(currentConnection);
         if (currentConnection != null) {
@@ -892,8 +899,10 @@ public class AsyncIggyTcpClient {
             // Not after a close: a login still in flight when `close()` cleared
             // this would set it again, and `connect()` clears `closed`, so the
             // next loss would replay a sign-in the caller had ended.
-            if (error == null && !closed) {
-                rememberedLogin = loginAttempt;
+            synchronized (this) {
+                if (error == null && !closed) {
+                    rememberedLogin = loginAttempt;
+                }
             }
             if (error != null) {
                 callerFuture.completeExceptionally(error);
@@ -990,11 +999,42 @@ public class AsyncIggyTcpClient {
         if (currentSystemClient == null) {
             return CompletableFuture.completedFuture(Optional.empty());
         }
-        return LeaderAwareness.findLeaderElsewhere(currentSystemClient::getClusterMetadata, currentTarget)
-                .thenApply(lookup -> {
-                    rememberRoster(lookup);
-                    return lookup.redirect();
+        return LeaderAwareness.findLeaderElsewhere(
+                        () -> currentSystemClient.getClusterMetadata().thenApply(this::observeTopology), currentTarget)
+                .thenApply(LeaderAwareness.LeaderLookup::redirect);
+    }
+
+    private CompletableFuture<Boolean> isClusteredForPoll() {
+        int knownSize = rosterSize;
+        if (knownSize != 0) {
+            return CompletableFuture.completedFuture(knownSize > 1);
+        }
+        long deadline = System.nanoTime() + LeaderAwareness.LEADERLESS_WAIT_BUDGET.toNanos();
+        return connection
+                .get()
+                .send(CommandCode.System.GET_CLUSTER_METADATA.getValue(), Unpooled.EMPTY_BUFFER, deadline)
+                .orTimeout(LeaderAwareness.LEADERLESS_WAIT_BUDGET.toNanos(), TimeUnit.NANOSECONDS)
+                .thenApply(response -> {
+                    try {
+                        ClusterMetadata metadata = BytesDeserializer.readClusterMetadata(response);
+                        if (metadata.nodes().isEmpty()) {
+                            throw IggyServerException.fromTcpResponse(
+                                    AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0]);
+                        }
+                        observeTopology(metadata);
+                        return metadata.nodes().size() > 1;
+                    } finally {
+                        response.release();
+                    }
                 });
+    }
+
+    private ClusterMetadata observeTopology(ClusterMetadata metadata) {
+        if (!metadata.nodes().isEmpty()) {
+            rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), LeaderAwareness.nodeTargets(metadata)));
+            rosterSize = metadata.nodes().size();
+        }
+        return metadata;
     }
 
     /**
@@ -1092,7 +1132,10 @@ public class AsyncIggyTcpClient {
                 || code == CommandCode.PersonalAccessToken.LOGIN_REGISTER.getValue();
     }
 
-    private void rememberCurrentLogin() {
+    private synchronized void rememberCurrentLogin() {
+        if (closed) {
+            return;
+        }
         AsyncTcpConnection current = connection.get();
         var snapshot = current.authenticationSnapshot();
         if (snapshot.isEmpty()) {

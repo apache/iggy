@@ -467,15 +467,15 @@ public final class BytesSerializer {
     }
 
     /**
-     * One message as it enters the batch encoder: the id already encoded to its 16 wire bytes
-     * and the user headers already encoded to their opaque bytes.
-     */
-    /**
      * The batch-header values a set of messages implies. Measured before a byte is written so an
      * input the wire cannot carry is refused with the output buffer untouched.
      */
     private record BatchExtent(BigInteger originTimestamp, long length) {}
 
+    /**
+     * One message as it enters the batch encoder: the id already encoded to its 16 wire bytes
+     * and the user headers already encoded to their opaque bytes.
+     */
     record RawMessage(byte[] id, BigInteger originTimestamp, byte[] payload, byte[] userHeaders) {
         RawMessage {
             if (id.length != 16) {

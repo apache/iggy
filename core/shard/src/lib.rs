@@ -24,7 +24,7 @@ mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
-pub use poll::{PollAttachment, PollCompleted};
+pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
@@ -336,7 +336,7 @@ pub enum PartitionRead {
     PollOnPrimary {
         consumer: PollingConsumer,
         args: PollingArgs,
-        attachment: poll::PollAttachment,
+        attachment: poll::ConsumerAttachment,
     },
     Poll {
         consumer: PollingConsumer,
@@ -777,6 +777,7 @@ pub enum LifecycleFrame {
     PartitionSubmit {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
+        attachment: Option<ConsumerAttachment>,
     },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
@@ -914,7 +915,7 @@ impl ShardFrame {
 
 /// Prepares served per `RequestPrepares` round.
 ///
-/// The per-peer bus queues are bounded (`peer_queue_capacity`, 256 by default)
+/// The per-peer bus queues are bounded (`peer_queue_capacity`)
 /// and overrun frames drop silently, so an unbounded burst loses its own tail;
 /// the receiver pulls the window chunk by chunk instead (each walked
 /// `RepairDone` immediately requests the next chunk while progress holds).
@@ -2098,6 +2099,19 @@ where
         namespace: IggyNamespace,
         request: Message<RoutedRequestHeader>,
     ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
+        self.partition_submit_attached(namespace, request, None)
+    }
+
+    /// Submit an offset write with its parent consumer's admission fence.
+    ///
+    /// # Errors
+    /// Returns [`PartitionSubmitRefused`] before admission when the inbox is unavailable.
+    pub fn partition_submit_attached(
+        &self,
+        namespace: IggyNamespace,
+        request: Message<RoutedRequestHeader>,
+        attachment: Option<ConsumerAttachment>,
+    ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
         let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
             // Same fallback as `route_typed`: a miss means "not seeded yet",
             // not "unroutable", and the owning shard parks what arrives early.
@@ -2110,6 +2124,7 @@ where
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
             request,
             reply: reply_tx,
+            attachment,
         });
         let Some(sender) = self.senders.get(target as usize) else {
             self.metrics.record_frame_drop(

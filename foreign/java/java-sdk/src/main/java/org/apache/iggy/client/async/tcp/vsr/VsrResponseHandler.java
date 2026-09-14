@@ -140,8 +140,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (VsrHeaders.peekCommand(msg) == VsrHeaders.COMMAND_REPLY
                 && (VsrOperation.isMetadata(replyOperation)
                         || replyOperation == VsrOperation.REGISTER
-                        || replyOperation == VsrOperation.LOGOUT)
-                && replyOperation != VsrOperation.TRUNCATE_PARTITION) {
+                        || replyOperation == VsrOperation.LOGOUT)) {
             session.observeMetadata(msg.getLongLE(msg.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
         }
         RequestKey key =

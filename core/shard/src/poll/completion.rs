@@ -37,7 +37,7 @@ use iggy_common::IggyError;
 use partitions::PollReadResult;
 use server_common::sharding::IggyNamespace;
 
-use super::{PollAttachment, PollCompleted};
+use super::{ConsumerAttachment, PollCompleted};
 use crate::coordinator::classify_try_send_err;
 use crate::metrics::{FrameDropMetrics, ShardMetrics, frame_drop_reason, frame_drop_variant};
 use crate::{PartitionReadReply, Receiver, Sender, channel};
@@ -77,7 +77,7 @@ impl PollCompletionLane {
         &self,
         namespace: IggyNamespace,
         reply: Sender<PartitionReadReply>,
-        attachment: Option<PollAttachment>,
+        attachment: Option<ConsumerAttachment>,
     ) -> Option<PollCompletionSender> {
         if self.state.closed.load(Ordering::Relaxed) || self.sender.is_disconnected() {
             reject(&reply, &self.state.metrics, frame_drop_reason::DISCONNECTED);
@@ -154,7 +154,7 @@ pub struct PollCompletionSender {
     slot: CompletionSlot,
     namespace: IggyNamespace,
     reply: Sender<PartitionReadReply>,
-    attachment: Option<PollAttachment>,
+    attachment: Option<ConsumerAttachment>,
 }
 
 impl PollCompletionSender {

@@ -31,6 +31,7 @@ use iggy::prelude::*;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::dispatch::COMMAND_TABLE;
+use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
 use iggy_common::wire_conversions::{
@@ -311,6 +312,19 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             }
 
             // Consumer Offsets
+            GET_CONSUMER_OFFSET_ROUTING_CODE => client
+                .send_binary_request(
+                    code,
+                    GetConsumerOffsetRequest {
+                        consumer: consumer_to_wire(&ctx.consumer).unwrap(),
+                        stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
+                        topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
+                        partition_id: Some(0),
+                    }
+                    .to_bytes(),
+                )
+                .await
+                .map(|_| ()),
             GET_CONSUMER_OFFSET_CODE => client
                 .get_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
                 .await

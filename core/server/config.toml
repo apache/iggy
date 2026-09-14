@@ -726,6 +726,7 @@ pin_cores = true
 # ~ the prepare queue depth of the planes the shard hosts ([metadata] on
 # shard 0, [partition] elsewhere) times replica_count times directions.
 # Both depths are tunable, so raising either raises the capacity needed here.
+# Slots are allocated at startup per shard, even before traffic arrives.
 inbox_capacity = 65536
 
 # Capacity of the reply lane: a separate bounded channel for cross-shard

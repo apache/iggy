@@ -94,6 +94,132 @@ public sealed class PrimaryPollingTests
         Assert.Equal(1, cluster.Primaries[0].Connections);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task given_unknown_topology_when_the_probe_fails_should_wait_for_a_valid_roster_before_polling(
+        bool standalone, bool unavailable)
+    {
+        using var cluster = new PollCluster(standalone ? 0 : 2);
+        var refuseMetadata = true;
+        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE && refuseMetadata
+            ? Reply(request.Operation, [], unavailable ? (uint)VsrError.FEATURE_UNAVAILABLE : 0)
+            : null;
+        using var client = await cluster.ConnectAsync();
+        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        if (unavailable)
+        {
+            var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
+            Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<MalformedResponseException>(() => PollAsync(client));
+        }
+
+        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
+        Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Connections));
+        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+
+        refuseMetadata = false;
+        await PollAsync(client);
+        refuseMetadata = true;
+        if (unavailable)
+        {
+            await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+                client.GetClusterMetadataAsync(TestContext.Current.CancellationToken));
+        }
+        else
+        {
+            Assert.Null(await client.GetClusterMetadataAsync(TestContext.Current.CancellationToken));
+        }
+
+        var metadataReads = cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE);
+        await PollAsync(client);
+
+        Assert.Equal(metadataReads, cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE));
+        Assert.Equal(standalone ? 2 : 0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(standalone ? 0 : 1, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
+        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        if (!standalone)
+        {
+            Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE));
+        }
+    }
+
+    [Theory]
+    [InlineData((byte)VsrOperation.TruncatePartition)]
+    [InlineData((byte)VsrOperation.DeleteSegments)]
+    public async Task given_delete_segments_commit_when_polling_should_raise_the_attachment_floor(byte replyOperation)
+    {
+        using var cluster = new PollCluster();
+        cluster.OnCoordinator = request =>
+        {
+            if (request.Operation != (byte)VsrOperation.DeleteSegments)
+            {
+                return null;
+            }
+
+            var reply = Reply(replyOperation,
+                replyOperation == (byte)VsrOperation.TruncatePartition ? new byte[4] : []);
+            BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), MetadataCommit);
+            return reply;
+        };
+        using var client = await cluster.ConnectAsync();
+        await PollAsync(client);
+        await client.DeleteSegmentsAsync(Stream, Topic, 0, 1, TestContext.Current.CancellationToken);
+        await PollAsync(client);
+
+        Assert.Equal(new ulong[] { 1, MetadataCommit }, cluster.Attachments.Select(request =>
+            BinaryPrimitives.ReadUInt64LittleEndian(request.Body.AsSpan(24))));
+        Assert.Equal(1, cluster.Primaries[0].Connections);
+    }
+
+    [Fact]
+    public async Task given_roster_without_nodes_when_polling_should_preserve_the_last_valid_topology()
+    {
+        using var cluster = new PollCluster();
+        var emptyRoster = true;
+        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE && emptyRoster
+            ? Reply(request.Operation, new byte[8])
+            : null;
+        using var client = await cluster.ConnectAsync();
+        await Assert.ThrowsAsync<MalformedResponseException>(() => PollAsync(client));
+        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Connections));
+
+        emptyRoster = false;
+        await PollAsync(client);
+        emptyRoster = true;
+        await Assert.ThrowsAsync<MalformedResponseException>(() =>
+            client.GetClusterMetadataAsync(TestContext.Current.CancellationToken));
+        var reads = cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE);
+        await PollAsync(client);
+
+        Assert.Equal(reads, cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE));
+        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE));
+    }
+
+    [Fact]
+    public async Task given_only_refusals_when_the_poll_budget_expires_should_report_not_accepted()
+    {
+        using var cluster = new PollCluster();
+        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_POLL_ROUTING_CODE
+            ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED)
+            : null;
+        using var client = await cluster.ConnectAsync();
+        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
+
+        Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Connections));
+    }
+
     [Fact]
     public async Task given_poll_waiting_for_connection_when_metadata_commits_should_revalidate_its_cached_route()
     {

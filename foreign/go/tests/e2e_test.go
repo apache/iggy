@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,6 +194,13 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	if streamName == "" {
 		t.Skip("set IGGY_POLL_ROUTING_STREAM and IGGY_POLL_ROUTING_TOPIC to a split-primary topic with eight messages per partition")
 	}
+	messagesPerPartition := 8
+	if value := os.Getenv("IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION"); value != "" {
+		var err error
+		messagesPerPartition, err = strconv.Atoi(value)
+		require.NoError(t, err, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
+		require.Positive(t, messagesPerPartition, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
+	}
 	stream, err := iggcon.NewIdentifier(streamName)
 	require.NoError(t, err)
 	topic, err := iggcon.NewIdentifier(os.Getenv("IGGY_POLL_ROUTING_TOPIC"))
@@ -219,14 +227,18 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	var primary iggcon.ClusterNode
 	require.NoError(t, primary.UnmarshalBinary(route[32:]))
 	coordinator := connected.GetConnectionInfo().ServerAddress
-	primaryAddress := net.JoinHostPort(primary.IP, strconv.Itoa(int(primary.Endpoints.Tcp)))
-	require.NotEqual(t, coordinator, primaryAddress, "the fixture must separate metadata and partition primaries")
+	primaryAddress := net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
+	coordinatorEndpoint, err := net.ResolveTCPAddr("tcp", coordinator)
+	require.NoError(t, err)
+	primaryEndpoint, err := net.ResolveTCPAddr("tcp", primaryAddress)
+	require.NoError(t, err)
+	require.False(t, coordinatorEndpoint.Port == primaryEndpoint.Port && coordinatorEndpoint.IP.Equal(primaryEndpoint.IP),
+		"the fixture must separate metadata and partition primaries")
 	before, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
 	require.NoError(t, err)
 	beforeClient := binaryserialization.DeserializeClient(before)
 	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
 	counts := make(map[uint32]int)
-	const messagesPerPartition = 8
 	for range int(details.PartitionsCount) * messagesPerPartition {
 		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, nil)
 		require.NoError(t, err)
@@ -237,7 +249,7 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 		assert.Equal(t, messagesPerPartition, counts[partition])
 		require.Eventually(t, func() bool {
 			offset, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
-			return err == nil && offset != nil && offset.StoredOffset == messagesPerPartition-1
+			return err == nil && offset != nil && offset.StoredOffset == uint64(messagesPerPartition-1)
 		}, 5*time.Second, 50*time.Millisecond,
 			"partition %d auto-commit must replicate to the coordinator's backup", partition)
 		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)

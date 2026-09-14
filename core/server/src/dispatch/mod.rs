@@ -656,7 +656,12 @@ async fn handle_client_request<B, MJ, S, SB>(
                 server_config,
                 transport_client_id,
                 request,
-                (user_id, client_address, metadata_watermark),
+                ConnectionContext {
+                    bound,
+                    user_id,
+                    address: client_address,
+                    metadata_watermark,
+                },
             )
             .await;
         }
@@ -709,6 +714,29 @@ async fn handle_client_request<B, MJ, S, SB>(
             // `bound` is Some here: `classify` sends unbound transports to
             // `UnboundReplicated`.
             let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
+            let consumer_session = if matches!(
+                request.header().operation,
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+            ) {
+                let attachment = sessions
+                    .borrow()
+                    .attached_consumer_session(transport_client_id);
+                match attachment {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        send_deny_reply(
+                            shard,
+                            transport_client_id,
+                            request.header(),
+                            error.as_code(),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
             // `None` rather than trust that.
@@ -719,6 +747,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 bound_session,
                 transport_client_id,
                 user_id,
+                consumer_session,
             )
             .await;
         }

@@ -58,6 +58,7 @@ const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 const UNAUTHENTICATED = 40;
 const STALE_CLIENT = 30;
+const FEATURE_UNAVAILABLE = 5;
 const MAX_POLL_ROUTES = 4096;
 const MAX_POLL_CONNECTIONS = 256;
 const CONSUMER_SESSION_SIZE = 32;
@@ -206,6 +207,7 @@ export class CommandResponseStream extends EventEmitter {
   heartbeatIntervalHandler?: NodeJS.Timeout;
   /** Whether a heartbeat ping is still awaiting its response */
   private heartbeatInFlight: boolean;
+  private rememberedCredentials?: ClientCredentials;
   private clustered?: boolean;
   private metadataWatermark = 0n;
   private routingGeneration = 0;
@@ -323,8 +325,8 @@ export class CommandResponseStream extends EventEmitter {
           : withinDeadline(this.connection.connect(), pollDeadline));
 
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
-        await (pollDeadline === undefined ? this.authenticate(this.options.credentials)
-          : withinDeadline(this.authenticate(this.options.credentials), pollDeadline));
+        await (pollDeadline === undefined ? this.authenticate(this._signInCredentials())
+          : withinDeadline(this.authenticate(this._signInCredentials()), pollDeadline));
 
       if (pollDeadline !== undefined) {
         const deadline = pollDeadline;
@@ -418,7 +420,7 @@ export class CommandResponseStream extends EventEmitter {
           // command fails client-side, a non-replicated one goes out with
           // session 0.
           if (!this.isAuthenticated && !this.isUnloggedCommand(command))
-            await this.authenticate(this.options.credentials);
+            await this.authenticate(this._signInCredentials());
         }
       }
       if (!isLoginCommand(command) || this.settlingLeader)
@@ -567,6 +569,8 @@ export class CommandResponseStream extends EventEmitter {
   private _rememberRoster(response: CommandResponse): void {
     try {
       const metadata = GET_CLUSTER_METADATA.deserialize(response);
+      if (metadata.nodes.length === 0)
+        return;
       this.clustered = metadata.nodes.length > 1;
       this.connection.rememberRoster(
         metadata.nodes
@@ -598,9 +602,10 @@ export class CommandResponseStream extends EventEmitter {
           if (response.data.length < CONSUMER_SESSION_SIZE)
             throw new Error('poll routing response is incomplete');
           const node = deserializeNode(response.data, CONSUMER_SESSION_SIZE);
-          if (node.length + CONSUMER_SESSION_SIZE !== response.data.length ||
-              !node.data.ip || node.data.endpoints.tcp === 0)
+          if (node.length + CONSUMER_SESSION_SIZE !== response.data.length || !node.data.ip)
             throw new Error('poll routing response has no valid TCP endpoint');
+          if (node.data.endpoints.tcp === 0)
+            throw responseError(COMMAND_CODE.PollMessages, FEATURE_UNAVAILABLE);
           const attachment = Buffer.from(response.data.subarray(0, CONSUMER_SESSION_SIZE));
           if (attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) < this.metadataWatermark)
             attachment.writeBigUInt64LE(this.metadataWatermark, METADATA_WATERMARK_OFFSET);
@@ -647,9 +652,9 @@ export class CommandResponseStream extends EventEmitter {
         try {
           if (!entry.client.isAuthenticated) {
             entry.attachment = undefined;
-            await withinDeadline(entry.client.connection.connect(), deadline,
+            await withinDeadline(entry.client.connection.connect(true), deadline,
               () => entry.client.destroy());
-            const credentials = this.options.credentials;
+            const credentials = this._signInCredentials();
             const login = 'token' in credentials ? LOGIN_WITH_TOKEN : LOGIN;
             const loginPayload = 'token' in credentials
               ? LOGIN_WITH_TOKEN.serialize(credentials)
@@ -696,10 +701,12 @@ export class CommandResponseStream extends EventEmitter {
           throw error instanceof ResponseError
             ? responseError(COMMAND_CODE.PollMessages, error.errorCode)
             : error;
-        await delay(Math.min(VSR_RETRY_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+        if (!worthAnotherAttempt(deadline))
+          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+        await delay(VSR_RETRY_INTERVAL_MS);
       }
     }
-    throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_COMMITTED);
+    throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
   }
 
   private async _pollRoutingControl(payload: Buffer, deadline: number): Promise<CommandResponse> {
@@ -740,29 +747,36 @@ export class CommandResponseStream extends EventEmitter {
   private _rememberCredentials(command: number, payload: Buffer): void {
     if (command === LOGIN.code) {
       const username = readWireName(payload, 0);
-      this.options.credentials = {
+      this.rememberedCredentials = {
         username: username.value, password: readWireName(payload, username.next).value
       };
     } else if (command === LOGIN_WITH_TOKEN.code) {
-      this.options.credentials = { token: readWireName(payload, 0).value };
+      this.rememberedCredentials = { token: readWireName(payload, 0).value };
     } else if ((command === COMMAND_CODE.ChangePassword || command === COMMAND_CODE.UpdateUser) &&
-        this.userId !== undefined && 'username' in this.options.credentials) {
-      const credentials = this.options.credentials;
+        this.userId !== undefined && this.rememberedCredentials &&
+        'username' in this.rememberedCredentials) {
+      const credentials = this.rememberedCredentials;
       const identifier = [serializeIdentifier(this.userId), serializeIdentifier(credentials.username)]
         .find((encoded) => payload.subarray(0, encoded.length).equals(encoded));
       if (!identifier)
         return;
       if (command === COMMAND_CODE.ChangePassword) {
         const currentPassword = readWireName(payload, identifier.length);
-        this.options.credentials = {
-          ...credentials, password: readWireName(payload, currentPassword.next).value
-        };
+        const password = readWireName(payload, currentPassword.next).value;
+        this.rememberedCredentials = { ...credentials, password };
+        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
+          this.options.credentials = { ...this.options.credentials, password };
       } else if (payload[identifier.length] === 1) {
-        this.options.credentials = {
-          ...credentials, username: readWireName(payload, identifier.length + 1).value
-        };
+        const username = readWireName(payload, identifier.length + 1).value;
+        this.rememberedCredentials = { ...credentials, username };
+        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
+          this.options.credentials = { ...this.options.credentials, username };
       }
     }
+  }
+
+  private _signInCredentials(): ClientCredentials {
+    return this.rememberedCredentials ?? this.options.credentials;
   }
 
   private _clearPollRouting(): void {
@@ -939,6 +953,7 @@ export class CommandResponseStream extends EventEmitter {
       }
       this._rememberCredentials(command, payload);
       if (prepared.command === COMMAND_CODE.LogoutUser) {
+        this.rememberedCredentials = undefined;
         this._resetSession();
       }
       // Every roster read feeds the redial candidates, whoever asked for it
@@ -1263,6 +1278,7 @@ export class CommandResponseStream extends EventEmitter {
    * Stops heartbeat and destroys the connection.
    */
   destroy() {
+    this.rememberedCredentials = undefined;
     this._clearPollRouting();
     if (this.heartbeatIntervalHandler)
       clearInterval(this.heartbeatIntervalHandler);

@@ -40,7 +40,6 @@ use bytes::Bytes;
 use consensus::client_table::SessionAttachment;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::PrepareHeader;
-use iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
@@ -59,9 +58,8 @@ use partitions::{PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
-use shard::{PartitionRead, PartitionReadReply, PollAttachment};
+use shard::{ConsumerAttachment, PartitionRead, PartitionReadReply};
 use std::rc::Rc;
-use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Route a partition data-plane op (`SendMessages` / consumer-offset writes)
@@ -89,7 +87,7 @@ use tracing::{debug, warn};
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub async fn dispatch_partition_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
@@ -97,6 +95,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     bound_session: u64,
     transport_client_id: u128,
     acting_user_id: Option<u32>,
+    consumer_session: Option<(u128, SessionAttachment)>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -109,7 +108,9 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         shard,
         header.operation,
         request_body(&request),
-        vsr_client_id,
+        consumer_session
+            .as_ref()
+            .map_or(vsr_client_id, |(parent, _)| *parent),
     ) {
         Ok(namespace) => namespace,
         Err(error) => {
@@ -169,6 +170,24 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         send_deny_reply(shard, transport_client_id, &header, status).await;
         return;
     }
+    let attachment = consumer_session
+        .map(|(parent, session)| {
+            capture_offset_attachment(
+                shard.plane.metadata().mux_stm.streams(),
+                scope,
+                request_body(&request),
+                parent,
+                session,
+            )
+        })
+        .transpose();
+    let attachment = match attachment {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+            return;
+        }
+    };
     // Convergence wait: a CreateTopic commit returns to the client before the
     // per-shard reconcilers seed routing rows and materialise the partition
     // (next wake/periodic tick). An op arriving inside that window is not lost
@@ -238,7 +257,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         // type-level fallback here.
         new_header.user_id = acting_user_id.unwrap_or(0);
     });
-    if vsr_client_id == transport_client_id {
+    if attachment.is_none() && vsr_client_id == transport_client_id {
         shard.dispatch(request.into_generic());
         return;
     }
@@ -248,6 +267,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         request,
         transport_client_id,
         &header,
+        attachment,
     )
     .await;
 }
@@ -267,6 +287,7 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     request: Message<RoutedRequestHeader>,
     transport_client_id: u128,
     header: &RoutedRequestHeader,
+    attachment: Option<ConsumerAttachment>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -275,7 +296,7 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let consumer_kind = consumer_offset_kind(&request);
-    let Ok(ticket) = shard.partition_submit(namespace, request) else {
+    let Ok(ticket) = shard.partition_submit_attached(namespace, request, attachment) else {
         // `PartitionSubmitRefused`: the frame never reached the owning shard,
         // so this is a known outcome and the client can be told now rather
         // than after its read-timeout. Same transient the plane itself answers
@@ -327,6 +348,34 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     });
 }
 
+fn capture_offset_attachment(
+    streams: &metadata::stm::stream::Streams,
+    namespace: IggyNamespace,
+    body: &[u8],
+    parent: u128,
+    session: SessionAttachment,
+) -> Result<ConsumerAttachment, IggyError> {
+    if !session.is_valid() {
+        return Err(IggyError::StaleClient);
+    }
+    let (wire, _) =
+        GetConsumerOffsetRequest::decode(body).map_err(|_| IggyError::InvalidCommand)?;
+    let group = if wire.consumer.kind == KIND_CONSUMER_GROUP {
+        Some(crate::responses::resolve_offset_group_id(
+            streams,
+            &wire.stream_id,
+            &wire.topic_id,
+            &wire.consumer.id,
+        )?)
+    } else {
+        None
+    };
+    let metadata = streams
+        .consumer_offset_metadata(namespace, group, parent)
+        .ok_or(IggyError::TransientNotAccepted)?;
+    Ok(ConsumerAttachment { session, metadata })
+}
+
 fn consumer_offset_kind(request: &Message<RoutedRequestHeader>) -> Option<ConsumerKind> {
     if request.header().operation != Operation::StoreConsumerOffset {
         return None;
@@ -353,7 +402,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
     consumer_client_id: u128,
-    attachment: Option<Arc<SessionAttachment>>,
+    attachment: Option<SessionAttachment>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -375,9 +424,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         .await;
         return;
     };
-    if crate::dispatch::non_replicated_code(request.header()) == POLL_MESSAGES_ON_PRIMARY_CODE
-        && !wire.auto_commit
-    {
+    if attachment.is_some() && !wire.auto_commit {
         send_non_replicated_deny(
             shard,
             request,
@@ -483,7 +530,7 @@ async fn read_polled_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     (namespace, partition_id, consumer, args): DecodedPollRequest,
-    attachment: Option<Arc<SessionAttachment>>,
+    attachment: Option<SessionAttachment>,
     consumer_client_id: u128,
 ) -> Result<BusMessage, ReadPolledMessagesError>
 where
@@ -510,7 +557,7 @@ where
         PartitionRead::PollOnPrimary {
             consumer,
             args,
-            attachment: PollAttachment {
+            attachment: ConsumerAttachment {
                 session: attachment,
                 metadata,
             },
@@ -1395,7 +1442,8 @@ mod tests {
         ));
         for (index, (operation, body, expected)) in cases.into_iter().enumerate() {
             let request = request_message(operation, 1, 1, index as u64 + 1, &body);
-            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID)).await;
+            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID), None)
+                .await;
             let replies = bus.client_replies.borrow();
             assert_eq!(
                 replies.len(),
@@ -1903,6 +1951,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            None,
         )
         .await;
 

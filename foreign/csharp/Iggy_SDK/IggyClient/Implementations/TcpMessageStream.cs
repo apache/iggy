@@ -966,8 +966,8 @@ public sealed partial class TcpMessageStream : IIggyClient
             TcpContracts.GetMessages(payload.AsSpan(0, messageBufferSize), consumer, streamId,
                 topicId, pollingStrategy, count, autoCommit, partitionId);
 
-            responseBuffer = autoCommit && await UsesClusterPollRoutingAsync(token)
-                ? await PollOnPrimaryAsync(new PollRouteKey(streamId, topicId, consumer.Type,
+            responseBuffer = autoCommit
+                ? await PollAutoCommitAsync(new PollRouteKey(streamId, topicId, consumer.Type,
                         consumer.ConsumerId, partitionId), payload.AsMemory(0, messageBufferSize), token)
                 : await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE,
                     payload.AsMemory(0, messageBufferSize), token: token);

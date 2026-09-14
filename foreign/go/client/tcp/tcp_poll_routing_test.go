@@ -21,8 +21,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -193,7 +195,7 @@ func TestPrimaryPoll_MetadataReplyRefreshesRouteAndAttachment(t *testing.T) {
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
 }
 
-func TestPrimaryPoll_UnknownOutcomeDoesNotReplayAndNextPollReplacesOnlyDataConnection(t *testing.T) {
+func TestPrimaryPoll_UnknownOutcomeDoesNotReplayAndOnlyLostRepliesReplaceDataConnection(t *testing.T) {
 	for _, lostReply := range []bool{false, true} {
 		t.Run(map[bool]string{false: "transient-not-committed", true: "lost-reply"}[lostReply], func(t *testing.T) {
 			var polls atomic.Int32
@@ -211,7 +213,11 @@ func TestPrimaryPoll_UnknownOutcomeDoesNotReplayAndNextPollReplacesOnlyDataConne
 			require.Equal(t, int32(1), polls.Load(), "the admitted poll is never replayed")
 			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 			require.NoError(t, err)
-			assert.Equal(t, 2, fixture.primaries[0].connections())
+			connections := 1
+			if lostReply {
+				connections = 2
+			}
+			assert.Equal(t, connections, fixture.primaries[0].connections())
 			assert.Equal(t, 1, fixture.coordinator.connections())
 		})
 	}
@@ -294,7 +300,7 @@ func TestPrimaryPoll_LogoutRetiresPendingDataAndDoesNotResurrectMembership(t *te
 	require.NoError(t, fixture.client.LogoutUser(context.Background()))
 	select {
 	case err := <-completed:
-		require.Error(t, err)
+		require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
 	case <-time.After(time.Second):
 		t.Fatal("logout left the data exchange running")
 	}
@@ -304,6 +310,290 @@ func TestPrimaryPoll_LogoutRetiresPendingDataAndDoesNotResurrectMembership(t *te
 	assert.Empty(t, fixture.client.polls.connections)
 	assert.False(t, fixture.client.session.Bound())
 	assert.Equal(t, 1, fixture.coordinator.connections())
+}
+
+func TestPrimaryPoll_CompleteStatusRepliesKeepTheDataConnection(t *testing.T) {
+	for _, status := range []ierror.IggyError{
+		ierror.ErrUnauthorized, ierror.ErrConsumerGroupPartitionNotOwned, ierror.ErrInvalidCommand,
+	} {
+		t.Run(status.Error(), func(t *testing.T) {
+			var polls atomic.Int32
+			fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+				if read.code() == uint32(command.PollMessagesOnPrimaryCode) && polls.Add(1) == 1 {
+					return statusReplyFrame(vsr.OperationNonReplicated, uint32(status.Code()), nil), true
+				}
+				return nil, false
+			}, nil)
+			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.ErrorIs(t, err, status)
+			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.NoError(t, err)
+			assert.Equal(t, 1, fixture.primaries[0].connections())
+			assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.AttachConsumerSessionCode))
+			assert.Equal(t, int32(2), polls.Load())
+		})
+	}
+}
+
+func TestPrimaryPoll_InvalidReplyFrameDropsTheDataConnectionWithoutReplay(t *testing.T) {
+	var polls atomic.Int32
+	fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+		if read.code() == uint32(command.PollMessagesOnPrimaryCode) && polls.Add(1) == 1 {
+			answer := replyFrame(vsr.OperationNonReplicated, nil)
+			binary.LittleEndian.PutUint32(answer[frameOffsetSize:], vsr.HeaderSize-1)
+			return answer, true
+		}
+		return nil, false
+	}, nil)
+	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+	require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+	require.Equal(t, int32(1), polls.Load())
+	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2, fixture.primaries[0].connections())
+}
+
+func TestPrimaryPoll_SessionFailureReplacesDataConnectionWithoutReplay(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		reply []byte
+	}{
+		{"evicted", evictionFrame(vsr.EvictionStaleClient, 0, 0)},
+		{"unauthenticated", statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrUnauthenticated.Code()), nil)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var polls atomic.Int32
+			fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+				if read.code() == uint32(command.PollMessagesOnPrimaryCode) && polls.Add(1) == 1 {
+					return test.reply, true
+				}
+				return nil, false
+			}, nil)
+			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+			require.Equal(t, int32(1), polls.Load())
+			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.NoError(t, err)
+			assert.Equal(t, 2, fixture.primaries[0].connections())
+			assert.Equal(t, 1, fixture.coordinator.connections())
+		})
+	}
+}
+
+func TestPrimaryPoll_ForwardedTruncateReplyRefreshesMetadataFence(t *testing.T) {
+	fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
+		if read.operation() == vsr.OperationDeleteSegments {
+			answer := replyFrame(vsr.OperationTruncatePartition, resultSection())
+			binary.LittleEndian.PutUint64(answer[testMetadataCommitOffset:], 42)
+			return answer, true
+		}
+		return nil, false
+	})
+	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+	require.NoError(t, err)
+	_, err = fixture.client.SendBinaryRequest(context.Background(), uint32(command.DeleteSegmentsCode), nil)
+	require.NoError(t, err)
+	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+	require.NoError(t, err)
+	var floors []uint64
+	for _, read := range fixture.primaries[0].recorded() {
+		if read.code() == uint32(command.AttachConsumerSessionCode) {
+			floors = append(floors, binary.LittleEndian.Uint64(read.payload[24:]))
+		}
+	}
+	assert.Equal(t, []uint64{1, 42}, floors)
+	assert.Equal(t, 1, fixture.primaries[0].connections())
+}
+
+func TestPrimaryPoll_RetirementDuringAttachmentIsNotCallerCancellation(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+		if read.code() == uint32(command.AttachConsumerSessionCode) {
+			close(entered)
+			<-release
+			return nil, true
+		}
+		return nil, false
+	}, nil)
+	stream, topic, consumer := groupConsumer(t)
+	partition := uint32(0)
+	payload, err := (&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
+		PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}).MarshalBinary()
+	require.NoError(t, err)
+	key := string(payload[:len(payload)-pollParametersSize])
+	route, err := fixture.client.pollRoute(context.Background(), key, payload)
+	require.NoError(t, err)
+	completed := make(chan error, 1)
+	go func() {
+		_, err := fixture.client.pollOnRoute(context.Background(), key, payload, route)
+		completed <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("primary did not receive the attachment")
+	}
+	require.NoError(t, fixture.client.LogoutUser(context.Background()))
+	select {
+	case err := <-completed:
+		require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
+	case <-time.After(time.Second):
+		t.Fatal("logout left the attachment running")
+	}
+	assert.Zero(t, requestCount(fixture.primaries[0].recorded(), command.PollMessagesOnPrimaryCode))
+}
+
+func TestPrimaryPoll_InternalBudgetDoesNotReturnCallerDeadline(t *testing.T) {
+	for _, outcome := range []string{"lost-reply", "queued", "refused"} {
+		t.Run(outcome, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				coordinator, coordinatorConn := newPipeClient(t)
+				defer func() { _ = coordinator.Close() }()
+				primary, primaryConn := newPipeClient(t)
+				defer func() { _ = primary.Close() }()
+				coordinator.rememberLogin(NewUsernamePasswordCredentials("iggy", "secret"))
+				coordinator.clustered.Store(true)
+				stream, topic, consumer := groupConsumer(t)
+				partition := uint32(0)
+				poll := &command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
+					PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}
+				payload, err := poll.MarshalBinary()
+				require.NoError(t, err)
+				key := string(payload[:len(payload)-pollParametersSize])
+				route := pollRoute{endpoint: "127.0.0.1:9000", parent: coordinator.pollSession.Load().parent}
+				lifetime, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				slot := &pollConnection{gate: make(chan struct{}, 1), ctx: lifetime, cancel: cancel,
+					conn: primary.conn, client: primary, parent: route.parent, attached: true}
+				coordinator.polls.routes = map[string]pollRoute{key: route}
+				coordinator.polls.connections = map[string]*pollConnection{route.endpoint: slot}
+				serve(coordinatorConn, func(_ int, read request) []byte {
+					return pollRoutingReply(t, read, route.endpoint, 0)
+				})
+				polls := 0
+				serve(primaryConn, func(_ int, read request) []byte {
+					if read.code() == uint32(command.AttachConsumerSessionCode) {
+						return replyFrame(vsr.OperationNonReplicated, nil)
+					}
+					polls++
+					if outcome == "refused" {
+						return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrTransientNotAccepted.Code()), nil)
+					}
+					return nil
+				})
+				if outcome == "queued" {
+					slot.gate <- struct{}{}
+				}
+				_, err = coordinator.pollPrimary(context.Background(), poll)
+				synctest.Wait()
+				if outcome == "refused" {
+					require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
+					assert.Greater(t, polls, 1)
+				} else {
+					require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+					if outcome == "lost-reply" {
+						assert.Equal(t, 1, polls, "an uncertain auto-commit cannot replay")
+					} else {
+						assert.Zero(t, polls)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestPrimaryPoll_CoordinatorTrafficDoesNotStarveColdRouting(t *testing.T) {
+	const workers = 8
+	busy := make(chan struct{})
+	var requests atomic.Int32
+	fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
+		if read.code() == uint32(command.GetStatsCode) {
+			if requests.Add(1) == workers {
+				close(busy)
+			}
+			time.Sleep(2 * time.Millisecond)
+			return replyFrame(vsr.OperationNonReplicated, nil), true
+		}
+		return nil, false
+	})
+	trafficCtx, cancel := context.WithCancel(context.Background())
+	var traffic sync.WaitGroup
+	for range workers {
+		traffic.Go(func() {
+			for trafficCtx.Err() == nil {
+				_, _ = fixture.client.SendBinaryRequest(trafficCtx, uint32(command.GetStatsCode), nil)
+			}
+		})
+	}
+	defer func() { cancel(); traffic.Wait() }()
+	select {
+	case <-busy:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator traffic did not start")
+	}
+	ctx, stop := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer stop()
+	_, err := pollPrimaryPartition(ctx, fixture.client, 0)
+	require.NoError(t, err, "cold routing must join the coordinator exchange queue")
+}
+
+func TestPrimaryPoll_UnknownTopologyCannotSelectLegacyPolling(t *testing.T) {
+	var failRoster atomic.Bool
+	failRoster.Store(true)
+	fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
+		if read.code() == uint32(command.GetClusterMetadataCode) && failRoster.Load() {
+			return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrFeatureUnavailable.Code()), nil), true
+		}
+		return nil, false
+	})
+	require.False(t, fixture.client.topologyKnown.Load(), "the login-time roster read failed")
+	parent := fixture.client.session.ClientID()
+	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+	require.ErrorIs(t, err, ierror.ErrFeatureUnavailable)
+	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
+
+	failRoster.Store(false)
+	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+	require.NoError(t, err)
+	require.True(t, fixture.client.topologyKnown.Load())
+	failRoster.Store(true)
+	_, err = fixture.client.GetClusterMetadata(context.Background())
+	require.ErrorIs(t, err, ierror.ErrFeatureUnavailable)
+	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+	require.NoError(t, err, "a failed refresh must preserve known topology and warm routes")
+	assert.Equal(t, 1, fixture.primaries[0].connections())
+	assert.Equal(t, 1, fixture.coordinator.connections())
+	assert.Equal(t, parent, fixture.client.session.ClientID())
+	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+}
+
+func TestPrimaryPoll_UnknownTopologyCanRecoverAsStandalone(t *testing.T) {
+	var failRoster atomic.Bool
+	failRoster.Store(true)
+	var fixture *primaryPollFixture
+	fixture = newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			if failRoster.Load() {
+				return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrFeatureUnavailable.Code()), nil), true
+			}
+			return clusterMetadataFrame(t, 0, fixture.coordinator.address()), true
+		}
+		return nil, false
+	})
+	failRoster.Store(false)
+	for range 2 {
+		_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+		require.NoError(t, err)
+	}
+	assert.True(t, fixture.client.topologyKnown.Load())
+	assert.False(t, fixture.client.clustered.Load())
+	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetClusterMetadataCode))
+	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
+	assert.Zero(t, fixture.primaries[0].connections())
 }
 
 func TestPrimaryPoll_ControlConnectionRecoversBeforeRouting(t *testing.T) {

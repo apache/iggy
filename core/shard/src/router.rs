@@ -802,13 +802,27 @@ where
             } => {
                 self.on_partition_read(namespace, read, reply).await;
             }
-            LifecycleFrame::PartitionSubmit { request, reply } => {
+            LifecycleFrame::PartitionSubmit {
+                request,
+                reply,
+                attachment,
+            } => {
                 // Addressed to the shard owning the request's namespace (the
                 // sender resolved it via the shards table, same fallback as
                 // `route_typed`). Every refusal answers on `reply`, so the
                 // awaiting shard never waits out its budget on a decision
                 // already made.
-                self.on_partition_submit(request, reply).await;
+                if let Some(attachment) = attachment
+                    && let Err(error) = self.validate_offset_attachment(&request, &attachment)
+                {
+                    let deny = consensus::build_deny_reply_from_request_header(
+                        request.header(),
+                        error.as_code(),
+                    );
+                    let _ = reply.try_send(Some(deny.into_generic()));
+                } else {
+                    self.on_partition_submit(request, reply).await;
+                }
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or

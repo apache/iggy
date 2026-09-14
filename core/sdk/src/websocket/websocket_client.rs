@@ -20,13 +20,12 @@ use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
     check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
 };
-use crate::poll_routing::{PollRouter, PollTransport};
+use crate::poll_routing::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::session::ConsensusSession;
 use crate::vsr::replay_after_session_reset_is_safe;
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
 use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
 use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
-use iggy_binary_protocol::WireEncode;
 use iggy_common::TransportProtocol;
 use rustls::{ClientConfig, pki_types::pem::PemObject};
 
@@ -48,6 +47,7 @@ use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -96,6 +96,7 @@ pub struct WebSocketClient {
     /// as walk candidates for a request the current node keeps refusing to
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
+    roster_learned: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent callers cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -130,18 +131,23 @@ impl Client for WebSocketClient {
 
 #[async_trait]
 impl BinaryTransport for WebSocketClient {
+    async fn send_offset_write_with_response(
+        &self,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        if self.poll_router.is_clustered(self).await? {
+            self.poll_router.write_offset(self, code, payload).await
+        } else {
+            self.send_raw_with_response(code, payload).await
+        }
+    }
+
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
     ) -> Result<Bytes, IggyError> {
-        if request.auto_commit && self.roster_endpoints.lock().await.len() > 1 {
-            return self.poll_router.poll(self, request).await;
-        }
-        self.send_raw_with_response(
-            iggy_binary_protocol::codes::POLL_MESSAGES_CODE,
-            request.to_bytes(),
-        )
-        .await
+        self.poll_router.poll(self, request).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -158,12 +164,7 @@ impl BinaryTransport for WebSocketClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        if matches!(
-            code,
-            iggy_binary_protocol::codes::ATTACH_CONSUMER_SESSION_CODE
-                | iggy_binary_protocol::codes::GET_POLL_ROUTING_CODE
-                | iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE
-        ) {
+        if is_poll_routing_code(code) {
             return self.send_poll_request(code, payload).await;
         }
         let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
@@ -453,8 +454,22 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
 
     async fn remember_session_credentials(&self, credentials: Credentials, user_id: u32) {
         self.poll_router.remember_credentials(credentials, user_id);
-        if !self.auto_login_configured() {
-            let endpoints = read_transport_endpoints(self, TransportProtocol::WebSocket).await;
+        if self.auto_login_configured()
+            || self.get_state().await != ClientState::Authenticated
+            || self.roster_learned.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let read = read_transport_endpoints(self, TransportProtocol::WebSocket);
+        let Ok((node_count, endpoints)) = tokio::time::timeout(ROSTER_READ_TIMEOUT, read).await
+        else {
+            warn!("Reading the cluster roster took longer than {ROSTER_READ_TIMEOUT:?}");
+            return;
+        };
+        if !endpoints.is_empty() {
+            self.poll_router
+                .roster_size
+                .store(node_count, Ordering::Release);
             *self.roster_endpoints.lock().await = endpoints;
         }
     }
@@ -497,7 +512,7 @@ impl PollTransport for WebSocketClient {
     }
 
     async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        self.send_raw(code, payload).await
+        self.send_raw_request(code, payload, false).await
     }
 }
 
@@ -534,6 +549,7 @@ impl WebSocketClient {
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
+            roster_learned: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -924,6 +940,9 @@ impl WebSocketClient {
         // persistently refused request runs, not for dead-node redial (which
         // remains TCP-only).
         if !leader_check.endpoints.is_empty() {
+            self.poll_router
+                .roster_size
+                .store(leader_check.node_count, Ordering::Release);
             *self.roster_endpoints.lock().await = leader_check.endpoints;
         }
         let leader_address = leader_check.redirect;
@@ -1051,6 +1070,15 @@ impl WebSocketClient {
     }
 
     async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, true).await
+    }
+
+    async fn send_raw_request(
+        &self,
+        code: u32,
+        payload: Bytes,
+        retry_transient: bool,
+    ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
                 trace!("Cannot send data. Client is shutdown.");
@@ -1156,7 +1184,7 @@ impl WebSocketClient {
                     frame_complete = true;
                     crate::vsr::observe_metadata_reply(&metadata_watermark, &response_header);
                     match crate::vsr::decode_response_split(&response_header, body) {
-                        Err(error) if code == iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE => return Err(error),
+                        Err(error) if !retry_transient => return Err(error),
                         Err(IggyError::TransientNotAccepted)
                             if tokio::time::Instant::now() >= not_accepted_deadline =>
                         {

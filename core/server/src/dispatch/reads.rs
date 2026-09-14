@@ -35,10 +35,10 @@ use crate::dispatch::partition::{
 };
 use crate::responses::{
     build_empty_reply, build_get_me_response, build_get_personal_access_tokens_response,
-    build_non_replicated_response, cluster_node_response, connected_client_to_response,
-    current_metadata_commit,
+    build_non_replicated_response, connected_client_to_response, current_metadata_commit,
+    fence_and_resolve_offset_namespace,
 };
-use crate::session_manager::SessionManager;
+use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::snapshot;
 use crate::wire::request_body;
@@ -49,12 +49,14 @@ use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     ATTACH_CONSUMER_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
-    PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
+    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE,
+    GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
+use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
@@ -359,7 +361,12 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     // serves ungated codes; the gated arms fail closed on it. An unknown
     // connection arrives with a floor of `0`: it was promised nothing, so its
     // reads wait for nothing.
-    (user_id, client_address, watermark): (Option<u32>, Option<SocketAddr>, u64),
+    ConnectionContext {
+        bound,
+        user_id,
+        address: client_address,
+        metadata_watermark: watermark,
+    }: ConnectionContext,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -494,20 +501,21 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         GET_SNAPSHOT_FILE_CODE => {
             handle_get_snapshot(shard, server_config, transport_client_id, &request, user_id).await;
         }
-        GET_POLL_ROUTING_CODE | ATTACH_CONSUMER_SESSION_CODE => {
-            let result = if code == GET_POLL_ROUTING_CODE {
-                poll_routing(
+        GET_POLL_ROUTING_CODE | GET_CONSUMER_OFFSET_ROUTING_CODE | ATTACH_CONSUMER_SESSION_CODE => {
+            let result = if code == ATTACH_CONSUMER_SESSION_CODE {
+                attach_consumer_session(shard, sessions, transport_client_id, &request, user_id)
+                    .await
+            } else {
+                consumer_routing(
                     shard,
                     sessions,
                     transport_client_id,
                     &request,
                     user_id,
                     client_address,
+                    code,
                 )
                 .await
-            } else {
-                attach_consumer_session(shard, sessions, transport_client_id, &request, user_id)
-                    .await
             };
             match result {
                 Ok(bytes) => {
@@ -534,9 +542,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .consumer_session(transport_client_id)
                     .map(|(client_id, attachment)| (client_id, Some(attachment)))
             } else {
-                sessions
-                    .borrow()
-                    .get_session(transport_client_id)
+                bound
                     .map(|(client_id, _)| (client_id, None))
                     .ok_or(IggyError::Unauthenticated)
             };
@@ -653,14 +659,15 @@ where
     Ok(Bytes::new())
 }
 
-#[allow(clippy::future_not_send)]
-async fn poll_routing<B, MJ, S, SB>(
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
+async fn consumer_routing<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
     client_address: Option<SocketAddr>,
+    code: u32,
 ) -> Result<Bytes, IggyError>
 where
     B: ShellBus,
@@ -669,17 +676,24 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let wire = PollMessagesRequest::decode_from(request_body(request))
+    let poll = if code == GET_POLL_ROUTING_CODE {
+        let poll = PollMessagesRequest::decode_from(request_body(request))
+            .map_err(|_| IggyError::InvalidCommand)?;
+        if !poll.auto_commit {
+            return Err(IggyError::InvalidCommand);
+        }
+        Some(poll)
+    } else {
+        None
+    };
+    let (wire, _) = GetConsumerOffsetRequest::decode(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
-    if !wire.auto_commit {
-        return Err(IggyError::InvalidCommand);
-    }
     let (client_id, session) = sessions
         .borrow()
         .get_session(transport_client_id)
         .ok_or(IggyError::Unauthenticated)?;
     let watermark = sessions.borrow().metadata_watermark(transport_client_id);
-    authorize_and_hold_read(shard, GET_POLL_ROUTING_CODE, watermark, || {
+    authorize_and_hold_read(shard, code, watermark, || {
         authorize_partition_read(
             shard,
             &wire.stream_id,
@@ -692,7 +706,18 @@ where
         .map_or(Ok(()), |code| Err(IggyError::from_code(code)))
     })
     .await?;
-    let (namespace, _, _, _) = resolve_poll_request(shard, &wire, client_id)?;
+    let namespace = if let Some(poll) = poll {
+        resolve_poll_request(shard, &poll, client_id)?.0
+    } else {
+        fence_and_resolve_offset_namespace(
+            shard,
+            &wire.consumer,
+            &wire.stream_id,
+            &wire.topic_id,
+            wire.partition_id,
+            client_id,
+        )?
+    };
     let primary = match shard
         .partition_read(namespace, PartitionRead::Primary)
         .await
@@ -714,7 +739,7 @@ where
             session,
             metadata_watermark: watermark.max(shard.plane.metadata().applied_frontier().get()),
         },
-        primary: cluster_node_response(primary),
+        primary: primary.into(),
     }
     .to_bytes())
 }

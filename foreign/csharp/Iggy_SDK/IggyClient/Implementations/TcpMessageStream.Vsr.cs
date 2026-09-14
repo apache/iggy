@@ -430,7 +430,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// </summary>
     private void RememberRoster(ClusterMetadata clusterMetadata)
     {
-        Volatile.Write(ref _clusterNodeCount, clusterMetadata.Nodes.Count());
+        var nodeCount = clusterMetadata.Nodes.Count();
+        if (nodeCount == 0)
+        {
+            throw new MalformedResponseException("Cluster metadata contains no nodes.");
+        }
+
+        Volatile.Write(ref _clusterNodeCount, nodeCount);
         var endpoints = clusterMetadata.Nodes
             .Where(node => node.Endpoints.Tcp != 0)
             .Select(node => ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp))

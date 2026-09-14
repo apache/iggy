@@ -84,9 +84,18 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 go test ./tests
 Add `IGGY_TCP_TLS_ENABLED=true` to run the TLS cases against a server started
 with `IGGY_TCP_TLS_ENABLED=true` and the certificate pair in `core/certs`.
 
-The split-primary regression needs an existing topic with eight messages
-per partition, seeded before only metadata leadership moves. It verifies
-that the coordinator differs from the partition primary:
+From the repository root, the integration harness builds a three-node fixture,
+seeds messages, moves metadata leadership independently of the partition
+primary, and runs the Go regression. It requires Go on `PATH`:
+
+```bash
+cargo build --bin iggy-server --bin iggy
+cargo test -p integration given_split_primaries_when_go_group_auto_commits_should_preserve_membership -- --ignored
+```
+
+To use an existing fixture, set its coordinator address and topic. The test
+expects eight messages per partition by default; override that with the
+positive integer `IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION` when needed:
 
 ```bash
 IGGY_TCP_ADDRESS=127.0.0.1:20016 \

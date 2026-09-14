@@ -29,8 +29,8 @@ use crate::offset_storage::{
 };
 use crate::persistence::{PartitionPersistence, PersistenceCompletion, PersistenceNotifier};
 use crate::poll_plan::{
-    DISK_POLL_CHUNK_MAX, DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan,
-    PollReadResult, PollTier, ResidentTailSnapshot,
+    DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
+    PollTier, ResidentTailSnapshot,
 };
 use crate::segment::Segment;
 use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
@@ -4157,21 +4157,16 @@ where
         (messages > 0).then(|| u32::try_from(bytes / messages).unwrap_or(u32::MAX))
     }
 
-    /// Widest batch this partition has committed, for the disk walk's chunk
-    /// floor. A batch is the unit that walk can consume, so a read below the
-    /// widest one risks decoding nothing and paying a re-read.
+    /// Widest observed committed batch, for the disk walk's chunk floor.
+    /// Recovered history starts unknown; each walk learns its own batch floor
+    /// when an incomplete batch requires an exact reread.
     ///
     /// A high-water, never lowered: retention cannot make an older batch
     /// narrower, and the read path clamps it to the chunk ceiling anyway, so
     /// the worst a stale value costs is the fixed-size read polls did before
     /// they were sized at all.
-    fn widest_committed_batch(&self) -> u64 {
-        let widest = self.widest_batch_bytes.get();
-        if widest == 0 || self.recovered_durable_offset.is_some() {
-            widest.max(DISK_POLL_CHUNK_MAX)
-        } else {
-            widest
-        }
+    const fn widest_committed_batch(&self) -> u64 {
+        self.widest_batch_bytes.get()
     }
 
     /// Starting `(segment index, byte position)` for a disk poll, resolved
@@ -11052,13 +11047,13 @@ mod tests {
     pub(super) type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
 
     #[test]
-    fn recovered_history_keeps_a_conservative_batch_read_floor() {
+    fn recovered_history_keeps_the_observed_batch_read_floor() {
         let (mut partition, _) = recording_partition();
-        assert_eq!(partition.widest_committed_batch(), DISK_POLL_CHUNK_MAX);
+        assert_eq!(partition.widest_committed_batch(), 0);
         partition.widest_batch_bytes.set(4096);
         assert_eq!(partition.widest_committed_batch(), 4096);
         partition.recovered_durable_offset = Some(100);
-        assert_eq!(partition.widest_committed_batch(), DISK_POLL_CHUNK_MAX);
+        assert_eq!(partition.widest_committed_batch(), 4096);
     }
 
     #[test]

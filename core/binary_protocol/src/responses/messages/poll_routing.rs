@@ -21,10 +21,10 @@ use crate::requests::system::AttachConsumerSessionRequest;
 use crate::responses::system::get_cluster_metadata::ClusterNodeResponse;
 use bytes::BytesMut;
 
-/// Routing for the partition selected by a `PollMessagesRequest`.
+/// Primary and parent session for a poll or offset-write route query.
 ///
 /// The primary is a hint: the receiving partition still checks its role before
-/// accepting a poll. The attachment carries the coordinator's authenticated
+/// accepting consumer progress. The attachment carries the coordinator's authenticated
 /// identity and metadata floor, never credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollRoutingResponse {

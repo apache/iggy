@@ -50,7 +50,6 @@ import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.encodeMessagesBatchInto;
@@ -87,21 +86,21 @@ public class MessagesTcpClient implements MessagesClient {
     private final TopicsClient topicsClient;
     private final ConsumerGroupsClient consumerGroupsClient;
     private final PollRouter pollRouter;
-    private final BooleanSupplier clustered;
+    private final Supplier<CompletableFuture<Boolean>> clustered;
 
     public MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
         this(connectionSupplier, new ClientRoutingState());
     }
 
     MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, ClientRoutingState routingState) {
-        this(connectionSupplier, routingState, null, () -> false);
+        this(connectionSupplier, routingState, null, () -> CompletableFuture.completedFuture(false));
     }
 
     MessagesTcpClient(
             Supplier<AsyncTcpConnection> connectionSupplier,
             ClientRoutingState routingState,
             PollRouter pollRouter,
-            BooleanSupplier clustered) {
+            Supplier<CompletableFuture<Boolean>> clustered) {
         this.connectionSupplier = connectionSupplier;
         this.routingState = routingState;
         this.topicsClient = new TopicsTcpClient(connectionSupplier);
@@ -170,9 +169,7 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeByte(autoCommit ? 1 : 0);
 
         // Send async request and transform response
-        CompletableFuture<ByteBuf> sent = autoCommit && clustered.getAsBoolean()
-                ? pollRouter.poll(payload)
-                : connection().send(CommandCode.Messages.POLL.getValue(), payload);
+        CompletableFuture<ByteBuf> sent = sendPoll(payload, autoCommit);
         CompletableFuture<PolledMessages> result = sent.thenApply(response -> {
             try {
                 return BytesDeserializer.readPolledMessages(response);
@@ -183,6 +180,34 @@ public class MessagesTcpClient implements MessagesClient {
         result.whenComplete((response, error) -> {
             if (result.isCancelled()) {
                 sent.cancel(false);
+            }
+        });
+        return result;
+    }
+
+    private CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, boolean autoCommit) {
+        if (!autoCommit || pollRouter == null) {
+            return connection().send(CommandCode.Messages.POLL.getValue(), payload);
+        }
+        PollCancellation cancellation = new PollCancellation();
+        CompletableFuture<ByteBuf> result = clustered
+                .get()
+                .handle((isClustered, error) -> {
+                    if (error != null || cancellation.isCancelled()) {
+                        payload.release();
+                        return CompletableFuture.<ByteBuf>failedFuture(
+                                error != null ? error : new CancellationException());
+                    }
+                    CompletableFuture<ByteBuf> sent = isClustered
+                            ? pollRouter.poll(payload)
+                            : connection().send(CommandCode.Messages.POLL.getValue(), payload);
+                    cancellation.track(sent);
+                    return sent;
+                })
+                .thenCompose(sent -> sent);
+        result.whenComplete((response, error) -> {
+            if (result.isCancelled()) {
+                cancellation.cancel();
             }
         });
         return result;

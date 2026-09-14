@@ -27,7 +27,7 @@
 //!
 //! Control-plane routes share the metadata primary as their forward target.
 //! Partition-write routes use a separate fallback: after a typed
-//! `TransientNotAccepted` response, try each other roster node at most once.
+//! `TransientNotAccepted` response, walk the roster until the retry deadline.
 //! That denial proves the operation never entered a partition pipeline.
 //! Partition primaries can differ from the metadata primary, so this fallback
 //! cannot use the metadata leader as its sole target.
@@ -95,8 +95,9 @@ use crate::server_error::ServerError;
 const FORWARDED_HEADER: HeaderName = HeaderName::from_static("iggy-forwarded");
 const FORWARDED_VALUE: HeaderValue = HeaderValue::from_static("1");
 
-/// Wall-clock bound on one forward attempt (send + primary processing + body
-/// read). Above the primary's own 30s in-flight transient replay budget, so a
+/// Wall-clock bound on one forward attempt, including buffered replies but
+/// only up to the headers for a streamed poll. Above the primary's own 30s
+/// in-flight transient replay budget, so a
 /// legitimately slow commit is answered rather than cut mid-flight; without
 /// this cap a hung primary would park the connection for the whole retry
 /// budget with no per-attempt bound (the HTTP client itself has no timeout).
@@ -131,7 +132,7 @@ const RESPONSE_CAPACITY_HINT: usize = 64 * 1024;
 
 /// Response headers copied from the primary's reply. Everything else is
 /// dropped, which subsumes the RFC 7230 hop-by-hop set: the relayed response
-/// is rebuilt, never streamed, so upstream `connection` / `transfer-encoding`
+/// uses a new body, so upstream `connection` / `transfer-encoding`
 /// semantics cannot leak to the client. `iggy-view` and `iggy-applied-op` are
 /// included so the relayed response carries the serving primary's view and
 /// applied op, not this follower's (the response layer only fills either when
@@ -243,8 +244,8 @@ pub(in crate::http) async fn forward_to_primary(
 /// Route-layer fallback for acknowledged partition writes over HTTP.
 ///
 /// HTTP has no persistent leader-aware connection to retarget. Execute on the
-/// contacted node first, then walk every other configured HTTP node at most
-/// once when the response is the typed `TransientNotAccepted` denial. That
+/// contacted node first, then retry across the configured HTTP nodes within
+/// the deadline after a typed `TransientNotAccepted` denial. That
 /// denial proves the write never entered a partition pipeline. Every ambiguous
 /// outcome is returned without replay.
 pub(in crate::http) async fn forward_partition_write(
@@ -388,15 +389,32 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
         .as_ref()
         .map(consensus::VsrConsensus::replica);
     let deadline = Instant::now() + FORWARD_RETRY_DEADLINE;
-    for socket in partition_http_sockets(&state.roster, self_id) {
-        if Instant::now() >= deadline {
+    let mut skip_node = self_id;
+    loop {
+        for socket in partition_http_sockets(&state.roster, skip_node) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
+            match attempt(&state, &method, &request_headers, &body, &url, false).await {
+                AttemptOutcome::Relay(response) => {
+                    return if method == Method::GET && response.status().is_success() {
+                        retain_forward_guard(response, guard, FORWARD_ATTEMPT_TIMEOUT)
+                    } else {
+                        response
+                    };
+                }
+                AttemptOutcome::Retry => {}
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining <= FORWARD_RETRY_INTERVAL {
             break;
         }
-        let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
-        match attempt(&state, &method, &request_headers, &body, &url, false).await {
-            AttemptOutcome::Relay(response) => return retain_forward_guard(response, guard),
-            AttemptOutcome::Retry => {}
-        }
+        // The local replica may become primary during a view change. Its
+        // forwarded marker prevents another roster walk on the loopback hop.
+        skip_node = None;
+        compio::time::sleep(FORWARD_RETRY_INTERVAL).await;
     }
 
     with_retry_after(CustomError::from(IggyError::TransientNotAccepted).into_response())
@@ -459,8 +477,8 @@ enum AttemptOutcome {
     Retry,
 }
 
-/// Run one forward attempt end to end (connect, send, read the full reply)
-/// under [`FORWARD_ATTEMPT_TIMEOUT`].
+/// Bound connect, send and buffered replies by [`FORWARD_ATTEMPT_TIMEOUT`].
+/// Successful polls return after their headers and have a separate body deadline.
 async fn attempt(
     state: &HttpInner,
     method: &Method,
@@ -574,12 +592,42 @@ fn stream_poll_body(stream: impl Stream<Item = Result<Bytes, cyper::Error>> + 's
     Body::from_stream(SendWrapper::new(stream))
 }
 
-fn retain_forward_guard(response: Response, guard: ForwardGuard) -> Response {
+fn retain_forward_guard(response: Response, guard: ForwardGuard, timeout: Duration) -> Response {
     let (parts, body) = response.into_parts();
-    let stream = futures::stream::unfold(
-        (body.into_data_stream(), guard),
-        |(mut stream, guard)| async move { stream.next().await.map(|chunk| (chunk, (stream, guard))) },
-    );
+    let (sender, receiver) = async_channel::bounded(1);
+    // The timer must run even when the downstream connection stops polling its
+    // body. One queued chunk bounds read-ahead; dropping the body cancels the task.
+    let task = compio::runtime::spawn(async move {
+        let mut stream = body.into_data_stream();
+        let relay = async {
+            while let Some(chunk) = stream.next().await {
+                if sender
+                    .send(chunk.map_err(std::io::Error::other))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        };
+        if compio::time::timeout(timeout, relay).await.is_err() {
+            drop(stream);
+            drop(guard);
+            // Discard a queued chunk so a stalled reader still receives an
+            // explicit body error instead of mistaking the timeout for EOF.
+            let _ = sender.force_send(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "forwarded poll response deadline exceeded",
+            )));
+        }
+    });
+    let stream = futures::stream::unfold((receiver, task), |(receiver, task)| async move {
+        receiver
+            .recv()
+            .await
+            .ok()
+            .map(|chunk| (chunk, (receiver, task)))
+    });
     Response::from_parts(parts, Body::from_stream(SendWrapper::new(stream)))
 }
 
@@ -976,14 +1024,17 @@ mod tests {
             observed.set(observed.get() + 1);
             Ok::<_, cyper::Error>(chunk.clone())
         }));
-        let response = retain_forward_guard(Response::new(stream_poll_body(stream)), guard);
+        let response = retain_forward_guard(
+            Response::new(stream_poll_body(stream)),
+            guard,
+            FORWARD_ATTEMPT_TIMEOUT,
+        );
         assert_eq!(polled.get(), 0);
         assert_eq!(in_flight.get(), 1);
         let mut stream = response.into_body().into_data_stream();
         let mut received = 0;
         while let Some(chunk) = stream.next().await {
             received += chunk.expect("successful chunk").len();
-            assert_eq!(in_flight.get(), 1);
         }
         assert_eq!(received, 65 * 1024 * 1024);
         assert_eq!(in_flight.get(), 0);
@@ -991,15 +1042,36 @@ mod tests {
 
     #[compio::test]
     async fn dropping_forwarded_poll_body_releases_admission() {
+        const CANCEL_TURN: Duration = Duration::from_millis(1);
         let in_flight = Rc::new(Cell::new(0));
         let guard = ForwardGuard::admit(&in_flight).expect("forward admitted");
         let response = retain_forward_guard(
             Response::new(stream_poll_body(futures::stream::pending())),
             guard,
+            FORWARD_ATTEMPT_TIMEOUT,
         );
         assert_eq!(in_flight.get(), 1);
         drop(response);
+        compio::time::sleep(CANCEL_TURN).await;
         assert_eq!(in_flight.get(), 0);
+    }
+
+    #[compio::test]
+    async fn an_unread_forwarded_poll_expires_and_releases_upstream() {
+        const BODY_TIMEOUT: Duration = Duration::from_millis(10);
+        let in_flight = Rc::new(Cell::new(0));
+        let guard = ForwardGuard::admit(&in_flight).expect("forward admitted");
+        let upstream = Rc::new(());
+        let held = Rc::clone(&upstream);
+        let stream = futures::stream::unfold(held, |held| async move {
+            Some((Ok::<_, cyper::Error>(Bytes::from_static(b"chunk")), held))
+        });
+        let response =
+            retain_forward_guard(Response::new(stream_poll_body(stream)), guard, BODY_TIMEOUT);
+        compio::time::sleep(BODY_TIMEOUT * 3).await;
+        assert_eq!(in_flight.get(), 0, "unread bodies must release admission");
+        assert_eq!(Rc::strong_count(&upstream), 1, "upstream must be dropped");
+        assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
     }
 
     #[compio::test]

@@ -1064,7 +1064,7 @@ impl StreamsInner {
     }
 }
 
-/// Metadata identity captured for one partition poll, independent of unrelated groups.
+/// Metadata identity for a consumer operation, independent of unrelated groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PollMetadata {
     created_revision: u64,
@@ -1086,6 +1086,14 @@ impl PollMetadata {
             .as_ref()
             == Some(self)
     }
+
+    #[must_use]
+    pub fn is_valid_for_offset(&self, streams: &Streams, namespace: IggyNamespace) -> bool {
+        streams
+            .consumer_offset_metadata(namespace, self.group.map(|(id, _)| id), self.client_id)
+            .as_ref()
+            == Some(self)
+    }
 }
 
 impl Streams {
@@ -1095,6 +1103,27 @@ impl Streams {
         namespace: IggyNamespace,
         group_id: Option<u64>,
         client_id: u128,
+    ) -> Option<PollMetadata> {
+        self.consumer_metadata(namespace, group_id, client_id, true)
+    }
+
+    /// Offset commits can drain partitions awaiting cooperative revocation.
+    #[must_use]
+    pub fn consumer_offset_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+    ) -> Option<PollMetadata> {
+        self.consumer_metadata(namespace, group_id, client_id, false)
+    }
+
+    fn consumer_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+        require_pollable: bool,
     ) -> Option<PollMetadata> {
         self.read(|inner| {
             let topic = inner
@@ -1106,7 +1135,12 @@ impl Streams {
             let group = if let Some(group_id) = group_id {
                 let group = topic.consumer_groups.get(&group_id)?;
                 if !group.members.iter().any(|(_, member)| {
-                    member.client_id == client_id && member.is_pollable(namespace.partition_id())
+                    member.client_id == client_id
+                        && if require_pollable {
+                            member.is_pollable(namespace.partition_id())
+                        } else {
+                            member.partitions.contains(&namespace.partition_id())
+                        }
                 }) {
                     return None;
                 }

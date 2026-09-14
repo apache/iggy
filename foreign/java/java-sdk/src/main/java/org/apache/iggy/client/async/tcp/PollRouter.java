@@ -25,6 +25,8 @@ import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
@@ -55,8 +57,6 @@ final class PollRouter {
     private static final int ATTACHMENT_BYTES = 32;
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     private static final long RETRY_INTERVAL_MILLIS = 50;
-    private static final int STALE_CLIENT = 30;
-    private static final int UNAUTHENTICATED = 40;
 
     private final Supplier<AsyncTcpConnection> coordinator;
     private final Function<ConnectionInfo, AsyncTcpConnection> connectData;
@@ -85,13 +85,8 @@ final class PollRouter {
             }
             pending.add(poll);
         }
-        var timeout = coordinator
-                .get()
-                .eventLoop()
-                .schedule(
-                        () -> poll.result.completeExceptionally(uncommitted()),
-                        POLL_TIMEOUT.toNanos(),
-                        TimeUnit.NANOSECONDS);
+        var timeout =
+                coordinator.get().eventLoop().schedule(poll::expire, POLL_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS);
         poll.result.whenComplete((response, error) -> {
             timeout.cancel(false);
             synchronized (this) {
@@ -123,7 +118,7 @@ final class PollRouter {
     }
 
     private void attempt(Poll poll) {
-        if (poll.result.isDone()) {
+        if (!poll.beginAttempt()) {
             return;
         }
         route(poll).thenCompose(route -> enqueue(route, poll)).whenComplete((response, error) -> {
@@ -143,6 +138,9 @@ final class PollRouter {
                 routes.remove(poll.key);
             }
             if (isNotAccepted(error)) {
+                if (!poll.retryRefusal()) {
+                    return;
+                }
                 coordinator
                         .get()
                         .eventLoop()
@@ -174,10 +172,8 @@ final class PollRouter {
                     return coordinator
                             .get()
                             .send(CommandCode.System.PING, Unpooled.EMPTY_BUFFER)
-                            .handle((response, pingError) -> {
-                                if (response != null) {
-                                    response.release();
-                                }
+                            .thenApply(response -> {
+                                response.release();
                                 throw notAccepted();
                             });
                 });
@@ -185,6 +181,9 @@ final class PollRouter {
 
     private Route decodeRoute(AsyncTcpConnection parent, Poll poll, ByteBuf response) {
         try {
+            if (response.readableBytes() < ATTACHMENT_BYTES) {
+                throw new IggyClientException("Truncated primary poll session attachment");
+            }
             Attachment attachment = new Attachment(
                     response.readLongLE(), response.readLongLE(), response.readLongLE(), response.readLongLE());
             var node = BytesDeserializer.readClusterNode(response);
@@ -206,6 +205,8 @@ final class PollRouter {
                 }
                 return route;
             }
+        } catch (IndexOutOfBoundsException | IggyMalformedResponseException error) {
+            throw new IggyClientException("Invalid TCP primary poll routing response", error);
         } finally {
             response.release();
         }
@@ -268,7 +269,8 @@ final class PollRouter {
                 || cause instanceof IggyTimeoutException
                 || cause instanceof IOException
                 || (cause instanceof IggyServerException server
-                        && (server.getRawErrorCode() == STALE_CLIENT || server.getRawErrorCode() == UNAUTHENTICATED));
+                        && (server.getRawErrorCode() == IggyErrorCode.STALE_CLIENT.getCode()
+                                || server.getRawErrorCode() == IggyErrorCode.UNAUTHENTICATED.getCode()));
     }
 
     private static IggyServerException notAccepted() {
@@ -282,7 +284,7 @@ final class PollRouter {
     private final class Slot {
         private CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
         private volatile AsyncTcpConnection connection;
-        private volatile Attachment attachment;
+        private volatile AttachedSession attachment;
         private Poll activePoll;
 
         CompletableFuture<ByteBuf> poll(Route route, Poll poll) {
@@ -315,33 +317,36 @@ final class PollRouter {
                         close();
                         return CompletableFuture.failedFuture(connectionFailed(error) ? notAccepted() : unwrap(error));
                     })
-                    .thenCompose(ignored -> {
-                        if (poll.result.isDone() || !routeIsCurrent(route)) {
-                            return CompletableFuture.failedFuture(notAccepted());
-                        }
-                        AsyncTcpConnection data = connection;
-                        if (data == null) {
-                            return CompletableFuture.failedFuture(notAccepted());
-                        }
-                        return data.send(CommandCode.Messages.POLL_ON_PRIMARY, Unpooled.wrappedBuffer(poll.payload))
-                                .whenComplete((response, error) -> {
-                                    if (error != null) {
-                                        if (isNotAccepted(error)) {
-                                            attachment = null;
-                                        } else {
-                                            close();
-                                        }
-                                    }
-                                })
-                                .exceptionallyCompose(error -> CompletableFuture.failedFuture(
-                                        connectionFailed(error) ? uncommitted() : unwrap(error)));
-                    })
+                    .thenCompose(ignored -> sendPoll(route, poll))
                     .whenComplete((response, error) -> {
                         synchronized (this) {
                             activePoll = null;
                             poll.activeSlot = null;
                         }
                     });
+        }
+
+        private CompletableFuture<ByteBuf> sendPoll(Route route, Poll poll) {
+            if (poll.result.isDone() || !routeIsCurrent(route)) {
+                return CompletableFuture.failedFuture(notAccepted());
+            }
+            AsyncTcpConnection data = connection;
+            AttachedSession attached = attachment;
+            if (data == null || attached == null) {
+                return CompletableFuture.failedFuture(notAccepted());
+            }
+            return data.sendPrimaryPoll(Unpooled.wrappedBuffer(poll.payload), attached.generation)
+                    .whenComplete((response, error) -> {
+                        if (error != null) {
+                            if (isNotAccepted(error)) {
+                                attachment = null;
+                            } else {
+                                close();
+                            }
+                        }
+                    })
+                    .exceptionallyCompose(error ->
+                            CompletableFuture.failedFuture(connectionFailed(error) ? uncommitted() : unwrap(error)));
         }
 
         private CompletableFuture<Void> prepare(Route route, Poll poll) {
@@ -367,24 +372,30 @@ final class PollRouter {
             } else {
                 ready = CompletableFuture.completedFuture(null);
             }
-            return ready.thenCompose(ignored -> {
-                if (poll.result.isDone() || !routeIsCurrent(route)) {
-                    return CompletableFuture.failedFuture(notAccepted());
-                }
-                Attachment current = attachment;
-                if (current != null && current.covers(route.attachment)) {
-                    return CompletableFuture.completedFuture(null);
-                }
-                AsyncTcpConnection data = connection;
-                if (data == null) {
-                    return CompletableFuture.failedFuture(notAccepted());
-                }
-                return data.send(CommandCode.System.ATTACH_CONSUMER_SESSION, route.attachment.encode())
-                        .thenAccept(response -> {
-                            response.release();
-                            attachment = route.attachment;
-                        });
-            });
+            return ready.thenCompose(ignored -> attach(route, poll));
+        }
+
+        private CompletableFuture<Void> attach(Route route, Poll poll) {
+            if (poll.result.isDone() || !routeIsCurrent(route)) {
+                return CompletableFuture.failedFuture(notAccepted());
+            }
+            AsyncTcpConnection data = connection;
+            if (data == null) {
+                return CompletableFuture.failedFuture(notAccepted());
+            }
+            AttachedSession current = attachment;
+            if (current != null && current.covers(data, route.attachment)) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return data.send(CommandCode.System.ATTACH_CONSUMER_SESSION, route.attachment.encode())
+                    .thenAccept(response -> {
+                        response.release();
+                        synchronized (this) {
+                            if (connection == data && activePoll == poll && !poll.result.isDone()) {
+                                attachment = new AttachedSession(data, data.sessionGeneration(), route.attachment);
+                            }
+                        }
+                    });
         }
 
         CompletableFuture<Void> close() {
@@ -417,7 +428,9 @@ final class PollRouter {
         private final String key;
         private final byte[] payload;
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+        private final long deadline = System.nanoTime() + POLL_TIMEOUT.toNanos();
         private volatile Slot activeSlot;
+        private boolean retryingRefusal;
 
         private Poll(String key, byte[] payload) {
             this.key = key;
@@ -429,6 +442,33 @@ final class PollRouter {
             if (slot != null) {
                 slot.cancel(this);
             }
+        }
+
+        private synchronized boolean beginAttempt() {
+            if (result.isDone()) {
+                return false;
+            }
+            retryingRefusal = false;
+            return true;
+        }
+
+        private synchronized boolean retryRefusal() {
+            retryingRefusal = true;
+            if (deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
+                result.completeExceptionally(notAccepted());
+                return false;
+            }
+            return !result.isDone();
+        }
+
+        private synchronized void expire() {
+            result.completeExceptionally(retryingRefusal ? notAccepted() : uncommitted());
+        }
+    }
+
+    private record AttachedSession(AsyncTcpConnection connection, long generation, Attachment attachment) {
+        boolean covers(AsyncTcpConnection data, Attachment required) {
+            return connection == data && generation == data.sessionGeneration() && attachment.covers(required);
         }
     }
 

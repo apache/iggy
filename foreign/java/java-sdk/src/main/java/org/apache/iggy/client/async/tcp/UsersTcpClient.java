@@ -128,9 +128,9 @@ public class UsersTcpClient implements UsersClient {
         // server reads an absent block as empty. Settings will ride one here,
         // as topics do.
 
-        AsyncTcpConnection current = connection();
-        return current.sendAndRelease(CommandCode.User.UPDATE, payload).thenRun(() -> {
-            current.refreshCredentials(userId, username, Optional.empty())
+        return connection().sendAndRelease(CommandCode.User.UPDATE, payload).thenRun(() -> {
+            connection()
+                    .refreshCredentials(userId, username, Optional.empty())
                     .ifPresent(previous -> routingHook.refreshLogin(previous, username, Optional.empty()));
         });
     }
@@ -157,12 +157,14 @@ public class UsersTcpClient implements UsersClient {
         payload.writeBytes(toBytes(currentPassword, "current password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
         payload.writeBytes(toBytes(newPassword, "new password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
 
-        AsyncTcpConnection current = connection();
-        return current.sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload).thenRun(() -> {
-            current.refreshCredentials(userId, Optional.empty(), Optional.of(newPassword))
-                    .ifPresent(
-                            previous -> routingHook.refreshLogin(previous, Optional.empty(), Optional.of(newPassword)));
-        });
+        return connection()
+                .sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload)
+                .thenRun(() -> {
+                    connection()
+                            .refreshCredentials(userId, Optional.empty(), Optional.of(newPassword))
+                            .ifPresent(previous ->
+                                    routingHook.refreshLogin(previous, Optional.empty(), Optional.of(newPassword)));
+                });
     }
 
     @Override

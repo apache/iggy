@@ -188,6 +188,7 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(ATTACH_CONSUMER_SESSION_CODE, "consumer_session.attach"),
     CommandMeta::non_replicated(GET_POLL_ROUTING_CODE, "message.poll_routing"),
     CommandMeta::non_replicated(POLL_MESSAGES_ON_PRIMARY_CODE, "message.poll_primary"),
+    CommandMeta::non_replicated(GET_CONSUMER_OFFSET_ROUTING_CODE, "consumer_offset.routing"),
 ];
 
 /// Lookup command metadata by command code.
@@ -253,6 +254,7 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         ATTACH_CONSUMER_SESSION_CODE => 51,
         GET_POLL_ROUTING_CODE => 52,
         POLL_MESSAGES_ON_PRIMARY_CODE => 53,
+        GET_CONSUMER_OFFSET_ROUTING_CODE => 54,
         _ => return None,
     };
     Some(&COMMAND_TABLE[idx])

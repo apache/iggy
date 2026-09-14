@@ -336,7 +336,7 @@ pub fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifi
 
 /// Fence a consumer-group offset op then resolve its target partition
 /// namespace. Shared by the four `Store`/`Delete` consumer-offset arms.
-fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
+pub fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
@@ -730,21 +730,8 @@ where
         nodes: metadata
             .nodes
             .into_iter()
-            .map(cluster_node_response)
+            .map(ClusterNodeResponse::from)
             .collect(),
-    }
-}
-
-pub fn cluster_node_response(node: iggy_common::ClusterNode) -> ClusterNodeResponse {
-    ClusterNodeResponse {
-        name: node.name,
-        ip: node.ip,
-        tcp_port: node.endpoints.tcp,
-        quic_port: node.endpoints.quic,
-        http_port: node.endpoints.http,
-        websocket_port: node.endpoints.websocket,
-        role: node.role as u8,
-        status: node.status as u8,
     }
 }
 

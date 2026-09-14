@@ -426,6 +426,8 @@ struct DiskWalk {
     matched: u32,
     fragments: PollFragments<4096>,
     last_matching_offset: Option<u64>,
+    /// Batch width learned from an incomplete read, retained across segments.
+    batch_read_floor: u64,
     #[cfg(feature = "poll-diagnostics")]
     requested_bytes: u64,
     #[cfg(feature = "poll-diagnostics")]
@@ -446,6 +448,7 @@ impl DiskWalk {
             matched: 0,
             fragments: PollFragments::new(),
             last_matching_offset: None,
+            batch_read_floor: 0,
             #[cfg(feature = "poll-diagnostics")]
             requested_bytes: 0,
             #[cfg(feature = "poll-diagnostics")]
@@ -631,7 +634,9 @@ impl DiskReadPlan {
         persisted: u64,
         walk: &mut DiskWalk,
     ) -> SegmentWalk {
-        let mut chunk_len = self.chunk_len(walk.remaining_to_read(count));
+        let mut chunk_len = self
+            .chunk_len(walk.remaining_to_read(count))
+            .max(walk.batch_read_floor);
         while walk.matched < count && walk.position < persisted {
             let len = (persisted - walk.position).min(chunk_len) as usize;
             let Some(chunk) = self.read_chunk_with_retry(file, len, walk).await else {
@@ -686,6 +691,7 @@ impl DiskReadPlan {
                     return SegmentWalk::Faulted;
                 }
                 chunk_len = if needed > len {
+                    walk.batch_read_floor = walk.batch_read_floor.max(needed as u64);
                     needed as u64
                 } else {
                     chunk_len.saturating_mul(4)
@@ -695,7 +701,9 @@ impl DiskReadPlan {
             if walk.matched > 0 {
                 walk.skipped = 0;
             }
-            chunk_len = self.chunk_len(walk.remaining_to_read(count));
+            chunk_len = self
+                .chunk_len(walk.remaining_to_read(count))
+                .max(walk.batch_read_floor);
             walk.position += consumed as u64;
         }
         SegmentWalk::Done
@@ -1143,7 +1151,8 @@ mod tests {
 
     #[cfg(feature = "poll-diagnostics")]
     #[compio::test]
-    async fn incomplete_batch_reread_uses_its_exact_length() {
+    async fn incomplete_batch_reread_keeps_its_exact_length_for_the_walk() {
+        const BATCH_COUNT: u32 = 4;
         let directory = tempfile::tempdir().unwrap();
         let mut messages = IggyMessages::with_capacity(1);
         messages.push(IggyMessage {
@@ -1157,13 +1166,18 @@ mod tests {
         let batch =
             SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
         let length = batch.header.total_size();
-        let mut record = vec![0; length];
-        batch.header.encode_into(&mut record);
-        record[COMMAND_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let mut records = vec![0; length * BATCH_COUNT as usize];
+        for (offset, record) in records.chunks_exact_mut(length).enumerate() {
+            let mut header = batch.header;
+            header.base_offset = offset as u64;
+            header.batch_checksum = header.checksum_for_blob(&batch.blob);
+            header.encode_into(record);
+            record[COMMAND_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        }
         let mut file = compio::fs::File::create(directory.path().join("batches.log"))
             .await
             .unwrap();
-        let (written, _) = file.write_all_at(record.repeat(4), 0).await.into();
+        let (written, _) = file.write_all_at(records, 0).await.into();
         written.unwrap();
         let file = compio::fs::File::open(directory.path().join("batches.log"))
             .await
@@ -1171,13 +1185,26 @@ mod tests {
         let plan = sizing_plan(Some(1), 0);
         let mut walk = DiskWalk::starting_at(0, 0);
         assert!(matches!(
-            plan.walk_segment(&file, offset_query(0), 1, (length * 4) as u64, &mut walk)
-                .await,
+            plan.walk_segment(
+                &file,
+                MessageLookup::Offset {
+                    offset: 0,
+                    count: BATCH_COUNT,
+                    ceiling: u64::MAX
+                },
+                BATCH_COUNT,
+                length as u64 * u64::from(BATCH_COUNT),
+                &mut walk
+            )
+            .await,
             SegmentWalk::Done
         ));
-        assert_eq!(walk.matched, 1);
-        assert_eq!(walk.chunk_reads, 2);
-        assert_eq!(walk.requested_bytes, DISK_POLL_CHUNK_MIN + length as u64);
+        assert_eq!(walk.matched, BATCH_COUNT);
+        assert_eq!(walk.chunk_reads, BATCH_COUNT + 1);
+        assert_eq!(
+            walk.requested_bytes,
+            DISK_POLL_CHUNK_MIN + length as u64 * u64::from(BATCH_COUNT)
+        );
     }
 
     fn offset_query(offset: u64) -> MessageLookup {

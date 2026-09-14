@@ -74,6 +74,9 @@ type IggyTcpClient struct {
 	// one for the header and one for the body; guarded by c.mtx.
 	reader *bufio.Reader
 	mtx    sync.Mutex
+	// Network exchanges queue here before taking the state mutex, so routing
+	// requests can wait fairly and cancel without spawning a lock waiter.
+	exchangeGate chan struct{}
 	// registerMtx single-flights the sign-in transaction: BeginRegister and
 	// Bind live in different c.mtx critical sections, and two interleaved
 	// sign-ins would commit one Register whose session is never bound.
@@ -116,6 +119,7 @@ type IggyTcpClient struct {
 	rememberedLogin   AutoLogin
 	sessionUserID     uint32
 	clustered         atomic.Bool
+	topologyKnown     atomic.Bool
 	metadataWatermark atomic.Uint64
 	pollSession       atomic.Pointer[activePollSession]
 	polls             pollRouter
@@ -307,6 +311,7 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 		currentServerAddress:   opts.config.serverAddress,
 		session:                vsr.NewSession(),
 		closed:                 make(chan struct{}),
+		exchangeGate:           make(chan struct{}, 1),
 	}
 }
 
@@ -661,9 +666,7 @@ func (c *IggyTcpClient) sendFrame(
 	if code == uint32(command.PollMessagesOnPrimaryCode) ||
 		code == uint32(command.GetPollRoutingCode) ||
 		code == uint32(command.AttachConsumerSessionCode) {
-		response, _, generation, err := c.attempt(
-			context.WithValue(ctx, singlePollExchange{}, struct{}{}), code, frame,
-			false, time.Now(), time.Now().Add(responseReadTimeout))
+		response, generation, _, err := c.sendPollFrame(ctx, code, frame)
 		return response, generation, err
 	}
 
@@ -759,13 +762,15 @@ func (c *IggyTcpClient) attempt(
 	stamped bool,
 	transientDeadline, readDeadline time.Time,
 ) ([]byte, bool, uint64, error) {
-	if ctx.Value(singlePollExchange{}) != nil {
-		if err := c.lockPollExchange(ctx); err != nil {
-			return nil, stamped, 0, err
-		}
-	} else {
-		c.mtx.Lock()
+	select {
+	case c.exchangeGate <- struct{}{}:
+		defer func() { <-c.exchangeGate }()
+	case <-ctx.Done():
+		return nil, stamped, 0, ctx.Err()
+	case <-c.closed:
+		return nil, stamped, 0, ierror.ErrClientShutdown
 	}
+	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, stamped, c.connGeneration, err
@@ -848,7 +853,14 @@ func (c *IggyTcpClient) exchangeLocked(
 	frame []byte,
 	transientDeadline, readDeadline time.Time,
 ) ([]byte, error) {
+	pollState, _ := ctx.Value(singlePollExchange{}).(*pollExchangeState)
 	for {
+		if pollState != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			pollState.written = true
+		}
 		c.logger.Debug("Sending a TCP request",
 			slog.Int("frame_length", len(frame)), slog.Int("code", int(code)))
 		if _, err := c.write(frame); err != nil {
@@ -882,10 +894,12 @@ func (c *IggyTcpClient) exchangeLocked(
 		if commit := vsr.MetadataCommit(&c.respHeader); commit > c.metadataWatermark.Load() {
 			c.metadataWatermark.Store(commit)
 		}
-		if ctx.Value(singlePollExchange{}) != nil {
+		if pollState != nil {
 			if err != nil {
 				c.handleReplyFailureLocked(err)
 			}
+			pollState.reusable = c.conn != nil && vsr.PeekCommand(&c.respHeader) == vsr.FrameReply &&
+				(err == nil || !isReconnectable(err))
 			return response, err
 		}
 		switch {

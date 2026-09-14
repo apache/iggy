@@ -29,7 +29,9 @@ use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
     ATTACH_CONSUMER_SESSION_CODE, GET_POLL_ROUTING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+    STORE_CONSUMER_OFFSET_CODE,
 };
+use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode};
@@ -49,8 +51,12 @@ const STREAM_NAME: &str = "partition-routing-stream";
 const TOPIC_NAME: &str = "partition-routing-topic";
 const PARTITION_ID: u32 = 0;
 const GROUP_NAME: &str = "partition-routing-group";
+const OFFSET_GROUP_NAME: &str = "offset-routing-group";
 const GROUP_PAYLOADS: [&str; 2] = ["group-poll-first", "group-poll-second"];
 const GROUP_POLL_BUDGET: Duration = Duration::from_secs(20);
+// QUIC may use the full 30-second response budget before a dead data connection
+// reports an uncertain outcome; recovery then needs a fresh routing attempt.
+const DATA_FAILOVER_BUDGET: Duration = Duration::from_secs(60);
 const INITIAL_VIEW: u32 = 0;
 const METADATA_CHECKPOINT_REQUESTS: usize = 256;
 
@@ -196,7 +202,222 @@ async fn given_different_metadata_and_partition_primaries_when_websocket_group_a
     assert_group_auto_commit_routing(harness, TransportProtocol::WebSocket).await;
 }
 
-async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: TransportProtocol) {
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_split_primaries_when_http_auto_commits_on_a_backup_should_replicate_offsets(
+    harness: &mut TestHarness,
+) {
+    let (partition_primary, metadata_primary, _) = seed_split_primaries(harness).await;
+    assert_ne!(partition_primary, metadata_primary);
+    let client = harness
+        .node(metadata_primary)
+        .http_client()
+        .unwrap()
+        .with_root_login()
+        .connect()
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let consumer = Consumer::default();
+    let response = timeout(
+        GROUP_POLL_BUDGET,
+        client.poll_messages(
+            &stream,
+            &topic,
+            Some(PARTITION_ID),
+            &consumer,
+            &PollingStrategy::first(),
+            GROUP_PAYLOADS.len() as u32,
+            true,
+        ),
+    )
+    .await
+    .expect("HTTP auto-commit must forward to the partition primary")
+    .unwrap();
+    assert_eq!(response.messages.len(), GROUP_PAYLOADS.len());
+    for (message, expected) in response.messages.iter().zip(GROUP_PAYLOADS) {
+        assert_eq!(message.payload.as_ref(), expected.as_bytes());
+    }
+    assert_replicated_offset(harness, &consumer, Some((GROUP_PAYLOADS.len() - 1) as u64)).await;
+}
+
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[ignore = "requires Go; run this test explicitly with --ignored"]
+async fn given_split_primaries_when_go_group_auto_commits_should_preserve_membership(
+    harness: &mut TestHarness,
+) {
+    let (_, metadata_primary, _) = seed_split_primaries(harness).await;
+    let output = tokio::process::Command::new("go")
+        .args([
+            "test",
+            "./tests",
+            "-run",
+            "^TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership$",
+            "-count=1",
+            "-v",
+        ])
+        .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../foreign/go"))
+        .env(
+            "IGGY_TCP_ADDRESS",
+            harness
+                .node(metadata_primary)
+                .tcp_addr()
+                .unwrap()
+                .to_string(),
+        )
+        .env("IGGY_POLL_ROUTING_STREAM", STREAM_NAME)
+        .env("IGGY_POLL_ROUTING_TOPIC", TOPIC_NAME)
+        .env(
+            "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION",
+            GROUP_PAYLOADS.len().to_string(),
+        )
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("run Go SDK test with the seeded cluster");
+    assert!(
+        output.status.success(),
+        "Go SDK routing regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn assert_group_offset_routing(
+    harness: &TestHarness,
+    member: &IggyClient,
+    metadata_address: &str,
+) {
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let group = Identifier::named(OFFSET_GROUP_NAME).unwrap();
+    let consumer = Consumer::group(group.clone());
+    member
+        .create_consumer_group(&stream, &topic, OFFSET_GROUP_NAME)
+        .await
+        .unwrap();
+    member
+        .join_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap();
+    let before = member.get_me().await.unwrap();
+    for offset in 0..GROUP_PAYLOADS.len() as u64 {
+        timeout(
+            GROUP_POLL_BUDGET,
+            member.store_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID), offset),
+        )
+        .await
+        .expect("manual group commit must reach the partition primary")
+        .expect("manual group commit must preserve its coordinator membership");
+        assert_eq!(
+            member.get_connection_info().await.server_address,
+            metadata_address
+        );
+        assert_eq!(member.get_me().await.unwrap().client_id, before.client_id);
+    }
+    let expected_offset = (GROUP_PAYLOADS.len() - 1) as u64;
+    assert_replicated_offset(harness, &consumer, Some(expected_offset)).await;
+    member
+        .delete_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
+        .await
+        .unwrap();
+    assert_eq!(
+        member.get_connection_info().await.server_address,
+        metadata_address
+    );
+    let membership = member
+        .get_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(membership.members_count, 1);
+    assert_eq!(membership.members[0].partitions, [PARTITION_ID]);
+    member
+        .leave_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap();
+    assert_replicated_offset(harness, &consumer, None).await;
+    for (group_name, policy) in [
+        (
+            "interval-offset-group",
+            AutoCommit::Interval(NonZeroIggyDuration::ONE_SECOND),
+        ),
+        (
+            "default-offset-group",
+            AutoCommit::IntervalOrWhen(
+                NonZeroIggyDuration::ONE_SECOND,
+                AutoCommitWhen::PollingMessages,
+            ),
+        ),
+    ] {
+        let mut interval_consumer = member
+            .consumer_group(group_name, STREAM_NAME, TOPIC_NAME)
+            .unwrap()
+            .batch_length(GROUP_PAYLOADS.len() as u32)
+            .auto_commit(policy)
+            .build();
+        interval_consumer.init().await.unwrap();
+        for _ in GROUP_PAYLOADS {
+            timeout(GROUP_POLL_BUDGET, interval_consumer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        let consumer = Consumer::group(Identifier::named(group_name).unwrap());
+        assert_replicated_offset(harness, &consumer, Some(expected_offset)).await;
+        assert_eq!(
+            member.get_connection_info().await.server_address,
+            metadata_address
+        );
+        assert_eq!(member.get_me().await.unwrap().client_id, before.client_id);
+        interval_consumer.shutdown().await.unwrap();
+    }
+}
+
+async fn assert_replicated_offset(
+    harness: &TestHarness,
+    consumer: &Consumer,
+    expected: Option<u64>,
+) {
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    for node in 0..harness.cluster_size() {
+        let address = harness.node(node).tcp_addr().unwrap();
+        let replica = connect_without_login(address).await;
+        replica
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        timeout(PRECONDITION_BUDGET, async {
+            loop {
+                let offset = replica
+                    .get_consumer_offset(consumer, &stream, &topic, Some(PARTITION_ID))
+                    .await
+                    .unwrap();
+                if offset.map(|offset| offset.stored_offset) == expected {
+                    break;
+                }
+                sleep(PRECONDITION_POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("node {node} must observe replicated offset {expected:?}"));
+        assert_eq!(
+            ClientWrapper::Tcp(replica)
+                .get_connection_info()
+                .await
+                .server_address,
+            address.to_string()
+        );
+    }
+}
+
+async fn seed_split_primaries(harness: &mut TestHarness) -> (usize, usize, u32) {
     let partition_primary = leader_node_index_via(harness, 0).await;
     let producer = harness
         .root_client_for_node(partition_primary)
@@ -267,6 +488,13 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
     .await
     .expect("the metadata-only election must move leadership off the live partition primary");
 
+    (partition_primary, metadata_primary, partition_view)
+}
+
+async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: TransportProtocol) {
+    let (partition_primary, metadata_primary, partition_view) = seed_split_primaries(harness).await;
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
     let metadata_node = harness.node(metadata_primary);
     let (builder, address) = match transport {
         TransportProtocol::Tcp => (metadata_node.tcp_client(), metadata_node.tcp_addr()),
@@ -306,6 +534,7 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
     })
     .await
     .expect("the metadata leader's backup must hold both seeded messages");
+    assert_group_offset_routing(harness, &member, &metadata_address).await;
     member
         .create_consumer_group(&stream, &topic, GROUP_NAME)
         .await
@@ -377,55 +606,25 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
     }
 
     let expected_offset = u64::try_from(GROUP_PAYLOADS.len() - 1).unwrap();
-    for node in 0..harness.cluster_size() {
-        let address = harness.node(node).tcp_addr().unwrap();
-        let replica = connect_without_login(address).await;
-        replica
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-            .await
-            .unwrap();
-        timeout(PRECONDITION_BUDGET, async {
-            loop {
-                let offset = replica
-                    .get_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
-                    .await
-                    .unwrap();
-                if offset.is_some_and(|offset| offset.stored_offset == expected_offset) {
-                    break;
-                }
-                sleep(PRECONDITION_POLL).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("node {node} must receive the automatic offset commits"));
-        assert_eq!(
-            ClientWrapper::Tcp(replica)
-                .get_connection_info()
-                .await
-                .server_address,
-            address.to_string()
-        );
-    }
-    if transport == TransportProtocol::Tcp {
-        let partition_primary = assert_cached_route_after_primary_loss(
-            harness,
-            &member,
-            partition_primary,
-            &stream,
-            &topic,
-            &consumer,
-        )
-        .await;
-        assert_data_session_fences(
-            harness,
-            &member,
-            partition_primary,
-            &stream,
-            &topic,
-            &consumer,
-        )
-        .await;
-    }
+    assert_replicated_offset(harness, &consumer, Some(expected_offset)).await;
+    let partition_primary = assert_cached_route_after_primary_loss(
+        harness,
+        &member,
+        partition_primary,
+        &stream,
+        &topic,
+        &consumer,
+    )
+    .await;
+    assert_data_session_fences(
+        harness,
+        &member,
+        partition_primary,
+        &stream,
+        &topic,
+        &consumer,
+    )
+    .await;
 }
 
 async fn assert_cached_route_after_primary_loss(
@@ -516,7 +715,7 @@ async fn assert_cached_route_after_primary_loss(
         )
         .await
         .unwrap();
-    let received = timeout(GROUP_POLL_BUDGET, async {
+    let received = timeout(DATA_FAILOVER_BUDGET, async {
         loop {
             match receiver.next().await.expect("the consumer must stay open") {
                 Ok(message) => break message,
@@ -658,6 +857,23 @@ async fn assert_data_session_fences(
         "the attached session must respect the member leaving"
     );
     assert!(polled.messages.is_empty());
+    let offset_write = StoreConsumerOffsetRequest {
+        consumer: consumer_to_wire(consumer).unwrap(),
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        partition_id: Some(PARTITION_ID),
+        offset: 0,
+        ack: iggy_binary_protocol::AckLevel::Quorum,
+    }
+    .to_bytes();
+    assert!(
+        matches!(
+            data.send_raw_with_response(STORE_CONSUMER_OFFSET_CODE, offset_write.clone())
+                .await,
+            Err(IggyError::ConsumerGroupPartitionNotOwned(..))
+        ),
+        "a departed member must not commit through its attachment"
+    );
 
     member
         .join_consumer_group(stream, topic, &consumer.id)

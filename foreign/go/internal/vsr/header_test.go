@@ -61,8 +61,8 @@ func TestMetadataCommitDoesNotUsePartitionOrReadReplyIndexes(t *testing.T) {
 		{OperationSendMessages, false},
 		{OperationStoreConsumerOffset, false},
 		{OperationDeleteConsumerOffset, false},
-		{OperationDeleteSegments, false},
-		{OperationTruncatePartition, false},
+		{OperationDeleteSegments, true},
+		{OperationTruncatePartition, true},
 		{Operation(255), false},
 	} {
 		var header [HeaderSize]byte

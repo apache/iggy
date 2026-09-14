@@ -22,6 +22,8 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.exception.IggyClientException;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -29,6 +31,7 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 
 import java.io.EOFException;
@@ -90,6 +93,481 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int CHANGE_PASSWORD_OPERATION = 144;
     private static final int TRANSIENT_NOT_COMMITTED = 57;
     private static final int POLL_PARAMETERS_BYTES = 14;
+
+    @Test
+    void shouldCancelAnAutoCommitWaitingForTopologyWithoutClosingCoordinator() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger metadataReads = new AtomicInteger();
+            AtomicInteger polls = new AtomicInteger();
+            AtomicInteger logins = new AtomicInteger();
+            CompletableFuture<Void> probing = new CompletableFuture<>();
+            CompletableFuture<Void> releaseProbe = new CompletableFuture<>();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    logins.incrementAndGet();
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    if (metadataReads.incrementAndGet() == 1) {
+                        return Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED);
+                    }
+                    probing.complete(null);
+                    releaseProbe.join();
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
+                    polls.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                CompletableFuture<PolledMessages> cancelled = poll(client, Optional.of(0L), true);
+                probing.get(5, TimeUnit.SECONDS);
+                assertThat(cancelled.cancel(false)).isTrue();
+                releaseProbe.complete(null);
+                poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS);
+                assertThat(polls).hasValue(1);
+                assertThat(logins).hasValue(1);
+                assertThat(client.getConnectionInfo().port()).isEqualTo(coordinatorSocket.getLocalPort());
+            } finally {
+                releaseProbe.complete(null);
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldKeepPrimaryRoutingWhenAClusterHasOnlyOneTcpEndpoint() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger routes = new AtomicInteger();
+            AtomicInteger legacyPolls = new AtomicInteger();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(coordinatorSocket.getLocalPort(), 0, coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    routes.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, 0));
+                }
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
+                    legacyPolls.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertThat(client.rosterTargets()).hasSize(1);
+                assertThatThrownBy(() -> poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
+                        .hasRootCauseInstanceOf(IggyClientException.class)
+                        .hasRootCauseMessage("Invalid TCP primary poll routing response");
+                assertThat(routes).hasValue(1);
+                assertThat(legacyPolls).hasValue(0);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldRequireKnownTopologyBeforeAutoCommitAndRecoverDiscovery() throws Exception {
+        for (boolean clustered : new boolean[] {false, true}) {
+            InetAddress loopback = InetAddress.getLoopbackAddress();
+            try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
+                    ServerSocket primarySocket = new ServerSocket(0, 4, loopback)) {
+                AtomicInteger metadataReads = new AtomicInteger();
+                AtomicInteger logins = new AtomicInteger();
+                AtomicInteger legacyPolls = new AtomicInteger();
+                AtomicInteger primaryPolls = new AtomicInteger();
+                AtomicBoolean metadataUnavailable = new AtomicBoolean(true);
+                CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        logins.incrementAndGet();
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        metadataReads.incrementAndGet();
+                        if (metadataUnavailable.get()) {
+                            return Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED);
+                        }
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                clustered
+                                        ? clusterMetadata(
+                                                coordinatorSocket.getLocalPort(),
+                                                primarySocket.getLocalPort(),
+                                                coordinatorSocket.getLocalPort())
+                                        : singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                    }
+                    if (request.is(GROUP_SYNC_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                Unpooled.buffer().writeLongLE(1).writeIntLE(1).writeIntLE(0));
+                    }
+                    if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                        assertThat(clustered).isTrue();
+                        return Response.success(
+                                OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
+                    }
+                    if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
+                        legacyPolls.incrementAndGet();
+                        return Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                    }
+                    throw new IllegalStateException("Unexpected coordinator request: " + request);
+                });
+                CompletableFuture<Void> primary = clustered
+                        ? serve(primarySocket, request -> {
+                            if (request.operation() == OPERATION_REGISTER) {
+                                return Response.success(OPERATION_REGISTER, registerBody(2));
+                            }
+                            if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                                return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                            }
+                            if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                                primaryPolls.incrementAndGet();
+                                return Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                            }
+                            throw new IllegalStateException("Unexpected primary request: " + request);
+                        })
+                        : CompletableFuture.completedFuture(null);
+                AsyncIggyTcpClient client = client(coordinatorSocket);
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.login().get(5, TimeUnit.SECONDS);
+                    assertThat(client.rosterTargets()).isEmpty();
+                    assertThat(metadataReads).hasValue(1);
+                    poll(client, Optional.of(0L), false).get(5, TimeUnit.SECONDS);
+                    assertThat(metadataReads).hasValue(1);
+                    assertThatThrownBy(
+                                    () -> poll(client, Optional.empty(), true).get(5, TimeUnit.SECONDS))
+                            .hasRootCauseInstanceOf(IggyServerException.class)
+                            .rootCause()
+                            .extracting(error -> ((IggyServerException) error).getRawErrorCode())
+                            .isEqualTo(TRANSIENT_NOT_ACCEPTED);
+                    assertThat(metadataReads).hasValue(2);
+                    assertThat(legacyPolls).hasValue(1);
+                    assertThat(primaryPolls).hasValue(0);
+
+                    metadataUnavailable.set(false);
+                    poll(client, Optional.empty(), true).get(5, TimeUnit.SECONDS);
+                    assertThat(metadataReads).hasValue(3);
+                    assertThat(client.rosterTargets()).hasSize(clustered ? 2 : 1);
+                    metadataUnavailable.set(true);
+                    client.findLeaderElsewhere(client.getConnectionInfo()).get(5, TimeUnit.SECONDS);
+                    poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS);
+                    assertThat(metadataReads).hasValue(4);
+                    assertThat(legacyPolls).hasValue(clustered ? 1 : 3);
+                    assertThat(primaryPolls).hasValue(clustered ? 2 : 0);
+                    assertThat(logins).hasValue(1);
+                    assertThat(client.getConnectionInfo().port()).isEqualTo(coordinatorSocket.getLocalPort());
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                coordinator.get(5, TimeUnit.SECONDS);
+                primary.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldRefreshCredentialsAfterMutationMovesToAnotherConnection() throws Exception {
+        for (boolean rename : new boolean[] {false, true}) {
+            InetAddress loopback = InetAddress.getLoopbackAddress();
+            try (ServerSocket oldSocket = new ServerSocket(0, 4, loopback);
+                    ServerSocket newSocket = new ServerSocket(0, 4, loopback)) {
+                AtomicInteger denials = new AtomicInteger();
+                AtomicInteger nextOperations = new AtomicInteger();
+                List<String> logins = new CopyOnWriteArrayList<>();
+                int mutation = rename ? UPDATE_USER_OPERATION : CHANGE_PASSWORD_OPERATION;
+                CompletableFuture<Void> oldLeader = serve(oldSocket, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                clusterMetadata(
+                                        oldSocket.getLocalPort(),
+                                        newSocket.getLocalPort(),
+                                        denials.get() == 0 ? oldSocket.getLocalPort() : newSocket.getLocalPort()));
+                    }
+                    if (request.operation() == mutation) {
+                        denials.incrementAndGet();
+                        return Response.error(mutation, TRANSIENT_NOT_ACCEPTED);
+                    }
+                    throw new IllegalStateException("Unexpected old-leader request: " + request);
+                });
+                CompletableFuture<Void> newLeader = serve(newSocket, 2, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        logins.add(request.bodyAsText());
+                        return Response.success(OPERATION_REGISTER, registerBody(logins.size() + 1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                clusterMetadata(
+                                        oldSocket.getLocalPort(), newSocket.getLocalPort(), newSocket.getLocalPort()));
+                    }
+                    if (request.operation() == mutation) {
+                        return Response.committed(
+                                mutation, 11, Unpooled.buffer().writeIntLE(0));
+                    }
+                    if (request.operation() == OPERATION_CREATE_STREAM) {
+                        return nextOperations.incrementAndGet() == 1
+                                ? Response.eviction(EVICTION_STALE_CLIENT)
+                                : Response.success(
+                                        OPERATION_CREATE_STREAM,
+                                        Unpooled.buffer().writeIntLE(0));
+                    }
+                    throw new IllegalStateException("Unexpected new-leader request: " + request);
+                });
+                AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                        .host(loopback.getHostAddress())
+                        .port(oldSocket.getLocalPort())
+                        .requestTimeout(Duration.ofSeconds(10))
+                        .heartbeatInterval(Duration.ofMinutes(1))
+                        .build();
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.users().login("manual-user", "manual-password").get(5, TimeUnit.SECONDS);
+                    CompletableFuture<Void> mutationResult = rename
+                            ? client.users().updateUser(UserId.of(1L), Optional.of("renamed-user"), Optional.empty())
+                            : client.users().changePassword(UserId.of(1L), "manual-password", "new-password");
+                    mutationResult.get(10, TimeUnit.SECONDS);
+                    assertThat(client.getConnectionInfo().port()).isEqualTo(newSocket.getLocalPort());
+                    assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                                    .get(5, TimeUnit.SECONDS))
+                            .hasCauseInstanceOf(IggyServerException.class);
+                    client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+                    assertThat(logins).hasSize(2);
+                    assertThat(logins.get(0)).contains("manual-user").contains("manual-password");
+                    assertThat(logins.get(1))
+                            .contains(rename ? "renamed-user" : "manual-user")
+                            .contains(rename ? "manual-password" : "new-password");
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                oldLeader.get(5, TimeUnit.SECONDS);
+                newLeader.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldReattachBeforePollingAfterIdleDataChannelLoss() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
+                ServerSocket primarySocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger logins = new AtomicInteger();
+            AtomicInteger attachedLogin = new AtomicInteger();
+            AtomicInteger attachments = new AtomicInteger();
+            AtomicInteger polls = new AtomicInteger();
+            AtomicReference<AsyncTcpConnection> auxiliary = new AtomicReference<>();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            CompletableFuture<Void> primary = serve(primarySocket, 2, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(logins.incrementAndGet()));
+                }
+                if (request.is(CommandCode.System.PING.getValue(), OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                }
+                if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    attachedLogin.set(logins.get());
+                    attachments.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                }
+                if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                    if (attachedLogin.get() != logins.get()) {
+                        return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                    }
+                    return polls.incrementAndGet() == 1
+                            ? Response.successAndDisconnect(OPERATION_NON_REPLICATED, emptyPoll(0))
+                            : Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                }
+                throw new IllegalStateException("Unexpected primary request: " + request);
+            });
+            AsyncTcpConnection parent = connection(coordinatorSocket);
+            PollRouter router = new PollRouter(() -> parent, endpoint -> {
+                AsyncTcpConnection data = connection(primarySocket);
+                auxiliary.set(data);
+                return data;
+            });
+            MessagesTcpClient messages = new MessagesTcpClient(
+                    () -> parent, new ClientRoutingState(), router, () -> CompletableFuture.completedFuture(true));
+            try {
+                parent.connect().get(5, TimeUnit.SECONDS);
+                new UsersTcpClient(() -> parent)
+                        .login("manual-user", "manual-password")
+                        .get(5, TimeUnit.SECONDS);
+                messages.pollMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Optional.of(0L),
+                                Consumer.group(7L),
+                                PollingStrategy.next(),
+                                1L,
+                                true)
+                        .get(5, TimeUnit.SECONDS);
+                auxiliary
+                        .get()
+                        .send(CommandCode.System.PING, Unpooled.EMPTY_BUFFER)
+                        .handle((response, error) -> {
+                            if (response != null) {
+                                response.release();
+                            }
+                            return null;
+                        })
+                        .get(5, TimeUnit.SECONDS);
+                messages.pollMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Optional.of(0L),
+                                Consumer.group(7L),
+                                PollingStrategy.next(),
+                                1L,
+                                true)
+                        .get(5, TimeUnit.SECONDS);
+                assertThat(logins).hasValue(2);
+                assertThat(attachments).hasValue(2);
+                assertThat(polls).hasValue(2);
+            } finally {
+                router.clearSession(parent).get(5, TimeUnit.SECONDS);
+                parent.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+            primary.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldPreserveRecoveryPingErrorAndRejectMalformedRoutingReplies() throws Exception {
+        for (int malformedSize : new int[] {-1, 0, 16, 32}) {
+            InetAddress loopback = InetAddress.getLoopbackAddress();
+            try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
+                    ServerSocket unusedPrimary = new ServerSocket(0, 4, loopback)) {
+                AtomicInteger routes = new AtomicInteger();
+                CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                clusterMetadata(
+                                        coordinatorSocket.getLocalPort(),
+                                        unusedPrimary.getLocalPort(),
+                                        coordinatorSocket.getLocalPort()));
+                    }
+                    if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                        routes.incrementAndGet();
+                        return malformedSize < 0
+                                ? Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode())
+                                : Response.success(
+                                        OPERATION_NON_REPLICATED,
+                                        Unpooled.buffer().writeZero(malformedSize));
+                    }
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.INVALID_CREDENTIALS.getCode());
+                });
+                AsyncIggyTcpClient client = client(coordinatorSocket);
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.users().login("manual-user", "manual-password").get(5, TimeUnit.SECONDS);
+                    if (malformedSize < 0) {
+                        assertThatThrownBy(() ->
+                                        poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
+                                .satisfies(
+                                        error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
+                                                .isEqualTo(IggyErrorCode.INVALID_CREDENTIALS.getCode()));
+                    } else {
+                        assertThatThrownBy(() ->
+                                        poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
+                                .hasCauseInstanceOf(IggyClientException.class);
+                    }
+                    assertThat(routes).hasValue(1);
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                coordinator.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void shouldReturnNonAdmissionWhenEveryRoutingAttemptIsRefused() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
+                ServerSocket unusedPrimary = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger refusals = new AtomicInteger();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(
+                                    coordinatorSocket.getLocalPort(),
+                                    unusedPrimary.getLocalPort(),
+                                    coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    refusals.incrementAndGet();
+                    return Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("manual-user", "manual-password").get(5, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> poll(client, Optional.of(0L), true).get(35, TimeUnit.SECONDS))
+                        .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
+                                .isEqualTo(TRANSIENT_NOT_ACCEPTED));
+                assertThat(refusals).hasValueGreaterThan(1);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private static AsyncTcpConnection connection(ServerSocket server) {
+        return new AsyncTcpConnection(
+                server.getInetAddress().getHostAddress(),
+                server.getLocalPort(),
+                false,
+                Optional.empty(),
+                AsyncTcpConnection.TcpConnectionPoolConfig.builder().build(),
+                Optional.empty());
+    }
 
     @Test
     void shouldRetainSuccessfulSelfRenameAndPasswordChangeForConfiguredLogin() throws Exception {
@@ -978,6 +1456,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                         break;
                                     }
                                     writeResponse(output, request, response);
+                                    if (response.closeAfterReply()) {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1115,29 +1596,40 @@ class AsyncIggyTcpClientTransientFailoverTest {
         }
     }
 
-    private record Response(int command, int operation, int status, int evictionReason, long commit, ByteBuf body) {
+    private record Response(
+            int command,
+            int operation,
+            int status,
+            int evictionReason,
+            long commit,
+            ByteBuf body,
+            boolean closeAfterReply) {
         static Response success(int operation, ByteBuf body) {
-            return new Response(COMMAND_REPLY, operation, 0, 0, 0, body);
+            return new Response(COMMAND_REPLY, operation, 0, 0, 0, body, false);
         }
 
         static Response error(int operation, int status) {
-            return new Response(COMMAND_REPLY, operation, status, 0, 0, Unpooled.EMPTY_BUFFER);
+            return new Response(COMMAND_REPLY, operation, status, 0, 0, Unpooled.EMPTY_BUFFER, false);
         }
 
         static Response eviction(int reason) {
-            return new Response(COMMAND_EVICTION, 0, 0, reason, 0, Unpooled.EMPTY_BUFFER);
+            return new Response(COMMAND_EVICTION, 0, 0, reason, 0, Unpooled.EMPTY_BUFFER, false);
         }
 
         static Response committed(int operation, long commit, ByteBuf body) {
-            return new Response(COMMAND_REPLY, operation, 0, 0, commit, body);
+            return new Response(COMMAND_REPLY, operation, 0, 0, commit, body, false);
         }
 
         static Response disconnect() {
-            return new Response(-1, 0, 0, 0, 0, Unpooled.EMPTY_BUFFER);
+            return new Response(-1, 0, 0, 0, 0, Unpooled.EMPTY_BUFFER, false);
         }
 
         static Response noReply() {
-            return new Response(-2, 0, 0, 0, 0, Unpooled.EMPTY_BUFFER);
+            return new Response(-2, 0, 0, 0, 0, Unpooled.EMPTY_BUFFER, false);
+        }
+
+        static Response successAndDisconnect(int operation, ByteBuf body) {
+            return new Response(COMMAND_REPLY, operation, 0, 0, 0, body, true);
         }
     }
 

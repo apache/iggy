@@ -190,8 +190,7 @@ func MetadataCommit(header *[HeaderSize]byte) uint64 {
 	if PeekCommand(header) != FrameReply || !IsKnownOperation(operation) {
 		return 0
 	}
-	if operation != OperationRegister && operation != OperationLogout &&
-		(!IsMetadata(operation) || operation == OperationTruncatePartition) {
+	if operation == OperationNonReplicated || operation >= OperationSendMessages {
 		return 0
 	}
 	return binary.LittleEndian.Uint64(header[replyOffsetCommit:])

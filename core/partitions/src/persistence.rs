@@ -1157,8 +1157,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             if epoch == self.epoch.get() && !self.retired.get() {
                 self.publish_mutation(journal, rebuild_references);
             }
-            // Reclaim when nothing is queued behind this mutation, so no
-            // acknowledgement pays for the unlinks and the directory barrier.
+            // Reclaim after publishing the mutation when the queue is empty.
+            // Appends arriving during reclaim still wait for its unlinks and
+            // directory barrier.
             // A partition that never drains would then never reclaim, so force
             // a pass every `RECLAIM_MUTATIONS_MAX` mutations and accept that
             // one group's latency.

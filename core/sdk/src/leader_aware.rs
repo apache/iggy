@@ -45,6 +45,8 @@ pub(crate) fn is_unauthenticated_metadata_probe(code: u32, error: &IggyError) ->
 
 /// What one leader check learned from the cluster roster.
 pub struct LeaderCheck {
+    /// Full roster size, including nodes that do not expose this transport.
+    pub node_count: usize,
     /// The leader's address, when it is not the node the client is on.
     pub redirect: Option<String>,
     /// Every endpoint the roster named for this transport. A client keeps
@@ -58,6 +60,7 @@ impl LeaderCheck {
     /// A check that learned nothing: stay where we are, remember no endpoint.
     fn inconclusive() -> Self {
         Self {
+            node_count: 0,
             redirect: None,
             endpoints: Vec::new(),
         }
@@ -90,12 +93,14 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
                 match process_cluster_metadata(&metadata, current_address, transport).await {
                     Outcome::Redirect(address) => {
                         return Ok(LeaderCheck {
+                            node_count: metadata.nodes.len(),
                             redirect: Some(address),
                             endpoints,
                         });
                     }
                     Outcome::LeaderIsCurrent => {
                         return Ok(LeaderCheck {
+                            node_count: metadata.nodes.len(),
                             redirect: None,
                             endpoints,
                         });
@@ -108,6 +113,7 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
                             // A leaderless roster still names where the nodes
                             // are, and that is what failover needs.
                             return Ok(LeaderCheck {
+                                node_count: metadata.nodes.len(),
                                 redirect: None,
                                 endpoints,
                             });
@@ -145,12 +151,15 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
 pub(crate) async fn read_transport_endpoints<C: ClusterClient>(
     client: &C,
     transport: TransportProtocol,
-) -> Vec<String> {
+) -> (usize, Vec<String>) {
     match client.get_cluster_metadata().await {
-        Ok(metadata) => transport_endpoints(&metadata, transport),
+        Ok(metadata) => (
+            metadata.nodes.len(),
+            transport_endpoints(&metadata, transport),
+        ),
         Err(error) => {
             debug!("Failed to read the cluster roster: {error}");
-            Vec::new()
+            (0, Vec::new())
         }
     }
 }

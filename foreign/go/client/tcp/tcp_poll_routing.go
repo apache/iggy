@@ -39,11 +39,15 @@ const (
 	consumerSessionSize   = 32
 	pollParametersSize    = 1 + 8 + 4 + 1
 	pollHeartbeatInterval = 5 * time.Second
-	pollLockRetryInterval = time.Millisecond
 )
 
 // Primary polls have no deduplication key, including within one VSR session.
 type singlePollExchange struct{}
+
+type pollExchangeState struct {
+	written  bool
+	reusable bool
+}
 
 // Published under c.mtx after authentication, then immutable. Warm data polls
 // must not wait behind unrelated coordinator I/O just to read their identity.
@@ -147,12 +151,21 @@ func (p *pollRouter) dropConnection(endpoint string, connection *pollConnection)
 	connection.retire()
 }
 
-func (c *IggyTcpClient) pollPrimary(ctx context.Context, request *command.PollMessages) ([]byte, error) {
-	if ctx == nil {
+func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.PollMessages) (response []byte, err error) {
+	if caller == nil {
 		return nil, ierror.ErrNilContext
 	}
-	ctx, cancel := context.WithTimeout(ctx, responseReadTimeout)
-	defer cancel()
+	ctx, cancel := context.WithTimeout(caller, responseReadTimeout)
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			if caller.Err() != nil {
+				err = caller.Err()
+			} else if !errors.Is(err, ierror.ErrTransientNotAccepted) {
+				err = ierror.ErrTransientNotCommitted
+			}
+		}
+		cancel()
+	}()
 	payload, err := request.MarshalBinary()
 	if err != nil {
 		return nil, err
@@ -167,7 +180,7 @@ func (c *IggyTcpClient) pollPrimary(ctx context.Context, request *command.PollMe
 	}
 	c.polls.mu.Unlock()
 	if heartbeatDue {
-		if _, err := c.sendPollRequest(ctx, uint32(command.PingCode), nil); err != nil {
+		if _, _, err := c.sendPollRequest(ctx, uint32(command.PingCode), nil); err != nil {
 			if !isReconnectable(err) {
 				return nil, err
 			}
@@ -181,24 +194,26 @@ func (c *IggyTcpClient) pollPrimary(ctx context.Context, request *command.PollMe
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		response, err := c.pollPrimaryOnce(ctx, key, payload)
+		route, err := c.pollRoute(ctx, key, payload)
+		var response []byte
+		if err == nil {
+			response, err = c.pollOnRoute(ctx, key, payload, route)
+		}
 		if !errors.Is(err, ierror.ErrTransientNotAccepted) {
 			return response, err
 		}
 		c.polls.dropRoute(key)
 		deadline, _ := ctx.Deadline()
-		if err := c.waitBeforeReplay(ctx, deadline); err != nil {
+		if time.Until(deadline) <= replayInterval {
 			return nil, err
 		}
+		if waitErr := c.waitBeforeReplay(ctx, deadline); waitErr != nil {
+			if caller.Err() == nil && ctx.Err() != nil {
+				return nil, err
+			}
+			return nil, waitErr
+		}
 	}
-}
-
-func (c *IggyTcpClient) pollPrimaryOnce(ctx context.Context, key string, payload []byte) ([]byte, error) {
-	route, err := c.pollRoute(ctx, key, payload)
-	if err != nil {
-		return nil, err
-	}
-	return c.pollOnRoute(ctx, key, payload, route)
 }
 
 func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []byte, route pollRoute) ([]byte, error) {
@@ -243,7 +258,7 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	case <-slot.ctx.Done():
 		return nil, ierror.ErrTransientNotAccepted
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	exchangeCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(slot.ctx, cancel)
 	defer stop()
 	defer cancel()
@@ -255,10 +270,11 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	}
 
 	if slot.client == nil {
-		client, err := c.connectPollClient(ctx, route)
+		client, err := c.connectPollClient(exchangeCtx, route)
 		if err != nil {
+			err = slot.exchangeError(ctx, pollExchangeState{}, err)
 			c.polls.dropConnection(route.endpoint, slot)
-			return nil, unacceptedPollError(err)
+			return nil, err
 		}
 		slot.mu.Lock()
 		if slot.retired {
@@ -272,9 +288,14 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	}
 	if !slot.attached || slot.parent.client != route.parent.client ||
 		slot.parent.session != route.parent.session || slot.parent.watermark < route.parent.watermark {
-		if _, err := slot.client.sendPollRequest(ctx, uint32(command.AttachConsumerSessionCode), route.parent.bytes()); err != nil {
-			c.polls.dropConnection(route.endpoint, slot)
-			return nil, unacceptedPollError(err)
+		if _, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.AttachConsumerSessionCode), route.parent.bytes()); err != nil {
+			// An attach cannot advance an offset, even if its reply is lost.
+			state.written = false
+			err = slot.exchangeError(ctx, state, err)
+			if !state.reusable {
+				c.polls.dropConnection(route.endpoint, slot)
+			}
+			return nil, err
 		}
 		slot.parent = route.parent
 		slot.attached = true
@@ -282,14 +303,15 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	if !c.pollParentCurrent(route.parent) {
 		return nil, ierror.ErrTransientNotAccepted
 	}
-	response, err := slot.client.sendPollRequest(ctx, uint32(command.PollMessagesOnPrimaryCode), payload)
+	response, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.PollMessagesOnPrimaryCode), payload)
+	err = slot.exchangeError(ctx, state, err)
 	if errors.Is(err, ierror.ErrTransientNotAccepted) {
 		slot.attached = false
-	} else if err != nil {
+	}
+	if err != nil {
 		c.polls.dropRoute(key)
-		c.polls.dropConnection(route.endpoint, slot)
-		if isReconnectable(err) {
-			err = ierror.ErrTransientNotCommitted
+		if !state.reusable {
+			c.polls.dropConnection(route.endpoint, slot)
 		}
 	}
 	return response, err
@@ -311,9 +333,7 @@ func (c *IggyTcpClient) pollRoute(ctx context.Context, key string, payload []byt
 	c.polls.mu.Lock()
 	route, cached := c.polls.routes[key]
 	c.polls.mu.Unlock()
-	usable := cached && c.matchesPollParent(route.parent) &&
-		route.parent.watermark >= c.metadataWatermark.Load()
-	if usable {
+	if cached && c.pollParentCurrent(route.parent) {
 		return route, nil
 	}
 	// This control command can recover a failed coordinator, but its one-exchange
@@ -371,7 +391,6 @@ func (c *IggyTcpClient) connectPollClient(ctx context.Context, route pollRoute) 
 	configuration := snapshot.configuration
 	configuration.serverAddress = route.endpoint
 	configuration.reconnection.enabled = false
-	configuration.reconnection.maxRetries = 1
 	client := NewIggyTcpClient(c.logger, func(options *Options) { options.config = configuration })
 	if err := client.Connect(suppressLeaderSettlement(ctx)); err != nil {
 		_ = client.Close()
@@ -380,38 +399,37 @@ func (c *IggyTcpClient) connectPollClient(ctx context.Context, route pollRoute) 
 	return client, nil
 }
 
-func (c *IggyTcpClient) sendPollRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
-	if ctx == nil {
-		return nil, ierror.ErrNilContext
-	}
+func (c *IggyTcpClient) sendPollRequest(ctx context.Context, code uint32, payload []byte) ([]byte, pollExchangeState, error) {
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
 	frame := append(reserveHeader(*bp), payload...)
 	*bp = frame
-	response, _, _, err := c.attempt(context.WithValue(ctx, singlePollExchange{}, struct{}{}),
-		code, frame, false, time.Now(), time.Now().Add(responseReadTimeout))
-	return response, err
+	response, _, state, err := c.sendPollFrame(ctx, code, frame)
+	return response, state, err
 }
 
-func unacceptedPollError(err error) error {
-	if isReconnectable(err) {
+func (c *IggyTcpClient) sendPollFrame(ctx context.Context, code uint32, frame []byte) ([]byte, uint64, pollExchangeState, error) {
+	state := pollExchangeState{}
+	if ctx == nil {
+		return nil, 0, state, ierror.ErrNilContext
+	}
+	response, _, generation, err := c.attempt(context.WithValue(ctx, singlePollExchange{}, &state),
+		code, frame, false, time.Now(), time.Now().Add(responseReadTimeout))
+	return response, generation, state, err
+}
+
+func (p *pollConnection) exchangeError(ctx context.Context, state pollExchangeState, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if p.ctx.Err() != nil || isReconnectable(err) || (state.written && !state.reusable) {
+		if state.written {
+			return ierror.ErrTransientNotCommitted
+		}
 		return ierror.ErrTransientNotAccepted
 	}
 	return err
-}
-
-func (c *IggyTcpClient) lockPollExchange(ctx context.Context) error {
-	for !c.mtx.TryLock() {
-		timer := time.NewTimer(pollLockRetryInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-c.closed:
-			timer.Stop()
-			return ierror.ErrClientShutdown
-		case <-timer.C:
-		}
-	}
-	return nil
 }

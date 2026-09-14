@@ -279,7 +279,8 @@ internal sealed class VsrConnection : IDisposable
         }
 
         var operation = VsrHeader.ReadReplyOperation(_replyHeaderBuffer);
-        if (operation.IsMetadata() || operation is VsrOperation.Register or VsrOperation.Logout)
+        if (operation is not (VsrOperation.NonReplicated or VsrOperation.SendMessages
+            or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset))
         {
             _observeMetadataCommit(BinaryPrimitives.ReadUInt64LittleEndian(
                 _replyHeaderBuffer.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));

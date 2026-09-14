@@ -57,28 +57,7 @@ public sealed partial class TcpMessageStream
         internal volatile bool Retired;
     }
 
-    private async Task<bool> UsesClusterPollRoutingAsync(CancellationToken token)
-    {
-        if (Volatile.Read(ref _clusterNodeCount) == 0)
-        {
-            try
-            {
-                if (await GetClusterMetadataAsync(token) is null)
-                {
-                    Volatile.Write(ref _clusterNodeCount, 1);
-                }
-            }
-            catch (IggyInvalidStatusCodeException error) when (error is
-            { StatusCode: VsrError.FEATURE_UNAVAILABLE, FromServer: true })
-            {
-                Volatile.Write(ref _clusterNodeCount, 1);
-            }
-        }
-
-        return Volatile.Read(ref _clusterNodeCount) > 1;
-    }
-
-    private async Task<IMemoryOwner<byte>> PollOnPrimaryAsync(PollRouteKey key, ReadOnlyMemory<byte> payload,
+    private async Task<IMemoryOwner<byte>> PollAutoCommitAsync(PollRouteKey key, ReadOnlyMemory<byte> payload,
         CancellationToken token)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -90,12 +69,39 @@ public sealed partial class TcpMessageStream
             {
                 try
                 {
-                    return await PollPrimaryOnceAsync(key, payload, deadline, cancellation.Token);
+                    if (Volatile.Read(ref _clusterNodeCount) == 0)
+                    {
+                        using var metadata = await SendPollControlAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
+                            ReadOnlyMemory<byte>.Empty, deadline, cancellation.Token);
+                        if (metadata.Memory.Length == 0)
+                        {
+                            throw new MalformedResponseException("Poll routing requires a nonempty cluster roster.");
+                        }
+
+                        RememberRoster(BinaryMapper.MapClusterMetadata(metadata.Memory.Span));
+                    }
+
+                    return Volatile.Read(ref _clusterNodeCount) > 1
+                        ? await PollPrimaryOnceAsync(key, payload, deadline, cancellation.Token)
+                        : await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE, payload,
+                            token: cancellation.Token);
                 }
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.TRANSIENT_NOT_ACCEPTED)
                 {
                     RemovePollRoute(key);
-                    await Task.Delay(PollRoutingRetryIntervalMs, cancellation.Token);
+                    if (Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
+                    {
+                        throw;
+                    }
+
+                    try
+                    {
+                        await Task.Delay(PollRoutingRetryIntervalMs, cancellation.Token);
+                    }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                    {
+                        ExceptionDispatchInfo.Throw(error);
+                    }
                 }
             }
         }

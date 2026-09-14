@@ -280,7 +280,7 @@ struct ClientEntry {
 ///
 /// It cannot keep that session alive: re-registration, logout, eviction and table replacement
 /// invalidate every attachment, including those held by other shard threads.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionAttachment {
     session: Weak<()>,
 }

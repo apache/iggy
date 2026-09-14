@@ -139,6 +139,11 @@ func (c *IggyTcpClient) PollMessages(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
+	if autoCommit && !c.topologyKnown.Load() {
+		if _, err := c.GetClusterMetadata(ctx); err != nil {
+			return nil, err
+		}
+	}
 	// A group poll that names no partition is orchestrated client-side: the
 	// member fetches its assignment and polls the partitions it owns in turn.
 	if consumer.Kind == iggcon.ConsumerKindGroup && partitionId == nil {

@@ -61,6 +61,9 @@ pub const POLL_MESSAGES_ON_PRIMARY_CODE: u32 = 104;
 pub const GET_CONSUMER_OFFSET_CODE: u32 = 120;
 pub const STORE_CONSUMER_OFFSET_CODE: u32 = 121;
 pub const DELETE_CONSUMER_OFFSET_CODE: u32 = 122;
+/// Primary and parent session for offset writes; uses `GetConsumerOffsetRequest`
+/// and `PollRoutingResponse`, with the offset ownership fence (revocations may drain).
+pub const GET_CONSUMER_OFFSET_ROUTING_CODE: u32 = 123;
 
 // -- Streams --
 pub const GET_STREAM_CODE: u32 = 200;

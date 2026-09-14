@@ -1348,10 +1348,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("WAL generation exhausted"))?;
-        let mut file = self
-            .storage
-            .open(&data_path(&self.directory, generation), OpenMode::Create)
-            .await?;
+        let path = data_path(&self.directory, generation);
+        // A failed boot unlink may still name the generation this rewrite
+        // adopts. It must no longer be eligible for deferred reclamation.
+        self.obsolete.retain(|queued| queued != &path);
+        let mut file = self.storage.open(&path, OpenMode::Create).await?;
         let mut entries = BTreeMap::new();
         let mut state = JournalState {
             generation,
@@ -1870,6 +1871,37 @@ mod tests {
         journal.cleanup_obsolete().await;
 
         assert!(!stale.exists());
+    }
+
+    #[compio::test]
+    async fn a_rewrite_reclaims_the_wal_path_it_reuses() {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+
+        // A crash before publishing the frontier can leave the next generation
+        // on disk; a failed boot unlink leaves that path queued for retry.
+        let reused = data_path(&directory, journal.state.generation + 1);
+        std::fs::write(&reused, b"unpublished generation").unwrap();
+        journal.obsolete.push_back(reused.clone());
+        journal.checkpoint(1).await.unwrap();
+        let second = prepare(2, first.header().checksum);
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        journal.cleanup_obsolete().await;
+        assert!(reused.exists(), "cleanup must retain the published WAL");
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), second.as_slice());
     }
 
     /// A failed unlink leaves its path queued for a retry. When a later append

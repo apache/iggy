@@ -33,6 +33,17 @@ pub trait BinaryTransport {
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
+    /// Route a store or delete offset request while retaining the membership connection.
+    async fn send_offset_write_with_response(
+        &self,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        self.send_raw_with_response(code, payload).await
+    }
     /// Transports may route an auto-commit poll without moving the connection
     /// that owns consumer-group membership.
     async fn send_poll_with_response(
@@ -52,10 +63,9 @@ pub trait BinaryTransport {
     fn consumer_group_state(&self) -> Arc<crate::ConsumerGroupClientState>;
 }
 
-/// Sealed marker. Downstream crates cannot implement
-/// [`VsrSessionControl`] because they cannot name
-/// `vsr_session_sealed::Sealed`. The session-mutation methods stay
-/// in-crate so only the SDK's login/logout flows can call them.
+/// Separate opt-in marker for session control. Exported as `VsrSessionSealed`
+/// so the SDK crate and external transport implementations can implement it;
+/// this does not restrict implementations to this crate.
 mod vsr_session_sealed {
     pub trait Sealed {}
 }

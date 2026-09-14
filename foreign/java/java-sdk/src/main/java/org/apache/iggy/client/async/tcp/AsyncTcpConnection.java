@@ -102,12 +102,6 @@ public class AsyncTcpConnection {
     static final int TRANSIENT_NOT_ACCEPTED = 58;
     // The pool holds one channel, and one channel lives on one loop.
     static final int DEFAULT_IO_THREADS = 1;
-    /**
-     * Writes consolidated into one flush inside a read loop. Netty's own
-     * default, which is tuned for exactly this shape: several requests written
-     * while one batch of replies is being dispatched.
-     */
-    private static final int FLUSH_CONSOLIDATION_MAX = 256;
 
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
@@ -415,6 +409,15 @@ public class AsyncTcpConnection {
 
     CompletableFuture<ByteBuf> send(
             int commandCode, ByteBuf payload, long requestDeadlineNanos, TransientFailoverState failoverState) {
+        return send(commandCode, payload, requestDeadlineNanos, failoverState, 0);
+    }
+
+    private CompletableFuture<ByteBuf> send(
+            int commandCode,
+            ByteBuf payload,
+            long requestDeadlineNanos,
+            TransientFailoverState failoverState,
+            long requiredSessionGeneration) {
         if (isLoginCode(commandCode) && authenticated) {
             return logoutThenLogin(commandCode, payload);
         }
@@ -455,10 +458,20 @@ public class AsyncTcpConnection {
                     responseFuture,
                     callerFuture,
                     requestDeadlineNanos,
-                    failoverState);
+                    failoverState,
+                    requiredSessionGeneration);
         });
 
         return callerFuture;
+    }
+
+    CompletableFuture<ByteBuf> sendPrimaryPoll(ByteBuf payload, long sessionGeneration) {
+        return send(
+                CommandCode.Messages.POLL_ON_PRIMARY.getValue(),
+                payload,
+                0,
+                new TransientFailoverState(),
+                sessionGeneration);
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -470,7 +483,8 @@ public class AsyncTcpConnection {
             CompletableFuture<ByteBuf> responseFuture,
             CompletableFuture<ByteBuf> callerFuture,
             long requestDeadlineNanos,
-            TransientFailoverState failoverState) {
+            TransientFailoverState failoverState,
+            long requiredSessionGeneration) {
         Runnable dispatch = () -> dispatchOnChannel(
                 channel,
                 commandCode,
@@ -479,7 +493,8 @@ public class AsyncTcpConnection {
                 responseFuture,
                 callerFuture,
                 requestDeadlineNanos,
-                failoverState);
+                failoverState,
+                requiredSessionGeneration);
         if (channel.eventLoop().inEventLoop()) {
             dispatch.run();
             return;
@@ -503,7 +518,8 @@ public class AsyncTcpConnection {
             CompletableFuture<ByteBuf> responseFuture,
             CompletableFuture<ByteBuf> callerFuture,
             long inheritedRequestDeadlineNanos,
-            TransientFailoverState failoverState) {
+            TransientFailoverState failoverState,
+            long requiredSessionGeneration) {
         boolean isLoginCommand = isLoginCode(commandCode);
         boolean holdLeaseUntilResponse = mutatesSessionState(commandCode);
         long requestDeadlineNanos = inheritedRequestDeadlineNanos == 0
@@ -529,6 +545,7 @@ public class AsyncTcpConnection {
                         responseFuture,
                         requestDeadlineNanos,
                         holdLeaseUntilResponse,
+                        requiredSessionGeneration,
                         authError));
     }
 
@@ -559,11 +576,19 @@ public class AsyncTcpConnection {
             CompletableFuture<ByteBuf> responseFuture,
             long requestDeadlineNanos,
             boolean holdLeaseUntilResponse,
+            long requiredSessionGeneration,
             Throwable authError) {
         try {
             if (authError != null) {
                 payload.release();
                 responseFuture.completeExceptionally(authError);
+                return;
+            }
+            if (requiredSessionGeneration != 0 && requiredSessionGeneration != sessionGeneration()) {
+                // Reauthentication replaces the data session and loses its parent attachment.
+                payload.release();
+                responseFuture.completeExceptionally(
+                        IggyServerException.fromTcpResponse(TRANSIENT_NOT_ACCEPTED, new byte[0]));
                 return;
             }
             sendFrame(channel, payload, commandCode, responseFuture, requestDeadlineNanos);
@@ -736,7 +761,8 @@ public class AsyncTcpConnection {
     }
 
     private static boolean isPollRoutingCode(int commandCode) {
-        return commandCode == CommandCode.System.ATTACH_CONSUMER_SESSION.getValue()
+        return commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()
+                || commandCode == CommandCode.System.ATTACH_CONSUMER_SESSION.getValue()
                 || commandCode == CommandCode.Messages.GET_POLL_ROUTING.getValue()
                 || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue();
     }
@@ -1115,7 +1141,10 @@ public class AsyncTcpConnection {
             // read loop: with no read in progress every flush passes straight
             // through, so a request on an otherwise idle connection is never
             // waiting on later traffic to push it out.
-            pipeline.addLast("flushConsolidation", new FlushConsolidationHandler(FLUSH_CONSOLIDATION_MAX, false));
+            pipeline.addLast(
+                    "flushConsolidation",
+                    new FlushConsolidationHandler(
+                            FlushConsolidationHandler.DEFAULT_EXPLICIT_FLUSH_AFTER_FLUSHES, false));
             pipeline.addLast("frameDecoder", new VsrFrameDecoder(maxVsrFrameSize));
             pipeline.addLast("responseHandler", new VsrResponseHandler(consensusSession, onEviction));
         }
