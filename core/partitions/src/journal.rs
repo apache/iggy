@@ -211,12 +211,12 @@ where
 /// How many evicted entries each partition retains for repair. Sized to
 /// cover a few seconds of traffic around a node restart; anything older is
 /// bulk-sync (phase 3) territory.
-pub const EVICTED_RING_CAPACITY: usize = 4096;
+pub const EVICTED_RING_CAPACITY: usize = 65536;
 
-/// Byte ceiling for the evicted ring: the entry cap alone lets each
-/// partition pin up to 4096 full-sized batches, which is unbounded in byte
-/// terms across many partitions. Whichever cap trips first evicts.
-pub const EVICTED_RING_BYTES_MAX: u64 = 16 * 1024 * 1024;
+/// Byte ceiling for the evicted ring. Every retained entry pins a full
+/// batch, so an entry cap alone can consume too much memory across many
+/// partitions. Whichever cap trips first evicts.
+pub const EVICTED_RING_BYTES_MAX: u64 = 64 * 1024 * 1024;
 
 impl<S> Default for PartitionJournal<S>
 where
@@ -809,7 +809,7 @@ where
     /// [`Self::header_by_op`] is a linear scan with no index, so asking it
     /// op-by-op over a window is O(window x headers): on the floor-refusal path
     /// the replica is gap-stopped, so nothing evicts and the header vec grows
-    /// with the live tail, and the default 4096-op window over ~100k resident
+    /// with the live tail, and even a 4096-op window over ~100k resident
     /// headers is on the order of 4e8 comparisons -- synchronous, on the shard
     /// pump, per repair round. Long enough to miss heartbeat and view-change
     /// deadlines for every group on the core and turn one rejoin into an

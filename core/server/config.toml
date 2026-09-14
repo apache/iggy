@@ -726,7 +726,7 @@ pin_cores = true
 # ~ the prepare queue depth of the planes the shard hosts ([metadata] on
 # shard 0, [partition] elsewhere) times replica_count times directions.
 # Both depths are tunable, so raising either raises the capacity needed here.
-inbox_capacity = 1024
+inbox_capacity = 65536
 
 # Capacity of the reply lane: a separate bounded channel for cross-shard
 # client-reply forwards, whose drops are terminal (no in-protocol
@@ -996,7 +996,7 @@ offset_reservation_lease = 65536
 # served from the ring before falling back to bulk sync, at the cost of pinned
 # memory per partition. Must be > 0 and <= 65536. Single-replica partitions
 # retain nothing regardless.
-evicted_ring_capacity = 4096
+evicted_ring_capacity = 65536
 
 # Byte ceiling for the evicted ring per partition; whichever ring cap (this or
 # evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
@@ -1005,7 +1005,7 @@ evicted_ring_capacity = 4096
 # hosts, pinned as anonymous memory beside the same bytes in page cache. Raising it on a
 # node with many partitions is a large memory decision; partition_repair_ring_bytes on the
 # metrics endpoint reports what the rings on each shard actually hold.
-evicted_ring_bytes_max = "16 MiB"
+evicted_ring_bytes_max = "64 MiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core
@@ -1065,7 +1065,7 @@ max_message_size = "64 MiB"
 
 # Bound on the per-peer mpsc queue. The writer task drains; the
 # send_to_* path enqueues.
-peer_queue_capacity = 256
+peer_queue_capacity = 4096
 
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
 reconnect_period = "5 s"

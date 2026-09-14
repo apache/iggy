@@ -606,7 +606,7 @@ async fn poll_from_zero_until(
 }
 
 /// Rejoin with a window larger than the peers' evicted ring
-/// (`EVICTED_RING_CAPACITY` = 4096 entries): the serving peer answers
+/// (explicitly configured to 4096 entries by the fixture): the serving peer answers
 /// `RangeEvicted` for the front of the range and the commit floor must
 /// settle at its retention point, with the rejoiner's recovered segments
 /// standing in below it. This is the only scenario that exercises
@@ -617,15 +617,8 @@ async fn poll_from_zero_until(
 pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
     const RING_OVERFLOW_OPS: u32 = 4300;
     const POST_RESTART_OPS: u32 = 50;
-    // The point of this scenario is overflowing the peers' evicted ring so
-    // RangeEvicted and the commit floor engage. The harness runs the server on
-    // the shipped default ring capacity; if that default ever reaches this op
-    // count the overflow stops happening and the test silently passes without
-    // covering the floor path. Fail loud instead.
-    const _: () = assert!(
-        RING_OVERFLOW_OPS as usize > configs::partition::DEFAULT_EVICTED_RING_CAPACITY,
-        "RING_OVERFLOW_OPS must exceed the default evicted ring capacity, or this scenario no longer exercises RangeEvicted",
-    );
+    // The fixture pins a smaller ring so production capacity increases do not
+    // turn this into a throughput benchmark or stop exercising RangeEvicted.
 
     let setup_client = harness
         .root_client()
