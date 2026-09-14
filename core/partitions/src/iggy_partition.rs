@@ -29,8 +29,8 @@ use crate::offset_storage::{
 };
 use crate::persistence::{PartitionPersistence, PersistenceCompletion, PersistenceNotifier};
 use crate::poll_plan::{
-    DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
-    PollTier, ResidentTailSnapshot,
+    DISK_POLL_CHUNK_MAX, DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan,
+    PollReadResult, PollTier, ResidentTailSnapshot,
 };
 use crate::segment::Segment;
 use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
@@ -140,6 +140,9 @@ where
     /// persisted): a fresh server treats a group as never-polled.
     pub last_polled_offsets: Arc<ConsumerGroupOffsets>,
     pub stats: Arc<PartitionStats>,
+    /// Widest batch committed here, the floor for a disk poll's first read.
+    /// See [`Self::widest_committed_batch`].
+    widest_batch_bytes: Cell<u64>,
     pub created_at: IggyTimestamp,
     pub revision_id: u64,
     pub(crate) offset_space: OffsetSpace,
@@ -587,6 +590,7 @@ where
             consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
             last_polled_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
             stats,
+            widest_batch_bytes: Cell::new(0),
             created_at: IggyTimestamp::now(),
             revision_id: 0,
             offset_space: OffsetSpace::default(),
@@ -2992,6 +2996,17 @@ where
         }
         self.check_local_poll_key(kind, consumer_id)
             .map_err(|error| self.poll_capacity_error(error))?;
+        // Already durable: the commit this poll would make has happened and
+        // replicated, so applying it locally syncs this replica to something
+        // the group agreed. Safe wherever the read was served, and checked
+        // before the role so a caught-up backup is not refused for a
+        // commit nobody needs.
+        if self
+            .durable_consumer_offsets
+            .covers(kind, consumer_id, offset)
+        {
+            return Ok(None);
+        }
         let consensus = self.consensus();
         // A replica that cannot originate the prepare cannot record this
         // progress anywhere a peer will ever see. `Ok(None)` would leave
@@ -3001,12 +3016,6 @@ where
         // Refusing keeps the outcome retriable on a replica that can commit.
         if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
             return Err(IggyError::TransientNotAccepted);
-        }
-        if self
-            .durable_consumer_offsets
-            .covers(kind, consumer_id, offset)
-        {
-            return Ok(None);
         }
 
         let reservation = self
@@ -3890,7 +3899,7 @@ where
             };
         }
 
-        let (start_segment, start_position) = self.disk_poll_start(&query);
+        let (start_segment, start_position, start_index_offset) = self.disk_poll_start(&query);
         // Cap resident sealed read handles: touch this poll's start segment so
         // the LRU keeps the hot set and drops the least-recently-used fd +
         // index (a no-op for the active segment, whose slot is bounded by
@@ -3915,9 +3924,11 @@ where
             partition_dir: self.partition_dir_resolution(),
             segments,
             start_position,
+            start_index_offset,
             namespace_raw: self.namespace().inner(),
             validate_checksum,
             bytes_per_message: self.mean_encoded_message_size(),
+            widest_batch_bytes: self.widest_committed_batch(),
         };
         // Snapshot the resident journal tail now (on the pump, under the
         // borrow) so the straddle splice runs off-task on owned data with no
@@ -4146,10 +4157,27 @@ where
         (messages > 0).then(|| u32::try_from(bytes / messages).unwrap_or(u32::MAX))
     }
 
+    /// Widest batch this partition has committed, for the disk walk's chunk
+    /// floor. A batch is the unit that walk can consume, so a read below the
+    /// widest one risks decoding nothing and paying a re-read.
+    ///
+    /// A high-water, never lowered: retention cannot make an older batch
+    /// narrower, and the read path clamps it to the chunk ceiling anyway, so
+    /// the worst a stale value costs is the fixed-size read polls did before
+    /// they were sized at all.
+    fn widest_committed_batch(&self) -> u64 {
+        let widest = self.widest_batch_bytes.get();
+        if widest == 0 || self.recovered_durable_offset.is_some() {
+            widest.max(DISK_POLL_CHUNK_MAX)
+        } else {
+            widest
+        }
+    }
+
     /// Starting `(segment index, byte position)` for a disk poll, resolved
     /// via each segment's sparse index cache. An index miss starts at the
     /// segment's first byte (the walk filters precisely).
-    fn disk_poll_start(&self, query: &MessageLookup) -> (usize, u64) {
+    fn disk_poll_start(&self, query: &MessageLookup) -> (usize, u64, Option<u64>) {
         let segments = self.log.segments();
         match query {
             MessageLookup::Offset { offset, .. } => {
@@ -4157,12 +4185,17 @@ where
                     .iter()
                     .rposition(|segment| segment.start_offset <= *offset)
                     .unwrap_or(0);
-                let position = self
+                let entry = self
                     .log
                     .segment_indexes(segment_index)
-                    .and_then(|cache| cache.offset_lower_bound(*offset))
-                    .map_or(0, |index| index.position);
-                (segment_index, position)
+                    .and_then(|cache| cache.offset_lower_bound(*offset));
+                let position = entry.map_or(0, |index| index.position);
+                let entry_offset = entry.map(|index| index.offset).or_else(|| {
+                    segments
+                        .get(segment_index)
+                        .map(|segment| segment.start_offset)
+                });
+                (segment_index, position, entry_offset)
             }
             MessageLookup::Timestamp { timestamp, .. } => {
                 // Resolve the starting SEGMENT from segment metadata, not from
@@ -4182,7 +4215,7 @@ where
                     .segment_indexes(segment_index)
                     .and_then(|cache| cache.timestamp_lower_bound(*timestamp))
                     .map_or(0, |index| index.position);
-                (segment_index, position)
+                (segment_index, position, None)
             }
         }
     }
@@ -6506,6 +6539,8 @@ where
                 }
 
                 if let Some(batch_stats) = batch_stats {
+                    self.widest_batch_bytes
+                        .set(self.widest_batch_bytes.get().max(batch_stats.size_bytes));
                     let end_offset = batch_stats.end_offset();
                     // The committed counter now names data, which is what makes
                     // it pollable and persistable. Outside the recovered-offset
@@ -11016,6 +11051,31 @@ mod tests {
 
     pub(super) type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
 
+    #[test]
+    fn recovered_history_keeps_a_conservative_batch_read_floor() {
+        let (mut partition, _) = recording_partition();
+        assert_eq!(partition.widest_committed_batch(), DISK_POLL_CHUNK_MAX);
+        partition.widest_batch_bytes.set(4096);
+        assert_eq!(partition.widest_committed_batch(), 4096);
+        partition.recovered_durable_offset = Some(100);
+        assert_eq!(partition.widest_committed_batch(), DISK_POLL_CHUNK_MAX);
+    }
+
+    #[test]
+    fn active_disk_poll_keeps_the_sparse_index_offset() {
+        let (mut partition, _) = recording_partition();
+        partition.log.ensure_indexes();
+        let index = partition.log.active_indexes_mut().unwrap();
+        index.insert(0, 0, 0);
+        index.insert(100, 100, 6400);
+        let query = MessageLookup::Offset {
+            offset: 150,
+            count: 10,
+            ceiling: 200,
+        };
+        assert_eq!(partition.disk_poll_start(&query), (0, 6400, Some(100)));
+    }
+
     fn recording_partition() -> (IggyPartition<RecordingBus>, SentFrames) {
         recording_partition_at(0, 1)
     }
@@ -12182,6 +12242,24 @@ mod tests {
             Err(IggyError::TransientNotAccepted)
         ));
         assert_eq!(partition.get_consumer_offset(consumer), None);
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+    }
+
+    /// A backup whose durable table already covers the offset has nothing to
+    /// replicate, so there is no divergence to prevent and the refusal must
+    /// not reach it. Otherwise a caught-up follower would fail reads over a
+    /// commit the group already agreed.
+    #[test]
+    fn given_backup_when_auto_commit_offset_is_already_durable_should_be_accepted() {
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let consumer = PollingConsumer::Consumer(7, 0);
+        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 9, 9);
+        let read_result = poll_read_result(&partition, consumer, true, Some(9));
+
+        let completion = partition
+            .complete_poll(read_result)
+            .expect("an already-durable offset admits no commit");
+        assert!(completion.replication.is_none());
         assert_eq!(partition.consensus.pipeline_len(), 0);
     }
 
@@ -13902,6 +13980,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![
                 DiskSegment {
@@ -13918,6 +13997,7 @@ mod tests {
                 },
             ],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
 
@@ -13976,6 +14056,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
             bytes_per_message: Some(1),
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -13984,6 +14065,7 @@ mod tests {
                 sealed: false,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
 
@@ -14062,6 +14144,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![
                 DiskSegment {
@@ -14078,6 +14161,7 @@ mod tests {
                 },
             ],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
 
@@ -14138,6 +14222,7 @@ mod tests {
         let plan = |validate_checksum| DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14146,6 +14231,7 @@ mod tests {
                 sealed: false,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let query = MessageLookup::Offset {
@@ -14178,6 +14264,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
@@ -14185,6 +14272,7 @@ mod tests {
                 sealed: false,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
             validate_checksum: true,
         };
@@ -14211,6 +14299,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Unresolvable,
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
@@ -14218,6 +14307,7 @@ mod tests {
                 sealed: false,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
             validate_checksum: true,
         };
@@ -14279,6 +14369,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14287,6 +14378,7 @@ mod tests {
                 sealed: true,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let first = plan
@@ -14312,6 +14404,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14320,6 +14413,7 @@ mod tests {
                 sealed: true,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let second = plan
@@ -14374,6 +14468,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14382,6 +14477,7 @@ mod tests {
                 sealed: true,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let outcome = plan
@@ -14460,6 +14556,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14470,6 +14567,7 @@ mod tests {
             // Byte 0, exactly what disk_poll_start returns for a sealed segment
             // whose resident index was dropped.
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let outcome = plan
@@ -14561,6 +14659,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14569,6 +14668,7 @@ mod tests {
                 sealed: true,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let outcome = plan
@@ -14640,6 +14740,7 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14648,6 +14749,7 @@ mod tests {
                 sealed: true,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let before_purge = plan
@@ -14690,6 +14792,7 @@ mod tests {
         let resumed = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
@@ -14698,6 +14801,7 @@ mod tests {
                 sealed: true,
             }],
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: namespace.inner(),
         };
         let after_purge = resumed

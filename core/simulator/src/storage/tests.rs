@@ -1210,7 +1210,7 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
         let (storage, mut journal) = baseline().await;
         storage.clear_trace();
         journal.checkpoint(2).await.unwrap();
-        journal.reclaim_obsolete().await;
+        journal.cleanup_obsolete().await;
         let unlink = storage
             .trace()
             .iter()
@@ -1220,7 +1220,7 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
             let (storage, mut journal) = baseline().await;
             storage.fail_at(unlink, FaultMode::Before);
             journal.checkpoint(2).await.unwrap();
-            journal.reclaim_obsolete().await;
+            journal.cleanup_obsolete().await;
             storage.clear_trace();
             let obsolete = Path::new("/partition/wal/prepares-0.wal");
             assert!(storage.exists(obsolete).await.unwrap());
@@ -1256,7 +1256,7 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
                 // have waited on the retry, and the writer's own maintenance
                 // pass is what must still take it.
                 assert!(storage.exists(obsolete).await.unwrap());
-                journal.reclaim_obsolete().await;
+                journal.cleanup_obsolete().await;
             }
             assert!(!storage.exists(obsolete).await.unwrap());
             assert_eq!(journal.checkpoint_op(), 2);

@@ -28,10 +28,11 @@ use crate::journal::{
 };
 use crate::{PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
+use iggy_binary_protocol::{WireError, batch};
 use iggy_common::{ConsumerKind, IggyError};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::poll::PollHistoryId;
-use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
+use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use tracing::{error, warn};
@@ -135,14 +136,21 @@ pub struct DiskReadPlan {
     /// first one.
     pub(crate) segments: Vec<DiskSegment>,
     pub(crate) start_position: u64,
+    pub(crate) start_index_offset: Option<u64>,
     pub(crate) namespace_raw: u64,
     /// Whether to verify each batch's `batch_checksum` against the bytes read.
     /// Detection only; a mismatch fails the poll closed and repairs nothing.
     pub(crate) validate_checksum: bool,
     /// Mean encoded bytes per message on this partition, or `None` before it
-    /// has committed anything. Sizes the disk walk's reads; never a bound on
-    /// what a read may return, since messages vary in size within a partition.
+    /// has committed anything. Sizes the disk walk's reads, and is never a
+    /// bound on what a read may return, since messages vary in size within a
+    /// partition.
     pub(crate) bytes_per_message: Option<u32>,
+    /// Widest batch this partition has committed, which is the smallest read
+    /// that is guaranteed to contain a whole one. The walk cannot advance on a
+    /// chunk holding no complete batch, so a count-derived estimate below this
+    /// buys nothing and costs the re-read it triggers.
+    pub(crate) widest_batch_bytes: u64,
 }
 
 pub struct DiskSegment {
@@ -390,7 +398,7 @@ pub enum DiskReadOutcome {
 /// Largest first read of a disk poll, and the size every poll used to read
 /// whatever it asked for. A batch wider than this still grows past it through
 /// the re-read path below; this bounds only where a walk starts.
-const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
+pub const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
 
 /// Smallest first read of a disk poll. Below this the syscall and the segment
 /// walk cost more than the bytes the smaller read saves, and a poll for a
@@ -411,6 +419,10 @@ enum SegmentWalk {
 struct DiskWalk {
     /// Byte offset into the segment being walked; reset at each boundary.
     position: u64,
+    /// Messages between the resolved index entry and the requested offset,
+    /// which the first read has to cover on top of what the poll asked for.
+    /// Cleared once anything matches, since the walk is then at the target.
+    skipped: u32,
     matched: u32,
     fragments: PollFragments<4096>,
     last_matching_offset: Option<u64>,
@@ -421,9 +433,16 @@ struct DiskWalk {
 }
 
 impl DiskWalk {
-    fn starting_at(position: u64) -> Self {
+    /// Messages the next read has to cover: what the poll still wants, plus
+    /// the run the sparse index left in front of the first match.
+    const fn remaining_to_read(&self, count: u32) -> u32 {
+        (count - self.matched).saturating_add(self.skipped)
+    }
+
+    fn starting_at(position: u64, skipped: u32) -> Self {
         Self {
             position,
+            skipped,
             matched: 0,
             fragments: PollFragments::new(),
             last_matching_offset: None,
@@ -438,15 +457,25 @@ impl DiskWalk {
 impl DiskReadPlan {
     /// Bytes to read for the next `remaining` messages.
     ///
-    /// A poll asks for a message count, and the walk reads bytes, so the two
-    /// are bridged by the partition's own mean encoded size. Reading a fixed
+    /// A poll asks for a message count and the walk reads bytes, so the two are
+    /// bridged by the partition's own mean encoded size. Reading a fixed
     /// megabyte instead costs a poll for a thousand hundred-byte messages ten
     /// times the bytes it returns, and the sparse-selection copy that follows
     /// scales with the chunk rather than with the selection.
     ///
-    /// The estimate is deliberately not a bound. Messages vary in size, the
-    /// starting offset can sit inside a batch the index resolved before it,
-    /// and an underestimate only costs another read of the next chunk.
+    /// The count-derived estimate alone is not enough, because a batch is the
+    /// unit the walk can consume. A poll for fewer messages than a producer put
+    /// in one batch estimates below that batch, decodes nothing, and pays the
+    /// quadrupling re-read below: at one message short of a full batch that is
+    /// five times the bytes a flat megabyte read would have taken. So the
+    /// estimate is floored at the widest batch this partition has committed,
+    /// which is the smallest read guaranteed to hold a whole one.
+    ///
+    /// The result is still not a bound. Messages vary in size, the starting
+    /// offset can sit inside a batch the index resolved before it, and a batch
+    /// wider than the ceiling still grows through the re-read path. The ceiling
+    /// is what every poll read before it was sized at all, so no poll reads
+    /// more than it used to.
     fn chunk_len(&self, remaining: u32) -> u64 {
         let Some(bytes_per_message) = self.bytes_per_message else {
             return DISK_POLL_CHUNK_MAX;
@@ -454,6 +483,7 @@ impl DiskReadPlan {
         u64::from(bytes_per_message)
             .saturating_mul(u64::from(remaining))
             .saturating_add(COMMAND_HEADER_SIZE as u64)
+            .max(self.widest_batch_bytes)
             .clamp(DISK_POLL_CHUNK_MIN, DISK_POLL_CHUNK_MAX)
     }
 
@@ -500,14 +530,25 @@ impl DiskReadPlan {
         // miss or load failure keeps `start_position` (the pre-existing
         // full-scan fallback). An active first segment keeps its
         // resident-index-resolved `start_position` untouched.
-        let position = match self.segments.first() {
-            Some(first) => self
-                .resolve_sealed_start(first, query, partition_dir)
-                .await
-                .unwrap_or(self.start_position),
-            None => self.start_position,
+        let resolved = match self.segments.first() {
+            Some(first) => self.resolve_sealed_start(first, query, partition_dir).await,
+            None => None,
         };
-        let mut walk = DiskWalk::starting_at(position);
+        let position = resolved.map_or(self.start_position, |(position, _)| position);
+        // The index is sparse, so the entry it resolved can sit a whole flush
+        // group before the requested offset. The walk has to read that run to
+        // reach the first match, and sizing the read from the requested count
+        // alone would cross it in floor-sized reads.
+        let entry_offset = resolved
+            .map(|(_, offset)| offset)
+            .or(self.start_index_offset);
+        let skipped = match (entry_offset, query) {
+            (Some(entry_offset), MessageLookup::Offset { offset, .. }) => {
+                u32::try_from(offset.saturating_sub(entry_offset)).unwrap_or(u32::MAX)
+            }
+            _ => 0,
+        };
+        let mut walk = DiskWalk::starting_at(position, skipped);
         // Set when an open/read retry exhausts. The walk breaks immediately so
         // later segments are never read into the result (which would leave a
         // gap at the faulted segment). Pre-fault matches are still served.
@@ -577,8 +618,10 @@ impl DiskReadPlan {
     /// Read one segment from `walk.position` until the count is filled, the
     /// segment is exhausted, or the walk must fail closed.
     ///
-    /// The chunk length is already bounded by `DISK_POLL_CHUNK_MAX` and by the
-    /// segment's persisted bytes, so narrowing it to a `usize` cannot truncate.
+    /// The read length is the chunk clipped to the segment's persisted bytes,
+    /// so narrowing it to a `usize` cannot truncate. The chunk itself is not
+    /// bounded by `DISK_POLL_CHUNK_MAX`: a batch wider than the ceiling grows
+    /// past it below.
     #[allow(clippy::cast_possible_truncation)]
     async fn walk_segment(
         &self,
@@ -588,7 +631,7 @@ impl DiskReadPlan {
         persisted: u64,
         walk: &mut DiskWalk,
     ) -> SegmentWalk {
-        let mut chunk_len = self.chunk_len(count - walk.matched);
+        let mut chunk_len = self.chunk_len(walk.remaining_to_read(count));
         while walk.matched < count && walk.position < persisted {
             let len = (persisted - walk.position).min(chunk_len) as usize;
             let Some(chunk) = self.read_chunk_with_retry(file, len, walk).await else {
@@ -597,7 +640,11 @@ impl DiskReadPlan {
                 return SegmentWalk::Faulted;
             };
             let fragments_before_chunk = walk.fragments.len();
-            let ChunkWalk { consumed, corrupt } = walk_disk_chunk(
+            let ChunkWalk {
+                consumed,
+                needed,
+                corrupt,
+            } = walk_disk_chunk(
                 &chunk,
                 query,
                 count,
@@ -632,11 +679,23 @@ impl DiskReadPlan {
                     // run, which would punch a silent gap into the poll.
                     return SegmentWalk::Faulted;
                 }
-                // A single batch larger than the chunk: grow and re-read.
-                chunk_len = chunk_len.saturating_mul(4);
+                // A single batch larger than the chunk. Its own header says
+                // how wide it is, so re-read exactly that; only a header this
+                // read could not reach leaves the old quadrupling.
+                if needed as u64 > persisted - walk.position {
+                    return SegmentWalk::Faulted;
+                }
+                chunk_len = if needed > len {
+                    needed as u64
+                } else {
+                    chunk_len.saturating_mul(4)
+                };
                 continue;
             }
-            chunk_len = self.chunk_len(count - walk.matched);
+            if walk.matched > 0 {
+                walk.skipped = 0;
+            }
+            chunk_len = self.chunk_len(walk.remaining_to_read(count));
             walk.position += consumed as u64;
         }
         SegmentWalk::Done
@@ -682,7 +741,7 @@ impl DiskReadPlan {
         segment: &DiskSegment,
         query: MessageLookup,
         partition_dir: &str,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u64)> {
         // The active segment grows under the reader, so neither the shared
         // sparse index nor the offset memo can describe it; its own resident
         // index already resolved `start_position`.
@@ -707,7 +766,7 @@ impl DiskReadPlan {
             && offset >= cursor.offset
             && offset < cursor.valid_until
         {
-            return Some(cursor.position);
+            return Some((cursor.position, cursor.offset));
         }
         let path = format!("{partition_dir}/{:0>20}.index", segment.start_offset);
         let reader = match IggyIndexReader::new(&path).await {
@@ -758,7 +817,7 @@ impl DiskReadPlan {
             }
         };
         match looked_up {
-            Ok(entry) => entry.map(|entry| entry.position),
+            Ok(entry) => entry.map(|entry| (entry.position, entry.offset)),
             Err(error) => {
                 self.warn_sparse_index_fallback(&path, "lower_bound", &error);
                 None
@@ -848,12 +907,15 @@ impl DiskReadPlan {
 /// timestamp, or `None` when the query is below the first indexed entry (the
 /// caller then scans from the segment start). Mirrors `disk_poll_start`'s
 /// resident-index resolution for the sealed, off-pump path.
-fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Option<u64> {
+/// Start byte for `query`, and the offset of the index entry it resolved to.
+/// The entry sits at or before the requested offset, so the difference is the
+/// run the walk has to skip before it can match anything.
+fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Option<(u64, u64)> {
     match query {
         MessageLookup::Offset { offset, .. } => index.offset_lower_bound(offset),
         MessageLookup::Timestamp { timestamp, .. } => index.timestamp_lower_bound(timestamp),
     }
-    .map(|entry| entry.position)
+    .map(|entry| (entry.position, entry.offset))
 }
 
 /// Walk stamped `[256B BatchHeader][blob]` batches in one disk
@@ -873,11 +935,16 @@ fn walk_disk_chunk(
 ) -> ChunkWalk {
     let bytes: &[u8] = chunk;
     let mut cursor = 0usize;
+    let mut needed = 0usize;
 
     while *matched < count && cursor + COMMAND_HEADER_SIZE <= bytes.len() {
-        let batch = match decode_batch_slice_with(&bytes[cursor..], integrity) {
+        let batch = match batch::decode_batch_slice_with(&bytes[cursor..], integrity) {
             Ok(batch) => batch,
-            Err(IggyError::InvalidBatchChecksum(found, expected, base_offset)) => {
+            Err(WireError::InvalidBatchChecksum {
+                stored: found,
+                computed: expected,
+                base_offset,
+            }) => {
                 // Distinguished from the incomplete-tail case below: this batch is
                 // entirely present and fails its own checksum, so it is damaged at rest.
                 error!(
@@ -892,12 +959,23 @@ fn walk_disk_chunk(
                 );
                 return ChunkWalk {
                     consumed: cursor.min(bytes.len()),
+                    needed: 0,
                     corrupt: true,
                 };
             }
-            Err(_) => {
-                // Incomplete tail batch: hand the position back to re-read or bail.
+            Err(WireError::UnexpectedEof { need, .. })
+                if need <= journal::partition_journal::PREPARE_BYTES_MAX =>
+            {
+                needed = need;
                 break;
+            }
+            Err(error) => {
+                error!(namespace_raw, position = cursor, %error, "invalid disk batch");
+                return ChunkWalk {
+                    consumed: cursor,
+                    needed: 0,
+                    corrupt: true,
+                };
             }
         };
         let total_size = batch.header.total_size();
@@ -921,6 +999,7 @@ fn walk_disk_chunk(
 
     ChunkWalk {
         consumed: cursor.min(bytes.len()),
+        needed,
         corrupt: false,
     }
 }
@@ -929,6 +1008,10 @@ fn walk_disk_chunk(
 /// than on a batch that simply did not fit in the chunk.
 struct ChunkWalk {
     consumed: usize,
+    /// Bytes the batch that did not fit needs in full, from its own header, or
+    /// zero when that header could not be read. Lets the caller re-read
+    /// exactly the batch instead of doubling its way up to it.
+    needed: usize,
     corrupt: bool,
 }
 
@@ -936,8 +1019,13 @@ struct ChunkWalk {
 mod tests {
     use super::*;
     use crate::iggy_index::IggyIndex;
+    use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use server_common::iobuf::Owned;
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    };
+    use server_common::sharding::IggyNamespace;
 
     /// Write a sealed-segment index file too large to materialize
     /// (`entry_count * IGGY_INDEX_SIZE > SEALED_INDEX_RESIDENT_MAX_BYTES`), so
@@ -962,16 +1050,47 @@ mod tests {
         entry_count
     }
 
-    #[test]
-    fn chunk_len_sizes_the_first_read_from_the_requested_count() {
-        let plan = |bytes_per_message| DiskReadPlan {
+    fn sizing_plan(bytes_per_message: Option<u32>, widest_batch_bytes: u64) -> DiskReadPlan {
+        DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
             bytes_per_message,
+            widest_batch_bytes,
             segments: Vec::new(),
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: 0,
             validate_checksum: false,
-        };
+        }
+    }
+
+    /// A batch is the unit the walk can consume, so a count-derived estimate
+    /// that lands under one decodes nothing and pays the quadrupling re-read.
+    /// A poll one message short of a producer's batch was the worst case,
+    /// reading about five times what a flat megabyte would have.
+    #[test]
+    fn chunk_len_never_lands_under_a_whole_batch() {
+        let batch = COMMAND_HEADER_SIZE as u64 + 1000 * 1000;
+        let mean = u32::try_from(batch / 1000).expect("mean fits");
+        let plan = sizing_plan(Some(mean), batch);
+
+        assert!(plan.chunk_len(999) >= batch);
+        assert!(plan.chunk_len(500) >= batch);
+        assert!(plan.chunk_len(1) >= batch);
+        // The floor never pushes a read above what an unsized poll would take.
+        assert_eq!(
+            sizing_plan(Some(mean), 4 << 20).chunk_len(1),
+            DISK_POLL_CHUNK_MAX
+        );
+        // A count wide enough to matter still wins over the floor.
+        assert_eq!(
+            sizing_plan(Some(10), 2048).chunk_len(1000),
+            DISK_POLL_CHUNK_MIN
+        );
+    }
+
+    #[test]
+    fn chunk_len_sizes_the_first_read_from_the_requested_count() {
+        let plan = |bytes_per_message| sizing_plan(bytes_per_message, 0);
 
         // Nothing committed yet, so nothing bridges a count to bytes.
         assert_eq!(plan(None).chunk_len(1000), DISK_POLL_CHUNK_MAX);
@@ -1001,12 +1120,14 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             segments: Vec::new(),
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: 0,
             validate_checksum: true,
         };
-        let mut walk = DiskWalk::starting_at(0);
+        let mut walk = DiskWalk::starting_at(0, 0);
         assert!(
             plan.read_chunk_with_retry(&file, 64, &mut walk)
                 .await
@@ -1015,6 +1136,45 @@ mod tests {
         assert_eq!(walk.chunk_reads, 3);
         assert_eq!(walk.requested_bytes, 192);
         assert_eq!(walk.matched, 0);
+    }
+
+    #[cfg(feature = "poll-diagnostics")]
+    #[compio::test]
+    async fn incomplete_batch_reread_uses_its_exact_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
+                payload_length: 128 << 10,
+                ..Default::default()
+            },
+            payload: Bytes::from(vec![1; 128 << 10]),
+            user_headers: None,
+        });
+        let batch =
+            SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
+        let length = batch.header.total_size();
+        let mut record = vec![0; length];
+        batch.header.encode_into(&mut record);
+        record[COMMAND_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let mut file = compio::fs::File::create(directory.path().join("batches.log"))
+            .await
+            .unwrap();
+        let (written, _) = file.write_all_at(record.repeat(4), 0).await.into();
+        written.unwrap();
+        let file = compio::fs::File::open(directory.path().join("batches.log"))
+            .await
+            .unwrap();
+        let plan = sizing_plan(Some(1), 0);
+        let mut walk = DiskWalk::starting_at(0, 0);
+        assert!(matches!(
+            plan.walk_segment(&file, offset_query(0), 1, (length * 4) as u64, &mut walk)
+                .await,
+            SegmentWalk::Done
+        ));
+        assert_eq!(walk.matched, 1);
+        assert_eq!(walk.chunk_reads, 2);
+        assert_eq!(walk.requested_bytes, DISK_POLL_CHUNK_MIN + length as u64);
     }
 
     fn offset_query(offset: u64) -> MessageLookup {
@@ -1048,8 +1208,10 @@ mod tests {
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(dir.display().to_string()),
             bytes_per_message: None,
+            widest_batch_bytes: 0,
             segments: Vec::new(),
             start_position: 0,
+            start_index_offset: None,
             namespace_raw: 0,
             validate_checksum: false,
         };
@@ -1060,7 +1222,9 @@ mod tests {
         let first = plan
             .resolve_sealed_start(&segment, offset_query(25), &partition_dir)
             .await;
-        assert_eq!(first, Some(200));
+        // The entry offset rides along so the caller can size its first read
+        // to cover the run between that entry and the requested offset.
+        assert_eq!(first, Some((200, 20)));
         let cursor = handle.offset_cursor.get().expect("cursor memoized");
         assert_eq!(
             (cursor.offset, cursor.valid_until, cursor.position),
@@ -1073,7 +1237,7 @@ mod tests {
         let in_interval = plan
             .resolve_sealed_start(&segment, offset_query(29), &partition_dir)
             .await;
-        assert_eq!(in_interval, Some(200));
+        assert_eq!(in_interval, Some((200, 20)));
 
         // ...while an offset past the interval misses the cursor, reaches for
         // the (now gone) file, and falls back to the byte-0 scan.

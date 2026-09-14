@@ -54,11 +54,12 @@
 use std::cell::Cell;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -66,7 +67,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use configs::http::HttpTlsConfig;
 use consensus::MetadataHandle;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use iggy_common::IggyError;
 use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -118,9 +119,9 @@ const MAX_IN_FLIGHT_FORWARDS: u32 = 128;
 
 /// Bound on a relayed response body, enforced twice: against a declared
 /// `content-length` before the read, and as a running cap on the streamed
-/// bytes so a length-less reply is bounded too. Forwarded routes answer
-/// entity JSON, not message batches (poll and snapshot are served locally),
-/// so this is a backstop, not a working limit.
+/// bytes so a length-less reply is bounded too. Successful poll responses
+/// stream separately because their automatic commit may already have advanced
+/// progress, so rejecting their total size would discard acknowledged data.
 const RESPONSE_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Pre-allocation hint cap for a relayed body: honest control-plane replies
@@ -220,7 +221,7 @@ pub(in crate::http) fn build_forward_state(
         client,
         scheme,
         body_limit,
-        in_flight: Cell::new(0),
+        in_flight: Rc::new(Cell::new(0)),
     })
 }
 
@@ -334,6 +335,14 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
     if !state.forward.active || request.headers().contains_key(FORWARDED_HEADER) {
         return next.run(request).await;
     }
+    // A read that does not move consumer progress is answered by whichever
+    // replica the caller reached, which is the point of reading from one. Only
+    // an automatic commit needs a replica that can originate the offset
+    // operation, so only that poll pays for the buffering and the credential
+    // resolution below.
+    if request.method() == Method::GET && !wants_auto_commit(request.uri().query()) {
+        return next.run(request).await;
+    }
     let bearer = match bearer_token(request.headers()) {
         Ok(bearer) => bearer,
         Err(error) => return CustomError::from(error).into_response(),
@@ -364,7 +373,7 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
         return response;
     }
 
-    let Some(_guard) = ForwardGuard::admit(&state.forward.in_flight) else {
+    let Some(guard) = ForwardGuard::admit(&state.forward.in_flight) else {
         return with_retry_after(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "forward_busy",
@@ -385,7 +394,7 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
         }
         let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
         match attempt(&state, &method, &request_headers, &body, &url, false).await {
-            AttemptOutcome::Relay(response) => return response,
+            AttemptOutcome::Relay(response) => return retain_forward_guard(response, guard),
             AttemptOutcome::Retry => {}
         }
     }
@@ -476,51 +485,7 @@ async fn attempt(
             Ok(response) => response,
             Err(error) => return classify_transport_error(&error),
         };
-        let status = response.status();
-        // Only the relayed subset survives; the response is consumed by the
-        // body stream below, so the values are pulled out first.
-        let relayed_headers: Vec<(HeaderName, HeaderValue)> = RELAYED_RESPONSE_HEADERS
-            .into_iter()
-            .filter_map(|name| {
-                let value = response.headers().get(&name)?.clone();
-                Some((name, value))
-            })
-            .collect();
-        let declared = response.content_length();
-        if declared.is_some_and(|length| length > RESPONSE_BODY_LIMIT as u64) {
-            warn!(?declared, "relayed response exceeds the body bound");
-            return AttemptOutcome::Relay(bad_gateway());
-        }
-        // Streamed with a running cap so a length-less reply is bounded by
-        // the limit, not merely by the attempt timeout. The capacity hint is
-        // clamped to RESPONSE_CAPACITY_HINT so a mis-declared content-length
-        // cannot pre-reserve the full bound. The running cap still bounds the
-        // real total.
-        let mut body = Vec::with_capacity(
-            declared
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or(0)
-                .min(RESPONSE_CAPACITY_HINT),
-        );
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    warn!(%error, "forward response body read failed; outcome unknown");
-                    return AttemptOutcome::Relay(bad_gateway());
-                }
-            };
-            if body.len() + chunk.len() > RESPONSE_BODY_LIMIT {
-                warn!(
-                    received = body.len() + chunk.len(),
-                    "relayed response exceeds the body bound"
-                );
-                return AttemptOutcome::Relay(bad_gateway());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        classify_reply(status, relayed_headers, Bytes::from(body), retry_redirect)
+        classify_forwarded_reply(response, method, retry_redirect).await
     };
     match compio::time::timeout(FORWARD_ATTEMPT_TIMEOUT, attempt).await {
         // Elapsed: the request may be mid-commit on the primary. Outcome
@@ -532,6 +497,90 @@ async fn attempt(
         )),
         Ok(outcome) => outcome,
     }
+}
+
+async fn classify_forwarded_reply(
+    response: cyper::Response,
+    method: &Method,
+    retry_redirect: bool,
+) -> AttemptOutcome {
+    let status = response.status();
+    // Only the relayed subset survives; the response is consumed by the
+    // body stream below, so the values are pulled out first.
+    let relayed_headers: Vec<(HeaderName, HeaderValue)> = RELAYED_RESPONSE_HEADERS
+        .into_iter()
+        .filter_map(|name| {
+            let value = response.headers().get(&name)?.clone();
+            Some((name, value))
+        })
+        .collect();
+    if method == Method::GET && !retry_redirect && status.is_success() {
+        let mut response = Response::new(stream_poll_body(response.bytes_stream()));
+        *response.status_mut() = status;
+        for (name, value) in relayed_headers {
+            response.headers_mut().insert(name, value);
+        }
+        return AttemptOutcome::Relay(response);
+    }
+    let declared = response.content_length();
+    if declared.is_some_and(|length| length > RESPONSE_BODY_LIMIT as u64) {
+        warn!(?declared, "relayed response exceeds the body bound");
+        return AttemptOutcome::Relay(bad_gateway());
+    }
+    // Streamed with a running cap so a length-less reply is bounded by
+    // the limit, not merely by the attempt timeout. The capacity hint is
+    // clamped to RESPONSE_CAPACITY_HINT so a mis-declared content-length
+    // cannot pre-reserve the full bound. The running cap still bounds the
+    // real total.
+    let mut body = Vec::with_capacity(
+        declared
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(RESPONSE_CAPACITY_HINT),
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                warn!(%error, "forward response body read failed; outcome unknown");
+                return AttemptOutcome::Relay(bad_gateway());
+            }
+        };
+        if body.len() + chunk.len() > RESPONSE_BODY_LIMIT {
+            warn!(
+                received = body.len() + chunk.len(),
+                "relayed response exceeds the body bound"
+            );
+            return AttemptOutcome::Relay(bad_gateway());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    classify_reply(status, relayed_headers, Bytes::from(body), retry_redirect)
+}
+
+fn stream_poll_body(stream: impl Stream<Item = Result<Bytes, cyper::Error>> + 'static) -> Body {
+    let stream = futures::stream::try_unfold(Box::pin(stream), |mut stream| async move {
+        match compio::time::timeout(FORWARD_ATTEMPT_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(bytes))) => Ok(Some((bytes, stream))),
+            Ok(None) => Ok(None),
+            Ok(Some(Err(error))) => Err(std::io::Error::other(error.to_string())),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "forwarded poll response stalled",
+            )),
+        }
+    });
+    Body::from_stream(SendWrapper::new(stream))
+}
+
+fn retain_forward_guard(response: Response, guard: ForwardGuard) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = futures::stream::unfold(
+        (body.into_data_stream(), guard),
+        |(mut stream, guard)| async move { stream.next().await.map(|chunk| (chunk, (stream, guard))) },
+    );
+    Response::from_parts(parts, Body::from_stream(SendWrapper::new(stream)))
 }
 
 /// Copy the forwardable request headers: the bearer (the primary
@@ -599,6 +648,9 @@ fn classify_reply(
 /// Inspect a response produced on this node without changing any terminal
 /// response. Only the typed never-admitted denial opens the roster fallback.
 async fn classify_local_partition_reply(response: Response) -> AttemptOutcome {
+    if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return AttemptOutcome::Relay(response);
+    }
     let (parts, body) = response.into_parts();
     let body = match to_bytes(body, RESPONSE_BODY_LIMIT).await {
         Ok(body) => body,
@@ -654,6 +706,24 @@ fn partition_http_sockets(
         .collect()
 }
 
+/// Whether a poll asks the server to store its offset after serving it.
+///
+/// Match the handler's URL decoding and boolean parsing. An invalid query
+/// reaches the handler through the forwarding layer for its normal rejection.
+fn wants_auto_commit(query: Option<&str>) -> bool {
+    #[derive(Default, Deserialize)]
+    struct AutoCommitQuery {
+        #[serde(default)]
+        auto_commit: bool,
+    }
+    query.is_some_and(|query| {
+        let Ok(uri) = format!("/?{query}").parse() else {
+            return true;
+        };
+        Query::<AutoCommitQuery>::try_from_uri(&uri).map_or(true, |Query(query)| query.auto_commit)
+    })
+}
+
 fn wants_linearizable(query: Option<&str>) -> bool {
     query.is_some_and(|query| {
         query
@@ -672,21 +742,23 @@ fn bad_gateway() -> Response {
 
 /// RAII admission against [`MAX_IN_FLIGHT_FORWARDS`]; releases on drop, so a
 /// client disconnect mid-forward frees the slot.
-struct ForwardGuard<'a> {
-    in_flight: &'a Cell<u32>,
+struct ForwardGuard {
+    in_flight: Rc<Cell<u32>>,
 }
 
-impl<'a> ForwardGuard<'a> {
-    fn admit(in_flight: &'a Cell<u32>) -> Option<Self> {
+impl ForwardGuard {
+    fn admit(in_flight: &Rc<Cell<u32>>) -> Option<Self> {
         if in_flight.get() >= MAX_IN_FLIGHT_FORWARDS {
             return None;
         }
         in_flight.set(in_flight.get() + 1);
-        Some(Self { in_flight })
+        Some(Self {
+            in_flight: Rc::clone(in_flight),
+        })
     }
 }
 
-impl Drop for ForwardGuard<'_> {
+impl Drop for ForwardGuard {
     fn drop(&mut self) {
         self.in_flight.set(self.in_flight.get() - 1);
     }
@@ -748,6 +820,8 @@ impl ServerCertVerifier for PinnedCertVerifier {
 mod tests {
     use super::*;
 
+    use std::io::{Read, Write};
+
     use configs::cluster::{ClusterNodeConfig, ResolvedClusterNode, TransportPorts};
 
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
@@ -794,6 +868,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_commit_query_matches_handler_decoding() {
+        assert!(wants_auto_commit(Some("auto_commit=true")));
+        assert!(wants_auto_commit(Some("auto_commit=1")));
+        assert!(wants_auto_commit(Some("count=10&auto_commit=true")));
+        assert!(wants_auto_commit(Some("auto_commit=yes")));
+        assert!(!wants_auto_commit(Some("auto_commit=false")));
+        assert!(wants_auto_commit(Some("auto_commit=0")));
+        assert!(!wants_auto_commit(Some("count=10")));
+        assert!(!wants_auto_commit(None));
+        assert!(wants_auto_commit(Some("%61uto_commit=true")));
+        assert!(wants_auto_commit(Some("auto_commit=%74rue")));
+        assert!(!wants_auto_commit(Some("%61uto_commit=%66alse")));
+    }
+
+    #[test]
     fn transient_not_accepted_body_matches_only_its_code() {
         let accepted = format!(
             r#"{{"id":{},"code":"transient_not_accepted","reason":"x","field":null}}"#,
@@ -811,7 +900,7 @@ mod tests {
 
     #[test]
     fn forward_guard_caps_and_releases() {
-        let in_flight = Cell::new(0);
+        let in_flight = Rc::new(Cell::new(0));
         let guards: Vec<_> = (0..MAX_IN_FLIGHT_FORWARDS)
             .map(|_| ForwardGuard::admit(&in_flight).expect("under cap"))
             .collect();
@@ -851,5 +940,118 @@ mod tests {
             panic!("an ambiguous commit outcome must never be retried")
         };
         assert_eq!(terminal.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[compio::test]
+    async fn successful_local_poll_body_is_not_collected_or_size_limited() {
+        let polled = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&polled);
+        let chunk = Bytes::from(vec![0; 1024 * 1024]);
+        let stream = futures::stream::iter((0..65).map(move |_| {
+            observed.set(observed.get() + 1);
+            Ok::<_, std::io::Error>(chunk.clone())
+        }));
+        let response = Response::new(Body::from_stream(SendWrapper::new(stream)));
+        let AttemptOutcome::Relay(response) = classify_local_partition_reply(response).await else {
+            panic!("successful response must not be retried")
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(polled.get(), 0);
+        let mut stream = response.into_body().into_data_stream();
+        let mut received = 0;
+        while let Some(chunk) = stream.next().await {
+            received += chunk.expect("successful chunk").len();
+        }
+        assert_eq!(received, 65 * 1024 * 1024);
+    }
+
+    #[compio::test]
+    async fn forwarded_poll_streams_large_body_and_retains_admission() {
+        let in_flight = Rc::new(Cell::new(0));
+        let guard = ForwardGuard::admit(&in_flight).expect("forward admitted");
+        let polled = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&polled);
+        let chunk = Bytes::from(vec![0; 1024 * 1024]);
+        let stream = futures::stream::iter((0..65).map(move |_| {
+            observed.set(observed.get() + 1);
+            Ok::<_, cyper::Error>(chunk.clone())
+        }));
+        let response = retain_forward_guard(Response::new(stream_poll_body(stream)), guard);
+        assert_eq!(polled.get(), 0);
+        assert_eq!(in_flight.get(), 1);
+        let mut stream = response.into_body().into_data_stream();
+        let mut received = 0;
+        while let Some(chunk) = stream.next().await {
+            received += chunk.expect("successful chunk").len();
+            assert_eq!(in_flight.get(), 1);
+        }
+        assert_eq!(received, 65 * 1024 * 1024);
+        assert_eq!(in_flight.get(), 0);
+    }
+
+    #[compio::test]
+    async fn dropping_forwarded_poll_body_releases_admission() {
+        let in_flight = Rc::new(Cell::new(0));
+        let guard = ForwardGuard::admit(&in_flight).expect("forward admitted");
+        let response = retain_forward_guard(
+            Response::new(stream_poll_body(futures::stream::pending())),
+            guard,
+        );
+        assert_eq!(in_flight.get(), 1);
+        drop(response);
+        assert_eq!(in_flight.get(), 0);
+    }
+
+    #[compio::test]
+    async fn forwarded_poll_accepts_large_http_content_length() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let forward =
+            build_forward_state(&HttpTlsConfig::default(), 1024, true).expect("forward client");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("HTTP listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("client connection");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("write timeout");
+            let mut request = Vec::new();
+            let mut bytes = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut bytes).expect("request bytes");
+                assert_ne!(read, 0);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n", 65 * 1024 * 1024)
+                .expect("response headers");
+            let chunk = vec![0; 1024 * 1024];
+            for _ in 0..65 {
+                socket.write_all(&chunk).expect("response chunk");
+            }
+        });
+        let response = forward
+            .client
+            .get(format!("http://{address}/messages"))
+            .expect("poll request")
+            .send()
+            .await
+            .expect("poll response");
+        assert_eq!(response.content_length(), Some(65 * 1024 * 1024));
+        let AttemptOutcome::Relay(response) =
+            classify_forwarded_reply(response, &Method::GET, false).await
+        else {
+            panic!("successful poll must not be retried")
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        let mut stream = response.into_body().into_data_stream();
+        let mut received = 0;
+        while let Some(chunk) = stream.next().await {
+            received += chunk.expect("response chunk").len();
+        }
+        assert_eq!(received, 65 * 1024 * 1024);
+        server.join().expect("HTTP server finished");
     }
 }

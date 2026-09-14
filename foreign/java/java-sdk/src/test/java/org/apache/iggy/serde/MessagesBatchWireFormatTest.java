@@ -243,7 +243,35 @@ class MessagesBatchWireFormatTest {
         var messages = List.of(message(1, 0, "a", Map.of()), message(2, 0x1_0000_0000L, "b", Map.of()));
 
         assertThatThrownBy(() -> BytesSerializer.toMessagesBatch(messages))
-                .isInstanceOf(IggyInvalidArgumentException.class);
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("Message 1")
+                .hasMessageContaining("4294967296 microseconds");
+    }
+
+    @Test
+    void shouldReportTimestampDeltaAgainstTheOldestMessageRegardlessOfOrder() {
+        var messages = List.of(
+                message(1, 0x1_0000_0000L + 7, "latest", Map.of()),
+                message(2, 7, "oldest", Map.of()),
+                message(3, 8, "middle", Map.of()));
+
+        assertThatThrownBy(() -> BytesSerializer.toMessagesBatch(messages))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("Message 0")
+                .hasMessageContaining("4294967296 microseconds");
+    }
+
+    @Test
+    void shouldEncodeNullAndEmptyUserHeadersIdentically() {
+        var absent = BytesSerializer.toMessagesBatch(List.of(message(1, 7, "payload", null)));
+        var empty = BytesSerializer.toMessagesBatch(List.of(message(1, 7, "payload", Map.of())));
+        try {
+            assertThat(ByteBufUtil.hexDump(absent)).isEqualTo(ByteBufUtil.hexDump(empty));
+            assertThat(absent.getIntLE(256 + 32)).isZero();
+        } finally {
+            absent.release();
+            empty.release();
+        }
     }
 
     @Test

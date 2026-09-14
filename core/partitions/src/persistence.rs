@@ -45,6 +45,12 @@ use nix::sys::resource::{Resource, getrlimit};
 const APPEND_BATCH_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const APPEND_BATCH_OPS_MAX: usize = 256;
 const CHECKPOINT_DIRTY_FILES_MAX: usize = 1024;
+/// Mutations a partition may apply before its obsolete files are reclaimed
+/// whether or not the queue has drained. Reclaiming only on an idle queue
+/// keeps the unlinks off every acknowledgement, but a partition under
+/// continuous load never goes idle and would hold its old generations until
+/// it did.
+const RECLAIM_MUTATIONS_MAX: u32 = 64;
 #[cfg(unix)]
 const OFFSET_FILES_TOTAL_MAX: usize = 1024;
 const OFFSET_FILES_PER_PARTITION_MAX: usize = 64;
@@ -1112,6 +1118,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             guard.complete = true;
             return;
         };
+        let mut mutations_since_reclaim = 0u32;
         loop {
             if self.retired.get() {
                 break;
@@ -1150,14 +1157,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             if epoch == self.epoch.get() && !self.retired.get() {
                 self.publish_mutation(journal, rebuild_references);
             }
-            // After the notification, never before the barrier it would delay.
-            // A checkpoint queues the generation it replaced, so reclaiming it
-            // here keeps the unlinks and the directory barrier out of the
-            // acknowledgement the next append is waiting on, while still
-            // running once per mutation so a busy partition reclaims as
-            // promptly as an idle one.
-            if journal.has_obsolete() {
-                journal.reclaim_obsolete().await;
+            // Reclaim when nothing is queued behind this mutation, so no
+            // acknowledgement pays for the unlinks and the directory barrier.
+            // A partition that never drains would then never reclaim, so force
+            // a pass every `RECLAIM_MUTATIONS_MAX` mutations and accept that
+            // one group's latency.
+            mutations_since_reclaim += 1;
+            let idle = self.queue.borrow().is_empty();
+            if idle || mutations_since_reclaim >= RECLAIM_MUTATIONS_MAX {
+                mutations_since_reclaim = 0;
+                journal.cleanup_obsolete().await;
             }
         }
         guard.complete = true;

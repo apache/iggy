@@ -67,6 +67,9 @@ public final class BytesSerializer {
     /** The timestamp delta is a u32 microsecond offset from the batch origin timestamp. */
     private static final BigInteger MAX_TIMESTAMP_DELTA_MICROS = BigInteger.valueOf(0xFFFF_FFFFL);
 
+    /** Encoded user headers of a message that carries none. */
+    private static final byte[] EMPTY_USER_HEADERS = new byte[0];
+
     /** Batch checksum input: five u64 header fields plus the u32 message count. */
     private static final int BATCH_CHECKSUM_FIXED_INPUT_BYTES = 5 * Long.BYTES + Integer.BYTES;
 
@@ -281,7 +284,7 @@ public final class BytesSerializer {
                     encodedMessageId(message.header().id()),
                     message.header().originTimestamp(),
                     message.payload(),
-                    readAllBytes(toBytes(message.userHeaders()))));
+                    encodedUserHeaders(message.userHeaders())));
         }
         return rawMessages;
     }
@@ -300,21 +303,33 @@ public final class BytesSerializer {
     private static BatchExtent measureBatch(List<RawMessage> messages, long capacityAllowance) {
         var originTimestamp = messages.get(0).originTimestamp();
         var latestTimestamp = originTimestamp;
+        var latestIndex = 0;
         long length = BATCH_HEADER_SIZE;
-        for (RawMessage message : messages) {
+        for (int index = 0; index < messages.size(); index++) {
+            RawMessage message = messages.get(index);
             var timestamp = message.originTimestamp();
             if (timestamp.signum() < 0 || timestamp.bitLength() > Long.SIZE) {
-                throw new IggyInvalidArgumentException("Message origin timestamp is outside unsigned 64-bit range");
+                throw new IggyInvalidArgumentException("Message " + index + " origin timestamp " + timestamp
+                        + " is outside the unsigned 64-bit range");
             }
             originTimestamp = originTimestamp.min(timestamp);
-            latestTimestamp = latestTimestamp.max(timestamp);
+            if (timestamp.compareTo(latestTimestamp) > 0) {
+                latestTimestamp = timestamp;
+                latestIndex = index;
+            }
             length += (long) MessageHeader.SIZE + message.payload().length + message.userHeaders().length;
             if (length > capacityAllowance) {
                 throw new IggyInvalidArgumentException("Message batch exceeds the output buffer capacity");
             }
         }
-        if (latestTimestamp.subtract(originTimestamp).compareTo(MAX_TIMESTAMP_DELTA_MICROS) > 0) {
-            throw new IggyInvalidArgumentException("Message origin timestamp delta exceeds unsigned 32-bit range");
+        // Name the offending message and its delta, the way the server's own
+        // InvalidMessageTimestampDelta does: the batch origin is whichever
+        // message is oldest, so neither is obvious from the caller's input.
+        var delta = latestTimestamp.subtract(originTimestamp);
+        if (delta.compareTo(MAX_TIMESTAMP_DELTA_MICROS) > 0) {
+            throw new IggyInvalidArgumentException("Message " + latestIndex
+                    + " origin timestamp exceeds the batch origin by " + delta
+                    + " microseconds, more than the timestamp delta field can hold");
         }
         return new BatchExtent(originTimestamp, length);
     }
@@ -409,6 +424,21 @@ public final class BytesSerializer {
         var bytes = new byte[length];
         buffer.getBytes(index, bytes);
         return Hashing.xxh3_64().hashBytesToLong(bytes);
+    }
+
+    /**
+     * Encoded user headers, or an empty array when there are none.
+     *
+     * <p>Returns before a buffer exists for the empty case. {@link #toBytes(Map)} answers that case
+     * with the shared {@link Unpooled#EMPTY_BUFFER}, which {@link #readAllBytes(ByteBuf)} would then
+     * release. That release happens to be a no-op on the singleton, which is the only reason the
+     * previous shape was safe.
+     */
+    private static byte[] encodedUserHeaders(Map<HeaderKey, HeaderValue> userHeaders) {
+        if (userHeaders == null || userHeaders.isEmpty()) {
+            return EMPTY_USER_HEADERS;
+        }
+        return readAllBytes(toBytes(userHeaders));
     }
 
     private static byte[] readAllBytes(ByteBuf buffer) {
