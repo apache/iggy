@@ -15,41 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The node a client is told is "the leader" must be the node that accepts a
-//! partition write.
-//!
-//! `get_cluster_metadata` marks a node `Leader` from the METADATA plane's
-//! `primary_index` alone, while a partition write is only accepted by the
-//! primary of that partition's OWN consensus group. Both planes pick their
-//! primary as `view % replica_count`, but their views are independent
-//! counters, so the two answers agree only while the views are congruent mod
-//! the replica count. Every other 3-node test happens to run with both planes
-//! at view 0, where node 0 is leader and partition primary at once, so none of
-//! them can see the split.
-//!
-//! This test forces the views apart: it moves the metadata plane off view 0,
-//! brings every node back, then creates a topic whose partition group is brand
-//! new. Seeded from the metadata view it lands on the advertised leader; left
-//! at view 0 it would name node 0, and no client could be told to go there.
-//!
-//! Both assertions are about the SAME node, and deliberately so. The SDK
-//! follows the roster's leader on connect, so a client asking for node 0 does
-//! not stay there - which is itself worth pinning down, since a test that
-//! believes it is exercising node 0 while sitting on the leader proves
-//! nothing. One assertion records where the client actually lands, the other
-//! is the contract: the node the roster advertises accepts a partition write.
+//! Metadata and partition consensus groups choose primaries independently.
+//! New partitions must inherit the metadata view, while existing partitions
+//! can retain a different primary after a metadata-only election. SDK clients
+//! settle on the metadata leader, so both writes to new partitions and group
+//! polls of existing partitions must reach an owner that can commit progress.
 
 use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::*;
-use integration::harness::disk::leader_node_index_via;
+use integration::harness::TestHarness;
+use integration::harness::disk::{
+    leader_node_index_via, read_metadata_superblock_state, read_partition_superblock_state,
+};
 use integration::iggy_harness;
-use tokio::time::{Instant, sleep};
+use journal::superblock::{PingPongSuperblock, SuperblockStore};
+use tokio::time::{Instant, sleep, timeout};
 
 const STREAM_NAME: &str = "partition-routing-stream";
 const TOPIC_NAME: &str = "partition-routing-topic";
 const PARTITION_ID: u32 = 0;
+const GROUP_NAME: &str = "partition-routing-group";
+const GROUP_PAYLOADS: [&str; 2] = ["group-poll-first", "group-poll-second"];
+const GROUP_POLL_BUDGET: Duration = Duration::from_secs(20);
+const INITIAL_VIEW: u32 = 0;
+const METADATA_CHECKPOINT_REQUESTS: usize = 256;
 
 /// Long enough for the backups to miss `cluster.heartbeat_timeout` (5s by
 /// default) and conclude an election.
@@ -170,6 +161,199 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
         "node {leader} is advertised as the cluster leader, so a partition write sent there must \
          be accepted (or forwarded), got {accepted_by_leader:?}"
     );
+}
+
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+async fn given_different_metadata_and_partition_primaries_when_group_auto_commits_should_return_messages(
+    harness: &mut TestHarness,
+) {
+    let partition_primary = leader_node_index_via(harness, 0).await;
+    let producer = harness
+        .root_client_for_node(partition_primary)
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    producer.create_stream(STREAM_NAME).await.unwrap();
+    producer
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut messages: Vec<_> = GROUP_PAYLOADS.into_iter().map(message).collect();
+    producer
+        .send_messages(
+            &stream,
+            &topic,
+            &Partitioning::partition_id(PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .expect("seed messages before separating the consensus views");
+    let partition_view =
+        read_partition_superblock_state(&harness.node(partition_primary).data_path())
+            .map_or(INITIAL_VIEW, |state| state.view);
+    assert_eq!(
+        partition_view as usize % harness.cluster_size(),
+        partition_primary,
+        "the seed producer must be on the partition primary"
+    );
+
+    // Checkpoint before editing the stopped backup's view, so the fixture
+    // preserves a real durable state instead of fabricating its other fields.
+    for index in 0..METADATA_CHECKPOINT_REQUESTS {
+        producer
+            .create_stream(&format!("{STREAM_NAME}-{index}"))
+            .await
+            .expect("fill the metadata journal to trigger its checkpoint");
+    }
+    let backup = (partition_primary + 1) % harness.cluster_size();
+    timeout(PRECONDITION_BUDGET, async {
+        while read_metadata_superblock_state(&harness.node(backup).data_path()).is_none() {
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the backup must checkpoint before the metadata-only view change");
+    advance_backup_metadata_view(harness, backup);
+    let metadata_primary = timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let leader = leader_node_index_via(harness, partition_primary).await;
+            if leader != partition_primary {
+                break leader;
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the metadata-only election must move leadership off the live partition primary");
+
+    let member = harness
+        .node(metadata_primary)
+        .tcp_client()
+        .unwrap()
+        .with_reconnecting_root_login()
+        .connect()
+        .await
+        .unwrap();
+    let metadata_address = harness
+        .node(metadata_primary)
+        .tcp_addr()
+        .unwrap()
+        .to_string();
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let polled = member
+                .poll_messages(
+                    &stream,
+                    &topic,
+                    Some(PARTITION_ID),
+                    &Consumer::default(),
+                    &PollingStrategy::first(),
+                    u32::try_from(GROUP_PAYLOADS.len()).unwrap(),
+                    false,
+                )
+                .await
+                .expect("the metadata leader can read the backup without committing offsets");
+            if polled.messages.len() == GROUP_PAYLOADS.len() {
+                break;
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the metadata leader's backup must hold both seeded messages");
+    member
+        .create_consumer_group(&stream, &topic, GROUP_NAME)
+        .await
+        .unwrap();
+    let group = Identifier::named(GROUP_NAME).unwrap();
+    member
+        .join_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap();
+    let membership = member
+        .get_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(membership.members_count, 1);
+    assert_eq!(membership.members[0].partitions, [PARTITION_ID]);
+    assert_eq!(
+        member.get_connection_info().await.server_address,
+        metadata_address
+    );
+    let backup_view = read_partition_superblock_state(&harness.node(metadata_primary).data_path())
+        .map_or(INITIAL_VIEW, |state| state.view);
+    assert_eq!(
+        backup_view, partition_view,
+        "the partition view must not follow the metadata-only election"
+    );
+
+    let consumer = Consumer::group(group);
+    for expected in GROUP_PAYLOADS {
+        let result = timeout(
+            GROUP_POLL_BUDGET,
+            member.poll_messages(
+                &stream,
+                &topic,
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                true,
+            ),
+        )
+        .await
+        .expect("an auto-commit group poll must complete within its routing budget");
+        let endpoint = member.get_connection_info().await.server_address;
+        let polled = result.unwrap_or_else(|error| {
+            panic!(
+                "a joined group must poll across different primaries: {error:?}; \
+                 metadata primary={metadata_primary}, partition primary={partition_primary}, \
+                 connection before={metadata_address}, connection after={endpoint}"
+            )
+        });
+        assert_eq!(
+            polled.messages.len(),
+            1,
+            "the assigned partition has unread messages"
+        );
+        assert_eq!(polled.messages[0].payload.as_ref(), expected.as_bytes());
+    }
+}
+
+fn advance_backup_metadata_view(harness: &mut TestHarness, backup: usize) {
+    harness.stop_node(backup).expect("stop only a backup");
+    let data_path = harness.node(backup).data_path();
+    let mut state = read_metadata_superblock_state(&data_path).expect("backup metadata state");
+    // Model a crash after persisting a metadata view change. Keeping log_view
+    // and every partition file intact makes the two consensus planes diverge.
+    state.view += 1;
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new()
+            .expect("superblock I/O runtime")
+            .block_on(async move {
+                PingPongSuperblock::open(data_path.join("metadata"))
+                    .await
+                    .expect("open the stopped backup's metadata superblock")
+                    .write(&state.to_bytes())
+                    .await
+                    .expect("persist the metadata-only view change");
+            });
+    })
+    .join()
+    .expect("superblock writer thread");
+    harness.restart_node(backup).expect("restart the backup");
 }
 
 /// One send, bounded. The SDK replays `TransientNotAccepted` and then hands the
