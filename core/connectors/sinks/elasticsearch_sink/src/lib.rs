@@ -33,7 +33,7 @@ use serde_json::json;
 use simd_json::{OwnedValue, prelude::*};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 sink_connector!(ElasticsearchSink);
 
@@ -219,30 +219,60 @@ impl ElasticsearchSink {
             .await
             .map_err(|e| Error::Connection(format!("Failed to parse bulk response: {}", e)))?;
 
-        // Check for individual document errors
-        let mut documents_indexed = 0;
-        if let Some(items) = response_body.get("items").and_then(|v| v.as_array()) {
-            let mut errors = 0;
-            for item in items {
-                if let Some(index_result) = item.get("index")
-                    && let Some(error) = index_result.get("error")
-                {
-                    warn!("Document indexing error: {}", error);
-                    errors += 1;
-                }
-            }
+        // A 200 without an items array is not a bulk response this connector
+        // can account for, so it must not be read as "nothing was indexed".
+        let Some(items) = response_body.get("items").and_then(|v| v.as_array()) else {
+            return Err(Error::Connection(format!(
+                "Elasticsearch bulk response for index '{}' carried no items array",
+                self.config.index
+            )));
+        };
 
-            documents_indexed = items.len() - errors;
+        let mut errors = 0;
+        let mut retryable_rejection = false;
+        for item in items {
+            if let Some(index_result) = item.get("index")
+                && let Some(error) = index_result.get("error")
+            {
+                warn!("Document indexing error: {error}");
+                errors += 1;
+                retryable_rejection |= index_result
+                    .get("status")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none_or(|status| status == 429 || status >= 500);
+            }
+        }
+
+        let documents_indexed = items.len() - errors;
+        {
             let mut state = self.state.lock().await;
             state.errors_count += errors;
             state.documents_indexed += documents_indexed;
         }
 
+        if errors > 0 {
+            // The runtime counts a batch, not a document, so a partial rejection
+            // is invisible in `/stats`. This line is the only per-batch record.
+            error!(
+                "Elasticsearch rejected {errors} of {} documents in index '{}'",
+                items.len(),
+                self.config.index
+            );
+        }
+
         if documents_indexed == 0 {
-            return Err(Error::CannotStoreData(format!(
+            let reason = format!(
                 "Elasticsearch bulk request indexed no documents in index '{}'",
                 self.config.index
-            )));
+            );
+            // Bad data must not look like a connectivity failure to a circuit
+            // breaker, but a 429 or 5xx rejection is transient and is not
+            // permanent. See `Error::PermanentHttpError`.
+            return Err(if retryable_rejection {
+                Error::CannotStoreData(reason)
+            } else {
+                Error::PermanentHttpError(reason)
+            });
         }
 
         Ok(documents_indexed)
@@ -446,7 +476,7 @@ mod tests {
 
                 if expected_indexed == 0 {
                     assert!(
-                        matches!(result, Err(Error::CannotStoreData(_))),
+                        matches!(result, Err(Error::PermanentHttpError(_))),
                         "{result:?}"
                     );
                 } else {
@@ -456,6 +486,74 @@ mod tests {
                 assert_eq!(state.documents_indexed, expected_indexed);
                 assert_eq!(state.errors_count, items.len() - expected_indexed);
             }
+        });
+    }
+
+    #[test]
+    fn given_transient_item_rejections_when_indexing_should_not_report_a_permanent_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            for status in [429, 503] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/_bulk"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "errors": true,
+                        "items": [json!({"index": {
+                            "status": status,
+                            "error": {"type": "es_rejected_execution_exception"}
+                        }})],
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let mut config = test_config();
+                config.url = server.uri();
+                let sink = ElasticsearchSink::new(1, config);
+                let client = sink
+                    .create_client()
+                    .await
+                    .expect("client should initialize");
+
+                let result = sink
+                    .bulk_index_documents(&client, vec![simd_json::json!({"id": 1})])
+                    .await;
+
+                assert!(
+                    matches!(result, Err(Error::CannotStoreData(_))),
+                    "status {status}: {result:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn given_a_bulk_response_without_items_when_indexing_should_report_a_connection_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/_bulk"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"took": 1})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut config = test_config();
+            config.url = server.uri();
+            let sink = ElasticsearchSink::new(1, config);
+            let client = sink
+                .create_client()
+                .await
+                .expect("client should initialize");
+
+            let result = sink
+                .bulk_index_documents(&client, vec![simd_json::json!({"id": 1})])
+                .await;
+
+            assert!(matches!(result, Err(Error::Connection(_))), "{result:?}");
+            let state = sink.state.lock().await;
+            assert_eq!(state.documents_indexed, 0);
+            assert_eq!(state.errors_count, 0);
         });
     }
 
