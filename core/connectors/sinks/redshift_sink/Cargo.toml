@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_redshift_sink"
-version = "0.4.1-edge.1"
+version = "0.4.1"
 description = "Iggy Redshift sink connector for storing stream messages into Redshift warehouse via S3"
 edition = "2024"
 license = "Apache-2.0"
