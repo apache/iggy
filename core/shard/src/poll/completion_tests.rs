@@ -21,14 +21,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake};
 
-use consensus::{ClientTable, PartitionsHandle, SessionEnd, build_reply_message_with};
-use iggy_binary_protocol::{Operation, PrepareHeader};
-use iggy_common::{IggyError, PollingStrategy};
+use consensus::{
+    ClientTable, MetadataHandle, PartitionsHandle, SessionEnd, build_reply_message_with,
+};
+use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, PurgeTopicRequest};
+use iggy_binary_protocol::{Command, Operation, PrepareHeader, WireEncode, WireIdentifier};
+use iggy_common::{IggyError, IggyTimestamp, PollingStrategy};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::IggyMessageBus;
 use metadata::IggyMetadata;
-use metadata::impls::metadata::IggySnapshot;
+use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
+use metadata::stm::StateMachine;
+use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
+use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
+use metadata::stm::user::Users;
 use partitions::{IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer};
+use server_common::Message;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
@@ -37,24 +45,66 @@ use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
     IggyShard, LifecycleFrame, PartitionConsensusConfig, PartitionRead, PartitionReadReply,
-    Receiver, ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
+    PollAttachment, Receiver, ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel,
+    shard_channel,
 };
 
 #[compio::test]
-async fn given_pending_attached_poll_when_authorization_changes_should_reject_completion_before_progress()
- {
+#[allow(clippy::too_many_lines)]
+async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_affected_reads() {
     const CLIENT: u128 = 41;
+    const OTHER_CLIENT: u128 = 42;
     const USER: u32 = 7;
     const GROUP: u64 = 7;
-    for logout in [false, true] {
-        let namespace = IggyNamespace::new(1, 1, 0);
+    #[derive(Debug, Clone, Copy)]
+    enum Change {
+        Logout,
+        Leave,
+        OtherLeave,
+        MissingLeave,
+        Rejoin,
+        Purge,
+        Delete,
+    }
+    for change in [
+        Change::Logout,
+        Change::Leave,
+        Change::OtherLeave,
+        Change::MissingLeave,
+        Change::Rejoin,
+        Change::Purge,
+        Change::Delete,
+    ] {
+        let namespace = IggyNamespace::new(0, 0, 0);
         let bus = Rc::new(IggyMessageBus::new(0));
         let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
-        let (owner, _owner_sender) = owner_with_inbox(&bus, config, namespace);
+        let mut inner = StreamsInner::default();
+        let mut stream = Stream::default();
+        let mut topic = Topic::default();
+        topic.partitions.push(Partition::new(
+            0,
+            namespace.inner(),
+            IggyTimestamp::default(),
+            1,
+            0,
+        ));
+        for (group_id, client_id) in [(GROUP, CLIENT), (GROUP + 1, OTHER_CLIENT)] {
+            let mut group = ConsumerGroup::new(group_id, Arc::from(format!("group-{group_id}")));
+            group.members.insert(ConsumerGroupMember::new(0, client_id));
+            group.rebalance_members(&[0]);
+            topic.consumer_groups.insert(group_id, group);
+        }
+        stream.topics.insert(topic);
+        inner.items.insert(stream);
+        let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
+        let (owner, _owner_sender) = owner_with_metadata(&bus, config, namespace, metadata);
+        owner
+            .shards_table
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 1));
         let partitions = owner.plane.partitions();
         partitions.insert(namespace, partition);
         let mut table = ClientTable::new(1);
-        let mut header = PrepareHeader {
+        let header = PrepareHeader {
             client: CLIENT,
             user_id: USER,
             operation: Operation::Register,
@@ -66,8 +116,36 @@ async fn given_pending_attached_poll_when_authorization_changes_should_reject_co
         let pump = owner.run_message_pump(stop, Arc::new(AtomicBool::new(false)));
         futures::pin_mut!(pump);
 
-        for stale in [true, false] {
-            let attachment = table.attach_session(CLIENT, header.op, USER).unwrap();
+        let session = Arc::new(table.attach_session(CLIENT, header.op, USER).unwrap());
+        let streams = owner.plane.metadata().mux_stm.streams();
+        if matches!(change, Change::Purge) {
+            let (reply, replies) = channel(1);
+            owner
+                .on_partition_read(
+                    namespace,
+                    PartitionRead::PollOnPrimary {
+                        consumer: PollingConsumer::Consumer(USER as usize, 0),
+                        args: PollingArgs {
+                            strategy: PollingStrategy::first(),
+                            count: 1,
+                            auto_commit: false,
+                        },
+                        attachment: PollAttachment {
+                            session: Arc::clone(&session),
+                            metadata: streams.poll_metadata(namespace, None, CLIENT).unwrap(),
+                        },
+                    },
+                    reply,
+                )
+                .await;
+            assert_single_message_reply(&replies);
+        }
+        let mut completions = Vec::new();
+        for group in [None, Some(GROUP)] {
+            let attachment = PollAttachment {
+                session: Arc::clone(&session),
+                metadata: streams.poll_metadata(namespace, group, CLIENT).unwrap(),
+            };
             let (reply, replies) = channel(1);
             let completion = owner
                 .poll_completions
@@ -76,7 +154,9 @@ async fn given_pending_attached_poll_when_authorization_changes_should_reject_co
             let plan = partitions
                 .build_poll_snapshot(
                     &namespace,
-                    PollingConsumer::ConsumerGroup(usize::try_from(GROUP).unwrap(), 0),
+                    group.map_or(PollingConsumer::Consumer(USER as usize, 0), |group| {
+                        PollingConsumer::ConsumerGroup(usize::try_from(group).unwrap(), 0)
+                    }),
                     &PollingArgs {
                         strategy: PollingStrategy::first(),
                         count: 1,
@@ -85,37 +165,65 @@ async fn given_pending_attached_poll_when_authorization_changes_should_reject_co
                 )
                 .expect("the group has an unread message");
             let result = plan.execute_resident();
-            if stale {
-                if logout {
-                    table.remove_client(CLIENT, USER, SessionEnd::Explicit);
-                    header.op += 1;
-                    table.commit_register(
-                        CLIENT,
-                        USER,
-                        build_reply_message_with(&header, 0, |_| {}),
-                    );
-                } else {
-                    table.invalidate_consumer_group_attachments();
-                }
+            completions.push((group, completion, replies, result));
+        }
+        match change {
+            Change::Logout => {
+                table.remove_client(CLIENT, USER, SessionEnd::Explicit);
             }
+            Change::Leave => streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default()),
+            Change::OtherLeave => {
+                streams.remove_consumer_group_member(OTHER_CLIENT, IggyTimestamp::default());
+            }
+            Change::MissingLeave => {
+                streams.remove_consumer_group_member(OTHER_CLIENT + 1, IggyTimestamp::default());
+            }
+            Change::Rejoin => apply_poll_metadata(
+                &owner,
+                Operation::JoinConsumerGroup,
+                JoinConsumerGroupRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    group_id: WireIdentifier::numeric(u32::try_from(GROUP).unwrap()),
+                    client_id: CLIENT,
+                    in_flight: Vec::new(),
+                }
+                .to_bytes(),
+            ),
+            Change::Purge => apply_poll_metadata(
+                &owner,
+                Operation::PurgeTopic,
+                PurgeTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                }
+                .to_bytes(),
+            ),
+            Change::Delete => apply_poll_metadata(
+                &owner,
+                Operation::DeleteTopic,
+                DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                }
+                .to_bytes(),
+            ),
+        }
+        for (group, completion, replies, result) in completions {
+            let stale = matches!(change, Change::Logout | Change::Purge | Change::Delete)
+                || (matches!(change, Change::Leave) && group.is_some());
             completion.complete(result);
             assert!(futures::poll!(pump.as_mut()).is_pending());
             let reply = replies
                 .try_recv()
                 .expect("the owner must validate the completion");
-            let progress = partitions.group_offset_state(&namespace, GROUP).unwrap();
             if stale {
                 assert!(
                     matches!(
                         reply,
                         PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
                     ),
-                    "stale authorization must reject, got {reply:?}"
-                );
-                assert_eq!(
-                    progress,
-                    (None, None),
-                    "stale completion must not advance either offset"
+                    "{change:?}, group {group:?}: stale authorization must reject, got {reply:?}"
                 );
             } else {
                 assert!(
@@ -128,10 +236,67 @@ async fn given_pending_attached_poll_when_authorization_changes_should_reject_co
                     ),
                     "fresh authorization must accept, got {reply:?}"
                 );
-                assert_eq!(progress, (Some(0), Some(0)));
+            }
+            if group.is_some() {
+                let expected = if stale {
+                    (None, None)
+                } else {
+                    (Some(0), Some(0))
+                };
+                assert_eq!(
+                    partitions.group_offset_state(&namespace, GROUP).unwrap(),
+                    expected,
+                    "{change:?}: completion must preserve group progress"
+                );
             }
         }
+        if matches!(change, Change::Purge) {
+            let (reply, replies) = channel(1);
+            owner
+                .on_partition_read(
+                    namespace,
+                    PartitionRead::PollOnPrimary {
+                        consumer: PollingConsumer::Consumer(USER as usize, 0),
+                        args: PollingArgs {
+                            strategy: PollingStrategy::first(),
+                            count: 1,
+                            auto_commit: true,
+                        },
+                        attachment: PollAttachment {
+                            session: Arc::clone(&session),
+                            metadata: streams.poll_metadata(namespace, None, CLIENT).unwrap(),
+                        },
+                    },
+                    reply,
+                )
+                .await;
+            assert!(
+                matches!(
+                    replies.try_recv().unwrap(),
+                    PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                ),
+                "new polls must wait until the committed purge is materialized"
+            );
+        }
     }
+}
+
+fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: impl AsRef<[u8]>) {
+    let body = body.as_ref();
+    let size = size_of::<PrepareHeader>() + body.len();
+    let mut message = Message::<PrepareHeader>::new(size);
+    let header = PrepareHeader {
+        command: Command::Prepare,
+        operation,
+        size: u32::try_from(size).unwrap(),
+        ..Default::default()
+    };
+    message.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(body);
+    let message = message.transmute_header::<PrepareHeader>(|_, target| *target = header);
+    assert_eq!(
+        owner.plane.metadata().mux_stm.update(message).unwrap().code,
+        0
+    );
 }
 
 /// Replacement can reuse every message offset from the old history. The pump
@@ -499,9 +664,18 @@ fn owner_with_inbox(
     config: PartitionsConfig,
     namespace: IggyNamespace,
 ) -> (CompletionTestShard, TaggedSender) {
+    owner_with_metadata(bus, config, namespace, PollTestMetadata::default())
+}
+
+fn owner_with_metadata(
+    bus: &Rc<IggyMessageBus>,
+    config: PartitionsConfig,
+    namespace: IggyNamespace,
+    metadata: PollTestMetadata,
+) -> (CompletionTestShard, TaggedSender) {
     let shard_id = ShardId::new(0);
     let partitions = IggyPartitions::new(shard_id, config);
-    let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None);
+    let metadata = IggyMetadata::new(None, None, None, None, metadata, None);
     let (sender, inbox, replies) = shard_channel(0, 2, 1);
     let routes = PapayaShardsTable::new();
     routes.insert(namespace, PartitionLocation::new(shard_id, 0));

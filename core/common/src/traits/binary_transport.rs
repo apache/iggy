@@ -87,6 +87,8 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// ran: the configured credentials still decide *who* the client signs in
     /// as, and a committed change decides what that user's password is.
     async fn refresh_session_password(&self, _user: &Identifier, _new_password: &str) {}
+    /// Keep auxiliary logins and reconnects working after the session user is renamed.
+    async fn refresh_session_username(&self, _user: &Identifier, _new_username: &str) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.

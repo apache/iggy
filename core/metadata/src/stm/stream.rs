@@ -1064,7 +1064,65 @@ impl StreamsInner {
     }
 }
 
+/// Metadata identity captured for one partition poll, independent of unrelated groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollMetadata {
+    created_revision: u64,
+    purge_generation: u64,
+    group: Option<(u64, u64)>,
+    client_id: u128,
+}
+
+impl PollMetadata {
+    #[must_use]
+    pub fn matches_partition(&self, created_revision: Option<u64>, purge_generation: u64) -> bool {
+        created_revision == Some(self.created_revision) && purge_generation == self.purge_generation
+    }
+
+    #[must_use]
+    pub fn is_valid(&self, streams: &Streams, namespace: IggyNamespace) -> bool {
+        streams
+            .poll_metadata(namespace, self.group.map(|(id, _)| id), self.client_id)
+            .as_ref()
+            == Some(self)
+    }
+}
+
 impl Streams {
+    #[must_use]
+    pub fn poll_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+    ) -> Option<PollMetadata> {
+        self.read(|inner| {
+            let topic = inner
+                .items
+                .get(namespace.stream_id())?
+                .topics
+                .get(namespace.topic_id())?;
+            let partition = find_partition(&topic.partitions, namespace.partition_id())?;
+            let group = if let Some(group_id) = group_id {
+                let group = topic.consumer_groups.get(&group_id)?;
+                if !group.members.iter().any(|(_, member)| {
+                    member.client_id == client_id && member.is_pollable(namespace.partition_id())
+                }) {
+                    return None;
+                }
+                Some((group.id, group.generation))
+            } else {
+                None
+            };
+            Some(PollMetadata {
+                created_revision: partition.created_revision,
+                purge_generation: partition.purge_generation,
+                group,
+                client_id,
+            })
+        })
+    }
+
     #[must_use]
     pub fn read<F, R>(&self, f: F) -> R
     where

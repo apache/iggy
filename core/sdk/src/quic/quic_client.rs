@@ -471,6 +471,10 @@ impl iggy_common::VsrSessionControl for QuicClient {
         self.poll_router.refresh_password(user, new_password);
     }
 
+    async fn refresh_session_username(&self, user: &iggy_common::Identifier, new_username: &str) {
+        self.poll_router.refresh_username(user, new_username);
+    }
+
     fn sdk_version(&self) -> &'static str {
         crate::SDK_VERSION
     }
@@ -600,6 +604,7 @@ impl QuicClient {
         recv: &mut RecvStream,
         response_buffer_size: usize,
         read_timeout: Duration,
+        metadata_watermark: &std::sync::atomic::AtomicU64,
     ) -> Result<Bytes, IggyError> {
         let buffer = tokio::time::timeout(read_timeout, recv.read_to_end(response_buffer_size))
             .await
@@ -615,6 +620,12 @@ impl QuicClient {
             return Err(IggyError::EmptyResponse);
         }
 
+        if let Some(header) = buffer
+            .get(..iggy_binary_protocol::HEADER_SIZE)
+            .and_then(|header| header.try_into().ok())
+        {
+            crate::vsr::observe_metadata_reply(metadata_watermark, header);
+        }
         crate::vsr::decode_response(Bytes::from(buffer))
     }
 
@@ -988,6 +999,7 @@ impl QuicClient {
         let connection = self.connection.clone();
         let response_buffer_size = self.config.response_buffer_size;
         let consensus_session = self.consensus_session.clone();
+        let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let connection = connection.lock().await;
@@ -1056,6 +1068,7 @@ impl QuicClient {
                         &mut recv,
                         response_buffer_size as usize,
                         remaining,
+                        &metadata_watermark,
                     )
                     .await
                     {

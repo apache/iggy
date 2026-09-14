@@ -59,8 +59,9 @@ use partitions::{PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{PartitionRead, PartitionReadReply, PollAttachment};
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Route a partition data-plane op (`SendMessages` / consumer-offset writes)
@@ -352,7 +353,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
     consumer_client_id: u128,
-    attachment: Option<SessionAttachment>,
+    attachment: Option<Arc<SessionAttachment>>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -404,8 +405,15 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     }
     let (body, channel) = match resolve_poll_request(shard, &wire, consumer_client_id) {
         Ok(resolved) => {
-            match read_polled_messages(shard, transport_client_id, request, resolved, attachment)
-                .await
+            match read_polled_messages(
+                shard,
+                transport_client_id,
+                request,
+                resolved,
+                attachment,
+                consumer_client_id,
+            )
+            .await
             {
                 Ok(reply) => {
                     send_host_frame(
@@ -475,7 +483,8 @@ async fn read_polled_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     (namespace, partition_id, consumer, args): DecodedPollRequest,
-    attachment: Option<SessionAttachment>,
+    attachment: Option<Arc<SessionAttachment>>,
+    consumer_client_id: u128,
 ) -> Result<BusMessage, ReadPolledMessagesError>
 where
     B: ShellBus,
@@ -485,10 +494,26 @@ where
     SB: SuperblockStore + 'static,
 {
     let read = if let Some(attachment) = attachment {
+        let group_id = match consumer {
+            PollingConsumer::ConsumerGroup(group, _) => Some(group as u64),
+            PollingConsumer::Consumer(..) => None,
+        };
+        let metadata = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .poll_metadata(namespace, group_id, consumer_client_id)
+            .ok_or(ReadPolledMessagesError::Rejected(
+                IggyError::TransientNotAccepted,
+            ))?;
         PartitionRead::PollOnPrimary {
             consumer,
             args,
-            attachment,
+            attachment: PollAttachment {
+                session: attachment,
+                metadata,
+            },
         }
     } else {
         PartitionRead::Poll { consumer, args }
@@ -2186,7 +2211,15 @@ mod tests {
                 auto_commit: true,
             },
         );
-        match read_polled_messages(shard, transport_client_id, &request, resolved_poll, None).await
+        match read_polled_messages(
+            shard,
+            transport_client_id,
+            &request,
+            resolved_poll,
+            None,
+            transport_client_id,
+        )
+        .await
         {
             Err(ReadPolledMessagesError::Rejected(error)) => error,
             Err(ReadPolledMessagesError::Fallback(_)) => {

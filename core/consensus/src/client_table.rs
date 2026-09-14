@@ -280,21 +280,14 @@ struct ClientEntry {
 ///
 /// It cannot keep that session alive: re-registration, logout, eviction and table replacement
 /// invalidate every attachment, including those held by other shard threads.
-/// Group ownership changes invalidate the captured group view independently.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionAttachment {
     session: Weak<()>,
-    group_view: Weak<()>,
 }
 
 impl SessionAttachment {
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.session_is_valid() && self.group_view.strong_count() != 0
-    }
-
-    #[must_use]
-    pub fn session_is_valid(&self) -> bool {
         self.session.strong_count() != 0
     }
 }
@@ -674,8 +667,6 @@ pub const COMMITTED_WINDOW_BITS: u64 = 128;
 /// the transfer wire format.
 #[derive(Debug)]
 pub struct ClientTable {
-    /// Volatile authorization generation, invalidated before assignment changes.
-    consumer_group_attachment: Option<Arc<()>>,
     /// `None` = free slot. Deterministic iteration for eviction + serialization.
     ///
     /// Under [`ClientTableMode::preallocate_slots`] this is sized to
@@ -734,7 +725,6 @@ impl ClientTable {
             (Vec::new(), HashMap::new())
         };
         Self {
-            consumer_group_attachment: None,
             slots,
             index,
             clients_max: max_clients,
@@ -891,7 +881,6 @@ impl ClientTable {
         }
         let clients_max = slots.len();
         let mut table = Self {
-            consumer_group_attachment: None,
             slots,
             index,
             clients_max,
@@ -1699,18 +1688,9 @@ impl ClientTable {
             return None;
         }
         let attachment = entry.attachment.get_or_insert_with(|| Arc::new(()));
-        let group_view = self
-            .consumer_group_attachment
-            .get_or_insert_with(|| Arc::new(()));
         Some(SessionAttachment {
             session: Arc::downgrade(attachment),
-            group_view: Arc::downgrade(group_view),
         })
-    }
-
-    /// Fence pending data polls before publishing a changed group assignment.
-    pub fn invalidate_consumer_group_attachments(&mut self) {
-        self.consumer_group_attachment = None;
     }
 
     /// Every registered client id, in slot order.
@@ -2211,27 +2191,6 @@ mod tests {
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
     const TEST_USER_ID: u32 = 7;
-
-    #[test]
-    fn group_assignment_changes_require_reattachment_without_ending_the_session() {
-        const CLIENT: u128 = 41;
-        let mut table = ClientTable::new(1);
-        table.commit_register(CLIENT, TEST_USER_ID, make_register_reply(CLIENT, 1));
-        let attached = table.attach_session(CLIENT, 1, TEST_USER_ID).unwrap();
-        table.invalidate_consumer_group_attachments();
-        assert!(!attached.is_valid());
-        assert!(attached.session_is_valid());
-        assert!(
-            table
-                .attach_session(CLIENT, 1, TEST_USER_ID)
-                .unwrap()
-                .is_valid()
-        );
-        assert!(
-            !attached.is_valid(),
-            "reattachment cannot revive an old read"
-        );
-    }
 
     #[test]
     fn session_attachments_require_the_owner_and_end_with_the_epoch() {

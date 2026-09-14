@@ -25,6 +25,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use super::register_forwarding::connect_without_login;
+use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
     ATTACH_CONSUMER_SESSION_CODE, GET_POLL_ROUTING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -436,6 +437,29 @@ async fn assert_cached_route_after_primary_loss(
     consumer: &Consumer,
 ) -> usize {
     const PAYLOAD: &str = "message-after-partition-failover";
+    let mut receiver = member
+        .consumer_group(GROUP_NAME, STREAM_NAME, TOPIC_NAME)
+        .unwrap()
+        .batch_length(1)
+        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+        .build();
+    receiver.init().await.unwrap();
+    assert!(
+        member
+            .poll_messages(
+                stream,
+                topic,
+                None,
+                consumer,
+                &PollingStrategy::next(),
+                1,
+                true
+            )
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
     let membership = member
         .get_consumer_group(stream, topic, &consumer.id)
         .await
@@ -492,48 +516,20 @@ async fn assert_cached_route_after_primary_loss(
         )
         .await
         .unwrap();
-    let polled = timeout(GROUP_POLL_BUDGET, async {
-        let result = member
-            .poll_messages(
-                stream,
-                topic,
-                None,
-                consumer,
-                &PollingStrategy::next(),
-                1,
-                true,
-            )
-            .await;
-        match result {
-            Ok(polled) => polled,
-            Err(
-                IggyError::Disconnected
-                | IggyError::TcpError
-                | IggyError::EmptyResponse
-                | IggyError::TransientNotCommitted,
-            ) => {
-                // The old process was killed before this poll, so the fixture
-                // knows its lost connection could not have admitted this read.
-                member
-                    .poll_messages(
-                        stream,
-                        topic,
-                        None,
-                        consumer,
-                        &PollingStrategy::next(),
-                        1,
-                        true,
-                    )
-                    .await
-                    .unwrap()
+    let received = timeout(GROUP_POLL_BUDGET, async {
+        loop {
+            match receiver.next().await.expect("the consumer must stay open") {
+                Ok(message) => break message,
+                // The fixture killed the old owner before polling, so the
+                // uncertain reply cannot hide admission of this new message.
+                Err(IggyError::TransientNotCommitted) => {}
+                Err(error) => panic!("poll could not recover its cached data route: {error:?}"),
             }
-            Err(error) => panic!("poll could not recover its cached data route: {error:?}"),
         }
     })
     .await
-    .expect("a later poll must refresh the dead data route without rejoining");
-    assert_eq!(polled.messages.len(), 1);
-    assert_eq!(polled.messages[0].payload.as_ref(), PAYLOAD.as_bytes());
+    .expect("IggyConsumer must resume after data loss without coordinator reconnect events");
+    assert_eq!(received.message.payload.as_ref(), PAYLOAD.as_bytes());
     assert_eq!(
         member.get_connection_info().await.server_address,
         coordinator
@@ -652,20 +648,6 @@ async fn assert_data_session_fences(
     })
     .await
     .expect("the data node must observe the member leaving");
-    assert!(
-        matches!(
-            data.send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
-                .await,
-            Err(IggyError::TransientNotAccepted)
-        ),
-        "an assignment change must fence the old attachment"
-    );
-    data.send_raw_with_response(
-        ATTACH_CONSUMER_SESSION_CODE,
-        route.consumer_session.to_bytes(),
-    )
-    .await
-    .unwrap();
     let response = data
         .send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
         .await
@@ -673,7 +655,7 @@ async fn assert_data_session_fences(
     let polled = PolledMessages::from_bytes(response).unwrap();
     assert_eq!(
         polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL,
-        "reattachment must not recreate group membership"
+        "the attached session must respect the member leaving"
     );
     assert!(polled.messages.is_empty());
 

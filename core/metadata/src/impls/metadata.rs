@@ -632,7 +632,6 @@ pub fn apply_committed_prepare<M>(
         >,
 {
     let header = *prepare.header();
-    invalidate_poll_attachments(mux_stm.streams(), client_table, &header);
     if header.operation == Operation::Register {
         // Register: commit_register creates the session, no state-machine op.
         if table_mutations_allowed {
@@ -680,34 +679,6 @@ pub fn apply_committed_prepare<M>(
             .borrow_mut()
             .commit_reply(header.client, header.user_id, reply);
         log_commit_reply_outcome(outcome, header.client, header.op);
-    }
-}
-
-fn invalidate_poll_attachments(
-    streams: &Streams,
-    client_table: &RefCell<ClientTable>,
-    header: &PrepareHeader,
-) {
-    let changes_assignments = matches!(
-        header.operation,
-        Operation::JoinConsumerGroup
-            | Operation::LeaveConsumerGroup
-            | Operation::RemoveConsumerGroupMember
-            | Operation::CompleteConsumerGroupRevocation
-            | Operation::DeleteConsumerGroup
-            | Operation::CreatePartitions
-            | Operation::CreatePartitionsWithAssignments
-            | Operation::DeletePartitions
-            | Operation::DeleteTopic
-            | Operation::PurgeTopic
-            | Operation::DeleteStream
-            | Operation::PurgeStream
-    ) || (header.operation == Operation::Logout
-        && !streams.consumer_group_memberships(header.client).is_empty());
-    if changes_assignments {
-        client_table
-            .borrow_mut()
-            .invalidate_consumer_group_attachments();
     }
 }
 
@@ -2898,11 +2869,6 @@ where
             // Sync-only — this is what makes pop/apply/advance atomic on
             // the single-threaded shard and keeps the head revalidation
             // sound.
-            invalidate_poll_attachments(
-                self.mux_stm.streams(),
-                &self.client_table,
-                &prepare_header,
-            );
             let reply = if prepare_header.operation == Operation::Register {
                 // Register: commit_register creates session, no SM.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());

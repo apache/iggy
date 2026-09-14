@@ -24,7 +24,7 @@ mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
-pub use poll::PollCompleted;
+pub use poll::{PollAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
@@ -336,7 +336,7 @@ pub enum PartitionRead {
     PollOnPrimary {
         consumer: PollingConsumer,
         args: PollingArgs,
-        attachment: consensus::client_table::SessionAttachment,
+        attachment: poll::PollAttachment,
     },
     Poll {
         consumer: PollingConsumer,

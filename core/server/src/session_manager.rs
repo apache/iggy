@@ -33,6 +33,7 @@ use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// What the request funnel resolves from one `connections` lookup per frame.
@@ -116,7 +117,7 @@ pub struct Connection {
     /// THIS socket was told, and a client that reconnects re-seeds from the
     /// session it binds.
     pub metadata_watermark: u64,
-    consumer_session: Option<(u128, SessionAttachment)>,
+    consumer_session: Option<(u128, Arc<SessionAttachment>)>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -391,13 +392,10 @@ impl SessionManager {
         if !matches!(connection.state, ConnectionState::Bound { .. }) {
             return Err(IggyError::Unauthenticated);
         }
-        if !attachment.session_is_valid() {
+        if !attachment.is_valid() {
             return Err(IggyError::StaleClient);
         }
-        if !attachment.is_valid() {
-            return Err(IggyError::TransientNotAccepted);
-        }
-        connection.consumer_session = Some((client_id, attachment));
+        connection.consumer_session = Some((client_id, Arc::new(attachment)));
         connection.metadata_watermark = connection.metadata_watermark.max(metadata_watermark);
         Ok(())
     }
@@ -406,12 +404,11 @@ impl SessionManager {
     ///
     /// # Errors
     /// Returns `Unauthenticated` without an authenticated attachment, or
-    /// `StaleClient` when the parent epoch has ended, or `TransientNotAccepted`
-    /// when a group assignment change requires reattachment.
+    /// `StaleClient` when the parent epoch has ended.
     pub fn consumer_session(
         &self,
         connection_id: u128,
-    ) -> Result<(u128, SessionAttachment), IggyError> {
+    ) -> Result<(u128, Arc<SessionAttachment>), IggyError> {
         let connection = self
             .connections
             .get(&connection_id)
@@ -423,13 +420,10 @@ impl SessionManager {
             .consumer_session
             .as_ref()
             .ok_or(IggyError::Unauthenticated)?;
-        if !attachment.session_is_valid() {
+        if !attachment.is_valid() {
             return Err(IggyError::StaleClient);
         }
-        if !attachment.is_valid() {
-            return Err(IggyError::TransientNotAccepted);
-        }
-        Ok((*client_id, attachment.clone()))
+        Ok((*client_id, Arc::clone(attachment)))
     }
 
     /// The highest metadata op this connection was told committed, or `0` when

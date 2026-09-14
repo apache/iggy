@@ -20,7 +20,7 @@ use crate::leader_aware::{
     check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
     read_transport_endpoints,
 };
-use crate::poll_routing::{PollRouter, PollTransport};
+use crate::poll_routing::{PollRouter, PollTransport, matches_session_user};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
 use crate::session::ConsensusSession;
@@ -123,6 +123,7 @@ pub struct TcpClient {
     /// password they carry is dead once the change commits, so every later
     /// sign-in reads this instead.
     configured_password: Mutex<Option<SecretString>>,
+    configured_username: Mutex<Option<String>>,
     // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
     // is `encode_request_header`, which is pure CPU and never awaits. The
     // tokio variant would pay a waker alloc + internal semaphore on
@@ -435,6 +436,8 @@ impl iggy_common::VsrSessionControl for TcpClient {
         else {
             return;
         };
+        let configured_username = self.configured_username.lock().await;
+        let configured = configured_username.as_ref().unwrap_or(configured);
 
         // The configured credentials cannot be rewritten -- the config is
         // shared and immutable -- and the password they carry will never work
@@ -461,6 +464,34 @@ impl iggy_common::VsrSessionControl for TcpClient {
                 .lock()
                 .await
                 .replace(SecretString::from(new_password.to_owned()));
+        }
+    }
+
+    async fn refresh_session_username(&self, user: &Identifier, new_username: &str) {
+        let renamed = {
+            let mut remembered = self.session_credentials.lock().await;
+            remembered.as_mut().and_then(|sign_in| {
+                let Credentials::UsernamePassword(username, _) = &mut sign_in.credentials else {
+                    return None;
+                };
+                if !matches_session_user(user, sign_in.user_id, username) {
+                    return None;
+                }
+                Some(std::mem::replace(username, new_username.to_owned()))
+            })
+        };
+        if let AutoLogin::Enabled(Credentials::UsernamePassword(configured, _)) =
+            &self.config.auto_login
+        {
+            let mut override_name = self.configured_username.lock().await;
+            let configured = override_name.as_ref().unwrap_or(configured);
+            if renamed.as_ref() == Some(configured)
+                || user
+                    .get_cow_str_value()
+                    .is_ok_and(|name| name.as_ref() == configured)
+            {
+                *override_name = Some(new_username.to_owned());
+            }
         }
     }
 
@@ -495,7 +526,6 @@ impl PollTransport for TcpClient {
             .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT)
             .await;
         if matches!(result, Err(IggyError::Disconnected | IggyError::TcpError)) {
-            self.stream.lock().await.take();
             self.set_state(ClientState::Disconnected).await;
         }
         result
@@ -561,6 +591,7 @@ impl TcpClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             configured_password: Mutex::new(None),
+            configured_username: Mutex::new(None),
             session_credentials: Mutex::new(None),
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
@@ -1000,13 +1031,19 @@ impl TcpClient {
             // configured user is applied on top: the configured password will
             // never work again, and the config cannot be rewritten.
             AutoLogin::Enabled(Credentials::UsernamePassword(username, configured_password)) => {
+                let username = self
+                    .configured_username
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| username.clone());
                 let password = self
                     .configured_password
                     .lock()
                     .await
                     .clone()
                     .unwrap_or_else(|| configured_password.clone());
-                Some(Credentials::UsernamePassword(username.clone(), password))
+                Some(Credentials::UsernamePassword(username, password))
             }
             AutoLogin::Enabled(credentials) => Some(credentials.clone()),
             AutoLogin::Disabled => None,
@@ -1474,10 +1511,11 @@ impl TcpClient {
     ) {
         let stream = self.stream.clone();
         let consensus_session = self.consensus_session.clone();
+        let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
         let joined = tokio::spawn(async move {
-            let mut stream = stream.lock().await;
-            let Some(stream) = stream.as_mut() else {
+            let mut stream_guard = stream.lock().await;
+            let Some(stream) = stream_guard.as_mut() else {
                 error!("Cannot send data. Client is not connected.");
                 return (None, Err(IggyError::NotConnected));
             };
@@ -1511,8 +1549,10 @@ impl TcpClient {
                 }
             };
             let header_bytes = bytemuck::bytes_of(&request_header);
+            let mut frame_complete = false;
             let outcome = async {
                 loop {
+                    frame_complete = false;
                     stream.write(header_bytes).await?;
                     if !payload.is_empty() {
                         stream.write(&payload).await?;
@@ -1577,6 +1617,8 @@ impl TcpClient {
                         Bytes::new()
                     };
 
+                    frame_complete = true;
+                    crate::vsr::observe_metadata_reply(&metadata_watermark, &response_header);
                     match crate::vsr::decode_response_split(&response_header, body) {
                         // `TransientNotCommitted`: the op's outcome is unknown
                         // (e.g. a view change canceled it in flight) -- ONLY a
@@ -1610,6 +1652,9 @@ impl TcpClient {
                 }
             }
             .await;
+            if !frame_complete {
+                stream_guard.take();
+            }
             (Some(request_header), outcome)
         })
         .await;
@@ -1658,6 +1703,81 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
+
+    #[tokio::test]
+    async fn a_canceled_exchange_discards_its_incomplete_reply_before_the_next_request() {
+        const READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+        let (listener, address) = live_endpoint().await;
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let deadline = tokio::time::Instant::now() + READ_BUDGET;
+        let mut exchange = Box::pin(client.send_raw_vsr_attempt(
+            GET_ME_CODE,
+            Bytes::new(),
+            None,
+            tokio::time::Instant::now(),
+            deadline,
+        ));
+        let mut request = [0; HEADER_SIZE];
+        tokio::select! {
+            result = &mut exchange => panic!("exchange ended before its reply: {result:?}"),
+            result = peer.read_exact(&mut request) => { result.unwrap(); }
+        }
+        let reply = ReplyHeader {
+            command: Command::Reply,
+            operation: Operation::NonReplicated,
+            size: u32::try_from(HEADER_SIZE).unwrap(),
+            ..Default::default()
+        };
+        peer.write_all(&bytemuck::bytes_of(&reply)[..HEADER_SIZE / 2])
+            .await
+            .unwrap();
+        // Dropping the caller leaves the transport task holding the stream lock.
+        drop(exchange);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.send_poll_request(GET_ME_CODE, Bytes::new()),
+        )
+        .await
+        .expect("the detached exchange must release its stream lock");
+        assert!(matches!(result, Err(IggyError::NotConnected)));
+        assert!(client.stream.lock().await.is_none());
+        let mut next_request = [0; 1];
+        assert_eq!(peer.read(&mut next_request).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn renaming_the_session_user_preserves_auxiliary_and_configured_credentials() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "old-name".to_owned(),
+                "password".into(),
+            )),
+            ..Default::default()
+        }))
+        .unwrap();
+        client
+            .remember_session_credentials(
+                Credentials::UsernamePassword("old-name".to_owned(), "password".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+        client
+            .refresh_session_username(&Identifier::numeric(SESSION_USER_ID).unwrap(), "new-name")
+            .await;
+        for forget in [false, true] {
+            if forget {
+                client.forget_session_credentials().await;
+            }
+            let Some(Credentials::UsernamePassword(username, _)) =
+                client.sign_in_credentials().await
+            else {
+                panic!("rename must preserve login credentials");
+            };
+            assert_eq!(username, "new-name");
+        }
+    }
 
     #[tokio::test]
     async fn a_primary_poll_with_an_unknown_outcome_is_not_replayed() {

@@ -467,6 +467,10 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
         self.poll_router.refresh_password(user, new_password);
     }
 
+    async fn refresh_session_username(&self, user: &iggy_common::Identifier, new_username: &str) {
+        self.poll_router.refresh_username(user, new_username);
+    }
+
     fn sdk_version(&self) -> &'static str {
         crate::SDK_VERSION
     }
@@ -1065,6 +1069,7 @@ impl WebSocketClient {
 
         let stream = self.stream.clone();
         let consensus_session = self.consensus_session.clone();
+        let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // The spawned task owns the lockstep exchange to completion. Cancelling
         // the caller after a partial WebSocket frame or response header must
         // not release the stream lock while leaving that connection reusable.
@@ -1104,72 +1109,83 @@ impl WebSocketClient {
             } else {
                 retry_deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
             };
-            loop {
-                let stream = stream_guard.as_mut().ok_or(IggyError::NotConnected)?;
-                stream.write(&request).await?;
-                stream.flush().await?;
+            let mut frame_complete = false;
+            let outcome = async {
+                loop {
+                    frame_complete = false;
+                    let stream = stream_guard.as_mut().ok_or(IggyError::NotConnected)?;
+                    stream.write(&request).await?;
+                    stream.flush().await?;
 
-                // One deadline spans both the header and body reads so a reply
-                // that delivers a header then stalls cannot wait up to 2x the
-                // timeout. On expiry drop the stream so a late reply cannot
-                // desync framing for the next request.
-                let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                let header_read =
-                    tokio::time::timeout_at(retry_deadline, stream.read(&mut response_header))
-                        .await;
-                let Ok(header_read) = header_read else {
-                    error!(
-                        "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response header for request with code: {code}"
-                    );
-                    *stream_guard = None;
-                    return Err(IggyError::Disconnected);
-                };
-                header_read?;
-
-                let response_size = crate::vsr::response_size(&response_header)?;
-                let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-                let body = if body_size > 0 {
-                    let mut body = vec![0u8; body_size];
-                    let body_read =
-                        tokio::time::timeout_at(retry_deadline, stream.read(&mut body)).await;
-                    let Ok(body_read) = body_read else {
+                    // One deadline spans both the header and body reads so a reply
+                    // that delivers a header then stalls cannot wait up to 2x the
+                    // timeout. On expiry drop the stream so a late reply cannot
+                    // desync framing for the next request.
+                    let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
+                    let header_read =
+                        tokio::time::timeout_at(retry_deadline, stream.read(&mut response_header))
+                            .await;
+                    let Ok(header_read) = header_read else {
                         error!(
-                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response body for request with code: {code}"
+                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response header for request with code: {code}"
                         );
                         *stream_guard = None;
                         return Err(IggyError::Disconnected);
                     };
-                    body_read?;
-                    Bytes::from(body)
-                } else {
-                    Bytes::new()
-                };
+                    header_read?;
 
-                match crate::vsr::decode_response_split(&response_header, body) {
-                    Err(error) if code == iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE => return Err(error),
-                    Err(IggyError::TransientNotAccepted)
-                        if tokio::time::Instant::now() >= not_accepted_deadline =>
-                    {
-                        // Never admitted, so re-issuable anywhere: hand it
-                        // back for a leader recheck or a roster walk instead
-                        // of replaying into the same refusal for the whole
-                        // request budget.
-                        return Err(IggyError::TransientNotAccepted);
+                    let response_size = crate::vsr::response_size(&response_header)?;
+                    let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                    let body = if body_size > 0 {
+                        let mut body = vec![0u8; body_size];
+                        let body_read =
+                            tokio::time::timeout_at(retry_deadline, stream.read(&mut body)).await;
+                        let Ok(body_read) = body_read else {
+                            error!(
+                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response body for request with code: {code}"
+                            );
+                            *stream_guard = None;
+                            return Err(IggyError::Disconnected);
+                        };
+                        body_read?;
+                        Bytes::from(body)
+                    } else {
+                        Bytes::new()
+                    };
+
+                    frame_complete = true;
+                    crate::vsr::observe_metadata_reply(&metadata_watermark, &response_header);
+                    match crate::vsr::decode_response_split(&response_header, body) {
+                        Err(error) if code == iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE => return Err(error),
+                        Err(IggyError::TransientNotAccepted)
+                            if tokio::time::Instant::now() >= not_accepted_deadline =>
+                        {
+                            // Never admitted, so re-issuable anywhere: hand it
+                            // back for a leader recheck or a roster walk instead
+                            // of replaying into the same refusal for the whole
+                            // request budget.
+                            return Err(IggyError::TransientNotAccepted);
+                        }
+                        // The server answered with a complete transient frame. The
+                        // lockstep stream is in sync, and replaying the same request
+                        // id on this session preserves metadata dedup even when the
+                        // original outcome is still resolving.
+                        Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
+                            if tokio::time::Instant::now() < retry_deadline =>
+                        {
+                            let remaining =
+                                retry_deadline.saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                        }
+                        other => return other,
                     }
-                    // The server answered with a complete transient frame. The
-                    // lockstep stream is in sync, and replaying the same request
-                    // id on this session preserves metadata dedup even when the
-                    // original outcome is still resolving.
-                    Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
-                        if tokio::time::Instant::now() < retry_deadline =>
-                    {
-                        let remaining =
-                            retry_deadline.saturating_duration_since(tokio::time::Instant::now());
-                        tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
-                    }
-                    other => return other,
                 }
             }
+            .await;
+            if !frame_complete {
+                stream_guard.take();
+            }
+            outcome
         })
         .await
         .map_err(|error| {

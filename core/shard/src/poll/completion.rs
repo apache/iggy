@@ -32,13 +32,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use consensus::client_table::SessionAttachment;
 use crossfire::{RecvError, TryRecvError, TrySendError};
 use iggy_common::IggyError;
 use partitions::PollReadResult;
 use server_common::sharding::IggyNamespace;
 
-use super::PollCompleted;
+use super::{PollAttachment, PollCompleted};
 use crate::coordinator::classify_try_send_err;
 use crate::metrics::{FrameDropMetrics, ShardMetrics, frame_drop_reason, frame_drop_variant};
 use crate::{PartitionReadReply, Receiver, Sender, channel};
@@ -78,7 +77,7 @@ impl PollCompletionLane {
         &self,
         namespace: IggyNamespace,
         reply: Sender<PartitionReadReply>,
-        attachment: Option<SessionAttachment>,
+        attachment: Option<PollAttachment>,
     ) -> Option<PollCompletionSender> {
         if self.state.closed.load(Ordering::Relaxed) || self.sender.is_disconnected() {
             reject(&reply, &self.state.metrics, frame_drop_reason::DISCONNECTED);
@@ -155,7 +154,7 @@ pub struct PollCompletionSender {
     slot: CompletionSlot,
     namespace: IggyNamespace,
     reply: Sender<PartitionReadReply>,
-    attachment: Option<SessionAttachment>,
+    attachment: Option<PollAttachment>,
 }
 
 impl PollCompletionSender {

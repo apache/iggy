@@ -31,12 +31,15 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::client_table::SessionAttachment;
-use consensus::{Consensus, PartitionsHandle};
+use consensus::{Consensus, MetadataHandle, PartitionsHandle};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
+use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::PollMetadata;
 use partitions::{PollCompletion, PollPlan, PollReadResult};
 use server_common::sharding::IggyNamespace;
+use std::sync::Arc;
 
 pub mod completion;
 #[cfg(test)]
@@ -45,6 +48,13 @@ mod completion_tests;
 mod test_support;
 #[cfg(test)]
 mod timeout_tests;
+
+/// Session lifetime and relevant metadata must both survive detached poll I/O.
+#[derive(Debug)]
+pub struct PollAttachment {
+    pub session: Arc<SessionAttachment>,
+    pub metadata: PollMetadata,
+}
 
 /// A read result awaiting acceptance by its partition owner.
 /// Disk tasks send it through the reserved completion lane. Resident reads
@@ -61,7 +71,7 @@ pub struct PollCompleted {
     result: PollReadResult,
     /// Return path for the accepted read or a rejection.
     reply: Sender<PartitionReadReply>,
-    attachment: Option<SessionAttachment>,
+    attachment: Option<PollAttachment>,
     /// Inbox enqueue time for disk diagnostics, or `None` for resident completion.
     #[cfg(feature = "poll-diagnostics")]
     queued_at: Option<std::time::Instant>,
@@ -71,6 +81,7 @@ impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
     B: MessageBus + 'static,
     T: ShardsTable,
+    M: StreamsFrontend,
     SB: SuperblockStore,
 {
     /// Execute a routed read on the partition owner's pump.
@@ -113,6 +124,19 @@ where
             } => (PartitionRead::Poll { consumer, args }, Some(attachment)),
             read => (read, None),
         };
+        if attachment.as_ref().is_some_and(|attachment| {
+            partitions.with_partition(&namespace, |partition| {
+                attachment.metadata.matches_partition(
+                    self.shards_table.epoch_for(namespace),
+                    partition.applied_purge_generation(),
+                )
+            }) != Some(true)
+        }) {
+            let _ = reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+            return;
+        }
         let result = match read {
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
@@ -244,7 +268,12 @@ where
         if reply.is_disconnected() {
             return;
         }
-        if attachment.is_some_and(|attachment| !attachment.is_valid()) {
+        if attachment.is_some_and(|attachment| {
+            !attachment.session.is_valid()
+                || !attachment
+                    .metadata
+                    .is_valid(self.plane.metadata().mux_stm.streams(), namespace)
+        }) {
             let _ = reply.try_send(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted,
             ));
