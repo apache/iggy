@@ -42,6 +42,7 @@ use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
+use crate::producer::{IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
@@ -63,6 +64,10 @@ pub struct IggyClient {
 /// Converts SDK errors to the RuntimeError exposed by the Python API.
 fn to_runtime_error<E: Display>(error: E) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+}
+
+fn to_value_error<E: Display>(error: E) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyValueError, _>(error.to_string())
 }
 
 /// Resolves the shared `create_topic`/`update_topic` parameters, applying
@@ -1318,6 +1323,111 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             Ok(PySendMessagesResponse::from(response))
+        })
+    }
+
+    /// Creates and initializes a high-level producer bound to a stream and topic.
+    ///
+    /// This is a Python port of the Rust high-level producer API. For detailed
+    /// producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+    /// `None` selects direct mode. `BackgroundProducerConfig` starts background
+    /// workers and makes successful sends mean queue acceptance rather than a
+    /// server commit. The returned producer is ready to send.
+    ///
+    /// Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
+    /// when stream/topic initialization fails.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        stream,
+        topic,
+        partitioning=None,
+        mode=None,
+        create_stream_if_not_exists=true,
+        create_topic_if_not_exists=true,
+        topic_partitions_count=1,
+        topic_message_expiry=None,
+        topic_max_size=None,
+        send_retries=Some(3),
+        send_retry_interval=RetryInterval::default(),
+    ))]
+    #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
+    fn producer<'a>(
+        &self,
+        py: Python<'a>,
+        stream: &str,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
+            &crate::partitioning::Partitioning,
+        >,
+        #[gen_stub(override_type(
+            type_repr = "DirectProducerConfig | BackgroundProducerConfig | None"
+        ))]
+        mode: Option<ProducerMode>,
+        create_stream_if_not_exists: bool,
+        create_topic_if_not_exists: bool,
+        topic_partitions_count: i64,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] topic_message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] topic_max_size: Option<
+            &MaxTopicSize,
+        >,
+        send_retries: Option<i64>,
+        send_retry_interval: RetryInterval,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let mode = mode.unwrap_or_default();
+
+        let topic_partitions_count =
+            producer_u32_param(topic_partitions_count, "topic_partitions_count")?;
+        let topic_message_expiry = topic_message_expiry
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .unwrap_or(RustIggyExpiry::ServerDefault);
+        let topic_max_size = topic_max_size
+            .map(RustMaxTopicSize::try_from)
+            .transpose()?
+            .unwrap_or(RustMaxTopicSize::ServerDefault);
+        let send_retries = send_retries
+            .map(|retries| producer_u32_param(retries, "send_retries"))
+            .transpose()?
+            .filter(|retries| *retries != 0);
+        let send_retry_interval = send_retry_interval.resolve()?;
+
+        let mut builder = self
+            .inner
+            .producer(stream, topic)
+            .map_err(to_value_error)?
+            .send_retries(send_retries, send_retry_interval);
+
+        builder = match mode {
+            ProducerMode::Direct(config) => builder.direct((&config).into()),
+            ProducerMode::Background(config) => builder.background((&config).try_into()?),
+        };
+
+        if let Some(partitioning) = partitioning {
+            builder = builder.partitioning(partitioning.inner.as_ref().clone());
+        }
+        if create_stream_if_not_exists {
+            builder = builder.create_stream_if_not_exists();
+        } else {
+            builder = builder.do_not_create_stream_if_not_exists();
+        }
+        if create_topic_if_not_exists {
+            builder = builder.create_topic_if_not_exists(
+                topic_partitions_count,
+                topic_message_expiry,
+                topic_max_size,
+            );
+        } else {
+            builder = builder.do_not_create_topic_if_not_exists();
+        }
+
+        future_into_py(py, async move {
+            // A background build starts Tokio worker tasks, so it must happen
+            // while this future is executing on the Rust runtime.
+            let producer = builder.build();
+            producer.init().await.map_err(to_runtime_error)?;
+            Ok(IggyProducer::new(producer))
         })
     }
 

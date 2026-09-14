@@ -96,8 +96,10 @@ Demonstrates fundamental client connection, authentication, batch message sendin
 To run the pair over HTTP:
 
 ```bash
-cargo run --example basic-producer -- --transport http
-cargo run --example basic-consumer -- --transport http
+cargo run --example basic-producer -- \
+  --transport http
+cargo run --example basic-consumer -- \
+  --transport http
 ```
 
 ## Message Pattern Examples

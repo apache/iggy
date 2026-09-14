@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use iggy::prelude::Partitioning as RustPartitioning;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use pyo3_stub_gen::{
@@ -27,7 +29,7 @@ use pyo3_stub_gen::{
 #[pyclass(from_py_object)]
 #[gen_stub_pyclass]
 pub struct Partitioning {
-    pub(crate) inner: RustPartitioning,
+    pub(crate) inner: Arc<RustPartitioning>,
 }
 
 #[gen_stub_pymethods]
@@ -37,7 +39,7 @@ impl Partitioning {
     #[staticmethod]
     pub fn balanced() -> Self {
         Self {
-            inner: RustPartitioning::balanced(),
+            inner: Arc::new(RustPartitioning::balanced()),
         }
     }
 
@@ -53,7 +55,7 @@ impl Partitioning {
     #[staticmethod]
     pub fn partition_id(partition_id: u32) -> Self {
         Self {
-            inner: RustPartitioning::partition_id(partition_id),
+            inner: Arc::new(RustPartitioning::partition_id(partition_id)),
         }
     }
 
@@ -73,7 +75,9 @@ impl Partitioning {
         };
         let inner = RustPartitioning::messages_key(&key)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 }
 
@@ -98,8 +102,21 @@ impl_stub_type!(PyPartitioning = Partitioning | isize);
 impl From<PyPartitioning> for RustPartitioning {
     fn from(partitioning: PyPartitioning) -> Self {
         match partitioning {
-            PyPartitioning::Strategy(partitioning) => partitioning.inner,
+            PyPartitioning::Strategy(partitioning) => partitioning.inner.as_ref().clone(),
             PyPartitioning::PartitionId(partition_id) => Self::partition_id(partition_id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_shares_the_rust_partitioning() {
+        let partitioning = Partitioning::balanced();
+        let cloned = partitioning.clone();
+
+        assert!(Arc::ptr_eq(&partitioning.inner, &cloned.inner));
     }
 }
