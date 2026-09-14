@@ -91,6 +91,9 @@ type IggyTcpClient struct {
 	connectedAt            time.Time
 	transportState         iggcon.TransportState
 	sessionState           iggcon.SessionState
+	// events fans out client lifecycle events to any number of subscribers;
+	// guarded by its own mutex.
+	events eventBroadcaster
 	// session carries the consensus client identity and request watermark;
 	// guarded by c.mtx.
 	session *vsr.Session
@@ -296,6 +299,7 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 		conn:                   nil,
 		transportState:         iggcon.TransportStateDisconnected,
 		sessionState:           iggcon.SessionStateUnauthenticated,
+		events:                 eventBroadcaster{},
 		connectedAt:            time.Time{},
 		leaderRedirectionState: iggcon.LeaderRedirectionState{},
 		currentServerAddress:   opts.config.serverAddress,
@@ -944,10 +948,15 @@ func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time
 	}
 }
 
-// invalidateConnLocked closes the connection and marks it as disconnected
+// invalidateConnLocked closes the connection and marks it as disconnected,
+// publishing a Disconnected event when the transport actually leaves a live
+// state.
 func (c *IggyTcpClient) invalidateConnLocked() {
 	_ = c.closeConnLocked()
-	c.transportState = iggcon.TransportStateDisconnected
+	if c.transportState != iggcon.TransportStateDisconnected {
+		c.transportState = iggcon.TransportStateDisconnected
+		c.events.publish(iggcon.DiagnosticEventDisconnected)
+	}
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
 	c.groups.clear()
@@ -1046,6 +1055,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 		// connected.
 		c.mtx.Lock()
 		c.transportState = iggcon.TransportStateDisconnected
+		c.events.publish(iggcon.DiagnosticEventDisconnected)
 		c.mtx.Unlock()
 		c.logger.Error("No server address to connect to.")
 		return ierror.ErrCannotEstablishConnection
@@ -1117,12 +1127,14 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 			return lastErr
 		}); err != nil {
 		c.mtx.Lock()
-		c.transportState = iggcon.TransportStateDisconnected
+		if c.transportState != iggcon.TransportStateDisconnected {
+			c.transportState = iggcon.TransportStateDisconnected
+			c.events.publish(iggcon.DiagnosticEventDisconnected)
+		}
 		c.mtx.Unlock()
 		if !c.config.reconnection.enabled {
 			c.logger.Warn("Automatic reconnection is disabled.")
 		}
-		// TODO publish event disconnected
 		return err
 	}
 
@@ -1153,6 +1165,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 	// The server fence does not survive the old socket, so the new connection
 	// starts from a fresh client identity.
 	c.session.Reset()
+	c.events.publish(iggcon.DiagnosticEventConnected)
 	clientAddress := c.clientAddress
 	serverAddress := c.currentServerAddress
 	c.mtx.Unlock()
@@ -1452,7 +1465,7 @@ func (c *IggyTcpClient) disconnectLocked() error {
 	err := c.closeConnLocked()
 
 	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
-	// TODO event pushing logic
+	c.events.publish(iggcon.DiagnosticEventDisconnected)
 	return err
 }
 
@@ -1482,10 +1495,19 @@ func (c *IggyTcpClient) shutdown() error {
 	c.groups.clear()
 	c.topics.clearCounts()
 	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
-	// TODO push shutdown event
+	c.events.publish(iggcon.DiagnosticEventShutdown)
+	c.events.close()
 	return err
 }
 
 func (c *IggyTcpClient) Close() error {
 	return c.shutdown()
+}
+
+// SubscribeEvents returns an independent channel of client lifecycle events
+// and an unsubscribe function that removes the subscription and closes the
+// channel. The channel is also closed on shutdown, after the final
+// DiagnosticEventShutdown.
+func (c *IggyTcpClient) SubscribeEvents() (<-chan iggcon.DiagnosticEvent, func()) {
+	return c.events.subscribe()
 }
