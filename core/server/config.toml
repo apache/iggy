@@ -532,14 +532,10 @@ repair_chunk_max = 128
 # cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
 
-# DOWNGRADE, every deployment: this release grew the superblock record from 66
-# to 74 bytes to carry partition.offset_reservation_lease's claim. The metadata
-# superblock is written by EVERY server, clustered or not, so upgrading rewrites
-# it at the new length on a plain single node too. A build that predates the
-# field refuses a record of that length and treats the refusal as a durability
-# violation, which fails the whole node's boot -- so rolling BACK to
-# server-0.9.0-edge.6 or earlier needs the data directory wiped on every node.
-# Upgrading needs nothing: the 66-byte record still decodes.
+# Superblock compatibility: 74-byte records include the partition offset
+# reservation frontier; legacy 66-byte records remain readable. Every server
+# writes a metadata superblock, including standalone deployments. Builds
+# without this field reject the larger record and cannot boot from it.
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
@@ -987,8 +983,7 @@ consumer_offsets_max = 4096
 # journaled it, so re-minting there needs a full-cluster crash; it claims
 # nothing, pays no write, and ignores this value.
 #
-# DOWNGRADE: see the note on superblock_wedged_fatal_timeout in [cluster].
-# Upgrading needs nothing.
+# For superblock compatibility, see superblock_wedged_fatal_timeout in [cluster].
 offset_reservation_lease = 65536
 
 # Entries the evicted ring retains per multi-replica partition for journal
