@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::leader_aware::read_transport_endpoints;
 use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
     check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
 };
+use crate::poll_routing::{PollRouter, PollTransport};
 use crate::session::ConsensusSession;
 use crate::vsr::replay_after_session_reset_is_safe;
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
 use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
 use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
+use iggy_binary_protocol::WireEncode;
+use iggy_common::TransportProtocol;
 use rustls::{ClientConfig, pki_types::pem::PemObject};
 
 use crate::prelude::Client;
@@ -75,6 +79,7 @@ const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Durati
 
 #[derive(Debug)]
 pub struct WebSocketClient {
+    poll_router: PollRouter<Self>,
     stream: Arc<Mutex<Option<WebSocketStreamKind>>>,
     pub(crate) config: Arc<WebSocketClientConfig>,
     pub(crate) state: Mutex<ClientState>,
@@ -125,6 +130,19 @@ impl Client for WebSocketClient {
 
 #[async_trait]
 impl BinaryTransport for WebSocketClient {
+    async fn send_poll_with_response(
+        &self,
+        request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+    ) -> Result<Bytes, IggyError> {
+        if request.auto_commit && self.roster_endpoints.lock().await.len() > 1 {
+            return self.poll_router.poll(self, request).await;
+        }
+        self.send_raw_with_response(
+            iggy_binary_protocol::codes::POLL_MESSAGES_CODE,
+            request.to_bytes(),
+        )
+        .await
+    }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
     }
@@ -140,6 +158,14 @@ impl BinaryTransport for WebSocketClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if matches!(
+            code,
+            iggy_binary_protocol::codes::ATTACH_CONSUMER_SESSION_CODE
+                | iggy_binary_protocol::codes::GET_POLL_ROUTING_CODE
+                | iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE
+        ) {
+            return self.send_poll_request(code, payload).await;
+        }
         let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
         let mut result = self.send_raw(code, payload.clone()).await;
 
@@ -411,6 +437,7 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
         // mid-request can leave the old session in place until this sign-in
         // re-mints it.
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
     }
 
@@ -420,7 +447,24 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
+    }
+
+    async fn remember_session_credentials(&self, credentials: Credentials, user_id: u32) {
+        self.poll_router.remember_credentials(credentials, user_id);
+        if !self.auto_login_configured() {
+            let endpoints = read_transport_endpoints(self, TransportProtocol::WebSocket).await;
+            *self.roster_endpoints.lock().await = endpoints;
+        }
+    }
+
+    async fn forget_session_credentials(&self) {
+        self.poll_router.forget_credentials();
+    }
+
+    async fn refresh_session_password(&self, user: &iggy_common::Identifier, new_password: &str) {
+        self.poll_router.refresh_password(user, new_password);
     }
 
     fn sdk_version(&self) -> &'static str {
@@ -429,6 +473,29 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
 }
 
 impl BinaryClient for WebSocketClient {}
+
+#[async_trait]
+impl PollTransport for WebSocketClient {
+    const PROTOCOL: TransportProtocol = TransportProtocol::WebSocket;
+
+    async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
+        let mut config = (*self.config).clone();
+        config.server_address = endpoint.to_owned();
+        config.auto_login = AutoLogin::Enabled(
+            self.poll_router
+                .credentials()
+                .ok_or(IggyError::Unauthenticated)?,
+        );
+        config.reconnection.enabled = false;
+        let client = Self::create(Arc::new(config))?;
+        client.connect_off_leader().await?;
+        Ok(client)
+    }
+
+    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        self.send_raw(code, payload).await
+    }
+}
 
 impl WebSocketClient {
     /// Whether an `AutoLogin` is configured on this client, which makes the
@@ -451,6 +518,7 @@ impl WebSocketClient {
         let (sender, receiver) = broadcast(1000);
         let server_address = config.server_address.clone();
         Ok(WebSocketClient {
+            poll_router: PollRouter::default(),
             stream: Arc::new(Mutex::new(None)),
             config,
             state: Mutex::new(ClientState::Disconnected),
@@ -1078,6 +1146,7 @@ impl WebSocketClient {
                 };
 
                 match crate::vsr::decode_response_split(&response_header, body) {
+                    Err(error) if code == iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE => return Err(error),
                     Err(IggyError::TransientNotAccepted)
                         if tokio::time::Instant::now() >= not_accepted_deadline =>
                     {

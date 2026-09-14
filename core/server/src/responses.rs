@@ -730,17 +730,21 @@ where
         nodes: metadata
             .nodes
             .into_iter()
-            .map(|node| ClusterNodeResponse {
-                name: node.name,
-                ip: node.ip,
-                tcp_port: node.endpoints.tcp,
-                quic_port: node.endpoints.quic,
-                http_port: node.endpoints.http,
-                websocket_port: node.endpoints.websocket,
-                role: node.role as u8,
-                status: node.status as u8,
-            })
+            .map(cluster_node_response)
             .collect(),
+    }
+}
+
+pub fn cluster_node_response(node: iggy_common::ClusterNode) -> ClusterNodeResponse {
+    ClusterNodeResponse {
+        name: node.name,
+        ip: node.ip,
+        tcp_port: node.endpoints.tcp,
+        quic_port: node.endpoints.quic,
+        http_port: node.endpoints.http,
+        websocket_port: node.endpoints.websocket,
+        role: node.role as u8,
+        status: node.status as u8,
     }
 }
 

@@ -20,6 +20,7 @@ use crate::leader_aware::{
     check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
     read_transport_endpoints,
 };
+use crate::poll_routing::{PollRouter, PollTransport};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
 use crate::session::ConsensusSession;
@@ -30,6 +31,7 @@ use crate::vsr::replay_after_session_reset_is_safe;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::{
     GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
 };
@@ -95,6 +97,7 @@ const FAILOVER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// It requires a valid server address.
 #[derive(Debug)]
 pub struct TcpClient {
+    poll_router: PollRouter<Self>,
     pub(crate) stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
     pub(crate) config: Arc<TcpClientConfig>,
     pub(crate) state: Mutex<ClientState>,
@@ -191,6 +194,19 @@ impl Client for TcpClient {
 
 #[async_trait]
 impl BinaryTransport for TcpClient {
+    async fn send_poll_with_response(
+        &self,
+        request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+    ) -> Result<Bytes, IggyError> {
+        if request.auto_commit && self.roster_endpoints.lock().await.len() > 1 {
+            return self.poll_router.poll(self, request).await;
+        }
+        self.send_raw_with_response(
+            iggy_binary_protocol::codes::POLL_MESSAGES_CODE,
+            request.to_bytes(),
+        )
+        .await
+    }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
     }
@@ -206,6 +222,14 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if matches!(
+            code,
+            iggy_binary_protocol::codes::ATTACH_CONSUMER_SESSION_CODE
+                | iggy_binary_protocol::codes::GET_POLL_ROUTING_CODE
+                | iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE
+        ) {
+            return self.send_poll_request(code, payload).await;
+        }
         let result = self.send_raw(code, payload.clone()).await;
         if result.is_ok() {
             return result;
@@ -350,6 +374,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
         // mid-request can leave the old session in place until this sign-in
         // re-mints it.
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
     }
 
@@ -359,6 +384,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
     }
 
@@ -445,6 +471,37 @@ impl iggy_common::VsrSessionControl for TcpClient {
 
 impl BinaryClient for TcpClient {}
 
+#[async_trait]
+impl PollTransport for TcpClient {
+    const PROTOCOL: TransportProtocol = TransportProtocol::Tcp;
+
+    async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
+        let mut config = (*self.config).clone();
+        config.server_address = endpoint.to_owned();
+        config.auto_login = AutoLogin::Enabled(
+            self.sign_in_credentials()
+                .await
+                .ok_or(IggyError::Unauthenticated)?,
+        );
+        config.reconnection.enabled = false;
+        let client = Self::create(Arc::new(config))?;
+        client.connect_off_leader().await?;
+        Ok(client)
+    }
+
+    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        let now = tokio::time::Instant::now();
+        let (_, result) = self
+            .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT)
+            .await;
+        if matches!(result, Err(IggyError::Disconnected | IggyError::TcpError)) {
+            self.stream.lock().await.take();
+            self.set_state(ClientState::Disconnected).await;
+        }
+        result
+    }
+}
+
 impl TcpClient {
     /// Create a new TCP client for the provided server address.
     pub fn new(
@@ -492,6 +549,7 @@ impl TcpClient {
     pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
         let server_address = config.server_address.clone();
         Ok(Self {
+            poll_router: PollRouter::default(),
             config,
             client_address: Mutex::new(None),
             stream: Arc::new(Mutex::new(None)),
@@ -1529,7 +1587,8 @@ impl TcpClient {
                         // which re-issues under a fresh session and could
                         // double-apply a committed write.
                         Err(IggyError::TransientNotCommitted)
-                            if tokio::time::Instant::now() < read_deadline =>
+                            if code != iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE
+                                && tokio::time::Instant::now() < read_deadline =>
                         {
                             let remaining = read_deadline
                                 .saturating_duration_since(tokio::time::Instant::now());
@@ -1594,10 +1653,57 @@ fn tls_server_name(server_address: &str) -> String {
 mod tests {
     use super::*;
     use iggy_binary_protocol::codes::{GET_ME_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::{Command, HEADER_SIZE, Operation, ReplyHeader};
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
+
+    #[tokio::test]
+    async fn a_primary_poll_with_an_unknown_outcome_is_not_replayed() {
+        let (listener, address) = live_endpoint().await;
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let response = ReplyHeader {
+                command: Command::Reply,
+                operation: Operation::NonReplicated,
+                size: u32::try_from(HEADER_SIZE).unwrap(),
+                status: IggyError::TransientNotCommitted.as_code(),
+                ..Default::default()
+            };
+            let mut requests = 0;
+            let mut header = [0; HEADER_SIZE];
+            while stream.read_exact(&mut header).await.is_ok() {
+                requests += 1;
+                if stream
+                    .write_all(bytemuck::bytes_of(&response))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            requests
+        });
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.send_poll_request(
+                iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE,
+                Bytes::new(),
+            ),
+        )
+        .await
+        .expect("an unknown poll outcome must return without entering a retry window");
+        assert!(matches!(result, Err(IggyError::TransientNotCommitted)));
+        Client::shutdown(&client).await.unwrap();
+        assert_eq!(
+            peer.await.unwrap(),
+            1,
+            "a poll cannot be deduplicated by its request header"
+        );
+    }
 
     #[test]
     fn tls_server_names_support_dns_ipv4_and_ipv6_endpoints() {

@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake};
 
-use consensus::PartitionsHandle;
+use consensus::{ClientTable, PartitionsHandle, SessionEnd, build_reply_message_with};
+use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::{IggyError, PollingStrategy};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::IggyMessageBus;
@@ -38,6 +39,100 @@ use crate::{
     IggyShard, LifecycleFrame, PartitionConsensusConfig, PartitionRead, PartitionReadReply,
     Receiver, ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
 };
+
+#[compio::test]
+async fn given_pending_attached_poll_when_authorization_changes_should_reject_completion_before_progress()
+ {
+    const CLIENT: u128 = 41;
+    const USER: u32 = 7;
+    const GROUP: u64 = 7;
+    for logout in [false, true] {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+        let (owner, _owner_sender) = owner_with_inbox(&bus, config, namespace);
+        let partitions = owner.plane.partitions();
+        partitions.insert(namespace, partition);
+        let mut table = ClientTable::new(1);
+        let mut header = PrepareHeader {
+            client: CLIENT,
+            user_id: USER,
+            operation: Operation::Register,
+            op: 1,
+            ..Default::default()
+        };
+        table.commit_register(CLIENT, USER, build_reply_message_with(&header, 0, |_| {}));
+        let (_stop, stop) = channel(1);
+        let pump = owner.run_message_pump(stop, Arc::new(AtomicBool::new(false)));
+        futures::pin_mut!(pump);
+
+        for stale in [true, false] {
+            let attachment = table.attach_session(CLIENT, header.op, USER).unwrap();
+            let (reply, replies) = channel(1);
+            let completion = owner
+                .poll_completions
+                .try_reserve(namespace, reply, Some(attachment))
+                .expect("reserve the attached read");
+            let plan = partitions
+                .build_poll_snapshot(
+                    &namespace,
+                    PollingConsumer::ConsumerGroup(usize::try_from(GROUP).unwrap(), 0),
+                    &PollingArgs {
+                        strategy: PollingStrategy::first(),
+                        count: 1,
+                        auto_commit: true,
+                    },
+                )
+                .expect("the group has an unread message");
+            let result = plan.execute_resident();
+            if stale {
+                if logout {
+                    table.remove_client(CLIENT, USER, SessionEnd::Explicit);
+                    header.op += 1;
+                    table.commit_register(
+                        CLIENT,
+                        USER,
+                        build_reply_message_with(&header, 0, |_| {}),
+                    );
+                } else {
+                    table.invalidate_consumer_group_attachments();
+                }
+            }
+            completion.complete(result);
+            assert!(futures::poll!(pump.as_mut()).is_pending());
+            let reply = replies
+                .try_recv()
+                .expect("the owner must validate the completion");
+            let progress = partitions.group_offset_state(&namespace, GROUP).unwrap();
+            if stale {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    ),
+                    "stale authorization must reject, got {reply:?}"
+                );
+                assert_eq!(
+                    progress,
+                    (None, None),
+                    "stale completion must not advance either offset"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Poll {
+                            current_offset: 0,
+                            ..
+                        }
+                    ),
+                    "fresh authorization must accept, got {reply:?}"
+                );
+                assert_eq!(progress, (Some(0), Some(0)));
+            }
+        }
+    }
+}
 
 /// Replacement can reuse every message offset from the old history. The pump
 /// must reject the old completion by history, then accept a fresh completion
@@ -69,7 +164,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let (stale_reply_sender, stale_replies) = channel(1);
     let old_completion = owner
         .poll_completions
-        .try_reserve(namespace, stale_reply_sender)
+        .try_reserve(namespace, stale_reply_sender, None)
         .expect("reserve the old read before executing it");
     let old_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
@@ -139,7 +234,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let (fresh_reply_sender, fresh_replies) = channel(1);
     let fresh_completion = owner
         .poll_completions
-        .try_reserve(namespace, fresh_reply_sender)
+        .try_reserve(namespace, fresh_reply_sender, None)
         .expect("reserve the fresh read before executing it");
     let fresh_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
@@ -218,7 +313,7 @@ async fn given_full_owner_inbox_when_reserved_reads_complete_should_interleave_b
         let (reply_sender, replies) = channel(1);
         let completion = owner
             .poll_completions
-            .try_reserve(namespace, reply_sender)
+            .try_reserve(namespace, reply_sender, None)
             .expect("reserve completion capacity before reading");
         let plan = partitions
             .build_poll_snapshot(
@@ -453,7 +548,7 @@ fn queue_resident_poll(
     let (reply_sender, replies) = channel(1);
     owner
         .poll_completions
-        .try_reserve(namespace, reply_sender)
+        .try_reserve(namespace, reply_sender, None)
         .expect("reserve capacity before completing the read")
         .complete(plan.execute_resident());
     assert_eq!(

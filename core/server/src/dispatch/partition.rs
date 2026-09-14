@@ -37,8 +37,10 @@ use crate::responses::{
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::request_body;
 use bytes::Bytes;
+use consensus::client_table::SessionAttachment;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
@@ -349,6 +351,8 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    consumer_client_id: u128,
+    attachment: Option<SessionAttachment>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -370,6 +374,18 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         .await;
         return;
     };
+    if crate::dispatch::non_replicated_code(request.header()) == POLL_MESSAGES_ON_PRIMARY_CODE
+        && !wire.auto_commit
+    {
+        send_non_replicated_deny(
+            shard,
+            request,
+            transport_client_id,
+            IggyError::InvalidCommand.as_code(),
+        )
+        .await;
+        return;
+    }
     // Gate on (stream, topic) before touching the partition plane. A resolution
     // miss denies typed on the resolve path below; a denial here replies
     // status!=0 with an empty body, distinct from the empty-poll "0 messages"
@@ -386,9 +402,11 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
     }
-    let (body, channel) = match resolve_poll_request(shard, &wire, request.header().client) {
+    let (body, channel) = match resolve_poll_request(shard, &wire, consumer_client_id) {
         Ok(resolved) => {
-            match read_polled_messages(shard, transport_client_id, request, resolved).await {
+            match read_polled_messages(shard, transport_client_id, request, resolved, attachment)
+                .await
+            {
                 Ok(reply) => {
                     send_host_frame(
                         &shard.bus,
@@ -457,6 +475,7 @@ async fn read_polled_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     (namespace, partition_id, consumer, args): DecodedPollRequest,
+    attachment: Option<SessionAttachment>,
 ) -> Result<BusMessage, ReadPolledMessagesError>
 where
     B: ShellBus,
@@ -465,10 +484,16 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    match shard
-        .partition_read(namespace, PartitionRead::Poll { consumer, args })
-        .await
-    {
+    let read = if let Some(attachment) = attachment {
+        PartitionRead::PollOnPrimary {
+            consumer,
+            args,
+            attachment,
+        }
+    } else {
+        PartitionRead::Poll { consumer, args }
+    };
+    match shard.partition_read(namespace, read).await {
         Some(PartitionReadReply::Poll {
             fragments,
             current_offset,
@@ -1385,7 +1410,15 @@ mod tests {
             1,
             TRUNCATED_BODY,
         );
-        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_poll_messages(
+            &shard,
+            TRANSPORT,
+            &poll,
+            Some(DEFAULT_ROOT_USER_ID),
+            poll.header().client,
+            None,
+        )
+        .await;
 
         let offset = request_message(
             Operation::NonReplicated,
@@ -1456,7 +1489,15 @@ mod tests {
         }
         .to_bytes();
         let poll = request_message(Operation::NonReplicated, VSR_CLIENT, SESSION, 1, &poll_body);
-        handle_poll_messages(&shard, TRANSPORT, &poll, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_poll_messages(
+            &shard,
+            TRANSPORT,
+            &poll,
+            Some(DEFAULT_ROOT_USER_ID),
+            poll.header().client,
+            None,
+        )
+        .await;
 
         let offset_body = GetConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(1)),
@@ -1694,6 +1735,8 @@ mod tests {
             TRANSPORT_CLIENT_ID,
             &request,
             Some(DEFAULT_ROOT_USER_ID),
+            request.header().client,
+            None,
         )
         .await;
 
@@ -2143,7 +2186,8 @@ mod tests {
                 auto_commit: true,
             },
         );
-        match read_polled_messages(shard, transport_client_id, &request, resolved_poll).await {
+        match read_polled_messages(shard, transport_client_id, &request, resolved_poll, None).await
+        {
             Err(ReadPolledMessagesError::Rejected(error)) => error,
             Err(ReadPolledMessagesError::Fallback(_)) => {
                 panic!("poll must not return an empty reply")

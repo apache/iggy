@@ -211,6 +211,12 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Logout preserves them so its caller can distinguish an unknown outcome
 /// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
+    AttachConsumerSession {
+        vsr_client_id: u128,
+        session: u64,
+        user_id: u32,
+        reply: Sender<Result<consensus::client_table::SessionAttachment, IggyError>>,
+    },
     Register {
         vsr_client_id: u128,
         user_id: u32,
@@ -326,6 +332,12 @@ const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// see [`IggyShard::partition_read`].
 #[derive(Debug)]
 pub enum PartitionRead {
+    Primary,
+    PollOnPrimary {
+        consumer: PollingConsumer,
+        args: PollingArgs,
+        attachment: consensus::client_table::SessionAttachment,
+    },
     Poll {
         consumer: PollingConsumer,
         args: PollingArgs,
@@ -360,6 +372,7 @@ pub enum PartitionRead {
 /// Reply to a [`PartitionRead`].
 #[derive(Debug)]
 pub enum PartitionReadReply {
+    Primary(u8),
     Poll {
         fragments: PollFragments,
         current_offset: u64,

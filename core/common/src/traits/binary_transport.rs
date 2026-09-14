@@ -20,6 +20,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::WireEncode;
+use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use std::sync::Arc;
 
 #[async_trait]
@@ -30,6 +33,18 @@ pub trait BinaryTransport {
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
+    /// Transports may route an auto-commit poll without moving the connection
+    /// that owns consumer-group membership.
+    async fn send_poll_with_response(
+        &self,
+        request: &PollMessagesRequest,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        self.send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
+            .await
+    }
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve

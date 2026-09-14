@@ -27,6 +27,8 @@
 
 use crate::cluster_meta::ClusterRoster;
 use ahash::AHashMap;
+use consensus::client_table::SessionAttachment;
+use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
 use std::net::SocketAddr;
@@ -114,6 +116,7 @@ pub struct Connection {
     /// THIS socket was told, and a client that reconnects re-seeds from the
     /// session it binds.
     pub metadata_watermark: u64,
+    consumer_session: Option<(u128, SessionAttachment)>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -181,6 +184,7 @@ impl SessionManager {
                 last_heartbeat: Instant::now(),
                 sdk: None,
                 metadata_watermark: 0,
+                consumer_session: None,
             });
     }
 
@@ -281,6 +285,7 @@ impl SessionManager {
                 // a write it never issued. Never the other direction - the
                 // bind below re-seeds from the register epoch.
                 conn.metadata_watermark = 0;
+                conn.consumer_session = None;
                 Ok(())
             }
             _ => Err(SessionError::InvalidTransition {
@@ -363,6 +368,68 @@ impl SessionManager {
         if let Some(conn) = self.connections.get_mut(&connection_id) {
             conn.metadata_watermark = conn.metadata_watermark.max(commit);
         }
+    }
+
+    /// Attach a consumer-group identity to an authenticated data connection.
+    ///
+    /// This connection retains its own consensus identity and disconnect cleanup.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` for an unbound connection or `StaleClient`
+    /// when the parent epoch has ended.
+    pub fn attach_consumer_session(
+        &mut self,
+        connection_id: u128,
+        client_id: u128,
+        attachment: SessionAttachment,
+        metadata_watermark: u64,
+    ) -> Result<(), IggyError> {
+        let connection = self
+            .connections
+            .get_mut(&connection_id)
+            .ok_or(IggyError::Unauthenticated)?;
+        if !matches!(connection.state, ConnectionState::Bound { .. }) {
+            return Err(IggyError::Unauthenticated);
+        }
+        if !attachment.session_is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        if !attachment.is_valid() {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        connection.consumer_session = Some((client_id, attachment));
+        connection.metadata_watermark = connection.metadata_watermark.max(metadata_watermark);
+        Ok(())
+    }
+
+    /// Resolve the attached group identity without extending its lifetime.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` without an authenticated attachment, or
+    /// `StaleClient` when the parent epoch has ended, or `TransientNotAccepted`
+    /// when a group assignment change requires reattachment.
+    pub fn consumer_session(
+        &self,
+        connection_id: u128,
+    ) -> Result<(u128, SessionAttachment), IggyError> {
+        let connection = self
+            .connections
+            .get(&connection_id)
+            .ok_or(IggyError::Unauthenticated)?;
+        if !matches!(connection.state, ConnectionState::Bound { .. }) {
+            return Err(IggyError::Unauthenticated);
+        }
+        let (client_id, attachment) = connection
+            .consumer_session
+            .as_ref()
+            .ok_or(IggyError::Unauthenticated)?;
+        if !attachment.session_is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        if !attachment.is_valid() {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        Ok((*client_id, attachment.clone()))
     }
 
     /// The highest metadata op this connection was told committed, or `0` when
@@ -496,10 +563,58 @@ const fn state_name(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::responses::build_empty_reply;
+    use consensus::ClientTable;
+    use consensus::client_table::SessionEnd;
+    use iggy_binary_protocol::{Operation, RoutedRequestHeader};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn data_disconnect_releases_only_its_own_session_and_parent_logout_fences_attachments() {
+        const USER: u32 = 7;
+        const PARENT: u128 = 11;
+        const DATA: u128 = 22;
+        const OTHER_DATA: u128 = 33;
+        let mut sessions = SessionManager::new();
+        let mut table = ClientTable::new(3);
+        let header = RoutedRequestHeader {
+            operation: Operation::Register,
+            ..Default::default()
+        };
+        for (client, epoch) in [(PARENT, 1), (DATA, 2), (OTHER_DATA, 3)] {
+            table.commit_register(
+                client,
+                USER,
+                build_empty_reply(&header, client, epoch, epoch),
+            );
+            sessions.ensure_connection(client, addr(5000), ClientTransportKind::Tcp);
+            sessions.login(client, USER).unwrap();
+            sessions.bind_session(client, client, epoch).unwrap();
+        }
+        for data in [DATA, OTHER_DATA] {
+            let attachment = table.attach_session(PARENT, 1, USER).unwrap();
+            sessions
+                .attach_consumer_session(data, PARENT, attachment, 3)
+                .unwrap();
+            assert_eq!(sessions.consumer_session(data).unwrap().0, PARENT);
+        }
+
+        let disconnected = sessions.remove_connection(DATA);
+        assert_eq!(disconnected, Some((DATA, 2)));
+        table.remove_client(DATA, USER, SessionEnd::DisconnectCleanup);
+        assert_eq!(sessions.get_session(PARENT), Some((PARENT, 1)));
+        assert_eq!(sessions.consumer_session(OTHER_DATA).unwrap().0, PARENT);
+
+        table.remove_client(PARENT, USER, SessionEnd::Explicit);
+        assert!(matches!(
+            sessions.consumer_session(OTHER_DATA),
+            Err(IggyError::StaleClient)
+        ));
+        assert_eq!(sessions.get_session(OTHER_DATA), Some((OTHER_DATA, 3)));
     }
 
     #[test]

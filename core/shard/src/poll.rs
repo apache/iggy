@@ -30,7 +30,8 @@
 
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
-use consensus::PartitionsHandle;
+use consensus::client_table::SessionAttachment;
+use consensus::{Consensus, PartitionsHandle};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -60,6 +61,7 @@ pub struct PollCompleted {
     result: PollReadResult,
     /// Return path for the accepted read or a rejection.
     reply: Sender<PartitionReadReply>,
+    attachment: Option<SessionAttachment>,
     /// Inbox enqueue time for disk diagnostics, or `None` for resident completion.
     #[cfg(feature = "poll-diagnostics")]
     queued_at: Option<std::time::Instant>,
@@ -74,7 +76,7 @@ where
     /// Execute a routed read on the partition owner's pump.
     /// Partitions missing materialized data reject the read. Resident polls finish
     /// inline. Disk polls return to the pump for acceptance after detached I/O.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub(crate) async fn on_partition_read(
         &self,
         namespace: IggyNamespace,
@@ -92,8 +94,42 @@ where
             ));
             return;
         }
+        if matches!(read, PartitionRead::PollOnPrimary { .. })
+            && partitions.with_partition(&namespace, |partition| {
+                let consensus = partition.consensus();
+                consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()
+            }) != Some(true)
+        {
+            let _ = reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+            return;
+        }
+        let (read, attachment) = match read {
+            PartitionRead::PollOnPrimary {
+                consumer,
+                args,
+                attachment,
+            } => (PartitionRead::Poll { consumer, args }, Some(attachment)),
+            read => (read, None),
+        };
         let result = match read {
-            PartitionRead::Poll { consumer, args } => {
+            PartitionRead::Primary => partitions
+                .with_partition(&namespace, |partition| {
+                    let consensus = partition.consensus();
+                    if consensus.is_normal()
+                        && !consensus.is_transferring()
+                        && !(consensus.has_ceded_primaryship()
+                            && consensus.primary_index(consensus.view()) == consensus.replica())
+                    {
+                        PartitionReadReply::Primary(consensus.primary_index(consensus.view()))
+                    } else {
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    }
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
+            PartitionRead::Poll { consumer, args }
+            | PartitionRead::PollOnPrimary { consumer, args, .. } => {
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {
                     None => PartitionReadReply::NotFound,
                     Some(plan) if plan.needs_off_pump_io() => {
@@ -109,7 +145,9 @@ where
                             completion::reject(&reply, self.metrics.frame_drop_metrics(), reason);
                             return;
                         }
-                        let Some(completion) = self.poll_completions.try_reserve(namespace, reply)
+                        let Some(completion) = self
+                            .poll_completions
+                            .try_reserve(namespace, reply, attachment)
                         else {
                             return;
                         };
@@ -137,6 +175,7 @@ where
                             namespace,
                             result: plan.execute_resident(),
                             reply,
+                            attachment,
                             #[cfg(feature = "poll-diagnostics")]
                             queued_at: None,
                         })
@@ -187,6 +226,7 @@ where
             namespace,
             result,
             reply,
+            attachment,
             #[cfg(feature = "poll-diagnostics")]
             queued_at,
         } = completion;
@@ -202,6 +242,12 @@ where
             );
         }
         if reply.is_disconnected() {
+            return;
+        }
+        if attachment.is_some_and(|attachment| !attachment.is_valid()) {
+            let _ = reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
             return;
         }
         let partitions = self.plane.partitions();

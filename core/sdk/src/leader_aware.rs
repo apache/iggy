@@ -191,7 +191,7 @@ fn transport_endpoints(metadata: &ClusterMetadata, transport: TransportProtocol)
 /// port to a bare `::1` yields a spelling no dial can parse, so an IPv6
 /// cluster would hand out a roster of undialable entries that still count as
 /// endpoints to fail over to.
-fn node_address(node: &ClusterNode, port: u16) -> String {
+pub(crate) fn node_address(node: &ClusterNode, port: u16) -> String {
     if node.ip.contains(':') && !node.ip.starts_with('[') {
         format!("[{}]:{port}", node.ip)
     } else {
@@ -199,7 +199,7 @@ fn node_address(node: &ClusterNode, port: u16) -> String {
     }
 }
 
-fn transport_port(node: &ClusterNode, transport: TransportProtocol) -> u16 {
+pub(crate) fn transport_port(node: &ClusterNode, transport: TransportProtocol) -> u16 {
     match transport {
         TransportProtocol::Tcp => node.endpoints.tcp,
         TransportProtocol::Quic => node.endpoints.quic,

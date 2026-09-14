@@ -24,7 +24,18 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use super::register_forwarding::connect_without_login;
 use iggy::prelude::*;
+use iggy_binary_protocol::codes::{
+    ATTACH_CONSUMER_SESSION_CODE, GET_POLL_ROUTING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+};
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::responses::messages::PollRoutingResponse;
+use iggy_binary_protocol::{WireDecode, WireEncode};
+use iggy_common::wire_conversions::{
+    consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
+};
+use iggy_common::{BinaryTransport, RESYNC_REQUIRED_PARTITION_SENTINEL};
 use integration::harness::TestHarness;
 use integration::harness::disk::{
     leader_node_index_via, read_metadata_superblock_state, read_partition_superblock_state,
@@ -167,6 +178,24 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
 async fn given_different_metadata_and_partition_primaries_when_group_auto_commits_should_return_messages(
     harness: &mut TestHarness,
 ) {
+    assert_group_auto_commit_routing(harness, TransportProtocol::Tcp).await;
+}
+
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+async fn given_different_metadata_and_partition_primaries_when_quic_group_auto_commits_should_return_messages(
+    harness: &mut TestHarness,
+) {
+    assert_group_auto_commit_routing(harness, TransportProtocol::Quic).await;
+}
+
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+async fn given_different_metadata_and_partition_primaries_when_websocket_group_auto_commits_should_return_messages(
+    harness: &mut TestHarness,
+) {
+    assert_group_auto_commit_routing(harness, TransportProtocol::WebSocket).await;
+}
+
+async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: TransportProtocol) {
     let partition_primary = leader_node_index_via(harness, 0).await;
     let producer = harness
         .root_client_for_node(partition_primary)
@@ -237,19 +266,23 @@ async fn given_different_metadata_and_partition_primaries_when_group_auto_commit
     .await
     .expect("the metadata-only election must move leadership off the live partition primary");
 
-    let member = harness
-        .node(metadata_primary)
-        .tcp_client()
+    let metadata_node = harness.node(metadata_primary);
+    let (builder, address) = match transport {
+        TransportProtocol::Tcp => (metadata_node.tcp_client(), metadata_node.tcp_addr()),
+        TransportProtocol::Quic => (metadata_node.quic_client(), metadata_node.quic_addr()),
+        TransportProtocol::WebSocket => (
+            metadata_node.websocket_client(),
+            metadata_node.websocket_addr(),
+        ),
+        TransportProtocol::Http => panic!("this test requires a binary transport"),
+    };
+    let member = builder
         .unwrap()
         .with_reconnecting_root_login()
         .connect()
         .await
         .unwrap();
-    let metadata_address = harness
-        .node(metadata_primary)
-        .tcp_addr()
-        .unwrap()
-        .to_string();
+    let metadata_address = address.unwrap().to_string();
     timeout(PRECONDITION_BUDGET, async {
         loop {
             let polled = member
@@ -329,7 +362,373 @@ async fn given_different_metadata_and_partition_primaries_when_group_auto_commit
             "the assigned partition has unread messages"
         );
         assert_eq!(polled.messages[0].payload.as_ref(), expected.as_bytes());
+        assert_eq!(
+            endpoint, metadata_address,
+            "a data poll must retain the metadata connection"
+        );
+        let current_membership = member
+            .get_consumer_group(&stream, &topic, &consumer.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_membership.members_count, 1);
+        assert_eq!(current_membership.members[0].id, membership.members[0].id);
     }
+
+    let expected_offset = u64::try_from(GROUP_PAYLOADS.len() - 1).unwrap();
+    for node in 0..harness.cluster_size() {
+        let address = harness.node(node).tcp_addr().unwrap();
+        let replica = connect_without_login(address).await;
+        replica
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        timeout(PRECONDITION_BUDGET, async {
+            loop {
+                let offset = replica
+                    .get_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
+                    .await
+                    .unwrap();
+                if offset.is_some_and(|offset| offset.stored_offset == expected_offset) {
+                    break;
+                }
+                sleep(PRECONDITION_POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("node {node} must receive the automatic offset commits"));
+        assert_eq!(
+            ClientWrapper::Tcp(replica)
+                .get_connection_info()
+                .await
+                .server_address,
+            address.to_string()
+        );
+    }
+    if transport == TransportProtocol::Tcp {
+        let partition_primary = assert_cached_route_after_primary_loss(
+            harness,
+            &member,
+            partition_primary,
+            &stream,
+            &topic,
+            &consumer,
+        )
+        .await;
+        assert_data_session_fences(
+            harness,
+            &member,
+            partition_primary,
+            &stream,
+            &topic,
+            &consumer,
+        )
+        .await;
+    }
+}
+
+async fn assert_cached_route_after_primary_loss(
+    harness: &mut TestHarness,
+    member: &IggyClient,
+    previous_primary: usize,
+    stream: &Identifier,
+    topic: &Identifier,
+    consumer: &Consumer,
+) -> usize {
+    const PAYLOAD: &str = "message-after-partition-failover";
+    let membership = member
+        .get_consumer_group(stream, topic, &consumer.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let coordinator = member.get_connection_info().await.server_address;
+    harness.kill_node(previous_primary).unwrap();
+    let poll = PollMessagesRequest {
+        consumer: consumer_to_wire(consumer).unwrap(),
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        partition_id: Some(PARTITION_ID),
+        strategy: polling_strategy_to_wire(&PollingStrategy::next()),
+        count: 1,
+        auto_commit: true,
+    }
+    .to_bytes();
+    let primary = timeout(PRECONDITION_BUDGET, async {
+        loop {
+            match member
+                .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+                .await
+            {
+                Ok(response) => {
+                    let route = PollRoutingResponse::decode_from(&response).unwrap();
+                    let node = (0..harness.cluster_size())
+                        .find(|&node| {
+                            harness.node(node).tcp_addr().unwrap().port() == route.primary.tcp_port
+                        })
+                        .unwrap();
+                    if node != previous_primary {
+                        break node;
+                    }
+                }
+                Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("route discovery failed during partition election: {error:?}"),
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the live metadata coordinator must discover the new partition primary");
+    let producer = connect_without_login(harness.node(primary).tcp_addr().unwrap()).await;
+    producer
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    producer
+        .send_messages(
+            stream,
+            topic,
+            &Partitioning::partition_id(PARTITION_ID),
+            &mut [message(PAYLOAD)],
+        )
+        .await
+        .unwrap();
+    let polled = timeout(GROUP_POLL_BUDGET, async {
+        let result = member
+            .poll_messages(
+                stream,
+                topic,
+                None,
+                consumer,
+                &PollingStrategy::next(),
+                1,
+                true,
+            )
+            .await;
+        match result {
+            Ok(polled) => polled,
+            Err(
+                IggyError::Disconnected
+                | IggyError::TcpError
+                | IggyError::EmptyResponse
+                | IggyError::TransientNotCommitted,
+            ) => {
+                // The old process was killed before this poll, so the fixture
+                // knows its lost connection could not have admitted this read.
+                member
+                    .poll_messages(
+                        stream,
+                        topic,
+                        None,
+                        consumer,
+                        &PollingStrategy::next(),
+                        1,
+                        true,
+                    )
+                    .await
+                    .unwrap()
+            }
+            Err(error) => panic!("poll could not recover its cached data route: {error:?}"),
+        }
+    })
+    .await
+    .expect("a later poll must refresh the dead data route without rejoining");
+    assert_eq!(polled.messages.len(), 1);
+    assert_eq!(polled.messages[0].payload.as_ref(), PAYLOAD.as_bytes());
+    assert_eq!(
+        member.get_connection_info().await.server_address,
+        coordinator
+    );
+    let current = member
+        .get_consumer_group(stream, topic, &consumer.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.members_count, 1);
+    assert_eq!(current.members[0].id, membership.members[0].id);
+    primary
+}
+
+async fn assert_data_session_fences(
+    harness: &TestHarness,
+    member: &IggyClient,
+    partition_primary: usize,
+    stream: &Identifier,
+    topic: &Identifier,
+    consumer: &Consumer,
+) {
+    const OTHER_USER: &str = "routing-other-user";
+    const OTHER_PASSWORD: &str = "routing-other-password";
+    let poll = PollMessagesRequest {
+        consumer: consumer_to_wire(consumer).unwrap(),
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        partition_id: Some(PARTITION_ID),
+        strategy: polling_strategy_to_wire(&PollingStrategy::next()),
+        count: 1,
+        auto_commit: true,
+    }
+    .to_bytes();
+    let response = member
+        .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+        .await
+        .unwrap();
+    let route = PollRoutingResponse::decode_from(&response).unwrap();
+    let address = harness.node(partition_primary).tcp_addr().unwrap();
+    let data = connect_without_login(address).await;
+    data.login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    member
+        .create_user(OTHER_USER, OTHER_PASSWORD, UserStatus::Active, None)
+        .await
+        .unwrap();
+    let other_user = Identifier::named(OTHER_USER).unwrap();
+    timeout(PRECONDITION_BUDGET, async {
+        while data.get_user(&other_user).await.unwrap().is_none() {
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the data node must observe the new user before login");
+    let other = connect_without_login(address).await;
+    other.login_user(OTHER_USER, OTHER_PASSWORD).await.unwrap();
+    assert!(
+        matches!(
+            other
+                .send_raw_with_response(
+                    ATTACH_CONSUMER_SESSION_CODE,
+                    route.consumer_session.to_bytes()
+                )
+                .await,
+            Err(IggyError::StaleClient)
+        ),
+        "authentication as another user must not authorize attachment"
+    );
+    let anonymous = connect_without_login(address).await;
+    assert!(matches!(
+        anonymous
+            .send_raw_with_response(
+                ATTACH_CONSUMER_SESSION_CODE,
+                route.consumer_session.to_bytes()
+            )
+            .await,
+        Err(IggyError::Unauthenticated)
+    ));
+    let mut wrong_epoch = route.consumer_session;
+    wrong_epoch.session += 1;
+    assert!(
+        matches!(
+            data.send_raw_with_response(ATTACH_CONSUMER_SESSION_CODE, wrong_epoch.to_bytes())
+                .await,
+            Err(IggyError::StaleClient)
+        ),
+        "attachment must require the exact parent epoch"
+    );
+    data.send_raw_with_response(
+        ATTACH_CONSUMER_SESSION_CODE,
+        route.consumer_session.to_bytes(),
+    )
+    .await
+    .unwrap();
+    data.send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+        .await
+        .unwrap();
+
+    member
+        .leave_consumer_group(stream, topic, &consumer.id)
+        .await
+        .unwrap();
+    timeout(PRECONDITION_BUDGET, async {
+        while data
+            .get_consumer_group(stream, topic, &consumer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .members_count
+            != 0
+        {
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the data node must observe the member leaving");
+    assert!(
+        matches!(
+            data.send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+                .await,
+            Err(IggyError::TransientNotAccepted)
+        ),
+        "an assignment change must fence the old attachment"
+    );
+    data.send_raw_with_response(
+        ATTACH_CONSUMER_SESSION_CODE,
+        route.consumer_session.to_bytes(),
+    )
+    .await
+    .unwrap();
+    let response = data
+        .send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+        .await
+        .unwrap();
+    let polled = PolledMessages::from_bytes(response).unwrap();
+    assert_eq!(
+        polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL,
+        "reattachment must not recreate group membership"
+    );
+    assert!(polled.messages.is_empty());
+
+    member
+        .join_consumer_group(stream, topic, &consumer.id)
+        .await
+        .unwrap();
+    member
+        .poll_messages(
+            stream,
+            topic,
+            None,
+            consumer,
+            &PollingStrategy::next(),
+            1,
+            true,
+        )
+        .await
+        .unwrap();
+    let response = member
+        .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+        .await
+        .unwrap();
+    let route = PollRoutingResponse::decode_from(&response).unwrap();
+    data.send_raw_with_response(
+        ATTACH_CONSUMER_SESSION_CODE,
+        route.consumer_session.to_bytes(),
+    )
+    .await
+    .unwrap();
+    member.logout_user().await.unwrap();
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let result = data
+                .send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+                .await;
+            if matches!(result, Err(IggyError::StaleClient)) {
+                break;
+            }
+            assert!(
+                result.is_ok() || matches!(result, Err(IggyError::TransientNotAccepted)),
+                "unexpected response while logout replicates: {result:?}"
+            );
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("parent logout must fence the independent data session");
+    assert_eq!(
+        ClientWrapper::Tcp(data)
+            .get_connection_info()
+            .await
+            .server_address,
+        address.to_string()
+    );
 }
 
 fn advance_backup_metadata_view(harness: &mut TestHarness, backup: usize) {

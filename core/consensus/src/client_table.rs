@@ -27,6 +27,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::mem::size_of;
+use std::sync::{Arc, Weak};
 use tracing::{trace, warn};
 
 /// Refcounted wrapper around a committed reply.
@@ -240,6 +241,7 @@ struct ClientEntry {
     /// Requests stamped with an older epoch are zombies and get fenced;
     /// a newer epoch than minted is a protocol violation.
     epoch: u64,
+    attachment: Option<Arc<()>>,
     /// Acting user id captured at register (re-register refreshes it: the
     /// rebind re-authenticated). Lets every replica resolve session -> user
     /// without a metadata lookup.
@@ -272,6 +274,29 @@ struct ClientEntry {
     /// commit loop. Maintained wherever `ring` is pushed.
     client_id: u128,
     latest_commit: u64,
+}
+
+/// A local attachment to one authenticated metadata session.
+///
+/// It cannot keep that session alive: re-registration, logout, eviction and table replacement
+/// invalidate every attachment, including those held by other shard threads.
+/// Group ownership changes invalidate the captured group view independently.
+#[derive(Debug, Clone)]
+pub struct SessionAttachment {
+    session: Weak<()>,
+    group_view: Weak<()>,
+}
+
+impl SessionAttachment {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.session_is_valid() && self.group_view.strong_count() != 0
+    }
+
+    #[must_use]
+    pub fn session_is_valid(&self) -> bool {
+        self.session.strong_count() != 0
+    }
 }
 
 /// Serializable form of one occupied slot.
@@ -649,6 +674,8 @@ pub const COMMITTED_WINDOW_BITS: u64 = 128;
 /// the transfer wire format.
 #[derive(Debug)]
 pub struct ClientTable {
+    /// Volatile authorization generation, invalidated before assignment changes.
+    consumer_group_attachment: Option<Arc<()>>,
     /// `None` = free slot. Deterministic iteration for eviction + serialization.
     ///
     /// Under [`ClientTableMode::preallocate_slots`] this is sized to
@@ -707,6 +734,7 @@ impl ClientTable {
             (Vec::new(), HashMap::new())
         };
         Self {
+            consumer_group_attachment: None,
             slots,
             index,
             clients_max: max_clients,
@@ -851,6 +879,7 @@ impl ClientTable {
             }
             slots[slot_idx] = Some(ClientEntry {
                 epoch: entry.epoch,
+                attachment: None,
                 user_id: entry.user_id,
                 watermark: entry.watermark,
                 watermark_checksum: entry.watermark_checksum,
@@ -862,6 +891,7 @@ impl ClientTable {
         }
         let clients_max = slots.len();
         let mut table = Self {
+            consumer_group_attachment: None,
             slots,
             index,
             clients_max,
@@ -1023,6 +1053,7 @@ impl ClientTable {
                 entry.epoch
             );
             entry.epoch = epoch;
+            entry.attachment = None;
             entry.user_id = user_id;
             // Drop the previous register reply (if still retained) before
             // pushing the new one: only the newest rebind's reply is
@@ -1066,6 +1097,7 @@ impl ClientTable {
             ring.push_back(cached);
             self.slots[slot_idx] = Some(ClientEntry {
                 epoch,
+                attachment: None,
                 user_id,
                 client_id,
                 latest_commit,
@@ -1653,6 +1685,34 @@ impl ClientTable {
         self.slots[slot_idx].as_ref().map(|entry| entry.epoch)
     }
 
+    /// Attach only after the caller has authenticated `user_id` and waited
+    /// for the local metadata frontier to cover the requested session.
+    pub fn attach_session(
+        &mut self,
+        client_id: u128,
+        session: u64,
+        user_id: u32,
+    ) -> Option<SessionAttachment> {
+        let &slot_idx = self.index.get(&client_id)?;
+        let entry = self.slots[slot_idx].as_mut()?;
+        if entry.epoch != session || entry.user_id != user_id || session == 0 {
+            return None;
+        }
+        let attachment = entry.attachment.get_or_insert_with(|| Arc::new(()));
+        let group_view = self
+            .consumer_group_attachment
+            .get_or_insert_with(|| Arc::new(()));
+        Some(SessionAttachment {
+            session: Arc::downgrade(attachment),
+            group_view: Arc::downgrade(group_view),
+        })
+    }
+
+    /// Fence pending data polls before publishing a changed group assignment.
+    pub fn invalidate_consumer_group_attachments(&mut self) {
+        self.consumer_group_attachment = None;
+    }
+
     /// Every registered client id, in slot order.
     ///
     /// Boot-time only: the id minter reseeds above the highest recovered
@@ -1967,6 +2027,7 @@ impl ClientTable {
                 .commit;
             table.slots[slot_idx] = Some(ClientEntry {
                 epoch,
+                attachment: None,
                 user_id,
                 watermark,
                 watermark_checksum,
@@ -2064,6 +2125,7 @@ impl ClientEntry {
     ) -> Self {
         Self {
             epoch: 0,
+            attachment: None,
             user_id,
             watermark,
             watermark_checksum: 0,
@@ -2149,6 +2211,97 @@ mod tests {
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
     const TEST_USER_ID: u32 = 7;
+
+    #[test]
+    fn group_assignment_changes_require_reattachment_without_ending_the_session() {
+        const CLIENT: u128 = 41;
+        let mut table = ClientTable::new(1);
+        table.commit_register(CLIENT, TEST_USER_ID, make_register_reply(CLIENT, 1));
+        let attached = table.attach_session(CLIENT, 1, TEST_USER_ID).unwrap();
+        table.invalidate_consumer_group_attachments();
+        assert!(!attached.is_valid());
+        assert!(attached.session_is_valid());
+        assert!(
+            table
+                .attach_session(CLIENT, 1, TEST_USER_ID)
+                .unwrap()
+                .is_valid()
+        );
+        assert!(
+            !attached.is_valid(),
+            "reattachment cannot revive an old read"
+        );
+    }
+
+    #[test]
+    fn session_attachments_require_the_owner_and_end_with_the_epoch() {
+        const CLIENT: u128 = 41;
+        const FIRST_SESSION: u64 = 1;
+        const NEXT_SESSION: u64 = 2;
+        let mut table = ClientTable::new(1);
+        table.commit_register(
+            CLIENT,
+            TEST_USER_ID,
+            make_register_reply(CLIENT, FIRST_SESSION),
+        );
+        assert!(
+            table
+                .attach_session(CLIENT, FIRST_SESSION, TEST_USER_ID + 1)
+                .is_none()
+        );
+        assert!(
+            table
+                .attach_session(CLIENT, NEXT_SESSION, TEST_USER_ID)
+                .is_none()
+        );
+        let attached = table
+            .attach_session(CLIENT, FIRST_SESSION, TEST_USER_ID)
+            .unwrap();
+        assert!(attached.is_valid());
+        table.commit_register(
+            CLIENT,
+            TEST_USER_ID,
+            make_register_reply(CLIENT, NEXT_SESSION),
+        );
+        assert!(!attached.is_valid());
+
+        let attached = table
+            .attach_session(CLIENT, NEXT_SESSION, TEST_USER_ID)
+            .unwrap();
+        table.remove_client(CLIENT, TEST_USER_ID, SessionEnd::DisconnectCleanup);
+        assert!(!attached.is_valid());
+        assert!(
+            table
+                .attach_session(CLIENT, NEXT_SESSION, TEST_USER_ID)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_attachments_do_not_survive_eviction_or_table_replacement() {
+        const CLIENT: u128 = 41;
+        const OTHER_CLIENT: u128 = 42;
+        let mut table = ClientTable::new(1);
+        table.commit_register(CLIENT, TEST_USER_ID, make_register_reply(CLIENT, 1));
+        let attached = table.attach_session(CLIENT, 1, TEST_USER_ID).unwrap();
+        table.commit_register(
+            OTHER_CLIENT,
+            TEST_USER_ID,
+            make_register_reply(OTHER_CLIENT, 2),
+        );
+        assert!(!attached.is_valid());
+
+        let attached = table.attach_session(OTHER_CLIENT, 2, TEST_USER_ID).unwrap();
+        let restored = ClientTable::from_snapshot(table.to_snapshot(), 1).unwrap();
+        table = restored;
+        assert!(!attached.is_valid());
+        assert!(
+            table
+                .attach_session(OTHER_CLIENT, 2, TEST_USER_ID)
+                .unwrap()
+                .is_valid()
+        );
+    }
 
     /// Capacity eviction reclaims an entry's replies but must not reset its
     /// dedup fence: the evicted client's own resume is a rebind in everything
