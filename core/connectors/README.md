@@ -51,7 +51,7 @@ Run these commands from the root of the same Iggy source checkout used for the s
 
     ```bash
     target/release/iggy --username iggy --password iggy stream create example_stream
-    target/release/iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
+    target/release/iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d --durability persisted
     target/release/iggy --username iggy --password iggy stream create qw
     target/release/iggy --username iggy --password iggy topic create qw records 1 none 1d
     ```
