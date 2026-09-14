@@ -357,6 +357,40 @@ const startPollCluster = async (
 
 describe('primary auto-commit polling', () => {
   for (const transport of ['TCP', 'TLS'] as const) {
+    for (const refused of [false, true]) {
+      it(`preserves raw poll responses over ${transport}${refused ? ' after a refusal' : ''}`, async () => {
+        const expected = replyFrame(Operation.NonReplicated, Buffer.from('raw primary'));
+        let polls = 0;
+        const cluster = await startPollCluster((frame, socket) => {
+          if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesOnPrimary)
+            return false;
+          polls += 1;
+          socket.write(refused && polls === 1
+            ? replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58)
+            : expected);
+          return true;
+        }, undefined, transport);
+        let resets = 0;
+        cluster.client.on('sessionReset', () => { resets += 1; });
+        try {
+          for (let poll = 0; poll < 2; poll += 1) {
+            const response = await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
+              { handleResponse: false });
+            assert.ok(Buffer.isBuffer(response), 'raw polls must return the complete VSR frame');
+            assert.deepEqual(response, expected);
+          }
+          assert.equal(polls, refused ? 3 : 2);
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), refused ? 2 : 1);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.AttachConsumerSession), refused ? 2 : 1);
+          assert.equal(resets, 0);
+        } finally {
+          await cluster.close();
+        }
+      });
+    }
+  }
+
+  for (const transport of ['TCP', 'TLS'] as const) {
     it(`retains the coordinator session and reuses authenticated primary polls over ${transport}`, async () => {
       const cluster = await startPollCluster(undefined, undefined, transport);
       const { client, primary, coordinator } = cluster;

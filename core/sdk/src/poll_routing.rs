@@ -18,6 +18,7 @@
 //! Auto-commit polls and offset writes use persistent data connections while
 //! the coordinator retains group membership. Only explicit non-admission permits
 //! rerouting. Replicated writes keep the data session's own deduplication identity.
+//! Routes and attachments are fenced by the coordinator's session generation.
 //! Cluster routing requires servers supporting the routing and attachment commands.
 
 use crate::leader_aware::{node_address, transport_port};
@@ -83,6 +84,7 @@ pub(crate) trait PollTransport: BinaryClient + Send + Sync + Sized {
 
 #[derive(Debug)]
 struct PollRoute {
+    generation: u64,
     endpoint: String,
     consumer_session: AttachConsumerSessionRequest,
 }
@@ -102,6 +104,7 @@ pub(crate) struct PollRouter<T> {
     pub(crate) metadata_watermark: Arc<AtomicU64>,
     /// Zero means no successful topology read, not a standalone server.
     pub(crate) roster_size: AtomicUsize,
+    session_generation: AtomicU64,
     routes: Mutex<HashMap<RouteKey, Arc<PollRoute>>>,
     connections: Mutex<HashMap<String, ConnectionSlot<T>>>,
     credentials: Mutex<Option<(Credentials, u32)>>,
@@ -113,6 +116,7 @@ impl<T> Default for PollRouter<T> {
         Self {
             metadata_watermark: Arc::default(),
             roster_size: AtomicUsize::new(0),
+            session_generation: AtomicU64::new(0),
             routes: Mutex::default(),
             connections: Mutex::default(),
             credentials: Mutex::default(),
@@ -127,14 +131,18 @@ impl<T> PollRouter<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        self.routes
+        let mut routes = self
+            .routes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.connections
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut connections = self
+            .connections
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Serialize invalidation with route and connection publication.
+        self.session_generation.fetch_add(1, Ordering::AcqRel);
+        routes.clear();
+        connections.clear();
     }
 
     pub(crate) fn remember_credentials(&self, credentials: Credentials, user_id: u32) {
@@ -311,6 +319,7 @@ impl<T: PollTransport> PollRouter<T> {
                 .connections
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.validate_route(&route)?;
             if let Some(slot) = connections.get(&route.endpoint) {
                 Arc::clone(slot)
             } else {
@@ -324,6 +333,7 @@ impl<T: PollTransport> PollRouter<T> {
             }
         };
         let mut connection = slot.lock().await;
+        self.validate_route(&route)?;
         if connection
             .as_ref()
             .is_some_and(|connection| !connection.usable)
@@ -338,6 +348,7 @@ impl<T: PollTransport> PollRouter<T> {
                 }
                 Err(error) => return Err(error),
             };
+            self.validate_route(&route)?;
             *connection = Some(PollConnection {
                 client,
                 consumer_session: None,
@@ -365,6 +376,7 @@ impl<T: PollTransport> PollRouter<T> {
                 .map_err(unaccepted_data_error)?;
             connection.consumer_session = Some(route.consumer_session);
         }
+        self.validate_route(&route)?;
         let result = connection
             .client
             .send_poll_request(code, payload.clone())
@@ -394,14 +406,16 @@ impl<T: PollTransport> PollRouter<T> {
         key: &RouteKey,
         payload: &Bytes,
     ) -> Result<Arc<PollRoute>, IggyError> {
+        let generation = self.session_generation.load(Ordering::Acquire);
         if let Some(route) = self
             .routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .filter(|route| {
-                route.consumer_session.metadata_watermark
-                    >= self.metadata_watermark.load(Ordering::Acquire)
+                route.generation == generation
+                    && route.consumer_session.metadata_watermark
+                        >= self.metadata_watermark.load(Ordering::Acquire)
             })
         {
             return Ok(Arc::clone(route));
@@ -429,6 +443,7 @@ impl<T: PollTransport> PollRouter<T> {
             return Err(IggyError::FeatureUnavailable);
         }
         let route = Arc::new(PollRoute {
+            generation,
             endpoint: node_address(&node, port),
             consumer_session: response.consumer_session,
         });
@@ -436,11 +451,22 @@ impl<T: PollTransport> PollRouter<T> {
             .routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.validate_route(&route)?;
         if routes.len() >= MAX_CACHED_ROUTES {
             routes.clear();
         }
         routes.insert(key.clone(), Arc::clone(&route));
         Ok(route)
+    }
+
+    fn validate_route(&self, route: &PollRoute) -> Result<(), IggyError> {
+        if route.generation != self.session_generation.load(Ordering::Acquire)
+            || route.consumer_session.metadata_watermark
+                < self.metadata_watermark.load(Ordering::Acquire)
+        {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        Ok(())
     }
 }
 
@@ -498,6 +524,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::str::FromStr;
     use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Channel {
@@ -508,11 +535,42 @@ mod tests {
 
     type Exchange = (Channel, u32, Result<Bytes, IggyError>);
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PausePoint {
+        Connect,
+        Reply(u32),
+    }
+
+    #[derive(Debug)]
+    struct Pause {
+        point: PausePoint,
+        reached: Notify,
+        resume: Notify,
+    }
+
     #[derive(Debug, Default)]
     struct Script {
         exchanges: Mutex<VecDeque<Exchange>>,
-        attachments: Mutex<Vec<u64>>,
+        attachments: Mutex<Vec<AttachConsumerSessionRequest>>,
         connections: AtomicUsize,
+        pause: Mutex<Option<Arc<Pause>>>,
+    }
+
+    impl Script {
+        async fn pause_at(&self, point: PausePoint) {
+            let pause = {
+                let mut pause = self.pause.lock().unwrap();
+                if pause.as_ref().is_some_and(|pause| pause.point == point) {
+                    pause.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -537,11 +595,11 @@ mod tests {
                 .expect("unexpected request");
             assert_eq!((channel, code), (expected_channel, expected_code));
             if code == ATTACH_CONSUMER_SESSION_CODE {
-                self.script.attachments.lock().unwrap().push(
-                    AttachConsumerSessionRequest::decode_from(payload)
-                        .unwrap()
-                        .metadata_watermark,
-                );
+                self.script
+                    .attachments
+                    .lock()
+                    .unwrap()
+                    .push(AttachConsumerSessionRequest::decode_from(payload).unwrap());
             }
             result
         }
@@ -606,13 +664,179 @@ mod tests {
         const PROTOCOL: TransportProtocol = TransportProtocol::Tcp;
         async fn connect_poll_client(&self, _endpoint: &str) -> Result<Self, IggyError> {
             self.script.connections.fetch_add(1, Ordering::Relaxed);
+            self.script.pause_at(PausePoint::Connect).await;
             Ok(Self {
                 channel: Channel::Data,
                 script: Arc::clone(&self.script),
             })
         }
         async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-            self.exchange(self.channel, code, &payload)
+            let result = self.exchange(self.channel, code, &payload);
+            self.script.pause_at(PausePoint::Reply(code)).await;
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_fences_in_flight_routes_connections_and_attachments() {
+        for code in [
+            POLL_MESSAGES_ON_PRIMARY_CODE,
+            STORE_CONSUMER_OFFSET_CODE,
+            DELETE_CONSUMER_OFFSET_CODE,
+        ] {
+            let routing_code = if code == POLL_MESSAGES_ON_PRIMARY_CODE {
+                GET_POLL_ROUTING_CODE
+            } else {
+                GET_CONSUMER_OFFSET_ROUTING_CODE
+            };
+            for point in [
+                PausePoint::Reply(routing_code),
+                PausePoint::Connect,
+                PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE),
+            ] {
+                let mut replacement = PollRoutingResponse::decode_from(&routing()).unwrap();
+                replacement.consumer_session.session = 2;
+                let mut exchanges = vec![(Channel::Coordinator, routing_code, Ok(routing()))];
+                if point == PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE) {
+                    exchanges.push((
+                        Channel::Data,
+                        ATTACH_CONSUMER_SESSION_CODE,
+                        Ok(Bytes::new()),
+                    ));
+                }
+                exchanges.extend([
+                    (
+                        Channel::Coordinator,
+                        routing_code,
+                        Ok(replacement.to_bytes()),
+                    ),
+                    (
+                        Channel::Data,
+                        ATTACH_CONSUMER_SESSION_CODE,
+                        Ok(Bytes::new()),
+                    ),
+                    (Channel::Data, code, Ok(Bytes::from_static(b"resumed"))),
+                    (Channel::Data, code, Ok(Bytes::from_static(b"warm"))),
+                ]);
+                let (router, coordinator, request) = fixture(exchanges);
+                let pause = Arc::new(Pause {
+                    point,
+                    reached: Notify::new(),
+                    resume: Notify::new(),
+                });
+                *coordinator.script.pause.lock().unwrap() = Some(Arc::clone(&pause));
+                let pending = routed_request(&router, &coordinator, &request, code);
+                tokio::pin!(pending);
+                tokio::select! {
+                    result = &mut pending => panic!("request finished before reconnect: {result:?}"),
+                    () = pause.reached.notified() => {}
+                }
+                router.clear_session();
+                router.clear_session();
+                router.metadata_watermark.store(11, Ordering::Release);
+                pause.resume.notify_one();
+
+                assert_eq!(pending.await.unwrap(), "resumed", "{code} at {point:?}");
+                assert_eq!(
+                    routed_request(&router, &coordinator, &request, code)
+                        .await
+                        .unwrap(),
+                    "warm"
+                );
+                let routes = router.routes.lock().unwrap();
+                assert_eq!(routes.len(), 1);
+                assert!(routes.iter().all(|((command, _), route)| {
+                    *command == routing_code && route.consumer_session.session == 2
+                }));
+                replacement.consumer_session.metadata_watermark = 11;
+                assert_eq!(
+                    *coordinator.script.attachments.lock().unwrap(),
+                    if point == PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE) {
+                        vec![
+                            PollRoutingResponse::decode_from(&routing())
+                                .unwrap()
+                                .consumer_session,
+                            replacement.consumer_session,
+                        ]
+                    } else {
+                        vec![replacement.consumer_session]
+                    }
+                );
+                assert_eq!(
+                    coordinator.script.connections.load(Ordering::Relaxed),
+                    if point == PausePoint::Reply(routing_code) {
+                        1
+                    } else {
+                        2
+                    }
+                );
+                assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_fences_queued_requests_without_replaying_in_flight_data() {
+        for code in [
+            POLL_MESSAGES_ON_PRIMARY_CODE,
+            STORE_CONSUMER_OFFSET_CODE,
+            DELETE_CONSUMER_OFFSET_CODE,
+        ] {
+            let routing_code = if code == POLL_MESSAGES_ON_PRIMARY_CODE {
+                GET_POLL_ROUTING_CODE
+            } else {
+                GET_CONSUMER_OFFSET_ROUTING_CODE
+            };
+            let mut replacement = PollRoutingResponse::decode_from(&routing()).unwrap();
+            replacement.consumer_session.session = 2;
+            let (router, coordinator, request) = fixture([
+                (Channel::Coordinator, routing_code, Ok(routing())),
+                (
+                    Channel::Data,
+                    ATTACH_CONSUMER_SESSION_CODE,
+                    Ok(Bytes::new()),
+                ),
+                (Channel::Data, code, Ok(Bytes::from_static(b"in flight"))),
+                (
+                    Channel::Coordinator,
+                    routing_code,
+                    Ok(replacement.to_bytes()),
+                ),
+                (
+                    Channel::Data,
+                    ATTACH_CONSUMER_SESSION_CODE,
+                    Ok(Bytes::new()),
+                ),
+                (Channel::Data, code, Ok(Bytes::from_static(b"queued"))),
+            ]);
+            let pause = Arc::new(Pause {
+                point: PausePoint::Reply(code),
+                reached: Notify::new(),
+                resume: Notify::new(),
+            });
+            *coordinator.script.pause.lock().unwrap() = Some(Arc::clone(&pause));
+            let in_flight = routed_request(&router, &coordinator, &request, code);
+            tokio::pin!(in_flight);
+            tokio::select! {
+                result = &mut in_flight => panic!("data reply was not paused: {result:?}"),
+                () = pause.reached.notified() => {}
+            }
+            let queued = routed_request(&router, &coordinator, &request, code);
+            tokio::pin!(queued);
+            assert!(futures::poll!(&mut queued).is_pending());
+            router.clear_session();
+            router.clear_session();
+            pause.resume.notify_one();
+
+            let (in_flight, queued) = tokio::join!(in_flight, queued);
+            assert_eq!(in_flight.unwrap(), "in flight");
+            assert_eq!(queued.unwrap(), "queued");
+            assert_eq!(
+                coordinator.script.attachments.lock().unwrap().last(),
+                Some(&replacement.consumer_session)
+            );
+            assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 2);
+            assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
         }
     }
 
@@ -768,7 +992,17 @@ mod tests {
             "after metadata"
         );
         assert_eq!(router.poll(&coordinator, &request).await.unwrap(), "warm");
-        assert_eq!(*coordinator.script.attachments.lock().unwrap(), [1, 11]);
+        assert_eq!(
+            coordinator
+                .script
+                .attachments
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|session| session.metadata_watermark)
+                .collect::<Vec<_>>(),
+            [1, 11]
+        );
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
         assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
     }
@@ -850,7 +1084,17 @@ mod tests {
             "resumed"
         );
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
-        assert_eq!(*coordinator.script.attachments.lock().unwrap(), [1]);
+        assert_eq!(
+            coordinator
+                .script
+                .attachments
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|session| session.metadata_watermark)
+                .collect::<Vec<_>>(),
+            [1]
+        );
         assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
     }
 
@@ -897,6 +1141,36 @@ mod tests {
         );
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 2);
         assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+    }
+
+    async fn routed_request(
+        router: &PollRouter<Transport>,
+        coordinator: &Transport,
+        request: &PollMessagesRequest,
+        code: u32,
+    ) -> Result<Bytes, IggyError> {
+        let payload = match code {
+            POLL_MESSAGES_ON_PRIMARY_CODE => return router.poll(coordinator, request).await,
+            STORE_CONSUMER_OFFSET_CODE => StoreConsumerOffsetRequest {
+                consumer: request.consumer.clone(),
+                stream_id: request.stream_id.clone(),
+                topic_id: request.topic_id.clone(),
+                partition_id: request.partition_id,
+                offset: 10,
+                ack: AckLevel::Quorum,
+            }
+            .to_bytes(),
+            DELETE_CONSUMER_OFFSET_CODE => DeleteConsumerOffsetRequest {
+                consumer: request.consumer.clone(),
+                stream_id: request.stream_id.clone(),
+                topic_id: request.topic_id.clone(),
+                partition_id: request.partition_id,
+                ack: AckLevel::Quorum,
+            }
+            .to_bytes(),
+            _ => panic!("unexpected routed command: {code}"),
+        };
+        router.write_offset(coordinator, code, payload).await
     }
 
     fn fixture(

@@ -36,7 +36,7 @@ import { deserializeNode } from '../wire/cluster/cluster.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { serializeIdentifier } from '../wire/identifier.utils.js';
 import {
-  Command, HEADER_SIZE, REPLY_OFFSET, peekCommand, readReplyOperation
+  Command, HEADER_SIZE, REPLY_OFFSET, peekCommand, readReplyOperation, readStatus
 } from '../wire/vsr/header.js';
 import { Operation, isKnownOperation } from '../wire/vsr/operation.js';
 import {
@@ -336,7 +336,7 @@ export class CommandResponseStream extends EventEmitter {
         if (this.clustered === undefined)
           throw new Error('cannot determine the poll routing topology');
         if (this.clustered)
-          return await this._pollOnPrimary(payload, deadline);
+          return await this._pollOnPrimary(payload, deadline, handleResponse);
       }
 
       // The roster read is itself a queued command and the queue is
@@ -585,7 +585,8 @@ export class CommandResponseStream extends EventEmitter {
 
   private async _pollOnPrimary(
     payload: Buffer,
-    deadline: number
+    deadline: number,
+    handleResponse: boolean
   ): Promise<CommandResponse> {
     const key = payload.subarray(0, -POLL_OPTIONS_SIZE).toString('hex');
     while (Date.now() < deadline && !this.connection.ending) {
@@ -673,7 +674,7 @@ export class CommandResponseStream extends EventEmitter {
             throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
           polling = true;
           return await entry.client._queueCommand(COMMAND_CODE.PollMessagesOnPrimary,
-            payload, true, true, false, deadline);
+            payload, handleResponse, true, false, deadline);
         } catch (error) {
           if (error instanceof ResponseError &&
               error.errorCode === TRANSIENT_NOT_ACCEPTED) {
@@ -911,8 +912,14 @@ export class CommandResponseStream extends EventEmitter {
           requestWritten ||= exchangeState.written;
         }
         this._observeMetadataReply(response);
-        if (!handleResp)
+        if (!handleResp) {
+          // Routing still needs refusals when the caller decodes the frame.
+          if (command === COMMAND_CODE.PollMessagesOnPrimary &&
+              peekCommand(response) === Command.Reply &&
+              readStatus(response) === TRANSIENT_NOT_ACCEPTED)
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
           return response as unknown as CommandResponse;
+        }
         try {
           parsed = decodeVsrResponse(response, command);
           break;
