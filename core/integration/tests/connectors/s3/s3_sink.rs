@@ -21,7 +21,7 @@ use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
-use iggy_connector_sdk::api::SinkInfoResponse;
+use iggy_connector_sdk::api::{ConnectorStatus, SinkInfoResponse};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
@@ -53,6 +53,22 @@ async fn s3_sink_initializes_and_runs(harness: &TestHarness, fixture: S3SinkFixt
     assert_eq!(sinks.len(), 1);
     assert_eq!(sinks[0].key, S3_SINK_KEY);
     assert!(sinks[0].enabled);
+    assert_eq!(sinks[0].status, ConnectorStatus::Running);
+
+    let keys = fixture.list_objects("").await.expect("List data objects");
+    assert!(
+        keys.is_empty(),
+        "Startup must not publish probe objects: {keys:?}"
+    );
+    let uploads = fixture
+        .bucket()
+        .list_multiparts_uploads(None, None)
+        .await
+        .expect("List multipart uploads");
+    assert!(
+        uploads.iter().all(|page| page.uploads.is_empty()),
+        "Startup must abort its multipart probe: {uploads:?}"
+    );
 
     drop(fixture);
 }

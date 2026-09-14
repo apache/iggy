@@ -111,7 +111,9 @@ The pinned `aws-creds` chain tries these sources in order:
 
 For temporary key pairs, supply the token through the environment or shared credentials file. This is not the AWS SDK credential chain.
 
-Startup validates configuration and loads credentials without writing probe objects. Bucket access is checked by the first real upload, so missing buckets, denied writes and endpoint failures surface then. The sink requires `PutObject` on data and loss-marker keys; neither `ListBucket` nor `DeleteObject` is required.
+Startup initiates a multipart upload at `<prefix>/.iggy-sink-probe` (bucket root when the prefix is empty) and aborts it before consuming messages. No parts are uploaded and no object is published or deleted. Both steps must succeed: missing buckets, denied writes or failed cleanup prevent startup. The credentials need `s3:PutObject` and `s3:AbortMultipartUpload` on the probe key, plus `s3:PutObject` on data and loss-marker keys. Neither `ListBucket` nor `DeleteObject` is required.
+
+Each probe step uses `max_attempts` and `retry_delay` for HTTP 408, 429 and 5xx failures. Abort also retries transport failures. Initiation does not add retries for an ambiguous transport failure because the upload ID may be lost; rust-s3 can still retry internally. A crash or lost response can leave an incomplete upload, so configure an `AbortIncompleteMultipartUpload` lifecycle rule. Failed aborts report the upload ID for cleanup.
 
 ## Output Example
 

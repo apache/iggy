@@ -20,13 +20,16 @@ use crate::formatter;
 use crate::path::{PathContext, render_s3_key};
 use crate::{BufferKey, S3Sink};
 use async_trait::async_trait;
-use iggy_connector_sdk::retry::retry_backoff;
+use iggy_connector_sdk::retry::{RetryPolicy, retry_async, retry_backoff};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use s3::error::S3Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const PROBE_KEY: &str = ".iggy-sink-probe";
+const PROBE_CONTENT_TYPE: &str = "application/octet-stream";
 
 struct FlushPayload {
     data: Vec<u8>,
@@ -43,7 +46,9 @@ impl Sink for S3Sink {
 
         self.validate_and_parse_config()?;
 
-        self.bucket = Some(crate::client::create_bucket(&self.config).await?);
+        let bucket = crate::client::create_bucket(&self.config).await?;
+        self.check_write_access(&bucket).await?;
+        self.bucket = Some(bucket);
 
         info!(
             "S3 sink ID: {} opened. format={}, rotation={}, max_file_size={}, template='{}'",
@@ -181,6 +186,62 @@ impl Sink for S3Sink {
 }
 
 impl S3Sink {
+    async fn check_write_access(&self, bucket: &s3::Bucket) -> Result<(), Error> {
+        let prefix = self
+            .config
+            .prefix
+            .as_deref()
+            .unwrap_or_default()
+            .trim_matches('/');
+        let probe_key = if prefix.is_empty() {
+            PROBE_KEY.to_string()
+        } else {
+            format!("{prefix}/{PROBE_KEY}")
+        };
+        let resolved = self.resolved();
+        let policy = RetryPolicy {
+            max_attempts: resolved.max_attempts,
+            base_delay: resolved.retry_delay,
+            max_delay: MAX_BACKOFF,
+        };
+
+        // Initiation checks PutObject without publishing an object. A transport
+        // failure can lose the upload ID, so do not retry that ambiguous result.
+        let upload = retry_async(
+            policy,
+            &format!("S3 sink ID: {} initiate write probe", self.id),
+            |error| matches!(error, S3Error::HttpFailWithBody(status, _) if is_retriable_status(*status)),
+            || bucket.initiate_multipart_upload(&probe_key, PROBE_CONTENT_TYPE),
+        )
+        .await
+        .map_err(|error| Error::InitError(format!(
+            "S3 bucket '{}' write probe at '{probe_key}' failed: {error}", bucket.name
+        )))?;
+
+        if upload.upload_id.is_empty() {
+            return Err(Error::InitError(format!(
+                "S3 bucket '{}' write probe at '{probe_key}' returned an empty upload ID",
+                bucket.name
+            )));
+        }
+
+        retry_async(
+            policy,
+            &format!("S3 sink ID: {} abort write probe", self.id),
+            |error| match error {
+                S3Error::HttpFailWithBody(status, _) => is_retriable_status(*status),
+                S3Error::Reqwest(_) => true,
+                _ => false,
+            },
+            || bucket.abort_upload(&probe_key, &upload.upload_id),
+        )
+        .await
+        .map_err(|error| Error::InitError(format!(
+            "S3 bucket '{}' could not abort write probe at '{probe_key}' (upload ID '{}'); s3:AbortMultipartUpload permission is required: {error}",
+            bucket.name, upload.upload_id
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn process_messages_inner(
         &self,
@@ -396,7 +457,7 @@ fn is_retriable_status(status: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use iggy_connector_sdk::{Payload, Schema};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{any, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -404,6 +465,32 @@ mod tests {
         DEFAULT_MAX_FILE_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PATH_TEMPLATE, FileRotation, S3Sink,
         S3SinkConfig,
     };
+
+    const TEST_UPLOAD_ID: &str = "test-upload-id";
+
+    fn probe_response(probe_key: &str, upload_id: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_string(format!(
+            "<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>{probe_key}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+        ))
+    }
+
+    async fn mock_write_probe(server: &MockServer, probe_key: &str) {
+        let probe_path = format!("/test-bucket/{probe_key}");
+        Mock::given(method("POST"))
+            .and(path(&probe_path))
+            .and(query_param("uploads", ""))
+            .respond_with(probe_response(probe_key, TEST_UPLOAD_ID))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(&probe_path))
+            .and(query_param("uploadId", TEST_UPLOAD_ID))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
 
     fn test_config() -> S3SinkConfig {
         S3SinkConfig {
@@ -427,10 +514,51 @@ mod tests {
     }
 
     #[test]
-    fn given_put_only_permissions_when_opening_should_write_only_uploaded_data() {
+    fn given_an_unwritable_bucket_when_opening_should_fail_before_consumption() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for (status, expected_attempts) in [(403, 1), (404, 1), (503, 2)] {
+                let server = MockServer::start().await;
+                Mock::given(any())
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&server)
+                    .await;
+                let config = S3SinkConfig {
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    max_attempts: Some(2),
+                    retry_delay: Some("1ms".to_string()),
+                    ..test_config()
+                };
+                let mut sink = S3Sink::new(1, config);
+
+                let result = sink.open().await;
+
+                assert!(
+                    matches!(result, Err(Error::InitError(_))),
+                    "S3 status {status} must prevent startup: {result:?}"
+                );
+                assert!(
+                    sink.bucket.is_none(),
+                    "An unwritable sink must remain unopened"
+                );
+                let requests = server.received_requests().await.expect("record requests");
+                assert_eq!(requests.len(), expected_attempts);
+                assert!(requests.iter().all(|request| request.method == "POST"));
+                let state = sink.state.lock().await;
+                assert_eq!(state.messages_received, 0);
+                assert_eq!(state.messages_lost, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn given_a_multipart_probe_when_opening_should_abort_before_uploading_data() {
         let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
         runtime.block_on(async {
             let server = MockServer::start().await;
+            mock_write_probe(&server, "allowed/events/.iggy-sink-probe").await;
             Mock::given(method("PUT"))
                 .respond_with(ResponseTemplate::new(200))
                 .mount(&server)
@@ -448,10 +576,10 @@ mod tests {
             };
             let mut sink = S3Sink::new(1, config);
             sink.open().await.expect("Sink should initialize");
-            assert!(
-                server.received_requests().await.expect("record requests").is_empty(),
-                "Opening the sink must not create probe objects or require other S3 permissions"
-            );
+            let requests = server.received_requests().await.expect("record requests");
+            assert_eq!(requests.len(), 2, "Startup must initiate and abort the probe");
+            assert_eq!(requests[0].method, "POST");
+            assert_eq!(requests[1].method, "DELETE");
 
             sink.consume(
                 &TopicMetadata {
@@ -474,14 +602,15 @@ mod tests {
                 }],
             )
             .await
-            .expect("PutObject-only access should allow data uploads");
+            .expect("Data upload should succeed after the probe is cleaned up");
             sink.close().await.expect("Sink should close");
 
             let requests = server.received_requests().await.expect("record requests");
-            assert_eq!(requests.len(), 1, "Only the data object should be written");
-            assert_eq!(requests[0].body, b"message");
+            assert_eq!(requests.len(), 3, "Only the data object should be written after the probe");
+            assert_eq!(requests[2].method, "PUT");
+            assert_eq!(requests[2].body, b"message");
             assert_eq!(
-                requests[0].url.path(),
+                requests[2].url.path(),
                 "/test-bucket/allowed/events/messages/00000-00000000000000000000-00000000000000000000.bin"
             );
             let state = sink.state.lock().await;
@@ -491,11 +620,141 @@ mod tests {
     }
 
     #[test]
+    fn given_a_probe_prefix_when_opening_should_use_the_configured_write_scope() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for (prefix, probe_key) in [
+                (None, ".iggy-sink-probe"),
+                (Some(""), ".iggy-sink-probe"),
+                (Some("/"), ".iggy-sink-probe"),
+                (Some("/allowed/events/"), "allowed/events/.iggy-sink-probe"),
+            ] {
+                let server = MockServer::start().await;
+                mock_write_probe(&server, probe_key).await;
+                let config = S3SinkConfig {
+                    prefix: prefix.map(str::to_string),
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    ..test_config()
+                };
+                let mut sink = S3Sink::new(1, config);
+
+                sink.open()
+                    .await
+                    .expect("Probe should succeed within the configured prefix");
+            }
+        });
+    }
+
+    #[test]
+    fn given_transient_probe_failures_when_opening_should_retry_the_failed_step() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for operation in ["POST", "DELETE"] {
+                for status in [408, 429, 503] {
+                    let server = MockServer::start().await;
+                    Mock::given(method(operation))
+                        .and(path("/test-bucket/data/.iggy-sink-probe"))
+                        .respond_with(ResponseTemplate::new(status))
+                        .up_to_n_times(1)
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    mock_write_probe(&server, "data/.iggy-sink-probe").await;
+                    let config = S3SinkConfig {
+                        endpoint: Some(server.uri()),
+                        access_key_id: Some("test-access-key".into()),
+                        secret_access_key: Some("test-secret-key".into()),
+                        max_attempts: Some(2),
+                        retry_delay: Some("1ms".to_string()),
+                        ..test_config()
+                    };
+                    let mut sink = S3Sink::new(1, config);
+
+                    sink.open()
+                        .await
+                        .expect("Transient probe failure should recover");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn given_a_failed_probe_abort_when_opening_should_refuse_startup() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for (status, expected_attempts) in [(403, 1), (503, 2)] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/test-bucket/data/.iggy-sink-probe"))
+                    .and(query_param("uploads", ""))
+                    .respond_with(probe_response("data/.iggy-sink-probe", TEST_UPLOAD_ID))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("DELETE"))
+                    .and(path("/test-bucket/data/.iggy-sink-probe"))
+                    .and(query_param("uploadId", TEST_UPLOAD_ID))
+                    .respond_with(ResponseTemplate::new(status))
+                    .expect(expected_attempts)
+                    .mount(&server)
+                    .await;
+                let config = S3SinkConfig {
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    max_attempts: Some(2),
+                    retry_delay: Some("1ms".to_string()),
+                    ..test_config()
+                };
+                let mut sink = S3Sink::new(1, config);
+
+                let result = sink.open().await;
+
+                assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
+                assert!(sink.bucket.is_none(), "Cleanup must succeed before opening");
+            }
+        });
+    }
+
+    #[test]
+    fn given_an_empty_upload_id_when_probing_should_fail_without_a_delete_request() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(probe_response("data/.iggy-sink-probe", ""))
+                .mount(&server)
+                .await;
+            let config = S3SinkConfig {
+                endpoint: Some(server.uri()),
+                access_key_id: Some("test-access-key".into()),
+                secret_access_key: Some("test-secret-key".into()),
+                ..test_config()
+            };
+            let mut sink = S3Sink::new(1, config);
+
+            let result = sink.open().await;
+
+            assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
+            let requests = server.received_requests().await.expect("record requests");
+            assert_eq!(
+                requests.len(),
+                1,
+                "An abort must identify the multipart upload"
+            );
+            assert_eq!(requests[0].method, "POST");
+        });
+    }
+
+    #[test]
     fn given_upload_status_when_writing_should_retry_only_transient_failures() {
         let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
         runtime.block_on(async {
             for status in [200, 403, 404, 408, 429, 503] {
                 let server = MockServer::start().await;
+                mock_write_probe(&server, "data/.iggy-sink-probe").await;
                 Mock::given(method("PUT"))
                     .and(path("/test-bucket/data/message.bin"))
                     .respond_with(ResponseTemplate::new(status))
@@ -546,6 +805,7 @@ mod tests {
         runtime.block_on(async {
             for previously_buffered in [0, 1] {
                 let server = MockServer::start().await;
+                mock_write_probe(&server, "data/.iggy-sink-probe").await;
                 let config = S3SinkConfig {
                     endpoint: Some(server.uri()),
                     access_key_id: Some("test-access-key".into()),
