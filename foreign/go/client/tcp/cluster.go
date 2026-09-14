@@ -19,8 +19,10 @@ package tcp
 
 import (
 	"context"
+	"fmt"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
@@ -33,6 +35,9 @@ func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.Cluster
 	err = metadata.UnmarshalBinary(response)
 	if err != nil {
 		return nil, err
+	}
+	if len(metadata.Nodes) == 0 {
+		return nil, fmt.Errorf("%w: empty cluster roster", ierror.ErrTransientNotAccepted)
 	}
 	c.clustered.Store(len(metadata.Nodes) > 1)
 	c.topologyKnown.Store(true)

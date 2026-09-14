@@ -1064,9 +1064,13 @@ max_batch = 256
 # also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
 
-# Bound on the per-peer mpsc queue. The writer task drains; the
+# Bound on each replica peer's mpsc queue. The writer task drains; the
 # send_to_* path enqueues.
 peer_queue_capacity = 4096
+
+# Each SDK connection allocates separate inbound and outbound queues.
+# Keep their capacity independent of replica repair bursts.
+client_queue_capacity = 256
 
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
 reconnect_period = "5 s"

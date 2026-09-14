@@ -24,7 +24,7 @@ use server_common::{
 use std::io;
 use std::{
     cell::{Cell, UnsafeCell},
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap},
     ops::RangeInclusive,
 };
 use tracing::warn;
@@ -185,7 +185,7 @@ where
     /// entries left the resident journal at flush. Bounded by
     /// [`EVICTED_RING_CAPACITY`]; requests older than the ring answer
     /// `RangeEvicted` honestly.
-    evicted_ring: UnsafeCell<VecDeque<(u64, JournalBuffer)>>,
+    evicted_ring: UnsafeCell<BTreeMap<u64, JournalBuffer>>,
     /// Running byte total of the buffers held by `evicted_ring`.
     evicted_ring_bytes: Cell<u64>,
     /// Entry-count ceiling for `evicted_ring`. Defaults to
@@ -231,7 +231,7 @@ where
             inner: UnsafeCell::new(JournalInner {
                 storage: S::default(),
             }),
-            evicted_ring: UnsafeCell::new(VecDeque::new()),
+            evicted_ring: UnsafeCell::new(BTreeMap::new()),
             evicted_ring_bytes: Cell::new(0),
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
@@ -362,7 +362,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let ring = unsafe { &mut *self.evicted_ring.get() };
         debug_assert!(ring.is_empty());
         self.evicted_ring_bytes.set(prepare.len() as u64);
-        ring.push_back((op, prepare));
+        ring.insert(op, prepare);
     }
 
     /// Entry bytes for `op`, from the resident journal or the evicted ring.
@@ -377,9 +377,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        ring.iter()
-            .find(|(ring_op, _)| *ring_op == op)
-            .map(|(_, entry)| entry.clone())
+        ring.get(&op).cloned()
     }
 
     /// The header at `op`, over exactly the range [`Self::repair_entry`] serves.
@@ -393,32 +391,32 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// The entry is still servable from the evicted ring, which is what makes
     /// the blank wrong rather than merely pessimistic.
     ///
-    /// The ring drops from the front, so the highest evicted op -- the commit
-    /// point of the last flush -- is the last thing it forgets.
+    /// Retention drops the lowest op, including when repair backfills arrive
+    /// out of order, so the commit point is the last thing it forgets.
     pub fn repair_header(&self, op: u64) -> Option<PrepareHeader> {
         if let Some(header) = self.header_by_op(op) {
             return Some(header);
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        let (_, entry) = ring.iter().find(|(ring_op, _)| *ring_op == op)?;
+        let entry = ring.get(&op)?;
         let header_bytes = entry.as_slice().get(..PREPARE_HEADER_SIZE)?;
         bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .ok()
             .copied()
     }
 
-    /// Every repairable header with an op in `ops`, in ONE pass over the resident
-    /// headers and ONE over the evicted ring.
+    /// Every repairable header with an op in `ops`, scanning resident headers
+    /// once and seeking the retained repair range by op.
     ///
-    /// [`Self::repair_header`] is two linear scans, so probing it per op costs
-    /// O(window x (headers + ring)), and the `DoViewChange` suffix build does
-    /// exactly that, up to `DVC_HEADERS_MAX` probes, on every SVC/DVC arrival and
-    /// non-Normal tick, on the pump. Result size is bounded by what the journal
-    /// holds, not by the width of `ops`. Resident wins over ring, as `repair_header`
-    /// probes.
+    /// Avoid repeating the resident header scan for each op in a view-change
+    /// suffix. Result size is bounded by what the journal holds, not by the
+    /// width of `ops`. Resident entries take precedence over retained repairs.
     #[must_use]
     pub fn repair_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
         let mut found = BTreeMap::new();
+        if ops.is_empty() {
+            return found;
+        }
         {
             let headers = unsafe { &*self.headers.get() };
             for header in headers.iter().filter(|header| ops.contains(&header.op)) {
@@ -426,7 +424,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        for (op, entry) in ring.iter().filter(|(op, _)| ops.contains(op)) {
+        for (op, entry) in ring.range(ops) {
             if found.contains_key(op) {
                 continue;
             }
@@ -440,17 +438,16 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         found
     }
 
-    /// Oldest op this journal can still serve for repair (ring front, else
-    /// resident head), or `None` when it holds nothing at all.
+    /// Oldest op this journal can still serve for repair, including resident
+    /// backfills older than the retained repair range.
     pub fn repair_retained_from(&self) -> Option<u64> {
-        {
-            let ring = unsafe { &*self.evicted_ring.get() };
-            if let Some((op, _)) = ring.front() {
-                return Some(*op);
-            }
-        }
-        let headers = unsafe { &*self.headers.get() };
-        headers.first().map(|header| header.op)
+        let ring = unsafe { &*self.evicted_ring.get() };
+        let resident = unsafe { &*self.op_to_storage_offset.get() };
+        ring.first_key_value()
+            .map(|(op, _)| *op)
+            .into_iter()
+            .chain(resident.first_key_value().map(|(op, _)| *op))
+            .min()
     }
 
     /// Synchronous resident-range poll read. Never awaits (mem storage reads
@@ -602,11 +599,13 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                     break;
                 };
                 ring_bytes += entry.len() as u64;
-                ring.push_back((op, entry));
+                if let Some(previous) = ring.insert(op, entry) {
+                    ring_bytes -= previous.len() as u64;
+                }
                 while ring.len() > self.evicted_ring_capacity.get()
                     || (ring_bytes > self.evicted_ring_bytes_max.get() && ring.len() > 1)
                 {
-                    if let Some((_, dropped)) = ring.pop_front() {
+                    if let Some((_, dropped)) = ring.pop_first() {
                         ring_bytes -= dropped.len() as u64;
                     }
                 }
@@ -765,7 +764,7 @@ where
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
             headers: UnsafeCell::new(Vec::new()),
             inner: UnsafeCell::new(JournalInner { storage }),
-            evicted_ring: UnsafeCell::new(VecDeque::new()),
+            evicted_ring: UnsafeCell::new(BTreeMap::new()),
             evicted_ring_bytes: Cell::new(0),
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
@@ -1493,6 +1492,55 @@ mod tests {
 
         assert!(!shape.complete);
         assert!(!shape.holds_messages);
+    }
+
+    #[compio::test]
+    async fn repair_retention_keeps_the_newest_ops_after_out_of_order_backfill() {
+        const CAPACITY: usize = 4;
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(CAPACITY, u64::MAX);
+        for op in [4, 2, 8, 6, 3, 1, 7, 5] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix(8).await;
+        assert_eq!(journal.evicted_ring_occupancy().0, CAPACITY);
+        assert_eq!(journal.repair_retained_from(), Some(5));
+        for op in 1..=4 {
+            assert!(journal.repair_entry(op).is_none());
+            assert!(journal.repair_header(op).is_none());
+        }
+        for op in 5..=8 {
+            assert_eq!(journal.repair_header(op).unwrap().op, op);
+            assert_eq!(
+                journal.repair_entry(op).unwrap().as_slice(),
+                build_prepare(op, HEADER_SIZE + 16).as_slice()
+            );
+        }
+        assert_eq!(
+            journal
+                .repair_headers_in(6..=7)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            vec![6, 7]
+        );
+        let empty_start = 7;
+        assert!(journal.repair_headers_in(empty_start..=6).is_empty());
+        for op in [3, 1] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .unwrap();
+        }
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        journal.evict_prefix(8).await;
+        assert_eq!(journal.repair_retained_from(), Some(5));
+        assert_eq!(journal.evicted_ring_occupancy().0, CAPACITY);
+        journal.clear_all();
+        assert_eq!(journal.evicted_ring_occupancy(), (0, 0));
+        assert!(journal.repair_entry(8).is_none());
     }
 
     #[compio::test]

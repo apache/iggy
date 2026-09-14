@@ -142,11 +142,7 @@ impl BinaryTransport for QuicClient {
         code: u32,
         payload: Bytes,
     ) -> Result<Bytes, IggyError> {
-        if self.poll_router.is_clustered(self).await? {
-            self.poll_router.write_offset(self, code, payload).await
-        } else {
-            self.send_raw_with_response(code, payload).await
-        }
+        self.poll_router.write_offset(self, code, payload).await
     }
 
     async fn send_poll_with_response(

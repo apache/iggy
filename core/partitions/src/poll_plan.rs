@@ -395,10 +395,9 @@ pub enum DiskReadOutcome {
     Faulted,
 }
 
-/// Largest first read of a disk poll, and the size every poll used to read
-/// whatever it asked for. A batch wider than this still grows past it through
-/// the re-read path below; this bounds only where a walk starts.
-pub const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
+/// Ceiling for ordinary disk reads. An incomplete batch may require one
+/// larger re-read, without widening subsequent chunks or segments.
+const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
 
 /// Smallest first read of a disk poll. Below this the syscall and the segment
 /// walk cost more than the bytes the smaller read saves, and a poll for a
@@ -426,7 +425,7 @@ struct DiskWalk {
     matched: u32,
     fragments: PollFragments<4096>,
     last_matching_offset: Option<u64>,
-    /// Batch width learned from an incomplete read, retained across segments.
+    /// Batch width learned from an incomplete read, capped at the chunk ceiling.
     batch_read_floor: u64,
     #[cfg(feature = "poll-diagnostics")]
     requested_bytes: u64,
@@ -691,7 +690,9 @@ impl DiskReadPlan {
                     return SegmentWalk::Faulted;
                 }
                 chunk_len = if needed > len {
-                    walk.batch_read_floor = walk.batch_read_floor.max(needed as u64);
+                    walk.batch_read_floor = walk
+                        .batch_read_floor
+                        .max((needed as u64).min(DISK_POLL_CHUNK_MAX));
                     needed as u64
                 } else {
                     chunk_len.saturating_mul(4)
@@ -1154,25 +1155,10 @@ mod tests {
     async fn incomplete_batch_reread_keeps_its_exact_length_for_the_walk() {
         const BATCH_COUNT: u32 = 4;
         let directory = tempfile::tempdir().unwrap();
-        let mut messages = IggyMessages::with_capacity(1);
-        messages.push(IggyMessage {
-            header: IggyMessageHeader {
-                payload_length: 128 << 10,
-                ..Default::default()
-            },
-            payload: Bytes::from(vec![1; 128 << 10]),
-            user_headers: None,
-        });
-        let batch =
-            SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
-        let length = batch.header.total_size();
-        let mut records = vec![0; length * BATCH_COUNT as usize];
-        for (offset, record) in records.chunks_exact_mut(length).enumerate() {
-            let mut header = batch.header;
-            header.base_offset = offset as u64;
-            header.batch_checksum = header.checksum_for_blob(&batch.blob);
-            header.encode_into(record);
-            record[COMMAND_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let length = disk_batch(128 << 10, 0).len();
+        let mut records = Vec::with_capacity(length * BATCH_COUNT as usize);
+        for offset in 0..BATCH_COUNT {
+            records.extend_from_slice(&disk_batch(128 << 10, u64::from(offset)));
         }
         let mut file = compio::fs::File::create(directory.path().join("batches.log"))
             .await
@@ -1205,6 +1191,78 @@ mod tests {
             walk.requested_bytes,
             DISK_POLL_CHUNK_MIN + length as u64 * u64::from(BATCH_COUNT)
         );
+    }
+
+    #[cfg(feature = "poll-diagnostics")]
+    #[compio::test]
+    async fn oversized_batch_does_not_widen_later_reads_or_the_next_segment() {
+        const SMALL_BATCHES: u64 = 16;
+        for separate_segments in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut wide = disk_batch(3 << 20, 0);
+            let wide_length = wide.len() as u64;
+            let mut tail = Vec::new();
+            for offset in 1..=SMALL_BATCHES {
+                tail.extend_from_slice(&disk_batch(128 << 10, offset));
+            }
+            let segments = if separate_segments {
+                vec![wide, tail]
+            } else {
+                wide.extend_from_slice(&tail);
+                vec![wide]
+            };
+            let plan = sizing_plan(Some(1), 0);
+            let mut walk = DiskWalk::starting_at(0, 0);
+            for (index, records) in segments.into_iter().enumerate() {
+                let path = directory.path().join(format!("{index}.log"));
+                std::fs::write(&path, &records).unwrap();
+                let file = compio::fs::File::open(path).await.unwrap();
+                walk.position = 0;
+                assert!(matches!(
+                    plan.walk_segment(
+                        &file,
+                        MessageLookup::Offset {
+                            offset: 0,
+                            count: 2,
+                            ceiling: u64::MAX
+                        },
+                        2,
+                        records.len() as u64,
+                        &mut walk,
+                    )
+                    .await,
+                    SegmentWalk::Done
+                ));
+            }
+            assert_eq!(walk.matched, 2);
+            assert_eq!(walk.chunk_reads, 3);
+            assert_eq!(
+                walk.requested_bytes,
+                DISK_POLL_CHUNK_MIN + wide_length + DISK_POLL_CHUNK_MAX,
+                "one oversized batch must not raise subsequent reads above the chunk ceiling"
+            );
+        }
+    }
+
+    #[cfg(feature = "poll-diagnostics")]
+    fn disk_batch(payload_length: u32, offset: u64) -> Vec<u8> {
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
+                payload_length,
+                ..Default::default()
+            },
+            payload: Bytes::from(vec![1; usize::try_from(payload_length).unwrap()]),
+            user_headers: None,
+        });
+        let mut batch =
+            SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
+        batch.header.base_offset = offset;
+        batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+        let mut record = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut record);
+        record[COMMAND_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        record
     }
 
     fn offset_query(offset: u64) -> MessageLookup {

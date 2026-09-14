@@ -88,6 +88,11 @@ public class MessagesTcpClient implements MessagesClient {
     private final PollRouter pollRouter;
     private final Supplier<CompletableFuture<Boolean>> clustered;
 
+    /**
+     * Creates a low-level client on the supplied connection without primary routing.
+     * Use {@code Iggy.tcpClientBuilder()} for clustered auto-commit polling so the
+     * coordinator retains group membership while data connections reach primaries.
+     */
     public MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
         this(connectionSupplier, new ClientRoutingState());
     }

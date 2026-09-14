@@ -707,7 +707,7 @@ async fn classify_local_partition_reply(response: Response) -> AttemptOutcome {
             return AttemptOutcome::Relay(bad_gateway());
         }
     };
-    if parts.status == StatusCode::SERVICE_UNAVAILABLE && is_transient_not_accepted_body(&body) {
+    if is_transient_not_accepted_body(&body) {
         return AttemptOutcome::Retry;
     }
     AttemptOutcome::Relay(Response::from_parts(parts, Body::from(body)))

@@ -540,34 +540,45 @@ func TestPrimaryPoll_CoordinatorTrafficDoesNotStarveColdRouting(t *testing.T) {
 }
 
 func TestPrimaryPoll_UnknownTopologyCannotSelectLegacyPolling(t *testing.T) {
-	var failRoster atomic.Bool
-	failRoster.Store(true)
-	fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
-		if read.code() == uint32(command.GetClusterMetadataCode) && failRoster.Load() {
-			return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrFeatureUnavailable.Code()), nil), true
-		}
-		return nil, false
-	})
-	require.False(t, fixture.client.topologyKnown.Load(), "the login-time roster read failed")
-	parent := fixture.client.session.ClientID()
-	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
-	require.ErrorIs(t, err, ierror.ErrFeatureUnavailable)
-	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
-	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
+	for _, test := range []struct {
+		name    string
+		reply   []byte
+		wantErr error
+	}{
+		{"unsupported", statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrFeatureUnavailable.Code()), nil), ierror.ErrFeatureUnavailable},
+		{"empty", clusterMetadataFrame(t, 0), ierror.ErrTransientNotAccepted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var failRoster atomic.Bool
+			failRoster.Store(true)
+			fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
+				if read.code() == uint32(command.GetClusterMetadataCode) && failRoster.Load() {
+					return append([]byte(nil), test.reply...), true
+				}
+				return nil, false
+			})
+			require.False(t, fixture.client.topologyKnown.Load(), "the login-time roster read failed")
+			parent := fixture.client.session.ClientID()
+			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.ErrorIs(t, err, test.wantErr)
+			assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+			assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
 
-	failRoster.Store(false)
-	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
-	require.NoError(t, err)
-	require.True(t, fixture.client.topologyKnown.Load())
-	failRoster.Store(true)
-	_, err = fixture.client.GetClusterMetadata(context.Background())
-	require.ErrorIs(t, err, ierror.ErrFeatureUnavailable)
-	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
-	require.NoError(t, err, "a failed refresh must preserve known topology and warm routes")
-	assert.Equal(t, 1, fixture.primaries[0].connections())
-	assert.Equal(t, 1, fixture.coordinator.connections())
-	assert.Equal(t, parent, fixture.client.session.ClientID())
-	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+			failRoster.Store(false)
+			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.NoError(t, err)
+			require.True(t, fixture.client.topologyKnown.Load())
+			failRoster.Store(true)
+			_, err = fixture.client.GetClusterMetadata(context.Background())
+			require.ErrorIs(t, err, test.wantErr)
+			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.NoError(t, err, "a failed refresh must preserve known topology and warm routes")
+			assert.Equal(t, 1, fixture.primaries[0].connections())
+			assert.Equal(t, 1, fixture.coordinator.connections())
+			assert.Equal(t, parent, fixture.client.session.ClientID())
+			assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+		})
+	}
 }
 
 func TestPrimaryPoll_UnknownTopologyCanRecoverAsStandalone(t *testing.T) {

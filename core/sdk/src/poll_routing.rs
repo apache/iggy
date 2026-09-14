@@ -50,6 +50,7 @@ const MAX_CACHED_ROUTES: usize = 4096;
 const MAX_DATA_CONNECTIONS: usize = 256;
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTING_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const ROUTING_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const ROSTER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) const fn is_poll_routing_code(code: u32) -> bool {
@@ -224,6 +225,9 @@ impl<T: PollTransport> PollRouter<T> {
         code: u32,
         payload: Bytes,
     ) -> Result<Bytes, IggyError> {
+        if !self.is_clustered(coordinator).await? {
+            return coordinator.send_raw_with_response(code, payload).await;
+        }
         let (_, route_size) =
             GetConsumerOffsetRequest::decode(&payload).map_err(|_| IggyError::InvalidCommand)?;
         let key = (
@@ -278,6 +282,7 @@ impl<T: PollTransport> PollRouter<T> {
                     .send_poll_control(PING_CODE, Bytes::new())
                     .await?;
             }
+            let mut retry_interval = ROUTING_RETRY_INTERVAL;
             loop {
                 let result = self.poll_once(coordinator, code, &key, &payload).await;
                 if !matches!(result, Err(IggyError::TransientNotAccepted)) {
@@ -287,10 +292,11 @@ impl<T: PollTransport> PollRouter<T> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&key);
-                if Instant::now() + ROUTING_RETRY_INTERVAL >= deadline {
+                if Instant::now() + retry_interval >= deadline {
                     return Err(IggyError::TransientNotAccepted);
                 }
-                sleep(ROUTING_RETRY_INTERVAL).await;
+                sleep(retry_interval).await;
+                retry_interval = (retry_interval * 2).min(ROUTING_RETRY_MAX_INTERVAL);
             }
         })
         .await;
@@ -551,6 +557,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct Script {
         exchanges: Mutex<VecDeque<Exchange>>,
+        route_queries: AtomicUsize,
         attachments: Mutex<Vec<AttachConsumerSessionRequest>>,
         connections: AtomicUsize,
         pause: Mutex<Option<Arc<Pause>>>,
@@ -594,6 +601,12 @@ mod tests {
                 .pop_front()
                 .expect("unexpected request");
             assert_eq!((channel, code), (expected_channel, expected_code));
+            if matches!(
+                code,
+                GET_POLL_ROUTING_CODE | GET_CONSUMER_OFFSET_ROUTING_CODE
+            ) {
+                self.script.route_queries.fetch_add(1, Ordering::Relaxed);
+            }
             if code == ATTACH_CONSUMER_SESSION_CODE {
                 self.script
                     .attachments
@@ -1052,6 +1065,53 @@ mod tests {
         assert_eq!(router.poll(&coordinator, &request).await.unwrap(), "warm");
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 0);
         assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_refusals_bound_route_queries_and_keep_the_non_admission_result() {
+        const SCRIPTED_ATTEMPTS: usize = 1000;
+        const MAX_ROUTE_QUERIES: usize = 40;
+        for refuse_routing in [true, false] {
+            let exchanges = (0..SCRIPTED_ATTEMPTS).flat_map(|_| {
+                if refuse_routing {
+                    return vec![(
+                        Channel::Coordinator,
+                        GET_POLL_ROUTING_CODE,
+                        Err(IggyError::TransientNotAccepted),
+                    )];
+                }
+                vec![
+                    (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
+                    (
+                        Channel::Data,
+                        ATTACH_CONSUMER_SESSION_CODE,
+                        Ok(Bytes::new()),
+                    ),
+                    (
+                        Channel::Data,
+                        POLL_MESSAGES_ON_PRIMARY_CODE,
+                        Err(IggyError::TransientNotAccepted),
+                    ),
+                ]
+            });
+            let (router, coordinator, request) = fixture(exchanges);
+            let started = Instant::now();
+            assert!(matches!(
+                router.poll(&coordinator, &request).await,
+                Err(IggyError::TransientNotAccepted)
+            ));
+            let queries = coordinator.script.route_queries.load(Ordering::Relaxed);
+            assert!(
+                queries <= MAX_ROUTE_QUERIES,
+                "sustained refusal overloaded the coordinator with {queries} route queries"
+            );
+            assert!(started.elapsed() <= POLL_TIMEOUT);
+            assert!(started.elapsed() >= POLL_TIMEOUT - Duration::from_secs(1));
+            assert_eq!(
+                coordinator.script.connections.load(Ordering::Relaxed),
+                usize::from(!refuse_routing)
+            );
+        }
     }
 
     #[tokio::test]

@@ -1676,6 +1676,8 @@ impl ClientTable {
 
     /// Attach only after the caller has authenticated `user_id` and waited
     /// for the local metadata frontier to cover the requested session.
+    /// The registered user owns the session, matching authenticated login
+    /// resume. Client ids and epochs are identifiers, not authentication secrets.
     pub fn attach_session(
         &mut self,
         client_id: u128,

@@ -1043,18 +1043,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    /// Drop every file the recovered history does not retain, repeating while
-    /// the queue shrinks: `cleanup_obsolete` removes a bounded batch per call
-    /// and re-queues what it could not remove.
+    /// Drop every file the recovered history does not retain.
     async fn remove_obsolete_history(&mut self) -> io::Result<()> {
         self.discover_obsolete().await?;
-        loop {
-            let remaining = self.obsolete.len();
-            self.cleanup_obsolete().await;
-            if self.obsolete.is_empty() || self.obsolete.len() == remaining {
-                return Ok(());
-            }
-        }
+        self.cleanup_obsolete().await;
+        Ok(())
     }
 
     async fn discover_obsolete(&mut self) -> io::Result<()> {
@@ -1079,8 +1072,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    /// Remove a bounded batch of the files no published generation retains,
-    /// and retry a directory barrier a previous batch could not complete.
+    /// Attempt every queued obsolete file once, and retry a directory barrier
+    /// a previous pass could not complete. Failed unlinks stay queued.
     /// Does nothing when the queue is empty and no barrier is owed.
     ///
     /// Off the append path, so the unlinks and the barrier do not sit inside a
@@ -1090,7 +1083,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// still reachable by a reader or a recovery. The writer owns the journal,
     /// so this runs between mutations and never beside one.
     pub async fn cleanup_obsolete(&mut self) {
-        let count = self.obsolete.len().min(16);
+        let count = self.obsolete.len();
         for _ in 0..count {
             let Some(path) = self.obsolete.pop_front() else {
                 break;
@@ -1871,6 +1864,37 @@ mod tests {
         journal.cleanup_obsolete().await;
 
         assert!(!stale.exists());
+    }
+
+    #[compio::test]
+    async fn cleanup_reclaims_all_generations_queued_between_writer_passes() {
+        const GENERATIONS: u64 = 64;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let mut parent = 0;
+        for op in 1..=GENERATIONS {
+            let entry = prepare(op, parent);
+            parent = entry.header().checksum;
+            journal.append(entry.into_frozen()).await.unwrap();
+            journal.checkpoint(op).await.unwrap();
+        }
+        let retired: Vec<_> = journal.obsolete.iter().cloned().collect();
+        assert_eq!(retired.len(), usize::try_from(GENERATIONS).unwrap());
+        journal.cleanup_obsolete().await;
+        assert!(
+            journal.obsolete.is_empty(),
+            "one reclaim pass must keep up with a writer's accumulated generations"
+        );
+        assert!(retired.iter().all(|path| !path.exists()));
+        drop(journal);
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.checkpoint_op(), GENERATIONS);
+        assert_eq!(journal.head(), GENERATIONS);
     }
 
     #[compio::test]
