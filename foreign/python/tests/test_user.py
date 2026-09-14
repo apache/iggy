@@ -362,6 +362,39 @@ class TestUpdateUser:
         await iggy_client.delete_user(created.id)
 
     @pytest.mark.asyncio
+    async def test_update_user_with_empty_options_succeeds(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_user accepts an empty options map."""
+        username, password = unique_credentials(unique_name)
+        new_username = unique_name(max_bytes=MAX_USERNAME_BYTES)
+        created = await iggy_client.create_user(username, password)
+
+        await iggy_client.update_user(created.id, username=new_username, options={})
+
+        user = await iggy_client.get_user(created.id)
+        assert user is not None
+        assert user.username == new_username
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_update_user_forwards_options(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_user forwards option keys to the server."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_user(
+                created.id,
+                options={"unknown": "value"},
+            )
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
     async def test_update_user_with_no_fields_is_a_noop(
         self, iggy_client: IggyClient, unique_name
     ):

@@ -354,6 +354,9 @@ impl IggyClient {
     ///     user_id: User identifier as `str | int`.
     ///     username: New username as `str | None`; unchanged when `None`.
     ///     status: New status as `UserStatus | None`; unchanged when `None`.
+    ///     options: Additional option keys as `dict[str, str] | None`, forwarded
+    ///         to the server. Current server versions reject all user update
+    ///         option keys.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the user is updated.
@@ -361,7 +364,7 @@ impl IggyClient {
     /// Raises:
     ///     ValueError: If a string identifier is invalid.
     ///     RuntimeError: If the request fails.
-    #[pyo3(signature = (user_id, username=None, status=None))]
+    #[pyo3(signature = (user_id, username=None, status=None, options=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn update_user<'a>(
         &self,
@@ -369,20 +372,19 @@ impl IggyClient {
         user_id: PyIdentifier,
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] username: Option<String>,
         #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+        #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
+        options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let user_id = Identifier::try_from(user_id)?;
         let status = status.map(UserStatus::from);
+        let update_options = UserUpdateOptions {
+            raw: options.unwrap_or_default(),
+        };
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             inner
-                .update_user(
-                    &user_id,
-                    username.as_deref(),
-                    status,
-                    // Users have no option keys yet.
-                    &UserUpdateOptions::default(),
-                )
+                .update_user(&user_id, username.as_deref(), status, &update_options)
                 .await
                 .map_err(to_runtime_error)?;
             Ok(())
