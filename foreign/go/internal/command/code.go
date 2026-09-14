@@ -51,6 +51,7 @@ const (
 	GetOffsetCode             Code = 120
 	StoreOffsetCode           Code = 121
 	DeleteConsumerOffsetCode  Code = 122
+	GetOffsetRoutingCode      Code = 123
 	GetStreamCode             Code = 200
 	GetStreamsCode            Code = 201
 	CreateStreamCode          Code = 202

@@ -841,6 +841,10 @@ func (c *IggyTcpClient) attempt(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, stamped, generation, ctxErr
 		}
+		// The I/O deadline can fire before the context's cancellation callback.
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return nil, stamped, generation, context.DeadlineExceeded
+		}
 	}
 	return response, stamped, generation, err
 }

@@ -50,6 +50,7 @@ export const COMMAND_CODE = {
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,
+  GetConsumerOffsetRouting: 123,
   GetStream: 200,
   GetStreams: 201,
   CreateStream: 202,

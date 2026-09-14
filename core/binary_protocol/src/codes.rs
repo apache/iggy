@@ -117,6 +117,7 @@ mod tests {
         GET_STATS_CODE,
         GET_SNAPSHOT_FILE_CODE,
         GET_CLUSTER_METADATA_CODE,
+        DESCRIBE_OPTIONS_CODE,
         ATTACH_CONSUMER_SESSION_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
@@ -144,6 +145,7 @@ mod tests {
         GET_CONSUMER_OFFSET_CODE,
         STORE_CONSUMER_OFFSET_CODE,
         DELETE_CONSUMER_OFFSET_CODE,
+        GET_CONSUMER_OFFSET_ROUTING_CODE,
         GET_STREAM_CODE,
         GET_STREAMS_CODE,
         CREATE_STREAM_CODE,
@@ -170,6 +172,11 @@ mod tests {
 
     #[test]
     fn every_code_has_a_name() {
+        assert_eq!(
+            ALL_CODES.len(),
+            crate::dispatch::COMMAND_TABLE.len(),
+            "command-code tests must cover the complete dispatch registry"
+        );
         for &code in ALL_CODES {
             assert!(
                 command_name(code).is_ok(),
