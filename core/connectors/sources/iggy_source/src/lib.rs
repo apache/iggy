@@ -22,7 +22,7 @@ use iggy::prelude::{
 };
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
-    retry::{exponential_backoff, jitter, parse_duration},
+    retry::{parse_duration, retry_backoff},
     source::SourceBatchResult,
     source_connector,
 };
@@ -376,11 +376,11 @@ impl Source for IggySource {
 
         let failed_cycles = self.consecutive_failed_poll_cycles.load(Ordering::Relaxed);
         if failed_cycles > 0 {
-            let delay = jitter(exponential_backoff(
+            let delay = retry_backoff(
                 self.retry_interval,
                 failed_cycles as u32,
                 self.max_retry_interval,
-            ));
+            );
             debug!(
                 "Backing off for {delay:?} after {failed_cycles} consecutive poll cycles with no \
                  successful partitions for \
