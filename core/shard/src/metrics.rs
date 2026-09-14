@@ -395,7 +395,7 @@ impl ShardMetrics {
         );
         registry.register(
             "partition_repair_ring_bytes",
-            "bytes this shard's partitions retain for peer repair",
+            "payload bytes this shard's partitions retain for peer repair, excluding allocation overhead",
             self.partition_repair_ring_bytes.clone(),
         );
         registry.register(

@@ -22,8 +22,11 @@ use bytes::{BufMut, BytesMut};
 /// Use a coordinator's consumer-group identity on an independently authenticated
 /// data connection.
 ///
-/// The server verifies ownership and the exact parent epoch.
-/// This grants neither a new group membership nor ownership of the parent session.
+/// The authenticated user must match the parent session's registered user, and
+/// the parent epoch must match exactly. Connections authenticated as the same
+/// user may share that user's existing group membership; client ids and epochs
+/// are identifiers, not authentication secrets. Attaching neither creates a
+/// membership nor extends the parent session's lifetime.
 ///
 /// Wire format: `[client_id:16 LE][session:8 LE][metadata_watermark:8 LE]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

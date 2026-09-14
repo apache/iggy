@@ -722,10 +722,9 @@ pin_cores = true
 
 # Per-shard inter-shard inbox capacity (the main lane: consensus frames,
 # connection setup, reconcile wakes). Bounded by design; consensus-frame
-# drops recover via VSR retransmit. Size for the consensus working set:
-# ~ the prepare queue depth of the planes the shard hosts ([metadata] on
-# shard 0, [partition] elsewhere) times replica_count times directions.
-# Both depths are tunable, so raising either raises the capacity needed here.
+# drops recover via VSR retransmit. Size for the combined consensus traffic of
+# all groups hosted by the shard, including replica fan-out and burst headroom.
+# Per-group prepare queue depth alone does not determine this capacity.
 # Slots are allocated at startup per shard, even before traffic arrives.
 inbox_capacity = 65536
 
@@ -999,13 +998,12 @@ offset_reservation_lease = 65536
 # retain nothing regardless.
 evicted_ring_capacity = 65536
 
-# Byte ceiling for the evicted ring per partition; whichever ring cap (this or
-# evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
-# large batches can pin. Must be > 0 and <= "256 MiB".
-# PER PARTITION and per replica, so the node-wide ceiling is this times the partitions it
-# hosts, pinned as anonymous memory beside the same bytes in page cache. Raising it on a
-# node with many partitions is a large memory decision; partition_repair_ring_bytes on the
-# metrics endpoint reports what the rings on each shard actually hold.
+# Payload-byte ceiling per partition and replica; the first ring cap reached
+# evicts the lowest ops, retaining the newest entry even if it alone exceeds
+# this budget. Must be > 0 and <= "256 MiB". Allocation capacity, alignment and
+# index overhead are additional memory, especially for small offset commits.
+# There is no node-wide budget. partition_repair_ring_bytes reports payload
+# bytes summed across a shard's partitions, not their allocated memory or RSS.
 evicted_ring_bytes_max = "64 MiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer

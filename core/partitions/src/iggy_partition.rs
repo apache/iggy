@@ -5317,15 +5317,8 @@ where
     /// op: a replication gap must not be skipped, or `advance_commit_min`'s
     /// sequential contract breaks.
     ///
-    /// KNOWN GAP: resident headers only. `commit_messages` evicts up to
-    /// `commit_max` (the cluster frontier, not this replica's commit point) while
-    /// `committed_headers_from` never reads the evicted ring, so a backlog past
-    /// [`COMMIT_WALK_OPS_MAX`] can have its un-reached ops flushed out from under
-    /// it and stop. Repair refetches them and the simulator's contiguity invariant
-    /// catches a walk that never recovers. Reading the ring here would close it
-    /// directly, but not as a one-line swap: the apply path needs batch bytes and
-    /// the ring is capacity-bounded, so headers it cannot back with bytes would
-    /// fence the partition instead of stalling it.
+    /// Reads resident headers only. The commit walk caps flushing at its last
+    /// drained op, keeping later headers resident for the next bounded walk.
     fn collect_committable_from_journal(
         &self,
         max_ops: usize,
@@ -9350,6 +9343,37 @@ mod tests {
         )
     }
 
+    /// Replace the fixture's initial segment with real files and offset stores.
+    /// Keep the returned directory alive until every read using those files ends.
+    pub(super) async fn disk_poll_partition(
+        config: &PartitionsConfig,
+    ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+        let directory = tempfile::tempdir().expect("create partition directory");
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.log.retire_front().expect("retire empty segment");
+        partition
+            .install_empty_segment(config, 0)
+            .await
+            .expect("install segment with real writers");
+
+        let consumer_path = directory.path().join("consumer_offsets");
+        let group_path = directory.path().join("consumer_group_offsets");
+        compio::fs::create_dir_all(&consumer_path)
+            .await
+            .expect("create consumer offsets directory");
+        compio::fs::create_dir_all(&group_path)
+            .await
+            .expect("create group offsets directory");
+        partition.configure_consumer_offset_storage(
+            consumer_path.to_string_lossy().into_owned(),
+            group_path.to_string_lossy().into_owned(),
+            ConsumerOffsets::with_capacity(1),
+            ConsumerGroupOffsets::with_capacity(1),
+        );
+        (directory, partition)
+    }
+
     /// A SOLO partition, the shape the offset reservation is scoped to.
     fn solo_recording_partition() -> IggyPartition<IggyMessageBus, RecordingSuperblock> {
         let namespace = IggyNamespace::new(1, 1, 0);
@@ -12159,9 +12183,9 @@ mod tests {
     #[compio::test]
     async fn given_small_message_tail_when_offset_ops_reach_the_bound_should_flush_it_and_evict() {
         const THRESHOLD: u32 = 8;
-        let mut partition = test_partition();
         let mut config = repair_config();
         config.messages_required_to_save = THRESHOLD;
+        let (directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
         journal_send_batch(&mut partition, 1).await;
         partition.consensus().advance_commit_max(1);
         partition.commit_journal(&config).await;
@@ -12195,6 +12219,37 @@ mod tests {
         assert_eq!(
             partition.get_consumer_offset(PollingConsumer::Consumer(7, 0)),
             Some(last_op)
+        );
+
+        let offset_path = partition
+            .persisted_offset_path(ConsumerKind::Consumer, 7)
+            .unwrap();
+        drop(partition);
+        let segment = std::fs::read(directory.path().join("00000000000000000000.log")).unwrap();
+        assert_eq!(segment.len() as u64, one_record);
+        let batch = decode_batch_slice(&segment).unwrap();
+        assert_eq!(batch.header.base_offset, 0);
+        assert_eq!(batch.message_count(), 1);
+        assert_eq!(batch.iter().next().unwrap().payload, b"abcdefgh");
+        let index = IggyIndexReader::new(
+            directory
+                .path()
+                .join("00000000000000000000.index")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            index.load_last().await.unwrap(),
+            Some(IggyIndex::new(0, batch.header.base_timestamp, 0))
+        );
+        assert_eq!(
+            crate::offset_storage::decode_offset_record(&std::fs::read(offset_path).unwrap()),
+            crate::offset_storage::OffsetRecord::Value {
+                offset: last_op,
+                checksummed: true,
+            }
         );
     }
 
@@ -16590,7 +16645,7 @@ mod purge_poll_tests {
     //! Completing the old poll must not advance progress over the fresh messages
     //! or restore a group's last polled mark when automatic commits are disabled.
 
-    use super::tests::{journal_send_batch, repair_config, test_partition};
+    use super::tests::{disk_poll_partition, journal_send_batch, repair_config};
     use super::*;
     use crate::PollFragments;
     use iggy_common::PollingStrategy;
@@ -16965,37 +17020,6 @@ mod purge_poll_tests {
             .expect("accept old read");
         assert_eq!(polled_offsets(&initial_completion.fragments), [0, 1, 2]);
         assert!(initial_completion.replication.is_none());
-    }
-
-    /// Replace the fixture's initial segment with real files and offset stores.
-    /// Keep the returned directory alive until every read using those files ends.
-    async fn disk_poll_partition(
-        config: &PartitionsConfig,
-    ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
-        let directory = tempfile::tempdir().expect("create partition directory");
-        let mut partition = test_partition();
-        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-        partition.log.retire_front().expect("retire empty segment");
-        partition
-            .install_empty_segment(config, 0)
-            .await
-            .expect("install segment with real writers");
-
-        let consumer_path = directory.path().join("consumer_offsets");
-        let group_path = directory.path().join("consumer_group_offsets");
-        compio::fs::create_dir_all(&consumer_path)
-            .await
-            .expect("create consumer offsets directory");
-        compio::fs::create_dir_all(&group_path)
-            .await
-            .expect("create group offsets directory");
-        partition.configure_consumer_offset_storage(
-            consumer_path.to_string_lossy().into_owned(),
-            group_path.to_string_lossy().into_owned(),
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
-        );
-        (directory, partition)
     }
 
     fn polled_offsets(fragments: &PollFragments) -> Vec<u64> {
