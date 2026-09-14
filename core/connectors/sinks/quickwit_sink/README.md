@@ -106,6 +106,9 @@ The examples use `mode: dynamic` to retain wrapper fields. With `mode: strict`, 
 Transient HTTP failures, including 429, can retry a request that Quickwit already accepted. Quickwit ingest has no deduplication key, so these retries can produce duplicate documents. Set `max_retries = 1` to disable the sink's HTTP retry loop. Calculated delays use exponential backoff with jitter; a valid `Retry-After` on HTTP 429 replaces the calculated delay.
 
 Service readiness retries any failed health probe. After verifying or creating the index, the sink probes its ingest endpoint with an empty body before accepting messages.
+This is intentional: legacy index metadata can exist before the ingest queue is ready, while the read-only `/tail` endpoint checks only legacy ingestion.
+The probe uses `commit=auto`, so it adds no documents and does not force a commit; see Quickwit's [ingest implementation](https://github.com/quickwit-oss/quickwit/blob/v0.8.2/quickwit/quickwit-serve/src/ingest_api/rest_handler.rs) and [legacy/V2 routing](https://github.com/quickwit-oss/quickwit/blob/v0.9.0/quickwit/quickwit-serve/src/ingest_api/rest_handler.rs).
+Ingest V2 accepts empty requests without checking shard readiness, so this probe does not guarantee that the first data request will succeed.
 Index readiness retries HTTP 404, 429, 5xx and network failures.
 Each readiness check uses `max_open_retries` and `open_retry_max_delay`; these probes submit no documents.
 

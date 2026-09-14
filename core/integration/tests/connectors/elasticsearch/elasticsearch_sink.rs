@@ -22,13 +22,15 @@ use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
+use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use integration::harness::seeds;
 use integration::iggy_harness;
+use reqwest::Client;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
-const LOG_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
-const LOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STATS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const STATS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
@@ -224,7 +226,7 @@ async fn elasticsearch_sink_preserves_json_structure(
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_rejected_document_when_indexing_should_report_zero_indexed(
+async fn given_rejected_document_when_indexing_should_report_runtime_error(
     harness: &TestHarness,
     fixture: ElasticsearchSinkFixture,
 ) {
@@ -247,19 +249,39 @@ async fn given_rejected_document_when_indexing_should_report_zero_indexed(
         .expect("send rejected document");
 
     let runtime = harness.connectors_runtime().expect("connectors runtime");
-    let logs = timeout(LOG_WAIT_TIMEOUT, async {
+    let stats_url = format!("{}/stats", runtime.http_url());
+    let http_client = Client::new();
+    let sink = timeout(STATS_WAIT_TIMEOUT, async {
         loop {
-            let (stdout, stderr) = runtime.collect_logs();
-            let logs = format!("{stdout}\n{stderr}");
-            if logs.contains("Successfully indexed") {
-                break logs;
+            let snapshot: ConnectorRuntimeStats = http_client
+                .get(&stats_url)
+                .send()
+                .await
+                .expect("stats request should complete")
+                .error_for_status()
+                .expect("stats endpoint should succeed")
+                .json()
+                .await
+                .expect("stats response should decode");
+            let sink = snapshot
+                .connectors
+                .into_iter()
+                .find(|connector| connector.key == "elasticsearch")
+                .expect("Elasticsearch sink should be reported");
+            if sink.errors > 0 {
+                break sink;
             }
-            sleep(LOG_POLL_INTERVAL).await;
+            sleep(STATS_POLL_INTERVAL).await;
         }
     })
     .await
-    .expect("bulk completion should be logged");
+    .expect("rejected bulk write should reach runtime error statistics");
 
+    assert_eq!(sink.errors, 1);
+    assert_eq!(sink.messages_consumed, Some(1));
+    assert_eq!(sink.messages_processed, Some(0));
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
     assert!(logs.contains("Document indexing error:"), "{logs}");
     assert_eq!(
         fixture.get_document_count().await.expect("document count"),
@@ -267,7 +289,7 @@ async fn given_rejected_document_when_indexing_should_report_zero_indexed(
         "Elasticsearch must reject the non-object document"
     );
     assert!(
-        logs.contains("Successfully indexed 0 documents"),
-        "the indexed count must exclude the rejected document: {logs}"
+        !logs.contains("Successfully indexed"),
+        "a rejected bulk write must not be logged as successful: {logs}"
     );
 }

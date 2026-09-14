@@ -238,6 +238,13 @@ impl ElasticsearchSink {
             state.documents_indexed += documents_indexed;
         }
 
+        if documents_indexed == 0 {
+            return Err(Error::CannotStoreData(format!(
+                "Elasticsearch bulk request indexed no documents in index '{}'",
+                self.config.index
+            )));
+        }
+
         Ok(documents_indexed)
     }
 }
@@ -376,5 +383,103 @@ impl Sink for ElasticsearchSink {
             self.id
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn test_config() -> ElasticsearchSinkConfig {
+        ElasticsearchSinkConfig {
+            url: "http://localhost:9200".to_string(),
+            index: "test".to_string(),
+            username: None,
+            password: None,
+            batch_size: None,
+            timeout_seconds: Some(1),
+            create_index_if_not_exists: Some(false),
+            index_mapping: None,
+        }
+    }
+
+    #[test]
+    fn given_bulk_item_results_when_indexing_should_fail_only_fully_rejected_batches() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            let accepted = json!({"index": {"status": 201}});
+            let rejected = json!({"index": {
+                "status": 400,
+                "error": {"type": "document_parsing_exception", "reason": "invalid document"}
+            }});
+            for (items, expected_indexed) in [
+                (vec![rejected.clone(), rejected.clone()], 0),
+                (vec![accepted.clone(), rejected], 1),
+                (vec![accepted.clone(), accepted], 2),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/_bulk"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "errors": expected_indexed < items.len(),
+                        "items": items,
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let mut config = test_config();
+                config.url = server.uri();
+                let sink = ElasticsearchSink::new(1, config);
+                let client = sink
+                    .create_client()
+                    .await
+                    .expect("client should initialize");
+                let result = sink
+                    .bulk_index_documents(
+                        &client,
+                        vec![simd_json::json!({"id": 1}), simd_json::json!({"id": 2})],
+                    )
+                    .await;
+
+                if expected_indexed == 0 {
+                    assert!(
+                        matches!(result, Err(Error::CannotStoreData(_))),
+                        "{result:?}"
+                    );
+                } else {
+                    assert_eq!(result, Ok(expected_indexed));
+                }
+                let state = sink.state.lock().await;
+                assert_eq!(state.documents_indexed, expected_indexed);
+                assert_eq!(state.errors_count, items.len() - expected_indexed);
+            }
+        });
+    }
+
+    #[test]
+    fn given_empty_batch_when_indexing_should_succeed_without_a_request() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            let mut config = test_config();
+            config.url = server.uri();
+            let sink = ElasticsearchSink::new(1, config);
+            let client = sink
+                .create_client()
+                .await
+                .expect("client should initialize");
+
+            assert_eq!(sink.bulk_index_documents(&client, Vec::new()).await, Ok(0));
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("requests should be recorded")
+                    .is_empty()
+            );
+        });
     }
 }

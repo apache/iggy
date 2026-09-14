@@ -178,7 +178,8 @@ impl QuickwitSink {
         client: &reqwest::Client,
         policy: RetryPolicy,
     ) -> Result<(), Error> {
-        // Index metadata can exist before Quickwit's ingest queue accepts documents.
+        // Legacy index metadata can exist before its ingest queue; /tail only supports legacy ingest.
+        // An empty commit=auto probe adds no documents and does not force a commit.
         retry_async(
             policy,
             &format!("Quickwit sink ID {} ingest readiness", self.id),
