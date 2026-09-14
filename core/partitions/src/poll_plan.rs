@@ -1019,12 +1019,15 @@ struct ChunkWalk {
 mod tests {
     use super::*;
     use crate::iggy_index::IggyIndex;
+    #[cfg(feature = "poll-diagnostics")]
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use server_common::iobuf::Owned;
+    #[cfg(feature = "poll-diagnostics")]
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
+    #[cfg(feature = "poll-diagnostics")]
     use server_common::sharding::IggyNamespace;
 
     /// Write a sealed-segment index file too large to materialize
