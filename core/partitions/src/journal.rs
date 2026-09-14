@@ -206,6 +206,13 @@ where
     /// serve purged bytes. Survives only as long as the journal (in-memory),
     /// same lifetime argument as the partition's `purge_floor_op`.
     poll_floor: Cell<u64>,
+    /// Resident entries that are not `SendMessages` (consumer offset stores
+    /// and deletes). They carry no segment bytes, so the message-count and
+    /// byte flush thresholds never see them, yet the flush is the only
+    /// eviction: without a bound on this count a consume-only workload, one
+    /// replicated auto-commit per poll, grows the journal for as long as it
+    /// runs. Rebuilt by every drain-and-re-append.
+    resident_control_ops: Cell<usize>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -237,6 +244,7 @@ where
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
             poll_floor: Cell::new(0),
+            resident_control_ops: Cell::new(0),
         }
     }
 }
@@ -319,6 +327,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         unsafe { &mut *self.headers.get() }.clear();
         unsafe { &mut *self.evicted_ring.get() }.clear();
         self.evicted_ring_bytes.set(0);
+        self.resident_control_ops.set(0);
     }
 
     /// Disable repair retention (single-replica groups: nobody to repair).
@@ -355,6 +364,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     pub fn resident_count(&self) -> usize {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         op_to_storage_offset.len()
+    }
+
+    /// Resident entries that are not `SendMessages`; the partition's flush
+    /// gate bounds this the way the message thresholds bound batches.
+    pub const fn resident_control_ops(&self) -> usize {
+        self.resident_control_ops.get()
     }
 
     /// Restore the materialized commit point for elections and body repair.
@@ -520,6 +535,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         offset_to_op.clear();
         let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
         timestamp_to_op.clear();
+        self.resident_control_ops.set(0);
 
         entries
     }
@@ -588,6 +604,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             offset_to_op.clear();
             let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
             timestamp_to_op.clear();
+            self.resident_control_ops.set(0);
         }
 
         let mut all_entries = all_entries.into_iter();
@@ -698,6 +715,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
             op_to_storage_offset.insert(op, storage_offset);
         }
+        if header.operation != Operation::SendMessages {
+            self.resident_control_ops
+                .set(self.resident_control_ops.get() + 1);
+        }
 
         // Poll-index only ops above the purge floor: `op_to_storage_offset`
         // above stays unconditional (consensus history for the repair and
@@ -721,16 +742,42 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         inner.storage.is_empty()
     }
 
-    /// Owned, op-ascending clones of the resident journal entries a poll may
-    /// serve. Each clone is a `Frozen` refcount bump, not a deep copy. Used to
-    /// snapshot the resident tail at poll-plan time so a disk-tier straddle can
-    /// be spliced off the partition borrow on owned data
-    /// ([`crate::iggy_partition`]).
+    /// Owned, offset-ascending clones of the resident `SendMessages` entries a
+    /// poll may serve, one `Frozen` refcount bump each. Snapshots the resident
+    /// tail at poll-plan time so a disk-tier straddle can be spliced off the
+    /// partition borrow on owned data ([`crate::iggy_partition`]).
+    ///
+    /// Walks the offset index rather than the storage vector: the snapshot walk
+    /// only ever matches message batches, and control ops (one per auto-commit
+    /// poll) outnumber them by orders of magnitude between flushes, so cloning
+    /// every entry made each disk-tier poll pay for every poll since the last
+    /// flush. The index also carries the purge fence: it holds indexed batches
+    /// above the poll floor only, and [`Self::clear_poll_index`] empties it, so
+    /// a fenced entry never reaches the snapshot.
+    pub fn resident_message_entries(&self) -> Vec<JournalBuffer> {
+        let offset_to_op = unsafe { &*self.offset_to_op.get() };
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let inner = unsafe { &*self.inner.get() };
+        let mut entries = Vec::with_capacity(offset_to_op.len());
+        for op in offset_to_op.values() {
+            if let Some(&storage_offset) = op_to_storage_offset.get(op)
+                && let Some(entry) = inner.storage.read_at_sync(storage_offset)
+            {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    /// Owned, append-ordered clones of every resident entry above the purge
+    /// floor, control ops included; one `Frozen` refcount bump each. Linear in
+    /// the resident journal, so not for the poll path, which takes
+    /// [`Self::resident_message_entries`].
     ///
     /// Entries at or below the purge floor are filtered out. They stay resident
     /// (consensus history for backups, repair and retransmission) but are
     /// poll-fenced exactly like the offset/timestamp indexes
-    /// [`Self::clear_poll_index`] sealed: the snapshot walk matches on the batch
+    /// [`Self::clear_poll_index`] sealed: a walk over these matches on the batch
     /// contents alone, so an unfiltered list re-exposes purged bytes as soon as
     /// one post-purge append puts an entry back into the index.
     pub fn resident_entries(&self) -> Vec<JournalBuffer> {
@@ -770,6 +817,7 @@ where
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
             poll_floor: Cell::new(0),
+            resident_control_ops: Cell::new(0),
         }
     }
 
@@ -1099,6 +1147,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
             unsafe { &mut *self.op_to_storage_offset.get() }.clear();
             unsafe { &mut *self.offset_to_op.get() }.clear();
             unsafe { &mut *self.timestamp_to_op.get() }.clear();
+            self.resident_control_ops.set(0);
         }
 
         let mut removed = 0usize;
@@ -1744,6 +1793,17 @@ mod tests {
     /// the `[PrepareHeader][256B batch header][blob]` layout
     /// `try_push_resident_entry` decodes.
     fn build_resident_prepare(message_count: usize, payload_len: usize) -> Frozen<4096> {
+        build_message_prepare(1, 0, message_count, payload_len)
+    }
+
+    /// [`build_resident_prepare`] at a chosen op and stamped base offset, so a
+    /// journal can hold several batches in offset order.
+    fn build_message_prepare(
+        op: u64,
+        base_offset: u64,
+        message_count: usize,
+        payload_len: usize,
+    ) -> Frozen<4096> {
         let mut messages = IggyMessages::with_capacity(message_count);
         for index in 0..message_count {
             let fill = u8::try_from(index % usize::from(u8::MAX)).expect("bounded by u8::MAX");
@@ -1756,11 +1816,12 @@ mod tests {
                 user_headers: None,
             });
         }
-        let owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+        let mut owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
             .expect("build send_messages batch");
+        owned.header.base_offset = base_offset;
         let record = stamped_batch_record(owned);
 
-        let mut prepare = build_prepare(1, PREPARE_HEADER_SIZE + record.len()).transmute_header(
+        let mut prepare = build_prepare(op, PREPARE_HEADER_SIZE + record.len()).transmute_header(
             |header: PrepareHeader, send_messages: &mut PrepareHeader| {
                 *send_messages = header;
                 send_messages.operation = Operation::SendMessages;
@@ -1768,6 +1829,96 @@ mod tests {
         );
         prepare.as_mut_slice()[PREPARE_HEADER_SIZE..].copy_from_slice(&record);
         prepare.into_frozen()
+    }
+
+    /// A header-only consumer offset prepare: the shape every auto-commit
+    /// journals, carrying no batch.
+    fn build_control_prepare(op: u64) -> Frozen<4096> {
+        build_prepare(op, HEADER_SIZE + 16)
+            .transmute_header(|header: PrepareHeader, control: &mut PrepareHeader| {
+                *control = header;
+                control.operation = Operation::StoreConsumerOffset;
+            })
+            .into_frozen()
+    }
+
+    fn entry_ops(entries: &[Frozen<4096>]) -> Vec<u64> {
+        entries
+            .iter()
+            .map(|entry| {
+                bytemuck::checked::try_from_bytes::<PrepareHeader>(&entry[..PREPARE_HEADER_SIZE])
+                    .expect("entry holds a valid prepare header")
+                    .op
+            })
+            .collect()
+    }
+
+    #[compio::test]
+    async fn resident_message_entries_skip_control_ops_and_fenced_batches() {
+        // Batches at ops 1, 3, 5 (three offsets each) interleaved with the
+        // offset ops a polling group journals between them.
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in 1..=6u64 {
+            let entry = if op % 2 == 1 {
+                build_message_prepare(op, (op - 1) / 2 * 3, 3, 8)
+            } else {
+                build_control_prepare(op)
+            };
+            journal.append(entry).await.expect("append");
+        }
+        assert_eq!(
+            entry_ops(&journal.resident_message_entries()),
+            vec![1, 3, 5]
+        );
+        assert_eq!(journal.resident_control_ops(), 3);
+
+        // The purge seal empties the poll view, and the first post-purge
+        // append re-arms it with that batch alone.
+        journal.clear_poll_index(3);
+        assert!(journal.resident_message_entries().is_empty());
+        journal
+            .append(build_message_prepare(7, 9, 3, 8))
+            .await
+            .expect("append");
+        assert_eq!(entry_ops(&journal.resident_message_entries()), vec![7]);
+
+        // Eviction re-appends the retained tail: op 5 is above the floor and
+        // comes back into the poll view, op 3 stays fenced.
+        journal.evict_prefix(2).await;
+        assert_eq!(entry_ops(&journal.resident_message_entries()), vec![5, 7]);
+        assert_eq!(journal.resident_control_ops(), 2);
+    }
+
+    #[compio::test]
+    async fn resident_control_ops_follow_every_rebuild() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in 1..=4u64 {
+            journal
+                .append(build_control_prepare(op))
+                .await
+                .expect("append");
+        }
+        journal
+            .append(build_message_prepare(5, 0, 3, 8))
+            .await
+            .expect("append");
+        assert_eq!(journal.resident_control_ops(), 4);
+
+        journal.evict_prefix(2).await;
+        assert_eq!(journal.resident_control_ops(), 2, "ops 3 and 4 stay");
+
+        journal.truncate_from(4).await.expect("truncate");
+        assert_eq!(journal.resident_control_ops(), 1, "only op 3 survives");
+
+        journal.commit();
+        assert_eq!(journal.resident_control_ops(), 0);
+
+        journal
+            .append(build_control_prepare(6))
+            .await
+            .expect("append");
+        journal.clear_all();
+        assert_eq!(journal.resident_control_ops(), 0);
     }
 
     fn offset_lookup(offset: u64, count: u32) -> MessageLookup {
