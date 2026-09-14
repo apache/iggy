@@ -517,6 +517,36 @@ impl IggyClient {
         })
     }
 
+    /// Closes the current connection without releasing the client.
+    /// Calling it when already disconnected succeeds. A later `connect()`
+    /// dials again, but the previous login is cleared, so `login_user()`
+    /// has to run again. Over HTTP there is no connection to close, so
+    /// this call succeeds without doing anything.
+    /// Raises `RuntimeError` if the disconnect fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn disconnect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.disconnect().await.map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
+    /// Releases the resources held by the client.
+    /// Calling it more than once succeeds. Over the binary transports no
+    /// further call works afterwards and each one fails with `Client shutdown`.
+    /// Over HTTP there is nothing to release, so this call succeeds without
+    /// doing anything.
+    /// Raises `RuntimeError` if the shutdown fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.shutdown().await.map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
     /// Creates a new stream with the provided ID and name.
     /// Raises `RuntimeError` if the stream cannot be created.
     #[pyo3(signature = (name))]

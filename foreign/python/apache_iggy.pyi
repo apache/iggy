@@ -1340,6 +1340,24 @@ class IggyClient:
         connection to establish, so only the heartbeat starts and this call
         succeeds even against an unreachable server.
         """
+    def disconnect(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Closes the current connection without releasing the client.
+        Calling it when already disconnected succeeds. A later `connect()`
+        dials again, but the previous login is cleared, so `login_user()`
+        has to run again. Over HTTP there is no connection to close, so
+        this call succeeds without doing anything.
+        Raises `RuntimeError` if the disconnect fails.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Releases the resources held by the client.
+        Calling it more than once succeeds. Over the binary transports no
+        further call works afterwards and each one fails with `Client shutdown`.
+        Over HTTP there is nothing to release, so this call succeeds without
+        doing anything.
+        Raises `RuntimeError` if the shutdown fails.
+        """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.

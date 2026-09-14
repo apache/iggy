@@ -168,3 +168,41 @@ class TestConnectivity:
     async def test_ping(self, iggy_client: IggyClient):
         """Test server ping functionality."""
         await iggy_client.ping()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_is_idempotent_and_reconnects(self):
+        """Test disconnect stops requests until the client connects again."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        await wait_for_ping(client)
+        await client.login_user("iggy", "iggy")
+
+        await client.disconnect()
+        await client.disconnect()
+
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await client.ping()
+
+        await client.connect()
+        await client.login_user("iggy", "iggy")
+        await wait_for_ping(client)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_idempotent_and_terminal(self):
+        """Test shutdown releases the client and rejects later requests."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        await wait_for_ping(client)
+        await client.login_user("iggy", "iggy")
+
+        await client.shutdown()
+        await client.shutdown()
+
+        with pytest.raises(RuntimeError, match="Client shutdown"):
+            await client.ping()
