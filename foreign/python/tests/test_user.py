@@ -386,11 +386,14 @@ class TestUpdateUser:
         username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError) as rejection:
             await iggy_client.update_user(
                 created.id,
                 options={"unknown": "value"},
             )
+
+        # Binary transports carry the code alone, so the key itself is empty.
+        assert "Unsupported option key" in str(rejection.value)
 
         await iggy_client.delete_user(created.id)
 

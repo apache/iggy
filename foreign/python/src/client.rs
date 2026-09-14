@@ -354,9 +354,9 @@ impl IggyClient {
     ///     user_id: User identifier as `str | int`.
     ///     username: New username as `str | None`; unchanged when `None`.
     ///     status: New status as `UserStatus | None`; unchanged when `None`.
-    ///     options: Additional option keys as `dict[str, str] | None`, forwarded
-    ///         to the server. Current server versions reject all user update
-    ///         option keys.
+    ///     options: Reserved for future use. Additional option keys as
+    ///         `dict[str, str] | None`, forwarded to the server. No user update
+    ///         option key exists yet, so a current server rejects every key.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the user is updated.
@@ -592,7 +592,7 @@ impl IggyClient {
     ///         `manage_streams` or per-stream `manage_stream` permission, the
     ///         stream does not exist, the new name is invalid or already used, or
     ///         the request fails.
-    #[pyo3(signature = (stream_id, name, options = None))]
+    #[pyo3(signature = (stream_id, name, options=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn update_stream<'a>(
         &self,

@@ -1255,9 +1255,9 @@ class IggyClient:
             user_id: User identifier as `str | int`.
             username: New username as `str | None`; unchanged when `None`.
             status: New status as `UserStatus | None`; unchanged when `None`.
-            options: Additional option keys as `dict[str, str] | None`, forwarded
-                to the server. Current server versions reject all user update
-                option keys.
+            options: Reserved for future use. Additional option keys as
+                `dict[str, str] | None`, forwarded to the server. No user update
+                option key exists yet, so a current server rejects every key.
 
         Returns:
             An awaitable that resolves to `None` when the user is updated.
