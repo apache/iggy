@@ -102,6 +102,8 @@ pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), See
             names::TOPIC,
             &TopicCreateOptions {
                 partitions_count: Some(1),
+                durability: Durability::Persisted,
+                messages_required_to_save: Some(1),
                 ..TopicCreateOptions::default()
             },
         )
@@ -113,6 +115,8 @@ pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), See
             names::TOPIC_2,
             &TopicCreateOptions {
                 partitions_count: Some(1),
+                durability: Durability::Persisted,
+                messages_required_to_save: Some(1),
                 ..TopicCreateOptions::default()
             },
         )
