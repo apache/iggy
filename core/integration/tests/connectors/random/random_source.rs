@@ -27,7 +27,10 @@ use tokio::time::{sleep, timeout};
 const API_KEY: &str = "test-api-key";
 const SOURCE_KEY: &str = "random";
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
-const STATE_STABILITY_WINDOW: Duration = Duration::from_secs(1);
+/// How long a counter is given to settle after the change that moves it.
+/// Shared by the state-file and gauge waits: both are waiting on the same
+/// thing, a report that may land just after the poll that preceded it.
+const SETTLE_WINDOW: Duration = Duration::from_secs(1);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[iggy_harness(
@@ -54,7 +57,7 @@ async fn state_save_failure_preserves_state_and_source_recovers(harness: &TestHa
         .connectors_runtime()
         .expect("connectors runtime")
         .http_url();
-    let http = Client::new();
+    let http = client();
     let errors_before_failure = source_errors(&http, &api_url).await;
     let state_dir = state_path.parent().expect("source state directory");
     let unavailable_state_dir = state_dir.with_extension("unavailable");
@@ -68,7 +71,7 @@ async fn state_save_failure_preserves_state_and_source_recovers(harness: &TestHa
         .expect("source state should remain readable");
     wait_for_source_error_after(&http, &api_url, errors_before_failure).await;
 
-    sleep(STATE_STABILITY_WINDOW).await;
+    sleep(SETTLE_WINDOW).await;
     assert_eq!(
         tokio::fs::read(&unavailable_state_path)
             .await
@@ -97,6 +100,102 @@ async fn state_save_failure_preserves_state_and_source_recovers(harness: &TestHa
     random_source_liveness::assert_produces_messages(harness).await;
 }
 
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/random/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn sources_running_does_not_climb_across_restarts(harness: &TestHarness) {
+    // The gauge counts running instances, and a restart takes one down before
+    // bringing one up, so one configured source stays at one however often it
+    // is restarted. It used to be reported by two mechanisms and taken back by
+    // one.
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = client();
+
+    wait_for_sources_running(&http, &api_url, 1).await;
+
+    for round in 1..=3 {
+        let response = http
+            .post(format!("{api_url}/sources/{SOURCE_KEY}/restart"))
+            .header("api-key", API_KEY)
+            .send()
+            .await
+            .expect("restart request should be sent");
+        assert_eq!(
+            response.status().as_u16(),
+            204,
+            "restart {round} should be accepted"
+        );
+
+        wait_for_sources_running(&http, &api_url, 1).await;
+    }
+
+    // Read it once more after the gauge has settled. A report that lands after
+    // the poll above would otherwise go unseen.
+    sleep(SETTLE_WINDOW).await;
+    assert_eq!(
+        sources_running(&http, &api_url).await,
+        1,
+        "one running source must stay counted once, whatever it took to restart it"
+    );
+}
+
+/// Every request carries [`WAIT_TIMEOUT`], so none of them can outlive the
+/// wait they belong to. Without it a stalled runtime hangs the test rather
+/// than failing it, and a hung test reports nothing at all.
+fn client() -> Client {
+    Client::builder()
+        .timeout(WAIT_TIMEOUT)
+        .build()
+        .expect("the test client must build")
+}
+
+/// The one request the stats helpers share. Handing back the `Result` rather
+/// than unwrapping it is what lets the retry loops keep treating a failed read
+/// as "not yet" while the direct readers keep failing on it.
+async fn fetch_stats(http: &Client, api_url: &str) -> reqwest::Result<ConnectorRuntimeStats> {
+    http.get(format!("{api_url}/stats"))
+        .header("api-key", API_KEY)
+        .send()
+        .await?
+        .json::<ConnectorRuntimeStats>()
+        .await
+}
+
+async fn sources_running(http: &Client, api_url: &str) -> u32 {
+    fetch_stats(http, api_url)
+        .await
+        .expect("runtime stats should be valid")
+        .sources_running
+}
+
+async fn wait_for_sources_running(http: &Client, api_url: &str, expected: u32) {
+    // The last value the loop actually saw, rather than a fresh read in the
+    // failure message. That read was the one request with no budget over it:
+    // it only runs once the wait has already timed out, which is exactly when
+    // the runtime is stalled, so the test hung instead of failing and reported
+    // nothing at all.
+    let mut last = None;
+    let reached = timeout(WAIT_TIMEOUT, async {
+        loop {
+            let running = sources_running(http, api_url).await;
+            last = Some(running);
+            if running == expected {
+                return;
+            }
+            sleep(RETRY_INTERVAL).await;
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "sources_running never reached {expected}; last read {last:?}"
+    );
+}
+
 async fn wait_for_state_file(state_path: &Path) {
     timeout(Duration::from_secs(5), async {
         while !state_path.exists() {
@@ -108,13 +207,7 @@ async fn wait_for_state_file(state_path: &Path) {
 }
 
 async fn source_errors(http: &Client, api_url: &str) -> u64 {
-    let stats = http
-        .get(format!("{api_url}/stats"))
-        .header("api-key", API_KEY)
-        .send()
-        .await
-        .expect("runtime stats should be available")
-        .json::<ConnectorRuntimeStats>()
+    let stats = fetch_stats(http, api_url)
         .await
         .expect("runtime stats should be valid");
     stats
@@ -128,12 +221,7 @@ async fn source_errors(http: &Client, api_url: &str) -> u64 {
 async fn wait_for_source_error_after(http: &Client, api_url: &str, previous_errors: u64) {
     timeout(WAIT_TIMEOUT, async {
         loop {
-            if let Ok(response) = http
-                .get(format!("{api_url}/stats"))
-                .header("api-key", API_KEY)
-                .send()
-                .await
-                && let Ok(stats) = response.json::<ConnectorRuntimeStats>().await
+            if let Ok(stats) = fetch_stats(http, api_url).await
                 && let Some(source) = stats
                     .connectors
                     .iter()

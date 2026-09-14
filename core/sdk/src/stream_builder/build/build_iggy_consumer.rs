@@ -51,7 +51,7 @@ pub(crate) async fn build_iggy_consumer(
     let batch_length = config.batch_length();
     let polling_interval = config.polling_interval();
     let polling_strategy = config.polling_strategy();
-    let partition = config.partitions_count();
+    let partition = config.partition_id();
     let polling_retry_interval = config.polling_retry_interval();
 
     trace!("Build iggy consumer");

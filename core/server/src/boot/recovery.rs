@@ -258,7 +258,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
         on_client_request,
         on_metadata_submit,
         on_list_clients,
-        on_partition_read,
         sessions,
     } = wire_shell_handlers(
         &bus,
@@ -282,12 +281,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
         Rc::clone(&on_client_request),
         on_metadata_submit,
         on_list_clients,
-        on_partition_read,
         metadata,
         partitions,
         senders,
         inbox,
         reply_inbox,
+        config.sharding.poll_completion_capacity,
         shards_table,
         PartitionConsensusConfig::new(
             topology.cluster_id,

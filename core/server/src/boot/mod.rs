@@ -55,7 +55,6 @@ use crate::boot::threads::{
     spawn_shutdown_watchdog, validate_sharding_runtime_knobs,
 };
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
-use crate::dispatch::partition::make_partition_read_handler;
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::dispatch::submit::make_metadata_submit_handler;
@@ -127,7 +126,6 @@ where
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
         on_list_clients: make_list_clients_handler(&sessions),
-        on_partition_read: make_partition_read_handler(shard_handle),
         sessions,
     }
 }

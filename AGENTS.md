@@ -188,9 +188,11 @@ non-trivial change passes verification, suggest `/team-review <target>`.
 
 BDD test naming: `given_X_when_Y_should_Z` (3-part). Promote to 4-part `given_X_when_Y_then_Z_should_W` only with a distinct "then" intermediate. Be consistent inside a file.
 
-Filter a single integration test by path:
+Filter a single integration test by path. Build the binaries the harness launches first: it runs
+whatever is already in `target/`, so a stale one fails as though the change under test broke it.
 
 ```bash
+cargo build --bin iggy-server --bin iggy-connectors
 cargo test -p integration -- connectors::runtime::benchmark::given_logging_format_json
 ```
 
@@ -202,6 +204,7 @@ cargo test -p integration -- connectors::runtime::benchmark::given_logging_forma
 - **`test_logs/` grows quickly.** Wipe between major refactors.
 - **Miri only covers `binary_protocol` + `consensus`.** Cannot emulate `io_uring` syscalls. do not try to expand Miri to crates that pull `compio`.
 - **Integration crate has no `--test` target.** Filter by test path inside the single `mod.rs` binary.
+- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server`, `iggy-connectors` or `iggy-mcp` is used silently. CI builds first (`cargo build --locked --bin iggy-server --bin iggy`); a local run does not, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
 
 ## Local state directories
 
