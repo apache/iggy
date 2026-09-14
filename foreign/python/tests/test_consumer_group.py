@@ -2322,3 +2322,270 @@ class TestConsumerGroup:
         shutdown_event.set()
 
         await consumer.consume_messages(take, shutdown_event)
+
+
+class TestConsumerShutdown:
+    """Test explicit consumer shutdown and offset drain timeout."""
+
+    @pytest.mark.asyncio
+    async def test_shutdown_after_consume_messages(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test shutdown succeeds after the consumption loop exits."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        test_messages = [f"Shutdown test {i} - {unique_name()}" for i in range(3)]
+        received_messages = []
+        shutdown_event = asyncio.Event()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        async def take(message: ReceiveMessage) -> None:
+            received_messages.append(message)
+            if len(received_messages) == len(test_messages):
+                shutdown_event.set()
+
+        async def send() -> None:
+            await iggy_client.send_messages(
+                stream_name,
+                topic_name,
+                partition_id,
+                [Message(message) for message in test_messages],
+            )
+
+        await asyncio.gather(consumer.consume_messages(take, shutdown_event), send())
+        assert [message.payload().decode() for message in received_messages] == (
+            test_messages
+        )
+
+        await consumer.shutdown()
+        assert (
+            consumer.get_last_consumed_offset(partition_id)
+            == received_messages[-1].offset()
+        )
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_idempotent(self, iggy_client: IggyClient, unique_name):
+        """Test repeated shutdown calls succeed."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            0,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        assert await consumer.shutdown() is None
+        assert await consumer.shutdown() is None
+        assert await asyncio.gather(consumer.shutdown(), consumer.shutdown()) == [
+            None,
+            None,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_consumer_group_accepts_custom_offset_drain_timeout(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a custom offset drain timeout is accepted."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        shutdown_event = asyncio.Event()
+        received_messages = []
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+            offset_drain_timeout=timedelta(seconds=1),
+        )
+
+        async def take(message: ReceiveMessage) -> None:
+            received_messages.append(message)
+            shutdown_event.set()
+
+        async def send() -> None:
+            await iggy_client.send_messages(
+                stream_name,
+                topic_name,
+                partition_id,
+                [Message(f"Drain timeout test - {unique_name()}")],
+            )
+
+        await asyncio.gather(consumer.consume_messages(take, shutdown_event), send())
+        assert len(received_messages) == 1
+
+        await consumer.shutdown()
+        assert await consumer.shutdown() is None
+
+    @pytest.mark.asyncio
+    async def test_consumer_group_rejects_negative_offset_drain_timeout(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a negative offset drain timeout raises."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        with pytest.raises(ValueError, match="duration must not be negative"):
+            await iggy_client.consumer_group(
+                unique_name(),
+                stream_name,
+                topic_name,
+                0,
+                PollingStrategy.Next(),
+                10,
+                auto_commit=AutoCommit.Disabled(),
+                poll_interval=timedelta(milliseconds=25),
+                offset_drain_timeout=timedelta(seconds=-1),
+            )
+
+    @pytest.mark.asyncio
+    async def test_shutdown_leaves_group_for_next_member(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test shutdown frees partitions for another group member."""
+        group_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        first_shutdown = asyncio.Event()
+        second_shutdown = asyncio.Event()
+        first_received = []
+        second_received = []
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        first = await iggy_client.consumer_group(
+            group_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        group = await iggy_client.get_consumer_group(
+            stream_name, topic_name, group_name
+        )
+        assert group is not None
+        assert group.members_count == 1
+
+        async def take_first(message: ReceiveMessage) -> None:
+            first_received.append(message)
+            first_shutdown.set()
+
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(f"First owner - {unique_name()}")],
+        )
+        await first.consume_messages(take_first, first_shutdown)
+        assert len(first_received) == 1
+
+        await first.shutdown()
+
+        for _ in range(50):
+            group = await iggy_client.get_consumer_group(
+                stream_name, topic_name, group_name
+            )
+            assert group is not None
+            if group.members_count == 0:
+                break
+            await asyncio.sleep(0.1)
+        assert group.members_count == 0
+        assert group.members == []
+
+        second = await iggy_client.consumer_group(
+            group_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        try:
+            group = await iggy_client.get_consumer_group(
+                stream_name, topic_name, group_name
+            )
+            assert group is not None
+            assert group.members_count == 1
+
+            async def take_second(message: ReceiveMessage) -> None:
+                second_received.append(message.payload().decode())
+                second_shutdown.set()
+
+            await iggy_client.send_messages(
+                stream_name,
+                topic_name,
+                partition_id,
+                [Message(f"Second owner - {unique_name()}")],
+            )
+            await asyncio.wait_for(
+                second.consume_messages(take_second, second_shutdown), timeout=10
+            )
+            assert len(second_received) == 1
+        finally:
+            await second.shutdown()

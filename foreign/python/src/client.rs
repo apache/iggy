@@ -1487,10 +1487,14 @@ impl IggyClient {
     /// Creates a new consumer group consumer.
     /// `partition_id` is ignored for a consumer group: the member reads the partitions
     /// the server assigns to it.
+    /// `offset_drain_timeout` controls how long `shutdown()` waits for background offset
+    /// tasks, five seconds by default.
     /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-    /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-    /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
-    /// is zero.
+    /// `poll_interval`, `polling_retry_interval`, `init_retry_interval`, `offset_drain_timeout`
+    /// or an `AutoCommit` interval is negative, or if any of those except `poll_interval`
+    /// and `offset_drain_timeout` is zero.
+    /// Call `shutdown()` after `consume_messages()` returns or once `iter_messages()`
+    /// iteration is finished to leave the group promptly.
     ///
     /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
     /// left on, this call fails at the join with `Feature is unavailable`.
@@ -1516,6 +1520,7 @@ impl IggyClient {
         init_retries=None,
         init_retry_interval=None,
         allow_replay=false,
+        offset_drain_timeout=None,
     ))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IggyConsumer]", imports=("collections.abc")))]
     fn consumer_group<'a>(
@@ -1542,6 +1547,8 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         init_retry_interval: Option<Py<PyDelta>>,
         allow_replay: bool,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        offset_drain_timeout: Option<Py<PyDelta>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let mut builder = self
             .inner
@@ -1602,6 +1609,10 @@ impl IggyClient {
         }
         if allow_replay {
             builder = builder.allow_replay()
+        }
+        if let Some(offset_drain_timeout) = offset_drain_timeout {
+            builder =
+                builder.offset_drain_timeout(py_delta_to_iggy_duration(&offset_drain_timeout)?)
         }
         let mut consumer = builder.build();
 

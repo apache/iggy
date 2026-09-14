@@ -139,6 +139,7 @@ impl IggyConsumer {
     /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
     /// only the interval part is applied; the `after` mode is ignored.
     /// Use `consume_messages()` if you need commit-after-processing semantics.
+    /// Call `shutdown()` once iteration is finished to leave the consumer group.
     #[gen_stub(override_return_type(type_repr="collections.abc.AsyncIterator[ReceiveMessage]", imports=("collections.abc")))]
     fn iter_messages(&self) -> ReceiveMessageIterator {
         let inner = self.inner.clone();
@@ -147,6 +148,8 @@ impl IggyConsumer {
 
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
     /// Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
+    /// Call `shutdown()` after this returns to drain pending offsets, leave the consumer group,
+    /// and stop the connection watcher.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
         &self,
@@ -207,6 +210,25 @@ impl IggyConsumer {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
+        })
+    }
+
+    /// Shuts the consumer down, draining pending offset commits, storing the last
+    /// consumed offsets unless auto-commit is disabled, leaving the consumer group,
+    /// and stopping the connection watcher.
+    /// Call after `consume_messages()` returns or once `iter_messages()` iteration is
+    /// finished. Calling it while `consume_messages()` is still running waits for the
+    /// consumption lock, so signal the shutdown event first.
+    /// Repeated calls succeed. Raises `RuntimeError` if the operation fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut inner = inner.lock().await;
+            inner
+                .shutdown()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
     }
 }

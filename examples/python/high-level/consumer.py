@@ -86,6 +86,7 @@ async def main() -> None:
             shutdown_event.set()
 
     await consumer.consume_messages(handle_message, shutdown_event)
+    await consumer.shutdown()
     logger.info("Consumed {} messages, exiting", consumed_messages)
 
 
