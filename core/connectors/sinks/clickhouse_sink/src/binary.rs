@@ -294,6 +294,11 @@ pub(crate) fn serialize_value(
         // ── Decimal ──────────────────────────────────────────────────────────
         ChType::Decimal(precision, scale) => {
             let int_val = coerce_decimal(value, *precision, *scale)?;
+            let precision_limit = 10i128.pow(u32::from(*precision));
+            if int_val <= -precision_limit || int_val >= precision_limit {
+                error!("Decimal value out of range for precision {precision}");
+                return Err(Error::InvalidRecord);
+            }
             if *precision <= 9 {
                 buf.extend_from_slice(
                     &i32::try_from(int_val)
@@ -632,25 +637,24 @@ fn parse_decimal_str(s: &str, scale: u8) -> Result<i128, ()> {
     let mut result = int_val.checked_mul(10i128.pow(scale)).ok_or(())?;
 
     if !frac_str.is_empty() {
-        // Cap at 38 digits: Decimal128(38) is the widest ClickHouse type, and
-        // 10^38 < i128::MAX, so no intermediate value overflows.
-        let frac_str = if frac_str.len() > 38 {
-            &frac_str[..38]
+        // Parse only retained digits so long fractions cannot overflow before rounding.
+        let retained_digits = frac_str.len().min(scale as usize);
+        let frac_val: i128 = if retained_digits == 0 {
+            0
         } else {
-            frac_str
+            frac_str[..retained_digits].parse().map_err(|_| ())?
         };
-        let frac_len = frac_str.len() as u32;
-        let frac_val: i128 = frac_str.parse().map_err(|_| ())?;
-        let frac_scaled = if frac_len <= scale {
-            frac_val
-                .checked_mul(10i128.pow(scale - frac_len))
-                .ok_or(())?
-        } else {
-            // More digits than scale: round half-up.
-            let divisor = 10i128.pow(frac_len - scale);
-            (frac_val + divisor / 2) / divisor
-        };
+        let frac_scaled = frac_val
+            .checked_mul(10i128.pow(scale - retained_digits as u32))
+            .ok_or(())?;
         result = result.checked_add(frac_scaled).ok_or(())?;
+        if frac_str
+            .as_bytes()
+            .get(scale as usize)
+            .is_some_and(|digit| *digit >= b'5')
+        {
+            result = result.checked_add(1).ok_or(())?;
+        }
     }
 
     Ok(if negative { -result } else { result })
@@ -718,7 +722,12 @@ fn coerce_to_unix_seconds_f64(value: &OwnedValue) -> Result<f64, Error> {
 
 /// Returns Unix seconds as i64 (truncates fractional seconds).
 fn coerce_to_unix_seconds(value: &OwnedValue) -> Result<i64, Error> {
-    Ok(coerce_to_unix_seconds_f64(value)? as i64)
+    let seconds = coerce_to_unix_seconds_f64(value)?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        error!("DateTime requires finite, non-negative Unix seconds");
+        return Err(Error::InvalidRecord);
+    }
+    Ok(seconds as i64)
 }
 
 /// Parse "YYYY-MM-DDThh:mm:ss[.frac][Z|±hh:mm]" into Unix seconds (f64).
@@ -894,6 +903,111 @@ mod tests {
 
     // ── primitives ───────────────────────────────────────────────────────────
     #[test]
+    fn decimal_serialization_enforces_declared_precision_after_scaling() {
+        for precision in [1, 9, 10, 18, 19, 38] {
+            let limit = 10i128.pow(u32::from(precision));
+            for scale in [0, precision] {
+                for sign in [1, -1] {
+                    let boundary = if scale == 0 {
+                        (sign * (limit - 1)).to_string()
+                    } else {
+                        format!(
+                            "{}0.{}",
+                            if sign < 0 { "-" } else { "" },
+                            "9".repeat(precision as usize)
+                        )
+                    };
+                    let mut buffer = Vec::new();
+                    serialize_value(
+                        &json_str(&boundary),
+                        &ChType::Decimal(precision, scale),
+                        &mut buffer,
+                    )
+                    .expect("The last value within precision must serialize");
+                    let expected = (sign * (limit - 1)).to_le_bytes();
+                    let width = if precision <= 9 {
+                        4
+                    } else if precision <= 18 {
+                        8
+                    } else {
+                        16
+                    };
+                    assert_eq!(
+                        buffer,
+                        expected[..width],
+                        "Decimal({precision}, {scale}): {boundary}"
+                    );
+
+                    let overflow = if scale == 0 {
+                        (sign * limit).to_string()
+                    } else {
+                        sign.to_string()
+                    };
+                    let rounded_overflow =
+                        format!("{boundary}{}", if scale == 0 { ".5" } else { "5" });
+                    for value in [json_str(&overflow), json_str(&rounded_overflow)] {
+                        let mut buffer = Vec::new();
+                        assert!(
+                            serialize_value(
+                                &value,
+                                &ChType::Decimal(precision, scale),
+                                &mut buffer
+                            )
+                            .is_err(),
+                            "Decimal({precision}, {scale}) must reject {value}"
+                        );
+                        assert!(buffer.is_empty());
+                    }
+                }
+            }
+        }
+        for value in [
+            json_i64(10_000_000),
+            json_u64(10_000_000),
+            json_f64(10_000_000.0),
+        ] {
+            assert!(
+                serialize_value(&value, &ChType::Decimal(9, 2), &mut Vec::new()).is_err(),
+                "{value}"
+            );
+        }
+        assert!(
+            serialize_value(
+                &json_str(&i128::MIN.to_string()),
+                &ChType::Decimal(38, 0),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn datetime_rejects_non_finite_and_pre_epoch_values() {
+        for value in [
+            json_f64(f64::NAN),
+            json_f64(f64::INFINITY),
+            json_f64(f64::NEG_INFINITY),
+            json_f64(-0.5),
+            json_str("1969-12-31T23:59:59.5Z"),
+        ] {
+            let mut buffer = Vec::new();
+            assert!(
+                serialize_value(&value, &ChType::DateTime, &mut buffer).is_err(),
+                "{value}"
+            );
+            assert!(buffer.is_empty());
+        }
+        for seconds in [0.0, 0.5, u32::MAX as f64 + 0.5] {
+            let mut buffer = Vec::new();
+            serialize_value(&json_f64(seconds), &ChType::DateTime, &mut buffer).unwrap();
+            assert_eq!(buffer, (seconds as u32).to_le_bytes());
+        }
+        let mut buffer = Vec::new();
+        serialize_value(&json_f64(-0.5), &ChType::DateTime64(3), &mut buffer).unwrap();
+        assert_eq!(buffer, (-500i64).to_le_bytes());
+    }
+
+    #[test]
     fn given_boundary_floats_when_serializing_numbers_should_preserve_values() {
         for (column_type, value, expected) in [
             (
@@ -905,11 +1019,6 @@ mod tests {
                 ChType::UInt64,
                 (1u64 << 63) as f64,
                 (1u64 << 63).to_le_bytes().to_vec(),
-            ),
-            (
-                ChType::Decimal(38, 0),
-                i128::MIN as f64,
-                i128::MIN.to_le_bytes().to_vec(),
             ),
         ] {
             let mut buffer = Vec::new();
@@ -941,7 +1050,13 @@ mod tests {
 
     #[test]
     fn given_overflowing_float_when_serializing_decimal_should_reject() {
-        for value in [i128::MAX as f64, f64::MAX, -f64::MAX, f64::NAN] {
+        for value in [
+            i128::MIN as f64,
+            i128::MAX as f64,
+            f64::MAX,
+            -f64::MAX,
+            f64::NAN,
+        ] {
             let mut buffer = Vec::new();
             let result = serialize_value(&json_f64(value), &ChType::Decimal(38, 0), &mut buffer);
             assert!(

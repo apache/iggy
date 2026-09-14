@@ -16,6 +16,6 @@ A sink connector that consumes messages from Iggy streams and indexes them to El
 
 - Bulk indexing optimization
 - Automatic index creation
-- Request errors and bulk requests with no successfully indexed documents fail the batch without connector retries. Partial bulk failures log the rejected count for the batch and are counted in closing statistics without failing the batch
+- Items rejected with HTTP 429 or 5xx receive up to three attempts with exponential backoff and jitter. Only rejected items are retried; accepted documents are not resubmitted. Request failures or malformed responses fail the batch without replaying an ambiguous write. Any remaining rejection fails the callback, including partial failures, while successful items remain indexed
 - Metadata field injection
 - Support for multiple data formats

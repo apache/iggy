@@ -80,10 +80,11 @@ pub use mongodb::{
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
 pub use postgres::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture,
-    PostgresSourceDeleteFixture, PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
+    POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
+    PostgresSinkJsonFixture, PostgresSinkLargeBatchFixture, PostgresSourceByteaFixture,
+    PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture, PostgresSourceDeleteFixture,
+    PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture, PostgresSourceJsonbFixture,
+    PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
     PostgresSourceNonUniqueTrackingFixture, PostgresSourceNumericTrackingFixture,
     PostgresSourceOps, PostgresSourceTextKeyFixture,
 };

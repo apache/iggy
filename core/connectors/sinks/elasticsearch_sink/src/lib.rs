@@ -23,13 +23,12 @@ use elasticsearch::{
     http::{Url, request::JsonBody, transport::TransportBuilder},
 };
 use iggy_common::IggyTimestamp;
+use iggy_connector_sdk::retry::RetryPolicy;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    convert::owned_value_to_serde_json, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use simd_json::{OwnedValue, prelude::*};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -38,6 +37,27 @@ use tracing::{error, info, warn};
 sink_connector!(ElasticsearchSink);
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+const BULK_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    max_attempts: 3,
+    base_delay: Duration::from_secs(1),
+    max_delay: Duration::from_secs(5),
+};
+
+#[derive(Deserialize)]
+struct BulkResponse {
+    items: Vec<BulkItem>,
+}
+
+#[derive(Deserialize)]
+struct BulkItem {
+    index: BulkIndexResult,
+}
+
+#[derive(Deserialize)]
+struct BulkIndexResult {
+    status: u16,
+    error: Option<serde_json::Value>,
+}
 
 #[derive(Debug)]
 struct State {
@@ -175,104 +195,107 @@ impl ElasticsearchSink {
     async fn bulk_index_documents(
         &self,
         client: &Elasticsearch,
-        documents: Vec<OwnedValue>,
+        mut documents: Vec<OwnedValue>,
     ) -> Result<usize, Error> {
         if documents.is_empty() {
             return Ok(0);
         }
 
-        let mut body: Vec<JsonBody<_>> = Vec::with_capacity(documents.len() * 2);
-        for doc in documents {
-            // Add index action
-            body.push(
-                json!({
-                    "index": {
-                        "_index": self.config.index
-                    }
-                })
-                .into(),
-            );
-            let doc_json: serde_json::Value = owned_value_to_serde_json(&doc);
-            body.push(doc_json.into());
-        }
-
-        let response = client
-            .bulk(BulkParts::None)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to execute bulk request: {}", e)))?;
-
-        if !response.status_code().is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(Error::Connection(format!(
-                "Bulk indexing failed: {}",
-                error_text
-            )));
-        }
-
-        let response_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to parse bulk response: {}", e)))?;
-
-        // A 200 without an items array is not a bulk response this connector
-        // can account for, so it must not be read as "nothing was indexed".
-        let Some(items) = response_body.get("items").and_then(|v| v.as_array()) else {
-            return Err(Error::Connection(format!(
-                "Elasticsearch bulk response for index '{}' carried no items array",
-                self.config.index
-            )));
-        };
-
-        let mut errors = 0;
-        let mut retryable_rejection = false;
-        for item in items {
-            if let Some(index_result) = item.get("index")
-                && let Some(error) = index_result.get("error")
-            {
-                warn!("Document indexing error: {error}");
-                errors += 1;
-                retryable_rejection |= index_result
-                    .get("status")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_none_or(|status| status == 429 || status >= 500);
+        let action = simd_json::json!({"index": {"_index": self.config.index.as_str()}});
+        let total_documents = documents.len();
+        let mut documents_indexed = 0;
+        let mut permanent_rejections = 0;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut body: Vec<JsonBody<&OwnedValue>> = Vec::with_capacity(documents.len() * 2);
+            for document in &documents {
+                body.push((&action).into());
+                body.push(document.into());
             }
-        }
 
-        let documents_indexed = items.len() - errors;
-        {
-            let mut state = self.state.lock().await;
-            state.errors_count += errors;
-            state.documents_indexed += documents_indexed;
-        }
+            // Generated document IDs make transport failures ambiguous. Retry only
+            // items the server explicitly rejected, never the whole request.
+            let response = client
+                .bulk(BulkParts::None)
+                .body(body)
+                .send()
+                .await
+                .map_err(|error| {
+                    Error::Connection(format!("Failed to execute bulk request: {error}"))
+                })?;
+            if !response.status_code().is_success() {
+                let status = response.status_code();
+                let reason = response.text().await.unwrap_or_default();
+                return Err(Error::Connection(format!(
+                    "Bulk indexing failed with status {status}: {reason}"
+                )));
+            }
+            let response: BulkResponse = response.json().await.map_err(|error| {
+                Error::Connection(format!("Failed to parse bulk response: {error}"))
+            })?;
+            if response.items.len() != documents.len() {
+                return Err(Error::Connection(format!(
+                    "Elasticsearch bulk response carried {} items for {} documents",
+                    response.items.len(),
+                    documents.len()
+                )));
+            }
 
-        if errors > 0 {
-            // The runtime counts a batch, not a document, so a partial rejection
-            // is invisible in `/stats`. This line is the only per-batch record.
-            error!(
-                "Elasticsearch rejected {errors} of {} documents in index '{}'",
-                items.len(),
-                self.config.index
+            let mut retry_documents = Vec::new();
+            let mut indexed = 0;
+            let mut rejected = 0;
+            for (document, item) in documents.into_iter().zip(response.items) {
+                let result = item.index;
+                if (200..300).contains(&result.status) && result.error.is_none() {
+                    indexed += 1;
+                } else {
+                    warn!(
+                        "Document indexing error: status {}: {:?}",
+                        result.status, result.error
+                    );
+                    if result.status == 429 || (500..600).contains(&result.status) {
+                        retry_documents.push(document);
+                    } else {
+                        rejected += 1;
+                    }
+                }
+            }
+            documents_indexed += indexed;
+            permanent_rejections += rejected;
+            {
+                let mut state = self.state.lock().await;
+                state.documents_indexed += indexed;
+                state.errors_count += rejected;
+            }
+            if retry_documents.is_empty() {
+                break;
+            }
+            if attempt >= BULK_RETRY_POLICY.max_attempts {
+                self.state.lock().await.errors_count += retry_documents.len();
+                return Err(Error::CannotStoreData(format!(
+                    "Elasticsearch indexed {documents_indexed} of {total_documents} documents in index '{}'; {} transient rejections remain after {attempt} attempts, {permanent_rejections} permanent rejections",
+                    self.config.index,
+                    retry_documents.len()
+                )));
+            }
+            let delay = BULK_RETRY_POLICY.backoff(attempt);
+            warn!(
+                "Retrying {} rejected Elasticsearch documents after {delay:?}, attempt {attempt}/{}",
+                retry_documents.len(),
+                BULK_RETRY_POLICY.max_attempts
             );
+            tokio::time::sleep(delay).await;
+            documents = retry_documents;
         }
 
-        if documents_indexed == 0 {
+        if permanent_rejections > 0 {
             let reason = format!(
-                "Elasticsearch bulk request indexed no documents in index '{}'",
+                "Elasticsearch rejected {permanent_rejections} of {total_documents} documents in index '{}'; indexed {documents_indexed}",
                 self.config.index
             );
-            // Bad data must not look like a connectivity failure to a circuit
-            // breaker, but a 429 or 5xx rejection is transient and is not
-            // permanent. See `Error::PermanentHttpError`.
-            return Err(if retryable_rejection {
-                Error::CannotStoreData(reason)
-            } else {
-                Error::PermanentHttpError(reason)
-            });
+            error!("{reason}");
+            return Err(Error::PermanentHttpError(reason));
         }
 
         Ok(documents_indexed)
@@ -287,6 +310,11 @@ impl Sink for ElasticsearchSink {
             self.id, self.config.url, self.config.index
         );
 
+        if self.config.batch_size.is_some() {
+            warn!(
+                "Elasticsearch plugin_config.batch_size is ignored; use streams[].batch_length to control the input batch size"
+            );
+        }
         let client = self.create_client().await?;
         self.ensure_index_exists(&client).await?;
         self.client = Some(client);
@@ -418,6 +446,7 @@ impl Sink for ElasticsearchSink {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -437,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn given_bulk_item_results_when_indexing_should_fail_only_fully_rejected_batches() {
+    fn given_bulk_item_results_when_indexing_should_fail_any_rejected_batch() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
         runtime.block_on(async {
             let accepted = json!({"index": {"status": 201}});
@@ -474,7 +503,7 @@ mod tests {
                     )
                     .await;
 
-                if expected_indexed == 0 {
+                if expected_indexed < items.len() {
                     assert!(
                         matches!(result, Err(Error::PermanentHttpError(_))),
                         "{result:?}"
@@ -504,7 +533,7 @@ mod tests {
                             "error": {"type": "es_rejected_execution_exception"}
                         }})],
                     })))
-                    .expect(1)
+                    .expect(u64::from(BULK_RETRY_POLICY.max_attempts))
                     .mount(&server)
                     .await;
                 let mut config = test_config();
@@ -554,6 +583,95 @@ mod tests {
             let state = sink.state.lock().await;
             assert_eq!(state.documents_indexed, 0);
             assert_eq!(state.errors_count, 0);
+        });
+    }
+
+    #[test]
+    fn given_mixed_bulk_results_when_retrying_should_send_only_transient_rejections() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            for permanent_rejection in [false, true] {
+                let server = MockServer::start().await;
+                let last_status = if permanent_rejection { 400 } else { 201 };
+                Mock::given(method("POST"))
+                    .and(path("/_bulk"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "items": [
+                            {"index": {"status": 201}},
+                            {"index": {"status": 429, "error": {"type": "es_rejected_execution_exception"}}},
+                            {"index": {"status": last_status}},
+                        ]
+                    })))
+                    .up_to_n_times(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/_bulk"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "items": [{"index": {"status": 201}}]
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let mut config = test_config();
+                config.url = server.uri();
+                let sink = ElasticsearchSink::new(1, config);
+                let client = sink.create_client().await.unwrap();
+                let documents = vec![
+                    simd_json::json!({"id": 1}),
+                    simd_json::json!({"id": 2}),
+                    simd_json::json!({"id": 3}),
+                ];
+                let result = sink.bulk_index_documents(&client, documents).await;
+                if permanent_rejection {
+                    assert!(matches!(result, Err(Error::PermanentHttpError(_))), "{result:?}");
+                } else {
+                    assert_eq!(result, Ok(3));
+                }
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2);
+                let retry_body: Vec<serde_json::Value> = requests[1].body
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice(line).unwrap())
+                    .collect();
+                assert_eq!(retry_body, vec![json!({"index": {"_index": "test"}}), json!({"id": 2})]);
+                let state = sink.state.lock().await;
+                assert_eq!(state.documents_indexed, if permanent_rejection { 2 } else { 3 });
+                assert_eq!(state.errors_count, usize::from(permanent_rejection));
+            }
+        });
+    }
+
+    #[test]
+    fn given_ambiguous_bulk_response_when_indexing_should_fail_without_replaying() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            for (status, body) in [
+                (503, json!({"error": "unavailable"})),
+                (200, json!({"items": []})),
+                (
+                    200,
+                    json!({"items": [{"index": {"error": "missing status"}}]}),
+                ),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/_bulk"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let mut config = test_config();
+                config.url = server.uri();
+                let sink = ElasticsearchSink::new(1, config);
+                let client = sink.create_client().await.unwrap();
+                let result = sink
+                    .bulk_index_documents(&client, vec![simd_json::json!({"id": 1})])
+                    .await;
+                assert!(matches!(result, Err(Error::Connection(_))), "{result:?}");
+            }
         });
     }
 

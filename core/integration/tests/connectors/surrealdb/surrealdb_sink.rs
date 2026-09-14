@@ -64,7 +64,7 @@ async fn json_messages_sink_to_surrealdb(harness: &TestHarness, fixture: Surreal
     server(connectors_runtime(config_path = "tests/connectors/surrealdb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_namespace_auth_should_insert_messages(
+async fn namespace_auth_inserts_messages(
     harness: &TestHarness,
     fixture: SurrealDbSinkNamespaceFixture,
 ) {
@@ -75,7 +75,7 @@ async fn given_namespace_auth_should_insert_messages(
     server(connectors_runtime(config_path = "tests/connectors/surrealdb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_database_auth_should_insert_messages(
+async fn database_auth_inserts_messages(
     harness: &TestHarness,
     fixture: SurrealDbSinkDatabaseFixture,
 ) {

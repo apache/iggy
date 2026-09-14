@@ -226,7 +226,7 @@ async fn elasticsearch_sink_preserves_json_structure(
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_rejected_document_when_indexing_should_report_runtime_error(
+async fn rejected_document_reports_runtime_error(
     harness: &TestHarness,
     fixture: ElasticsearchSinkFixture,
 ) {

@@ -20,8 +20,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use iggy_connector_sdk::retry::{
-    RetryPolicy, build_retry_client, check_connectivity_with_retry, is_transient_status,
-    retry_async,
+    RetryPolicy, build_retry_client, check_connectivity, is_transient_status, retry_async,
 };
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
@@ -73,7 +72,9 @@ pub struct QuickwitSinkConfig {
     pub retry_delay: Option<String>,
     /// Maximum retry delay cap as a human-readable duration string, e.g. "5s" (default: 5s).
     pub retry_max_delay: Option<String>,
-    /// Total attempts per readiness check including the first (default: 10). 1 disables retries.
+    /// Startup attempt budget shared by health and ingest readiness (default: 10).
+    /// Each check runs once, with up to max_open_retries - 1 retries shared between them.
+    /// Values of 0 or 1 disable retries.
     pub max_open_retries: Option<u32>,
     /// Maximum retry delay cap when opening the sink, e.g. "30s" (default: 30s).
     pub open_retry_max_delay: Option<String>,
@@ -405,7 +406,7 @@ impl Sink for QuickwitSink {
                 .timeout(timeout)
                 .build()
                 .map_err(|error| Error::InitError(format!("reqwest client: {error}")))?;
-            let open_retry_policy = RetryPolicy {
+            let mut open_retry_policy = RetryPolicy {
                 max_attempts: self
                     .config
                     .max_open_retries
@@ -414,14 +415,26 @@ impl Sink for QuickwitSink {
                 base_delay: retry_delay,
                 max_delay: open_retry_max_delay,
             };
-            check_connectivity_with_retry(
-                &raw_client,
-                endpoint_url(&base_url, &["health", "readyz"])?,
-                "Quickwit sink",
-                self.id,
+            let health_url = endpoint_url(&base_url, &["health", "readyz"])?;
+            let mut health_attempts = 0;
+            retry_async(
                 open_retry_policy,
+                &format!("Quickwit sink ID {} startup connectivity", self.id),
+                |_| true,
+                || {
+                    health_attempts += 1;
+                    check_connectivity(&raw_client, health_url.clone(), "Quickwit sink")
+                },
             )
-            .await?;
+            .await
+            .map_err(|failure| {
+                error!(
+                    "Quickwit sink ID {} startup connectivity: {failure}",
+                    self.id
+                );
+                failure.into_error()
+            })?;
+            open_retry_policy.max_attempts -= health_attempts - 1;
 
             self.client = Some(build_retry_client(
                 raw_client.clone(),
@@ -821,6 +834,33 @@ mod tests {
                     simd_json::json!({"text": "first message", "data_type": "text"})
                 );
             }
+        });
+    }
+
+    #[test]
+    fn given_health_retries_when_ingest_is_unavailable_should_share_the_startup_budget() {
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            let (url, server) = start_test_server(vec![
+                ("GET /health/readyz HTTP/1.1", 503, "not ready"),
+                ("GET /health/readyz HTTP/1.1", 200, ""),
+                ("GET /api/v1/indexes/test HTTP/1.1", 200, "{}"),
+                (
+                    "POST /api/v1/test/ingest?commit=auto HTTP/1.1",
+                    503,
+                    "not ready",
+                ),
+                ("POST /api/v1/test/ingest?commit=auto HTTP/1.1", 200, "{}"),
+            ])
+            .await;
+            let mut config = test_config();
+            config.url = url;
+            config.max_open_retries = Some(2);
+            let mut sink = QuickwitSink::new(1, config);
+            let result = sink.open().await;
+            server.abort();
+            assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
+            assert!(sink.client.is_none());
         });
     }
 

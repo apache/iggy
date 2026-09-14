@@ -156,6 +156,7 @@ pub struct DorisSinkConfig {
     /// Stream Load output format: `"json"` (default) or `"csv"`. CSV is opt-in
     /// for throughput; because Doris CSV is positional (JSON is name-mapped), it
     /// requires `columns` to pin the column order, else `open()` fails.
+    /// A field named `format` would lose its environment override to `PLUGIN_CONFIG_FORMAT`.
     pub output_format: Option<Format>,
     /// Total per-request HTTP timeout as a human-readable duration, e.g. "30s"
     /// (default 30s). Matches the `timeout` field on the http/influxdb sinks.

@@ -34,6 +34,7 @@ sink_connector!(PostgresSink);
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
+const MAX_BIND_PARAMETERS: usize = u16::MAX as usize;
 
 #[derive(Debug)]
 pub struct PostgresSink {
@@ -231,23 +232,36 @@ impl PostgresSink {
         messages: &[ConsumedMessage],
     ) -> Result<(), Error> {
         let pool = self.get_pool()?;
-        let batch_size = self.config.batch_size.unwrap_or(100).max(1) as usize;
+        let params_per_row = Self::insert_columns(
+            self.config.include_metadata.unwrap_or(true),
+            self.config.include_checksum.unwrap_or(true),
+            self.config.include_origin_timestamp.unwrap_or(true),
+        )
+        .len();
+        let batch_size = (self.config.batch_size.unwrap_or(100).max(1) as usize)
+            .min(MAX_BIND_PARAMETERS / params_per_row);
+        let mut last_error = None;
+        let mut msg_count = 0;
+        let mut insertion_errors = 0;
 
         for batch in messages.chunks(batch_size) {
-            if let Err(e) = self
+            match self
                 .insert_batch(batch, topic_metadata, messages_metadata, pool)
                 .await
             {
-                let mut state = self.state.lock().await;
-                state.insertion_errors += batch.len() as u64;
-                error!("Failed to insert batch: {e}");
+                Ok(()) => msg_count += batch.len(),
+                Err(error) => {
+                    insertion_errors += batch.len();
+                    error!("Failed to insert batch: {error}");
+                    last_error = Some(error);
+                }
             }
         }
 
         let mut state = self.state.lock().await;
-        state.messages_processed += messages.len() as u64;
+        state.messages_processed += msg_count as u64;
+        state.insertion_errors += insertion_errors as u64;
 
-        let msg_count = messages.len();
         let table = &self.config.target_table;
         if self.verbose {
             info!(
@@ -261,7 +275,7 @@ impl PostgresSink {
             );
         }
 
-        Ok(())
+        last_error.map_or(Ok(()), Err)
     }
 
     async fn insert_batch(
@@ -458,31 +472,13 @@ impl PostgresSink {
         row_count: usize,
     ) -> Result<(String, u32), Error> {
         let quoted_table = quote_identifier(table_name)?;
-        let mut query = format!("INSERT INTO {quoted_table} (id");
-
-        let mut params_per_row: u32 = 1; // id
-
-        if include_metadata {
-            query.push_str(
-                ", iggy_offset, iggy_timestamp, iggy_stream, iggy_topic, iggy_partition_id",
-            );
-            params_per_row += 5;
-        }
-
-        if include_checksum {
-            query.push_str(", iggy_checksum");
-            params_per_row += 1;
-        }
-
-        if include_origin_timestamp {
-            query.push_str(", iggy_origin_timestamp");
-            params_per_row += 1;
-        }
-
-        query.push_str(", payload");
-        params_per_row += 1;
-
-        query.push_str(") VALUES ");
+        let columns =
+            Self::insert_columns(include_metadata, include_checksum, include_origin_timestamp);
+        let params_per_row = columns.len() as u32;
+        let mut query = format!(
+            "INSERT INTO {quoted_table} ({}) VALUES ",
+            columns.join(", ")
+        );
 
         let mut value_groups = Vec::with_capacity(row_count);
         for row_idx in 0..row_count {
@@ -498,6 +494,31 @@ impl PostgresSink {
         query.push_str(&value_groups.join(", "));
 
         Ok((query, params_per_row))
+    }
+
+    fn insert_columns(
+        include_metadata: bool,
+        include_checksum: bool,
+        include_origin_timestamp: bool,
+    ) -> Vec<&'static str> {
+        let mut columns = vec!["id"];
+        if include_metadata {
+            columns.extend([
+                "iggy_offset",
+                "iggy_timestamp",
+                "iggy_stream",
+                "iggy_topic",
+                "iggy_partition_id",
+            ]);
+        }
+        if include_checksum {
+            columns.push("iggy_checksum");
+        }
+        if include_origin_timestamp {
+            columns.push("iggy_origin_timestamp");
+        }
+        columns.push("payload");
+        columns
     }
 }
 
@@ -560,6 +581,49 @@ mod tests {
             max_retries: None,
             retry_delay: None,
         }
+    }
+
+    #[test]
+    fn given_invalid_json_when_consumed_should_report_failure_without_counting_success() {
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create test runtime");
+        runtime.block_on(async {
+            let mut config = test_config();
+            config.payload_format = Some("json".to_string());
+            let pool = PgPoolOptions::new()
+                .connect_lazy(config.connection_string.expose_secret())
+                .expect("Failed to configure lazy test pool");
+            let mut sink = PostgresSink::new(1, config);
+            sink.pool = Some(pool);
+            let result = sink
+                .consume(
+                    &TopicMetadata {
+                        stream: "events".to_string(),
+                        topic: "messages".to_string(),
+                    },
+                    MessagesMetadata {
+                        partition_id: 0,
+                        current_offset: 0,
+                        schema: iggy_connector_sdk::Schema::Raw,
+                    },
+                    vec![ConsumedMessage {
+                        id: 1,
+                        offset: 0,
+                        checksum: 0,
+                        timestamp: 0,
+                        origin_timestamp: 0,
+                        headers: None,
+                        payload: iggy_connector_sdk::Payload::Raw(b"invalid JSON".to_vec()),
+                    }],
+                )
+                .await;
+            assert!(
+                matches!(result, Err(Error::CannotStoreData(_))),
+                "{result:?}"
+            );
+            let state = sink.state.lock().await;
+            assert_eq!(state.messages_processed, 0);
+            assert_eq!(state.insertion_errors, 1);
+        });
     }
 
     #[test]

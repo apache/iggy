@@ -27,6 +27,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const PROBE_KEY: &str = ".iggy-sink-probe";
 
 struct FlushPayload {
     data: Vec<u8>,
@@ -45,7 +46,27 @@ impl Sink for S3Sink {
 
         let bucket = crate::client::create_bucket(&self.config).await?;
 
-        crate::client::verify_bucket(&bucket).await?;
+        let prefix = self
+            .config
+            .prefix
+            .as_deref()
+            .unwrap_or_default()
+            .trim_matches('/');
+        let probe_key = if prefix.is_empty() {
+            PROBE_KEY.to_string()
+        } else {
+            format!("{prefix}/{PROBE_KEY}")
+        };
+        // Probe the same write scope as data uploads without requiring ListBucket.
+        self.upload_with_retry(&bucket, &probe_key, &[])
+            .await
+            .map_err(|error| {
+                Error::InitError(format!(
+                    "S3 bucket '{}' write probe failed: {error}",
+                    bucket.name
+                ))
+            })?;
+        let _ = bucket.delete_object(&probe_key).await;
 
         info!(
             "S3 sink ID: {} connected to bucket '{}' in region '{}'",
@@ -242,7 +263,6 @@ impl S3Sink {
         buffer: &mut FileBuffer,
     ) -> Result<FlushPayload, Error> {
         let resolved = self.resolved();
-        let data = formatter::finalize_buffer(buffer.entries(), resolved.output_format);
 
         let ctx = PathContext {
             stream: &key.stream,
@@ -264,6 +284,7 @@ impl S3Sink {
         let first_offset = buffer.first_offset();
         let last_offset = buffer.last_offset();
 
+        let data = formatter::finalize_buffer(buffer, resolved.output_format);
         buffer.reset();
 
         Ok(FlushPayload {
@@ -436,6 +457,56 @@ mod tests {
     }
 
     #[test]
+    fn startup_probe_uses_prefix_and_retries_transient_failures() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for prefix in [None, Some(""), Some("/"), Some("/allowed/events/")] {
+                for status in [200, 403, 404, 408, 429, 503] {
+                    let server = MockServer::start().await;
+                    let probe_path = if prefix == Some("/allowed/events/") {
+                        "/test-bucket/allowed/events/.iggy-sink-probe"
+                    } else {
+                        "/test-bucket/.iggy-sink-probe"
+                    };
+                    Mock::given(method("PUT"))
+                        .and(path(probe_path))
+                        .respond_with(ResponseTemplate::new(status))
+                        .up_to_n_times(1)
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    Mock::given(method("PUT"))
+                        .and(path(probe_path))
+                        .respond_with(ResponseTemplate::new(200))
+                        .expect(u64::from(matches!(status, 408 | 429 | 503)))
+                        .mount(&server)
+                        .await;
+                    let config = S3SinkConfig {
+                        prefix: prefix.map(str::to_string),
+                        endpoint: Some(server.uri()),
+                        access_key_id: Some("test-access-key".into()),
+                        secret_access_key: Some("test-secret-key".into()),
+                        max_attempts: Some(2),
+                        retry_delay: Some("1ms".to_string()),
+                        ..test_config()
+                    };
+                    let mut sink = S3Sink::new(1, config);
+                    let result = sink.open().await;
+                    if matches!(status, 403 | 404) {
+                        assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
+                        assert!(sink.bucket.is_none());
+                    } else {
+                        assert!(
+                            result.is_ok(),
+                            "prefix {prefix:?}, status {status}: {result:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn given_failed_upload_should_count_each_lost_message_once() {
         const TOTAL_MESSAGES: u64 = 3;
         const ROTATION_MESSAGES: u64 = 2;
@@ -445,7 +516,7 @@ mod tests {
             for previously_buffered in [0, 1] {
                 let server = MockServer::start().await;
                 Mock::given(method("PUT"))
-                    .and(path("/test-bucket/.iggy-sink-probe"))
+                    .and(path("/test-bucket/data/.iggy-sink-probe"))
                     .respond_with(ResponseTemplate::new(200))
                     .mount(&server)
                     .await;

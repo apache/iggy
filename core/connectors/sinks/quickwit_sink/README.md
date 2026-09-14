@@ -12,7 +12,7 @@ The Quickwit connector sends data to the Quickwit API using HTTP. It checks read
 | `max_retries` | `3` | Total HTTP attempts including the first; `0` and `1` both allow one attempt. |
 | `retry_delay` | `"1s"` | Base exponential delay for HTTP retries and readiness probes. |
 | `retry_max_delay` | `"5s"` | Cap for calculated HTTP retry delays; a valid `Retry-After` on HTTP 429 overrides it. |
-| `max_open_retries` | `10` | Total attempts per readiness check including the first; `0` and `1` both allow one attempt. |
+| `max_open_retries` | `10` | One initial probe per readiness check, with up to `max_open_retries - 1` retries shared between them; `0` and `1` disable retries. |
 | `open_retry_max_delay` | `"30s"` | Maximum delay between readiness probes. |
 | `timeout` | `"30s"` | Timeout per HTTP attempt; retries and waits can extend the complete operation. |
 
@@ -28,7 +28,7 @@ verbose_logging = false
 max_retries = 3
 retry_delay = "1s"
 retry_max_delay = "5s"
-# Total attempts per readiness check including the first; 1 disables retries.
+# One initial probe per readiness check; share up to max_open_retries - 1 retries.
 max_open_retries = 10
 open_retry_max_delay = "30s"
 timeout = "30s"
@@ -110,7 +110,8 @@ This is intentional: legacy index metadata can exist before the ingest queue is 
 The probe uses `commit=auto`, so it adds no documents and does not force a commit; see Quickwit's [ingest implementation](https://github.com/quickwit-oss/quickwit/blob/v0.8.2/quickwit/quickwit-serve/src/ingest_api/rest_handler.rs) and [legacy/V2 routing](https://github.com/quickwit-oss/quickwit/blob/v0.9.0/quickwit/quickwit-serve/src/ingest_api/rest_handler.rs).
 Ingest V2 accepts empty requests without checking shard readiness, so this probe does not guarantee that the first data request will succeed.
 Index readiness retries HTTP 404, 429, 5xx and network failures.
-Each readiness check uses `max_open_retries` and `open_retry_max_delay`; these probes submit no documents.
+The two checks share up to `max_open_retries - 1` retries, in addition to one initial probe each.
+Values of `0` or `1` disable retries. Delays use `open_retry_max_delay`; these probes submit no documents.
 
 The sink cannot guarantee at-least-once delivery. The runtime commits offsets when polling, logs/counts plugin callback errors and continues without replaying the failed batch. A permanent error or exhausted retry budget is logged, but affected messages are not redelivered. The runtime's processed-message count does not prove successful indexing.
 

@@ -13,7 +13,7 @@ The PostgreSQL sink connector consumes messages from Iggy topics and stores them
 
 ## Configuration
 
-Build from the matching 0.9.0/edge checkout root:
+Build from the matching Iggy checkout root:
 
 ```bash
 cargo build --release -p iggy_connector_postgres_sink
@@ -59,7 +59,7 @@ payload_format = "bytea"
 | ------ | ---- | ------- | ----------- |
 | `connection_string` | string | required | PostgreSQL connection string |
 | `target_table` | string | required | One quoted table identifier; `schema.table` is a literal name containing a dot |
-| `batch_size` | u32 | `100` | Maximum messages per insert statement; `0` behaves as `1` |
+| `batch_size` | u32 | `100` | Maximum messages per insert statement, capped by PostgreSQL's bind-parameter limit; `0` behaves as `1` |
 | `max_connections` | u32 | `10` | Max database connections |
 | `auto_create_table` | bool | `false` | Create a missing table; existing tables are not migrated |
 | `include_metadata` | bool | `true` | Include Iggy metadata columns |
@@ -187,10 +187,10 @@ CREATE INDEX idx_payload_gin ON iggy_messages USING GIN (payload);
 - Adjust `max_connections` based on PostgreSQL's `max_connections` setting
 - Use `poll_interval` to control how often the sink checks for new messages
 - Use `payload_format = "json"` for JSON data to enable native querying
-- Stay within PostgreSQL's 65,535 bind-parameter limit: each row uses
-  `2 + 5 * include_metadata + include_checksum + include_origin_timestamp`
-  parameters. With default flags, at most 7,281 rows fit in one statement.
-  Larger actual chunks fail; the runtime's `batch_length` also limits poll size.
+
+The sink caps each statement at PostgreSQL's 65,535 bind parameters based on
+the enabled columns. With default flags, at most 7,281 rows fit in one statement.
+The runtime's `batch_length` also limits poll size.
 
 ## Example Configs
 
@@ -273,10 +273,11 @@ loop.
 
 Each current-poll chunk becomes one multi-row `INSERT`. A bad payload, duplicate
 primary key, incompatible table or other terminal failure rejects that chunk.
-Later chunks are still attempted. Failures are logged and added to a private
-insertion-error count, but `consume()` returns success and counts every attempted
-message as processed. Runtime processed counts can include unstored messages,
-and runtime error counts do not expose these insert failures.
+Later chunks are still attempted. Failures are logged and added to the sink's
+insertion-error count, and `consume()` returns the last chunk error. The sink
+counts only successfully inserted chunks as processed. The runtime counts
+callbacks, so a partially successful callback is reported as an error even when
+some rows were stored.
 
 The query has no `ON CONFLICT` or upsert clause. An ID already in the table
 rejects the whole chunk, including new IDs alongside it. There is no transaction

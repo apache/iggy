@@ -618,7 +618,7 @@ async fn unordered_duplicate_partial_insert_has_exact_accounting(
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
+async fn schema_validation_mid_batch_surfaces_hard_error_and_counts_valid_documents(
     harness: &TestHarness,
     fixture: MongoDbSinkFixture,
 ) {
@@ -705,7 +705,7 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
 
     assert!(
         id11_inserted,
-        "Expected prefix message (_id=11) to be inserted before schema validation failure"
+        "Expected valid message (_id=11) to be inserted despite schema validation failures"
     );
     assert!(
         !id12_inserted,
@@ -713,7 +713,7 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
     );
     assert!(
         !id13_inserted,
-        "Expected suffix message (_id=13) to fail the collection validator"
+        "Expected invalid message (_id=13) to fail the collection validator"
     );
 
     let total_docs = collection
@@ -722,7 +722,7 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
         .expect("Failed to count documents after schema validation test");
     assert_eq!(
         total_docs, 1,
-        "Expected exact prefix-only write accounting under schema validation failure"
+        "Expected only the valid document to count as written under schema validation failure"
     );
 }
 

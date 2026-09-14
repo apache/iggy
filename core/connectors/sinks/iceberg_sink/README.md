@@ -47,8 +47,8 @@ store_path_style_access = true
 - **store_class**: The storage class to use. **Currently, only S3-compatible storage is supported.**
 - **store_path_style_access**: Use path-style S3 URLs (`http://host/bucket/key`). Defaults to `true`, which MinIO-style endpoints require; set to `false` for stores that only accept virtual-hosted-style URLs.
 
-All options above are required except the credential pair and `store_path_style_access`.
-`tables` and `dynamic_route_field` must be present even when the selected mode does not use them.
+All options above are required except the credential pair, `store_path_style_access`, and the unused routing field.
+Static routing requires a non-empty `tables` list; dynamic routing requires a non-empty `dynamic_route_field`.
 
 ## Static Routing
 

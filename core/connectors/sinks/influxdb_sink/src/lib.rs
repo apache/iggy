@@ -31,7 +31,7 @@ use iggy_connector_sdk::{
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest_middleware::ClientWithMiddleware;
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -348,7 +348,7 @@ impl InfluxDbSinkConfig {
 /// `measurement`, `precision`, `include_*`, `batch_size_limit`.
 ///
 /// **Open-time fields** (populated in `open()`, guarded by `Option<T>`):
-/// `client`, `write_url`, `auth_header` — callers must invoke `open()` before
+/// `client`, `write_url` - callers must invoke `open()` before
 /// any `process_batch()` call; `get_client()` returns an error otherwise.
 #[derive(Debug)]
 pub struct InfluxDbSink {
@@ -356,7 +356,6 @@ pub struct InfluxDbSink {
     config: InfluxDbSinkConfig,
     client: Option<ClientWithMiddleware>,
     write_url: Option<Url>,
-    auth_header: Option<SecretBox<String>>,
     circuit_breaker: Arc<CircuitBreaker>,
     messages_attempted: AtomicU64,
     write_success: AtomicU64,
@@ -433,7 +432,6 @@ impl InfluxDbSink {
             config,
             client: None,
             write_url: None,
-            auth_header: None,
             circuit_breaker,
             messages_attempted: AtomicU64::new(0),
             write_success: AtomicU64::new(0),
@@ -457,7 +455,9 @@ impl InfluxDbSink {
         let timeout = parse_duration(self.config.timeout(), DEFAULT_TIMEOUT);
         let mut authorization =
             HeaderValue::from_str(&self.config.auth_header()).map_err(|error| {
-                Error::InvalidConfigValue(format!("Invalid InfluxDB authorization header: {error}"))
+                Error::InvalidConfigValue(format!(
+                    "InfluxDB token contains characters that are invalid in an HTTP header: {error}"
+                ))
             })?;
         authorization.set_sensitive(true);
         let mut headers = HeaderMap::new();
@@ -670,17 +670,8 @@ impl InfluxDbSink {
         let url = self.write_url.as_ref().ok_or_else(|| {
             Error::Connection("write_url not initialized — call open() first".to_string())
         })?;
-        let auth = self
-            .auth_header
-            .as_ref()
-            .map(|s| s.expose_secret().as_str())
-            .ok_or_else(|| {
-                Error::Connection("auth_header not initialised — was open() called?".to_string())
-            })?;
-
         let response = client
             .post(url.as_str())
-            .header("Authorization", auth)
             .header("Content-Type", "text/plain; charset=utf-8")
             // into_bytes() hands the Vec<u8> directly to Bytes without copying.
             .body(Bytes::from(body.into_bytes()))
@@ -775,7 +766,6 @@ impl Sink for InfluxDbSink {
         ));
 
         self.write_url = Some(self.config.build_write_url()?);
-        self.auth_header = Some(SecretBox::new(Box::new(self.config.auth_header())));
 
         info!("InfluxDB sink ID: {} opened successfully", self.id);
         Ok(())

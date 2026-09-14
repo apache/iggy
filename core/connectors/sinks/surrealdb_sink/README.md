@@ -14,7 +14,7 @@ the same identities, but do not ensure that a failed batch will be delivered.
 
 ## Configuration
 
-From the matching 0.9.0/edge Iggy checkout root, build the plugin:
+From the matching Iggy checkout root, build the plugin:
 
 ```bash
 cargo build --release -p iggy_connector_surrealdb_sink
