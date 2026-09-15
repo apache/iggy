@@ -1,0 +1,120 @@
+# DynamoDB Sink Connector
+
+A sink connector that consumes messages from Iggy streams and writes them to an
+Amazon DynamoDB table with `BatchWriteItem` through the official AWS SDK.
+
+## Configuration
+
+```toml
+[plugin_config]
+table = "iggy_messages"
+region = "us-east-1"
+# endpoint = "http://localhost:8000"
+# access_key_id = "..."
+# secret_access_key = "..."
+# session_token = "..."
+partition_key_field = "iggy_id"
+# sort_key_field = "iggy_offset"
+batch_size = 25
+include_metadata = true
+include_checksum = true
+include_origin_timestamp = true
+max_item_size = 409600
+max_retries = 3
+retry_delay = "500ms"
+max_retry_delay = "5s"
+verbose_logging = false
+```
+
+- `table`: Target DynamoDB table. The table must already exist.
+- `region`: AWS region. Falls back to the default AWS region chain when unset.
+- `endpoint`: Custom endpoint URL, for DynamoDB Local or a VPC endpoint.
+- `access_key_id` / `secret_access_key` / `session_token`: Static credentials.
+  Provide both `access_key_id` and `secret_access_key`, or neither. When both
+  are omitted the connector uses the default AWS credential chain. A
+  `session_token` belongs to those static credentials, so it is rejected when
+  they are missing instead of being silently ignored.
+- `partition_key_field`: Item attribute used as the table partition key.
+  Defaults to `iggy_id`.
+- `sort_key_field`: Item attribute used as the table sort key. Only set this
+  when the table has a sort key.
+- `batch_size`: Items per `BatchWriteItem` request. Defaults to `25`, which is
+  also the DynamoDB limit, so larger values are clamped.
+- `include_metadata`: Add `iggy_stream`, `iggy_topic`, `iggy_partition_id`,
+  `iggy_offset`, and `iggy_timestamp` to each item. Defaults to `true`.
+- `include_checksum`: Add `iggy_checksum`. Defaults to `true`.
+- `include_origin_timestamp`: Add `iggy_origin_timestamp`. Defaults to `true`.
+- `max_item_size`: Maximum item size in bytes. Defaults to `409600` (400 KB),
+  which is also the DynamoDB limit, so larger values are clamped. The size
+  follows the DynamoDB rules, including the fixed per-item overhead and the
+  overhead of nested lists and maps, and rounds every estimate up.
+- `max_retries`: Retries after the first attempt. Defaults to `3`.
+- `retry_delay`: First retry delay as a humantime string. Defaults to `500ms`.
+- `max_retry_delay`: Upper bound of a single backoff, jitter included.
+  Defaults to `5s`.
+- `verbose_logging`: Log per-batch results at info level. Defaults to `false`.
+
+## Behavior
+
+JSON objects are written attribute by attribute, so a message field becomes a
+DynamoDB attribute of the matching type. JSON arrays and scalars are nested
+under a `payload` attribute, because a DynamoDB item must be a map. Text
+payloads go into `payload` as a string. Raw payloads are parsed as JSON when
+possible, otherwise they are stored as binary. Protobuf, FlatBuffer, and Avro
+payloads are not supported and are skipped with a warning.
+
+Metadata attributes are written after the payload, so they overwrite payload
+fields of the same name, including a payload field configured as a key.
+
+Message headers are not written. An item carries the payload and the enabled
+`iggy_*` metadata attributes only.
+
+## Keys and Idempotency
+
+`BatchWriteItem` uses `PutRequest`, which overwrites an existing item with the
+same primary key. Redelivery of the same message therefore writes the same item
+again as long as the key is deterministic.
+
+When the payload does not carry the configured `partition_key_field`, the
+connector injects a key built from the stream, topic, partition, and message
+offset, with each name prefixed by its byte length so that a name containing the
+separator cannot build another topic's key. The offset identifies a message
+inside its partition and stays the same on redelivery, unlike the message ID,
+which is `0` for every message sent without an explicit one. When
+`sort_key_field` is configured and missing, the message offset is injected.
+
+A payload value wins over the injected one, so a message that carries the key
+field with an empty value, or with a value that is neither a string, a number,
+nor binary, is skipped rather than falling back to the injected key, because
+DynamoDB would reject the whole batch. Metadata attributes are the exception:
+they are written after the payload, so a key field named `iggy_offset`, for
+example, takes the metadata value.
+
+The key fields are checked against the table on startup. A `partition_key_field`
+or `sort_key_field` that does not match the table key schema fails the connector
+while it opens, instead of on the first write. The declared key types are read
+from the same call. The generated partition key is a string (`S`) and the
+generated sort key is a number (`N`), so a table typing its keys as anything
+else only accepts messages that carry those fields, which the connector warns
+about on startup. Every item is then checked against the declared `S`, `N`, or
+`B` type and against the DynamoDB key size limits, 2,048 bytes for a partition
+key and 1,024 bytes for a sort key. A mismatched item is skipped instead of
+failing its whole batch.
+
+DynamoDB rejects a request that writes the same key twice, so within one
+`consume()` call only the newest item per key is sent.
+
+## Retries
+
+Unprocessed items returned by `BatchWriteItem` are retried with exponential
+backoff, so a partially throttled batch is not silently dropped. Throttling and
+server errors such as `ProvisionedThroughputExceededException`,
+`ThrottlingException`, `InternalServerError`, and
+`ReplicatedWriteConflictException` are retried the same way, which covers both
+provisioned and on-demand capacity modes as well as multi-Region tables.
+Validation and access errors are permanent and returned without a retry.
+
+Items larger than `max_item_size` are logged and skipped instead of failing the
+whole batch. So are records carrying a number outside the range DynamoDB
+stores, between 1E-130 and 1E+126 in magnitude, because the service answers a
+permanent validation error for the whole request.
