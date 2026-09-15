@@ -199,4 +199,4 @@ never labeled or closed by it. A closed PR can be reopened.
 
 ## Questions?
 
-[Discussions](https://github.com/apache/iggy/discussions) or [Discord](https://discord.gg/apache-iggy)
+[Discussions](https://github.com/apache/iggy/discussions), [Discord](https://discord.gg/apache-iggy) or the [dev@iggy.apache.org](https://iggy.apache.org/community/mailing-lists/) mailing list (subscribe by emailing <dev-subscribe@iggy.apache.org>)
