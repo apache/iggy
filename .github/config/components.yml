@@ -345,10 +345,7 @@ components:
       - "foreign/swift/**"
       - "bdd/swift/**"
       - "examples/swift/**"
-      # The SDK compiles against the VSR wire contract, so a change to the
-      # protocol crate must rerun it.
-      - "core/binary_protocol/**"
-    tasks: ["lint", "test", "build", "build-macos"]
+    tasks: ["lint", "test", "build", "build-macos", "golden"]
 
   # Shared BDD infrastructure that affects all BDD tests
   bdd-infrastructure:
