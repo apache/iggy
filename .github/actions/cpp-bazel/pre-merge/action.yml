@@ -63,7 +63,7 @@ runs:
       shell: bash
       run: |
         cd foreign/cpp
-        cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
+        cargo clippy --all-targets --all-features -- -D warnings
 
     - name: Build
       if: inputs.task == 'build'
@@ -72,18 +72,24 @@ runs:
         cd foreign/cpp
         bazel build --config=ci //:iggy-cpp
 
+    - name: Install cargo-llvm-cov
+      if: inputs.task == 'test'
+      uses: taiki-e/install-action@v2.87.3
+      with:
+        tool: cargo-llvm-cov
+
     - name: Setup server for tests
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/server-start
       with:
         cargo-bin: iggy-server
 
-    - name: Test
+    - name: Test with coverage
       if: inputs.task == 'test'
       shell: bash
       run: |
         cd foreign/cpp
-        bazel test --config=ci //...
+        ../../scripts/ci/cpp-coverage.sh
 
     - name: Stop server after tests
       if: always() && inputs.task == 'test'
