@@ -11,7 +11,7 @@ The Quickwit connector sends data to the Quickwit API using HTTP. It checks read
 | `verbose_logging` | `false` | Log received and ingested message counts at `info` instead of `debug`. |
 | `max_retries` | `3` | Total HTTP attempts including the first; `0` and `1` both allow one attempt. |
 | `retry_delay` | `"1s"` | Base exponential delay for HTTP retries and readiness probes. |
-| `retry_max_delay` | `"5s"` | Cap for calculated HTTP retry delays; a valid `Retry-After` on HTTP 429 overrides it. |
+| `retry_max_delay` | `"5s"` | Cap for HTTP retry delays, both calculated and taken from `Retry-After`. |
 | `max_open_retries` | `10` | One initial probe per readiness check, with up to `max_open_retries - 1` retries shared between them; `0` and `1` disable retries. |
 | `open_retry_max_delay` | `"30s"` | Maximum delay between readiness probes. |
 | `timeout` | `"30s"` | Timeout per HTTP attempt; retries and waits can extend the complete operation. |
@@ -103,7 +103,7 @@ The examples use `mode: dynamic` to retain wrapper fields. With `mode: strict`, 
 
 ## Delivery semantics
 
-Transient HTTP failures, including 429, can retry a request that Quickwit already accepted. Quickwit ingest has no deduplication key, so these retries can produce duplicate documents. Set `max_retries = 1` to disable the sink's HTTP retry loop. Calculated delays use exponential backoff with jitter; a valid `Retry-After` on HTTP 429 replaces the calculated delay.
+Transient HTTP failures, including 429, can retry a request that Quickwit already accepted. Quickwit ingest has no deduplication key, so these retries can produce duplicate documents. Set `max_retries = 1` to disable the sink's HTTP retry loop. Calculated delays use exponential backoff with jitter. A valid `Retry-After` on HTTP 429 or any 5xx replaces the calculated delay, bounded by `retry_max_delay`.
 
 Service readiness retries any failed health probe. After verifying or creating the index, the sink probes its ingest endpoint with an empty body before accepting messages.
 This is intentional: legacy index metadata can exist before the ingest queue is ready, while the read-only `/tail` endpoint checks only legacy ingestion.

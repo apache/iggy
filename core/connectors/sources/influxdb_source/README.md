@@ -112,7 +112,9 @@ circuit_breaker_threshold = 5       # consecutive failures before circuit trips
 circuit_breaker_cool_down = "30s"   # cooldown before queries resume
 ```
 
-Attempt counts are clamped to at least one. Query retries use exponential backoff with jitter; integer-seconds `Retry-After` on HTTP 429 can override the delay cap. Other HTTP errors and malformed successful response bodies fail the poll. Startup retries failed authenticated `GET /health` requests. Invalid duration strings warn and fall back to `1s`, while zero durations are accepted. `batch_size = 0` is clamped to `1`. Without `initial_offset`, the cursor starts at `1970-01-01T00:00:00Z`.
+Attempt counts are clamped to at least one. Query retries use exponential backoff with jitter. Integer-seconds `Retry-After` on HTTP 429 or any 5xx replaces the calculated delay, bounded by `retry_max_delay`.
+
+Other HTTP errors and malformed successful response bodies fail the poll. Startup retries failed authenticated `GET /health` requests. Invalid duration strings warn and fall back to `1s`, while zero durations are accepted. `batch_size = 0` is clamped to `1`. Without `initial_offset`, the cursor starts at `1970-01-01T00:00:00Z`.
 
 ## Query Template Placeholders
 
