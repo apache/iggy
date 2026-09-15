@@ -83,6 +83,22 @@ fn ephemeral_range() -> (u16, u16) {
 /// that whole band. `flock` alone doesn't save it either: it is advisory, so it only excludes
 /// another `PortGuard`-based process, never an unrelated `bind(0)` elsewhere on the box landing on
 /// the same number from the kernel's own ephemeral pool.
+///
+/// Known residual gap, not fixed by the "matches `port_reserver.rs`" preference above: this
+/// `PortGuard` locks its own directory (`iggy-kafka-gateway-test-port-locks`), disjoint from
+/// `port_reserver.rs`'s (`iggy-test-port-locks`), so the two share no lock state even when their
+/// *bands* land on the same numbers. That only happens when the ephemeral floor leaves neither
+/// allocator room below it - `port_reserver.rs` needs room below its own, higher `BAND_START`
+/// (20000) to use the below-floor branch at all, while this function only needs room below
+/// `MIN_CANDIDATE_PORT` (10000) - so a floor at or under 10000 pushes *both* to their
+/// above-the-ceiling fallback, anchored at the identical `ceiling + 1`: this band takes the first
+/// [`DESIRED_SLOTS`] of it, `port_reserver.rs` takes the entire rest up to `u16::MAX`. A port
+/// this crate's tests reserve there is invisible to `port_reserver.rs`'s own lock, and vice versa,
+/// so two suites in the same workspace could hand out the same port under two different locks.
+/// `core/integration/src/harness/mod.rs`'s `mod port_reserver;` is private, so sharing its lock
+/// directory (the complete fix) needs a visibility change there first; narrow enough (an
+/// ephemeral floor this low is uncommon - the Linux default is 32768) that this is disclosed
+/// rather than worked around here.
 fn port_band() -> (u16, u16) {
     static BAND: OnceLock<(u16, u16)> = OnceLock::new();
     *BAND.get_or_init(|| {
@@ -193,21 +209,40 @@ impl PortGuard {
 /// `docs/TEST_SUITE.md` for the prerequisite, the same one `core/integration`'s own
 /// server-spawning tests already carry.
 ///
-/// `assert_cmd::cargo::cargo_bin`, matching `core/integration`'s own
-/// `harness::handle::server::start` - not a from-scratch `cargo build` invocation. An earlier
-/// version of this function drove `cargo build --package server --bin iggy-server` directly,
-/// reasoning that `Command::cargo_bin` "only resolves `CARGO_BIN_EXE_*` for binaries owned by
-/// *this* package" - true of the `CARGO_BIN_EXE_*` env-var lookup alone, but `cargo_bin` falls
-/// back to `legacy_cargo_bin` when that's unset, which derives the target directory from
-/// `env::current_exe()` (this test binary's own path) and looks for a same-named file there -
-/// correct under `CARGO_TARGET_DIR`, `--release`, or a `--target` triple subdirectory precisely
-/// because it reads back from where cargo actually placed *this* binary, not a guessed path. That
-/// version also re-ran a `cargo build` from every one of this file's server-spawning tests
-/// (nextest runs each as its own process, so the `OnceLock` memoized nothing across them),
-/// serialized by `.config/nextest.toml`'s `kafka_bridge` test-group but still real, avoidable
-/// per-test overhead this version has none of.
+/// Walks up from this test binary's own path (`env::current_exe()`) rather than calling
+/// `assert_cmd::cargo::cargo_bin("iggy-server")` directly: `cargo_bin`'s `CARGO_BIN_EXE_*`
+/// env-var lookup only resolves for binaries owned by *this* package, so for `iggy-server`
+/// (a different package) it always falls through to `cargo_bin`'s own `legacy_cargo_bin`, which
+/// panics with its own internal message - not the "binary not found" text `TEST_SUITE.md`
+/// promises - when the binary is not yet built (`CARGO_BIN_EXE_iggy-server` is unset, so its
+/// panic path prints that plus every binary name it *did* find, not a helpful next step). Ancestor
+/// directories of `current_exe()` reach the same `target/<profile>/` directory
+/// `legacy_cargo_bin` derives - correct under `CARGO_TARGET_DIR`, `--release`, or a `--target`
+/// triple subdirectory for the identical reason: it reads back from where cargo actually placed
+/// *this* binary, not a guessed path - so checking existence there first, before ever calling
+/// into `assert_cmd`, gives this crate's own message instead of a Cargo internal one. An earlier
+/// version of this function drove `cargo build --package server --bin iggy-server` directly from
+/// every server-spawning test (nextest runs each as its own process, so the `OnceLock` memoized
+/// nothing across them), serialized by `.config/nextest.toml`'s `kafka_bridge` test-group but
+/// still real, avoidable per-test overhead this version has none of.
+///
+/// # Panics
+///
+/// Panics if `iggy-server` cannot be found alongside this test binary's own target directory.
 fn iggy_server_binary() -> PathBuf {
-    assert_cmd::cargo::cargo_bin("iggy-server")
+    let current_exe = std::env::current_exe().expect("resolve this test binary's own path");
+    let binary_name = format!("iggy-server{}", std::env::consts::EXE_SUFFIX);
+    current_exe
+        .ancestors()
+        .map(|dir| dir.join(&binary_name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "iggy-server binary not found near {} - build it first with \
+                 `cargo build --package server --bin iggy-server`",
+                current_exe.display()
+            )
+        })
 }
 
 struct TestServer {
@@ -255,6 +290,14 @@ impl TestServer {
             // but a spawned server here can still land alongside a pinned server from a different
             // package's test in the same nextest run.
             .env("IGGY_SHARDING_PIN_CORES", "false")
+            // Only half of core/integration's own pairing: unpinning cores stops a server from
+            // being pinned to a specific range, but config.toml's own default
+            // (cpu_allocation = "numa:auto") still sizes the shard pool to the whole machine with
+            // nothing set here - every server this crate's tests spawn would still compete for
+            // the entire box against unrelated packages' tests in the same nextest run. A small
+            // fixed range (matching the same harness's own fallback for an unreadable core count)
+            // caps that instead.
+            .env("IGGY_SHARDING_CPU_ALLOCATION", "0..4")
             // `--with-default-root-credentials` is off by default (args.rs) - without these,
             // a fresh server provisions no loginable root user at all, and every bridge connect
             // attempt fails with "invalid credentials" no matter what this test passes.
@@ -642,13 +685,24 @@ async fn ensure_stream_and_topic_is_idempotent_for_a_numeric_topic_name() {
 
 /// Regression test: `ensure_stream` used to hand `ensure_topic` the stream's *numeric* id
 /// (`Identifier::numeric`), and streams are backed by a recycled slab (freed keys are reused by
-/// the next created stream) - a stream deleted and recreated between the two calls would leave
+/// the next created stream) - a stream deleted and recreated *between* `ensure_stream`'s own
+/// `get_stream`/`create_stream` call and `ensure_topic`'s use of the id it returned would leave
 /// `ensure_topic` writing into whatever stream now holds that recycled numeric key, not the one
 /// `ensure_stream_and_topic`'s caller actually resolved. The fix threads the *named* `Identifier`
-/// through instead. This does not (cannot, from a black-box test) hit the exact `await` window the
-/// bug lived in, but it does prove the name, not a captured numeric id, is what actually governs:
-/// delete the stream, recreate it under the same name, and the very next call must still land the
-/// topic on the live incarnation.
+/// through instead.
+///
+/// What this test actually proves, and what it does not: `ensure_stream` and `ensure_topic` are
+/// both private, called back-to-back inside one `ensure_stream_and_topic` invocation with no
+/// `await` point this black-box test can land a delete-and-recreate inside - the exact race the
+/// bug lived in is not reproducible from here, full stop, not just "hard." What this test does
+/// verify is the weaker, but real, precondition: `ensure_stream_and_topic` has no bridge-level
+/// cache, so its *second*, wholly separate invocation always resolves the stream fresh, by name.
+/// A hypothetical regression back to `Identifier::numeric(...)` would still pass every assertion
+/// below, because the numeric id that build would return comes from this call's own fresh,
+/// by-name lookup - already correct by construction, not a stale value carried over from the
+/// first call. Delete-and-recreate before the second call is not exercising the TOCTOU window at
+/// all; it is here only to document (via the id-collision check right below) that the metadata
+/// slab does in fact recycle freed keys, which is the premise the original bug depended on.
 #[tokio::test]
 #[serial]
 async fn ensure_topic_targets_the_streams_live_incarnation_after_a_delete_and_recreate() {
@@ -741,7 +795,7 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
 /// RFC 5737 TEST-NET-1 - reserved for documentation, routed nowhere, so the connect attempt hangs
 /// on the kernel's own SYN-retry timeout (confirmed against this exact address before writing this
 /// test: over the sandbox's real network stack, a bare `connect()` past 3s had not yet failed).
-/// Before `CONNECT_TIMEOUT`, this test would have hung for minutes; now it must fail within a
+/// Before `REQUEST_TIMEOUT`, this test would have hung for minutes; now it must fail within a
 /// bounded window.
 #[tokio::test]
 async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
@@ -754,18 +808,21 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
     };
 
     let start = tokio::time::Instant::now();
-    // Outer safety net, not the behavior under test: if CONNECT_TIMEOUT regresses to "none" again,
-    // this fails the test in bounded time instead of hanging the whole suite.
+    // Outer safety net, not the behavior under test: if REQUEST_TIMEOUT regresses to "none"
+    // again, this fails the test in bounded time instead of hanging the whole suite.
     let result = tokio::time::timeout(Duration::from_secs(30), IggyBridge::connect(config))
         .await
         .expect("IggyBridge::connect must return on its own, not hang past a generous margin");
 
     assert!(
         start.elapsed() < Duration::from_secs(20),
-        "connect took {:?}, longer than CONNECT_TIMEOUT (15s) should allow",
+        "connect took {:?}, longer than REQUEST_TIMEOUT (15s) should allow",
         start.elapsed()
     );
-    assert!(matches!(result, Err(BridgeError::Iggy(_))));
+    // BridgeError::Timeout, not BridgeError::Iggy: with_request_timeout's own elapsed branch
+    // maps here (see that function's doc for why an unknown outcome must not borrow
+    // CannotEstablishConnection's known-safe code).
+    assert!(matches!(result, Err(BridgeError::Timeout)));
 }
 
 /// Regression test: `IggyClient::disconnect` (what `close` used to call) never touches
@@ -860,15 +917,69 @@ async fn high_watermarks_reports_every_requested_partition_from_one_round_trip()
             .expect("send messages to this partition");
     }
 
-    let watermarks = bridge
+    let watermarks: Vec<(u32, i64)> = bridge
         .high_watermarks("orders", &[0, 1, 2])
         .await
-        .expect("all three partitions exist on this topic");
+        .expect("all three partitions exist on this topic")
+        .into_iter()
+        .map(|(partition, watermark)| {
+            (
+                partition,
+                watermark.expect("every requested partition exists on this topic"),
+            )
+        })
+        .collect();
 
     assert_eq!(
         watermarks,
         vec![(0, 1), (1, 3), (2, 0)],
         "must report each partition's own watermark, in the order requested"
+    );
+}
+
+/// Regression test: an earlier version of `high_watermarks` collected the whole batch into one
+/// `Result`, so the first out-of-range partition discarded every watermark already resolved for
+/// the call. Mixes a valid and an out-of-range partition in one call and asserts the valid one's
+/// watermark still comes back.
+#[tokio::test]
+#[serial]
+async fn high_watermarks_keeps_resolved_partitions_when_another_is_out_of_range() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("stream and topic must exist before checking watermarks");
+
+    let results = bridge
+        .high_watermarks("orders", &[0, 5])
+        .await
+        .expect("the call itself succeeds - only partition 5 is out of range, not the topic");
+
+    assert_eq!(
+        results.len(),
+        2,
+        "must report one entry per requested partition"
+    );
+    // BridgeError has no PartialEq (it wraps IggyError, itself not comparable), so the per-partition
+    // Results are checked by hand rather than via assert_eq! on the whole tuple.
+    let (partition0, watermark0) = &results[0];
+    assert_eq!(*partition0, 0);
+    assert_eq!(
+        *watermark0
+            .as_ref()
+            .expect("partition 0 exists and must not be discarded by partition 5's error"),
+        0
+    );
+    let (partition5, watermark5) = &results[1];
+    assert_eq!(*partition5, 5);
+    assert!(
+        matches!(watermark5, Err(BridgeError::PartitionOutOfRange { .. })),
+        "partition 5 does not exist on a 1-partition topic: {watermark5:?}"
     );
 }
 

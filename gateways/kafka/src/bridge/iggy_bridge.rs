@@ -38,44 +38,63 @@ use crate::bridge::topic_map::validate_kafka_topic_name;
 /// sent.
 ///
 /// This bounds the *count*, not the *wall-clock time*, of that inner retry loop - see
-/// [`CONNECT_TIMEOUT`] for the latter.
+/// [`REQUEST_TIMEOUT`] for the latter.
 const RECONNECTION_RETRIES: u32 = 3;
 
-/// Wall-clock ceiling on the whole `client.connect()` call in [`IggyBridge::connect`], including
-/// every attempt [`RECONNECTION_RETRIES`] makes internally.
+/// Wall-clock ceiling [`with_request_timeout`] applies uniformly: to the initial `client.connect()`
+/// in [`IggyBridge::connect`] (including every attempt [`RECONNECTION_RETRIES`] makes internally),
+/// and to every call made after it succeeds (`get_stream`, `create_stream`, `get_topic`,
+/// `create_topic`, `shutdown`).
 ///
-/// Without this, an unreachable-but-not-refusing address hangs far longer than "a few seconds":
-/// `TcpClient::establish_bounded` only applies its own `FAILOVER_DIAL_TIMEOUT` (2s) when at least
-/// two failover candidates are configured (`tcp_client.rs`) - a bridge always configures exactly
-/// one address, so that guard never engages, and the plain `TcpStream::connect` underneath has no
-/// deadline of its own. Against a firewall that drops SYN packets instead of refusing them, each
-/// of the up to `RECONNECTION_RETRIES + 1` dial attempts pays the kernel's own SYN-retry timeout
-/// (minutes, not seconds) rather than the `reconnection_interval` between attempts - a closed port
-/// (instant RST) never exercises this path, so the failure mode only shows up in production.
-/// 15s comfortably covers a slow-but-alive server's handshake (well above p99 login latency) while
-/// still failing well short of the pathological multi-minute case.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Ceiling on a single Iggy client call made *after* [`IggyBridge::connect`] already succeeded -
-/// `get_stream`, `create_stream`, `get_topic`, `create_topic`, and `shutdown`.
+/// One constant, not two separately-named ones with the same value: both call sites bound the
+/// identical underlying hazard. `TcpClient::establish_bounded` only applies its own
+/// `FAILOVER_DIAL_TIMEOUT` (2s) when at least two failover candidates are configured
+/// (`tcp_client.rs`) - a bridge always configures exactly one address, so that guard never engages
+/// at either site, and the plain `TcpStream::connect` underneath has no deadline of its own.
+/// Against a firewall that drops SYN packets instead of refusing them, each dial attempt pays the
+/// kernel's own SYN-retry timeout (minutes, not seconds) rather than the `reconnection_interval`
+/// between attempts - a closed port (instant RST) never exercises this path, so the failure mode
+/// only shows up in production. 15s comfortably covers a slow-but-alive server's handshake (well
+/// above p99 login latency) while still failing well short of the pathological multi-minute case.
 ///
-/// [`CONNECT_TIMEOUT`] alone only bounds the *initial* connect. `TcpClient::send_raw_with_response`
-/// (`tcp_client.rs`) reconnects internally on any transport error, mid-call, through the exact
-/// same undead-lined `TcpStream::connect` path `CONNECT_TIMEOUT` exists to bound - so a bridge
-/// call made after a successful `connect()` (a later network partition, Iggy moved to a new
-/// address) could still hang on the kernel's own SYN-retry window with nothing here to stop it.
-/// Same value as `CONNECT_TIMEOUT`: both bound the same underlying dial, just entered from a
-/// different call site.
-const REQUEST_TIMEOUT: Duration = CONNECT_TIMEOUT;
+/// Known limitation, not closed by this constant: [`with_request_timeout`] cancels only the
+/// *caller's* wait, not the SDK's own work. `TcpClient::send_raw_vsr_attempt` (`tcp_client.rs`)
+/// writes, flushes and reads inside a detached `tokio::spawn` specifically so that dropping the
+/// awaiting future - exactly what this timeout does on expiry - cannot abort it mid-flight (that
+/// function's own "SAFETY: we run code holding the `stream` lock in a task so we can't be
+/// cancelled while holding the lock"). A call that times out here can leave that detached task
+/// still holding `IggyClient`'s single stream mutex for up to `RESPONSE_READ_TIMEOUT` (30s,
+/// `tcp_client.rs`) longer, queuing every other bridge call behind it. Raising this constant does
+/// not close the gap either: a mid-call reconnect (`send_raw_with_response`, `tcp_client.rs`)
+/// replays on a fresh `RESPONSE_READ_TIMEOUT` budget, and the reconnect dial itself goes through
+/// the same undead-lined `TcpStream::connect` this constant exists to bound - genuinely unbounded,
+/// so no finite value here can guarantee catching it. That same unboundedness is why this timeout
+/// cannot simply be dropped for post-connect calls either: [`IggyBridge`] holds one `IggyClient`
+/// with no pooling, so an unbounded reconnect dial with nothing here to stop it would wedge every
+/// later call on this bridge, not just the one that triggered it. Tolerable only because nothing
+/// calls this bridge from a live Kafka handler yet - closing it needs either a cooperatively
+/// cancellable SDK call or a deadline on the SDK's own reconnect dial, neither of which this
+/// bridge can add from the outside. Must be resolved before #3535/#3536 share this client across
+/// concurrent connections.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`]. See that constant's doc for why every
-/// bridge method needs this, not just [`IggyBridge::connect`].
+/// bridge method needs this, not just [`IggyBridge::connect`] - and for the cancellation gap this
+/// wrapper does not close.
+///
+/// On expiry, maps to [`BridgeError::Timeout`], not `IggyError::CannotEstablishConnection`: the
+/// SDK's write/read run in a detached task this timeout cannot abort (see [`REQUEST_TIMEOUT`]'s
+/// doc), so by the time this fires the request may already be on the wire, or already applied
+/// server-side - a genuinely unknown outcome, not a known connection failure. `BridgeError`'s own
+/// mapping already treats an unknown outcome (`IggyError::TransientNotCommitted`) as distinct from
+/// a known-safe-to-retry one for exactly this reason; a caller-side timeout is the same shape and
+/// must not borrow the known-safe code.
 async fn with_request_timeout<T>(
     op: impl Future<Output = Result<T, IggyError>>,
 ) -> Result<T, BridgeError> {
     tokio::time::timeout(REQUEST_TIMEOUT, op)
         .await
-        .map_err(|_elapsed| BridgeError::Iggy(IggyError::CannotEstablishConnection))?
+        .map_err(|_elapsed| BridgeError::Timeout)?
         .map_err(BridgeError::Iggy)
 }
 
@@ -110,12 +129,13 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Returns [`BridgeError::InvalidConfig`] if `config.address` is empty. Returns
-    /// [`BridgeError::Iggy`] if the address is malformed, the TCP connection fails, connecting
-    /// takes longer than `CONNECT_TIMEOUT` (an unreachable-and-silently-dropping address, not
-    /// just a refused one, is covered - see that constant's doc), or authentication is rejected -
-    /// this is the boundary [`BridgeError::to_kafka_error_code`] exists for: a handler calling
-    /// this must map the error to a wire response, never panic or unwrap, since an unreachable
-    /// Iggy backend is an expected runtime condition, not a bug.
+    /// [`BridgeError::Timeout`] if connecting takes longer than `REQUEST_TIMEOUT` (an
+    /// unreachable-and-silently-dropping address, not just a refused one, is covered - see that
+    /// constant's doc). Returns [`BridgeError::Iggy`] if the address is malformed, the TCP
+    /// connection fails, or authentication is rejected - this is the boundary
+    /// [`BridgeError::to_kafka_error_code`] exists for: a handler calling this must map the error
+    /// to a wire response, never panic or unwrap, since an unreachable Iggy backend is an
+    /// expected runtime condition, not a bug.
     pub async fn connect(config: IggyBridgeConfig) -> Result<Self, BridgeError> {
         if config.address.trim().is_empty() {
             return Err(BridgeError::InvalidConfig(
@@ -157,9 +177,9 @@ impl IggyBridge {
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::Iggy`] if the underlying client reports a shutdown failure (e.g. the
-    /// socket was already in a state that rejects a clean shutdown), or if it takes longer than
-    /// `REQUEST_TIMEOUT`.
+    /// Returns [`BridgeError::Timeout`] if it takes longer than `REQUEST_TIMEOUT`. Returns
+    /// [`BridgeError::Iggy`] if the underlying client reports a shutdown failure (e.g. the socket
+    /// was already in a state that rejects a clean shutdown).
     pub async fn close(self) -> Result<(), BridgeError> {
         with_request_timeout(self.client.shutdown()).await
     }
@@ -203,9 +223,10 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
-    /// topic-naming rules. Returns [`BridgeError::Iggy`] for connectivity/auth failures, or if a
-    /// call takes longer than `REQUEST_TIMEOUT`. Returns [`BridgeError::PartitionCountMismatch`]
-    /// if the topic already exists with a different partition count than `partition_count`.
+    /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] for connectivity/auth failures. Returns
+    /// [`BridgeError::PartitionCountMismatch`] if the topic already exists with a different
+    /// partition count than `partition_count`.
     pub async fn ensure_stream_and_topic(
         &self,
         kafka_topic: &str,
@@ -415,15 +436,17 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
-    /// topic-naming rules. Returns [`BridgeError::Iggy`] if the mapped stream doesn't exist (see
-    /// the note above on which resource is actually missing), or if the call takes longer than
-    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::PartitionOutOfRange`] if any requested
-    /// partition is beyond the topic's partition count.
+    /// topic-naming rules. Returns [`BridgeError::Timeout`] if the call takes longer than
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] if the mapped stream doesn't exist (see
+    /// the note above on which resource is actually missing). These are call-level failures -
+    /// nothing about any individual partition could be resolved. A single out-of-range
+    /// `partition` does not fail the whole call: it is reported per-partition (see the return
+    /// type), so the partitions that did resolve are never discarded to report one that didn't.
     pub async fn high_watermarks(
         &self,
         kafka_topic: &str,
         partitions: &[u32],
-    ) -> Result<Vec<(u32, i64)>, BridgeError> {
+    ) -> Result<Vec<(u32, Result<i64, BridgeError>)>, BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
@@ -440,14 +463,14 @@ impl IggyBridge {
                 ))
             })?;
 
-        partitions
+        Ok(partitions
             .iter()
             .map(|&partition| {
                 // `TryFrom<GetTopicResponse> for TopicDetails` (wire_conversions.rs) sorts
                 // `partitions` by `id` on every decode, so a binary search is correct here, not
                 // just faster than a linear scan - for a 1000-partition topic, the difference is
                 // O(log n) vs O(n) probes per requested partition.
-                let partition_details = details
+                let watermark = details
                     .partitions
                     .binary_search_by_key(&partition, |p| p.id)
                     .map(|index| &details.partitions[index])
@@ -459,17 +482,20 @@ impl IggyBridge {
                         topic: kafka_topic.to_string(),
                         partition,
                         partitions_count: details.partitions_count,
-                    })?;
-                let watermark = if partition_details.messages_count == 0
-                    && partition_details.current_offset == 0
-                {
-                    0
-                } else {
-                    partition_details.current_offset.saturating_add(1)
-                };
-                Ok((partition, i64::try_from(watermark).unwrap_or(i64::MAX)))
+                    })
+                    .map(|partition_details| {
+                        if partition_details.messages_count == 0
+                            && partition_details.current_offset == 0
+                        {
+                            0
+                        } else {
+                            partition_details.current_offset.saturating_add(1)
+                        }
+                    })
+                    .map(|watermark| i64::try_from(watermark).unwrap_or(i64::MAX));
+                (partition, watermark)
             })
-            .collect()
+            .collect())
     }
 
     /// Convenience wrapper around [`Self::high_watermarks`] for a single partition. See that
@@ -498,6 +524,6 @@ impl IggyBridge {
                 "high_watermarks returns exactly one result per requested partition, \
                  and exactly one was requested",
             );
-        Ok(watermark)
+        watermark
     }
 }

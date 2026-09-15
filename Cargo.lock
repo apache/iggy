@@ -7013,7 +7013,6 @@ dependencies = [
 name = "iggy-gateway-kafka"
 version = "0.1.0"
 dependencies = [
- "assert_cmd",
  "bytes",
  "iggy",
  "kafka-protocol",
@@ -7026,7 +7025,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
- "toml 1.1.5+spec-1.1.0",
+ "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

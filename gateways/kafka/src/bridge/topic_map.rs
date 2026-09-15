@@ -101,6 +101,16 @@ pub(crate) fn validate_kafka_topic_name(field: &str, value: &str) -> Result<(), 
             ),
         });
     }
+    // Kafka's own `Topic.validate` special-cases these two names as invalid even though every
+    // byte in them is otherwise legal (`.` is itself an allowed character) - not a traversal risk
+    // here, since Iggy builds on-disk paths from numeric ids rather than the topic name, but the
+    // doc above claims this function applies Kafka's own rules, and these are two of them.
+    if value == "." || value == ".." {
+        return Err(BridgeError::InvalidKafkaTopicName {
+            kafka_topic: value.to_string(),
+            reason: format!("{field} cannot be \".\" or \"..\""),
+        });
+    }
     if let Some(illegal) = value
         .bytes()
         .find(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
@@ -179,7 +189,21 @@ impl TopicMapping {
 
         let mut targets = HashSet::with_capacity(topics.len());
         for (kafka_topic, over) in &topics {
-            validate_kafka_topic_name("topic mapping key", kafka_topic)?;
+            // `validate_kafka_topic_name` returns `InvalidKafkaTopicName` - the variant a live
+            // Kafka request's own `kafka_topic` argument fails with, wire-mapped to
+            // `INVALID_TOPIC_EXCEPTION` (17), "the client asked for a bad name." A mapping-file
+            // key is not that: it is an operator's config, validated once at load time, long
+            // before any Kafka client is involved. Rewrapped as `InvalidConfig` (wire-mapped to
+            // -1) so a TOML typo reads as the bridge's own fault, not as if some Kafka client had
+            // sent this exact malformed name - matching this function's own `# Errors` doc, which
+            // promises `InvalidConfig` for a bad key.
+            if let Err(BridgeError::InvalidKafkaTopicName { reason, .. }) =
+                validate_kafka_topic_name("topic mapping key", kafka_topic)
+            {
+                return Err(BridgeError::InvalidConfig(format!(
+                    "topic mapping key {kafka_topic:?}: {reason}"
+                )));
+            }
             validate_identifier_name(
                 &format!("topic mapping override for '{kafka_topic}': its stream"),
                 &over.stream,
@@ -470,6 +494,10 @@ mod tests {
         // validation, " orders " parses out of the TOML cleanly, then never matches
         // resolve()'s exact HashMap::get for the real Kafka topic "orders" - it just silently
         // falls through to the default stream instead of erroring.
+        //
+        // InvalidConfig, not InvalidKafkaTopicName: this is an operator's TOML typo, caught at
+        // config load, not a live Kafka client sending a malformed topic name - InvalidConfig
+        // wire-maps to -1 (the bridge's own fault), InvalidKafkaTopicName to 17 (the client's).
         let toml = r#"
             default_stream = "kafka"
 
@@ -478,7 +506,7 @@ mod tests {
             topic = "orders_v2"
         "#;
         let err = TopicMapping::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
+        assert!(matches!(err, BridgeError::InvalidConfig(_)));
     }
 
     #[test]
@@ -491,7 +519,7 @@ mod tests {
             topic = "orders_v2"
         "#;
         let err = TopicMapping::from_toml_str(toml).unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
+        assert!(matches!(err, BridgeError::InvalidConfig(_)));
     }
 
     #[test]
@@ -501,7 +529,7 @@ mod tests {
             "a".repeat(MAX_KAFKA_TOPIC_NAME_LEN + 1)
         );
         let err = TopicMapping::from_toml_str(&toml).unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
+        assert!(matches!(err, BridgeError::InvalidConfig(_)));
     }
 
     #[test]
@@ -516,7 +544,19 @@ mod tests {
             topic = "orders_v2"
         "#;
         let err = TopicMapping::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn validate_kafka_topic_name_rejects_dot_and_dotdot() {
+        // Kafka's own Topic.validate special-cases exactly these two names as invalid, even
+        // though '.' alone is a legal character in every other position.
+        let err = validate_kafka_topic_name("kafka_topic", ".").unwrap_err();
         assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
+        let err = validate_kafka_topic_name("kafka_topic", "..").unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
+        // A real Kafka application name containing dots (not equal to "." or "..") stays legal.
+        validate_kafka_topic_name("kafka_topic", "org.apache.kafka.events").unwrap();
     }
 
     #[test]

@@ -80,14 +80,23 @@ real `iggy-server`).
 
 The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETRIES = 3`, not the
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
-attempt - retries included - is capped at `CONNECT_TIMEOUT` (15s) wall-clock, so `IggyBridge::connect`
+attempt - retries included - is capped at `REQUEST_TIMEOUT` (15s) wall-clock, so `IggyBridge::connect`
 fails in bounded time whether the address refuses the connection or silently drops it, instead of
 blocking the calling task indefinitely. Every other bridge call (`ensure_stream_and_topic`,
-`high_watermark(s)`, `close`) carries its own `REQUEST_TIMEOUT` (same 15s bound) for the same
-reason: the SDK reconnects internally, mid-call, on a transport error, through the same
-undead-lined dial path - a bridge call made well after the initial connect can still hit this if
-Iggy becomes unreachable later. See `IggyBridge`'s own doc comment (its rustdoc is private, so
-this isn't a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
+`high_watermark(s)`, `close`) carries the same `REQUEST_TIMEOUT` for the same reason: the SDK
+reconnects internally, mid-call, on a transport error, through the same undead-lined dial path - a
+bridge call made well after the initial connect can still hit this if Iggy becomes unreachable
+later.
+
+This timeout only bounds the *caller's* wait, not the SDK's own work: the SDK writes and reads on
+a detached background task specifically so that dropping the awaiting future - what this timeout
+does on expiry - cannot abort it mid-flight. A timed-out call can leave that task holding the
+shared client's connection lock for up to another 30s (the SDK's own reply deadline), queuing
+every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
+Concurrency ceiling below), so this only matters once concurrent Kafka connections share a bridge
+- tolerable today only because nothing calls this bridge from a live handler yet; must be resolved
+before `#3535`/`#3536`. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't
+a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
 
 ### Topic mapping
 
@@ -166,10 +175,16 @@ rely on.
 - An Iggy commit whose outcome is genuinely unknown (`TransientNotCommitted`) →
   `REQUEST_TIMED_OUT` (7) - retriable in real Kafka too, chosen because it's what a real broker
   sends for the same shape of failure, not to make a client stop retrying
+- A bridge-side call timeout (`BridgeError::Timeout`) → `REQUEST_TIMED_OUT` (7), the same code and
+  the same reasoning as `TransientNotCommitted` above - the SDK's write/read run on a task this
+  timeout cannot abort, so the outcome is unknown, not known-safe-to-retry (see Connection config's
+  timeout caveat above)
 - An invalid Kafka-side topic name (empty, whitespace-padded, oversized, illegal characters) →
   `INVALID_TOPIC_EXCEPTION` (17), checked before any Iggy call is made
 - `PartitionCountMismatch` → `TOPIC_ALREADY_EXISTS` (36, not `INVALID_PARTITIONS` - that code's
   own text is "below 1", a different condition)
+- Too many partitions requested (`TooManyPartitions`) → `INVALID_PARTITIONS` (37), reachable
+  through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
 
 ## Wire fixture tool

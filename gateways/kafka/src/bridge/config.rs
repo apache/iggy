@@ -82,7 +82,8 @@ impl IggyBridgeConfig {
     ///
     /// Returns [`BridgeError::InvalidConfig`] if `IGGY_KAFKA_IGGY_PASSWORD` is unset or empty, if
     /// `IGGY_KAFKA_IGGY_USERNAME` is set but empty, or if `IGGY_KAFKA_TOPIC_MAP_PATH` is set but
-    /// the file is missing or fails to parse.
+    /// the file is missing, fails to parse, or fails validation (e.g. a malformed mapping key or
+    /// an empty `default_stream`).
     pub fn from_env() -> Result<Self, BridgeError> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
@@ -110,30 +111,31 @@ impl IggyBridgeConfig {
             ));
         }
         let stream_env = std::env::var("IGGY_KAFKA_IGGY_STREAM").ok();
-        // TopicMapping::new (below, on the no-file branch) validates default_stream too now, so
-        // removing this check wouldn't let an invalid value through uncaught - but its own message
-        // would say "topic mapping's default_stream", not IGGY_KAFKA_IGGY_STREAM, leaving whoever
-        // reads the error to work out which env var that phrase actually refers to. Checked here
-        // first so the message names the var an operator can actually go fix.
-        if let Some(ref stream) = stream_env {
-            validate_identifier_name("IGGY_KAFKA_IGGY_STREAM", stream)?;
-        }
         let topic_map_path = std::env::var("IGGY_KAFKA_TOPIC_MAP_PATH").ok();
 
-        let topic_mapping = match topic_map_path {
-            Some(path) => {
-                if stream_env.is_some() {
-                    warn!(
-                        "IGGY_KAFKA_IGGY_STREAM is set but ignored: IGGY_KAFKA_TOPIC_MAP_PATH's \
-                         own default_stream takes precedence"
-                    );
-                }
-                TopicMapping::from_file(Path::new(&path))?
+        let topic_mapping = if let Some(path) = topic_map_path {
+            if stream_env.is_some() {
+                warn!(
+                    "IGGY_KAFKA_IGGY_STREAM is set but ignored: IGGY_KAFKA_TOPIC_MAP_PATH's own \
+                     default_stream takes precedence"
+                );
             }
-            None => TopicMapping::new(
+            TopicMapping::from_file(Path::new(&path))?
+        } else {
+            // Validated here, not unconditionally above: on the file branch above,
+            // IGGY_KAFKA_IGGY_STREAM is ignored entirely (the warn! there already says so), so a
+            // padded or empty value must not hard-fail startup when a topic-map file is also set.
+            // TopicMapping::new below validates default_stream on this branch too, but its own
+            // message says "topic mapping's default_stream", not IGGY_KAFKA_IGGY_STREAM, leaving
+            // whoever reads the error to work out which env var that phrase actually refers to.
+            // Checked here first so the message names the var an operator can actually go fix.
+            if let Some(ref stream) = stream_env {
+                validate_identifier_name("IGGY_KAFKA_IGGY_STREAM", stream)?;
+            }
+            TopicMapping::new(
                 stream_env.unwrap_or_else(|| "kafka".to_string()),
                 std::collections::HashMap::new(),
-            )?,
+            )?
         };
 
         Ok(Self {
@@ -302,6 +304,38 @@ mod tests {
 
         assert_eq!(
             result.expect("valid config").topic_mapping.default_stream(),
+            "from-toml"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_ignores_invalid_stream_env_var_when_topic_map_file_is_set() {
+        // Regression test: IGGY_KAFKA_IGGY_STREAM is documented (README.md) and warn!()-logged as
+        // fully ignored once IGGY_KAFKA_TOPIC_MAP_PATH is set - a padded/empty value there must
+        // not hard-fail startup on a var the map-file branch never reads.
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(file.path(), "default_stream = \"from-toml\"\n").expect("write temp file");
+
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+            std::env::set_var("IGGY_KAFKA_IGGY_STREAM", " padded and invalid ");
+            std::env::set_var("IGGY_KAFKA_TOPIC_MAP_PATH", file.path());
+        }
+        let result = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
+            std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
+        }
+
+        assert_eq!(
+            result
+                .expect("an ignored var's own invalidity must not fail startup")
+                .topic_mapping
+                .default_stream(),
             "from-toml"
         );
     }

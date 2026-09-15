@@ -45,6 +45,18 @@ pub enum BridgeError {
     /// from an actual server rejection are affected.
     #[error("Iggy client error: {0}")]
     Iggy(#[from] IggyError),
+    /// A bridge call exceeded its wall-clock budget (`with_request_timeout`'s `REQUEST_TIMEOUT`)
+    /// without a definitive answer from Iggy.
+    ///
+    /// Distinct from `Iggy(IggyError::CannotEstablishConnection)`: that variant means the SDK
+    /// itself gave up on establishing or using the connection, a known failure safe to retry. A
+    /// timeout here means only that *this caller* stopped waiting - the SDK does its write/read
+    /// inside a detached task this timeout cannot abort (`with_request_timeout`'s own doc has the
+    /// mechanism), so the request may already be on the wire, or already applied server-side, by
+    /// the time this fires. That is the same unknown-outcome shape `IggyError::TransientNotCommitted`
+    /// is, which is why this maps like that variant, not like a known connection failure.
+    #[error("bridge call timed out waiting for a reply from Iggy")]
+    Timeout,
     /// `high_watermark` was asked about a partition index the topic doesn't have.
     #[error(
         "partition {partition} out of range for topic '{topic}' ({partitions_count} partitions)"
@@ -81,12 +93,16 @@ impl BridgeError {
     /// Connection-shaped failures reuse `NOT_LEADER_OR_FOLLOWER` (6) - the same retriable code
     /// the foundation's Produce/Fetch stubs already send - so a client backs off and retries
     /// rather than treating a transient Iggy outage as a permanent failure. Not-found maps to
-    /// `UNKNOWN_TOPIC_OR_PARTITION` (3). Anything without a closer analogue falls back to
+    /// `UNKNOWN_TOPIC_OR_PARTITION` (3). A bridge-side [`Self::Timeout`] maps to
+    /// `REQUEST_TIMED_OUT` (7), the same code `IggyError::TransientNotCommitted` gets and for the
+    /// same reason: the outcome is unknown, not known-safe-to-retry, so it must not share a code
+    /// with the connection-shaped set. Anything without a closer analogue falls back to
     /// `UNKNOWN_SERVER_ERROR` (-1).
     #[must_use]
     pub const fn to_kafka_error_code(&self) -> i16 {
         match self {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
+            Self::Timeout => ERROR_REQUEST_TIMED_OUT,
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,
             Self::InvalidKafkaTopicName { .. } => ERROR_INVALID_TOPIC_EXCEPTION,
@@ -291,6 +307,16 @@ mod tests {
         // unambiguous retriable set, or a caller could blindly retry a Produce into a duplicate.
         let err = BridgeError::Iggy(IggyError::TransientNotCommitted);
         assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
+
+    #[test]
+    fn timeout_maps_to_request_timed_out_not_not_leader_or_follower() {
+        // A caller-side timeout is the same unknown-outcome shape as TransientNotCommitted (the
+        // SDK's write/read run in a detached task this timeout cannot abort, so the request may
+        // already be on the wire) - must not borrow CannotEstablishConnection's known-safe code.
+        let err = BridgeError::Timeout;
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+        assert_ne!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
     }
 
     #[test]

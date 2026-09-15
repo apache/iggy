@@ -30,9 +30,10 @@ cargo build --package server --bin iggy-server
 cargo test -p iggy-gateway-kafka
 ```
 
-Same prerequisite `core/integration`'s own server-spawning tests already carry
-(`assert_cmd::cargo::cargo_bin` locates an already-built binary; neither harness invokes `cargo
-build` itself). Skipping this step fails with a clear "binary not found" message, not a hang or a
+Same prerequisite `core/integration`'s own server-spawning tests already carry (this suite's
+`iggy_server_binary()` walks up from its own `env::current_exe()` to find the already-built binary
+in the same target directory; neither harness invokes `cargo build` itself). Skipping this step
+fails with a clear "binary not found" message naming the build command to run, not a hang or a
 silent skip.
 
 ---
