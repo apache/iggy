@@ -747,6 +747,30 @@ where
                 self.bus
                     .install_client_ws_fd(fd, meta, self.on_client_request.clone());
             }
+            LifecycleFrame::ClientTcpTlsConnectionSetup { fd, meta, config } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated TCP-TLS client fd (pre-handshake)"
+                );
+                self.bus.install_client_tcp_tls_fd(
+                    fd,
+                    meta,
+                    config,
+                    self.on_client_request.clone(),
+                );
+            }
+            LifecycleFrame::ClientWssConnectionSetup { fd, meta, config } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated WSS client fd (pre-handshake)"
+                );
+                self.bus
+                    .install_client_wss_fd(fd, meta, config, self.on_client_request.clone());
+            }
             LifecycleFrame::ForwardReplicaSend { replica_id, msg } => {
                 if let Err(e) = self.bus.send_to_replica(replica_id, msg).await {
                     tracing::debug!(
