@@ -46,6 +46,14 @@ inputs:
     description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
     required: false
     default: ""
+  target:
+    description: "Dockerfile stage to build. Empty builds the default (last) stage. Used to select an image flavor from a multi-flavor Dockerfile."
+    required: false
+    default: ""
+  flavor_suffix:
+    description: "Image flavor suffix (e.g. -slim). Scopes the layer cache, since two flavors of one component build different graphs concurrently on the same arch. Empty for single-flavor components, which keeps their cache refs unchanged."
+    required: false
+    default: ""
   gha-cache:
     description: "Whether to use GitHub Actions cache for Docker layers (disable to save cache space)"
     required: false
@@ -208,11 +216,17 @@ runs:
         os="${{ runner.os }}"
         arch="${{ runner.arch }}"
         img="${{ steps.config.outputs.image }}"
+        # A flavor selects a different Dockerfile stage, so two flavors of one
+        # component build different graphs. They run concurrently on the same
+        # arch and both export mode=max, so an unsuffixed ref would be
+        # last-writer-wins and cache-from could restore the other flavor's
+        # graph. Empty for single-flavor components, whose refs are unchanged.
+        flavor="${{ inputs.flavor_suffix }}"
 
         # Include architecture in cache scope to prevent collisions between
         # native amd64 and arm64 builds (both have runner.os = "Linux")
-        scope_arch="${comp}-${os}-${arch}"
-        scope_os="${comp}-${os}"
+        scope_arch="${comp}${flavor}-${os}-${arch}"
+        scope_os="${comp}${flavor}-${os}"
 
         # Shared deps cache image - apache/iggy has the most deps, others can reuse
         shared_deps="apache/iggy"
@@ -247,7 +261,7 @@ runs:
               printf '%s\n' \
                 "type=registry,ref=${shared_deps}:buildcache-${arch}" \
                 "type=registry,ref=${shared_deps}:buildcache" \
-                "type=registry,ref=${img}:latest" \
+                "type=registry,ref=${img}:latest${flavor}" \
                 "type=gha,scope=buildkit-deps-${os}-${arch}" \
                 "type=gha,scope=buildkit-${scope_arch}" \
                 "type=gha,scope=buildkit-${scope_os}"
@@ -256,7 +270,7 @@ runs:
             CACHE_TO=$(
               printf '%s\n' \
                 "type=registry,ref=${shared_deps}:buildcache-${arch},mode=max" \
-                "type=registry,ref=${img}:buildcache-${arch},mode=max" \
+                "type=registry,ref=${img}:buildcache${flavor}-${arch},mode=max" \
                 "type=inline" \
                 "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
                 "type=gha,scope=buildkit-${scope_arch},mode=max"
@@ -265,9 +279,9 @@ runs:
               printf '%s\n' \
                 "type=registry,ref=${shared_deps}:buildcache-${arch}" \
                 "type=registry,ref=${shared_deps}:buildcache" \
-                "type=registry,ref=${img}:buildcache-${arch}" \
-                "type=registry,ref=${img}:buildcache" \
-                "type=registry,ref=${img}:latest" \
+                "type=registry,ref=${img}:buildcache${flavor}-${arch}" \
+                "type=registry,ref=${img}:buildcache${flavor}" \
+                "type=registry,ref=${img}:latest${flavor}" \
                 "type=gha,scope=buildkit-deps-${os}-${arch}" \
                 "type=gha,scope=buildkit-${scope_arch}" \
                 "type=gha,scope=buildkit-${scope_os}"
@@ -342,6 +356,7 @@ runs:
       with:
         context: ${{ steps.ctx.outputs.context }}
         file: ${{ steps.config.outputs.dockerfile }}
+        target: ${{ inputs.target }}
         platforms: ${{ steps.platforms.outputs.platforms }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: ${{ env.CACHE_FROM }}
@@ -357,6 +372,7 @@ runs:
       with:
         context: ${{ steps.ctx.outputs.context }}
         file: ${{ steps.config.outputs.dockerfile }}
+        target: ${{ inputs.target }}
         platforms: ${{ steps.platforms.outputs.platforms }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
