@@ -9,7 +9,7 @@ Boilerplate for a new `core/connectors/sinks/<name>_sink/`. Adapt the
 # Apache 2.0 header (copy verbatim from any existing sink Cargo.toml)
 [package]
 name = "iggy_connector_<name>_sink"
-version = "0.4.1-edge.1"   # match the version most other sinks use
+version = "0.5.0"   # match the version most other sinks use
 edition = "2024"
 license = "Apache-2.0"
 publish = false

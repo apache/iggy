@@ -22,8 +22,8 @@ install a release compatible with your server:
 go get github.com/apache/iggy/foreign/go
 ```
 
-Unversioned `go get` does not automatically select prereleases. VSR edge
-versions are available, for example `v0.9.0-edge.6`. For unreleased changes,
+Unversioned `go get` selects the latest stable release. VSR support starts
+with `v0.9.0`. For unreleased changes,
 build both SDK and server from the same checkout; `examples/go/go.mod`
 replaces this module with the local SDK source.
 
