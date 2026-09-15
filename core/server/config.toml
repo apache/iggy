@@ -1066,7 +1066,8 @@ peer_queue_capacity = 4096
 client_queue_capacity = 256
 
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
-reconnect_period = "5 s"
+# Also bounds each dial, so a peer that drops SYNs cannot stall the sweep.
+reconnect_period = "1 s"
 
 # Timeout for per-peer close drain (flush writer, tear down reader)
 # before force-cancellation.
