@@ -24,7 +24,7 @@ mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
-pub use poll::PollCompleted;
+pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
@@ -211,6 +211,12 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Logout preserves them so its caller can distinguish an unknown outcome
 /// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
+    AttachConsumerSession {
+        vsr_client_id: u128,
+        session: u64,
+        user_id: u32,
+        reply: Sender<Result<consensus::client_table::SessionAttachment, IggyError>>,
+    },
     Register {
         vsr_client_id: u128,
         user_id: u32,
@@ -326,6 +332,12 @@ const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// see [`IggyShard::partition_read`].
 #[derive(Debug)]
 pub enum PartitionRead {
+    Primary,
+    PollOnPrimary {
+        consumer: PollingConsumer,
+        args: PollingArgs,
+        attachment: poll::ConsumerAttachment,
+    },
     Poll {
         consumer: PollingConsumer,
         args: PollingArgs,
@@ -360,6 +372,7 @@ pub enum PartitionRead {
 /// Reply to a [`PartitionRead`].
 #[derive(Debug)]
 pub enum PartitionReadReply {
+    Primary(u8),
     Poll {
         fragments: PollFragments,
         current_offset: u64,
@@ -764,6 +777,7 @@ pub enum LifecycleFrame {
     PartitionSubmit {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
+        attachment: Option<ConsumerAttachment>,
     },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
@@ -901,7 +915,7 @@ impl ShardFrame {
 
 /// Prepares served per `RequestPrepares` round.
 ///
-/// The per-peer bus queues are bounded (`peer_queue_capacity`, 256 by default)
+/// The per-peer bus queues are bounded (`peer_queue_capacity`)
 /// and overrun frames drop silently, so an unbounded burst loses its own tail;
 /// the receiver pulls the window chunk by chunk instead (each walked
 /// `RepairDone` immediately requests the next chunk while progress holds).
@@ -2085,6 +2099,19 @@ where
         namespace: IggyNamespace,
         request: Message<RoutedRequestHeader>,
     ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
+        self.partition_submit_attached(namespace, request, None)
+    }
+
+    /// Submit an offset write with its parent consumer's admission fence.
+    ///
+    /// # Errors
+    /// Returns [`PartitionSubmitRefused`] before admission when the inbox is unavailable.
+    pub fn partition_submit_attached(
+        &self,
+        namespace: IggyNamespace,
+        request: Message<RoutedRequestHeader>,
+        attachment: Option<ConsumerAttachment>,
+    ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
         let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
             // Same fallback as `route_typed`: a miss means "not seeded yet",
             // not "unroutable", and the owning shard parks what arrives early.
@@ -2097,6 +2124,7 @@ where
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
             request,
             reply: reply_tx,
+            attachment,
         });
         let Some(sender) = self.senders.get(target as usize) else {
             self.metrics.record_frame_drop(
@@ -7565,9 +7593,14 @@ where
         }
 
         let mut persistence_metrics = partitions::PersistenceMetrics::default();
+        let mut repair_ring_entries = 0usize;
+        let mut repair_ring_bytes = 0u64;
         for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_mut_by_ns(namespace) {
                 partition.drive_persistence().await;
+                let (entries, bytes) = partition.repair_ring_occupancy();
+                repair_ring_entries += entries;
+                repair_ring_bytes += bytes;
                 if let Some(metrics) = partition.take_persistence_metrics() {
                     persistence_metrics.disk_bytes += metrics.disk_bytes;
                     persistence_metrics.retained_bytes += metrics.retained_bytes;
@@ -7576,12 +7609,15 @@ where
                     persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
                     persistence_metrics.completed_batches += metrics.completed_batches;
                     persistence_metrics.batched_prepares += metrics.batched_prepares;
+                    persistence_metrics.group_commit_waits += metrics.group_commit_waits;
                     persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
                     persistence_metrics.failed_writes += metrics.failed_writes;
                 }
             }
         }
         self.metrics.record_persistence(&persistence_metrics);
+        self.metrics
+            .set_repair_ring(repair_ring_entries, repair_ring_bytes);
 
         // Counted at most ONCE per sweep and only if a re-arm actually fires,
         // then tracked locally as arms land. Counting per namespace is a full

@@ -480,6 +480,21 @@ impl From<StatsResponse> for Stats {
 // System - Cluster Metadata
 // ---------------------------------------------------------------------------
 
+impl From<ClusterNode> for ClusterNodeResponse {
+    fn from(node: ClusterNode) -> Self {
+        Self {
+            name: node.name,
+            ip: node.ip,
+            tcp_port: node.endpoints.tcp,
+            quic_port: node.endpoints.quic,
+            http_port: node.endpoints.http,
+            websocket_port: node.endpoints.websocket,
+            role: node.role as u8,
+            status: node.status as u8,
+        }
+    }
+}
+
 impl TryFrom<ClusterNodeResponse> for ClusterNode {
     type Error = IggyError;
 

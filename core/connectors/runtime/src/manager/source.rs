@@ -103,6 +103,15 @@ impl SourceManager {
         }
     }
 
+    pub async fn recover_from_error(&self, key: &str, metrics: Option<&Arc<Metrics>>) {
+        if let Some(source) = self.sources.get(key) {
+            let mut source = source.lock().await;
+            if source.info.status == ConnectorStatus::Error {
+                source.apply_status(ConnectorStatus::Running, metrics);
+            }
+        }
+    }
+
     pub async fn is_stopping_or_stopped(&self, key: &str) -> bool {
         let Some(source) = self.sources.get(key).map(|entry| entry.value().clone()) else {
             return true;
@@ -648,6 +657,32 @@ mod tests {
         let details = source.lock().await;
         assert_eq!(details.info.status, ConnectorStatus::Error);
         assert!(details.info.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn recover_from_error_should_not_overwrite_stopping_status() {
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopping;
+        let manager = SourceManager::new(vec![details]);
+
+        manager.recover_from_error("pg", None).await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Stopping);
+    }
+
+    #[tokio::test]
+    async fn recover_from_error_should_restore_running_status_and_clear_error() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+        manager.set_error("pg", "connection failed", None).await;
+
+        manager.recover_from_error("pg", None).await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Running);
+        assert!(details.info.last_error.is_none());
     }
 
     #[tokio::test]

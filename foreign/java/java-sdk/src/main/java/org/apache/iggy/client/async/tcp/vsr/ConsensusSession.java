@@ -42,6 +42,8 @@ public final class ConsensusSession {
     private long requestCounter = 1;
     private long correlationCounter = 1;
     private boolean registerConsumed;
+    private long generation;
+    private long metadataWatermark;
 
     public ConsensusSession() {
         regenerateClientId();
@@ -77,6 +79,7 @@ public final class ConsensusSession {
             throw new IllegalStateException("Register reply carried a non-positive session epoch: " + sessionEpoch);
         }
         this.session = sessionEpoch;
+        generation++;
     }
 
     /**
@@ -131,6 +134,21 @@ public final class ConsensusSession {
     /** Clears the bound epoch (logout / eviction); next login re-registers. */
     synchronized void reset() {
         session = null;
+        generation++;
+    }
+
+    public synchronized long generation() {
+        return generation;
+    }
+
+    public synchronized long metadataWatermark() {
+        return metadataWatermark;
+    }
+
+    synchronized void observeMetadata(long commit) {
+        if (Long.compareUnsigned(commit, metadataWatermark) > 0) {
+            metadataWatermark = commit;
+        }
     }
 
     synchronized long clientIdLow() {

@@ -37,12 +37,14 @@ import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
 import org.apache.iggy.client.async.tcp.LeaderAwareness.LeaderRedirectionState;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.slf4j.Logger;
@@ -136,8 +138,8 @@ public class AsyncIggyTcpClient {
 
     private final ConnectionInfo seedConnectionInfo;
     private final AtomicBoolean reconnecting = new AtomicBoolean();
-    private final Optional<String> username;
-    private final Optional<String> password;
+    private volatile Optional<String> username;
+    private volatile Optional<String> password;
     private final Optional<Duration> connectionTimeout;
     private final Optional<Duration> acquireTimeout;
     private final Optional<Duration> requestTimeout;
@@ -160,9 +162,21 @@ public class AsyncIggyTcpClient {
         @Override
         public void forgetLogin() {
             rememberedLogin = null;
+            routingState.clearAssignments();
+            pollRouter.clearSession(connection.get());
+        }
+
+        @Override
+        public void refreshLogin(String oldUsername, Optional<String> nextUsername, Optional<String> nextPassword) {
+            if (username.filter(oldUsername::equals).isPresent()) {
+                nextUsername.ifPresent(value -> username = Optional.of(value));
+                nextPassword.ifPresent(value -> password = Optional.of(value));
+            }
+            rememberCurrentLogin();
         }
     };
     private final AtomicReference<AsyncTcpConnection> connection = new AtomicReference<>();
+    private final PollRouter pollRouter = new PollRouter(connection::get, this::openPollConnection);
     private final AtomicReference<CompletableFuture<Void>> loginChain =
             new AtomicReference<>(CompletableFuture.completedFuture(null));
     private volatile ConnectionInfo connectionInfo;
@@ -173,6 +187,9 @@ public class AsyncIggyTcpClient {
      * remembered while the connection was still healthy.
      */
     private volatile List<ConnectionInfo> rosterTargets = List.of();
+
+    // Zero is unknown; peers without TCP still count toward a clustered topology.
+    private volatile int rosterSize;
     /**
      * The login a successful sign-in ran, replayed after a redial so the
      * session is re-established on whichever node answers. The supplier
@@ -275,6 +292,7 @@ public class AsyncIggyTcpClient {
      */
     public CompletableFuture<Void> connect() {
         closed = false;
+        pollRouter.clearSession(connection.get());
         ConnectionInfo target = connectionInfo;
         AsyncTcpConnection newConnection = openConnection(target);
         AsyncTcpConnection previousConnection = connection.getAndSet(newConnection);
@@ -285,7 +303,8 @@ public class AsyncIggyTcpClient {
         Supplier<AsyncTcpConnection> currentConnection = connection::get;
         return newConnection.connect().thenRun(() -> {
             log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
-            messagesClient = new MessagesTcpClient(currentConnection, routingState);
+            messagesClient =
+                    new MessagesTcpClient(currentConnection, routingState, pollRouter, this::isClusteredForPoll);
             consumerGroupsClient = new ConsumerGroupsTcpClient(currentConnection);
             consumerOffsetsClient = new ConsumerOffsetsTcpClient(currentConnection);
             streamsClient = new StreamsTcpClient(currentConnection);
@@ -484,14 +503,17 @@ public class AsyncIggyTcpClient {
      * @return a {@link CompletableFuture} that completes when all resources are released
      */
     public CompletableFuture<Void> close() {
-        closed = true;
         // Closing is caller intent, like a logout: connect() clears `closed`
         // again, and a session the caller ended must not come back with the
         // credentials the earlier sign-in used.
-        rememberedLogin = null;
+        synchronized (this) {
+            closed = true;
+            rememberedLogin = null;
+        }
         AsyncTcpConnection currentConnection = connection.get();
+        CompletableFuture<Void> dataClosed = pollRouter.clearSession(currentConnection);
         if (currentConnection != null) {
-            return currentConnection.close();
+            return dataClosed.thenCompose(ignored -> currentConnection.close());
         }
         return CompletableFuture.completedFuture(null);
     }
@@ -523,6 +545,24 @@ public class AsyncIggyTcpClient {
                 this::retryTransientOnLeader,
                 this::onSessionReset,
                 this::onConnectionFailure);
+    }
+
+    private AsyncTcpConnection openPollConnection(ConnectionInfo target) {
+        return new AsyncTcpConnection(
+                target.host(),
+                target.port(),
+                enableTls,
+                tlsCertificate,
+                poolConfig,
+                Optional.of(connection.get().eventLoopGroup()),
+                ioThreads,
+                dialTimeout(),
+                requestTimeout,
+                heartbeatInterval,
+                maxVsrFrameSize,
+                null,
+                ignored -> {},
+                ignored -> {});
     }
 
     /**
@@ -560,6 +600,7 @@ public class AsyncIggyTcpClient {
      */
     private void onSessionReset(int errorCode) {
         routingState.clearAssignments();
+        pollRouter.clearSession(connection.get());
         if (errorCode == IggyErrorCode.STALE_CLIENT.getCode()) {
             log.debug("The server evicted this session as stale; the next request re-establishes it");
         }
@@ -845,6 +886,8 @@ public class AsyncIggyTcpClient {
      * roster read. Each transaction has a fresh redirection budget.
      */
     CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt) {
+        pollRouter.clearSession(connection.get());
+        routingState.clearAssignments();
         CompletableFuture<Void> gate = new CompletableFuture<>();
         CompletableFuture<Void> previous = loginChain.getAndSet(gate);
         LeaderRedirectionState redirectionState = new LeaderRedirectionState();
@@ -856,8 +899,10 @@ public class AsyncIggyTcpClient {
             // Not after a close: a login still in flight when `close()` cleared
             // this would set it again, and `connect()` clears `closed`, so the
             // next loss would replay a sign-in the caller had ended.
-            if (error == null && !closed) {
-                rememberedLogin = loginAttempt;
+            synchronized (this) {
+                if (error == null && !closed) {
+                    rememberedLogin = loginAttempt;
+                }
             }
             if (error != null) {
                 callerFuture.completeExceptionally(error);
@@ -954,11 +999,42 @@ public class AsyncIggyTcpClient {
         if (currentSystemClient == null) {
             return CompletableFuture.completedFuture(Optional.empty());
         }
-        return LeaderAwareness.findLeaderElsewhere(currentSystemClient::getClusterMetadata, currentTarget)
-                .thenApply(lookup -> {
-                    rememberRoster(lookup);
-                    return lookup.redirect();
+        return LeaderAwareness.findLeaderElsewhere(
+                        () -> currentSystemClient.getClusterMetadata().thenApply(this::observeTopology), currentTarget)
+                .thenApply(LeaderAwareness.LeaderLookup::redirect);
+    }
+
+    private CompletableFuture<Boolean> isClusteredForPoll() {
+        int knownSize = rosterSize;
+        if (knownSize != 0) {
+            return CompletableFuture.completedFuture(knownSize > 1);
+        }
+        long deadline = System.nanoTime() + LeaderAwareness.LEADERLESS_WAIT_BUDGET.toNanos();
+        return connection
+                .get()
+                .send(CommandCode.System.GET_CLUSTER_METADATA.getValue(), Unpooled.EMPTY_BUFFER, deadline)
+                .orTimeout(LeaderAwareness.LEADERLESS_WAIT_BUDGET.toNanos(), TimeUnit.NANOSECONDS)
+                .thenApply(response -> {
+                    try {
+                        ClusterMetadata metadata = BytesDeserializer.readClusterMetadata(response);
+                        if (metadata.nodes().isEmpty()) {
+                            throw IggyServerException.fromTcpResponse(
+                                    AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0]);
+                        }
+                        observeTopology(metadata);
+                        return metadata.nodes().size() > 1;
+                    } finally {
+                        response.release();
+                    }
                 });
+    }
+
+    private ClusterMetadata observeTopology(ClusterMetadata metadata) {
+        if (!metadata.nodes().isEmpty()) {
+            rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), LeaderAwareness.nodeTargets(metadata)));
+            rosterSize = metadata.nodes().size();
+        }
+        return metadata;
     }
 
     /**
@@ -1039,6 +1115,7 @@ public class AsyncIggyTcpClient {
         }
         connectionInfo = newTarget;
         routingState.clearAssignments();
+        pollRouter.clearSession(oldConnection);
         oldConnection.close().whenComplete((ignored, closeError) -> {
             if (closeError != null) {
                 log.warn("Failed to close previous connection: {}", closeError.getMessage());
@@ -1053,5 +1130,34 @@ public class AsyncIggyTcpClient {
                 || code == CommandCode.User.LOGIN_REGISTER.getValue()
                 || code == CommandCode.PersonalAccessToken.LOGIN.getValue()
                 || code == CommandCode.PersonalAccessToken.LOGIN_REGISTER.getValue();
+    }
+
+    private synchronized void rememberCurrentLogin() {
+        if (closed) {
+            return;
+        }
+        AsyncTcpConnection current = connection.get();
+        var snapshot = current.authenticationSnapshot();
+        if (snapshot.isEmpty()) {
+            return;
+        }
+        var authentication = snapshot.get();
+        byte[] payload;
+        try {
+            payload = new byte[authentication.payload().readableBytes()];
+            authentication.payload().readBytes(payload);
+        } finally {
+            authentication.payload().release();
+        }
+        rememberedLogin = () -> connection
+                .get()
+                .send(authentication.commandCode(), Unpooled.wrappedBuffer(payload))
+                .thenApply(response -> {
+                    try {
+                        return new IdentityInfo(response.readUnsignedIntLE(), Optional.empty());
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 }

@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::OutputFormat;
+use crate::buffer::FileBuffer;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_to_serde_json,
@@ -192,31 +193,24 @@ fn timestamp_to_rfc3339(micros: u64) -> String {
 }
 
 /// Finalize buffer entries into the output byte format.
-pub(crate) fn finalize_buffer<'a>(
-    entries: impl Iterator<Item = &'a [u8]>,
-    format: OutputFormat,
-) -> Vec<u8> {
+pub(crate) fn finalize_buffer(buffer: &mut FileBuffer, format: OutputFormat) -> Vec<u8> {
     match format {
         OutputFormat::JsonLines => {
-            let mut result = Vec::new();
-            for entry in entries {
+            let mut result =
+                Vec::with_capacity(buffer.byte_len() + buffer.message_count() as usize);
+            for entry in buffer.entries() {
                 result.extend_from_slice(entry);
                 result.push(b'\n');
             }
             result
         }
-        OutputFormat::Raw => {
-            let mut result = Vec::new();
-            for entry in entries {
-                result.extend_from_slice(entry);
-            }
-            result
-        }
+        OutputFormat::Raw => buffer.take_data(),
         OutputFormat::JsonArray => {
-            let mut result = Vec::new();
+            let separators = (buffer.message_count() as usize).saturating_sub(1);
+            let mut result = Vec::with_capacity(buffer.byte_len() + separators + b"[]".len());
             result.push(b'[');
             let mut first = true;
-            for entry in entries {
+            for entry in buffer.entries() {
                 if !first {
                     result.push(b',');
                 }
@@ -340,8 +334,8 @@ mod tests {
     fn finalize_json_lines() {
         let data = b"{\"a\":1}{\"b\":2}";
         let boundaries = [7usize, 14];
-        let entries = entries_from_boundaries(data, &boundaries);
-        let result = finalize_buffer(entries, OutputFormat::JsonLines);
+        let mut buffer = buffer_from_boundaries(data, &boundaries);
+        let result = finalize_buffer(&mut buffer, OutputFormat::JsonLines);
         assert_eq!(result, b"{\"a\":1}\n{\"b\":2}\n");
     }
 
@@ -349,8 +343,14 @@ mod tests {
     fn finalize_raw_no_delimiter() {
         let data = b"\x00\x01\x02\x0a\xff\xfe";
         let boundaries = [4usize, 6];
-        let entries = entries_from_boundaries(data, &boundaries);
-        let result = finalize_buffer(entries, OutputFormat::Raw);
+        let mut buffer = buffer_from_boundaries(data, &boundaries);
+        let original_allocation = buffer.entries().next().unwrap().as_ptr();
+        let result = finalize_buffer(&mut buffer, OutputFormat::Raw);
+        assert_eq!(
+            result.as_ptr(),
+            original_allocation,
+            "Raw output must reuse the buffer allocation"
+        );
         assert_eq!(
             result, data,
             "Raw must concatenate without inserting delimiters"
@@ -361,8 +361,8 @@ mod tests {
     fn finalize_json_array() {
         let data = b"{\"a\":1}{\"b\":2}";
         let boundaries = [7usize, 14];
-        let entries = entries_from_boundaries(data, &boundaries);
-        let result = finalize_buffer(entries, OutputFormat::JsonArray);
+        let mut buffer = buffer_from_boundaries(data, &boundaries);
+        let result = finalize_buffer(&mut buffer, OutputFormat::JsonArray);
         assert_eq!(result, b"[{\"a\":1},{\"b\":2}]");
     }
 
@@ -379,15 +379,13 @@ mod tests {
         assert_eq!(ts, "1970-01-01T00:00:00Z");
     }
 
-    fn entries_from_boundaries<'a>(
-        data: &'a [u8],
-        boundaries: &'a [usize],
-    ) -> impl Iterator<Item = &'a [u8]> {
+    fn buffer_from_boundaries(data: &[u8], boundaries: &[usize]) -> FileBuffer {
+        let mut buffer = FileBuffer::new();
         let mut start = 0;
-        boundaries.iter().map(move |&end| {
-            let s = &data[start..end];
+        for (offset, &end) in boundaries.iter().enumerate() {
+            buffer.append(&data[start..end], offset as u64, 0);
             start = end;
-            s
-        })
+        }
+        buffer
     }
 }

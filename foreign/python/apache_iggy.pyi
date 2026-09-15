@@ -1246,6 +1246,7 @@ class IggyClient:
         user_id: builtins.str | builtins.int,
         username: builtins.str | None = None,
         status: UserStatus | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update a user by unique ID or username.
@@ -1254,6 +1255,9 @@ class IggyClient:
             user_id: User identifier as `str | int`.
             username: New username as `str | None`; unchanged when `None`.
             status: New status as `UserStatus | None`; unchanged when `None`.
+            options: Reserved for future use. Additional option keys as
+                `dict[str, str] | None`, forwarded to the server. No user update
+                option key exists yet, so a current server rejects every key.
 
         Returns:
             An awaitable that resolves to `None` when the user is updated.

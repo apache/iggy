@@ -475,17 +475,19 @@ pub fn convert_request_message(
         return Ok(message);
     }
 
-    admit_wire_request(namespace, body, request_header, checksum)
+    let admitted = admit_wire_request(body)?;
+    compact_wire_request(namespace, message, admitted, checksum)
 }
 
-/// Validate a producer's `[metadata][batch]` body and rebuild it as the
-/// pipeline form with the partition stamped.
-fn admit_wire_request(
-    namespace: IggyNamespace,
-    body: &[u8],
-    mut request_header: RoutedRequestHeader,
-    checksum: ChecksumMode,
-) -> Result<Message<RoutedRequestHeader>, IggyError> {
+/// A validated producer body: where its batch starts inside the body, and the
+/// batch header the pipeline form carries once the partition is stamped in.
+struct AdmittedBatch {
+    body_offset: usize,
+    header: BatchHeader,
+}
+
+/// Validate a producer's `[metadata][batch]` body and locate its batch.
+fn admit_wire_request(body: &[u8]) -> Result<AdmittedBatch, IggyError> {
     if body.len() < 4 {
         return Err(IggyError::InvalidCommand);
     }
@@ -516,17 +518,45 @@ fn admit_wire_request(
         return Err(IggyError::InvalidCommand);
     }
 
+    Ok(AdmittedBatch {
+        body_offset: batch_start,
+        header: batch.header,
+    })
+}
+
+/// Rewrite a validated `[header][metadata][batch]` frame as the pipeline form
+/// `[header][batch]`, with the resolved partition stamped in.
+///
+/// The metadata prefix is dropped by sliding the batch down over it rather
+/// than by filling a second buffer: the frame is already owned and already
+/// aligned, and the batch is all but a few dozen bytes of it, so a second
+/// allocation copies the same bytes and then frees the original, once per
+/// produce.
+fn compact_wire_request(
+    namespace: IggyNamespace,
+    message: Message<RoutedRequestHeader>,
+    admitted: AdmittedBatch,
+    checksum: ChecksumMode,
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let header_size = std::mem::size_of::<RoutedRequestHeader>();
-    let total_size = header_size + batch.header.total_size();
+    let total_size = header_size + admitted.header.total_size();
+    let mut request_header = *message.header();
     request_header.size = u32::try_from(total_size).map_err(|_| IggyError::InvalidCommand)?;
-    let mut buffer = Owned::<MESSAGE_ALIGN>::with_capacity(total_size);
-    buffer.extend_from_slice(bytemuck::bytes_of(&request_header));
-    buffer.extend_from_slice(batch_bytes);
+
+    let batch_start = header_size + admitted.body_offset;
+    let batch_end = batch_start + admitted.header.total_size();
+    let mut buffer = message.into_owned();
+    buffer
+        .as_mut_slice()
+        .copy_within(batch_start..batch_end, header_size);
+    buffer.truncate(total_size);
+
     let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&request_header));
 
     // The producer hashed `partition_id = 0`; stamp the resolved partition
     // and restamp (or clear, for the stamp-fills-it path) the batch checksum.
-    let mut stamped = batch.header;
+    let mut stamped = admitted.header;
     stamped.partition_id = namespace.partition_id() as u64;
     stamped.batch_checksum = match checksum {
         ChecksumMode::Compute => {
@@ -1087,6 +1117,26 @@ mod tests {
             payloads,
             vec![&b"first-payload"[..], &b"second-payload"[..]]
         );
+    }
+
+    /// Admission slides the batch over the metadata prefix inside the buffer
+    /// the request arrived in. A second buffer would copy the same bytes and
+    /// free the original once per produce, and the frame's own length has to
+    /// follow the prefix it just dropped.
+    #[test]
+    fn convert_request_message_admits_wire_body_in_place() {
+        let namespace = IggyNamespace::new(1, 1, 3);
+        let wire = wire_request_message(&wire_send_messages_body(&sample_messages()));
+        let buffer = wire.as_slice().as_ptr();
+        let wire_size = wire.header().size as usize;
+
+        let converted = convert_request_message(namespace, wire, ChecksumMode::Compute)
+            .expect("wire body admits");
+
+        assert_eq!(converted.as_slice().as_ptr(), buffer);
+        let size = converted.header().size as usize;
+        assert!(size < wire_size, "the metadata prefix must be gone");
+        assert_eq!(converted.as_slice().len(), size);
     }
 
     #[test]
