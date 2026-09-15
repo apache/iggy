@@ -43,6 +43,7 @@ jobs:
     runs-on: ${{
       (inputs.task == 'build-aarch64-gnu' || inputs.task == 'build-aarch64-musl') && 'ubuntu-24.04-arm' ||
       (inputs.task == 'build-macos-aarch64' || inputs.task == 'clippy-macos-aarch64') && 'macos-14' ||
+      inputs.task == 'build-macos' && 'macos-15' ||
       inputs.task == 'build-windows-sdk' && 'windows-latest' ||
       'ubuntu-latest'
       }}
@@ -228,6 +229,13 @@ jobs:
       - name: Run C++ SDK Task
         if: inputs.component == 'sdk-cpp'
         uses: ./.github/actions/cpp-bazel/pre-merge
+        with:
+          task: ${{ inputs.task }}
+
+      # Swift SDK
+      - name: Run Swift SDK task
+        if: inputs.component == 'sdk-swift'
+        uses: ./.github/actions/swift/pre-merge
         with:
           task: ${{ inputs.task }}
 
