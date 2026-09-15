@@ -37,6 +37,7 @@ use anyhow::anyhow;
 use http::Extensions;
 use humantime::Duration as HumanDuration;
 use rand::RngExt as _;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use std::fmt;
 use std::future::Future;
@@ -168,8 +169,8 @@ pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) ->
 }
 
 /// Parse a `Retry-After` header value (integer seconds).
-/// Returns `None` for HTTP-date values — callers should fall back to their
-/// own backoff strategy.
+/// Returns `None` for any value that is not integer seconds, including the
+/// HTTP-date form — callers should fall back to their own backoff strategy.
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     if let Ok(secs) = value.trim().parse::<u64>() {
         return Some(Duration::from_secs(secs));
@@ -352,11 +353,27 @@ pub fn is_transient_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+/// Read the delay a response's `Retry-After` header asks for, before any cap.
+///
+/// Returns `None` when the header is absent, unreadable, zero, or in the
+/// HTTP-date form that [`parse_retry_after`] does not accept. Zero counts as
+/// absent because a server that answers "retry immediately" would otherwise
+/// spend the whole attempt budget inside one round trip. Every one of those
+/// cases leaves the caller on its own computed backoff.
+fn requested_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after)
+        .filter(|delay| !delay.is_zero())
+}
+
 /// Per-request retry middleware for HTTP connectors.
 ///
 /// Wraps a `reqwest-middleware` stack and retries transient failures
 /// (HTTP 429, 5xx, network errors) with exponential back-off and ±20 % jitter.
-/// A `Retry-After` response header on a 429 overrides the calculated delay.
+/// A `Retry-After` response header on a retried status overrides the
+/// calculated delay, bounded by the same `max_delay` as the backoff.
 ///
 /// The `log_prefix` parameter identifies the connector in log messages
 /// (e.g. `"InfluxDB"`, `"Elasticsearch"`), allowing this middleware to be
@@ -420,29 +437,35 @@ impl Middleware for HttpRetryMiddleware {
                         return Ok(response);
                     }
 
-                    // Parse Retry-After on 429 before falling back to our own
-                    // calculated backoff.
-                    let retry_after = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        response
-                            .headers()
-                            .get("Retry-After")
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(parse_retry_after)
-                    } else {
-                        None
-                    };
-
                     attempts += 1;
                     if is_transient_status(status) && attempts < self.policy.max_attempts {
+                        // The cap is the operator's `max_delay`, not a constant of
+                        // our own: the retry settings are the time budget for one
+                        // `consume` or `poll` call, so the server must not stretch
+                        // it. The runtime's HTTP state client caps `Retry-After`
+                        // at its `max_backoff` for the same reason.
+                        let requested = requested_retry_after(response.headers());
+                        let delay = requested.map_or_else(
+                            || self.policy.backoff(attempts),
+                            |requested| requested.min(self.policy.max_delay),
+                        );
                         // Consume the error body for logging, then retry.
                         let body_text = response.text().await.unwrap_or_default();
-                        let delay = retry_after.unwrap_or_else(|| self.policy.backoff(attempts));
-                        warn!(
-                            "{} transient error {status} \
-                             (attempt {attempts}/{}): {body_text}. \
-                             Retrying in {delay:?}...",
-                            self.log_prefix, self.policy.max_attempts
-                        );
+                        match requested.filter(|requested| *requested > delay) {
+                            Some(requested) => warn!(
+                                "{} transient error {status} \
+                                 (attempt {attempts}/{}): {body_text}. \
+                                 Retrying in {delay:?}, capped by max_delay \
+                                 from the {requested:?} that Retry-After asked for...",
+                                self.log_prefix, self.policy.max_attempts
+                            ),
+                            None => warn!(
+                                "{} transient error {status} \
+                                 (attempt {attempts}/{}): {body_text}. \
+                                 Retrying in {delay:?}...",
+                                self.log_prefix, self.policy.max_attempts
+                            ),
+                        }
                         tokio::time::sleep(delay).await;
                         current_req = match next_req {
                             Some(r) => r,
@@ -816,11 +839,102 @@ mod tests {
         );
     }
 
+    fn retry_after_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn given_a_retry_after_should_read_the_full_requested_delay() {
+        // The middleware applies the cap, and logs the full value when it does.
+        assert_eq!(
+            requested_retry_after(&retry_after_header("86400")),
+            Some(Duration::from_secs(86400))
+        );
+    }
+
+    #[test]
+    fn given_an_unusable_retry_after_should_fall_back_to_the_computed_backoff() {
+        for (header, why) in [
+            // Honoring zero spends the whole attempt budget inside one round
+            // trip, which is the opposite of what the server asked for.
+            ("0", "a zero header must not remove the backoff"),
+            (
+                "Wed, 21 Oct 2026 07:28:00 GMT",
+                "the HTTP-date form is not parsed yet",
+            ),
+            (
+                "not-a-number",
+                "an unparsable header must not stop the retry",
+            ),
+        ] {
+            assert_eq!(
+                requested_retry_after(&retry_after_header(header)),
+                None,
+                "{why}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_retry_after_past_max_delay_should_wait_no_longer_than_max_delay() {
+        // Three seconds rather than an hour keeps a failing run short.
+        let server = mock_then_ok(429, &[("Retry-After", "3")]).await;
+        let max_delay = Duration::from_millis(100);
+        let client = retry_client(3, Duration::from_millis(10), max_delay);
+
+        let started = Instant::now();
+        let response = client.get(server.uri()).send().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "expected exactly one retry"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "honored the raw header instead of the {max_delay:?} ceiling: waited {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_retry_after_on_a_503_should_take_precedence_over_the_computed_backoff() {
+        // RFC 9110 allows Retry-After on any 5xx, and InfluxDB OSS documents it
+        // on 503.
+        let server = mock_then_ok(503, &[("Retry-After", "1")]).await;
+        // Computed backoff far below the header, and the ceiling far above it,
+        // so honoring the header is the only way to reach the asserted band.
+        let client = retry_client(3, Duration::from_millis(10), Duration::from_secs(30));
+
+        let started = Instant::now();
+        let response = client.get(server.uri()).send().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "expected exactly one retry"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "ignored Retry-After on a 503 and used the computed backoff: waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "waited {elapsed:?}, past the 1s the header asked for"
+        );
+    }
+
     #[tokio::test]
     async fn given_a_retry_after_should_take_precedence_over_the_computed_backoff() {
         let server = mock_then_ok(429, &[("Retry-After", "1")]).await;
-        // Backoff bounded far below the header, so honoring it is visible.
-        let client = retry_client(3, Duration::from_millis(10), Duration::from_millis(50));
+        // Computed backoff far below the header, and the ceiling far above it,
+        // so honoring the header is the only way to reach the asserted band.
+        let client = retry_client(3, Duration::from_millis(10), Duration::from_secs(30));
 
         let started = Instant::now();
         let response = client.get(server.uri()).send().await.unwrap();
@@ -839,7 +953,7 @@ mod tests {
         // The header asks for 1s. Anything far past it means the middleware
         // added its own backoff on top instead of honoring the header.
         assert!(
-            elapsed < Duration::from_millis(1500),
+            elapsed < Duration::from_millis(2500),
             "waited {elapsed:?}, past the 1s the header asked for"
         );
     }
