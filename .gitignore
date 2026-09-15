@@ -24,6 +24,8 @@ foreign/cpp/build
 foreign/java/**/build
 foreign/java/**/out
 foreign/node/**/dist
+foreign/swift/.build
+foreign/swift/.swiftpm
 foreign/node/npm-debug.log*
 foreign/node/.npm
 **/node_modules

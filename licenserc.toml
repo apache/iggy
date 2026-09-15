@@ -79,6 +79,8 @@ excludes = [
     "**/META-INF/services/**",
     ".github/config/hawkeye.version",
     "**/.python-version",
+    "**/Package.resolved",
+    "**/.swift-format",
     "**/gradle/wrapper/**",
     # cargo-php regenerates this file with an extra separator after the header.
     "foreign/php/iggy-php.stubs.php",
@@ -92,6 +94,7 @@ extensions = [
     "php",
     "rs",
     "js",
+    "swift",
     "ts",
 ]
 style_out = "doubleslash"
