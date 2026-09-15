@@ -709,6 +709,7 @@ pub fn run(
     clients: &[SimClient],
     tick_budget: u64,
     replies_target: u64,
+    invariants: &mut Invariants,
 ) -> u64 {
     let mut injector = FaultInjector::new(workload.options.seed, sim.replica_count);
     run_with_faults(
@@ -718,11 +719,16 @@ pub fn run(
         tick_budget,
         replies_target,
         &mut injector,
+        invariants,
     )
 }
 
 /// [`run`] against a caller-owned [`FaultInjector`], so a test can assert what
 /// was actually injected instead of trusting the probabilities to have fired.
+///
+/// [`Invariants`] is caller-owned for a second reason: the drain that follows this
+/// call carries on with the same checker, and its high-water marks and canonical
+/// commit chain are what let a regression spanning the two phases be seen at all.
 /// # Panics
 /// If `injector` was built for a different replica count than `sim` has.
 pub fn run_with_faults(
@@ -732,6 +738,7 @@ pub fn run_with_faults(
     tick_budget: u64,
     replies_target: u64,
     injector: &mut FaultInjector,
+    invariants: &mut Invariants,
 ) -> u64 {
     // The injector is caller-owned, and it sized `last_transition` from a count
     // nobody has checked against this simulator. Left unchecked the mismatch
@@ -747,7 +754,6 @@ pub fn run_with_faults(
         sim.replica_count,
         workload.options.seed,
     );
-    let mut invariants = Invariants::new();
     let mut replies_seen = 0u64;
     for _ in 0..tick_budget {
         workload.tick();
@@ -1109,7 +1115,15 @@ mod tests {
         // The recovery has to leave a usable session behind. Without a fresh
         // registration the next request is refused with another eviction and
         // nothing commits.
-        let replies = run(&mut sim, &mut workload, &clients, 400, u64::MAX);
+        let mut invariants = Invariants::new();
+        let replies = run(
+            &mut sim,
+            &mut workload,
+            &clients,
+            400,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "the recovered client got no replies");
         assert!(
             workload
