@@ -1434,7 +1434,7 @@ impl IggyConsumer {
             IdKind::String => (consumer.id.get_string_value()?, None),
         };
 
-        let consumer_group_id = name.to_owned().try_into()?;
+        let consumer_group_id = Identifier::named(&name)?;
         trace!(
             "Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
         );
