@@ -350,8 +350,9 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     auto moved_to = std::move(client);
     (void)moved_to;
 
-    const auto stream = iggy::Identifier::String("stream");
-    const auto topic  = iggy::Identifier::String("topic");
+    const auto stream   = iggy::Identifier::String("stream");
+    const auto topic    = iggy::Identifier::String("topic");
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
 
     // Exercising the moved-from guard requires invoking every operation on the valid but empty source object.
     EXPECT_THROW(client.Connect(), iggy::IggyException);
@@ -374,6 +375,9 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.PurgeTopic(stream, topic), iggy::IggyException);
     EXPECT_THROW(client.CreatePartitions(stream, topic, 1), iggy::IggyException);
     EXPECT_THROW(client.DeletePartitions(stream, topic, 1), iggy::IggyException);
+    EXPECT_THROW(client.StoreConsumerOffset(consumer, stream, topic, 0, 0), iggy::IggyException);
+    EXPECT_THROW(client.GetConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
+    EXPECT_THROW(client.DeleteConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
 }
 
 TEST(AutoLoginKindTest, HasStableDiscriminantsAndZeroInitializedDefault) {
