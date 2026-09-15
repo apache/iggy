@@ -231,6 +231,13 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      # Swift SDK
+      - name: Run Swift SDK task
+        if: inputs.component == 'sdk-swift'
+        uses: ./.github/actions/swift/pre-merge
+        with:
+          task: ${{ inputs.task }}
+
       - name: Upload Java coverage to Codecov
         if: inputs.component == 'sdk-java' && inputs.task == 'test'
         uses: codecov/codecov-action@v7.0.0
