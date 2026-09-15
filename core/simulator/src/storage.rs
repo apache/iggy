@@ -21,12 +21,17 @@
 
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode, StorageEntry};
 use server_common::iobuf::Frozen;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Each `SimStorage` is an independent filesystem, so writer identities must not
+/// collide between instances the way bare paths would.
+static NEXT_FILESYSTEM: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Crash {
@@ -39,6 +44,11 @@ pub enum FaultMode {
     Before,
     After,
     TornWrite,
+    /// A short write the kernel never reports. `TornWrite` returns an error, so
+    /// every caller learns the record is incomplete; a device that writes half a
+    /// block and completes the operation tells nobody, and only the record's own
+    /// checksum can refuse it on the way back.
+    SilentTornWrite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +79,9 @@ pub struct SimFile {
     storage: SimStorage,
     inode: usize,
     epoch: u64,
+    /// errseq sample taken at open. A writeback failure recorded before this
+    /// handle existed is invisible to it, exactly as on Linux.
+    error_seen: Cell<u64>,
 }
 
 #[derive(Clone)]
@@ -85,10 +98,12 @@ enum Inode {
 
 #[derive(Clone)]
 struct State {
+    id: u64,
     inodes: Vec<Inode>,
     epoch: u64,
     trace: Vec<StorageOperation>,
     written_bytes: BTreeMap<usize, usize>,
+    write_errors: BTreeMap<usize, u64>,
     fault: Option<(usize, FaultMode)>,
     paused: Option<StorageOperation>,
     waiters: Vec<std::task::Waker>,
@@ -137,6 +152,47 @@ impl SimStorage {
                 Inode::Directory { entries, stable } => stable.clone_from(entries),
             }
         }
+    }
+
+    /// Writeback is per-page and unordered: pages from `first` on reach stable
+    /// storage while everything below them stays dirty and is lost to power
+    /// loss. Whole-inode [`Self::writeback`] cannot produce that state, so a
+    /// recovery walk that trusts its prefix passes under it and fails here.
+    ///
+    /// # Panics
+    /// Panics if `page_size` is zero.
+    pub fn writeback_from_page(&self, page_size: usize, first: usize) {
+        assert!(page_size > 0, "page size must be positive");
+        for inode in &mut self.state.borrow_mut().inodes {
+            if let Inode::File { buffered, stable } = inode {
+                let start = first.saturating_mul(page_size);
+                if start >= buffered.len() {
+                    continue;
+                }
+                stable.resize(buffered.len(), 0);
+                stable[start..].copy_from_slice(&buffered[start..]);
+            }
+        }
+    }
+
+    /// Fail the inode's pending writeback the way a failing device does: the
+    /// dirty pages above the last barrier are dropped and unrecoverable, and the
+    /// error is reported once to each handle that was already open. A handle
+    /// opened afterwards samples the current sequence and sees success over the
+    /// same lost bytes, which is what makes a fresh-descriptor `fsync` an
+    /// unsound barrier for writes issued through a different one.
+    ///
+    /// # Errors
+    /// Returns an error if `path` does not resolve to a file.
+    pub fn fail_writeback(&self, path: &Path) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        let inode = state.lookup(path)?;
+        match &mut state.inodes[inode] {
+            Inode::File { buffered, stable } => buffered.clone_from(stable),
+            Inode::Directory { .. } => return Err(invalid("writeback failure on a directory")),
+        }
+        *state.write_errors.entry(inode).or_default() += 1;
+        Ok(())
     }
 
     pub fn pause_writes(&self) {
@@ -194,8 +250,12 @@ impl SimStorage {
         if mode == Some(FaultMode::Before) {
             return Err(io::Error::other("injected storage failure"));
         }
-        let result = action(&mut state, mode == Some(FaultMode::TornWrite))?;
-        if mode.is_some() {
+        let torn = matches!(
+            mode,
+            Some(FaultMode::TornWrite | FaultMode::SilentTornWrite)
+        );
+        let result = action(&mut state, torn)?;
+        if mode.is_some() && mode != Some(FaultMode::SilentTornWrite) {
             return Err(io::Error::other("injected failure after storage effect"));
         }
         Ok(result)
@@ -205,6 +265,17 @@ impl SimStorage {
 impl DurableStorage for SimStorage {
     type File = SimFile;
 
+    fn writer_identity(&self, path: &Path) -> io::Result<Option<std::path::PathBuf>> {
+        // The epoch is the simulated process incarnation. A lease that a cancelled
+        // writer left interrupted is fenced until the process holding it dies, so
+        // an identity that survived `Crash::Process` could never reopen.
+        let state = self.state.borrow();
+        let process = format!("sim-{}-{}", state.id, state.epoch);
+        Ok(Some(
+            std::path::PathBuf::from(process).join(path.strip_prefix("/").unwrap_or(path)),
+        ))
+    }
+
     async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<SimFile> {
         let creates = matches!(mode, OpenMode::Create | OpenMode::CreateOrOpen);
         let operation = if creates {
@@ -213,7 +284,7 @@ impl DurableStorage for SimStorage {
             StorageOperation::Open
         };
         self.wait_for(operation).await;
-        let (inode, epoch) = self.perform(operation, |state, _| {
+        let (inode, epoch, errors) = self.perform(operation, |state, _| {
             let inode = if creates {
                 let (parent, name) = state.parent(path)?;
                 if let Some(&inode) = state.directory(parent)?.get(&name) {
@@ -240,12 +311,14 @@ impl DurableStorage for SimStorage {
             } else {
                 state.lookup(path)?
             };
-            Ok((inode, state.epoch))
+            let errors = state.write_errors.get(&inode).copied().unwrap_or_default();
+            Ok((inode, state.epoch, errors))
         })?;
         Ok(SimFile {
             storage: self.clone(),
             inode,
             epoch,
+            error_seen: Cell::new(errors),
         })
     }
 
@@ -440,6 +513,17 @@ impl DurableFile for SimFile {
         self.storage
             .perform(StorageOperation::FileSync, |state, _| {
                 state.file(self.inode, self.epoch)?;
+                let errors = state
+                    .write_errors
+                    .get(&self.inode)
+                    .copied()
+                    .unwrap_or_default();
+                if errors > self.error_seen.get() {
+                    self.error_seen.set(errors);
+                    return Err(io::Error::other(
+                        "writeback failed before this handle synced",
+                    ));
+                }
                 if let Inode::File { buffered, stable } = &mut state.inodes[self.inode] {
                     stable.clone_from(buffered);
                 }
@@ -489,10 +573,12 @@ impl SimFile {
 impl Default for State {
     fn default() -> Self {
         Self {
+            id: NEXT_FILESYSTEM.fetch_add(1, Ordering::Relaxed),
             inodes: vec![Inode::directory()],
             epoch: 0,
             trace: Vec::new(),
             written_bytes: BTreeMap::new(),
+            write_errors: BTreeMap::new(),
             fault: None,
             paused: None,
             waiters: Vec::new(),

@@ -580,6 +580,13 @@ pub(in crate::boot) fn validate_sharding_runtime_knobs(
             max: INBOX_CAPACITY_MAX,
         });
     }
+    let poll_completion_capacity = sharding.poll_completion_capacity;
+    if poll_completion_capacity == 0 || poll_completion_capacity > INBOX_CAPACITY_MAX {
+        return Err(ServerError::InvalidPollCompletionCapacity {
+            value: poll_completion_capacity,
+            max: INBOX_CAPACITY_MAX,
+        });
+    }
     let drain_timeout = sharding.shutdown_drain_timeout.get_duration();
     if drain_timeout.is_zero() || drain_timeout > SHUTDOWN_DRAIN_TIMEOUT_MAX {
         return Err(ServerError::InvalidShutdownDrainTimeout {
@@ -857,6 +864,38 @@ impl StopSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_invalid_poll_completion_capacity_when_boot_validates_should_report_setting() {
+        for capacity in [0, INBOX_CAPACITY_MAX + 1] {
+            let sharding = configs::sharding::ShardingConfig {
+                poll_completion_capacity: capacity,
+                ..configs::sharding::ShardingConfig::default()
+            };
+            let error = validate_sharding_runtime_knobs(&sharding)
+                .expect_err("boot must reject invalid completion capacity before allocation");
+
+            assert!(matches!(
+                error,
+                ServerError::InvalidPollCompletionCapacity { value, max }
+                    if value == capacity && max == INBOX_CAPACITY_MAX
+            ));
+        }
+    }
+
+    #[test]
+    fn given_poll_completion_capacity_at_boundaries_when_boot_validates_should_accept() {
+        for capacity in [1, INBOX_CAPACITY_MAX] {
+            let sharding = configs::sharding::ShardingConfig {
+                poll_completion_capacity: capacity,
+                ..configs::sharding::ShardingConfig::default()
+            };
+            assert!(
+                validate_sharding_runtime_knobs(&sharding).is_ok(),
+                "boot rejected completion capacity {capacity}"
+            );
+        }
+    }
 
     #[test]
     fn shutdown_on_drop_armed_flips_flag() {

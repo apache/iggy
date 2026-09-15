@@ -188,6 +188,8 @@ impl Default for PartitionConfig {
                 .wal_bytes_max
                 .parse()
                 .expect("embedded WAL capacity is valid"),
+            wal_group_commit_delay_micros: u64::try_from(partition.wal_group_commit_delay_micros)
+                .expect("embedded WAL group commit delay is valid"),
             validate_checksum: SERVER_CONFIG.partition.validate_checksum,
             prepare_queue_depth: partition.prepare_queue_depth as usize,
             dedup_clients_max: partition.dedup_clients_max as usize,
@@ -295,6 +297,7 @@ impl Default for MessageBusConfig {
             max_batch: bus.max_batch as usize,
             max_message_size: bus.max_message_size.parse().unwrap(),
             peer_queue_capacity: bus.peer_queue_capacity as usize,
+            client_queue_capacity: bus.client_queue_capacity as usize,
             reconnect_period: bus.reconnect_period.parse().unwrap(),
             close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
             close_grace: bus.close_grace.parse().unwrap(),

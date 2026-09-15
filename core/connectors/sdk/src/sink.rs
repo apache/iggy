@@ -267,6 +267,13 @@ macro_rules! sink_connector {
 
             let mut container = SinkContainer::new(id);
             let result = container.open(id, config_ptr, config_len, log_callback, <$type>::new);
+            if result != 0 {
+                // Rolled back rather than registered, for the reason the
+                // source macro gives: a failed open is still stored on the
+                // container, and registering it strands an instance nothing
+                // outside can name to close.
+                return result;
+            }
             INSTANCES.insert(id, container);
             result
         }

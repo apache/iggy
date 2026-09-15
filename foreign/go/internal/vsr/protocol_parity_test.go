@@ -133,6 +133,7 @@ var goHeaderOffsets = map[string]map[string]int{
 	"ReplyHeader": {
 		"size":      replyOffsetSize,
 		"command":   replyOffsetCommand,
+		"commit":    replyOffsetCommit,
 		"operation": replyOffsetOperation,
 		"status":    replyOffsetStatus,
 	},

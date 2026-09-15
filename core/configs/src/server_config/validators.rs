@@ -668,13 +668,17 @@ mod tests {
 
     #[test]
     fn given_repair_chunk_max_at_peer_queue_capacity_when_validating_should_reject() {
-        let config = config_with_override("[cluster]\nrepair_chunk_max = 256\n");
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 256\n\n[message_bus]\npeer_queue_capacity = 256\n",
+        );
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn given_repair_chunk_max_below_peer_queue_capacity_when_validating_should_pass() {
-        let config = config_with_override("[cluster]\nrepair_chunk_max = 255\n");
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 255\n\n[message_bus]\npeer_queue_capacity = 256\n",
+        );
         config
             .validate()
             .expect("a chunk below the peer queue capacity must validate");

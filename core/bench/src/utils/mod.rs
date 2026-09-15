@@ -20,6 +20,7 @@ use bench_report::{
     numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
     transport::BenchmarkTransport,
 };
+use configs::{ConfigEnvMappings, server::ServerConfig};
 use iggy::prelude::*;
 use std::{fs, path::Path};
 use tracing::{error, info};
@@ -43,6 +44,13 @@ pub mod client_factory;
 pub mod cpu_name;
 pub mod finish_condition;
 pub mod rate_limiter;
+
+const BENCHMARK_SERVER_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_ENV_PATH",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+    "IGGY_SHARD_EVENT_INTERVAL",
+];
 
 pub fn batch_total_size_bytes(polled_messages: &PolledMessages) -> u64 {
     polled_messages
@@ -187,7 +195,11 @@ fn add_environment_variables(parts: &mut Vec<String>, server_address: &str) {
 
     if is_localhost {
         let iggy_vars: Vec<_> = std::env::vars()
-            .filter(|(k, _)| k.starts_with("IGGY_"))
+            .filter(|(name, _)| {
+                BENCHMARK_SERVER_ENV_VARS.contains(&name.as_str())
+                    || ServerConfig::find_by_env_name(name)
+                        .is_some_and(|mapping| !mapping.is_secret)
+            })
             .collect();
 
         if !iggy_vars.is_empty() {

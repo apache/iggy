@@ -16,6 +16,7 @@
 // under the License.
 
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
+use journal::partition_journal::FRONTIER_FILE_NAME;
 use std::io;
 use std::path::Path;
 
@@ -124,6 +125,12 @@ async fn link_tree<S: DurableStorage>(
             if entry.directory {
                 storage.create_directories(&destination).await?;
                 pending.push((source.join(&name), destination));
+            } else if name == FRONTIER_FILE_NAME {
+                // The partition WAL publishes its frontier by overwriting one of
+                // two slots in place, so a hard link would not freeze it: the
+                // WAL reset this snapshot exists to roll back would rewrite the
+                // snapshot's own bytes. Two blocks, copied once per install.
+                copy_file(&source.join(&name), &destination, storage).await?;
             } else {
                 // Transfer unlinks or atomically replaces these frozen files.
                 // Hard links retain the old bytes without copying segment data.
@@ -140,6 +147,20 @@ async fn link_tree<S: DurableStorage>(
         storage.sync_directory(&directory).await?;
     }
     Ok(())
+}
+
+async fn copy_file<S: DurableStorage>(
+    source: &Path,
+    destination: &Path,
+    storage: &S,
+) -> io::Result<()> {
+    let original = storage.open(source, OpenMode::Read).await?;
+    let length = usize::try_from(original.length().await?)
+        .map_err(|_| io::Error::other("partition WAL frontier is too large to copy"))?;
+    let bytes = original.read(0, length).await?;
+    let mut copy = storage.open(destination, OpenMode::Create).await?;
+    copy.write(0, bytes).await?;
+    copy.sync().await
 }
 
 fn is_scratch(name: &str) -> bool {

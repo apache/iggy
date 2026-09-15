@@ -584,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn typed_provider_deserializes_env_vars() {
         unsafe {
             env::set_var("TEST_ENABLED", "true");

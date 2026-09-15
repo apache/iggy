@@ -19,10 +19,12 @@ pub mod builder;
 pub mod config;
 pub mod coordinator;
 pub mod metrics;
+mod poll;
 mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
+pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
@@ -209,6 +211,12 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Logout preserves them so its caller can distinguish an unknown outcome
 /// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
+    AttachConsumerSession {
+        vsr_client_id: u128,
+        session: u64,
+        user_id: u32,
+        reply: Sender<Result<consensus::client_table::SessionAttachment, IggyError>>,
+    },
     Register {
         vsr_client_id: u128,
         user_id: u32,
@@ -324,6 +332,12 @@ const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// see [`IggyShard::partition_read`].
 #[derive(Debug)]
 pub enum PartitionRead {
+    Primary,
+    PollOnPrimary {
+        consumer: PollingConsumer,
+        args: PollingArgs,
+        attachment: poll::ConsumerAttachment,
+    },
     Poll {
         consumer: PollingConsumer,
         args: PollingArgs,
@@ -358,6 +372,7 @@ pub enum PartitionRead {
 /// Reply to a [`PartitionRead`].
 #[derive(Debug)]
 pub enum PartitionReadReply {
+    Primary(u8),
     Poll {
         fragments: PollFragments,
         current_offset: u64,
@@ -366,15 +381,13 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
-    /// The read was refused and returns no messages, even where fragments were
-    /// already gathered. For a poll with `auto_commit`, `TooManyConsumerOffsets`
-    /// when the poll needed a new offset key past `[partition]
-    /// consumer_offsets_max`, and `TransientNotAccepted` when the auto-commit
-    /// could not be submitted: the owning shard's inbox was full, or the
-    /// partition changed primary or incarnation during the read. Transient
-    /// refusal also covers any read while the partition requires state transfer,
-    /// and permits retrying. A capacity refusal needs a slot reclaimed
-    /// or a higher configured limit before a new key can succeed.
+    /// The read was refused and returns no messages. A poll that needs a new
+    /// consumer offset key beyond the configured limit returns
+    /// `TooManyConsumerOffsets`. A completion whose history changed, whose owner
+    /// inbox is unavailable, or whose automatic commit cannot be admitted returns
+    /// `TransientNotAccepted`, allowing the client to retry. Reads also return
+    /// `TransientNotAccepted` when submission fails before reaching the owner
+    /// or while the partition requires state transfer.
     Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
     /// committed offsets on this partition (each `None` if absent).
@@ -402,22 +415,15 @@ pub enum PartitionReadReply {
     NotFound,
 }
 
-/// Handler the owning shard runs for an inbound
-/// [`LifecycleFrame::PartitionRead`]. The server wires it to its partitions
-/// plane; the handler pushes the result back over the carried reply sender.
-pub type PartitionReadHandler =
-    Rc<dyn Fn(IggyNamespace, PartitionRead, Sender<PartitionReadReply>)>;
-
-/// Reply budget for a cross-shard [`IggyShard::partition_read`]. Bounds a
-/// wedged owning shard; the caller maps expiry to a client-visible error.
+/// Reply budget for [`IggyShard::partition_read`]. Bounds a wedged owning shard;
+/// the caller maps expiry to an error with unknown acceptance.
 ///
 /// 10s, not lower: a disk poll over tiny segments opens one file per
-/// segment, so a 1024-message read can legitimately take several seconds
-/// on an oversubscribed host (8 parallel test clusters). Expiry is masked
-/// as an empty poll downstream while the abandoned walk keeps running, so
-/// a too-small budget turns slow reads into missing data plus duplicated
-/// walks from client retries. Must stay below the SDK's 30s request
-/// deadline.
+/// segment, so a read of 1024 messages can legitimately take several seconds
+/// on an oversubscribed host (8 parallel test clusters). Disk I/O continues
+/// after expiry, so a short budget can waste completed reads. Acceptance racing
+/// with expiry can still leave an unknown outcome. Must stay below the SDK's
+/// 30s request deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Budget for a partition write's wait on its committed reply. Longer than a
@@ -771,12 +777,7 @@ pub enum LifecycleFrame {
     PartitionSubmit {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
-    },
-    /// Local auto-commit submission. The guard travels with the frame so an
-    /// inbox drop or admission refusal releases its provisional key directly.
-    AutoCommitSubmit {
-        request: Message<RoutedRequestHeader>,
-        reservation: partitions::AutoCommitReservation,
+        attachment: Option<ConsumerAttachment>,
     },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
@@ -914,7 +915,7 @@ impl ShardFrame {
 
 /// Prepares served per `RequestPrepares` round.
 ///
-/// The per-peer bus queues are bounded (`peer_queue_capacity`, 256 by default)
+/// The per-peer bus queues are bounded (`peer_queue_capacity`)
 /// and overrun frames drop silently, so an unbounded burst loses its own tail;
 /// the receiver pulls the window chunk by chunk instead (each walked
 /// `RepairDone` immediately requests the next chunk while progress holds).
@@ -1441,16 +1442,11 @@ where
     /// the simulator stub ctor.
     on_list_clients: ListClientsHandler,
 
-    /// Handler for inbound [`LifecycleFrame::PartitionRead`] queries.
-    /// The server wires it to this shard's partitions plane. Defaults to a
-    /// no-op for the simulator stub ctor.
-    on_partition_read: PartitionReadHandler,
-
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
     /// same channel path as remote routing.
     ///
-    /// [`assert_sender_ordering`] is invoked in the ctor so `senders[i]`
+    /// [`validate_sender_ordering`] runs during construction so `senders[i]`
     /// is guaranteed to feed the shard whose `id == i`. Call sites can
     /// therefore index by `target_shard` without re-checking.
     senders: Vec<TaggedSender>,
@@ -1470,6 +1466,10 @@ where
     /// fill the main lane. Fed via [`TaggedSender::reply_sender`].
     reply_inbox: Receiver<ShardFrame>,
 
+    /// Disk reads reserve this lane before I/O so ordinary frames cannot
+    /// displace their results. Only the owner pump validates completions.
+    poll_completions: poll::completion::PollCompletionLane,
+
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
 
@@ -1484,8 +1484,7 @@ where
     /// and in single-shard tests that bypass the coordinator.
     coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
 
-    /// Per-shard observability counters. Cloned at metric increment sites,
-    /// so cheap (`Arc` clone) regardless of label cardinality.
+    /// Observability counters shared with the metrics registry.
     metrics: crate::metrics::ShardMetrics,
 
     /// Late-bound `MetadataCommitTick` handler. `None` until reconciler
@@ -1675,6 +1674,13 @@ where
         self.reply_inbox.len()
     }
 
+    /// Queued disk completions covered by the simulator's lost wakeup check.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn poll_completion_inbox_len(&self) -> usize {
+        self.poll_completions.len()
+    }
+
     /// The armed metadata repair window as `(to_op, peer)`, `None` when no session
     /// is running.
     ///
@@ -1702,6 +1708,8 @@ where
     /// * `inbox` - the receiver that this shard drains in its message pump.
     /// * `reply_inbox` - the reply lane's receiver, drained by the same
     ///   pump (client `Reply` forwards only; see [`TaggedSender::reply_sender`]).
+    /// * `poll_completion_capacity` - separate limit on running disk polls plus
+    ///   results awaiting dequeue by this shard's owner pump. Must be nonzero.
     /// * `shards_table` - namespace -> shard routing table.
     /// * `coordinator` - `Some` on shard 0 (supplied by the builder when
     ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
@@ -1718,6 +1726,10 @@ where
     /// fit in `u16`. Both are bootstrap programming errors: the
     /// permutation would silently misroute every inter-shard frame, or
     /// addressing space (u16) would wrap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_completion_capacity` is zero.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: ShardIdentity,
@@ -1726,12 +1738,12 @@ where
         on_client_request: RequestHandler,
         on_metadata_submit: MetadataSubmitHandler,
         on_list_clients: ListClientsHandler,
-        on_partition_read: PartitionReadHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
         reply_inbox: Receiver<ShardFrame>,
+        poll_completion_capacity: usize,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
@@ -1745,6 +1757,8 @@ where
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
+        let poll_completions =
+            poll::completion::PollCompletionLane::new(poll_completion_capacity, &metrics);
         Ok(Self {
             id,
             name,
@@ -1754,11 +1768,11 @@ where
             on_client_request,
             on_metadata_submit,
             on_list_clients,
-            on_partition_read,
             senders,
             shard_count,
             inbox,
             reply_inbox,
+            poll_completions,
             shards_table,
             partition_consensus,
             coordinator,
@@ -1992,14 +2006,22 @@ where
         clients
     }
 
-    /// Run a partition read (message poll / consumer-offset lookup) on the
-    /// shard owning `namespace` and await the reply.
+    /// Run a partition read on the shard owning `namespace` and await the reply.
     ///
     /// Routes a [`LifecycleFrame::PartitionRead`] through the shards table
-    /// (self-sends included, so a locally-owned partition takes the same
-    /// path). `None` = unroutable namespace, full owning-shard inbox,
-    /// dropped reply sender, or `PARTITION_READ_TIMEOUT` expiry; the
-    /// caller maps it to a client-visible error.
+    /// (including sends to this shard). An unroutable namespace, missing sender,
+    /// or rejected inbox submission returns [`PartitionReadReply::Rejected`]
+    /// with [`IggyError::TransientNotAccepted`]: the owner never received the
+    /// request, so this read cannot advance progress and is safe to retry.
+    ///
+    /// `None` means submission succeeded but the reply sender was dropped or
+    /// `PARTITION_READ_TIMEOUT` expired. A timeout drops the reply receiver
+    /// without canceling a queued request or detached read. The owner discards
+    /// a poll completion if it observes disconnection before admission. If
+    /// timeout races with that check, completion can still advance progress and
+    /// admit an automatic commit. Callers must not treat a missing reply as an
+    /// accepted empty poll or as evidence that retrying cannot advance progress
+    /// again.
     #[allow(clippy::future_not_send)]
     pub async fn partition_read(
         &self,
@@ -2012,7 +2034,9 @@ where
                 namespace_raw = namespace.inner(),
                 "partition_read: namespace not routable (not materialised yet or deleted)"
             );
-            return None;
+            return Some(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
         };
         let (reply_tx, reply_rx) = channel::<PartitionReadReply>(1);
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
@@ -2020,14 +2044,20 @@ where
             read,
             reply: reply_tx,
         });
-        let sender = self.senders.get(target as usize)?;
+        let Some(sender) = self.senders.get(target as usize) else {
+            return Some(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+        };
         if let Err(error) = sender.try_send(frame) {
             tracing::warn!(
                 shard = self.id,
                 target,
                 "partition_read: inbox rejected PartitionRead frame: {error:?}"
             );
-            return None;
+            return Some(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
         }
         match bus_timeout(&self.bus, PARTITION_READ_TIMEOUT, reply_rx.recv()).await {
             Some(Ok(reply)) => Some(reply),
@@ -2069,6 +2099,19 @@ where
         namespace: IggyNamespace,
         request: Message<RoutedRequestHeader>,
     ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
+        self.partition_submit_attached(namespace, request, None)
+    }
+
+    /// Submit an offset write with its parent consumer's admission fence.
+    ///
+    /// # Errors
+    /// Returns [`PartitionSubmitRefused`] before admission when the inbox is unavailable.
+    pub fn partition_submit_attached(
+        &self,
+        namespace: IggyNamespace,
+        request: Message<RoutedRequestHeader>,
+        attachment: Option<ConsumerAttachment>,
+    ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
         let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
             // Same fallback as `route_typed`: a miss means "not seeded yet",
             // not "unroutable", and the owning shard parks what arrives early.
@@ -2081,6 +2124,7 @@ where
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
             request,
             reply: reply_tx,
+            attachment,
         });
         let Some(sender) = self.senders.get(target as usize) else {
             self.metrics.record_frame_drop(
@@ -2104,32 +2148,6 @@ where
         Ok(PartitionSubmitTicket {
             receiver: reply_rx,
             target,
-        })
-    }
-
-    /// Submit an auto-commit back to the partition-owning shard's pump.
-    ///
-    /// # Errors
-    /// Returns a refusal if the local inbox cannot accept the frame.
-    pub fn submit_auto_commit_offset(
-        &self,
-        request: Message<RoutedRequestHeader>,
-        reservation: partitions::AutoCommitReservation,
-    ) -> Result<(), PartitionSubmitRefused> {
-        let frame = ShardFrame::lifecycle(LifecycleFrame::AutoCommitSubmit {
-            request,
-            reservation,
-        });
-        let sender = self
-            .senders
-            .get(usize::from(self.id))
-            .ok_or(PartitionSubmitRefused)?;
-        sender.try_send(frame).map_err(|error| {
-            self.metrics.record_frame_drop(
-                crate::metrics::frame_drop_variant::PARTITION_AUTO_COMMIT,
-                crate::coordinator::classify_try_send_err(&error),
-            );
-            PartitionSubmitRefused
         })
     }
 
@@ -2215,6 +2233,10 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
+        // Direct owner tests can keep one disk poll outstanding. Tests needing
+        // concurrent reads construct a lane with their chosen capacity.
+        const POLL_COMPLETION_CAPACITY: usize = 1;
+
         // Placeholder lanes: the simulator delivers frames straight to
         // `on_message` (see the `shard_count` note below), so nothing ever
         // sends here and capacity 1 exists only to satisfy the fields. The
@@ -2223,6 +2245,7 @@ where
         // unbounded variant is wanted here either.
         let (_tx, inbox) = channel(1);
         let (_reply_tx, reply_inbox) = channel(1);
+        let metrics = crate::metrics::ShardMetrics::for_shard();
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
@@ -2234,7 +2257,6 @@ where
             on_client_request: std::rc::Rc::new(|_, _| {}),
             on_metadata_submit: std::rc::Rc::new(|_| {}),
             on_list_clients: std::rc::Rc::new(|_| {}),
-            on_partition_read: std::rc::Rc::new(|_, _, _| {}),
             plane,
             coordinator: None,
             senders: Vec::new(),
@@ -2247,9 +2269,13 @@ where
             shard_count: 1,
             inbox,
             reply_inbox,
+            poll_completions: poll::completion::PollCompletionLane::new(
+                POLL_COMPLETION_CAPACITY,
+                &metrics,
+            ),
             shards_table,
             partition_consensus,
-            metrics: crate::metrics::ShardMetrics::for_shard(),
+            metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
@@ -7567,9 +7593,14 @@ where
         }
 
         let mut persistence_metrics = partitions::PersistenceMetrics::default();
+        let mut repair_ring_entries = 0usize;
+        let mut repair_ring_bytes = 0u64;
         for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_mut_by_ns(namespace) {
                 partition.drive_persistence().await;
+                let (entries, bytes) = partition.repair_ring_occupancy();
+                repair_ring_entries += entries;
+                repair_ring_bytes += bytes;
                 if let Some(metrics) = partition.take_persistence_metrics() {
                     persistence_metrics.disk_bytes += metrics.disk_bytes;
                     persistence_metrics.retained_bytes += metrics.retained_bytes;
@@ -7578,12 +7609,15 @@ where
                     persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
                     persistence_metrics.completed_batches += metrics.completed_batches;
                     persistence_metrics.batched_prepares += metrics.batched_prepares;
+                    persistence_metrics.group_commit_waits += metrics.group_commit_waits;
                     persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
                     persistence_metrics.failed_writes += metrics.failed_writes;
                 }
             }
         }
         self.metrics.record_persistence(&persistence_metrics);
+        self.metrics
+            .set_repair_ring(repair_ring_entries, repair_ring_bytes);
 
         // Counted at most ONCE per sweep and only if a re-arm actually fires,
         // then tracked locally as arms land. Counting per namespace is a full
@@ -9062,9 +9096,9 @@ where
     /// `Normal` because its window comes from the live commit frontier. This window
     /// comes from the parked merged log, so it runs in `ViewChange` for the replica
     /// that parked it. Without it the coverage scan in
-    /// [`Self::start_pending_partition_view`] reports an op nothing ever fetches --
-    /// the sweep's gap detector needs `probe.normal` too -- and only the
-    /// view-change timeout moves the replica.
+    /// [`Self::advance_pending_partition_view`] reports an op that nothing fetches.
+    /// The sweep's gap detector also requires `probe.normal`, so only the view
+    /// change timeout moves the replica.
     ///
     /// `avoid` is the peer a stall just gave up on, so rotation lands on a
     /// different sender instead of the head of the same list.
@@ -10463,7 +10497,7 @@ where
 
 /// Snapshot a partition's uncommitted suffix into its consensus.
 ///
-/// Same contract as [`Self::refresh_metadata_dvc_suffix`]. The partition journal
+/// Same contract as [`refresh_metadata_dvc_suffix`]. The partition journal
 /// is in-memory only, so after a restart it reads empty and this replica votes
 /// all-nack: correct, since the ops really are lost and the merge needs a peer
 /// that still holds them.

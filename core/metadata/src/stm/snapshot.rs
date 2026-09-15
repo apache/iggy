@@ -22,24 +22,16 @@ use std::fmt;
 use crate::stm::stream::StreamsSnapshot;
 use crate::stm::user::UsersSnapshot;
 
-/// The version of the snapshot format in use, reserved for breaking changes.
+/// The snapshot format version written by this build.
 ///
-/// One version means exactly one serialized shape, and [`MetadataSnapshot::decode`]
-/// accepts nothing else. Bump it in the same change that alters the shape: append,
-/// remove, reorder, retype, or redefine the meaning of any field, at any depth
-/// under [`MetadataSnapshot`]. There is no accepted range and no per-version
-/// translation. A snapshot this build cannot read is refused, not best-effort
-/// decoded.
+/// Each version identifies a serialized shape. Bump it when fields change,
+/// including nested fields: `MessagePack` encodes structs positionally, so a
+/// layout change can reinterpret bytes without a deserialization error.
 ///
-/// Nothing softer would hold. msgpack encodes a struct positionally, so a field one
-/// build appends reaches another as an unexplained extra array element; without the
-/// version the reader either fails on an unrelated msgpack error or, for a
-/// same-length change, silently reads one field's bytes as another's.
-///
-/// Bumping it invalidates every `snapshot.bin` already on disk, and a node whose
-/// snapshot is refused refuses boot. That is deliberate. The metadata plane is
-/// pre-production, so the cost is clearing a data directory; once it ships, a bump
-/// needs an explicit translation path added here alongside it.
+/// [`MetadataSnapshot::decode`] accepts versions from
+/// [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`] through this version. Older accepted
+/// formats rely on defaulted trailing fields; incompatible versions outside
+/// that range are refused before payload deserialization.
 ///
 /// Version 2: `status` sits at reply-header offset 216 (version 1 carried a
 /// `namespace` word before it), which the client table's cached replies embed as raw
@@ -283,9 +275,9 @@ impl MetadataSnapshot {
     /// whichever later field happened to misparse.
     ///
     /// # Errors
-    /// [`SnapshotError::UnsupportedFormatVersion`] when the stamped version is not
-    /// [`SNAPSHOT_FORMAT_VERSION`], or [`SnapshotError::Deserialize`] if msgpack
-    /// deserialization fails.
+    /// [`SnapshotError::UnsupportedFormatVersion`] when the stamped version is
+    /// outside [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`]..=[`SNAPSHOT_FORMAT_VERSION`],
+    /// or [`SnapshotError::Deserialize`] if `MessagePack` deserialization fails.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
         // Bytes carrying no readable version are not a snapshot at all, so they fall
         // through to the deserializer, whose error names what actually went wrong.

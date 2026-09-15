@@ -23,6 +23,13 @@ import { createServer, type Server } from 'node:net';
 import { describe, it } from 'node:test';
 import { createServer as createTlsServer } from 'node:tls';
 import { COMMAND_CODE } from '../wire/command.code.js';
+import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT } from '../wire/index.js';
+import { UPDATE_USER } from '../wire/user/update-user.command.js';
+import { CHANGE_PASSWORD } from '../wire/user/change-password.command.js';
+import { POLL_MESSAGES } from '../wire/message/poll-messages.command.js';
+import { PollingStrategy } from '../wire/message/poll.utils.js';
+import { ConsumerKind } from '../wire/offset/offset.utils.js';
+import { readWireName } from '../wire/vsr/index.js';
 import { ResponseError } from '../wire/error.utils.js';
 import {
   Command,
@@ -269,6 +276,640 @@ const compressLeaderlessPoll = (
   settlement.leaderlessWaitBudget = budget;
   settlement.leaderlessPollInterval = 1;
 };
+
+const groupPollPayload = (autocommit = true, partitionId = 0): Buffer =>
+  POLL_MESSAGES.serialize({
+    streamId: 1,
+    topicId: 1,
+    consumer: { kind: ConsumerKind.Group, id: 1 },
+    partitionId,
+    pollingStrategy: PollingStrategy.Next,
+    count: 1,
+    autocommit
+  });
+
+const routingBody = (request: Buffer, port: number, watermark: bigint): Buffer => {
+  const attachment = Buffer.alloc(32);
+  request.copy(attachment, 0, REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16);
+  request.copy(attachment, 16, REQUEST_OFFSET.session, REQUEST_OFFSET.session + 8);
+  attachment.writeBigUInt64LE(watermark, 24);
+  const metadata = singleNodeMetadataBody(port);
+  const nodeOffset = 4 + metadata.readUInt32LE(0) + 4;
+  return Buffer.concat([attachment, metadata.subarray(nodeOffset)]);
+};
+
+const countCommand = (server: VsrTestServer, code: number): number =>
+  server.frames.filter((frame) =>
+    frame.readUInt8(REQUEST_OFFSET.operation) === Operation.NonReplicated &&
+    frame.readUInt32LE(REQUEST_OFFSET.reserved) === code).length;
+
+const registerCredentialsBody = (frame: Buffer): Buffer => {
+  const sdkName = readWireName(frame, HEADER_SIZE + 4);
+  const sdkVersion = readWireName(frame, sdkName.next);
+  return frame.subarray(sdkVersion.next);
+};
+
+const startPollCluster = async (
+  primaryOverride?: (frame: Buffer, socket: Socket) => boolean,
+  coordinatorOverride?: (frame: Buffer, socket: Socket) => boolean,
+  transport: 'TCP' | 'TLS' = 'TCP'
+) => {
+  const primary = await startVsrServer((frame, socket) => {
+    if (primaryOverride?.(frame, socket))
+      return;
+    if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.PollMessagesOnPrimary) {
+      socket.write(replyFrame(Operation.NonReplicated, Buffer.from('primary')));
+      return;
+    }
+    singleNodeHandler(primary.port)(frame, socket);
+  }, transport);
+  const coordinator = await startVsrServer((frame, socket) => {
+    if (coordinatorOverride?.(frame, socket))
+      return;
+    const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+    if (code === COMMAND_CODE.GetClusterMetadata) {
+      socket.write(replyFrame(Operation.NonReplicated,
+        twoNodeMetadataBody(primary.port, coordinator.port)));
+      return;
+    }
+    if (code === COMMAND_CODE.GetPollRouting) {
+      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame, primary.port, 1n)));
+      return;
+    }
+    singleNodeHandler(coordinator.port)(frame, socket);
+  }, transport);
+  const config = {
+    ...vsrConfig(coordinator.port), transport, heartbeatInterval: 0,
+    options: {
+      ...vsrConfig(coordinator.port).options,
+      ...(transport === 'TLS' ? { ca: TLS_CA_CERTIFICATE, servername: 'localhost' } : {})
+    }
+  };
+  const client = new CommandResponseStream(config);
+  return {
+    client, primary, coordinator,
+    close: async () => {
+      client.destroy();
+      await Promise.all([coordinator.close(), primary.close()]);
+    }
+  };
+};
+
+describe('primary auto-commit polling', () => {
+  for (const transport of ['TCP', 'TLS'] as const) {
+    for (const refused of [false, true]) {
+      it(`preserves raw poll responses over ${transport}${refused ? ' after a refusal' : ''}`, async () => {
+        const expected = replyFrame(Operation.NonReplicated, Buffer.from('raw primary'));
+        let polls = 0;
+        const cluster = await startPollCluster((frame, socket) => {
+          if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesOnPrimary)
+            return false;
+          polls += 1;
+          socket.write(refused && polls === 1
+            ? replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58)
+            : expected);
+          return true;
+        }, undefined, transport);
+        let resets = 0;
+        cluster.client.on('sessionReset', () => { resets += 1; });
+        try {
+          for (let poll = 0; poll < 2; poll += 1) {
+            const response = await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
+              { handleResponse: false });
+            assert.ok(Buffer.isBuffer(response), 'raw polls must return the complete VSR frame');
+            assert.deepEqual(response, expected);
+          }
+          assert.equal(polls, refused ? 3 : 2);
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), refused ? 2 : 1);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.AttachConsumerSession), refused ? 2 : 1);
+          assert.equal(resets, 0);
+        } finally {
+          await cluster.close();
+        }
+      });
+    }
+  }
+
+  for (const transport of ['TCP', 'TLS'] as const) {
+    it(`retains the coordinator session and reuses authenticated primary polls over ${transport}`, async () => {
+      const cluster = await startPollCluster(undefined, undefined, transport);
+      const { client, primary, coordinator } = cluster;
+      let resets = 0;
+      client.on('sessionReset', () => { resets += 1; });
+      try {
+        const first = await client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        const second = await client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        assert.equal(first.data.toString(), 'primary');
+        assert.equal(second.data.toString(), 'primary');
+        assert.equal(countCommand(coordinator, COMMAND_CODE.GetPollRouting), 1);
+        assert.equal(countCommand(coordinator, COMMAND_CODE.PollMessages), 0);
+        assert.equal(countCommand(primary, COMMAND_CODE.PollMessagesOnPrimary), 2);
+        assert.equal(countCommand(primary, COMMAND_CODE.AttachConsumerSession), 1);
+        assert.equal(countCommand(primary, COMMAND_CODE.GetClusterMetadata), 0,
+          'auxiliary login must stay on the partition primary');
+        assert.equal(primary.frames.filter((frame) =>
+          frame[REQUEST_OFFSET.operation] === Operation.Register).length, 1);
+        const route = coordinator.frames.find((frame) =>
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPollRouting)!;
+        const attach = primary.frames.find((frame) =>
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.AttachConsumerSession)!;
+        assert.deepEqual(attach.subarray(HEADER_SIZE, HEADER_SIZE + 16),
+          route.subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16));
+        assert.equal(attach.readBigUInt64LE(HEADER_SIZE + 16), TEST_SESSION);
+        assert.notDeepEqual(attach.subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16),
+          route.subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16),
+          'the auxiliary must authenticate under its own VSR identity');
+        assert.equal(resets, 0);
+      } finally {
+        await cluster.close();
+      }
+    });
+  }
+
+  it('preserves manual-commit and standalone poll paths', async () => {
+    const cluster = await startPollCluster();
+    const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+    const standalone = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    try {
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(false));
+      await standalone.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), 1);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 0);
+      assert.equal(countCommand(server, COMMAND_CODE.PollMessages), 1);
+      assert.equal(countCommand(server, COMMAND_CODE.GetPollRouting), 0);
+    } finally {
+      standalone.destroy();
+      await cluster.close();
+      await server.close();
+    }
+  });
+
+  it('refreshes the attachment after a metadata acknowledgement but ignores partition commits', async () => {
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      const operation = frame[REQUEST_OFFSET.operation];
+      if (operation !== Operation.UpdateTopic && operation !== Operation.SendMessages)
+        return false;
+      const response = replyFrame(operation, operation === Operation.UpdateTopic ? Buffer.alloc(4) : Buffer.alloc(0));
+      response.writeBigUInt64LE(operation === Operation.UpdateTopic ? 15n : 900n, REPLY_OFFSET.commit);
+      socket.write(response);
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, Buffer.alloc(0));
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 1);
+      await cluster.client.sendCommand(COMMAND_CODE.UpdateTopic, Buffer.alloc(0), { handleResponse: false });
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const attachments = cluster.primary.frames.filter((frame) =>
+        frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.AttachConsumerSession);
+      assert.deepEqual(attachments.map((frame) => frame.readBigUInt64LE(HEADER_SIZE + 24)), [1n, 15n]);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 2);
+      await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const replacement = cluster.primary.frames.filter((frame) =>
+        frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.AttachConsumerSession).at(-1)!;
+      assert.equal(replacement.readBigUInt64LE(HEADER_SIZE + 24), 15n,
+        'a new coordinator session must retain previously acknowledged metadata');
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('refreshes a not-admitted route without moving the coordinator', async () => {
+    let polls = 0;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesOnPrimary)
+        return false;
+      polls += 1;
+      if (polls > 1)
+        return false;
+      socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+      return true;
+    });
+    let resets = 0;
+    cluster.client.on('sessionReset', () => { resets += 1; });
+    try {
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      assert.equal(polls, 2);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 2);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.AttachConsumerSession), 2);
+      assert.equal(resets, 0);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  for (const refusing of [COMMAND_CODE.GetPollRouting, COMMAND_CODE.AttachConsumerSession,
+    COMMAND_CODE.PollMessagesOnPrimary]) {
+    it(`reports not accepted after command ${refusing} refuses the whole poll budget`, async () => {
+      const refuse = (frame: Buffer, socket: Socket): boolean => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== refusing)
+          return false;
+        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+        return true;
+      };
+      const cluster = await startPollCluster(refuse, refuse);
+      let resets = 0;
+      cluster.client.on('sessionReset', () => { resets += 1; });
+      try {
+        await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
+          { deadline: Date.now() + 250 }), (error: unknown) =>
+          error instanceof ResponseError && error.errorCode === 58);
+        assert.ok(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting) >= 2);
+        if (refusing === COMMAND_CODE.GetPollRouting)
+          assert.equal(cluster.primary.frames.length, 0);
+        if (refusing === COMMAND_CODE.AttachConsumerSession)
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), 0);
+        assert.equal(resets, 0);
+      } finally {
+        await cluster.close();
+      }
+    });
+  }
+
+  it('reports a typed error when the primary has no TCP endpoint', async () => {
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPollRouting)
+        return false;
+      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame, 0, 1n)));
+      return true;
+    });
+    let resets = 0;
+    cluster.client.on('sessionReset', () => { resets += 1; });
+    try {
+      await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload()),
+        (error: unknown) => error instanceof ResponseError && error.errorCode === 5);
+      assert.equal(cluster.primary.frames.length, 0);
+      assert.equal(resets, 0);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  for (const standalone of [false, true]) {
+    for (const failure of ['empty reply', 'empty roster', 'unavailable']) {
+      it(`requires valid topology after ${failure} before ${standalone ? 'standalone' : 'cluster'} polling`, async () => {
+        const clusterName = Buffer.from('cluster-without-nodes');
+        const emptyRoster = Buffer.alloc(4 + clusterName.length + 4);
+        emptyRoster.writeUInt32LE(clusterName.length, 0);
+        clusterName.copy(emptyRoster, 4);
+        let rejectMetadata = true;
+        let coordinatorPort = 0;
+        const cluster = await startPollCluster(undefined, (frame, socket) => {
+          if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata)
+            return false;
+          if (rejectMetadata) {
+            socket.write(replyFrame(Operation.NonReplicated,
+              failure === 'empty roster' ? emptyRoster : Buffer.alloc(0),
+              failure === 'unavailable' ? 5 : 0));
+            return true;
+          }
+          if (standalone) {
+            socket.write(replyFrame(Operation.NonReplicated, singleNodeMetadataBody(coordinatorPort)));
+            return true;
+          }
+          return false;
+        });
+        coordinatorPort = cluster.coordinator.port;
+        let resets = 0;
+        cluster.client.on('sessionReset', () => { resets += 1; });
+        try {
+          await cluster.client.authenticate(vsrConfig(coordinatorPort).credentials);
+          await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload()));
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), 0);
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 0);
+          assert.equal(cluster.primary.frames.length, 0);
+          rejectMetadata = false;
+          await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+          rejectMetadata = true;
+          const refresh = cluster.client.sendCommand(COMMAND_CODE.GetClusterMetadata, Buffer.alloc(0));
+          if (failure === 'unavailable')
+            await assert.rejects(refresh, (error: unknown) => error instanceof ResponseError && error.errorCode === 5);
+          else
+            await refresh;
+          const reads = countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata);
+          await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata), reads);
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), standalone ? 2 : 0);
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), standalone ? 0 : 1);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), standalone ? 0 : 2);
+          assert.equal(resets, 0);
+        } finally {
+          await cluster.close();
+        }
+      });
+    }
+  }
+
+  it('refreshes a stalled auxiliary TLS dial within the shared poll budget', async () => {
+    const held: Socket[] = [];
+    const silent = createServer((socket) => {
+      held.push(socket);
+      socket.resume();
+    });
+    silent.listen(0, '127.0.0.1');
+    await once(silent, 'listening');
+    const silentPort = (silent.address() as AddressInfo).port;
+    let routes = 0;
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPollRouting || ++routes > 1)
+        return false;
+      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame, silentPort, 1n)));
+      return true;
+    }, 'TLS');
+    let resets = 0;
+    cluster.client.on('sessionReset', () => { resets += 1; });
+    try {
+      const response = await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
+        { deadline: Date.now() + 5_000 });
+      assert.equal(response.data.toString(), 'primary');
+      assert.equal(routes, 2);
+      assert.equal(held.length, 1);
+      assert.equal(held[0].destroyed, true);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), 1);
+      assert.equal(resets, 0);
+    } finally {
+      await cluster.close();
+      held.forEach((socket) => socket.destroy());
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
+  });
+
+  for (const operation of [Operation.TruncatePartition, Operation.DeleteSegments]) {
+    it(`raises the attachment floor for a DeleteSegments acknowledgement with operation ${operation}`, async () => {
+      const cluster = await startPollCluster(undefined, (frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] !== Operation.DeleteSegments)
+          return false;
+        const response = replyFrame(operation,
+          operation === Operation.TruncatePartition ? Buffer.alloc(4) : Buffer.alloc(0));
+        response.writeBigUInt64LE(50n, REPLY_OFFSET.commit);
+        socket.write(response);
+        return true;
+      });
+      try {
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        await cluster.client.sendCommand(COMMAND_CODE.DeleteSegments, Buffer.alloc(0));
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        const attachments = cluster.primary.frames.filter((frame) =>
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.AttachConsumerSession);
+        assert.deepEqual(attachments.map((frame) => frame.readBigUInt64LE(HEADER_SIZE + 24)), [1n, 50n]);
+        assert.equal(cluster.primary.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register).length, 1);
+      } finally {
+        await cluster.close();
+      }
+    });
+  }
+
+  it('rechecks metadata after waiting behind another primary poll', async () => {
+    let firstPoll!: (socket: Socket) => void;
+    const admitted = new Promise<Socket>((resolve) => { firstPoll = resolve; });
+    let polls = 0;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesOnPrimary || ++polls !== 1)
+        return false;
+      firstPoll(socket);
+      return true;
+    }, (frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateTopic)
+        return false;
+      const response = replyFrame(Operation.UpdateTopic, Buffer.alloc(4));
+      response.writeBigUInt64LE(21n, REPLY_OFFSET.commit);
+      socket.write(response);
+      return true;
+    });
+    try {
+      const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const socket = await admitted;
+      const second = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      await cluster.client.sendCommand(COMMAND_CODE.UpdateTopic, Buffer.alloc(0));
+      assert.equal(polls, 1, 'concurrent polls must share a serialized primary connection');
+      socket.write(replyFrame(Operation.NonReplicated, Buffer.from('primary')));
+      await Promise.all([first, second]);
+      assert.equal(polls, 2);
+      const attachments = cluster.primary.frames.filter((frame) =>
+        frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.AttachConsumerSession);
+      assert.deepEqual(attachments.map((frame) => frame.readBigUInt64LE(HEADER_SIZE + 24)), [1n, 21n]);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  for (const failure of ['disconnect', 'not committed', 'timeout', 'partial reply', 'stale session', 'unauthenticated'] as const) {
+    it(`does not replay an uncertain primary poll after ${failure}`, async () => {
+      let polls = 0;
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesOnPrimary)
+          return false;
+        polls += 1;
+        if (polls > 1)
+          return false;
+        if (failure === 'disconnect') socket.destroy();
+        if (failure === 'not committed')
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 57));
+        if (failure === 'stale session')
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 30));
+        if (failure === 'unauthenticated')
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 40));
+        if (failure === 'partial reply')
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.from('partial')).subarray(0, HEADER_SIZE + 1));
+        return true;
+      });
+      let resets = 0;
+      cluster.client.on('sessionReset', () => { resets += 1; });
+      try {
+        await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
+          { deadline: Date.now() + 300 }), (error: unknown) =>
+          error instanceof ResponseError && error.errorCode === 57);
+        assert.equal(polls, 1);
+        assert.equal(resets, 0);
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        assert.equal(polls, 2);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.AttachConsumerSession), 2);
+      } finally {
+        await cluster.close();
+      }
+    });
+  }
+
+  for (const status of [30, 40]) {
+    it(`rebuilds an auxiliary rejected with session status ${status} before poll admission`, async () => {
+      let attachments = 0;
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.AttachConsumerSession || ++attachments > 1)
+          return false;
+        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), status));
+        return true;
+      });
+      let resets = 0;
+      cluster.client.on('sessionReset', () => { resets += 1; });
+      try {
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        assert.equal(attachments, 2);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), 1);
+        assert.equal(cluster.primary.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register).length, 2);
+        assert.equal(resets, 0);
+      } finally {
+        await cluster.close();
+      }
+    });
+
+    it(`replaces the coordinator socket after a control session status ${status}`, async () => {
+      const registered = new Set<Socket>();
+      let routes = 0;
+      const cluster = await startPollCluster(undefined, (frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.Register) {
+          assert.equal(registered.has(socket), false,
+            'a fresh VSR identity cannot register on the old bound transport');
+          registered.add(socket);
+        }
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPollRouting || ++routes > 1)
+          return false;
+        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), status));
+        return true;
+      });
+      try {
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        assert.equal(registered.size, 2);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), 1);
+      } finally {
+        await cluster.close();
+      }
+    });
+  }
+
+  it('uses manual login and updated credentials for new primary connections', async () => {
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      const operation = frame[REQUEST_OFFSET.operation];
+      if (operation !== Operation.UpdateUser && operation !== Operation.ChangePassword)
+        return false;
+      socket.write(replyFrame(operation, Buffer.alloc(4)));
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'manual', password: 'first' }));
+      await cluster.client.sendCommand(UPDATE_USER.code, UPDATE_USER.serialize({ userId: 7, username: 'renamed' }));
+      await cluster.client.sendCommand(CHANGE_PASSWORD.code, CHANGE_PASSWORD.serialize({
+        userId: 7, currentPassword: 'first', newPassword: 'second'
+      }));
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const login = cluster.primary.frames.find((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register)!;
+      const credentials = registerCredentialsBody(login);
+      const username = readWireName(credentials, 0);
+      const password = readWireName(credentials, username.next);
+      assert.equal(username.value, 'renamed');
+      assert.equal(password.value, 'second');
+      await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const replacement = cluster.primary.frames.filter((frame) =>
+        frame[REQUEST_OFFSET.operation] === Operation.Register).at(-1)!;
+      assert.equal(readWireName(registerCredentialsBody(replacement), 0).value, 'iggy');
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('authenticates auxiliary connections with the active personal access token', async () => {
+    const cluster = await startPollCluster();
+    try {
+      await cluster.client.sendCommand(LOGIN_WITH_TOKEN.code, LOGIN_WITH_TOKEN.serialize({ token: 'manual-token' }));
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const login = cluster.primary.frames.find((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register)!;
+      const sdkName = readWireName(login, HEADER_SIZE + 4);
+      const sdkVersion = readWireName(login, sdkName.next);
+      assert.equal(readWireName(login, sdkVersion.next).value, 'manual-token');
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  for (const manual of [
+    { command: LOGIN.code, payload: LOGIN.serialize({ username: 'manual', password: 'first' }), identity: 'manual' },
+    { command: LOGIN_WITH_TOKEN.code, payload: LOGIN_WITH_TOKEN.serialize({ token: 'manual-token' }), identity: 'manual-token' }
+  ]) {
+    it(`retains ${manual.identity} across recovery and restores configured credentials after logout`, async () => {
+      let coordinatorSocket!: Socket;
+      const cluster = await startPollCluster(undefined, (_frame, socket) => {
+        coordinatorSocket = socket;
+        return false;
+      });
+      try {
+        await cluster.client.sendCommand(manual.command, manual.payload);
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        const reset = once(cluster.client, 'sessionReset');
+        coordinatorSocket.destroy();
+        await reset;
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        for (const server of [cluster.coordinator, cluster.primary]) {
+          const login = server.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register).at(-1)!;
+          assert.equal(readWireName(registerCredentialsBody(login), 0).value, manual.identity);
+        }
+        await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        for (const server of [cluster.coordinator, cluster.primary]) {
+          const login = server.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register).at(-1)!;
+          const credentials = registerCredentialsBody(login);
+          const username = readWireName(credentials, 0);
+          assert.equal(username.value, 'iggy');
+          assert.equal(readWireName(credentials, username.next).value, 'iggy');
+        }
+      } finally {
+        await cluster.close();
+      }
+    });
+  }
+
+  it('updates the configured identity after its password and username change', async () => {
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      const operation = frame[REQUEST_OFFSET.operation];
+      if (operation !== Operation.UpdateUser && operation !== Operation.ChangePassword)
+        return false;
+      socket.write(replyFrame(operation, Buffer.alloc(4)));
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      await cluster.client.sendCommand(UPDATE_USER.code, UPDATE_USER.serialize({ userId: 7, username: 'renamed' }));
+      await cluster.client.sendCommand(CHANGE_PASSWORD.code, CHANGE_PASSWORD.serialize({
+        userId: 7, currentPassword: 'iggy', newPassword: 'second'
+      }));
+      await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      for (const server of [cluster.coordinator, cluster.primary]) {
+        const login = server.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register).at(-1)!;
+        const credentials = registerCredentialsBody(login);
+        const username = readWireName(credentials, 0);
+        assert.equal(username.value, 'renamed');
+        assert.equal(readWireName(credentials, username.next).value, 'second');
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('closes a waiting primary exchange on coordinator logout without replay', async () => {
+    let admitted!: () => void;
+    const pendingAdmission = new Promise<void>((resolve) => { admitted = resolve; });
+    const cluster = await startPollCluster((frame) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesOnPrimary)
+        return false;
+      admitted();
+      return true;
+    });
+    try {
+      const polling = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const failed = assert.rejects(polling, (error: unknown) =>
+        error instanceof ResponseError && error.errorCode === 57);
+      await pendingAdmission;
+      await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+      await failed;
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), 1);
+      assert.equal(cluster.client.isAuthenticated, false);
+    } finally {
+      await cluster.close();
+    }
+  });
+});
 
 describe('VSR client socket', () => {
   it('exchanges VSR frames over TLS', async () => {

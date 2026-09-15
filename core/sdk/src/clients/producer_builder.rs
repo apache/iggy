@@ -196,8 +196,8 @@ impl IggyProducerBuilder {
     }
 
     /// Sets the producer to use direct message sending.
-    /// This mode ensures that messages are sent immediately to the server
-    /// without being buffered or delayed.
+    /// This mode sends from the calling task without buffering between calls.
+    /// `DirectConfig::linger_time` can delay a call before its requests are sent.
     pub fn direct(mut self, config: DirectConfig) -> Self {
         self.mode = SendMode::Direct(config);
         self

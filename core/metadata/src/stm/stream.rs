@@ -67,6 +67,7 @@ use iggy_common::wire_conversions::{resource_options_from_wire, resource_options
 use iggy_common::{
     CompressionAlgorithm, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats,
     ResourceOptions, StreamStats, TopicCreateOptions, TopicRuntimeOptions, TopicStats,
+    topic_option_keys,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -1063,7 +1064,99 @@ impl StreamsInner {
     }
 }
 
+/// Metadata identity for a consumer operation, independent of unrelated groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollMetadata {
+    created_revision: u64,
+    purge_generation: u64,
+    group: Option<(u64, u64)>,
+    client_id: u128,
+}
+
+impl PollMetadata {
+    #[must_use]
+    pub fn matches_partition(&self, created_revision: Option<u64>, purge_generation: u64) -> bool {
+        created_revision == Some(self.created_revision) && purge_generation == self.purge_generation
+    }
+
+    #[must_use]
+    pub fn is_valid(&self, streams: &Streams, namespace: IggyNamespace) -> bool {
+        streams
+            .poll_metadata(namespace, self.group.map(|(id, _)| id), self.client_id)
+            .as_ref()
+            == Some(self)
+    }
+
+    #[must_use]
+    pub fn is_valid_for_offset(&self, streams: &Streams, namespace: IggyNamespace) -> bool {
+        streams
+            .consumer_offset_metadata(namespace, self.group.map(|(id, _)| id), self.client_id)
+            .as_ref()
+            == Some(self)
+    }
+}
+
 impl Streams {
+    #[must_use]
+    pub fn poll_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+    ) -> Option<PollMetadata> {
+        self.consumer_metadata(namespace, group_id, client_id, true)
+    }
+
+    /// Offset commits can drain partitions awaiting cooperative revocation.
+    #[must_use]
+    pub fn consumer_offset_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+    ) -> Option<PollMetadata> {
+        self.consumer_metadata(namespace, group_id, client_id, false)
+    }
+
+    fn consumer_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+        require_pollable: bool,
+    ) -> Option<PollMetadata> {
+        self.read(|inner| {
+            let topic = inner
+                .items
+                .get(namespace.stream_id())?
+                .topics
+                .get(namespace.topic_id())?;
+            let partition = find_partition(&topic.partitions, namespace.partition_id())?;
+            let group = if let Some(group_id) = group_id {
+                let group = topic.consumer_groups.get(&group_id)?;
+                if !group.members.iter().any(|(_, member)| {
+                    member.client_id == client_id
+                        && if require_pollable {
+                            member.is_pollable(namespace.partition_id())
+                        } else {
+                            member.partitions.contains(&namespace.partition_id())
+                        }
+                }) {
+                    return None;
+                }
+                Some((group.id, group.generation))
+            } else {
+                None
+            };
+            Some(PollMetadata {
+                created_revision: partition.created_revision,
+                purge_generation: partition.purge_generation,
+                group,
+                client_id,
+            })
+        })
+    }
+
     #[must_use]
     pub fn read<F, R>(&self, f: F) -> R
     where
@@ -1585,11 +1678,8 @@ impl Streams {
             let stream = inner.items.get(stream_id)?;
             let topic = stream.topics.get(topic_id)?;
             let partition_id = usize::try_from(partition_id).ok()?;
-            topic
-                .partitions
-                .iter()
-                .any(|partition| partition.id == partition_id)
-                .then(|| IggyNamespace::new(stream_id, topic_id, partition_id))
+            find_partition(&topic.partitions, partition_id)
+                .map(|_| IggyNamespace::new(stream_id, topic_id, partition_id))
         })
     }
 
@@ -1631,17 +1721,7 @@ impl Streams {
         self.inner.read(|inner| {
             let stream = inner.items.get(namespace.stream_id())?;
             let topic = stream.topics.get(namespace.topic_id())?;
-            let partition_id = namespace.partition_id();
-            if let Some(partition) = topic.partitions.get(partition_id)
-                && partition.id == partition_id
-            {
-                return Some(read(partition));
-            }
-            topic
-                .partitions
-                .iter()
-                .find(|partition| partition.id == partition_id)
-                .map(read)
+            find_partition(&topic.partitions, namespace.partition_id()).map(read)
         })
     }
 
@@ -1837,6 +1917,22 @@ impl Streams {
 /// replicas disagree about their TOML.
 const fn admits_slab_key(vacant_key: usize, ceiling: usize) -> bool {
     vacant_key < ceiling
+}
+
+/// The partition carrying `partition_id`, or `None` when the topic has none.
+///
+/// A primary mints dense 0-based ids, so the vector index IS the id and the
+/// direct hit answers every ordinary topic. The scan exists only for a vector
+/// left sparse by a partition delete, where an index no longer names its id.
+fn find_partition(partitions: &[Partition], partition_id: usize) -> Option<&Partition> {
+    if let Some(partition) = partitions.get(partition_id)
+        && partition.id == partition_id
+    {
+        return Some(partition);
+    }
+    partitions
+        .iter()
+        .find(|partition| partition.id == partition_id)
 }
 
 /// Range and distinctness for the ABSOLUTE partition ids on a topic create,
@@ -2234,20 +2330,23 @@ impl StateHandler for UpdateTopicRequest {
 
         // Decoded before any mutation: a malformed block must leave the topic
         // untouched rather than half-renamed.
-        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
+        let Ok(mut updated_options) = resource_options_from_wire(&self.options, true) else {
             return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
         };
         // Read leniently, like every other committed op: a key this build does
         // not know is skipped rather than failing an operation its peers
         // accepted.
         let updated = TopicCreateOptions::parse_committed(&self.options);
+        // Default sentinels leave both the effective value and its provenance
+        // unchanged, just as an omitted key does.
+        updated_options.retain(|key, _| match key.as_str() {
+            Ok(topic_option_keys::MESSAGE_EXPIRY) => updated.message_expiry.is_some(),
+            Ok(topic_option_keys::MAX_TOPIC_SIZE) => updated.max_topic_size.is_some(),
+            _ => true,
+        });
 
         stream.topic_index.remove(&topic.name);
         topic.name = new_name_arc.clone();
-        // Settings arrive only through the options block now, so the typed
-        // fields are a projection of it and cannot drift. Absent means absent:
-        // a client that sends just a rename leaves every setting alone, and one
-        // built before a key existed cannot erase it.
         if let Some(compression_algorithm) = updated.compression_algorithm {
             topic.compression_algorithm = compression_algorithm;
         }
@@ -2751,7 +2850,7 @@ mod tests {
         CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
-    use iggy_common::{HeaderKey, HeaderKind, topic_option_keys};
+    use iggy_common::{HeaderKey, HeaderKind, TopicUpdateOptions, topic_option_keys};
     use std::str::FromStr;
 
     #[test]
@@ -2954,6 +3053,89 @@ mod tests {
             &10_000_000_000u64.to_le_bytes(),
             "the map must carry the resolved value, not the sentinel"
         );
+    }
+
+    #[test]
+    fn update_topic_sentinels_preserve_effective_options_and_provenance() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let message_expiry = IggyExpiry::from(5_000_000u64);
+        let max_topic_size = MaxTopicSize::from(10_000_000_000u64);
+        let create = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic").unwrap(),
+                options: TopicCreateOptions {
+                    message_expiry: Some(message_expiry),
+                    ..TopicCreateOptions::default()
+                }
+                .to_explicit_wire(|key| key == topic_option_keys::MESSAGE_EXPIRY)
+                .unwrap(),
+            },
+            derived_options: TopicCreateOptions {
+                max_topic_size: Some(max_topic_size),
+                ..TopicCreateOptions::default()
+            }
+            .to_wire()
+            .unwrap(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&create, &mut inner, IggyTimestamp::from(1)).code,
+            0
+        );
+        let original_options = inner
+            .items
+            .get(0)
+            .unwrap()
+            .topics
+            .get(0)
+            .unwrap()
+            .options
+            .clone();
+
+        for options in [
+            TopicUpdateOptions::default(),
+            TopicUpdateOptions {
+                message_expiry: Some(IggyExpiry::ServerDefault),
+                max_topic_size: Some(MaxTopicSize::ServerDefault),
+                ..TopicUpdateOptions::default()
+            },
+            TopicUpdateOptions {
+                raw: [
+                    topic_option_keys::MESSAGE_EXPIRY,
+                    topic_option_keys::MAX_TOPIC_SIZE,
+                ]
+                .into_iter()
+                .map(|key| (key.to_owned(), "server_default".to_owned()))
+                .collect(),
+                ..TopicUpdateOptions::default()
+            },
+        ] {
+            let update = UpdateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("renamed").unwrap(),
+                options: options.to_wire().unwrap(),
+            };
+            assert_eq!(
+                StateHandler::apply(&update, &mut inner, IggyTimestamp::from(2)).code,
+                0
+            );
+            let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+            assert_eq!(topic.name.as_ref(), "renamed");
+            assert_eq!(topic.message_expiry, message_expiry);
+            assert_eq!(topic.max_topic_size, max_topic_size);
+            assert_eq!(
+                topic.options, original_options,
+                "update {options:?} must preserve values and provenance"
+            );
+        }
     }
 
     #[test]
@@ -4139,6 +4321,37 @@ mod tests {
             .find(|partition| partition.id == partition_id)
             .expect("committed partition")
             .clone()
+    }
+
+    /// A delete leaves every surviving id above the hole naming an index that
+    /// is no longer its own, so the direct hit has to fall through to the scan
+    /// or the survivor resolves to nothing and its namespace stops routing.
+    #[test]
+    fn given_sparse_partition_ids_when_resolving_should_fall_back_to_the_scan() {
+        let inner = inner_with_registered_partition();
+        let template = committed_partition(&inner, 0, 0, 0);
+        let partition = |id| Partition {
+            id,
+            ..template.clone()
+        };
+        let dense = vec![partition(0), partition(1)];
+        let sparse = vec![partition(3), partition(7)];
+
+        assert_eq!(
+            find_partition(&dense, 1).map(|partition| partition.id),
+            1.into()
+        );
+        assert_eq!(
+            find_partition(&sparse, 3).map(|partition| partition.id),
+            3.into()
+        );
+        assert_eq!(
+            find_partition(&sparse, 7).map(|partition| partition.id),
+            7.into()
+        );
+        assert!(find_partition(&sparse, 0).is_none());
+        assert!(find_partition(&sparse, 1).is_none());
+        assert!(find_partition(&dense, 2).is_none());
     }
 
     /// A checkpoint reads a stream's total and each of its topics' as separate

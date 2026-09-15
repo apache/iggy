@@ -80,6 +80,7 @@ name = "iggy-server"
 path = "src/main.rs"
 
 [features]
+poll-diagnostics = ["shard/poll-diagnostics"]
 default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]

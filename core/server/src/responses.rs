@@ -336,7 +336,7 @@ pub fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifi
 
 /// Fence a consumer-group offset op then resolve its target partition
 /// namespace. Shared by the four `Store`/`Delete` consumer-offset arms.
-fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
+pub fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
@@ -730,16 +730,7 @@ where
         nodes: metadata
             .nodes
             .into_iter()
-            .map(|node| ClusterNodeResponse {
-                name: node.name,
-                ip: node.ip,
-                tcp_port: node.endpoints.tcp,
-                quic_port: node.endpoints.quic,
-                http_port: node.endpoints.http,
-                websocket_port: node.endpoints.websocket,
-                role: node.role as u8,
-                status: node.status as u8,
-            })
+            .map(ClusterNodeResponse::from)
             .collect(),
     }
 }
@@ -1026,7 +1017,7 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
                 .map_err(|_| IggyError::InvalidFormat)?,
             kind: HeaderKind::String.as_code(),
             default_value: Bytes::from_static(b"none"),
-            description: "Compression algorithm (none, gzip)".to_string(),
+            description: "Compression algorithm (none, gzip); stored and reported, not applied to messages".to_string(),
         },
         OptionDescriptor {
             key: WireName::new(topic_option_keys::MESSAGE_EXPIRY)
@@ -1046,8 +1037,8 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             default_value: Bytes::copy_from_slice(
                 &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
             ),
-            description: "Topic size cap in bytes, or a byte-size string (e.g. 1 GiB); \
-                              must be at least the segment size"
+            description: "Topic-wide sealed-segment size cap, split across all partitions, in bytes \
+                              or a byte-size string (e.g. 1 GiB); finite values must be at least the segment size"
                 .to_string(),
         },
         OptionDescriptor {
@@ -1082,9 +1073,8 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
                 &iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
             ),
             description: format!(
-                "Flush the journal once it holds this many messages; \
-                     1..={}. A threshold no segment can reach leaves committed \
-                     messages in the journal, which a crash does not preserve",
+                "Ordinary message-count flush trigger; 1..={}. Required persistence, \
+                     capacity pressure, and lifecycle operations can flush earlier",
                 iggy_common::MAX_MESSAGES_REQUIRED_TO_SAVE
             ),
         },
@@ -1109,11 +1099,10 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
                 iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             )]),
             description: format!(
-                "Reserve each segment's bytes up front where the filesystem supports \
-                     it; pairs with segment_size. The reservation is real disk and runs \
-                     inline on the owning shard, at every rotation and once per owned \
-                     partition at boot, so segment_size * partitions_count is capped at \
-                     {} bytes",
+                "Request segment_size bytes of disk reservation when each segment opens. \
+                     Unsupported or failed reservations fall back to ordinary allocation \
+                     with a warning. Reservation runs inline on the owning shard. \
+                     segment_size * partitions_count is capped at {} bytes per create",
                 iggy_common::MAX_PREALLOCATED_TOPIC_BYTES
             ),
         },
@@ -1518,7 +1507,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// The SDK strips a result section off exactly the replies whose operation is
 /// [`iggy_binary_protocol::Operation::is_result_framed`] (every metadata op plus the
-/// four consumer-offset ops), and a non-empty `Register`, which it handles on its
+/// two consumer-offset writes), and a non-empty `Register`, which it handles on its
 /// own. For those, a payload missing the leading zero count has its first four bytes
 /// eaten as a result count, and the decode fails or, worse, succeeds on the shifted
 /// remainder: the raw-PAT reply shipped once without the prefix and broke the SDK.

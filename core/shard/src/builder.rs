@@ -31,8 +31,7 @@ use crate::coordinator::{ShardZeroCoordinator, classify_try_send_err};
 use crate::metrics::{ShardMetrics, frame_drop_variant};
 use crate::{
     CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
-    PartitionConsensusConfig, PartitionReadHandler, Receiver, ShardCtorError, ShardFrame,
-    ShardIdentity, TaggedSender,
+    PartitionConsensusConfig, Receiver, ShardCtorError, ShardFrame, ShardIdentity, TaggedSender,
 };
 use consensus::VsrConsensus;
 use journal::JournalHandle;
@@ -68,12 +67,12 @@ where
     on_client_request: RequestHandler,
     on_metadata_submit: MetadataSubmitHandler,
     on_list_clients: ListClientsHandler,
-    on_partition_read: PartitionReadHandler,
     metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
     partitions: IggyPartitions<B, SB>,
     senders: Vec<TaggedSender>,
     inbox: Receiver<ShardFrame>,
     reply_inbox: Receiver<ShardFrame>,
+    poll_completion_capacity: usize,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
@@ -99,12 +98,12 @@ where
         on_client_request: RequestHandler,
         on_metadata_submit: MetadataSubmitHandler,
         on_list_clients: ListClientsHandler,
-        on_partition_read: PartitionReadHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
         reply_inbox: Receiver<ShardFrame>,
+        poll_completion_capacity: usize,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coord_config: CoordinatorConfig,
@@ -117,12 +116,12 @@ where
             on_client_request,
             on_metadata_submit,
             on_list_clients,
-            on_partition_read,
             metadata,
             partitions,
             senders,
             inbox,
             reply_inbox,
+            poll_completion_capacity,
             shards_table,
             partition_consensus,
             coord_config,
@@ -142,6 +141,10 @@ where
     /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
     /// fit in `u16`. Both are bootstrap programming errors and the
     /// `u16` overflow check fires on every shard, not only shard 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_completion_capacity` is zero.
     pub fn build(self) -> Result<BuiltShard<B, MJ, S, M, T, SB>, ShardCtorError> {
         let is_shard_zero = self.identity.id == 0;
 
@@ -228,12 +231,12 @@ where
             self.on_client_request,
             self.on_metadata_submit,
             self.on_list_clients,
-            self.on_partition_read,
             self.metadata,
             self.partitions,
             self.senders,
             self.inbox,
             self.reply_inbox,
+            self.poll_completion_capacity,
             self.shards_table,
             self.partition_consensus,
             coordinator,

@@ -96,6 +96,7 @@ public sealed class VsrProtocolDriftTests
         Assert.Equal(VsrHeader.SIZE_OFFSET, offsets["size"]);
         Assert.Equal(VsrHeader.COMMAND_OFFSET, offsets["command"]);
         Assert.Equal(VsrHeader.REPLY_OPERATION_OFFSET, offsets["operation"]);
+        Assert.Equal(VsrHeader.REPLY_COMMIT_OFFSET, offsets["commit"]);
         Assert.Equal(VsrHeader.REPLY_STATUS_OFFSET, offsets["status"]);
 
         Assert.DoesNotContain("namespace", offsets.Keys);

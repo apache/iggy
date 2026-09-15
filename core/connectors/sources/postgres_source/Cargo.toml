@@ -57,5 +57,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+rmp-serde = { workspace = true }
+
 [lints]
 workspace = true

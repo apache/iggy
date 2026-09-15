@@ -243,7 +243,7 @@ pub async fn should_help_match() {
                 r#"Create topic with given name, number of partitions, compression algorithm and expiry time for given stream ID
 
 Stream ID can be specified as a stream name or ID
-If topic ID is not provided then the server will automatically assign it
+The server assigns the topic ID. The legacy --topic-id flag is ignored.
 
 Examples
  iggy topic create 1 sensor1 2 gzip 15days
@@ -266,24 +266,24 @@ Arguments:
           Number of partitions inside the topic
 
   <COMPRESSION_ALGORITHM>
-          Compression algorithm for the topic, set to "none" for no compression
+          Compression metadata (none or gzip). Payload compression is not implemented
 
   [MESSAGE_EXPIRY]...
           Message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
 {CLAP_INDENT}
-          "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
+          Skipping this parameter or using "server_default" creates a topic with no message expiry.
 {CLAP_INDENT}
           [default: server_default]
 
 Options:
   -t, --topic-id <TOPIC_ID>
-          Topic ID to create
+          Legacy topic ID flag (ignored)
 
   -m, --max-topic-size <MAX_TOPIC_SIZE>
           Max topic size in human-readable format like "unlimited" or "15GB"
 {CLAP_INDENT}
-          "server_default" or skipping parameter makes CLI to use server default (from current server config) max topic size
-          Can't be lower than segment size in the config.
+          Skipping this parameter or using "server_default" creates a topic with unlimited size.
+          A finite size cannot be lower than the topic segment size.
 {CLAP_INDENT}
           [default: server_default]
 
@@ -336,11 +336,11 @@ Arguments:
   <STREAM_ID>              Stream ID to create topic
   <NAME>                   Name of the topic
   <PARTITIONS_COUNT>       Number of partitions inside the topic
-  <COMPRESSION_ALGORITHM>  Compression algorithm for the topic, set to "none" for no compression
+  <COMPRESSION_ALGORITHM>  Compression metadata (none or gzip). Payload compression is not implemented
   [MESSAGE_EXPIRY]...      Message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:
-  -t, --topic-id <TOPIC_ID>                                      Topic ID to create
+  -t, --topic-id <TOPIC_ID>                                      Legacy topic ID flag (ignored)
   -m, --max-topic-size <MAX_TOPIC_SIZE>                          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
       --durability <DURABILITY>                                  Message completion policy: replicated or persisted. Both policies store messages on disk [default: replicated] [possible values:
                                                                  replicated, persisted]

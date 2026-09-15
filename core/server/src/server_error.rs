@@ -104,6 +104,8 @@ pub enum ServerError {
     InvalidInboxCapacity { value: usize, max: usize },
     #[error("sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
     InvalidReplyInboxCapacity { value: usize, max: usize },
+    #[error("sharding.poll_completion_capacity must be in 1..={max}; got {value}")]
+    InvalidPollCompletionCapacity { value: usize, max: usize },
     #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,
@@ -436,9 +438,10 @@ pub enum PartitionRecoveryRefusal {
     },
     /// The sparse index of a topic running under `persisted durability` outruns its
     /// log by more than the one entry a crash can legitimately strand there.
-    /// Persistence writes exactly one entry per flush chunk, chunks never
-    /// overlap, and flushes are serialized, so every entry below the last one
-    /// names a chunk whose log bytes completed their fdatasync. A completed
+    /// Persistence writes exactly one entry per flush chunk and chunks never
+    /// overlap. The WAL makes a body durable before acknowledging it and the
+    /// flush indexes it later, so every entry on disk names a chunk whose log
+    /// bytes completed their fdatasync. A completed
     /// chunk can contain batches acknowledged before the flush threshold was
     /// reached, while the in-flight chunk can do so too. Reply timing is not
     /// the proof. Only the chunk in flight when the process died can have an

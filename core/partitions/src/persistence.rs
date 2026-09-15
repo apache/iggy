@@ -30,14 +30,27 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use nix::sys::resource::{Resource, getrlimit};
 
-const APPEND_BATCH_BYTES_MAX: u64 = 1024 * 1024;
-const APPEND_BATCH_OPS_MAX: usize = 64;
+// Group commit bounds, not throughput bounds. Every prepare in a group is
+// already queued and waiting, so widening the group moves work off the barrier
+// and onto a buffered memcpy: one body write and one durability barrier serve
+// the whole group instead of each prepare paying its own. The byte budget is
+// charged against the padded BODY size even when the WAL stores a segment
+// reference and writes 4096 bytes per record, so a tight budget caps grouping
+// far below what the write itself costs.
+const APPEND_BATCH_BYTES_MAX: u64 = 8 * 1024 * 1024;
+const APPEND_BATCH_OPS_MAX: usize = 256;
 const CHECKPOINT_DIRTY_FILES_MAX: usize = 1024;
+/// Mutations a partition may apply before its obsolete files are reclaimed
+/// whether or not the queue has drained. Reclaiming only on an idle queue
+/// keeps the unlinks off every acknowledgement, but a partition under
+/// continuous load never goes idle and would hold its old generations until
+/// it did.
+const RECLAIM_MUTATIONS_MAX: u32 = 64;
 #[cfg(unix)]
 const OFFSET_FILES_TOTAL_MAX: usize = 1024;
 const OFFSET_FILES_PER_PARTITION_MAX: usize = 64;
@@ -101,6 +114,11 @@ pub struct PersistenceMetrics {
     pub checkpoints_pending: u64,
     pub completed_batches: u64,
     pub batched_prepares: u64,
+    /// Durable groups that took the optional pre-barrier wait. Zero while the
+    /// delay is disabled, and zero with it enabled means the arrival gap never
+    /// cleared the guard, so a group-size change measured against the delay
+    /// alone would be attributing something else.
+    pub group_commit_waits: u64,
     pub completed_checkpoints: u64,
     pub failed_writes: u64,
 }
@@ -146,8 +164,14 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     failure: RefCell<Option<Arc<io::Error>>>,
     failure_operation: Cell<Operation>,
     notifier: RefCell<Option<PersistenceNotifier>>,
+    group_commit_delay: Cell<Duration>,
+    /// Interval between the two most recent submissions. Decides whether a
+    /// group-commit wait would see another prepare before it expires.
+    append_gap: Cell<Duration>,
+    last_append: Cell<Option<Instant>>,
     completed_batches: Cell<u64>,
     batched_prepares: Cell<u64>,
+    group_commit_waits: Cell<u64>,
     completed_checkpoints: Cell<u64>,
     failed_writes: Cell<u64>,
 }
@@ -526,8 +550,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             failure: RefCell::new(None),
             failure_operation: Cell::new(Operation::SendMessages),
             notifier: RefCell::new(None),
+            group_commit_delay: Cell::new(Duration::ZERO),
+            append_gap: Cell::new(Duration::MAX),
+            last_append: Cell::new(None),
             completed_batches: Cell::new(0),
             batched_prepares: Cell::new(0),
+            group_commit_waits: Cell::new(0),
             completed_checkpoints: Cell::new(0),
             failed_writes: Cell::new(0),
         });
@@ -576,6 +604,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             });
         }
         false
+    }
+
+    /// Bound on the wait the writer may take before a barrier, to let more
+    /// prepares join the group. Zero keeps the writer's barrier-paced grouping.
+    pub fn set_group_commit_delay(&self, delay: Duration) {
+        self.group_commit_delay.set(delay);
     }
 
     pub fn set_notifier(&self, notifier: PersistenceNotifier) {
@@ -696,6 +730,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 "partition WAL submission is out of order",
             ));
         }
+        let now = Instant::now();
+        self.append_gap.set(
+            self.last_append
+                .replace(Some(now))
+                .map_or(Duration::MAX, |previous| {
+                    now.saturating_duration_since(previous)
+                }),
+        );
         self.queued_bytes.set(self.queued_bytes.get() + bytes);
         self.accepted
             .borrow_mut()
@@ -952,6 +994,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             checkpoints_pending: u64::from(self.checkpoint_pending()),
             completed_batches: self.completed_batches.replace(0),
             batched_prepares: self.batched_prepares.replace(0),
+            group_commit_waits: self.group_commit_waits.replace(0),
             completed_checkpoints: self.completed_checkpoints.replace(0),
             failed_writes: self.failed_writes.replace(0),
         }
@@ -1075,6 +1118,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             guard.complete = true;
             return;
         };
+        let mut mutations_since_reclaim = 0u32;
         loop {
             if self.retired.get() {
                 break;
@@ -1111,47 +1155,67 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 break;
             }
             if epoch == self.epoch.get() && !self.retired.get() {
-                let mut references = self.segment_references.borrow_mut();
-                if rebuild_references {
-                    references.clear();
-                    references.extend(journal.written_segment_references(0));
-                } else if let Some(from_op) = self.written_head.get().checked_add(1) {
-                    references.extend(journal.written_segment_references(from_op));
-                }
-                drop(references);
-                self.disk_bytes.set(journal.size_bytes());
-                self.retained_bytes.set(journal.retained_bytes());
-                self.segment_checkpoint.set(journal.segment_checkpoint());
-                let advanced = journal.durable_op() != self.durable_head.get()
-                    || journal.checkpoint_op() != self.checkpoint.get()
-                    || journal.certified_log_view() != self.certified_log_view.get()
-                    || (journal.segment_checkpoint().is_some()
-                        && journal.head() != self.written_head.get());
-                self.certified_log_view.set(journal.certified_log_view());
-                if self
-                    .requested_log_view
-                    .get()
-                    .is_some_and(|(view, _, _)| Some(view) == self.certified_log_view.get())
-                {
-                    self.requested_log_view.set(None);
-                }
-                self.written_head.set(journal.head());
-                self.durable_head.set(journal.durable_op());
-                if journal.checkpoint_op() > self.checkpoint.get() {
-                    self.accepted
-                        .borrow_mut()
-                        .checkpoint(journal.checkpoint_op());
-                }
-                self.checkpoint.set(journal.checkpoint_op());
-                self.checkpoint_checksum.set(journal.checkpoint_checksum());
-                self.purge_generation.set(journal.purge_marker().0);
-                self.purge_floor.set(journal.purge_marker().1);
-                if advanced {
-                    self.notify();
-                }
+                self.publish_mutation(journal, rebuild_references);
+            }
+            // Reclaim after publishing the mutation when the queue is empty.
+            // Appends arriving during reclaim still wait for its unlinks and
+            // directory barrier.
+            // A partition that never drains would then never reclaim, so force
+            // a pass every `RECLAIM_MUTATIONS_MAX` mutations and accept that
+            // one group's latency.
+            mutations_since_reclaim += 1;
+            let idle = self.queue.borrow().is_empty();
+            if idle || mutations_since_reclaim >= RECLAIM_MUTATIONS_MAX {
+                mutations_since_reclaim = 0;
+                journal.cleanup_obsolete().await;
             }
         }
         guard.complete = true;
+    }
+
+    /// Republish what the completed mutation moved, and wake the partition when
+    /// any of it advanced. Runs only while the writer still owns this epoch: a
+    /// retired or re-epoched writer must not overwrite the state its successor
+    /// published.
+    fn publish_mutation(&self, journal: &PartitionPrepareJournal<S>, rebuild_references: bool) {
+        let mut references = self.segment_references.borrow_mut();
+        if rebuild_references {
+            references.clear();
+            references.extend(journal.written_segment_references(0));
+        } else if let Some(from_op) = self.written_head.get().checked_add(1) {
+            references.extend(journal.written_segment_references(from_op));
+        }
+        drop(references);
+        self.disk_bytes.set(journal.size_bytes());
+        self.retained_bytes.set(journal.retained_bytes());
+        self.segment_checkpoint.set(journal.segment_checkpoint());
+        let advanced = journal.durable_op() != self.durable_head.get()
+            || journal.checkpoint_op() != self.checkpoint.get()
+            || journal.certified_log_view() != self.certified_log_view.get()
+            || (journal.segment_checkpoint().is_some()
+                && journal.head() != self.written_head.get());
+        self.certified_log_view.set(journal.certified_log_view());
+        if self
+            .requested_log_view
+            .get()
+            .is_some_and(|(view, _, _)| Some(view) == self.certified_log_view.get())
+        {
+            self.requested_log_view.set(None);
+        }
+        self.written_head.set(journal.head());
+        self.durable_head.set(journal.durable_op());
+        if journal.checkpoint_op() > self.checkpoint.get() {
+            self.accepted
+                .borrow_mut()
+                .checkpoint(journal.checkpoint_op());
+        }
+        self.checkpoint.set(journal.checkpoint_op());
+        self.checkpoint_checksum.set(journal.checkpoint_checksum());
+        self.purge_generation.set(journal.purge_marker().0);
+        self.purge_floor.set(journal.purge_marker().1);
+        if advanced {
+            self.notify();
+        }
     }
 
     async fn apply_mutation(
@@ -1227,46 +1291,30 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         &self,
         journal: &mut PartitionPrepareJournal<S>,
         first: Frozen<4096>,
-        mut durable: bool,
+        durable: bool,
         epoch: u64,
         first_bytes: u64,
     ) -> io::Result<()> {
         let mut batch = SmallVec::<[Frozen<4096>; 8]>::new();
         batch.push(first);
         let mut bytes = first_bytes;
-        {
-            let mut queue = self.queue.borrow_mut();
-            while batch.len() < APPEND_BATCH_OPS_MAX {
-                let Some(Mutation::Append {
-                    epoch: next_epoch,
-                    bytes: next_bytes,
-                    ..
-                }) = queue.front()
-                else {
-                    break;
-                };
-                if *next_epoch != epoch
-                    || bytes.saturating_add(*next_bytes) > APPEND_BATCH_BYTES_MAX
-                {
-                    break;
-                }
-                let Some(Mutation::Append {
-                    prepare,
-                    durable: requires_sync,
-                    bytes: record_bytes,
-                    ..
-                }) = queue.pop_front()
-                else {
-                    unreachable!("append prefix was checked");
-                };
-                bytes += record_bytes;
-                self.queued_bytes
-                    .set(self.queued_bytes.get().saturating_sub(record_bytes));
-                durable |= requires_sync;
-                batch.push(prepare);
-            }
-        }
+        let mut durable = durable;
+        self.collect_queued(&mut batch, &mut bytes, &mut durable, epoch);
+        // Charged before the wait: `collect_queued` took these bytes out of the
+        // queued total, and admission and checkpoint pacing sum queued and
+        // in-flight bytes against the budget, so a gap here would admit a full
+        // group past it.
         self.in_flight_bytes.set(bytes);
+        // The barrier is what groups prepares, so a barrier cheaper than the
+        // interval between arrivals groups nothing and every prepare pays its
+        // own writes. This wait puts that grouping back under operator control.
+        if durable && let Some(delay) = self.group_commit_wait(&batch, bytes) {
+            self.group_commit_waits
+                .set(self.group_commit_waits.get() + 1);
+            compio::runtime::time::sleep(delay).await;
+            self.collect_queued(&mut batch, &mut bytes, &mut durable, epoch);
+            self.in_flight_bytes.set(bytes);
+        }
         let count = batch.len() as u64;
         journal.append_batch_buffered(&batch).await?;
         if durable {
@@ -1276,6 +1324,58 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 .set(self.batched_prepares.get() + count);
         }
         Ok(())
+    }
+
+    /// Move every queued append that still fits into `batch`.
+    fn collect_queued(
+        &self,
+        batch: &mut SmallVec<[Frozen<4096>; 8]>,
+        bytes: &mut u64,
+        durable: &mut bool,
+        epoch: u64,
+    ) {
+        let mut queue = self.queue.borrow_mut();
+        while batch.len() < APPEND_BATCH_OPS_MAX {
+            let Some(Mutation::Append {
+                epoch: next_epoch,
+                bytes: next_bytes,
+                ..
+            }) = queue.front()
+            else {
+                break;
+            };
+            if *next_epoch != epoch || bytes.saturating_add(*next_bytes) > APPEND_BATCH_BYTES_MAX {
+                break;
+            }
+            let Some(Mutation::Append {
+                prepare,
+                durable: requires_sync,
+                bytes: record_bytes,
+                ..
+            }) = queue.pop_front()
+            else {
+                unreachable!("append prefix was checked");
+            };
+            *bytes += record_bytes;
+            self.queued_bytes
+                .set(self.queued_bytes.get().saturating_sub(record_bytes));
+            *durable |= requires_sync;
+            batch.push(prepare);
+        }
+    }
+
+    /// How long to wait for more prepares before the barrier, if at all.
+    ///
+    /// `None` for a disabled delay, a group already at its bounds, or arrivals
+    /// spaced wider than the delay, where the wait would expire before the next
+    /// prepare reached the queue.
+    fn group_commit_wait(&self, batch: &[Frozen<4096>], bytes: u64) -> Option<Duration> {
+        let delay = self.group_commit_delay.get();
+        if delay.is_zero() || batch.len() >= APPEND_BATCH_OPS_MAX || bytes >= APPEND_BATCH_BYTES_MAX
+        {
+            return None;
+        }
+        (self.append_gap.get() <= delay).then_some(delay)
     }
 
     fn notify(&self) {
@@ -1304,6 +1404,49 @@ mod tests {
     use iggy_binary_protocol::{Command, Operation};
     use server_common::{Message, iobuf::Owned};
     use tempfile::tempdir;
+
+    /// `io::ErrorKind::StorageFull` is still unstable, so match the raw errno.
+    const ENOSPC: i32 = 28;
+
+    /// A full disk is a refused write, not a torn one: the prior bytes are
+    /// intact and nothing is undefined. Latching it fences the partition for the
+    /// life of the process, and `drive_persistence` escalates that to a node
+    /// shutdown. The same function already treats open failures as retriable.
+    #[compio::test]
+    #[ignore = "PR #4092 review: a refused consumer-offset write latches an unclearable `failure`, retroactively reporting already-acked prepares as unwritten"]
+    async fn given_a_full_disk_when_the_offset_write_is_refused_then_persistence_should_not_fence()
+    {
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        persistence
+            .append(first.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_written(first.header()));
+
+        persistence.fail_operation(
+            io::Error::from_raw_os_error(ENOSPC),
+            Operation::StoreConsumerOffset,
+        );
+
+        assert!(
+            persistence.is_written(first.header()),
+            "an unrelated offset write reported an already-durable prepare as unwritten"
+        );
+        assert!(
+            persistence.failure().is_none(),
+            "ENOSPC on one consumer-offset record latched the partition; nothing clears `failure` (its only `None` is the constructor), so `is_written_through` stays false and `drive_persistence` raises FatalCommit"
+        );
+        assert!(
+            persistence.start(),
+            "the writer refuses to start again after a recoverable errno"
+        );
+    }
 
     #[compio::test]
     async fn completion_is_generation_scoped_and_buffered_work_does_not_ack_durability() {
@@ -1487,6 +1630,94 @@ mod tests {
         }
         assert!(persistence.needs_checkpoint());
         assert_eq!(persistence.disk_bytes.get(), 0);
+    }
+
+    /// The barrier is what groups prepares, so a barrier cheaper than the
+    /// interval between arrivals leaves every prepare paying its own writes.
+    /// The delay restores the grouping without changing what the barrier
+    /// covers, and it must not fire on a partition whose arrivals are spaced
+    /// wider than the wait.
+    #[compio::test]
+    async fn a_group_commit_delay_admits_prepares_that_arrive_during_the_wait() {
+        const DELAY: Duration = Duration::from_millis(200);
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        persistence.set_group_commit_delay(DELAY);
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        let third = prepare(3, second.header().checksum);
+        // Two back-to-back submissions put the arrival estimate under the delay.
+        persistence.append(first.into_frozen(), true).unwrap();
+        persistence.append(second.into_frozen(), true).unwrap();
+        assert!(persistence.start());
+        let writer = Rc::clone(&persistence);
+        let late = async {
+            compio::runtime::time::sleep(DELAY / 4).await;
+            // Collected bytes stay charged against the budget while the writer
+            // waits; they left the queue but have not reached the barrier.
+            let waiting = persistence.take_metrics();
+            assert_eq!(waiting.queued_bytes, 0);
+            assert_eq!(waiting.in_flight_bytes, 2 * 4096);
+            persistence.append(third.into_frozen(), true).unwrap();
+        };
+        futures::future::join(writer.run(), late).await;
+        assert!(persistence.failure().is_none());
+        assert!(persistence.is_durable_through(3));
+        let metrics = persistence.take_metrics();
+        assert_eq!(metrics.completed_batches, 1);
+        assert_eq!(metrics.batched_prepares, 3);
+        assert_eq!(metrics.in_flight_bytes, 0);
+    }
+
+    /// A group with no barrier to amortize gains nothing from waiting, and a
+    /// wait there would only delay the durable group queued behind it.
+    #[compio::test]
+    async fn a_group_commit_delay_is_skipped_for_a_group_without_a_barrier() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        // Wide apart on purpose: a taken wait is at least the delay, a slow
+        // append on a loaded runner is milliseconds, so the bound cannot be
+        // crossed by either for the wrong reason.
+        persistence.set_group_commit_delay(Duration::from_secs(2));
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), false).unwrap();
+        persistence.append(second.into_frozen(), false).unwrap();
+        assert!(persistence.start());
+        let started = Instant::now();
+        Rc::clone(&persistence).run().await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(persistence.is_written_through(2));
+        assert_eq!(persistence.take_metrics().completed_batches, 0);
+    }
+
+    /// A partition whose prepares arrive further apart than the delay would pay
+    /// the wait for nothing, so the estimate has to keep it off.
+    #[compio::test]
+    async fn a_group_commit_delay_is_skipped_when_arrivals_outlast_it() {
+        let directory = tempdir().unwrap();
+        let (persistence, _) =
+            PartitionPersistence::open(&directory.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        persistence.set_group_commit_delay(Duration::from_millis(1));
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), true).unwrap();
+        compio::runtime::time::sleep(Duration::from_millis(20)).await;
+        persistence.append(second.into_frozen(), true).unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_durable_through(2));
+        // Both were queued before the writer started, so they share one barrier
+        // regardless. What matters is that no wait was taken to get there.
+        assert_eq!(persistence.take_metrics().completed_batches, 1);
     }
 
     fn prepare(op: u64, parent: u128) -> Message<PrepareHeader> {

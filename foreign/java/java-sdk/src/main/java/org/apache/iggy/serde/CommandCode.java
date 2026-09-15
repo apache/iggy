@@ -32,6 +32,7 @@ public interface CommandCode {
         GET_STATS(10),
         GET_CLUSTER_METADATA(12),
         DESCRIBE_OPTIONS(13),
+        ATTACH_CONSUMER_SESSION(14),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);
@@ -93,7 +94,9 @@ public interface CommandCode {
 
     enum Messages implements CommandCode {
         POLL(100),
-        SEND(101);
+        SEND(101),
+        GET_POLL_ROUTING(103),
+        POLL_ON_PRIMARY(104);
 
         private final int value;
 
