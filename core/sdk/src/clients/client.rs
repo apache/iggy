@@ -21,6 +21,7 @@ use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::EncryptorKind;
+use crate::prelude::Identifier;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
@@ -651,8 +652,8 @@ impl IggyClient {
             self.client.clone(),
             name.to_owned(),
             Consumer::new(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
             None,
@@ -722,8 +723,8 @@ impl IggyClient {
             self.client.clone(),
             name.to_owned(),
             Consumer::group(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
             None,
@@ -781,9 +782,9 @@ impl IggyClient {
     pub fn producer(&self, stream: &str, topic: &str) -> Result<IggyProducerBuilder, IggyError> {
         Ok(IggyProducerBuilder::new(
             self.client.clone(),
-            stream.try_into()?,
+            Identifier::named(stream)?,
             stream.to_owned(),
-            topic.try_into()?,
+            Identifier::named(topic)?,
             topic.to_owned(),
             self.encryptor.clone(),
             self.partitioner.clone(),

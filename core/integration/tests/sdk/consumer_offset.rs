@@ -131,9 +131,7 @@ async fn given_standalone_stream_consumer_when_creating_topic_should_select_part
         let topic_name = format!("{TOPIC_NAME}-{partitions_count}");
         let topic_id = Identifier::named(&topic_name).unwrap();
         let config = IggyConsumerConfig::builder()
-            .stream_id(stream_id.clone())
             .stream_name(STREAM_NAME)
-            .topic_id(topic_id.clone())
             .topic_name(topic_name)
             .consumer_name(CONSUMER_NAME)
             .consumer_kind(ConsumerKind::Consumer)

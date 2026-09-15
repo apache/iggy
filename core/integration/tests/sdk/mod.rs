@@ -27,3 +27,4 @@ mod producer;
 mod protocol_version;
 mod raw;
 mod send_confirmation;
+mod stream_builder;

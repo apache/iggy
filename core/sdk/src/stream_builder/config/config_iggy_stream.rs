@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::prelude::{Identifier, IggyDuration, IggyError};
+use crate::prelude::{IggyDuration, IggyError};
 use crate::stream_builder::{IggyConsumerConfig, IggyProducerConfig};
 use bon::Builder;
 
@@ -86,16 +86,8 @@ impl IggyStreamConfig {
         &self.producer_config
     }
 
-    pub fn stream_id(&self) -> &Identifier {
-        self.producer_config.stream_id()
-    }
-
     pub fn stream_name(&self) -> &str {
         self.producer_config.stream_name()
-    }
-
-    pub fn topic_id(&self) -> &Identifier {
-        self.producer_config.topic_id()
     }
 
     pub fn topic_name(&self) -> &str {
