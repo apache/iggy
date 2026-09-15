@@ -59,6 +59,9 @@ github:
     edit_comment_discussion: "Re: {title}"
     delete_comment_discussion: "Re: {title}"
 
+  collaborators:
+    - justinmclean
+
 notifications:
   commits: commits@iggy.apache.org
   issues: commits@iggy.apache.org

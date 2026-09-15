@@ -42,6 +42,7 @@ use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
+use crate::producer::{IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
@@ -60,9 +61,13 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
-/// Keeps the SDK's own message on the `RuntimeError` the Python surface raises.
+/// Converts SDK errors to the RuntimeError exposed by the Python API.
 fn to_runtime_error<E: Display>(error: E) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+}
+
+fn to_value_error<E: Display>(error: E) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyValueError, _>(error.to_string())
 }
 
 /// Resolves the shared `create_topic`/`update_topic` parameters, applying
@@ -94,9 +99,9 @@ fn resolve_topic_params(
 #[pymethods]
 impl IggyClient {
     /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
-    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
-    /// new runtime for asynchronous operations.
-    /// Future versions might utilize asyncio for more Pythonic async.
+    /// `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. Construction is
+    /// synchronous; async methods return asyncio awaitables backed by the shared
+    /// Tokio runtime.
     ///
     /// Args:
     ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
@@ -174,8 +179,8 @@ impl IggyClient {
         // is a no-op for the other transports since the protocol isn't known until the
         // connection string is parsed.
         let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-        let client = RustIggyClient::from_connection_string(&connection_string)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let client =
+            RustIggyClient::from_connection_string(&connection_string).map_err(to_runtime_error)?;
         Ok(Self {
             inner: Arc::new(client),
         })
@@ -186,12 +191,10 @@ impl IggyClient {
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
-            inner
-                .ping()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-        })
+        future_into_py(
+            py,
+            async move { inner.ping().await.map_err(to_runtime_error) },
+        )
     }
 
     /// Get the statistics and details of the server and its running process.
@@ -210,10 +213,7 @@ impl IggyClient {
     fn get_stats<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let stats = inner
-                .get_stats()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let stats = inner.get_stats().await.map_err(to_runtime_error)?;
             Ok(PyStats::from(stats))
         })
     }
@@ -243,7 +243,7 @@ impl IggyClient {
             let specs = inner
                 .describe_options(scope)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(specs
                 .into_iter()
                 .map(PyOptionSpec::from)
@@ -265,7 +265,7 @@ impl IggyClient {
             inner
                 .login_user(&username, &password)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -288,10 +288,7 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            let user = inner
-                .get_user(&user_id)
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let user = inner.get_user(&user_id).await.map_err(to_runtime_error)?;
             Ok(user.map(PyUserInfoDetails::from))
         })
     }
@@ -308,10 +305,7 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            let users = inner
-                .get_users()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let users = inner.get_users().await.map_err(to_runtime_error)?;
             Ok(users.into_iter().map(PyUserInfo::from).collect::<Vec<_>>())
         })
     }
@@ -349,7 +343,7 @@ impl IggyClient {
             let user = inner
                 .create_user(&username, &password, status, permissions)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(PyUserInfoDetails::from(user))
         })
     }
@@ -360,6 +354,9 @@ impl IggyClient {
     ///     user_id: User identifier as `str | int`.
     ///     username: New username as `str | None`; unchanged when `None`.
     ///     status: New status as `UserStatus | None`; unchanged when `None`.
+    ///     options: Reserved for future use. Additional option keys as
+    ///         `dict[str, str] | None`, forwarded to the server. No user update
+    ///         option key exists yet, so a current server rejects every key.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the user is updated.
@@ -367,7 +364,7 @@ impl IggyClient {
     /// Raises:
     ///     ValueError: If a string identifier is invalid.
     ///     RuntimeError: If the request fails.
-    #[pyo3(signature = (user_id, username=None, status=None))]
+    #[pyo3(signature = (user_id, username=None, status=None, options=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn update_user<'a>(
         &self,
@@ -375,22 +372,21 @@ impl IggyClient {
         user_id: PyIdentifier,
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] username: Option<String>,
         #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+        #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
+        options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let user_id = Identifier::try_from(user_id)?;
         let status = status.map(UserStatus::from);
+        let update_options = UserUpdateOptions {
+            raw: options.unwrap_or_default(),
+        };
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             inner
-                .update_user(
-                    &user_id,
-                    username.as_deref(),
-                    status,
-                    // Users have no option keys yet.
-                    &UserUpdateOptions::default(),
-                )
+                .update_user(&user_id, username.as_deref(), status, &update_options)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -415,7 +411,7 @@ impl IggyClient {
             inner
                 .delete_user(&user_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -453,7 +449,7 @@ impl IggyClient {
             inner
                 .update_permissions(&user_id, permissions)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -486,7 +482,7 @@ impl IggyClient {
             inner
                 .change_password(&user_id, &current_password, &new_password)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -503,10 +499,7 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
-                .logout_user()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            inner.logout_user().await.map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -519,10 +512,7 @@ impl IggyClient {
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
-                .connect()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            inner.connect().await.map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -534,10 +524,7 @@ impl IggyClient {
     fn create_stream<'a>(&self, py: Python<'a>, name: String) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
-                .create_stream(&name)
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            inner.create_stream(&name).await.map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -558,7 +545,7 @@ impl IggyClient {
             let stream = inner
                 .get_stream(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(stream.map(StreamDetails::from))
         })
     }
@@ -575,10 +562,7 @@ impl IggyClient {
     fn get_streams<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let streams = inner
-                .get_streams()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let streams = inner.get_streams().await.map_err(to_runtime_error)?;
             Ok(streams.into_iter().map(Stream::from).collect::<Vec<_>>())
         })
     }
@@ -608,7 +592,7 @@ impl IggyClient {
     ///         `manage_streams` or per-stream `manage_stream` permission, the
     ///         stream does not exist, the new name is invalid or already used, or
     ///         the request fails.
-    #[pyo3(signature = (stream_id, name, options = None))]
+    #[pyo3(signature = (stream_id, name, options=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn update_stream<'a>(
         &self,
@@ -627,7 +611,7 @@ impl IggyClient {
             inner
                 .update_stream(&stream_id, &name, &update_options)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -660,7 +644,7 @@ impl IggyClient {
             inner
                 .delete_stream(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -694,7 +678,7 @@ impl IggyClient {
             inner
                 .purge_stream(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -704,12 +688,13 @@ impl IggyClient {
     /// Args:
     ///     stream: Stream identifier as `str | int`.
     ///     name: Topic name as `str`.
-    ///     partitions_count: Number of partitions as `int`.
+    ///     partitions_count: Number of partitions as `int`, at most 1000.
     ///     compression_algorithm: Compression algorithm as `str | None`.
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///     segment_size: Per-topic segment size in bytes as `int | None`.
-    ///     enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+    ///     durability: Message completion policy, defaulting to replicated.
+    ///     consumer_offset_durability: Independent offset policy, defaulting to replicated.
     ///     messages_required_to_save: Message-count flush threshold as `int | None`.
     ///     size_of_messages_required_to_save: Byte flush threshold as `int | None`.
     ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
@@ -726,7 +711,7 @@ impl IggyClient {
     ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
     ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, enforce_fsync = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
+        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -746,7 +731,11 @@ impl IggyClient {
             &MaxTopicSize,
         >,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] segment_size: Option<u64>,
-        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enforce_fsync: Option<bool>,
+        #[gen_stub(override_type(type_repr = "Durability | None"))] durability: Option<
+            &Bound<'_, PyAny>,
+        >,
+        #[gen_stub(override_type(type_repr = "Durability | None"))]
+        consumer_offset_durability: Option<&Bound<'_, PyAny>>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         messages_required_to_save: Option<u32>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))]
@@ -769,7 +758,11 @@ impl IggyClient {
             message_expiry: (expiry != RustIggyExpiry::ServerDefault).then_some(expiry),
             max_topic_size: (max_size != RustMaxTopicSize::ServerDefault).then_some(max_size),
             segment_size: segment_size.map(IggyByteSize::from),
-            enforce_fsync,
+            durability: crate::durability::Durability::try_from(durability)?.0,
+            consumer_offset_durability: crate::durability::Durability::try_from(
+                consumer_offset_durability,
+            )?
+            .0,
             messages_required_to_save,
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
@@ -784,7 +777,7 @@ impl IggyClient {
             inner
                 .create_topic(&stream, &name, &topic_options)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -807,7 +800,7 @@ impl IggyClient {
             let topic = inner
                 .get_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(topic.map(TopicDetails::from))
         })
     }
@@ -835,7 +828,7 @@ impl IggyClient {
             let topics = inner
                 .get_topics(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(topics.into_iter().map(Topic::from).collect::<Vec<_>>())
         })
     }
@@ -889,10 +882,7 @@ impl IggyClient {
         // Absent stays absent: a key the caller did not pass is left alone
         // server-side rather than reset to a default.
         let compression_algorithm = compression_algorithm
-            .map(|algo| {
-                CompressionAlgorithm::from_str(&algo)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-            })
+            .map(|algo| CompressionAlgorithm::from_str(&algo).map_err(to_runtime_error))
             .transpose()?;
         let update_options = TopicUpdateOptions {
             compression_algorithm,
@@ -909,7 +899,7 @@ impl IggyClient {
             inner
                 .update_topic(&stream_id, &topic_id, &name, &update_options)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -940,7 +930,7 @@ impl IggyClient {
             inner
                 .delete_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -971,7 +961,93 @@ impl IggyClient {
             inner
                 .purge_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
+    /// Create partitions for a topic. New partition IDs continue from one past the
+    /// current highest ID; IDs removed by deletion can be reused. Existing consumer
+    /// groups are immediately rebalanced across all partitions, advancing their
+    /// generation and dropping pending revocations.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     partitions_count: Number of partitions to create as `int`, between 1 and
+    ///         1000 inclusive.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the partitions are committed;
+    ///     storage materialization completes asynchronously.
+    ///
+    /// Raises:
+    ///     ValueError: If an identifier is invalid.
+    ///     OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
+    ///     RuntimeError: If the client is not authenticated, lacks global
+    ///         `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+    ///         `manage_topics`, or per-topic `manage_topic` permission, or the
+    ///         request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn create_partitions<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        partitions_count: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .create_partitions(&stream_id, &topic_id, partitions_count)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
+    /// Delete the last partitions from a topic, including all messages stored in them.
+    /// Existing consumer groups are immediately rebalanced across the remaining
+    /// partitions, advancing their generation and dropping pending revocations.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     partitions_count: Number of partitions to delete as `int` from the end of
+    ///         the topic; must be between 1 and 1000 inclusive and no greater than
+    ///         its current count.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when deletion is accepted; storage
+    ///     teardown completes asynchronously.
+    ///
+    /// Raises:
+    ///     ValueError: If an identifier is invalid.
+    ///     OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
+    ///     RuntimeError: If the client is not authenticated, lacks global
+    ///         `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+    ///         `manage_topics`, or per-topic `manage_topic` permission, or the
+    ///         request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_partitions<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        partitions_count: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_partitions(&stream_id, &topic_id, partitions_count)
+                .await
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -1005,7 +1081,7 @@ impl IggyClient {
             inner
                 .create_consumer_group(&stream_id, &topic_id, &name)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -1041,7 +1117,7 @@ impl IggyClient {
             let group = inner
                 .get_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(group.map(PyConsumerGroupDetails::from))
         })
     }
@@ -1073,7 +1149,7 @@ impl IggyClient {
             let groups = inner
                 .get_consumer_groups(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(groups
                 .into_iter()
                 .map(PyConsumerGroup::from)
@@ -1111,7 +1187,7 @@ impl IggyClient {
             inner
                 .delete_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -1149,7 +1225,7 @@ impl IggyClient {
             inner
                 .join_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -1189,7 +1265,7 @@ impl IggyClient {
             inner
                 .leave_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
@@ -1208,7 +1284,7 @@ impl IggyClient {
     /// Returns:
     ///     An awaitable that resolves to `SendMessagesResponse`. Its confirmations
     ///     report the committed partition and batch base offset. The list is empty
-    ///     when the server reports no offsets, including on the legacy server.
+    ///     when the server reports no offsets.
     ///
     /// Raises:
     ///     ValueError: If a string stream or topic identifier is invalid.
@@ -1247,8 +1323,113 @@ impl IggyClient {
             let response = inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(PySendMessagesResponse::from(response))
+        })
+    }
+
+    /// Creates and initializes a high-level producer bound to a stream and topic.
+    ///
+    /// This is a Python port of the Rust high-level producer API. For detailed
+    /// producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+    /// `None` selects direct mode. `BackgroundProducerConfig` starts background
+    /// workers and makes successful sends mean queue acceptance rather than a
+    /// server commit. The returned producer is ready to send.
+    ///
+    /// Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
+    /// when stream/topic initialization fails.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        stream,
+        topic,
+        partitioning=None,
+        mode=None,
+        create_stream_if_not_exists=true,
+        create_topic_if_not_exists=true,
+        topic_partitions_count=1,
+        topic_message_expiry=None,
+        topic_max_size=None,
+        send_retries=Some(3),
+        send_retry_interval=RetryInterval::default(),
+    ))]
+    #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
+    fn producer<'a>(
+        &self,
+        py: Python<'a>,
+        stream: &str,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "Partitioning | None"))] partitioning: Option<
+            &crate::partitioning::Partitioning,
+        >,
+        #[gen_stub(override_type(
+            type_repr = "DirectProducerConfig | BackgroundProducerConfig | None"
+        ))]
+        mode: Option<ProducerMode>,
+        create_stream_if_not_exists: bool,
+        create_topic_if_not_exists: bool,
+        topic_partitions_count: i64,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] topic_message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] topic_max_size: Option<
+            &MaxTopicSize,
+        >,
+        send_retries: Option<i64>,
+        send_retry_interval: RetryInterval,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let mode = mode.unwrap_or_default();
+
+        let topic_partitions_count =
+            producer_u32_param(topic_partitions_count, "topic_partitions_count")?;
+        let topic_message_expiry = topic_message_expiry
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .unwrap_or(RustIggyExpiry::ServerDefault);
+        let topic_max_size = topic_max_size
+            .map(RustMaxTopicSize::try_from)
+            .transpose()?
+            .unwrap_or(RustMaxTopicSize::ServerDefault);
+        let send_retries = send_retries
+            .map(|retries| producer_u32_param(retries, "send_retries"))
+            .transpose()?
+            .filter(|retries| *retries != 0);
+        let send_retry_interval = send_retry_interval.resolve()?;
+
+        let mut builder = self
+            .inner
+            .producer(stream, topic)
+            .map_err(to_value_error)?
+            .send_retries(send_retries, send_retry_interval);
+
+        builder = match mode {
+            ProducerMode::Direct(config) => builder.direct((&config).into()),
+            ProducerMode::Background(config) => builder.background((&config).try_into()?),
+        };
+
+        if let Some(partitioning) = partitioning {
+            builder = builder.partitioning(partitioning.inner.as_ref().clone());
+        }
+        if create_stream_if_not_exists {
+            builder = builder.create_stream_if_not_exists();
+        } else {
+            builder = builder.do_not_create_stream_if_not_exists();
+        }
+        if create_topic_if_not_exists {
+            builder = builder.create_topic_if_not_exists(
+                topic_partitions_count,
+                topic_message_expiry,
+                topic_max_size,
+            );
+        } else {
+            builder = builder.do_not_create_topic_if_not_exists();
+        }
+
+        future_into_py(py, async move {
+            // A background build starts Tokio worker tasks, so it must happen
+            // while this future is executing on the Rust runtime.
+            let producer = builder.build();
+            producer.init().await.map_err(to_runtime_error)?;
+            Ok(IggyProducer::new(producer))
         })
     }
 
@@ -1289,7 +1470,7 @@ impl IggyClient {
                     auto_commit,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             let partition_id = polled_messages.partition_id;
             let messages = polled_messages
                 .messages
@@ -1365,7 +1546,7 @@ impl IggyClient {
         let mut builder = self
             .inner
             .consumer_group(name, stream, topic)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(to_runtime_error)?
             .without_encryptor()
             .partition(partition_id);
 
@@ -1425,10 +1606,7 @@ impl IggyClient {
         let mut consumer = builder.build();
 
         future_into_py(py, async move {
-            consumer
-                .init()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            consumer.init().await.map_err(to_runtime_error)?;
             let state = consumer.state();
             let name = consumer.name().to_string();
             let stream = PyIdentifier::try_from(consumer.stream())?;
@@ -1469,7 +1647,7 @@ impl IggyClient {
             let response = inner
                 .send_binary_request(code, Bytes::from(payload))
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
         })
     }

@@ -21,6 +21,10 @@ use std::rc::Rc;
 
 pub use server_common::Storage;
 
+pub mod partition_journal;
+pub use partition_journal::{DurableAppend, PartitionPrepareJournal};
+
+pub mod durable_storage;
 pub mod file_storage;
 pub mod local_gate;
 pub mod prepare_journal;

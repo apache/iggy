@@ -734,7 +734,6 @@ async fn reconcile_additions(
         // hold once the whole cluster restarted.
         let partition_dir =
             ctx.config
-                .system
                 .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
         let prior_life_on_disk = std::fs::metadata(&partition_dir).is_ok();
 
@@ -1472,7 +1471,7 @@ mod tests {
         current_revision, delete_partitions_from_disk, fetch_partition_build_inputs,
         reconcile_consumer_group_offsets, reconcile_once,
     };
-    use configs::server::{ServerConfig, ServerSystemConfig};
+    use configs::server::ServerConfig;
     use consensus::{MetadataHandle, PartitionsHandle};
     use iggy_binary_protocol::codec::WireEncode;
     use iggy_binary_protocol::primitives::identifier::WireName;
@@ -1787,17 +1786,10 @@ mod tests {
     }
 
     fn test_config(tmp: &TempDir) -> ServerConfig {
-        let mut cfg = ServerConfig::default();
-        // `ServerSystemConfig` is not `Clone`, so `Arc::make_mut` is out; build a
-        // fresh value via struct-update syntax and swap the Arc wholesale.
-        // Only `path` differs from the default; every other field uses the
-        // runtime's defaults.
-        let system = ServerSystemConfig {
+        ServerConfig {
             path: tmp.path().to_string_lossy().into_owned(),
-            ..ServerSystemConfig::default()
-        };
-        cfg.system = Arc::new(system);
-        cfg
+            ..ServerConfig::default()
+        }
     }
 
     /// Assemble a fully functional `ServerShard` for reconciler tests.
@@ -1816,8 +1808,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
@@ -2486,7 +2477,7 @@ mod tests {
 
         reconcile_pass(&ctx).await;
         // Verify disk hierarchy exists before the delete commits.
-        let partition_root_before = ctx.config.system.get_partition_path(0, 0, 0);
+        let partition_root_before = ctx.config.get_partition_path(0, 0, 0);
         assert!(
             std::path::Path::new(&partition_root_before).exists(),
             "partition directory must exist post-materialisation"
@@ -2511,11 +2502,9 @@ mod tests {
                 None,
                 "shards_table row must be pruned for {ns:?}"
             );
-            let path = ctx.config.system.get_partition_path(
-                ns.stream_id(),
-                ns.topic_id(),
-                ns.partition_id(),
-            );
+            let path =
+                ctx.config
+                    .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
             assert!(
                 !std::path::Path::new(&path).exists(),
                 "on-disk hierarchy for {ns:?} must be removed"
@@ -3184,7 +3173,7 @@ mod tests {
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         assert!(partitions.contains(&ns));
-        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        let partition_root = ctx.config.get_partition_path(0, 0, 0);
         assert!(std::path::Path::new(&partition_root).exists());
 
         // Reconstruct the post-failed-teardown state: tombstone set +
@@ -3263,7 +3252,7 @@ mod tests {
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         assert!(partitions.contains(&ns));
-        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        let partition_root = ctx.config.get_partition_path(0, 0, 0);
 
         // Post-successful-teardown, pre-drain state: tombstone set +
         // shards_table row gone, NO delete failure (the disk delete
@@ -3328,7 +3317,7 @@ mod tests {
             None,
             "tombstoned namespace must stay unrouted"
         );
-        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        let partition_root = ctx.config.get_partition_path(0, 0, 0);
         assert!(
             !std::path::Path::new(&partition_root).exists(),
             "no fresh build may touch the refused files' directory"
@@ -3358,7 +3347,7 @@ mod tests {
         let partitions = shard.plane.partitions();
         // Boot-fence shape with the refused files still at their real paths.
         partitions.tombstone(ns);
-        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        let partition_root = ctx.config.get_partition_path(0, 0, 0);
         std::fs::create_dir_all(&partition_root).expect("plant partition dir");
         let refused_log = format!("{partition_root}/00000000000000000000.log");
         std::fs::write(&refused_log, b"refused bytes").expect("plant refused log");
@@ -3411,7 +3400,7 @@ mod tests {
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         partitions.tombstone(ns);
-        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        let partition_root = ctx.config.get_partition_path(0, 0, 0);
         std::fs::create_dir_all(&partition_root).expect("plant partition dir");
         let refused_log = format!("{partition_root}/00000000000000000000.log");
         std::fs::write(&refused_log, b"refused bytes").expect("plant refused log");

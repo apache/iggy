@@ -93,7 +93,7 @@ pub fn factory_from_config(
         }
         StateStorageKind::Http => {
             let factory = HttpStateFactory::new(&config.http)?;
-            info!("State will be stored via HTTP at: {}", config.http.url);
+            info!("State will be stored via HTTP: {}", config.http);
             Ok(Arc::new(factory))
         }
     }

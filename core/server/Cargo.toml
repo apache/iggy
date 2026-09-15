@@ -17,7 +17,7 @@
 
 [package]
 name = "server"
-version = "0.9.0-edge.7"
+version = "0.9.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -80,6 +80,7 @@ name = "iggy-server"
 path = "src/main.rs"
 
 [features]
+poll-diagnostics = ["shard/poll-diagnostics"]
 default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]

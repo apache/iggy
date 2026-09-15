@@ -39,7 +39,7 @@ pub mod reads;
 pub mod session_ops;
 pub mod submit;
 #[cfg(test)]
-mod test_support;
+pub mod test_support;
 
 use crate::consumer_group::maybe_rewrite_consumer_group_request;
 use crate::dispatch::failure::{
@@ -58,7 +58,7 @@ use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::wire::verify_request_checksum;
 use ahash::{AHashMap, AHashSet};
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
@@ -140,7 +140,7 @@ pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: Arc<ServerSystemConfig>,
+    server_config: Arc<ServerConfig>,
     max_tokens_per_user: u32,
 ) -> RequestHandler
 where
@@ -194,7 +194,7 @@ where
             &bus_for_spawn,
             &shard_handle,
             &sessions,
-            &system_config,
+            &server_config,
             max_tokens_per_user,
             &queues,
             &active,
@@ -225,9 +225,8 @@ where
 //     manager, so BOTH planes ran as the original registrant;
 //   - the pair carries far less entropy than "client-generated random
 //     u128" implies: HTTP mints `client_id` from the shard-0 sequential
-//     counter (`mint_shard_zero_client_id`, seeded at 1 per process) and no
-//     live path ever bumps an epoch past 1, so the token was `client=N,
-//     session=1` for small N;
+//     counter (`mint_shard_zero_client_id`) and the epoch is a metadata commit
+//     position, so neither value is an authentication secret;
 //   - `ClientEntry` carries no transport or plane tag, so a raw TCP peer
 //     could bind an HTTP-originated session;
 //   - `bind_session` demotes the evicted holder to `Connected`, the one
@@ -247,7 +246,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: &Arc<ServerSystemConfig>,
+    server_config: &Arc<ServerConfig>,
     max_tokens_per_user: u32,
     queues: &ClientRequestQueues,
     active: &ActiveClientRequests,
@@ -278,7 +277,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
 
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
-    let system_config = Arc::clone(system_config);
+    let server_config = Arc::clone(server_config);
     let queues = Rc::clone(queues);
     let active = Rc::clone(active);
     bus.spawn(async move {
@@ -292,7 +291,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
         drain_client_requests(
             shard,
             sessions,
-            system_config,
+            server_config,
             max_tokens_per_user,
             queues,
             client_id,
@@ -380,7 +379,7 @@ impl Drop for ActiveDrainSlot {
 async fn drain_client_requests<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
-    system_config: Arc<ServerSystemConfig>,
+    server_config: Arc<ServerConfig>,
     max_tokens_per_user: u32,
     queues: ClientRequestQueues,
     client_id: u128,
@@ -398,7 +397,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
         handle_client_request(
             &shard,
             &sessions,
-            &system_config,
+            &server_config,
             max_tokens_per_user,
             client_id,
             message,
@@ -519,7 +518,7 @@ fn non_replicated_code(header: &RoutedRequestHeader) -> u32 {
 async fn handle_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: &Arc<ServerSystemConfig>,
+    server_config: &Arc<ServerConfig>,
     max_tokens_per_user: u32,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
@@ -653,10 +652,15 @@ async fn handle_client_request<B, MJ, S, SB>(
             handle_non_replicated_request(
                 shard,
                 sessions,
-                system_config,
+                server_config,
                 transport_client_id,
                 request,
-                (user_id, client_address, metadata_watermark),
+                ConnectionContext {
+                    bound,
+                    user_id,
+                    address: client_address,
+                    metadata_watermark,
+                },
             )
             .await;
         }
@@ -709,6 +713,29 @@ async fn handle_client_request<B, MJ, S, SB>(
             // `bound` is Some here: `classify` sends unbound transports to
             // `UnboundReplicated`.
             let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
+            let consumer_session = if matches!(
+                request.header().operation,
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+            ) {
+                let attachment = sessions
+                    .borrow()
+                    .attached_consumer_session(transport_client_id);
+                match attachment {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        send_deny_reply(
+                            shard,
+                            transport_client_id,
+                            request.header(),
+                            error.as_code(),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
             // `None` rather than trust that.
@@ -719,6 +746,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 bound_session,
                 transport_client_id,
                 user_id,
+                consumer_session,
             )
             .await;
         }
@@ -759,12 +787,8 @@ async fn handle_client_request<B, MJ, S, SB>(
             let request = match maybe_rewrite_consumer_group_request(shard, request).await {
                 Ok(rewritten) => rewritten,
                 Err(error) => {
-                    // Both of the rewrite's own failures are `InvalidCommand`
-                    // decode errors, so a replay cannot help: deny typed
-                    // instead of leaving the lockstep connection to its read
-                    // timeout. (Its third error path needs a body past
-                    // `u32::MAX` against a 64 MiB message cap, so no client
-                    // frame reaches it; the deny is correct there too.)
+                    // Preserve transient recovery rejection so the client can
+                    // retry the join once partition state is available.
                     send_pre_consensus_deny(
                         shard,
                         transport_client_id,
@@ -901,6 +925,9 @@ mod tests {
     /// A test shard wired to its own lanes (the held sender feeds them),
     /// for the reply-lane pump tests below.
     fn reply_lane_test_shard(name: &str) -> (SpyBus, shard::TaggedSender, Rc<TestShard>) {
+        // These tests do not dispatch disk polls, so keep that lane minimal.
+        const POLL_COMPLETION_CAPACITY: usize = 1;
+
         let bus = SpyBus::default();
         let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
@@ -908,8 +935,7 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
+
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -926,12 +952,12 @@ mod tests {
             Rc::new(|_, _| {}),
             Rc::new(|_| {}),
             Rc::new(|_| {}),
-            Rc::new(|_, _, _| {}),
             metadata,
             partitions,
             vec![sender],
             inbox_rx,
             reply_inbox_rx,
+            POLL_COMPLETION_CAPACITY,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
@@ -1080,7 +1106,7 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let system_config = Arc::new(ServerSystemConfig::default());
+        let server_config = Arc::new(ServerConfig::default());
 
         let multi_node = Rc::new(ClusterRoster {
             enabled: true,
@@ -1107,7 +1133,7 @@ mod tests {
             handle_client_request(
                 &shard,
                 &sessions,
-                &system_config,
+                &server_config,
                 1,
                 TRANSPORT,
                 metadata_read(),
@@ -1352,13 +1378,13 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let system_config = Arc::new(ServerSystemConfig::default());
+        let server_config = Arc::new(ServerConfig::default());
 
         for code in [LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE] {
             handle_client_request(
                 &shard,
                 &sessions,
-                &system_config,
+                &server_config,
                 1,
                 TRANSPORT,
                 non_replicated_request(TRANSPORT, code),
@@ -1393,12 +1419,12 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let system_config = Arc::new(ServerSystemConfig::default());
+        let server_config = Arc::new(ServerConfig::default());
 
         handle_client_request(
             &shard,
             &sessions,
-            &system_config,
+            &server_config,
             1,
             TRANSPORT,
             wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
@@ -1428,12 +1454,12 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let system_config = Arc::new(ServerSystemConfig::default());
+        let server_config = Arc::new(ServerConfig::default());
 
         handle_client_request(
             &shard,
             &sessions,
-            &system_config,
+            &server_config,
             1,
             TRANSPORT,
             non_replicated_request(TRANSPORT, PING_CODE),
@@ -1461,7 +1487,7 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let system_config = Arc::new(ServerSystemConfig::default());
+        let server_config = Arc::new(ServerConfig::default());
 
         let mut message = wire_request(Operation::CreateStream, TRANSPORT, 1, 1, BODY);
         {
@@ -1476,7 +1502,7 @@ mod tests {
         handle_client_request(
             &shard,
             &sessions,
-            &system_config,
+            &server_config,
             1,
             TRANSPORT,
             message.into_generic(),
@@ -1519,7 +1545,7 @@ mod tests {
             &bus,
             &unset_shard_handle(),
             &Rc::new(RefCell::new(SessionManager::new())),
-            Arc::new(ServerSystemConfig::default()),
+            Arc::new(ServerConfig::default()),
             1,
         );
         assert_eq!(
@@ -1543,7 +1569,7 @@ mod tests {
             &bus,
             &shard_handle,
             &Rc::new(RefCell::new(SessionManager::new())),
-            Arc::new(ServerSystemConfig::default()),
+            Arc::new(ServerConfig::default()),
             1,
         );
 

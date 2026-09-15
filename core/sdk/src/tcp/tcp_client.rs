@@ -20,6 +20,9 @@ use crate::leader_aware::{
     check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
     read_transport_endpoints,
 };
+use crate::poll_routing::{
+    PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code, matches_session_user,
+};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
 use crate::session::ConsensusSession;
@@ -79,11 +82,6 @@ const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// overall.
 const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Bound on the roster read that follows a sign-in the caller ran itself. The
-/// read is a convenience for a failover that may never happen, so a cluster
-/// that answers it slowly must not hold up the sign-in.
-const ROSTER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Bound on one dial while the client has other endpoints to try. A host
 /// that drops the SYN -- powered off, or partitioned away -- takes the OS
 /// connect timeout to fail, which is minutes, and every other endpoint waits
@@ -95,6 +93,7 @@ const FAILOVER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// It requires a valid server address.
 #[derive(Debug)]
 pub struct TcpClient {
+    poll_router: PollRouter<Self>,
     pub(crate) stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
     pub(crate) config: Arc<TcpClientConfig>,
     pub(crate) state: Mutex<ClientState>,
@@ -120,6 +119,7 @@ pub struct TcpClient {
     /// password they carry is dead once the change commits, so every later
     /// sign-in reads this instead.
     configured_password: Mutex<Option<SecretString>>,
+    configured_username: Mutex<Option<String>>,
     // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
     // is `encode_request_header`, which is pure CPU and never awaits. The
     // tokio variant would pay a waker alloc + internal semaphore on
@@ -191,6 +191,20 @@ impl Client for TcpClient {
 
 #[async_trait]
 impl BinaryTransport for TcpClient {
+    async fn send_offset_write_with_response(
+        &self,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        self.poll_router.write_offset(self, code, payload).await
+    }
+
+    async fn send_poll_with_response(
+        &self,
+        request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+    ) -> Result<Bytes, IggyError> {
+        self.poll_router.poll(self, request).await
+    }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
     }
@@ -206,6 +220,9 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if is_poll_routing_code(code) {
+            return self.send_poll_request(code, payload).await;
+        }
         let result = self.send_raw(code, payload.clone()).await;
         if result.is_ok() {
             return result;
@@ -350,6 +367,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
         // mid-request can leave the old session in place until this sign-in
         // re-mints it.
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
     }
 
@@ -359,6 +377,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
     }
 
@@ -391,12 +410,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
                 else {
                     return None;
                 };
-                let targets_session_user = match user.kind {
-                    IdKind::Numeric => user.get_u32_value().is_ok_and(|id| id == sign_in.user_id),
-                    IdKind::String => user
-                        .get_cow_str_value()
-                        .is_ok_and(|name| name.as_ref() == username),
-                };
+                let targets_session_user = matches_session_user(user, sign_in.user_id, username);
                 if targets_session_user {
                     *password = SecretString::from(new_password.to_owned());
                 }
@@ -409,6 +423,8 @@ impl iggy_common::VsrSessionControl for TcpClient {
         else {
             return;
         };
+        let configured_username = self.configured_username.lock().await;
+        let configured = configured_username.as_ref().unwrap_or(configured);
 
         // The configured credentials cannot be rewritten -- the config is
         // shared and immutable -- and the password they carry will never work
@@ -438,12 +454,70 @@ impl iggy_common::VsrSessionControl for TcpClient {
         }
     }
 
+    async fn refresh_session_username(&self, user: &Identifier, new_username: &str) {
+        let renamed = {
+            let mut remembered = self.session_credentials.lock().await;
+            remembered.as_mut().and_then(|sign_in| {
+                let Credentials::UsernamePassword(username, _) = &mut sign_in.credentials else {
+                    return None;
+                };
+                if !matches_session_user(user, sign_in.user_id, username) {
+                    return None;
+                }
+                Some(std::mem::replace(username, new_username.to_owned()))
+            })
+        };
+        if let AutoLogin::Enabled(Credentials::UsernamePassword(configured, _)) =
+            &self.config.auto_login
+        {
+            let mut override_name = self.configured_username.lock().await;
+            let configured = override_name.as_ref().unwrap_or(configured);
+            if renamed.as_ref() == Some(configured)
+                || user
+                    .get_cow_str_value()
+                    .is_ok_and(|name| name.as_ref() == configured)
+            {
+                *override_name = Some(new_username.to_owned());
+            }
+        }
+    }
+
     fn sdk_version(&self) -> &'static str {
         crate::SDK_VERSION
     }
 }
 
 impl BinaryClient for TcpClient {}
+
+#[async_trait]
+impl PollTransport for TcpClient {
+    const PROTOCOL: TransportProtocol = TransportProtocol::Tcp;
+
+    async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
+        let mut config = (*self.config).clone();
+        config.server_address = endpoint.to_owned();
+        config.auto_login = AutoLogin::Enabled(
+            self.sign_in_credentials()
+                .await
+                .ok_or(IggyError::Unauthenticated)?,
+        );
+        config.reconnection.enabled = false;
+        let client = Self::create(Arc::new(config))?;
+        client.connect_off_leader().await?;
+        Ok(client)
+    }
+
+    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        let now = tokio::time::Instant::now();
+        let (_, result) = self
+            .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT, false)
+            .await;
+        if matches!(result, Err(IggyError::Disconnected | IggyError::TcpError)) {
+            self.set_state(ClientState::Disconnected).await;
+        }
+        result
+    }
+}
 
 impl TcpClient {
     /// Create a new TCP client for the provided server address.
@@ -492,6 +566,7 @@ impl TcpClient {
     pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
         let server_address = config.server_address.clone();
         Ok(Self {
+            poll_router: PollRouter::default(),
             config,
             client_address: Mutex::new(None),
             stream: Arc::new(Mutex::new(None)),
@@ -503,6 +578,7 @@ impl TcpClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             configured_password: Mutex::new(None),
+            configured_username: Mutex::new(None),
             session_credentials: Mutex::new(None),
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
@@ -856,6 +932,9 @@ impl TcpClient {
         // stop being dialed. The configured seeds are kept separately and
         // outlive it.
         if !leader_check.endpoints.is_empty() {
+            self.poll_router
+                .roster_size
+                .store(leader_check.node_count, Ordering::Release);
             *self.roster_endpoints.lock().await = leader_check.endpoints;
         }
 
@@ -942,13 +1021,19 @@ impl TcpClient {
             // configured user is applied on top: the configured password will
             // never work again, and the config cannot be rewritten.
             AutoLogin::Enabled(Credentials::UsernamePassword(username, configured_password)) => {
+                let username = self
+                    .configured_username
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| username.clone());
                 let password = self
                     .configured_password
                     .lock()
                     .await
                     .clone()
                     .unwrap_or_else(|| configured_password.clone());
-                Some(Credentials::UsernamePassword(username.clone(), password))
+                Some(Credentials::UsernamePassword(username, password))
             }
             AutoLogin::Enabled(credentials) => Some(credentials.clone()),
             AutoLogin::Disabled => None,
@@ -982,7 +1067,8 @@ impl TcpClient {
         }
 
         let read = read_transport_endpoints(self, TransportProtocol::Tcp);
-        let Ok(endpoints) = tokio::time::timeout(ROSTER_READ_TIMEOUT, read).await else {
+        let Ok((node_count, endpoints)) = tokio::time::timeout(ROSTER_READ_TIMEOUT, read).await
+        else {
             warn!("Reading the cluster roster took longer than {ROSTER_READ_TIMEOUT:?}");
             return;
         };
@@ -994,6 +1080,9 @@ impl TcpClient {
             "{NAME} client learned {} endpoint(s) to fail over to.",
             endpoints.len()
         );
+        self.poll_router
+            .roster_size
+            .store(node_count, Ordering::Release);
         *self.roster_endpoints.lock().await = endpoints;
     }
 
@@ -1269,6 +1358,7 @@ impl TcpClient {
                     None,
                     transient_deadline,
                     overall_deadline,
+                    true,
                 )
                 .await;
             match result {
@@ -1410,16 +1500,18 @@ impl TcpClient {
         preencoded: Option<iggy_binary_protocol::consensus::RequestHeader>,
         transient_deadline: tokio::time::Instant,
         read_deadline: tokio::time::Instant,
+        retry_transient: bool,
     ) -> (
         Option<iggy_binary_protocol::consensus::RequestHeader>,
         Result<Bytes, IggyError>,
     ) {
         let stream = self.stream.clone();
         let consensus_session = self.consensus_session.clone();
+        let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
         let joined = tokio::spawn(async move {
-            let mut stream = stream.lock().await;
-            let Some(stream) = stream.as_mut() else {
+            let mut stream_guard = stream.lock().await;
+            let Some(stream) = stream_guard.as_mut() else {
                 error!("Cannot send data. Client is not connected.");
                 return (None, Err(IggyError::NotConnected));
             };
@@ -1453,8 +1545,10 @@ impl TcpClient {
                 }
             };
             let header_bytes = bytemuck::bytes_of(&request_header);
+            let mut frame_complete = false;
             let outcome = async {
                 loop {
+                    frame_complete = false;
                     stream.write(header_bytes).await?;
                     if !payload.is_empty() {
                         stream.write(&payload).await?;
@@ -1519,7 +1613,10 @@ impl TcpClient {
                         Bytes::new()
                     };
 
+                    frame_complete = true;
+                    crate::vsr::observe_metadata_reply(&metadata_watermark, &response_header);
                     match crate::vsr::decode_response_split(&response_header, body) {
+                        Err(error) if !retry_transient => return Err(error),
                         // `TransientNotCommitted`: the op's outcome is unknown
                         // (e.g. a view change canceled it in flight) -- ONLY a
                         // same-session replay of the same request id is safe
@@ -1529,7 +1626,8 @@ impl TcpClient {
                         // which re-issues under a fresh session and could
                         // double-apply a committed write.
                         Err(IggyError::TransientNotCommitted)
-                            if tokio::time::Instant::now() < read_deadline =>
+                            if code != iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE
+                                && tokio::time::Instant::now() < read_deadline =>
                         {
                             let remaining = read_deadline
                                 .saturating_duration_since(tokio::time::Instant::now());
@@ -1551,6 +1649,9 @@ impl TcpClient {
                 }
             }
             .await;
+            if !frame_complete {
+                stream_guard.take();
+            }
             (Some(request_header), outcome)
         })
         .await;
@@ -1594,10 +1695,140 @@ fn tls_server_name(server_address: &str) -> String {
 mod tests {
     use super::*;
     use iggy_binary_protocol::codes::{GET_ME_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::{Command, HEADER_SIZE, Operation, ReplyHeader};
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
+
+    #[tokio::test]
+    async fn a_canceled_exchange_discards_its_incomplete_reply_before_the_next_request() {
+        const READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+        let (listener, address) = live_endpoint().await;
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let deadline = tokio::time::Instant::now() + READ_BUDGET;
+        let mut exchange = Box::pin(client.send_raw_vsr_attempt(
+            GET_ME_CODE,
+            Bytes::new(),
+            None,
+            tokio::time::Instant::now(),
+            deadline,
+            false,
+        ));
+        let mut request = [0; HEADER_SIZE];
+        tokio::select! {
+            result = &mut exchange => panic!("exchange ended before its reply: {result:?}"),
+            result = peer.read_exact(&mut request) => { result.unwrap(); }
+        }
+        let reply = ReplyHeader {
+            command: Command::Reply,
+            operation: Operation::NonReplicated,
+            size: u32::try_from(HEADER_SIZE).unwrap(),
+            ..Default::default()
+        };
+        peer.write_all(&bytemuck::bytes_of(&reply)[..HEADER_SIZE / 2])
+            .await
+            .unwrap();
+        // Dropping the caller leaves the transport task holding the stream lock.
+        drop(exchange);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.send_poll_request(GET_ME_CODE, Bytes::new()),
+        )
+        .await
+        .expect("the detached exchange must release its stream lock");
+        assert!(matches!(result, Err(IggyError::NotConnected)));
+        assert!(client.stream.lock().await.is_none());
+        let mut next_request = [0; 1];
+        assert_eq!(peer.read(&mut next_request).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn renaming_the_session_user_preserves_auxiliary_and_configured_credentials() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "old-name".to_owned(),
+                "password".into(),
+            )),
+            ..Default::default()
+        }))
+        .unwrap();
+        client
+            .remember_session_credentials(
+                Credentials::UsernamePassword("old-name".to_owned(), "password".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+        client
+            .refresh_session_username(&Identifier::numeric(SESSION_USER_ID).unwrap(), "new-name")
+            .await;
+        for forget in [false, true] {
+            if forget {
+                client.forget_session_credentials().await;
+            }
+            let Some(Credentials::UsernamePassword(username, _)) =
+                client.sign_in_credentials().await
+            else {
+                panic!("rename must preserve login credentials");
+            };
+            assert_eq!(username, "new-name");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routed_consumer_operation_with_an_unknown_outcome_is_not_replayed() {
+        for code in [
+            iggy_binary_protocol::codes::POLL_MESSAGES_ON_PRIMARY_CODE,
+            iggy_binary_protocol::codes::STORE_CONSUMER_OFFSET_CODE,
+            iggy_binary_protocol::codes::DELETE_CONSUMER_OFFSET_CODE,
+        ] {
+            let (listener, address) = live_endpoint().await;
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let response = ReplyHeader {
+                    command: Command::Reply,
+                    operation: Operation::NonReplicated,
+                    size: u32::try_from(HEADER_SIZE).unwrap(),
+                    status: IggyError::TransientNotCommitted.as_code(),
+                    ..Default::default()
+                };
+                let mut requests = 0;
+                let mut header = [0; HEADER_SIZE];
+                while stream.read_exact(&mut header).await.is_ok() {
+                    requests += 1;
+                    if stream
+                        .write_all(bytemuck::bytes_of(&response))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                requests
+            });
+            let client = client_with(&address);
+            Client::connect(&client).await.unwrap();
+            client.bind_vsr_session(1).await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.send_poll_request(code, Bytes::new()),
+            )
+            .await
+            .expect("an unknown outcome must return without entering a retry window");
+            assert!(
+                matches!(result, Err(IggyError::TransientNotCommitted)),
+                "code {code}: {result:?}"
+            );
+            Client::shutdown(&client).await.unwrap();
+            assert_eq!(
+                peer.await.unwrap(),
+                1,
+                "an unknown outcome must not become a later non-admission"
+            );
+        }
+    }
 
     #[test]
     fn tls_server_names_support_dns_ipv4_and_ipv6_endpoints() {

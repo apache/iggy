@@ -32,6 +32,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
+const PLUGIN_CONFIG_FORMAT_ENV_SUFFIX: &str = "FORMAT";
+
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct ConnectorId {
     key: String,
@@ -355,6 +357,10 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
             }
 
             let field_path = &env_key_upper[prefix.len()..];
+            // ConfigEnv handles plugin_config_format on the connector itself.
+            if field_path == PLUGIN_CONFIG_FORMAT_ENV_SUFFIX {
+                continue;
+            }
             let field_name = field_path.to_lowercase();
             let parsed_value = ::configs::parse_env_value_to_json(&env_value);
 
@@ -855,8 +861,12 @@ impl Provider for ConnectorEnvProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::process::Command;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::configs::connectors::ConfigFormat;
 
     #[tokio::test]
     async fn given_valid_key_when_creating_source_config_should_write_prefixed_file() {
@@ -879,5 +889,129 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, vec!["source_random_0.toml"]);
+    }
+
+    #[test]
+    fn given_runtime_format_env_when_loading_configs_should_preserve_plugin_overrides() {
+        const CHILD_PROCESS_ENV: &str = "IGGY_CONNECTORS_FORMAT_OVERRIDE_TEST";
+        const CONNECTOR_KEY: &str = "format_override_test";
+        const FORMAT_ONLY_KEY: &str = "format_only_test";
+
+        if std::env::var_os(CHILD_PROCESS_ENV).is_none() {
+            // Environment overrides stay in a child process to avoid racing other tests.
+            let mut command = Command::new(
+                std::env::current_exe().expect("Test binary path should be available"),
+            );
+            command
+                .arg("--exact")
+                .arg(
+                    std::thread::current()
+                        .name()
+                        .expect("Test thread should have a name"),
+                )
+                .env_clear()
+                .env(CHILD_PROCESS_ENV, "1");
+            for connector_type in ["SINK", "SOURCE"] {
+                let prefix = format!(
+                    "IGGY_CONNECTORS_{connector_type}_{}_PLUGIN_CONFIG_",
+                    CONNECTOR_KEY.to_uppercase()
+                );
+                command
+                    .env(format!("{prefix}FORMAT"), "yaml")
+                    .env(format!("{prefix}URL"), "http://overridden.test")
+                    .env(format!("{prefix}FORMAT_OPTIONS"), r#"["compact","json"]"#)
+                    .env(
+                        format!(
+                            "IGGY_CONNECTORS_{connector_type}_{}_PLUGIN_CONFIG_FORMAT",
+                            FORMAT_ONLY_KEY.to_uppercase()
+                        ),
+                        "yaml",
+                    );
+            }
+            let output = command.output().expect("Config override test should run");
+            assert!(
+                output.status.success(),
+                "Config override test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = TempDir::new().expect("Config directory should be created");
+        for connector_type in ["sink", "source"] {
+            for key in [CONNECTOR_KEY, FORMAT_ONLY_KEY] {
+                let mut config = format!(
+                    r#"
+type = "{connector_type}"
+key = "{key}"
+enabled = true
+version = 0
+name = "format override test"
+path = "unused"
+streams = []
+plugin_config_format = "json"
+"#
+                );
+                if key == CONNECTOR_KEY {
+                    config.push_str(
+                        r#"
+[plugin_config]
+url = "http://original.test"
+format_options = ["original"]
+[plugin_config.headers]
+content_type = "application/json"
+"#,
+                    );
+                }
+                std::fs::write(
+                    dir.path().join(format!("{connector_type}_{key}.toml")),
+                    config,
+                )
+                .expect("Connector config should be written");
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("Test runtime should be created");
+        runtime.block_on(async {
+            let provider = LocalConnectorsConfigProvider::new(
+                dir.path()
+                    .to_str()
+                    .expect("Config directory should be UTF-8"),
+            )
+            .init()
+            .await
+            .expect("Connector configs should load");
+
+            for key in [CONNECTOR_KEY, FORMAT_ONLY_KEY] {
+                let sink = provider
+                    .get_sink_config(key, None)
+                    .await
+                    .expect("Sink config should be available")
+                    .expect("Sink config should exist");
+                let source = provider
+                    .get_source_config(key, None)
+                    .await
+                    .expect("Source config should be available")
+                    .expect("Source config should exist");
+                let expected_plugin_config = (key == CONNECTOR_KEY).then(|| {
+                    serde_json::json!({
+                        "url": "http://overridden.test",
+                        "headers": {"content_type": "application/json"},
+                        "format_options": ["compact", "json"]
+                    })
+                });
+                for (connector_type, format, plugin_config) in [
+                    ("sink", sink.plugin_config_format, sink.plugin_config),
+                    ("source", source.plugin_config_format, source.plugin_config),
+                ] {
+                    assert_eq!(format, Some(ConfigFormat::Yaml), "{connector_type} {key}");
+                    assert_eq!(
+                        plugin_config, expected_plugin_config,
+                        "{connector_type} {key}"
+                    );
+                }
+            }
+        });
     }
 }

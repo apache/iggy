@@ -26,16 +26,20 @@ import enum
 import typing
 
 __all__ = [
+    "Durability",
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
     "AutoLogin",
+    "BackgroundProducerConfig",
+    "BackpressureMode",
     "CacheMetrics",
     "CacheMetricsKey",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "DirectProducerConfig",
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
@@ -43,12 +47,15 @@ __all__ = [
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
+    "IggyProducer",
     "MaxTopicSize",
     "OptionSpec",
     "Partition",
     "Partitioning",
     "Permissions",
     "PollingStrategy",
+    "ProducerSendError",
+    "ProducerSharding",
     "QuicConfig",
     "QuicReconnectionConfig",
     "ReceiveMessage",
@@ -302,6 +309,107 @@ class AutoLogin:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class BackgroundProducerConfig:
+    r"""
+    Immutable configuration for a producer that queues sends on background workers.
+
+    For detailed background-producer semantics, see
+    https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+    """
+    @property
+    def num_shards(self) -> builtins.int:
+        r"""
+        Number of background worker shards, each with its own queue.
+        A value of zero is treated as one shard.
+        """
+    @property
+    def linger_time(self) -> datetime.timedelta:
+        r"""
+        Maximum time a worker holds a non-empty buffer before flushing it.
+        A zero duration flushes as soon as the worker receives a send.
+        """
+    @property
+    def batch_size(self) -> builtins.int:
+        r"""
+        Per-worker flush threshold in buffered bytes.
+        A value of zero disables this threshold.
+        """
+    @property
+    def batch_length(self) -> builtins.int:
+        r"""
+        Per-worker flush threshold in queued sends, not individual messages.
+        A value of zero disables this threshold.
+        """
+    @property
+    def max_buffer_size(self) -> builtins.int:
+        r"""
+        Maximum bytes buffered or in flight across all worker shards.
+        A value of zero makes the byte budget unlimited.
+        """
+    @property
+    def failure_mode(self) -> BackpressureMode:
+        r"""
+        Behavior when `max_buffer_size` is exhausted.
+        """
+    @property
+    def max_in_flight(self) -> builtins.int:
+        r"""
+        Maximum number of requests written concurrently across all workers.
+        A value of zero uses the runtime's maximum semaphore permit count.
+        """
+    @property
+    def sharding(self) -> ProducerSharding:
+        r"""
+        Strategy used to assign each send to a worker shard.
+        Ordered sharding preserves per-destination dispatch order, while balanced
+        sharding distributes sends round-robin and may reorder them.
+        """
+    def __new__(
+        cls,
+        *,
+        num_shards: builtins.int = 1,
+        linger_time: datetime.timedelta = ...,
+        batch_size: builtins.int = 1048576,
+        batch_length: builtins.int = 1000,
+        max_buffer_size: builtins.int = 33554432,
+        failure_mode: BackpressureMode = ...,
+        max_in_flight: builtins.int = 1,
+        sharding: ProducerSharding = ...,
+    ) -> BackgroundProducerConfig:
+        r"""
+        Constructs background batching, capacity, backpressure, and sharding configuration.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class BackpressureMode:
+    r"""
+    What a background send does when the producer buffer is full.
+    """
+    @property
+    def timeout(self) -> datetime.timedelta | None:
+        r"""
+        The configured timeout, or `None` for modes without one.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    @staticmethod
+    def block() -> BackpressureMode:
+        r"""
+        Wait indefinitely for buffer capacity.
+        """
+    @staticmethod
+    def block_with_timeout(timeout: datetime.timedelta) -> BackpressureMode:
+        r"""
+        Wait up to `timeout` for buffer capacity.
+        """
+    @staticmethod
+    def fail_immediately() -> BackpressureMode:
+        r"""
+        Fail immediately when the producer buffer is full.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class CacheMetrics:
     r"""
     Cache metrics for a specific partition.
@@ -449,6 +557,30 @@ class ConsumerGroupMember:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
         """
+
+@typing.final
+class DirectProducerConfig:
+    r"""
+    Configuration for a producer that sends from the calling task.
+    """
+    @property
+    def batch_length(self) -> builtins.int:
+        r"""
+        Maximum number of messages sent in one request.
+        A value of zero uses the internal limit of 1,000,000 messages.
+        """
+    @property
+    def linger_time(self) -> datetime.timedelta:
+        r"""
+        Minimum gap requested between sequential direct sends.
+        """
+    def __new__(
+        cls, *, batch_length: builtins.int = 1000, linger_time: datetime.timedelta = ...
+    ) -> DirectProducerConfig:
+        r"""
+        Constructs direct-producer batching and pacing configuration.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class GlobalPermissions:
@@ -988,9 +1120,9 @@ class IggyClient:
     ) -> IggyClient:
         r"""
         Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
-        `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. This initializes a
-        new runtime for asynchronous operations.
-        Future versions might utilize asyncio for more Pythonic async.
+        `QuicConfig`, an `HttpConfig`, or a `WebSocketConfig`. Construction is
+        synchronous; async methods return asyncio awaitables backed by the shared
+        Tokio runtime.
 
         Args:
             conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
@@ -1114,6 +1246,7 @@ class IggyClient:
         user_id: builtins.str | builtins.int,
         username: builtins.str | None = None,
         status: UserStatus | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update a user by unique ID or username.
@@ -1122,6 +1255,9 @@ class IggyClient:
             user_id: User identifier as `str | int`.
             username: New username as `str | None`; unchanged when `None`.
             status: New status as `UserStatus | None`; unchanged when `None`.
+            options: Reserved for future use. Additional option keys as
+                `dict[str, str] | None`, forwarded to the server. No user update
+                option key exists yet, so a current server rejects every key.
 
         Returns:
             An awaitable that resolves to `None` when the user is updated.
@@ -1313,7 +1449,8 @@ class IggyClient:
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
         segment_size: builtins.int | None = None,
-        enforce_fsync: builtins.bool | None = None,
+        durability: Durability | None = None,
+        consumer_offset_durability: Durability | None = None,
         messages_required_to_save: builtins.int | None = None,
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
@@ -1325,12 +1462,13 @@ class IggyClient:
         Args:
             stream: Stream identifier as `str | int`.
             name: Topic name as `str`.
-            partitions_count: Number of partitions as `int`.
+            partitions_count: Number of partitions as `int`, at most 1000.
             compression_algorithm: Compression algorithm as `str | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
             segment_size: Per-topic segment size in bytes as `int | None`.
-            enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+            durability: Message completion policy, defaulting to replicated.
+            consumer_offset_durability: Independent offset policy, defaulting to replicated.
             messages_required_to_save: Message-count flush threshold as `int | None`.
             size_of_messages_required_to_save: Byte flush threshold as `int | None`.
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
@@ -1442,6 +1580,66 @@ class IggyClient:
 
         Raises:
             RuntimeError: If an identifier is invalid or the request fails.
+        """
+    def create_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Create partitions for a topic. New partition IDs continue from one past the
+        current highest ID; IDs removed by deletion can be reused. Existing consumer
+        groups are immediately rebalanced across all partitions, advancing their
+        generation and dropping pending revocations.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to create as `int`, between 1 and
+                1000 inclusive.
+
+        Returns:
+            An awaitable that resolves to `None` when the partitions are committed;
+            storage materialization completes asynchronously.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
+            RuntimeError: If the client is not authenticated, lacks global
+                `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+                `manage_topics`, or per-topic `manage_topic` permission, or the
+                request fails.
+        """
+    def delete_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete the last partitions from a topic, including all messages stored in them.
+        Existing consumer groups are immediately rebalanced across the remaining
+        partitions, advancing their generation and dropping pending revocations.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to delete as `int` from the end of
+                the topic; must be between 1 and 1000 inclusive and no greater than
+                its current count.
+
+        Returns:
+            An awaitable that resolves to `None` when deletion is accepted; storage
+            teardown completes asynchronously.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
+            RuntimeError: If the client is not authenticated, lacks global
+                `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+                `manage_topics`, or per-topic `manage_topic` permission, or the
+                request fails.
         """
     def create_consumer_group(
         self,
@@ -1598,7 +1796,7 @@ class IggyClient:
         Returns:
             An awaitable that resolves to `SendMessagesResponse`. Its confirmations
             report the committed partition and batch base offset. The list is empty
-            when the server reports no offsets, including on the legacy server.
+            when the server reports no offsets.
 
         Raises:
             ValueError: If a string stream or topic identifier is invalid.
@@ -1606,6 +1804,32 @@ class IggyClient:
             OverflowError: If a numeric stream, topic, or partition ID is outside
                 the supported unsigned 32-bit range.
             RuntimeError: If the request fails.
+        """
+    def producer(
+        self,
+        stream: builtins.str,
+        topic: builtins.str,
+        partitioning: Partitioning | None = None,
+        mode: DirectProducerConfig | BackgroundProducerConfig | None = None,
+        create_stream_if_not_exists: builtins.bool = True,
+        create_topic_if_not_exists: builtins.bool = True,
+        topic_partitions_count: builtins.int = 1,
+        topic_message_expiry: IggyExpiry | None = None,
+        topic_max_size: MaxTopicSize | None = None,
+        send_retries: builtins.int | None = 3,
+        send_retry_interval: datetime.timedelta | None = ...,
+    ) -> collections.abc.Awaitable[IggyProducer]:
+        r"""
+        Creates and initializes a high-level producer bound to a stream and topic.
+
+        This is a Python port of the Rust high-level producer API. For detailed
+        producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+        `None` selects direct mode. `BackgroundProducerConfig` starts background
+        workers and makes successful sends mean queue acceptance rather than a
+        server commit. The returned producer is ready to send.
+
+        Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
+        when stream/topic initialization fails.
         """
     def poll_messages(
         self,
@@ -1799,6 +2023,63 @@ class IggyExpiry:
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     ...
+
+@typing.final
+class IggyProducer:
+    r"""
+    Python port of the Rust high-level producer API, bound to one stream and topic.
+
+    For detailed producer semantics, see
+    https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
+
+    Direct sends complete after the server responds and contain commit confirmations.
+    Background sends complete once accepted by a worker and contain no confirmations.
+    Always use the async context manager or call `shutdown()` explicitly; dropping a
+    background producer can lose accepted buffered messages.
+    """
+    def send(
+        self, messages: list[SendMessage]
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends a batch to the producer's bound stream and topic.
+        In background mode, success means accepted into the dispatcher and the
+        returned confirmation list is empty.
+        """
+    def send_one(
+        self, message: SendMessage
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends one message to the producer's bound stream and topic.
+        It has the same mode-dependent completion semantics as `send()`.
+        """
+    def send_with_partitioning(
+        self, messages: list[SendMessage], partitioning: Partitioning | None = None
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends a batch with an optional per-call partitioning override.
+        It has the same mode-dependent completion semantics as `send()`.
+        """
+    def send_to(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        messages: list[SendMessage],
+        partitioning: Partitioning | None = None,
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
+        r"""
+        Sends a batch to another existing stream and topic.
+        It has the same mode-dependent completion semantics as `send()` and does
+        not create the alternate destination.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Waits for active sends and closes the producer. Repeated calls are safe.
+        Background shutdown flushes every accepted buffered message before returning.
+        """
+    def __aenter__(self) -> collections.abc.Awaitable[IggyProducer]: ...
+    def __aexit__(
+        self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any
+    ) -> collections.abc.Awaitable[builtins.bool]: ...
 
 class MaxTopicSize:
     r"""
@@ -2016,6 +2297,29 @@ class PollingStrategy:
         def __new__(cls) -> PollingStrategy.Next: ...
 
     ...
+
+@typing.final
+class ProducerSendError(builtins.RuntimeError):
+    r"""
+    A direct producer error that preserves partial-send recovery state.
+    """
+    @property
+    def cause(self) -> builtins.str:
+        r"""
+        The underlying Iggy error message.
+        """
+    @property
+    def failed(self) -> builtins.list[SendMessage]:
+        r"""
+        Messages without a usable confirmation after the failure.
+        An encryptor can leave these messages encrypted, so do not submit them
+        to the same producer without restoring their original payloads.
+        """
+    @property
+    def committed(self) -> builtins.list[SendMessagesConfirmation]:
+        r"""
+        Confirmations returned for chunks committed before the failure.
+        """
 
 @typing.final
 class QuicConfig:
@@ -2267,12 +2571,8 @@ class SendMessagesConfirmation:
         at-least-once, so an earlier retry may already have committed these
         messages at a lower offset.
 
-        A batch is confirmed once it is committed in memory, not once it is
-        fsynced. A crash-restart can stamp a later batch with an offset a client
-        has already recorded.
-
-        The legacy server confirms nothing, so its confirmation list is empty
-        and this value is never reached.
+        Confirmation follows VSR quorum commit. A topic with persisted message
+        durability also waits for recoverable stable-storage copies on the quorum.
         """
 
 @typing.final
@@ -2285,15 +2585,13 @@ class SendMessagesResponse:
         r"""
         Gets the commit confirmations, one per partition the batch was written to.
 
-        The list is empty when the server reports no offsets, and the legacy
-        server never reports any, so branch on it being empty rather than
-        indexing into it.
+        The list is empty when the server reports no offsets, so check whether
+        it is empty before indexing into it.
 
         A reported `base_offset` never implies uniqueness, because delivery is
         at-least-once and an earlier retry may already have committed the same
-        messages at a lower offset. A batch is confirmed once it is committed in
-        memory, not once it is fsynced. A crash-restart can stamp a later batch
-        with an offset a client has already recorded.
+        messages at a lower offset. Confirmation follows the topic's message
+        durability policy: quorum commit, plus stable storage for persisted topics.
         """
 
 @typing.final
@@ -3192,6 +3490,15 @@ class WebSocketReconnectionConfig:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class ProducerSharding(enum.Enum):
+    r"""
+    How a background producer distributes sends among its workers.
+    """
+
+    ORDERED = ...
+    BALANCED = ...
+
+@typing.final
 class UserStatus(enum.Enum):
     r"""
     The status of a user account.
@@ -3205,3 +3512,7 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
+
+class Durability(str, enum.Enum):
+    REPLICATED = "replicated"
+    PERSISTED = "persisted"

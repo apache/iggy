@@ -90,7 +90,7 @@ pub struct CreateTopic {
 
     #[schemars(
         description = "additional options as string key-values, e.g. {\"segment_size\": \"128 MiB\"}; \
-                       call describe_options for the keys the server accepts (optional)"
+                       keys are validated by the Iggy server (optional)"
     )]
     #[serde(default)]
     pub options: BTreeMap<String, String>,
@@ -235,7 +235,7 @@ pub struct Message {
     #[schemars(description = "message identifier (optional, number)")]
     pub id: Option<u128>,
 
-    #[schemars(description = "message payload, base64 encoded string")]
+    #[schemars(description = "message payload as a UTF-8 string")]
     pub payload: String,
 }
 

@@ -138,10 +138,13 @@ pub struct MessageBusConfig {
     /// validator; undersize or oversize frames are rejected.
     pub max_message_size: usize,
 
-    /// Bound on the per-peer mpsc queue. The writer task drains; the
+    /// Bound on each replica peer's mpsc queue. The writer task drains; the
     /// `send_to_*` path enqueues. Too small drops under burst; too
     /// large delays backpressure signalling.
     pub peer_queue_capacity: usize,
+
+    /// Bound on each SDK connection's inbound and outbound queues.
+    pub client_queue_capacity: usize,
 
     /// Interval between outbound reconnect attempts to peers with
     /// `peer_id > self_id`.
@@ -214,6 +217,7 @@ impl From<&ServerConfig> for MessageBusConfig {
             max_message_size: usize::try_from(bus.max_message_size.as_bytes_u64())
                 .expect("message_bus.max_message_size fits usize on supported targets"),
             peer_queue_capacity: bus.peer_queue_capacity,
+            client_queue_capacity: bus.client_queue_capacity,
             reconnect_period: bus.reconnect_period.get_duration(),
             mesh_expected_peers: if cfg.cluster.enabled {
                 cfg.cluster.nodes.len().saturating_sub(1)

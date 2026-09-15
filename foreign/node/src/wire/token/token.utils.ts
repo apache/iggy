@@ -78,13 +78,9 @@ export const deserializeCreateToken = (p: Buffer, pos = 0): TokenDeserialized =>
 export const deserializeToken = (p: Buffer, pos = 0): TokenSerialized => {
   const nameLength = p.readUInt8(pos);
   const name = p.subarray(pos + 1, pos + 1 + nameLength).toString();
-  const rest = p.subarray(pos + 1 + nameLength);
-  let expiry = null;
-  let bytesRead = pos + 1 + nameLength;
-  if (rest.length >= 8) {
-    expiry = toDate(rest.readBigUInt64LE(0));
-    bytesRead += 8;
-  }
+  const expiryRaw = p.readBigUInt64LE(pos + 1 + nameLength);
+  const expiry = expiryRaw === 0n ? null : toDate(expiryRaw);
+  const bytesRead = 1 + nameLength + 8;
   return {
     bytesRead,
     data: {

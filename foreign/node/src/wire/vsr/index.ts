@@ -133,7 +133,7 @@ const registerCommand = (command: number): boolean =>
   command === COMMAND_CODE.LoginRegister ||
   command === COMMAND_CODE.LoginRegisterWithAccessToken;
 
-const readWireName = (
+export const readWireName = (
   payload: Buffer,
   offset: number
 ): { value: string, next: number } => {

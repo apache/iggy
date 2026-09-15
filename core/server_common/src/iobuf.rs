@@ -125,6 +125,10 @@ impl<const ALIGN: usize> Owned<ALIGN> {
         self.inner.extend_from_slice(bytes);
     }
 
+    pub fn truncate(&mut self, len: usize) {
+        self.inner.truncate(len);
+    }
+
     pub fn split_at(self, split_at: usize) -> (Prefix<ALIGN>, Frozen<ALIGN>) {
         assert!(split_at <= self.inner.len());
 

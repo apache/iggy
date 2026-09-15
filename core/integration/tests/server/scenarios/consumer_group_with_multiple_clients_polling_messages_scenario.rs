@@ -24,8 +24,12 @@ use integration::harness::{TestHarness, assert_clean_system, create_user, login_
 use std::str::{FromStr, from_utf8};
 
 pub async fn run(harness: &TestHarness) {
+    // The metadata leader can change while the consumer clients are polling.
     let system_client = harness
-        .root_client()
+        .client_builder_for(harness.transport().expect("Failed to get test transport"))
+        .expect("Failed to create client builder")
+        .with_reconnecting_root_login()
+        .connect()
         .await
         .expect("Failed to get root client");
     let client1 = create_client(harness).await;

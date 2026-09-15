@@ -23,6 +23,7 @@ components:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
+      - ".config/**" # nextest + cargo-rail config gate every Rust test job
 
   # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and chain-publishes
@@ -542,7 +543,7 @@ components:
   web-ui:
     paths:
       - "web/**"
-    tasks: ["lint", "build"]
+    tasks: ["lint", "test", "build"]
 
   helm:
     paths:
