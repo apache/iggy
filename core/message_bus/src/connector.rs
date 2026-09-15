@@ -44,15 +44,6 @@ use std::rc::Rc;
 use std::time::Duration;
 use tracing::{debug, info};
 
-/// Default reconnect sweep period.
-///
-/// Equivalent to `MessageBusConfig::default().reconnect_period`; exposed
-/// as a named const for test / bench ergonomics. Kept in sync with the
-/// `MessageBusConfig::default` impl. Remove once the configs-crate
-/// migration lands and bootstrap always reads the period from
-/// `ServerConfig`.
-pub const DEFAULT_RECONNECT_PERIOD: Duration = Duration::from_secs(5);
-
 /// Dial every peer with `peer_id > self_id` once, then launch a periodic
 /// sweep in the background. The periodic task handle is tracked on the bus
 /// so graceful shutdown can await it.
@@ -64,7 +55,7 @@ pub async fn start(
     on_dialed: DialedReplicaFn,
     reconnect_period: Duration,
 ) {
-    connect_all(bus, self_id, &peers, &on_dialed).await;
+    connect_all(bus, self_id, &peers, &on_dialed, reconnect_period).await;
 
     let handler = on_dialed.clone();
     let token = bus.token();
@@ -89,6 +80,7 @@ async fn connect_all(
     self_id: u8,
     peers: &[(u8, SocketAddr)],
     on_dialed: &DialedReplicaFn,
+    connect_timeout: Duration,
 ) {
     let dials = peers.iter().filter_map(|&(peer_id, addr)| {
         if peer_id <= self_id {
@@ -116,7 +108,7 @@ async fn connect_all(
             );
             return None;
         }
-        Some(connect_one(peer_id, addr, on_dialed))
+        Some(connect_one(peer_id, addr, on_dialed, connect_timeout))
     });
     // Dial concurrently so one unreachable peer's connect latency does not
     // stall the rest. The futures share one task, so the `on_dialed`
@@ -136,7 +128,7 @@ async fn periodic_reconnect(
     token: ShutdownToken,
 ) {
     while token.sleep_or_shutdown(period).await {
-        connect_all(bus, self_id, &peers, &on_dialed).await;
+        connect_all(bus, self_id, &peers, &on_dialed, period).await;
     }
     debug!("replica reconnect periodic task exiting");
 }
@@ -146,12 +138,26 @@ async fn periodic_reconnect(
 /// Connect failures are logged and swallowed; VSR tolerates missing
 /// peers and the periodic sweep retries. The handshake (and its
 /// `handshake_grace` bound) runs on the owning shard after delegation.
+///
+/// The dial is bounded by `connect_timeout`: the sweep joins every dial,
+/// so a peer that drops SYNs would otherwise hold the whole sweep for the
+/// kernel connect timeout (about two minutes on Linux) and starve the
+/// retries the heartbeat timeout depends on.
 #[allow(clippy::future_not_send)]
-async fn connect_one(peer_id: u8, addr: SocketAddr, on_dialed: &DialedReplicaFn) {
-    let stream = match TcpStream::connect(addr).await {
-        Ok(s) => s,
-        Err(e) => {
+async fn connect_one(
+    peer_id: u8,
+    addr: SocketAddr,
+    on_dialed: &DialedReplicaFn,
+    connect_timeout: Duration,
+) {
+    let stream = match compio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             debug!(replica = peer_id, %addr, "connect failed: {e}");
+            return;
+        }
+        Err(_) => {
+            debug!(replica = peer_id, %addr, ?connect_timeout, "connect timed out");
             return;
         }
     };

@@ -26,7 +26,7 @@ use common::{
     install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
 };
 use message_bus::IggyMessageBus;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -70,7 +70,7 @@ async fn connection_lost_fires_exactly_once_per_peer_disconnect() {
         0,
         vec![(1u8, addr1)],
         dial_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 
