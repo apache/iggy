@@ -244,7 +244,7 @@ struct IggyMessageTests {
     }
 
     @Test func descriptionShowsABoundedPreview() throws {
-        let short = try IggyMessage("hello")
+        let short = try IggyMessage(String("hello"))
         #expect(short.description == "[0] ID:0 'hello'")
         // 46 ASCII bytes then a two-byte "é" straddling the 47-byte cut.
         let straddling = try IggyMessage(String(repeating: "a", count: 46) + "éé" + String(repeating: "b", count: 20))
