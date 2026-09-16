@@ -28,7 +28,6 @@ use common::{
 };
 use iggy_common::IggyError;
 use message_bus::client_listener::RequestHandler;
-use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
 use message_bus::replica::io::{QuicServerCredentials, start_on_shard_zero};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::transports::tls::self_signed_for_loopback;
@@ -86,7 +85,7 @@ async fn shard_zero_binds_listener_and_starts_connector() {
         None,
         None,
         None,
-        DEFAULT_RECONNECT_PERIOD,
+        bus_zero.config().reconnect_period,
     )
     .await
     .expect("start_on_shard_zero must succeed on shard 0");
@@ -149,7 +148,7 @@ async fn non_zero_shard_skips_io() {
         None,
         None,
         None,
-        DEFAULT_RECONNECT_PERIOD,
+        bus_one.config().reconnect_period,
     )
     .await
     .expect("start_on_shard_zero must succeed on non-zero shard (no-op)");
@@ -227,7 +226,7 @@ async fn shard_zero_binds_all_six_planes_when_configured() {
         Some(accepted_quic),
         Some(accepted_tls),
         Some(accepted_wss),
-        DEFAULT_RECONNECT_PERIOD,
+        bus_zero.config().reconnect_period,
     )
     .await
     .expect("start_on_shard_zero must succeed");
@@ -297,7 +296,7 @@ async fn tcp_tls_listen_addr_without_credentials_rejected() {
         None,
         Some(accepted_tls),
         None,
-        DEFAULT_RECONNECT_PERIOD,
+        bus_zero.config().reconnect_period,
     )
     .await
     .expect_err("partial TCP-TLS trio must reject");
@@ -339,7 +338,7 @@ async fn wss_listen_addr_without_credentials_rejected() {
         None,
         None,
         Some(accepted_wss),
-        DEFAULT_RECONNECT_PERIOD,
+        bus_zero.config().reconnect_period,
     )
     .await
     .expect_err("partial WSS trio must reject");

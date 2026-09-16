@@ -182,3 +182,8 @@ async fn slow_tls_handshake_evicts_registry() {
         "graceful shutdown should not force-cancel"
     );
 }
+
+#[compio::test]
+async fn failed_and_interrupted_tls_handshakes_release_delegated_connections() {
+    common::assert_failed_tls_installs_are_removed(message_bus::ClientTransportKind::TcpTls).await;
+}

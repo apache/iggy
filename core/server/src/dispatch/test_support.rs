@@ -30,7 +30,7 @@ use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus,
-    ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
 };
 use metadata::impls::metadata::IggySnapshot;
 use metadata::stm::stream::Streams;
@@ -141,6 +141,22 @@ impl ConnectionInstaller for SpyBus {
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
+        _on_request: RequestHandler,
+    ) {
+    }
+    fn install_client_tcp_tls_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _on_request: RequestHandler,
+    ) {
+    }
+    fn install_client_wss_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
         _on_request: RequestHandler,
     ) {
     }

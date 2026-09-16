@@ -43,9 +43,8 @@ use tracing::warn;
 /// [`super::tcp_tls::install_client_tcp_tls`]. `SO_KEEPALIVE` is
 /// intentionally NOT set; see `socket_opts`.
 ///
-/// WSS is shard-0 terminal for the same reasons as the TCP-TLS plane;
-/// see [`super::tcp_tls::install_client_tcp_tls`] for the rustls
-/// non-serialisability argument.
+/// Called on the destination shard after raw-fd delegation. Both TLS and
+/// WebSocket state are created and driven exclusively on this runtime.
 #[allow(clippy::future_not_send)]
 pub fn install_client_wss(
     bus: &Rc<IggyMessageBus>,
