@@ -39,10 +39,12 @@ use nix::sys::resource::{Resource, getrlimit};
 // already queued and waiting, so widening the group moves work off the barrier
 // and onto a buffered memcpy: one body write and one durability barrier serve
 // the whole group instead of each prepare paying its own. The byte budget is
-// charged against the padded BODY size even when the WAL stores a segment
-// reference and writes 4096 bytes per record, so a tight budget caps grouping
-// far below what the write itself costs.
-const APPEND_BATCH_BYTES_MAX: u64 = 8 * 1024 * 1024;
+// charged against the padded WAL extent, which is one reference record for a
+// message body retained in segment storage.
+const APPEND_BATCH_WAL_BYTES_MAX: u64 = 8 * 1024 * 1024;
+// Bound segment body work independently of the WAL extent. References make the
+// WAL cheap, but do not make copying their bodies into segment storage cheap.
+const APPEND_BATCH_SEGMENT_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const APPEND_BATCH_OPS_MAX: usize = 256;
 const CHECKPOINT_DIRTY_FILES_MAX: usize = 1024;
 /// Mutations a partition may apply before its obsolete files are reclaimed
@@ -416,7 +418,7 @@ enum Mutation<S: DurableStorage> {
         epoch: u64,
         prepare: Frozen<4096>,
         durable: bool,
-        bytes: u64,
+        retained_bytes: u64,
     },
     Truncate {
         epoch: u64,
@@ -437,6 +439,15 @@ enum Mutation<S: DurableStorage> {
         prepare: Option<Frozen<4096>>,
         segments: Option<(SegmentPosition, u64)>,
     },
+}
+
+struct AppendBatchBytes {
+    /// Logical capacity in bytes retained until checkpoint, charged as padded inline records.
+    retained_capacity: u64,
+    /// Padded WAL extent in bytes encoded in the current storage mode.
+    wal_extent: u64,
+    /// Unpadded message-body bytes copied into segment storage.
+    segment_body: u64,
 }
 
 impl PartitionPersistence {
@@ -714,7 +725,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     /// Returns an error if persistence fails, capacity is exhausted, or history is invalid.
     pub fn append(&self, prepare: Frozen<4096>, durable: bool) -> io::Result<()> {
         let header = prepare_header(&prepare)?;
-        let bytes = journal::partition_journal::record_length(prepare.len())? as u64;
+        let retained_bytes = journal::partition_journal::record_length(prepare.len())? as u64;
         if self.accepted.borrow().checksum(header.op) == Some(header.checksum) {
             return Ok(());
         }
@@ -738,7 +749,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                     now.saturating_duration_since(previous)
                 }),
         );
-        self.queued_bytes.set(self.queued_bytes.get() + bytes);
+        self.queued_bytes
+            .set(self.queued_bytes.get() + retained_bytes);
         self.accepted
             .borrow_mut()
             .checksums
@@ -748,7 +760,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             epoch: self.epoch.get(),
             prepare,
             durable,
-            bytes,
+            retained_bytes,
         });
         Ok(())
     }
@@ -876,7 +888,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 Mutation::Append {
                     epoch: previous,
                     prepare,
-                    bytes,
+                    retained_bytes,
                     ..
                 } => {
                     if prepare_header(prepare).is_ok_and(|header| header.op < from_op) {
@@ -884,7 +896,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                         true
                     } else {
                         self.queued_bytes
-                            .set(self.queued_bytes.get().saturating_sub(*bytes));
+                            .set(self.queued_bytes.get().saturating_sub(*retained_bytes));
                         false
                     }
                 }
@@ -1126,8 +1138,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             let Some(mutation) = self.queue.borrow_mut().pop_front() else {
                 break;
             };
-            let (epoch, bytes) = match &mutation {
-                Mutation::Append { epoch, bytes, .. } => (*epoch, *bytes),
+            let (epoch, retained_bytes) = match &mutation {
+                Mutation::Append {
+                    epoch,
+                    retained_bytes,
+                    ..
+                } => (*epoch, *retained_bytes),
                 Mutation::CertifyView { epoch, .. }
                 | Mutation::EnableSegments { epoch, .. }
                 | Mutation::Purge { epoch, .. }
@@ -1136,8 +1152,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 | Mutation::Reset { epoch, .. } => (*epoch, 0),
             };
             self.queued_bytes
-                .set(self.queued_bytes.get().saturating_sub(bytes));
-            self.in_flight_bytes.set(bytes);
+                .set(self.queued_bytes.get().saturating_sub(retained_bytes));
+            self.in_flight_bytes.set(retained_bytes);
             let rebuild_references = matches!(
                 mutation,
                 Mutation::EnableSegments { .. }
@@ -1146,7 +1162,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                     | Mutation::Checkpoint { .. }
                     | Mutation::Reset { .. }
             );
-            let result = self.apply_mutation(journal, mutation, epoch, bytes).await;
+            let result = self
+                .apply_mutation(journal, mutation, epoch, retained_bytes)
+                .await;
             self.in_flight_bytes.set(0);
             if let Err(error) = result {
                 self.failed_writes.set(self.failed_writes.get() + 1);
@@ -1223,7 +1241,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         journal: &mut PartitionPrepareJournal<S>,
         mutation: Mutation<S>,
         epoch: u64,
-        bytes: u64,
+        retained_bytes: u64,
     ) -> io::Result<()> {
         match mutation {
             Mutation::EnableSegments {
@@ -1238,7 +1256,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             Mutation::Append {
                 prepare, durable, ..
             } => {
-                self.append_batch(journal, prepare, durable, epoch, bytes)
+                self.append_batch(journal, prepare, durable, epoch, retained_bytes)
                     .await
             }
             Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
@@ -1293,27 +1311,32 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         first: Frozen<4096>,
         durable: bool,
         epoch: u64,
-        first_bytes: u64,
+        first_retained_bytes: u64,
     ) -> io::Result<()> {
+        let (first_wal_bytes, first_segment_body_bytes) = append_lengths(journal, &first)?;
+        let mut bytes = AppendBatchBytes {
+            retained_capacity: first_retained_bytes,
+            wal_extent: first_wal_bytes as u64,
+            segment_body: first_segment_body_bytes as u64,
+        };
         let mut batch = SmallVec::<[Frozen<4096>; 8]>::new();
         batch.push(first);
-        let mut bytes = first_bytes;
         let mut durable = durable;
-        self.collect_queued(&mut batch, &mut bytes, &mut durable, epoch);
+        self.collect_queued(journal, &mut batch, &mut bytes, &mut durable, epoch)?;
         // Charged before the wait: `collect_queued` took these bytes out of the
         // queued total, and admission and checkpoint pacing sum queued and
         // in-flight bytes against the budget, so a gap here would admit a full
         // group past it.
-        self.in_flight_bytes.set(bytes);
+        self.in_flight_bytes.set(bytes.retained_capacity);
         // The barrier is what groups prepares, so a barrier cheaper than the
         // interval between arrivals groups nothing and every prepare pays its
         // own writes. This wait puts that grouping back under operator control.
-        if durable && let Some(delay) = self.group_commit_wait(&batch, bytes) {
+        if durable && let Some(delay) = self.group_commit_wait(&batch, &bytes) {
             self.group_commit_waits
                 .set(self.group_commit_waits.get() + 1);
             compio::runtime::time::sleep(delay).await;
-            self.collect_queued(&mut batch, &mut bytes, &mut durable, epoch);
-            self.in_flight_bytes.set(bytes);
+            self.collect_queued(journal, &mut batch, &mut bytes, &mut durable, epoch)?;
+            self.in_flight_bytes.set(bytes.retained_capacity);
         }
         let count = batch.len() as u64;
         journal.append_batch_buffered(&batch).await?;
@@ -1329,39 +1352,58 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     /// Move every queued append that still fits into `batch`.
     fn collect_queued(
         &self,
+        journal: &PartitionPrepareJournal<S>,
         batch: &mut SmallVec<[Frozen<4096>; 8]>,
-        bytes: &mut u64,
+        bytes: &mut AppendBatchBytes,
         durable: &mut bool,
         epoch: u64,
-    ) {
+    ) -> io::Result<()> {
         let mut queue = self.queue.borrow_mut();
         while batch.len() < APPEND_BATCH_OPS_MAX {
             let Some(Mutation::Append {
                 epoch: next_epoch,
-                bytes: next_bytes,
+                prepare,
                 ..
             }) = queue.front()
             else {
                 break;
             };
-            if *next_epoch != epoch || bytes.saturating_add(*next_bytes) > APPEND_BATCH_BYTES_MAX {
+            if *next_epoch != epoch {
+                break;
+            }
+            let (next_wal_bytes, next_segment_body_bytes) = append_lengths(journal, prepare)?;
+            let next_wal_bytes = next_wal_bytes as u64;
+            let next_segment_bytes = next_segment_body_bytes as u64;
+            // Inline prepares count their full padded WAL extent and zero segment
+            // bytes. Segment-backed SendMessages count a padded reference record
+            // in the WAL and their unpadded body bytes against the segment limit.
+            if bytes.wal_extent.saturating_add(next_wal_bytes) > APPEND_BATCH_WAL_BYTES_MAX
+                || bytes.segment_body.saturating_add(next_segment_bytes)
+                    > APPEND_BATCH_SEGMENT_BYTES_MAX
+            {
                 break;
             }
             let Some(Mutation::Append {
                 prepare,
                 durable: requires_sync,
-                bytes: record_bytes,
+                retained_bytes: record_retained_bytes,
                 ..
             }) = queue.pop_front()
             else {
                 unreachable!("append prefix was checked");
             };
-            *bytes += record_bytes;
-            self.queued_bytes
-                .set(self.queued_bytes.get().saturating_sub(record_bytes));
+            bytes.retained_capacity += record_retained_bytes;
+            bytes.wal_extent += next_wal_bytes;
+            bytes.segment_body += next_segment_bytes;
+            self.queued_bytes.set(
+                self.queued_bytes
+                    .get()
+                    .saturating_sub(record_retained_bytes),
+            );
             *durable |= requires_sync;
             batch.push(prepare);
         }
+        Ok(())
     }
 
     /// How long to wait for more prepares before the barrier, if at all.
@@ -1369,9 +1411,19 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     /// `None` for a disabled delay, a group already at its bounds, or arrivals
     /// spaced wider than the delay, where the wait would expire before the next
     /// prepare reached the queue.
-    fn group_commit_wait(&self, batch: &[Frozen<4096>], bytes: u64) -> Option<Duration> {
+    fn group_commit_wait(
+        &self,
+        batch: &[Frozen<4096>],
+        bytes: &AppendBatchBytes,
+    ) -> Option<Duration> {
         let delay = self.group_commit_delay.get();
-        if delay.is_zero() || batch.len() >= APPEND_BATCH_OPS_MAX || bytes >= APPEND_BATCH_BYTES_MAX
+        // Inline prepares are bounded by their full padded WAL extent. Segment-
+        // backed SendMessages are bounded by both their reference-record extent
+        // and the message bodies copied into segment storage.
+        if delay.is_zero()
+            || batch.len() >= APPEND_BATCH_OPS_MAX
+            || bytes.wal_extent >= APPEND_BATCH_WAL_BYTES_MAX
+            || bytes.segment_body >= APPEND_BATCH_SEGMENT_BYTES_MAX
         {
             return None;
         }
@@ -1396,6 +1448,14 @@ fn prepare_header(prepare: &Frozen<4096>) -> io::Result<&PrepareHeader> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short prepare"))?;
     bytemuck::checked::try_from_bytes(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid prepare"))
+}
+
+fn append_lengths<S: DurableStorage>(
+    journal: &PartitionPrepareJournal<S>,
+    prepare: &Frozen<4096>,
+) -> io::Result<(usize, usize)> {
+    let header = prepare_header(prepare)?;
+    journal.append_lengths(header.operation, prepare.len())
 }
 
 #[cfg(test)]

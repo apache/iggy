@@ -27,7 +27,7 @@ use journal::partition_journal::{
     PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference, record_length,
 };
 use journal::{DurableAppend, PartitionPrepareJournal};
-use partitions::{PartitionPersistence, install_backup};
+use partitions::{PartitionPersistence, PersistenceMetrics, install_backup};
 use server_common::send_messages::{
     BATCH_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
 };
@@ -2853,45 +2853,56 @@ fn given_an_interrupted_writer_when_the_process_restarts_then_the_partition_shou
 }
 
 #[test]
-#[ignore = "PR #4092 review: append coalescing is gated on message-body bytes, not the WAL extent, so batching is inert at the benchmarked batch sizes"]
 fn given_large_bodies_when_appending_then_wal_records_should_coalesce_into_one_barrier_group() {
     block_on(async {
         const PREPARES: u64 = 8;
-        let storage = storage_for_partition().await;
-        let (persistence, _) =
-            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
-                .await
-                .unwrap();
-        persistence.enable_segment_storage(
-            SegmentPosition::default(),
-            PREPARES * LARGE_BATCH_BYTES as u64,
-        );
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-        persistence.take_metrics();
-
-        let mut parent = 0;
-        for offset in 0..PREPARES {
-            let prepare = owned_prepare_sized(offset + 1, parent, offset, LARGE_BATCH_BYTES);
-            parent = prepare.header().checksum;
-            persistence.append(prepare.into_frozen(), true).unwrap();
-        }
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-
-        let metrics = persistence.take_metrics();
+        let metrics = large_body_batch_metrics(PREPARES).await;
         assert_eq!(metrics.batched_prepares, PREPARES);
         // Under segment references a record occupies one 4 KiB extent, so all
-        // eight fit far inside APPEND_BATCH_BYTES_MAX. The gate measures the
-        // message body instead, so each prepare takes its own barrier group.
+        // eight fit far inside the group-commit WAL byte budget.
         assert_eq!(
             metrics.completed_batches,
             1,
-            "coalescing is gated on body bytes, so {PREPARES} prepares paid {} barrier groups for {} bytes of WAL extent",
+            "{PREPARES} prepares paid {} barrier groups for {} bytes of WAL extent",
             metrics.completed_batches,
             PREPARES * PARTITION_WAL_BLOCK_SIZE as u64
         );
     });
+}
+
+#[test]
+fn given_segment_body_work_exceeds_the_limit_when_appending_then_the_batch_should_split() {
+    block_on(async {
+        const PREPARES: u64 = 9;
+        let metrics = large_body_batch_metrics(PREPARES).await;
+        assert_eq!(metrics.batched_prepares, PREPARES);
+        assert_eq!(metrics.completed_batches, 2);
+    });
+}
+
+async fn large_body_batch_metrics(prepares: u64) -> PersistenceMetrics {
+    let storage = storage_for_partition().await;
+    let (persistence, _) =
+        PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    persistence.enable_segment_storage(
+        SegmentPosition::default(),
+        prepares * LARGE_BATCH_BYTES as u64,
+    );
+    assert!(persistence.start());
+    Rc::clone(&persistence).run().await;
+    persistence.take_metrics();
+
+    let mut parent = 0;
+    for offset in 0..prepares {
+        let prepare = owned_prepare_sized(offset + 1, parent, offset, LARGE_BATCH_BYTES);
+        parent = prepare.header().checksum;
+        persistence.append(prepare.into_frozen(), true).unwrap();
+    }
+    assert!(persistence.start());
+    Rc::clone(&persistence).run().await;
+    persistence.take_metrics()
 }
 
 fn owned_prepare_sized(

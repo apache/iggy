@@ -474,6 +474,30 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.retained_bytes
     }
 
+    /// Physical write lengths an append occupies in the current storage mode.
+    ///
+    /// The first return value is the padded number of bytes written to the WAL.
+    /// The second return value is the unpadded message-body bytes written to
+    /// segment storage, or zero when the prepare remains inline in the WAL.
+    ///
+    /// # Errors
+    /// Returns an error when `prepare_length` falls outside the supported bounds.
+    pub fn append_lengths(
+        &self,
+        operation: Operation,
+        prepare_length: usize,
+    ) -> io::Result<(usize, usize)> {
+        let inline_length = record_length(prepare_length)?;
+        if self.state.segment_storage.is_some() && operation == Operation::SendMessages {
+            Ok((
+                record_length(REFERENCED_PREPARE_BYTES)?,
+                prepare_length - size_of::<PrepareHeader>(),
+            ))
+        } else {
+            Ok((inline_length, 0))
+        }
+    }
+
     #[must_use]
     pub fn contains(&self, header: &PrepareHeader) -> bool {
         if header.op > self.durable_head {
