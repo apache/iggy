@@ -2947,13 +2947,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions
     }
 
-    /// Handle a received `DoViewChange` message (only relevant for primary candidate).
-    ///
-    /// "When the new primary receives f + 1 DOVIEWCHANGE messages from different
-    /// replicas (including itself), it sets its view-number to that in the messages
-    /// and selects as the new log the one contained in the message with the largest v'..."
-    ///
-    /// The `commit` this replica advertises in a `DoViewChange`.
+    /// The `commit` this replica advertises in a `DoViewChange`, and in any
+    /// `StartView` it announces.
     ///
     /// `commit_max`, not `commit_min`: the new primary floors its pipeline rebuild
     /// at `max(commit)` across the quorum, and only `commit_max` bounds that range
@@ -2964,7 +2959,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// the prepares and `DoViewChangeHeader::validate` rejects `commit > op`.
     /// Lossless for the rebuild floor: quorum intersection guarantees some sender
     /// whose head covers the true commit point carries it.
-    fn dvc_commit(&self) -> u64 {
+    #[must_use]
+    pub fn dvc_commit(&self) -> u64 {
         let op = self.sequencer.current_sequence();
         self.commit_max.get().min(op)
     }
@@ -3235,12 +3231,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         vec![VsrAction::SendStartView {
             view: self.view.get(),
             op: self.sequencer.current_sequence(),
-            commit: self.commit_max.get(),
+            commit: self.dvc_commit(),
             incarnation: header.incarnation,
             target: Some(header.replica),
-            // A probe answer reports this primary's settled frontier, not a
-            // freshly merged log, so there is no canonical suffix to publish.
-            suffix: Vec::new(),
+            // A prober can hold a different entry at an op at or below this
+            // commit point, left from a view whose entry the change truncated.
+            // Without the canonical headers it cannot know, so it adopts the
+            // commit point and applies its own stale entry.
+            suffix: self.local_dvc_suffix().headers().to_vec(),
             group: self.group,
         }]
     }
@@ -5999,6 +5997,109 @@ mod recovery_barrier_tests {
             consensus.recovery_barrier(),
             120,
             "a zero head must not disarm the gate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_answer_tests {
+    //! What a primary publishes when it answers a `RequestStartView` probe.
+    //!
+    //! The answer is not a bare frontier report. A prober can hold a different
+    //! entry at an op at or below the announced commit point, left from a view
+    //! whose entry the change truncated, and the canonical headers are its only
+    //! way to find that out before it adopts the commit point.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::test_bus::NoopBus;
+    use crate::view_change_quorum::dvc_blank;
+
+    const PROBER: u8 = 1;
+
+    /// Replica 0 of 3, primary in view 0 with head `head` and commit point
+    /// `commit`, carrying a fresh suffix snapshot over `[commit + 1, head]`.
+    fn primary_with_suffix(head: u64, commit: u64) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let consensus = VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(head);
+        consensus.advance_commit_max(commit);
+        // Tagged on `(head, commit)` as they stand now, so `local_dvc_suffix`
+        // returns it rather than falling back to empty.
+        let headers: Vec<PrepareHeader> = (commit + 1..=head).rev().map(dvc_blank).collect();
+        let present = (1u128 << headers.len()) - 1;
+        consensus.set_local_dvc_suffix(DvcSuffix::new(headers, 0, present));
+        consensus
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn probe(view: u32) -> RequestStartViewHeader {
+        RequestStartViewHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 1,
+            size: size_of::<RequestStartViewHeader>() as u32,
+            view,
+            release: 0,
+            command: Command::RequestStartView,
+            replica: PROBER,
+            reserved_frame: [0; 66],
+            group: METADATA_GROUP,
+            reserved: [0; 104],
+            incarnation: 0,
+        }
+    }
+
+    /// The suffix is the whole point: without it the prober cannot tell its own
+    /// op from the view's op at the same number, adopts the commit point, and
+    /// commits the stale entry.
+    #[test]
+    fn given_a_cached_suffix_when_answering_a_probe_should_publish_its_headers() {
+        let consensus = primary_with_suffix(7, 5);
+
+        let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &probe(0));
+
+        let [
+            VsrAction::SendStartView {
+                op,
+                commit,
+                suffix,
+                target,
+                ..
+            },
+        ] = &actions[..]
+        else {
+            panic!("a probe from a backup must be answered with one StartView: {actions:?}");
+        };
+        assert_eq!(*op, 7);
+        assert_eq!(*commit, 5);
+        assert_eq!(*target, Some(PROBER));
+        assert_eq!(
+            suffix.iter().map(|header| header.op).collect::<Vec<_>>(),
+            vec![7, 6],
+            "the answer must carry the view's canonical headers, high op first"
+        );
+    }
+
+    /// `commit_max` legitimately runs ahead of the head, since a replica learns
+    /// the commit point before it holds the prepares. `StartViewHeader::validate`
+    /// refuses `commit > op`, and the dispatcher turns that refusal into a panic,
+    /// so the announcement clamps the way `DoViewChange` already does.
+    #[test]
+    fn given_a_commit_point_above_the_head_when_answering_a_probe_should_clamp_it() {
+        let consensus = primary_with_suffix(7, 5);
+        consensus.advance_commit_max(9);
+        assert!(consensus.commit_max() > consensus.sequencer().current_sequence());
+
+        let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &probe(0));
+
+        let [VsrAction::SendStartView { op, commit, .. }] = &actions[..] else {
+            panic!("expected one StartView: {actions:?}");
+        };
+        assert!(
+            commit <= op,
+            "announced commit {commit} exceeds head {op}, which StartViewHeader::validate \
+             rejects and the dispatcher panics on"
         );
     }
 }
