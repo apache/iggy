@@ -2605,11 +2605,19 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 2_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            2_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "workload produced no replies");
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
             "system did not drain within the tick budget"
         );
         // Cross-replica agreement + entity oracle (single client => strict).
@@ -2661,7 +2669,15 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            3_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "workload produced no replies");
         assert!(
             !sim.crashed.is_empty(),
@@ -2669,7 +2685,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
             "surviving quorum did not drain within the tick budget"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -2722,7 +2738,15 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            3_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "lossy workload produced no replies");
         assert!(
             wl.resends() > 0,
@@ -2731,7 +2755,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -3822,7 +3846,15 @@ mod tests {
         let mut wl = Workload::new(options);
         let clients = [client];
         // run() asserts the per-tick invariants every tick under injected crashes.
-        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            3_000,
+            u64::MAX,
+            &mut invariants,
+        );
 
         let crashed = sim.crashed.len();
         assert!(
@@ -4050,6 +4082,7 @@ mod tests {
             let mut workload = Workload::new(options);
             let mut injector = FaultInjector::new(seed, replica_count);
             let clients = [client];
+            let mut invariants = crate::workload::invariants::Invariants::new();
             let replies = run_with_faults(
                 &mut sim,
                 &mut workload,
@@ -4057,6 +4090,7 @@ mod tests {
                 3_000,
                 u64::MAX,
                 &mut injector,
+                &mut invariants,
             );
             (
                 replies,
@@ -4564,7 +4598,15 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 4_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            4_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "shell workload produced no replies");
 
         let stats = wl.auditor.stats();
@@ -4580,7 +4622,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -4662,7 +4704,16 @@ mod tests {
 
         let clients = [client];
         let mut injector = FaultInjector::new(seed, replica_count);
-        run_with_faults(&mut sim, &mut wl, &clients, 1_500, u64::MAX, &mut injector);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        run_with_faults(
+            &mut sim,
+            &mut wl,
+            &clients,
+            1_500,
+            u64::MAX,
+            &mut injector,
+            &mut invariants,
+        );
 
         assert!(
             wl.auditor.stats().transient_rejections > 0,
@@ -4671,7 +4722,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -4742,6 +4793,7 @@ mod tests {
 
         let clients = [client];
         let mut injector = FaultInjector::new(seed, replica_count);
+        let mut invariants = crate::workload::invariants::Invariants::new();
         let _ = workload::run_with_faults(
             &mut sim,
             &mut workload,
@@ -4749,6 +4801,7 @@ mod tests {
             4_000,
             u64::MAX,
             &mut injector,
+            &mut invariants,
         );
 
         assert!(
@@ -4756,7 +4809,7 @@ mod tests {
             "no replica crashed, so no view change ran and this proves nothing"
         );
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000),
+            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &workload),
         );
@@ -4806,22 +4859,18 @@ mod tests {
 
         let clients = [client];
         let mut injector = FaultInjector::new(seed, replica_count);
+        // The checker is read afterwards, so it is declared here rather than left to
+        // the driver: `chain` below is the accumulated canonical commit chain.
         let mut invariants = Invariants::new();
-        // Driven here rather than through `workload::run` so the accumulated
-        // chain is readable afterwards; `run` builds its own `Invariants`.
-        for _ in 0..4_000u32 {
-            wl.tick();
-            injector.step(&mut sim, &wl);
-            workload::resubmit_due(&mut sim, &mut wl);
-            if let Some((target, msg)) = wl.build_request(&clients[0]) {
-                sim.submit_request(clients[0].client_id(), target, msg.into_generic());
-            }
-            for reply in sim.step() {
-                let cmds = wl.on_reply(&reply);
-                workload::apply_sim_commands(&mut sim, &cmds);
-            }
-            invariants.check(&sim, &wl);
-        }
+        workload::run_with_faults(
+            &mut sim,
+            &mut wl,
+            &clients,
+            4_000,
+            u64::MAX,
+            &mut injector,
+            &mut invariants,
+        );
 
         assert!(
             injector.restarts() > 0,
@@ -4839,12 +4888,12 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
         assert!(
-            oracle::settle_to_stable_view(&mut sim, &mut wl, 50_000),
+            oracle::settle_to_stable_view(&mut sim, &mut wl, 50_000, &mut invariants),
             "metadata views never converged after the drain"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -5222,11 +5271,19 @@ mod tests {
         options.weights = ActionWeights::new(&[(Action::SendMessages, 100)]);
         let mut wl = Workload::new(options);
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 2_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            2_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "workload produced no replies");
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
             "system did not drain within the tick budget"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -7982,6 +8039,91 @@ mod review_4092_dst_tests {
         assert!(
             options.durability.is_persisted() || options.consumer_offset_durability.is_persisted(),
             "no simulator API can seed a persisted topic, so the durability guarantee this PR adds is unreachable from the deterministic simulator and `init_partition` asserts it out anyway"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_answer_divergence_tests {
+    //! End-to-end seeds for the probe-answer `StartView`. The mechanism itself is
+    //! pinned by `consensus::impls::probe_answer_tests`; these replay the runs that
+    //! found it.
+
+    use super::*;
+
+    /// Seed 144 of the uniform swarm lane: replica 0 prepared op 7 in view 0
+    /// without acks, view 1 truncated it and prepared a different op 7, and
+    /// replica 0 then adopted view 1 through a probe answer that carried no
+    /// canonical headers, so it kept its own op 7 and committed that instead.
+    ///
+    /// Network faults only, no crash needed, which is why it lands at op 7 and
+    /// replays fast. The mechanism is pinned separately by
+    /// `consensus::impls::probe_answer_tests`; this is the end-to-end seed.
+    #[test]
+    fn given_a_probe_adopted_view_when_the_head_diverges_should_not_commit_the_stale_entry() {
+        use crate::workload::{
+            self, FaultInjector, Workload,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let seed = 144;
+        // Swarm, not a fixed profile: the asymmetric partitions and clogs this
+        // seed draws are what let a primary prepare an op it cannot get acked.
+        let mut network_opts = packet::PacketSimulatorOptions::swarm(seed);
+        network_opts.node_count = replica_count;
+        network_opts.client_count = 1;
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
+        options.weights = ActionWeights::uniform();
+        options.crash_per_tick_ratio = 0.01;
+        options.restart_per_tick_ratio = 0.05;
+        let mut wl = Workload::new(options);
+
+        let mut injector = FaultInjector::new(seed, replica_count);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        // `run_with_faults` runs the per-tick invariants and the live state
+        // checker, which is where the divergence fired.
+        workload::run_with_faults(
+            &mut sim,
+            &mut wl,
+            &[client],
+            6_000,
+            u64::MAX,
+            &mut injector,
+            &mut invariants,
+        );
+
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &wl),
+        );
+        assert!(
+            oracle::settle_to_stable_view(&mut sim, &mut wl, 50_000, &mut invariants),
+            "metadata views never converged after the drain"
+        );
+        let report = oracle::assert_converged(&sim, &mut wl);
+        assert!(
+            report.ops_compared > 0,
+            "no committed metadata op was witnessed on two replicas, so this seed \
+             would pass on a diverged cluster"
         );
     }
 }
