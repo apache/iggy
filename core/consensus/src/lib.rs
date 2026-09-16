@@ -110,6 +110,11 @@ pub trait Pipeline {
     fn pop_request(&mut self) -> Option<Self::Request> {
         None
     }
+
+    /// Inspect the original queue head without transferring reply ownership.
+    fn request_head(&self) -> Option<&Self::Request> {
+        None
+    }
 }
 
 pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RoutedRequestHeader>;

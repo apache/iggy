@@ -73,6 +73,7 @@ where
     inbox: Receiver<ShardFrame>,
     reply_inbox: Receiver<ShardFrame>,
     poll_completion_capacity: usize,
+    partition_io_limits: Option<crate::PartitionIoLimits>,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
@@ -122,11 +123,18 @@ where
             inbox,
             reply_inbox,
             poll_completion_capacity,
+            partition_io_limits: None,
             shards_table,
             partition_consensus,
             coord_config,
             metrics,
         }
+    }
+
+    #[must_use]
+    pub const fn with_partition_io_limits(mut self, limits: crate::PartitionIoLimits) -> Self {
+        self.partition_io_limits = Some(limits);
+        self
     }
 
     /// Consume the builder and produce a fully wired [`BuiltShard`]. On
@@ -224,7 +232,7 @@ where
             None
         };
 
-        let shard = IggyShard::new(
+        let mut shard = IggyShard::new(
             self.identity,
             self.bus,
             self.on_replica_message,
@@ -242,6 +250,10 @@ where
             coordinator,
             self.metrics,
         )?;
+
+        if let Some(limits) = self.partition_io_limits {
+            shard.partition_io = crate::partition_io::PartitionIoLane::new(limits);
+        }
 
         Ok(BuiltShard { shard })
     }

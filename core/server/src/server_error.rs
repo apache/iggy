@@ -106,6 +106,8 @@ pub enum ServerError {
     InvalidReplyInboxCapacity { value: usize, max: usize },
     #[error("sharding.poll_completion_capacity must be in 1..={max}; got {value}")]
     InvalidPollCompletionCapacity { value: usize, max: usize },
+    #[error(transparent)]
+    InvalidPartitionIoLimits(#[from] shard::PartitionIoLimitsError),
     #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,

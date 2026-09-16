@@ -39,6 +39,7 @@ use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::task::Waker;
 use tracing::warn;
 
 /// RAII counter for live [`IggyPartitions::with_partition`] borrows. The
@@ -111,6 +112,8 @@ where
     tombstoned: RefCell<AHashSet<IggyNamespace>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
+    io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
+    loopback_ready: Rc<LoopbackReady>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
     /// `insert` / `remove` can assert the partitions vec is never mutated
     /// while a sanctioned non-pump read borrow is outstanding. Cannot fire for
@@ -119,6 +122,21 @@ where
     /// leave the count stuck.
     #[cfg(debug_assertions)]
     borrow_active: Cell<u32>,
+}
+
+#[derive(Default)]
+struct LoopbackReady {
+    partitions: RefCell<BTreeMap<IggyNamespace, crate::PartitionIncarnation>>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl LoopbackReady {
+    fn wake(&self) {
+        let waker = self.waker.borrow().clone();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
 }
 
 impl<B, SB> IggyPartitions<B, SB>
@@ -136,6 +154,8 @@ where
             tombstoned: RefCell::new(AHashSet::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             persistence_notifier: RefCell::new(None),
+            io_notifier: RefCell::new(None),
+            loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -152,6 +172,8 @@ where
             tombstoned: RefCell::new(AHashSet::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             persistence_notifier: RefCell::new(None),
+            io_notifier: RefCell::new(None),
+            loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -164,6 +186,61 @@ where
             }
         }
         *self.persistence_notifier.borrow_mut() = Some(notifier);
+    }
+
+    pub fn set_io_notifier(&self, notifier: crate::PartitionIoNotifier, bytes_max: usize) {
+        for partition in self.partitions() {
+            partition.set_io_notifier(Rc::clone(&notifier), bytes_max);
+        }
+        *self.io_notifier.borrow_mut() = Some((notifier, bytes_max));
+    }
+
+    /// Only physical result settlement may look through the tombstone gate.
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_io_owner(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B, SB>> {
+        let local = self.namespace_map().get(namespace).copied()?;
+        self.get_mut(local)
+    }
+
+    #[must_use]
+    pub fn take_ready_loopbacks(&self) -> BTreeMap<IggyNamespace, crate::PartitionIncarnation> {
+        std::mem::take(&mut *self.loopback_ready.partitions.borrow_mut())
+    }
+
+    #[must_use]
+    pub fn has_ready_loopbacks(&self) -> bool {
+        !self.loopback_ready.partitions.borrow().is_empty()
+    }
+
+    pub fn register_loopback_waker(&self, waker: &Waker) {
+        let mut registered = self.loopback_ready.waker.borrow_mut();
+        if registered
+            .as_ref()
+            .is_none_or(|previous| !previous.will_wake(waker))
+        {
+            *registered = Some(waker.clone());
+        }
+    }
+
+    /// Metadata shares the pump wake without entering partition readiness.
+    pub fn loopback_wake_notifier(&self) -> consensus::LoopbackNotifier {
+        let ready = Rc::clone(&self.loopback_ready);
+        consensus::LoopbackNotifier::new(move || ready.wake())
+    }
+
+    fn install_loopback_notifier(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) {
+        let ready = Rc::clone(&self.loopback_ready);
+        let incarnation = partition.incarnation();
+        partition
+            .consensus()
+            .set_loopback_notifier(Some(consensus::LoopbackNotifier::new(move || {
+                ready.partitions.borrow_mut().insert(namespace, incarnation);
+                ready.wake();
+            })));
     }
 
     pub const fn config(&self) -> &PartitionsConfig {
@@ -254,6 +331,10 @@ where
         if let Some(notifier) = self.persistence_notifier.borrow().as_ref() {
             partition.set_persistence_notifier(Rc::clone(notifier));
         }
+        if let Some((notifier, bytes_max)) = self.io_notifier.borrow().as_ref() {
+            partition.set_io_notifier(Rc::clone(notifier), *bytes_max);
+        }
+        self.install_loopback_notifier(namespace, &partition);
         partition.publish_current_offset();
         partition.set_consumer_group_offsets_reconcile_epoch(Rc::clone(
             &self.consumer_group_offsets_reconcile_epoch,
@@ -417,6 +498,12 @@ where
         );
 
         let partition = partitions.swap_remove(idx);
+        partition.invalidate_workerless_offset_files();
+        partition.consensus().set_loopback_notifier(None);
+        self.loopback_ready
+            .partitions
+            .borrow_mut()
+            .remove(namespace);
 
         if idx < partitions.len() {
             // `swap_remove` moved the tail entry into `idx`. Update the map
@@ -461,6 +548,15 @@ where
     /// shard's runtime (reconciler sets the fence synchronously before
     /// awaiting disk delete).
     pub fn tombstone(&self, namespace: IggyNamespace) {
+        if let Some(partition) = self.get_by_ns(&namespace) {
+            partition.stop_io_admission();
+            partition.invalidate_workerless_offset_files();
+            partition.consensus().set_loopback_notifier(None);
+        }
+        self.loopback_ready
+            .partitions
+            .borrow_mut()
+            .remove(&namespace);
         self.tombstoned.borrow_mut().insert(namespace);
     }
 
@@ -468,6 +564,9 @@ where
     /// `ReconcileOp::ConfirmRemove` after the partition is dropped.
     pub fn untombstone(&self, namespace: &IggyNamespace) {
         self.tombstoned.borrow_mut().remove(namespace);
+        if let Some(partition) = self.get_by_ns(namespace) {
+            self.install_loopback_notifier(*namespace, partition);
+        }
     }
 
     /// Snapshot read resources under a synchronous borrow on the owning pump.
@@ -828,6 +927,64 @@ mod tests {
         )
     }
 
+    #[compio::test]
+    async fn loopback_readiness_tracks_mount_tombstone_and_replacement() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let config = PartitionsConfig {
+            messages_required_to_save: 100,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024_u64),
+            validate_checksum: true,
+            segment_size: IggyByteSize::from(1024 * 1024_u64),
+            preallocate_segments: false,
+            encryptor: None,
+            path_layout: crate::PartitionPathLayout::default(),
+        };
+        let partitions = IggyPartitions::new(ShardId::new(0), config);
+        let first = build_partition();
+        let incarnation = first.incarnation();
+        let header = PrepareHeader {
+            command: Command::Prepare,
+            cluster: TEST_CLUSTER,
+            group: namespace.inner(),
+            checksum: 42,
+            ..Default::default()
+        };
+        consensus::send_prepare_ok(first.consensus(), &header, true).await;
+        partitions.insert(namespace, first);
+        assert_eq!(
+            partitions.take_ready_loopbacks().get(&namespace),
+            Some(&incarnation)
+        );
+        assert!(!partitions.has_ready_loopbacks());
+
+        partitions.tombstone(namespace);
+        assert!(!partitions.has_ready_loopbacks());
+        partitions.untombstone(&namespace);
+        assert!(
+            partitions.has_ready_loopbacks(),
+            "unmount cancellation restores queued work"
+        );
+        let retired = partitions.remove(&namespace).unwrap();
+        assert!(!partitions.has_ready_loopbacks());
+        let mut messages = Vec::new();
+        retired.consensus().drain_loopback_into(&mut messages);
+        consensus::send_prepare_ok(retired.consensus(), &header, true).await;
+        assert!(
+            !partitions.has_ready_loopbacks(),
+            "retired notifier was detached"
+        );
+
+        let replacement = build_partition();
+        assert_ne!(replacement.incarnation(), incarnation);
+        let replacement_incarnation = replacement.incarnation();
+        consensus::send_prepare_ok(replacement.consensus(), &header, true).await;
+        partitions.insert(namespace, replacement);
+        assert_eq!(
+            partitions.take_ready_loopbacks().get(&namespace),
+            Some(&replacement_incarnation)
+        );
+    }
+
     /// `build_partition` for a replicated group. The replica count is what
     /// decides whether the journal retains evicted entries for repair, so a
     /// single-replica partition cannot exercise anything that reads the ring.
@@ -928,12 +1085,7 @@ mod tests {
         // so the oldest resident offset advances to 3 (the gap edge).
         let prefix = partition.log.journal().inner.committed_prefix(3);
         assert_eq!(prefix.len(), 3, "ops for offsets 0,1,2 are the prefix");
-        partition
-            .log
-            .journal()
-            .inner
-            .evict_prefix(prefix.len())
-            .await;
+        partition.log.journal().inner.evict_prefix(prefix.len());
 
         // Snapshot the resident tail the way `build_poll_plan` does.
         let oldest_resident = partition.log.journal().inner.oldest_resident_offset();
@@ -1017,12 +1169,7 @@ mod tests {
         let commit_max = 3;
         let prefix = partition.log.journal().inner.committed_prefix(commit_max);
         assert_eq!(prefix.len(), 3, "the whole log is committed and flushable");
-        partition
-            .log
-            .journal()
-            .inner
-            .evict_prefix(prefix.len())
-            .await;
+        partition.log.journal().inner.evict_prefix(prefix.len());
 
         assert!(
             partition

@@ -299,6 +299,10 @@ pub(in crate::boot) async fn build_shard_for_thread(
         },
         metrics,
     )
+    .with_partition_io_limits(shard::PartitionIoLimits::new(
+        config.sharding.partition_io_capacity,
+        config.sharding.partition_io_bytes_max,
+    )?)
     .build()
     .map_err(ServerError::ShardConstruction)?;
 

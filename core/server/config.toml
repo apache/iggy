@@ -738,6 +738,11 @@ reply_inbox_capacity = 1024
 # separate capacity. This limits operation count, not retained message bytes.
 poll_completion_capacity = 1024
 
+# Active partition file jobs plus results awaiting owner acceptance per shard.
+partition_io_capacity = 16
+# Omit partition_io_bytes_max to resolve max(256 MiB, the largest legal job).
+# Charges include retained backing allocations, even for small visible slices.
+
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized
 # larger than typical TCP RTT times in-flight write-batch so writers

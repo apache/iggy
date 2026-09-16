@@ -1010,10 +1010,22 @@ async fn tear_down_owned_partition(
     // on_replicate / on_ack frames that haven't observed the queued
     // tombstone yet. Idempotent on retry: already-tombstoned namespace
     // stays tombstoned; already-removed shards_table row is a no-op.
+    let teardown = partitions
+        .get_io_owner(&ns)
+        .map(|partition| partition.capture_teardown());
     if !partitions.is_tombstoned(&ns) {
         partitions.tombstone(ns);
     }
     shards_table.remove(&ns);
+
+    if let Some(teardown) = teardown
+        && let Err(error) = teardown.drain().await
+    {
+        ctx.record_failure(ns, FailureCause::Delete, now);
+        ctx.shard.metrics().record_partition_reconcile_failure();
+        error!(shard = shard_id, ns_raw = ns.inner(), %error, "partition writers did not settle; retaining tombstone and files");
+        return;
+    }
 
     if let Err(err) = delete_partitions_from_disk(
         ns.stream_id(),

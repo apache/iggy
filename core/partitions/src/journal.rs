@@ -138,17 +138,7 @@ impl Storage for PartitionJournalMemStorage {
     type Buffer = JournalBuffer;
 
     async fn write_at(&self, _offset: usize, buf: Self::Buffer) -> io::Result<usize> {
-        let len = buf.len();
-        let entries = unsafe { &mut *self.entries.get() };
-        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
-        let current_offset = unsafe { &mut *self.current_offset.get() };
-
-        let index = entries.len();
-        offset_to_index.insert(*current_offset, index);
-        entries.push(buf);
-        *current_offset += len;
-
-        Ok(len)
+        Ok(self.write_at_sync(buf))
     }
 
     async fn read_at(&self, offset: usize, _buffer: Self::Buffer) -> io::Result<Self::Buffer> {
@@ -301,6 +291,20 @@ impl PartitionJournalMemStorage {
     fn current_offset(&self) -> usize {
         let current_offset = unsafe { &*self.current_offset.get() };
         *current_offset
+    }
+
+    fn write_at_sync(&self, buf: JournalBuffer) -> usize {
+        let len = buf.len();
+        let entries = unsafe { &mut *self.entries.get() };
+        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
+        let current_offset = unsafe { &mut *self.current_offset.get() };
+
+        let index = entries.len();
+        offset_to_index.insert(*current_offset, index);
+        entries.push(buf);
+        *current_offset += len;
+
+        len
     }
 }
 
@@ -538,50 +542,42 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         entries
     }
 
-    /// Entries forming the contiguous committed op-run from the front of the
-    /// journal up to and including `commit_max`, WITHOUT evicting them.
-    ///
-    /// A backup journals replicated prepares up to a full pipeline ahead of the
-    /// commit frontier. Only this gapless prefix may be flushed to a segment;
-    /// persisting the uncommitted tail would write per-replica-timing bytes to
-    /// disk (cross-replica divergence) and drop the headers those ops need when
-    /// their own commit later lands (`commit_min` wedge). Stopping at the first
-    /// gap keeps a post-gap op (even one `<= commit_max`) resident until its
-    /// predecessor lands, so nothing is persisted ahead of a replication hole.
-    /// Entries are append-ordered, op-ascending on a backup, so the prefix is
-    /// the front. Read-only: the caller evicts via `evict_prefix` only once the
-    /// bytes are durable, so a persist failure leaves the prefix recoverable.
+    /// Pin the contiguous resident prefix through `commit_max`, stopping at gaps.
+    /// Entries remain resident until their physical writes have been accepted.
     pub fn committed_prefix(&self, commit_max: u64) -> Vec<JournalBuffer> {
-        let headers = unsafe { &*self.headers.get() };
-        let entries = {
-            let inner = unsafe { &*self.inner.get() };
-            inner.storage.entries()
-        };
-        let mut committed = Vec::new();
-        let mut expected: Option<u64> = None;
-        for (header, entry) in headers.iter().zip(entries) {
-            let contiguous = expected.is_none_or(|next| header.op == next);
-            if header.op > commit_max || !contiguous {
-                break;
-            }
-            expected = Some(header.op + 1);
-            committed.push(entry);
-        }
-        committed
+        let count = self.committed_prefix_len(commit_max);
+        let inner = unsafe { &*self.inner.get() };
+        let entries = unsafe { &*inner.storage.entries.get() };
+        entries.iter().take(count).cloned().collect()
     }
 
-    /// Evict the first `count` entries (the committed prefix just read via
-    /// `committed_prefix`) and keep the rest resident with the op / offset /
-    /// timestamp indexes rebuilt for the compacted layout. Returns each retained
-    /// entry paired with its `RetainedBatchMeta`, surfaced from the re-append
-    /// decode, so the caller folds its accounting without decoding the tail a
-    /// second time. Re-appending replays the original bytes, valid when first
-    /// appended, so it cannot fail. Call only after the evicted bytes are
-    /// durable: on a persist failure the prefix must stay resident for recovery.
-    pub async fn evict_prefix(
-        &self,
-        count: usize,
-    ) -> Vec<(JournalBuffer, Option<RetainedBatchMeta>)> {
+    /// Inspect resident allocations without pinning extra payload references.
+    /// The closure cannot retain the borrowed entry vector across owner mutations.
+    pub(crate) fn with_entries<R>(&self, inspect: impl FnOnce(&[JournalBuffer]) -> R) -> R {
+        let inner = unsafe { &*self.inner.get() };
+        let entries = unsafe { &*inner.storage.entries.get() };
+        inspect(entries)
+    }
+
+    pub(crate) fn committed_prefix_len(&self, commit_max: u64) -> usize {
+        let headers = unsafe { &*self.headers.get() };
+        let mut previous: Option<u64> = None;
+        headers
+            .iter()
+            .take_while(|header| {
+                if header.op > commit_max
+                    || previous.is_some_and(|op| op.checked_add(1) != Some(header.op))
+                {
+                    return false;
+                }
+                previous = Some(header.op);
+                true
+            })
+            .count()
+    }
+
+    /// Remove the persisted prefix and return the retained entries with their batch metadata.
+    pub fn evict_prefix(&self, count: usize) -> Vec<(JournalBuffer, Option<RetainedBatchMeta>)> {
         let all_entries = {
             let inner = unsafe { &*self.inner.get() };
             inner.storage.drain()
@@ -639,10 +635,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let retained: Vec<JournalBuffer> = all_entries.collect();
         let mut result = Vec::with_capacity(retained.len());
         for entry in retained {
-            let meta = self
-                .append_with_meta(entry.clone())
-                .await
-                .expect("re-appending a retained journal entry must not fail");
+            let meta = self.append_with_meta_sync(entry.clone());
             result.push((entry, meta));
         }
 
@@ -659,10 +652,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// is infallible, so the push never runs ahead of a failed write. A future
     /// fallible `Storage` MUST roll the header push back on a write error (or
     /// write before pushing the header) or the zip desyncs.
-    async fn append_with_meta(
-        &self,
-        entry: JournalBuffer,
-    ) -> io::Result<Option<RetainedBatchMeta>> {
+    fn append_with_meta_sync(&self, entry: JournalBuffer) -> Option<RetainedBatchMeta> {
         let header_bytes = &entry[..PREPARE_HEADER_SIZE];
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
@@ -705,7 +695,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let storage_offset = {
             let inner = unsafe { &*self.inner.get() };
             let storage_offset = inner.storage.current_offset();
-            inner.storage.write_at(storage_offset, entry).await?;
+            inner.storage.write_at_sync(entry);
             storage_offset
         };
 
@@ -732,7 +722,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             timestamp_to_op.insert((timestamp, op), op);
         }
 
-        Ok(meta)
+        meta
     }
 
     pub fn is_empty(&self) -> bool {
@@ -786,7 +776,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             return entries;
         }
         // `headers[i]` pairs with storage index `i` (see the length-lock
-        // invariant on `append_with_meta`), so the op comes from the header
+        // invariant on `append_with_meta_sync`), so the op comes from the header
         // vector rather than a per-entry decode.
         let headers = unsafe { &*self.headers.get() };
         headers
@@ -824,25 +814,10 @@ where
         headers.iter().find(|header| header.op == op).copied()
     }
 
-    /// Whether `op` is resident, in O(log n) instead of `header_by_op`'s scan.
-    /// Callers that only need presence must use this: a miss is the common case
-    /// on the residency checks, and a miss is exactly when the scan walks the
-    /// whole vec.
+    /// Test residency without scanning the header vector.
     ///
-    /// It answers off `op_to_storage_offset`, so it is `header_by_op(op).is_some()`
-    /// everywhere except INSIDE [`Self::append_with_meta`], which pushes the
-    /// header before the storage write and inserts the offset after it: a task
-    /// that interleaves at that await sees the header without the offset and is
-    /// answered `false`. Both are cleared together at every clear site
-    /// ([`Self::commit`], [`Self::evict_prefix`], the restore path), so that
-    /// window is the only divergence.
-    ///
-    /// The window is unreachable for this journal: `PartitionJournalMemStorage`
-    /// writes to memory and its `write_at` never yields, so no task can observe
-    /// the half-inserted state. That is what lets `apply_repaired_prepare` lean
-    /// on this for idempotence, where a false negative would re-journal an op
-    /// the log already holds. A future yielding `Storage` has to insert the
-    /// offset before the write, or move that check back to the header vec.
+    /// Synchronous insertion and eviction keep the storage map and headers
+    /// consistent throughout every externally observable owner state.
     pub fn holds_op(&self, op: u64) -> bool {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         op_to_storage_offset.contains_key(&op)
@@ -1101,7 +1076,8 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     }
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
-        self.append_with_meta(entry).await.map(|_| ())
+        self.append_with_meta_sync(entry);
+        Ok(())
     }
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
@@ -1135,7 +1111,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
             inner.storage.drain()
         };
         // Positional against `headers` until the clear below (see the length-lock
-        // invariant on `append_with_meta`), so the ops are captured first.
+        // invariant on `append_with_meta_sync`), so the ops are captured first.
         let ops: Vec<u64> = {
             let headers = unsafe { &*self.headers.get() };
             headers.iter().map(|header| header.op).collect()
@@ -1155,9 +1131,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
                 continue;
             }
             // Replays bytes this journal already accepted once, so it cannot fail.
-            self.append_with_meta(entry)
-                .await
-                .expect("re-appending a retained journal entry must not fail");
+            self.append_with_meta_sync(entry);
         }
         Ok(removed)
     }
@@ -1552,7 +1526,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        journal.evict_prefix(8).await;
+        journal.evict_prefix(8);
         assert_eq!(journal.evicted_ring_occupancy().0, CAPACITY);
         assert_eq!(journal.repair_retained_from(), Some(5));
         for op in 1..=4 {
@@ -1582,7 +1556,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(journal.repair_retained_from(), Some(1));
-        journal.evict_prefix(8).await;
+        journal.evict_prefix(8);
         assert_eq!(journal.repair_retained_from(), Some(5));
         assert_eq!(journal.evicted_ring_occupancy().0, CAPACITY);
         journal.clear_all();
@@ -1604,7 +1578,7 @@ mod tests {
         }
         // `commit_messages` evicts the committed prefix inclusively, so the commit
         // point's own resident header goes with it.
-        journal.evict_prefix(2).await;
+        journal.evict_prefix(2);
         assert!(
             journal.header_by_op(2).is_none(),
             "the resident header at the commit point is gone after the flush"
@@ -1651,7 +1625,7 @@ mod tests {
             "read must not evict op 1"
         );
 
-        let retained = journal.evict_prefix(committed.len()).await;
+        let retained = journal.evict_prefix(committed.len());
         assert_eq!(
             retained.len(),
             2,
@@ -1679,7 +1653,7 @@ mod tests {
 
         // Advancing the frontier flushes the rest with no gap.
         let committed = journal.committed_prefix(4);
-        let rest = journal.evict_prefix(committed.len()).await;
+        let rest = journal.evict_prefix(committed.len());
         assert!(rest.is_empty(), "ops 3 and 4 flush on the next evict");
         assert!(journal.is_empty(), "journal is empty once all ops flushed");
     }
@@ -1711,7 +1685,7 @@ mod tests {
             .collect();
         assert_eq!(ops, vec![1, 2], "prefix stops before the op 3 gap");
 
-        let retained = journal.evict_prefix(committed.len()).await;
+        let retained = journal.evict_prefix(committed.len());
         assert_eq!(retained.len(), 1, "op 4 stays retained past the gap");
         assert!(journal.header_by_op(4).is_some(), "op 4 still resident");
     }
@@ -1882,7 +1856,7 @@ mod tests {
 
         // Eviction re-appends the retained tail: op 5 is above the floor and
         // comes back into the poll view, op 3 stays fenced.
-        journal.evict_prefix(2).await;
+        journal.evict_prefix(2);
         assert_eq!(entry_ops(&journal.resident_message_entries()), vec![5, 7]);
         assert_eq!(journal.resident_control_ops(), 2);
     }
@@ -1902,7 +1876,7 @@ mod tests {
             .expect("append");
         assert_eq!(journal.resident_control_ops(), 4);
 
-        journal.evict_prefix(2).await;
+        journal.evict_prefix(2);
         assert_eq!(journal.resident_control_ops(), 2, "ops 3 and 4 stay");
 
         journal.truncate_from(4).await.expect("truncate");

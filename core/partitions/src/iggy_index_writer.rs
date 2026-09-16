@@ -97,7 +97,7 @@ impl IggyIndexWriter {
         })
     }
 
-    /// Appends encoded sparse index bytes at the current write cursor and
+    /// Writes encoded sparse index bytes at a captured file position and
     /// returns how many bytes landed. The cursor is left where it was: the
     /// caller advances it with `advance` once the companion segment save has
     /// also succeeded.
@@ -105,21 +105,28 @@ impl IggyIndexWriter {
     /// # Errors
     ///
     /// Returns an error if the index bytes cannot be written or synced to disk.
-    pub(crate) async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
-        let saved = self.save_indexes_buffered(indexes).await?;
+    pub(crate) async fn save_indexes_at(
+        &self,
+        indexes: Vec<u8>,
+        position: u64,
+    ) -> Result<u64, IggyError> {
+        let saved = self.save_indexes_buffered_at(indexes, position).await?;
         if saved > 0 && self.fsync {
             self.fsync().await?;
         }
         Ok(saved)
     }
 
-    pub(crate) async fn save_indexes_buffered(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
+    pub(crate) async fn save_indexes_buffered_at(
+        &self,
+        indexes: Vec<u8>,
+        position: u64,
+    ) -> Result<u64, IggyError> {
         if indexes.is_empty() {
             return Ok(0);
         }
 
         let len = indexes.len();
-        let position = self.index_size_bytes.load(Ordering::Relaxed);
         let file = &self.file;
         (&*file)
             .write_all_at(indexes, position)
@@ -142,6 +149,10 @@ impl IggyIndexWriter {
     /// once both halves have succeeded.
     pub(crate) fn advance(&self, bytes: u64) {
         self.index_size_bytes.fetch_add(bytes, Ordering::Release);
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.index_size_bytes.load(Ordering::Relaxed)
     }
 
     /// Flushes buffered index file contents to disk.
@@ -172,9 +183,15 @@ mod tests {
         let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
             .await
             .unwrap();
-        assert_eq!(writer.save_indexes_buffered(vec![1; 32]).await.unwrap(), 32);
+        assert_eq!(
+            writer
+                .save_indexes_buffered_at(vec![1; 32], 0)
+                .await
+                .unwrap(),
+            32
+        );
         assert!(writer.fsync().await.is_err());
-        assert!(writer.save_indexes(vec![1; 32]).await.is_err());
+        assert!(writer.save_indexes_at(vec![1; 32], 0).await.is_err());
     }
 
     #[compio::test]

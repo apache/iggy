@@ -220,6 +220,12 @@ const fn consumer_kind_index(kind: ConsumerKind) -> usize {
 /// resolved at scrape time via the per-shard registry, not as a label.
 #[derive(Clone)]
 pub struct ShardMetrics {
+    partition_io_active_jobs: Gauge,
+    partition_io_queued_results: Gauge,
+    partition_io_charged_bytes: Gauge,
+    partition_io_wait_depth: Gauge,
+    partition_io_quarantined_jobs: Gauge,
+
     partition_wal_disk_bytes: Gauge,
     partition_wal_retained_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
@@ -291,6 +297,11 @@ impl ShardMetrics {
             .clone();
         let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
+            partition_io_active_jobs: Gauge::default(),
+            partition_io_queued_results: Gauge::default(),
+            partition_io_charged_bytes: Gauge::default(),
+            partition_io_wait_depth: Gauge::default(),
+            partition_io_quarantined_jobs: Gauge::default(),
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
@@ -408,6 +419,26 @@ impl ShardMetrics {
             "partition WAL writer failures",
             self.partition_wal_errors.clone(),
         );
+    }
+
+    pub(crate) fn set_partition_io(
+        &self,
+        active: usize,
+        queued: usize,
+        bytes: usize,
+        waiting: usize,
+        quarantined: usize,
+    ) {
+        self.partition_io_active_jobs
+            .set(i64::try_from(active).unwrap_or(i64::MAX));
+        self.partition_io_queued_results
+            .set(i64::try_from(queued).unwrap_or(i64::MAX));
+        self.partition_io_charged_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.partition_io_wait_depth
+            .set(i64::try_from(waiting).unwrap_or(i64::MAX));
+        self.partition_io_quarantined_jobs
+            .set(i64::try_from(quarantined).unwrap_or(i64::MAX));
     }
 
     /// Republished by every partition sweep: what the repair rings on this
@@ -766,8 +797,35 @@ impl ShardMetrics {
     /// `[http.metrics]` scrape encodes it. Names are registered without the
     /// `_total` suffix; the prometheus text exposition appends it for
     /// counters.
+    #[allow(clippy::too_many_lines)]
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        registry.register(
+            "partition_io_active_jobs",
+            "partition I/O active jobs",
+            self.partition_io_active_jobs.clone(),
+        );
+        registry.register(
+            "partition_io_queued_results",
+            "partition I/O queued results",
+            self.partition_io_queued_results.clone(),
+        );
+        registry.register(
+            "partition_io_charged_bytes",
+            "partition I/O charged bytes",
+            self.partition_io_charged_bytes.clone(),
+        );
+        registry.register(
+            "partition_io_wait_depth",
+            "partition I/O wait depth",
+            self.partition_io_wait_depth.clone(),
+        );
+        registry.register(
+            "partition_io_quarantined_jobs",
+            "partition I/O quarantined jobs",
+            self.partition_io_quarantined_jobs.clone(),
+        );
+
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",

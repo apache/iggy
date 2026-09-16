@@ -551,6 +551,7 @@ mod tests {
             futures::executor::block_on(partition.flush_committed_messages(config))
                 .expect("the in-memory flush must succeed");
         }
+        sim.run_pumps();
         (sim, namespace)
     }
 

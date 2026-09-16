@@ -567,6 +567,10 @@ pub(in crate::boot) fn validate_sharding_runtime_knobs(
     sharding: &configs::sharding::ShardingConfig,
 ) -> Result<(), ServerError> {
     let inbox_capacity = sharding.inbox_capacity;
+    shard::PartitionIoLimits::new(
+        sharding.partition_io_capacity,
+        sharding.partition_io_bytes_max,
+    )?;
     if inbox_capacity == 0 || inbox_capacity > INBOX_CAPACITY_MAX {
         return Err(ServerError::InvalidInboxCapacity {
             value: inbox_capacity,

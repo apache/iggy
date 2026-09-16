@@ -51,6 +51,9 @@ server_common = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints.clippy]
 enum_glob_use = "deny"
 pedantic = "deny"
