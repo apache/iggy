@@ -7386,6 +7386,7 @@ dependencies = [
  "dashmap",
  "iggy_connector_sdk",
  "opendal 0.59.1",
+ "secrecy",
  "serde",
  "simd-json",
  "tempfile",

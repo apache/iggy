@@ -29,6 +29,7 @@ use iggy_connector_sdk::{
     sink_connector,
 };
 use opendal::{Buffer, Operator};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tracing::{debug, error, info};
 
@@ -52,7 +53,7 @@ pub struct OpenDalSinkConfig {
     #[serde(default = "default_path_template")]
     pub path_template: String,
     #[serde(default)]
-    pub options: BTreeMap<String, String>,
+    pub options: BTreeMap<String, SecretString>,
     #[serde(default)]
     pub max_attempts: Option<u32>,
     #[serde(default)]
@@ -175,8 +176,12 @@ impl Sink for OpenDalSink {
             ));
         }
 
-        opendal::init_default_registry();
-        let options = self.config.options.clone();
+        opendal::install_default();
+        let options = self
+            .config
+            .options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.expose_secret().to_owned()));
         let operator = Operator::via_iter(service, options).map_err(|error| {
             Error::InitError(format!(
                 "Failed to create OpenDAL service '{service}': {error}"
@@ -291,6 +296,11 @@ mod tests {
 
     use iggy_connector_sdk::{Payload, Schema, Sink};
     use tempfile::TempDir;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::timeout,
+    };
 
     use super::*;
 
@@ -299,7 +309,7 @@ mod tests {
             service: "fs".to_string(),
             path_prefix: Some("iggy/messages".to_string()),
             path_template: default_path_template(),
-            options: BTreeMap::from([("root".to_string(), root.to_string())]),
+            options: BTreeMap::from([("root".to_string(), SecretString::from(root.to_string()))]),
             max_attempts: Some(1),
             retry_delay: None,
             verbose_logging: None,
@@ -326,6 +336,189 @@ mod tests {
 
         assert!(output.contains("root"));
         assert!(!output.contains("/secret/storage/path"));
+    }
+
+    #[test]
+    fn given_temporary_s3_failure_when_consuming_should_retry_write() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test server should bind");
+            let endpoint = format!(
+                "http://{}",
+                listener
+                    .local_addr()
+                    .expect("test server address should be available")
+            );
+            let mut config = test_config("/tmp");
+            config.service = "s3".to_string();
+            config.max_attempts = Some(2);
+            config.retry_delay = Some("1ms".to_string());
+            config.options = BTreeMap::from([
+                (
+                    "bucket".to_string(),
+                    SecretString::from("test-bucket".to_string()),
+                ),
+                (
+                    "region".to_string(),
+                    SecretString::from("us-east-1".to_string()),
+                ),
+                ("endpoint".to_string(), SecretString::from(endpoint)),
+                (
+                    "access_key_id".to_string(),
+                    SecretString::from("access-key".to_string()),
+                ),
+                (
+                    "secret_access_key".to_string(),
+                    SecretString::from("secret-key".to_string()),
+                ),
+            ]);
+            let mut sink = OpenDalSink::new(1, config);
+
+            let server = async {
+                for request_index in 0..3 {
+                    let (mut connection, _) = listener
+                        .accept()
+                        .await
+                        .expect("OpenDAL should connect to the test server");
+                    let mut request = [0; 4096];
+                    let bytes_read = connection
+                        .read(&mut request)
+                        .await
+                        .expect("test server should read the request");
+                    let request = String::from_utf8_lossy(&request[..bytes_read]);
+
+                    let (status, headers, body) = match request_index {
+                        0 => {
+                            assert!(request.starts_with("GET "));
+                            (
+                                "200 OK",
+                                "",
+                                concat!(
+                                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                                    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                                    "<Name>test-bucket</Name><Prefix></Prefix><KeyCount>0</KeyCount>",
+                                    "<MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated>",
+                                    "</ListBucketResult>"
+                                ),
+                            )
+                        }
+                        1 => {
+                            assert!(request.starts_with("PUT "));
+                            (
+                                "500 Internal Server Error",
+                                "",
+                                concat!(
+                                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                                    "<Error><Code>InternalError</Code>",
+                                    "<Message>temporary failure</Message></Error>"
+                                ),
+                            )
+                        }
+                        2 => {
+                            assert!(request.starts_with("PUT "));
+                            ("200 OK", "ETag: \"test-etag\"\r\n", "")
+                        }
+                        _ => unreachable!(),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n{headers}\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    connection
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("test server should write the response");
+                }
+            };
+            let client = async {
+                sink.open().await.expect("S3 service should open");
+                let topic_metadata = TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "orders".to_string(),
+                };
+                let messages_metadata = MessagesMetadata {
+                    partition_id: 2,
+                    current_offset: 4,
+                    schema: Schema::Raw,
+                };
+                sink.consume(
+                    &topic_metadata,
+                    messages_metadata,
+                    vec![test_message(4, Payload::Raw(vec![1, 2, 3]))],
+                )
+                .await
+                .expect("temporary S3 error should be retried");
+            };
+
+            let (server_result, client_result) = tokio::join!(
+                timeout(Duration::from_secs(5), server),
+                timeout(Duration::from_secs(5), client)
+            );
+            server_result.expect("OpenDAL should complete three requests");
+            client_result.expect("OpenDAL operations should finish");
+        });
+    }
+
+    #[test]
+    fn given_unopened_sink_when_consuming_should_return_init_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let sink = OpenDalSink::new(1, test_config("/tmp"));
+            let topic_metadata = TopicMetadata {
+                stream: "events".to_string(),
+                topic: "orders".to_string(),
+            };
+            let messages_metadata = MessagesMetadata {
+                partition_id: 2,
+                current_offset: 4,
+                schema: Schema::Raw,
+            };
+
+            let error = sink
+                .consume(&topic_metadata, messages_metadata, Vec::new())
+                .await
+                .expect_err("unopened sink should reject messages");
+
+            assert!(matches!(error, Error::InitError(_)));
+        });
+    }
+
+    #[test]
+    fn given_unwritable_fs_service_when_consuming_should_return_storage_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let temp_dir = TempDir::new().expect("temp directory should be created");
+            let root = temp_dir.path().to_path_buf();
+            let mut sink = OpenDalSink::new(1, test_config(&root.to_string_lossy()));
+            sink.open().await.expect("sink should open");
+            fs::remove_dir_all(&root).expect("storage root should be removed");
+            fs::write(&root, b"not a directory").expect("storage root should become a file");
+
+            let topic_metadata = TopicMetadata {
+                stream: "events".to_string(),
+                topic: "orders".to_string(),
+            };
+            let messages_metadata = MessagesMetadata {
+                partition_id: 2,
+                current_offset: 4,
+                schema: Schema::Raw,
+            };
+            let error = sink
+                .consume(
+                    &topic_metadata,
+                    messages_metadata,
+                    vec![test_message(4, Payload::Raw(vec![1, 2, 3]))],
+                )
+                .await
+                .expect_err("unwritable storage should reject the message");
+
+            assert!(matches!(error, Error::CannotStoreData(_)));
+            assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 0);
+            assert_eq!(sink.write_errors.load(Ordering::Relaxed), 1);
+        });
     }
 
     #[test]
