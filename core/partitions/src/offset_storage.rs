@@ -20,8 +20,17 @@ use compio::{
     io::{AsyncReadAt, AsyncReadAtExt, AsyncWriteAtExt},
 };
 use iggy_common::{IggyError, calculate_checksum};
-use std::{io, path::Path};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::warn;
+
+#[cfg(unix)]
+use nix::sys::resource::{Resource, getrlimit};
 
 const OFFSET_SIZE: usize = core::mem::size_of::<u64>();
 const CHECKSUM_SIZE: usize = core::mem::size_of::<u64>();
@@ -44,6 +53,192 @@ const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
 
 /// `[generation][created_revision]`, both LE u64.
 const PURGE_GENERATION_RECORD_SIZE: usize = 2 * OFFSET_SIZE;
+
+#[cfg(unix)]
+const OFFSET_FILES_TOTAL_MAX: usize = 1024;
+const OFFSET_FILES_PER_PARTITION_MAX: usize = 64;
+#[cfg(unix)]
+const OFFSET_FILE_LIMIT_DIVISOR: u64 = 4;
+
+static RETAINED_OFFSET_FILES: AtomicUsize = AtomicUsize::new(0);
+static OFFSET_FILE_LIMIT: LazyLock<usize> = LazyLock::new(|| {
+    #[cfg(unix)]
+    let limit = getrlimit(Resource::RLIMIT_NOFILE).map_or(0, |(soft, _)| {
+        usize::try_from(soft / OFFSET_FILE_LIMIT_DIVISOR)
+            .unwrap_or(OFFSET_FILES_TOTAL_MAX)
+            .min(OFFSET_FILES_TOTAL_MAX)
+    });
+    #[cfg(not(unix))]
+    let limit = 0;
+    limit
+});
+
+/// The permit follows the descriptor through checkout and checkpoint sync.
+pub struct RetainedOffsetFile<F> {
+    pub(crate) file: F,
+    permit: Rc<OffsetFilePermit>,
+}
+
+pub(crate) struct OffsetFilePermit {
+    partition_count: Rc<Cell<usize>>,
+    valid: Cell<bool>,
+}
+
+enum OffsetFileEntry<F> {
+    Cached(RetainedOffsetFile<F>),
+    CheckedOut(Weak<OffsetFilePermit>),
+}
+
+/// One cache owner per partition. Invalidation also marks checked-out writers,
+/// so returning a completed write cannot cache an obsolete inode.
+pub(crate) struct RetainedOffsetFiles<F> {
+    files: RefCell<HashMap<String, OffsetFileEntry<F>>>,
+    retired: RefCell<Vec<RetainedOffsetFile<F>>>,
+    count: Rc<Cell<usize>>,
+}
+
+impl<F> Default for RetainedOffsetFiles<F> {
+    fn default() -> Self {
+        Self {
+            files: RefCell::new(HashMap::new()),
+            retired: RefCell::new(Vec::new()),
+            count: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl<F> RetainedOffsetFiles<F> {
+    pub(crate) fn take(&self, path: &str) -> Option<RetainedOffsetFile<F>> {
+        let mut files = self.files.borrow_mut();
+        let entry = files.get_mut(path)?;
+        let OffsetFileEntry::Cached(retained) = entry else {
+            return None;
+        };
+        let placeholder = OffsetFileEntry::CheckedOut(Rc::downgrade(&retained.permit));
+        match std::mem::replace(entry, placeholder) {
+            OffsetFileEntry::Cached(retained) => Some(retained),
+            OffsetFileEntry::CheckedOut(_) => unreachable!("checked cached entry"),
+        }
+    }
+
+    pub(crate) fn checkout(&self, path: &str) -> Option<(Option<F>, Rc<OffsetFilePermit>)> {
+        if let Some(retained) = self.take(path) {
+            return Some((Some(retained.file), retained.permit));
+        }
+        if self.files.borrow().get(path).is_some_and(|entry| {
+            matches!(entry, OffsetFileEntry::CheckedOut(permit) if permit.strong_count() != 0)
+        }) {
+            return None;
+        }
+        self.reserve(path).map(|permit| (None, permit))
+    }
+
+    pub(crate) fn reserve(&self, path: &str) -> Option<Rc<OffsetFilePermit>> {
+        if self.count.get() >= OFFSET_FILES_PER_PARTITION_MAX {
+            return None;
+        }
+        let permit = OffsetFilePermit::acquire(Rc::clone(&self.count))?;
+        self.retire(path);
+        let mut files = self.files.borrow_mut();
+        files.retain(|_, entry| {
+            !matches!(entry, OffsetFileEntry::CheckedOut(permit) if permit.strong_count() == 0)
+        });
+        files.insert(
+            path.to_owned(),
+            OffsetFileEntry::CheckedOut(Rc::downgrade(&permit)),
+        );
+        Some(permit)
+    }
+
+    pub(crate) fn put(&self, path: &str, file: F, permit: Rc<OffsetFilePermit>) {
+        let retained = RetainedOffsetFile { file, permit };
+        if retained.permit.valid.get() {
+            let mut files = self.files.borrow_mut();
+            if let Some(entry) = files.get_mut(path)
+                && matches!(entry, OffsetFileEntry::CheckedOut(permit) if permit.as_ptr() == Rc::as_ptr(&retained.permit))
+            {
+                *entry = OffsetFileEntry::Cached(retained);
+                return;
+            }
+        }
+        self.retired.borrow_mut().push(retained);
+    }
+
+    pub(crate) fn retire(&self, path: &str) {
+        let entry = self.files.borrow_mut().remove(path);
+        if let Some(entry) = entry {
+            self.retire_entry(entry);
+        }
+    }
+
+    pub(crate) fn retire_all(&self) {
+        for (_, entry) in self.files.borrow_mut().drain() {
+            self.retire_entry(entry);
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.retire_all();
+        self.discard_retired();
+    }
+
+    pub(crate) fn discard_retired(&self) {
+        self.retired.borrow_mut().clear();
+    }
+
+    pub(crate) fn retired_count(&self) -> usize {
+        self.retired.borrow().len()
+    }
+
+    pub(crate) fn take_checkpoint(&self) -> (Vec<RetainedOffsetFile<F>>, BTreeSet<PathBuf>) {
+        let paths = self
+            .files
+            .borrow()
+            .iter()
+            .filter(|(_, entry)| matches!(entry, OffsetFileEntry::Cached(_)))
+            .map(|(path, _)| PathBuf::from(path))
+            .collect();
+        self.retire_all();
+        (std::mem::take(&mut *self.retired.borrow_mut()), paths)
+    }
+
+    fn retire_entry(&self, entry: OffsetFileEntry<F>) {
+        match entry {
+            OffsetFileEntry::Cached(retained) => {
+                retained.permit.valid.set(false);
+                self.retired.borrow_mut().push(retained);
+            }
+            OffsetFileEntry::CheckedOut(permit) => {
+                if let Some(permit) = permit.upgrade() {
+                    permit.valid.set(false);
+                }
+            }
+        }
+    }
+}
+
+impl OffsetFilePermit {
+    fn acquire(partition_count: Rc<Cell<usize>>) -> Option<Rc<Self>> {
+        RETAINED_OFFSET_FILES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < *OFFSET_FILE_LIMIT).then_some(count + 1)
+            })
+            .ok()?;
+        partition_count.set(partition_count.get() + 1);
+        Some(Rc::new(Self {
+            partition_count,
+            valid: Cell::new(true),
+        }))
+    }
+}
+
+impl Drop for OffsetFilePermit {
+    fn drop(&mut self) {
+        self.partition_count
+            .set(self.partition_count.get().wrapping_sub(1));
+        RETAINED_OFFSET_FILES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// What a consumer-offset file was found to hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,6 +691,75 @@ mod tests {
                 checksummed: true
             }
         );
+    }
+
+    #[test]
+    fn retained_files_keep_permits_through_checkout_and_checkpoint() {
+        let cache = RetainedOffsetFiles::default();
+        for index in 0..OFFSET_FILES_PER_PARTITION_MAX {
+            let path = index.to_string();
+            let (file, permit) = cache.checkout(&path).unwrap();
+            assert!(file.is_none());
+            cache.put(&path, index, permit);
+        }
+        let checked_out = cache.take("0").unwrap();
+        assert_eq!(cache.count.get(), OFFSET_FILES_PER_PARTITION_MAX);
+        assert!(
+            cache.checkout("overflow").is_none(),
+            "checkout retains capacity"
+        );
+        cache.retire("1");
+        assert!(
+            cache.checkout("overflow").is_none(),
+            "retired files retain capacity"
+        );
+        let (checkpoint, paths) = cache.take_checkpoint();
+        assert_eq!(paths.len(), OFFSET_FILES_PER_PARTITION_MAX - 2);
+        assert!(
+            cache.checkout("overflow").is_none(),
+            "queued checkpoint owns its descriptors"
+        );
+        drop(checkpoint);
+        assert_eq!(cache.count.get(), 1, "checked-out descriptor is still open");
+        drop(checked_out);
+        assert_eq!(cache.count.get(), 0);
+        assert!(cache.checkout("overflow").is_some());
+    }
+
+    #[test]
+    fn invalidation_prevents_late_return_from_replacing_a_new_inode() {
+        let cache = RetainedOffsetFiles::default();
+        let (file, original) = cache.checkout("offset").unwrap();
+        assert!(file.is_none());
+        cache.put("offset", 7, original);
+        let (file, original) = cache.checkout("offset").unwrap();
+        assert_eq!(file, Some(7));
+        cache.retire("offset");
+        let (_, replacement) = cache.checkout("offset").unwrap();
+        cache.put("offset", 9, replacement);
+        cache.put("offset", 7, original);
+        assert_eq!(cache.retired_count(), 1);
+        let replacement = cache.take("offset").unwrap();
+        assert_eq!(replacement.file, 9);
+        cache.clear();
+        assert_eq!(
+            cache.count.get(),
+            1,
+            "clear cannot release a checked-out descriptor"
+        );
+        drop(replacement);
+        assert_eq!(cache.count.get(), 0);
+    }
+
+    #[test]
+    fn abandoned_cold_opens_do_not_accumulate_cache_entries_or_permits() {
+        let cache = RetainedOffsetFiles::<u64>::default();
+        for index in 0..OFFSET_FILES_PER_PARTITION_MAX * 2 {
+            let (_, permit) = cache.checkout(&index.to_string()).unwrap();
+            drop(permit);
+            assert_eq!(cache.count.get(), 0);
+            assert_eq!(cache.files.borrow().len(), 1);
+        }
     }
 
     #[test]

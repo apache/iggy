@@ -483,12 +483,15 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                 partition.commit_journal(&config).await;
             }
         }
-        let reply = owner
-            .await_partition_submit(ticket)
-            .await
-            .unwrap()
-            .try_into_typed::<ReplyHeader>()
-            .unwrap();
+        let futures::future::Either::Left((reply, _)) = futures::future::select(
+            Box::pin(owner.await_partition_submit(ticket)),
+            pump.as_mut(),
+        )
+        .await
+        else {
+            panic!("pump stopped before the admitted offset write completed");
+        };
+        let reply = reply.unwrap().try_into_typed::<ReplyHeader>().unwrap();
         let header = reply.header();
         let status = if admitted {
             0

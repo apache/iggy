@@ -1019,7 +1019,9 @@ mod tests {
     use iggy_common::calculate_checksum;
     use message_bus::{BusMessage, SendError};
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
+    use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     /// `PrepareHeader`'s alignment, which every suffix body has to satisfy.
     const BODY_ALIGN: usize = align_of::<PrepareHeader>();
@@ -1481,6 +1483,37 @@ mod tests {
         buf.clear();
         consensus.drain_loopback_into(&mut buf);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn loopback_notifier_registers_existing_work_and_only_notifies_new_edges() {
+        let consensus = Rc::new(VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new()));
+        consensus.init();
+        let message =
+            || Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).into_generic();
+        consensus.push_loopback(message());
+        let notifications = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&notifications);
+        let owner = Rc::downgrade(&consensus);
+        consensus.set_loopback_notifier(Some(crate::LoopbackNotifier::new(move || {
+            assert!(
+                owner.upgrade().unwrap().has_loopback(),
+                "notification releases the queue borrow"
+            );
+            observed.set(observed.get() + 1);
+        })));
+        assert_eq!(notifications.get(), 1);
+        consensus.push_loopback(message());
+        assert_eq!(notifications.get(), 1);
+        let mut messages = Vec::new();
+        consensus.drain_loopback_into(&mut messages);
+        assert_eq!(messages.len(), 2);
+        consensus.push_loopback(message());
+        assert_eq!(notifications.get(), 2);
+        consensus.set_loopback_notifier(None);
+        consensus.drain_loopback_into(&mut messages);
+        consensus.push_loopback(message());
+        assert_eq!(notifications.get(), 2, "retired owners do not notify");
     }
 
     #[test]

@@ -321,6 +321,7 @@ impl ConsumerOffsetCapacity {
     }
 
     /// See [`Self::set_pending_count`] for the serialization contract.
+    #[cfg(test)]
     pub(crate) fn release_reservation(&self, id: u32) {
         let mut pending = self.pending.borrow_mut();
         let Some(count) = pending.get_mut(&id) else {

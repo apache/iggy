@@ -19,6 +19,8 @@ pub mod builder;
 pub mod config;
 pub mod coordinator;
 pub mod metrics;
+mod partition_io;
+pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
 mod poll;
 mod router;
 pub mod shards_table;
@@ -598,6 +600,8 @@ impl std::ops::Deref for TaggedSender {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ShardCtorError {
+    #[error(transparent)]
+    PartitionIoLimits(#[from] PartitionIoLimitsError),
     #[error(
         "senders[{index}] carries shard_id {actual}; inter-shard vec must be in canonical \
          order (senders[i].shard_id() == i)"
@@ -1009,20 +1013,6 @@ impl<M> RestorableMetadataStm for M where
         + metadata::stm::snapshot::RestoreSnapshotInPlace<metadata::stm::snapshot::MetadataSnapshot>
 {
 }
-
-/// Chunk size for state-transfer artifact pulls. Lockstep (one in flight),
-/// so the bounded per-peer bus queue can never drop a burst tail. Clamped
-/// against the live bus ceiling by
-/// [`IggyShard::state_chunk_len_max`] rather than assumed to fit.
-/// Superblock writes issued at once when a whole shard's groups need one in the
-/// same pass: a node-wide view change, or a graceful stop collapsing every
-/// partition's offset reservation.
-///
-/// Each write is a create + write + 2 fsyncs. Serial, a few hundred groups on
-/// ordinary storage overrun the view-change escalation window (and, on the stop
-/// path, a supervisor's kill timeout); unbounded, they dump the whole burst of
-/// fds and fsyncs onto the reactor in one pass.
-const SUPERBLOCK_FAN_OUT: usize = 16;
 
 const STATE_CHUNK_LEN: u32 = 256 * 1024;
 
@@ -1491,6 +1481,8 @@ where
     /// displace their results. Only the owner pump validates completions.
     poll_completions: poll::completion::PollCompletionLane,
     deferred_polls: poll::deferred::DeferredPolls,
+    partition_io: partition_io::PartitionIoLane<SB>,
+    cooperative_events: Cell<usize>,
 
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
@@ -1781,6 +1773,10 @@ where
         let ShardIdentity { id, name } = identity;
         let poll_completions =
             poll::completion::PollCompletionLane::new(poll_completion_capacity, &metrics);
+        let partition_io = partition_io::PartitionIoLane::new(PartitionIoLimits::new(
+            partition_io::DEFAULT_PARTITION_IO_CAPACITY,
+            None,
+        )?);
         Ok(Self {
             id,
             name,
@@ -1796,6 +1792,8 @@ where
             reply_inbox,
             poll_completions,
             deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
+            partition_io,
+            cooperative_events: Cell::new(0),
             shards_table,
             partition_consensus,
             coordinator,
@@ -2268,6 +2266,9 @@ where
     /// directly via [`on_message`](Self::on_message) instead of the TCP /
     /// fd-transfer path. Installs no-op connection handlers because the
     /// simulator never receives a replica connection-setup frame.
+    ///
+    /// # Panics
+    /// Panics when the target cannot address the largest supported partition I/O job.
     #[must_use]
     pub fn without_inbox(
         identity: ShardIdentity,
@@ -2318,6 +2319,11 @@ where
                 POLL_COMPLETION_CAPACITY,
                 &metrics,
             ),
+            partition_io: partition_io::PartitionIoLane::new(
+                PartitionIoLimits::new(partition_io::DEFAULT_PARTITION_IO_CAPACITY, None)
+                    .expect("simulator supports the production partition I/O limits"),
+            ),
+            cooperative_events: Cell::new(0),
             shards_table,
             partition_consensus,
             metrics,
@@ -4162,27 +4168,10 @@ where
         self.plane.on_ack(prepare_ok).await;
     }
 
-    /// Drain and dispatch loopback messages for each consensus plane.
-    ///
-    /// Each plane's loopback is dispatched directly to that plane's `on_ack`,
-    /// avoiding a flat merge that would require re-routing through `on_message`.
-    ///
-    /// Invariant: planes do not produce loopback messages FOR EACH OTHER.
-    /// `on_ack` never pushes to another plane's loopback, so draining
-    /// metadata before partitions is order-independent. Within its own
-    /// plane, `on_ack` CAN push loopback entries (a metadata commit promotes
-    /// buffered requests, and each promoted prepare self-acks through
-    /// `send_or_loopback(self)`) -- `repair_primary_self_acks` drains those
-    /// residuals itself; see its interleaved drain.
-    ///
-    /// # Panics
-    /// Panics if a loopback message is not a valid `PrepareOk` message.
+    /// Service a snapshot in metadata/namespace/FIFO order. New self-acks
+    /// stay in their consensus queues until the following round.
     #[allow(clippy::future_not_send)]
-    pub async fn process_loopback(
-        &self,
-        buf: &mut Vec<Message<GenericHeader>>,
-        namespace_scratch: &mut Vec<IggyNamespace>,
-    ) -> usize
+    pub(crate) async fn process_loopback(&self, round: &mut router::LoopbackRound) -> usize
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -4197,47 +4186,73 @@ where
                 metadata::stm::snapshot::MetadataSnapshot,
             >,
     {
-        debug_assert!(buf.is_empty(), "buf must be empty on entry");
-        debug_assert!(
-            namespace_scratch.is_empty(),
-            "namespace_scratch must be empty on entry",
-        );
-
-        let mut total = 0;
         let planes = self.plane.inner();
-
-        if let Some(ref consensus) = planes.0.consensus {
-            consensus.drain_loopback_into(buf);
-            let count = buf.len();
-            total += count;
-            for msg in buf.drain(..) {
-                let typed: Message<PrepareOkHeader> = msg
-                    .try_into_typed()
-                    .expect("loopback queue must only contain PrepareOk messages");
-                planes.0.on_ack(typed).await;
+        if round.entries.is_empty() {
+            if let Some(ref consensus) = planes.0.consensus {
+                consensus.drain_loopback_into(&mut round.scratch);
+                round
+                    .entries
+                    .extend(round.scratch.drain(..).map(|message| (None, message)));
+            }
+            let ready = planes.1.0.take_ready_loopbacks();
+            for (namespace, incarnation) in ready {
+                let Some(partition) = planes
+                    .1
+                    .0
+                    .get_by_ns(&namespace)
+                    .filter(|partition| partition.incarnation() == incarnation)
+                else {
+                    continue;
+                };
+                partition
+                    .consensus()
+                    .drain_loopback_into(&mut round.scratch);
+                round.entries.extend(
+                    round
+                        .scratch
+                        .drain(..)
+                        .map(|message| (Some(incarnation), message)),
+                );
             }
         }
 
-        namespace_scratch.extend(planes.1.0.namespaces().copied());
-        for namespace in namespace_scratch.drain(..) {
-            // `get_by_ns` returns `None` for tombstoned namespaces: skip
-            // draining their loopback queue so we don't surface PrepareOk
-            // frames targeting a partition the reconciler is tearing down.
-            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
-                continue;
+        let mut serviced = 0;
+        while serviced < router::COOPERATIVE_EVENT_BUDGET {
+            let Some((incarnation, message)) = round.entries.pop_front() else {
+                break;
             };
-            partition.consensus().drain_loopback_into(buf);
-        }
-        let count = buf.len();
-        total += count;
-        for msg in buf.drain(..) {
-            let typed: Message<PrepareOkHeader> = msg
+            let message: Message<PrepareOkHeader> = message
                 .try_into_typed()
                 .expect("loopback queue must only contain PrepareOk messages");
-            planes.1.0.on_ack(typed).await;
+            match incarnation {
+                None => planes.0.on_ack(message).await,
+                Some(incarnation) => {
+                    let namespace = IggyNamespace::from_raw(message.header().group);
+                    if planes
+                        .1
+                        .0
+                        .get_by_ns(&namespace)
+                        .is_some_and(|partition| partition.incarnation() == incarnation)
+                    {
+                        planes.1.0.on_ack(message).await;
+                    }
+                }
+            }
+            serviced += 1;
+            self.cooperate().await;
         }
+        serviced
+    }
 
-        total
+    fn has_pending_loopback(&self, round: &router::LoopbackRound) -> bool {
+        !round.entries.is_empty()
+            || self.plane.partitions().has_ready_loopbacks()
+            || self
+                .plane
+                .metadata()
+                .consensus
+                .as_ref()
+                .is_some_and(VsrConsensus::has_loopback)
     }
 
     /// Simulator-only: mutates `IggyPartitions` off the pump task, bypassing the
@@ -4497,6 +4512,10 @@ where
         ) else {
             return;
         };
+        if partition.history_is_busy() {
+            partition.defer_view_transition(MessageBag::StartViewChange(msg));
+            return;
+        }
         refresh_partition_dvc_suffix(partition);
         let consensus = partition.consensus();
         let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
@@ -4562,6 +4581,10 @@ where
         ) else {
             return;
         };
+        if partition.history_is_busy() {
+            partition.defer_view_transition(MessageBag::DoViewChange(msg));
+            return;
+        }
         refresh_partition_dvc_suffix(partition);
         let consensus = partition.consensus();
         let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
@@ -4697,21 +4720,6 @@ where
             return;
         }
 
-        let config = planes.1.0.config();
-        // Counted BEFORE the `&mut partition` below exists: the scan takes
-        // shared borrows of every partition (see `arm_partition_transfer`).
-        // Gated on the arm actually being possible, so a stale or misdirected
-        // frame -- and every StartView for a group that is not awaiting a
-        // transfer, which is all of them during an ordinary view change -- does
-        // not pay a node-wide scan. (A shard-level counter would remove the scan
-        // entirely, but `IggyPartition::transfer` is `pub` and cleared inside the
-        // partitions crate, so an externally maintained count would drift; that
-        // refactor is a prerequisite, not a detail.)
-        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.group) {
-            self.partition_transfers_inflight()
-        } else {
-            0
-        };
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
             header.group,
@@ -4721,6 +4729,10 @@ where
         ) else {
             return;
         };
+        if partition.history_is_busy() {
+            partition.defer_view_transition(MessageBag::StartView(msg));
+            return;
+        }
         let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
             tracing::warn!(
                 shard = self.id,
@@ -4746,60 +4758,76 @@ where
             // like it, pending-less adoptions (empty StartView suffix) still sweep
             // the relics above the adopted head.
             let pending = partition.consensus().pending_view_log();
+            if partition.has_io_dispatcher()
+                && let Some(from_op) =
+                    partition_view_divergence_from(self.id, partition, pending.as_ref())
+            {
+                partition.defer_view_truncation(from_op, actions, Some(header.replica));
+                return;
+            }
             reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
         }
+        self.finish_partition_view_adoption(
+            IggyNamespace::from_raw(header.group),
+            header.replica,
+            actions,
+        )
+        .await;
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn finish_partition_view_adoption(
+        &self,
+        namespace: IggyNamespace,
+        peer: u8,
+        actions: Vec<VsrAction>,
+    ) where
+        MJ: JournalHandle,
+        MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        let transfers_inflight =
+            if Self::may_arm_partition_transfer(self.plane.partitions(), namespace.inner()) {
+                self.partition_transfers_inflight()
+            } else {
+                0
+            };
+        let adopted = !actions.is_empty();
+        let partitions = self.plane.partitions();
+        let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+            return;
+        };
         let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
-        // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
-        // executes there (`dispatch_vsr_actions` bails on `journal: None`)
-        // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions).await;
-        // Gate on actual adoption: a rejected StartView returns no actions,
-        // and re-arming on one would re-mint the nonce and drop an in-flight
-        // descriptor.
         if adopted
             && partition.consensus().state_transfer_stage()
                 == consensus::StateTransferStage::AwaitingTarget
         {
             tracing::info!(
                 shard = self.id,
-                namespace_raw = header.group,
-                peer = header.replica,
+                namespace_raw = namespace.inner(),
+                peer,
                 "adopted a live view while awaiting transfer; requesting partition state transfer"
             );
-            // The announcing replica becomes `session.peer`, which the re-arm
-            // path feeds to `next_transfer_peer`'s ring arithmetic, so an id
-            // outside the cluster must not get that far.
-            if self.peer_is_known(header.replica, "StartView") {
+            if self.peer_is_known(peer, "StartView") {
                 let _ = self
-                    .arm_partition_transfer(partition, header.replica, transfers_inflight)
+                    .arm_partition_transfer(partition, peer, transfers_inflight)
                     .await;
             }
             return;
         }
-        // A commit walk during Fetching can advance commit_min past the
-        // incoming frontier (or trip the install's anti-rewind refusal), so
-        // gate on the whole transfer, not one stage.
         if partition.consensus().is_transferring() {
             return;
         }
-        // Outside the gate: the persist fences the SEND, not the local commit
-        // walk or the repair fetch below (a fetch asks to LEARN, it does not
-        // advertise this replica's view).
         if local_actions
             .iter()
             .any(|action| matches!(action, VsrAction::CommitJournal))
         {
-            partition.commit_journal(config).await;
+            partition.commit_journal(partitions.config()).await;
         }
-        // Same gap-fill as the metadata arm: a journal-less rejoiner that
-        // adopted the new view still lacks the window's entries; repair from
-        // the announcing primary, floor settled by its RangeEvicted. The shared
-        // helper carries one guard more than this site needs (`is_transferring`,
-        // already covered by the early return above) and logs the arm.
-        self.maybe_request_partition_repair(partition, header.replica)
-            .await;
+        self.maybe_request_partition_repair(partition, peer).await;
+        partition.notify_io();
     }
 
     #[allow(clippy::future_not_send)]
@@ -4917,6 +4945,7 @@ where
         if let Some(ref consensus) = planes.0.consensus
             && consensus.group() == header.group
         {
+            refresh_metadata_dvc_suffix(consensus, planes.0.journal.as_ref());
             let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &header);
             let (local_actions, wire_actions) = split_local_actions(actions);
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &local_actions).await;
@@ -4932,6 +4961,11 @@ where
         else {
             return;
         };
+        if partition.history_is_busy() {
+            partition.defer_view_transition(MessageBag::RequestStartView(msg.clone()));
+            return;
+        }
+        refresh_partition_dvc_suffix(partition);
         let consensus = partition.consensus();
         let actions = consensus.handle_request_start_view(PlaneKind::Partitions, &header);
         let (local_actions, wire_actions) = split_local_actions(actions);
@@ -5603,6 +5637,10 @@ where
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
+        if partition.history_is_busy() {
+            partition.defer_view_transition(MessageBag::RepairRangeReply(msg.clone()));
+            return;
+        }
         let Some(session) = partition.repair else {
             return;
         };
@@ -5878,6 +5916,9 @@ where
             let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                 return;
             };
+            if partition.history_is_busy() {
+                return;
+            }
             if !partition
                 .consensus()
                 .is_primary_for_view(partition.consensus().view())
@@ -5891,7 +5932,15 @@ where
             // already holds a header for, so the scan would report a gap nothing
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
-            reconcile_partition_view_divergence(self.id, partition, Some(&pending)).await;
+            if let Some(from_op) =
+                partition_view_divergence_from(self.id, partition, Some(&pending))
+            {
+                if partition.has_io_dispatcher() {
+                    partition.defer_view_truncation(from_op, Vec::new(), None);
+                    return;
+                }
+                reconcile_partition_view_divergence(self.id, partition, Some(&pending)).await;
+            }
             let consensus = partition.consensus();
             // Identity, not presence: see the metadata twin. The floor is the local
             // commit point, the partition twin of the metadata snapshot floor:
@@ -7588,53 +7637,16 @@ where
         // spreads over every group instead of replaying the same prefix.
         rotate_sweep_to_cursor(namespace_scratch, self.partition_walk_cursor.get());
 
-        // Pre-pass: issue every group's pending superblock write CONCURRENTLY.
-        // A cluster-wide view change makes every group on this shard need one in
-        // the same tick, and each `atomic_replace` is a create + write + 2
-        // fsyncs; run serially, a few hundred groups on ordinary storage exceed
-        // the 5s view-change escalation and loop elections. The writes are
-        // independent (each group owns its store, lock, and failure bookkeeping,
-        // all behind `&self`), and the per-group loop below re-checks the persist
-        // gate on its lock-free fast path, so gating semantics are unchanged.
-        //
-        // The offset-reservation extension rides the same pre-pass, which is the
-        // whole point of it being here: the append fence writes the superblock
-        // INLINE in this pump, where those two fsyncs delay the tick above for
-        // every group on the core. Extending at half a block of headroom keeps
-        // the fence on its lock-free fast path under load, so the write happens
-        // here instead of in front of a produce. Ordered BEFORE the persist
-        // because any write marks the view durable, so one write can satisfy
-        // both and the persist gate below then finds nothing to do.
-        let pending_persists: Vec<_> = namespace_scratch
-            .iter()
-            .copied()
-            .filter(|namespace| {
-                partitions.get_by_ns(namespace).is_some_and(|partition| {
-                    partition.consensus().needs_superblock_persist()
-                        || partition.needs_offset_reservation_extension()
-                })
-            })
-            .map(|namespace| async move {
-                if let Some(partition) = partitions.get_by_ns(&namespace) {
-                    // Verdicts dropped on purpose. The reservation is backstopped
-                    // by the fence at the mint, which refuses the append if the
-                    // ceiling never caught up; and the persist gate is re-run by
-                    // the per-group loop below on its lock-free fast path, which
-                    // withholds every view-scoped send when it fails.
-                    if partition.needs_offset_reservation_extension() {
-                        let _ = partition.extend_offset_reservation().await;
-                    }
-                    let _ = partition.persist_superblock_if_needed().await;
+        for namespace in namespace_scratch.iter() {
+            if let Some(partition) = partitions.get_by_ns(namespace) {
+                if partition.needs_offset_reservation_extension() {
+                    let _ = partition.extend_offset_reservation().await;
                 }
-            })
-            .collect();
-        let mut pending_persists = pending_persists.into_iter();
-        loop {
-            let chunk: Vec<_> = pending_persists.by_ref().take(SUPERBLOCK_FAN_OUT).collect();
-            if chunk.is_empty() {
-                break;
+                let _ = partition.persist_superblock_if_needed().await;
             }
-            futures::future::join_all(chunk).await;
+            if let Some(partition) = partitions.get_io_owner(namespace) {
+                partition.notify_io();
+            }
         }
 
         let mut persistence_metrics = partitions::PersistenceMetrics::default();
@@ -7754,7 +7766,8 @@ where
                 refresh_partition_dvc_suffix(partition);
             }
             partition.ensure_materialization_recovery();
-            let actions = consensus.tick(PlaneKind::Partitions);
+            let actions = consensus
+                .tick_with_history_fence(PlaneKind::Partitions, partition.history_writes_pending());
             partition.ensure_materialization_recovery();
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
@@ -7965,7 +7978,7 @@ where
                     repairs_live += 1;
                 }
                 let probe = partition_gap_probe(partition);
-                let walk_stalled = group_is_walk_stalled(&probe);
+                let walk_stalled = !partition.has_pending_commit() && group_is_walk_stalled(&probe);
                 // The RATE cap only. The concurrency cap lives in the arm fn,
                 // which is the funnel every arming site goes through; resolved
                 // before the debounce either way, so a refusal keeps the group
@@ -8182,83 +8195,6 @@ where
             .set_consumer_offsets_stranded(ConsumerKind::ConsumerGroup, stranded[1]);
 
         fatal
-    }
-
-    /// Flush every owned partition's committed journal prefix to segment
-    /// storage. Pump-shutdown counterpart of the commit-time persist gate:
-    /// a graceful stop must not lose committed messages still resident in
-    /// the in-memory journal (mirrors the legacy pump's final flush).
-    #[allow(clippy::future_not_send)]
-    pub async fn flush_partitions(&self)
-    where
-        B: MessageBus,
-    {
-        let partitions = self.plane.partitions();
-        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
-        tracing::info!(
-            shard = self.id,
-            partitions = namespaces.len(),
-            "shutdown flush: draining committed journals to segment storage"
-        );
-        let mut collapse_pending = Vec::new();
-        for namespace in namespaces {
-            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
-                continue;
-            };
-            if let Err(error) = partition
-                .flush_committed_messages(partitions.config())
-                .await
-            {
-                tracing::error!(
-                    namespace_raw = namespace.inner(),
-                    %error,
-                    "failed to flush partition journal on shutdown"
-                );
-                // The bytes left behind are cluster-committed, so the pump
-                // must not let this exit report clean (it re-scans for faults
-                // after this flush). A partition already fenced by the commit
-                // path keeps its original fault.
-                partition.fence_flush_failure();
-                // The collapse claims the segments account for every confirmed
-                // offset, which a failed flush is exactly the case against, so
-                // leave the reservation standing.
-                continue;
-            }
-            collapse_pending.push(namespace);
-        }
-
-        // Collapsed CONCURRENTLY, for the same reason the tick coalesces its view
-        // persists: see [`SUPERBLOCK_FAN_OUT`]. Each group owns its store, lock
-        // and failure bookkeeping, all behind `&self`.
-        //
-        // The flushes above stay serial: they take `&mut`, and the writers they
-        // drive are the shard's, not the partition's.
-        let mut pending = collapse_pending
-            .into_iter()
-            .map(|namespace| async move {
-                // The segments now prove where the offset space ends, so the
-                // reservation has nothing left to witness. Without the collapse
-                // every clean stop would leave a lease-block-wide hole.
-                let Some(partition) = partitions.get_by_ns(&namespace) else {
-                    return;
-                };
-                if !partition.collapse_offset_reservation().await {
-                    tracing::warn!(
-                        namespace_raw = namespace.inner(),
-                        "could not collapse the offset reservation on shutdown; the restart \
-                         will resume above it and leave a gap in the offset space"
-                    );
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_iter();
-        loop {
-            let chunk: Vec<_> = pending.by_ref().take(SUPERBLOCK_FAN_OUT).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            futures::future::join_all(chunk).await;
-        }
     }
 
     /// Whether this shard may build a partition offer for `namespace` without
@@ -8885,66 +8821,18 @@ where
     /// install just made, then quarantine the segments that would have
     /// contradicted it. `None` where the counter is authoritative.
     #[allow(clippy::future_not_send)]
-    async fn fence_partition_for_rebuild(
+    fn fence_partition_for_rebuild(
         &self,
         namespace: IggyNamespace,
-        partition: &IggyPartition<B, SB>,
+        partition: &mut IggyPartition<B, SB>,
         intended_frontier: Option<u64>,
     ) where
         B: MessageBus + 'static,
         T: ShardsTable,
     {
-        // BEFORE the quarantine: it moves away the segments that are this
-        // partition's only other witness to the offset frontier, and the
-        // rebuild's sole anchor is then the durable record.
-        // Ungated by the write backoff on purpose: this is a one-shot write
-        // ahead of an irreversible quarantine, not a retry loop, so a skipped
-        // attempt is the last chance gone rather than deferred work.
-        let recorded = partition
-            .record_frontier_before_quarantine(intended_frontier)
-            .await;
-        if !recorded {
-            tracing::error!(
-                shard = self.id,
-                namespace_raw = namespace.inner(),
-                intended_frontier,
-                "could not record the fenced partition's offset frontier before quarantining \
-                 its segments; the rebuild will re-seed from whatever the record still holds"
-            );
-        }
-        match partition.quarantine_partition_dir().await {
-            Ok(Some(fenced_dir)) => tracing::error!(
-                shard = self.id,
-                namespace_raw = namespace.inner(),
-                fenced_dir,
-                "quarantined the fenced partition's segment files; they are kept for \
-                 inspection and never read again"
-            ),
-            Ok(None) => {}
-            Err(error) => {
-                // NO rebuild: `build_partition_fresh` plants segment 0 with
-                // `file_exists = false`, truncating whatever the failed
-                // quarantine left, so a rebuild here eats the chain one segment
-                // per attempt. Tombstone and stop -- the bytes stay for an
-                // operator, and the boot path makes the same call. The
-                // partition stays unreachable until it is dealt with; that is
-                // the intended fence, not a wait.
-                tracing::error!(
-                    shard = self.id,
-                    namespace_raw = namespace.inner(),
-                    %error,
-                    "failed to quarantine the fenced partition's segment files; leaving it \
-                     tombstoned rather than rebuilding over them"
-                );
-                self.plane.partitions().tombstone(namespace);
-                self.shards_table.remove(&namespace);
-                return;
-            }
-        }
+        partition.begin_quarantine(intended_frontier);
         self.plane.partitions().tombstone(namespace);
         self.shards_table.remove(&namespace);
-        self.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
-        self.signal_reconcile_wake();
     }
 
     /// Arm a fresh partition transfer session against `peer` and request its
@@ -9235,6 +9123,10 @@ where
         else {
             return;
         };
+        if partition.history_is_busy() {
+            partition.defer_view_transition(MessageBag::StateTransferTarget(msg.clone()));
+            return;
+        }
         let session_matches = partition
             .transfer
             .as_ref()
@@ -9589,6 +9481,11 @@ where
             return;
         }
 
+        if partition.history_is_busy() {
+            partition.notify_io();
+            return;
+        }
+
         // Everything present: verify + decode the offsets artifact, install.
         let Some(session) = partition.transfer.take() else {
             return;
@@ -9692,15 +9589,50 @@ where
         partition
             .consensus()
             .set_state_transfer_stage(consensus::StateTransferStage::Installing);
-        let outcome = partition
-            .install_state_transfer(
-                &config,
+        let outcome = if partition.has_io_dispatcher() {
+            match partition.queue_state_transfer_install(
                 commit_op,
                 staged,
                 &offsets_bytes,
                 committed_purge_generation,
-            )
+                peer,
+            ) {
+                Ok(()) => return,
+                Err(error) => Err(error),
+            }
+        } else {
+            partition
+                .install_state_transfer(
+                    &config,
+                    commit_op,
+                    staged,
+                    &offsets_bytes,
+                    committed_purge_generation,
+                )
+                .await
+        };
+        self.finish_partition_install(namespace, peer, outcome)
             .await;
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn finish_partition_install(
+        &self,
+        namespace: u64,
+        peer: u8,
+        outcome: Result<
+            partitions::state_transfer::PartitionInstallOutcome,
+            partitions::state_transfer::PartitionInstallError,
+        >,
+    ) where
+        B: MessageBus + 'static,
+        T: ShardsTable,
+    {
+        let partitions = self.plane.partitions();
+        let config = partitions.config().clone();
+        let Some(partition) = partitions.get_mut_by_ns(&IggyNamespace::from_raw(namespace)) else {
+            return;
+        };
         partition
             .consensus()
             .set_state_transfer_stage(consensus::StateTransferStage::Idle);
@@ -9760,8 +9692,7 @@ where
                     IggyNamespace::from_raw(namespace),
                     partition,
                     Some(frontier),
-                )
-                .await;
+                );
             }
             Err(error) => {
                 tracing::error!(
@@ -11347,13 +11278,14 @@ fn build_dvc_suffix(
 /// positionally, so the stale entry is what `evict_prefix` flushes to the segment:
 /// durable divergent bytes, no error anywhere.
 #[allow(clippy::future_not_send)]
-async fn reconcile_partition_view_divergence<B, SB>(
+fn partition_view_divergence_from<B, SB>(
     shard: u16,
-    partition: &mut IggyPartition<B, SB>,
+    partition: &IggyPartition<B, SB>,
     pending: Option<&MergedLog>,
-) where
+) -> Option<u64>
+where
     B: MessageBus,
-    SB: journal::superblock::SuperblockStore,
+    SB: SuperblockStore,
 {
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
@@ -11405,6 +11337,19 @@ async fn reconcile_partition_view_divergence<B, SB>(
         repairable_from = Some(repairable_from.map_or(above_head, |op| op.min(above_head)));
     }
 
+    repairable_from
+}
+
+#[allow(clippy::future_not_send)]
+async fn reconcile_partition_view_divergence<B, SB>(
+    shard: u16,
+    partition: &mut IggyPartition<B, SB>,
+    pending: Option<&MergedLog>,
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let repairable_from = partition_view_divergence_from(shard, partition, pending);
     let Some(from_op) = repairable_from else {
         return;
     };
@@ -11415,7 +11360,6 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 namespace_raw = partition.consensus().group(),
                 from_op,
                 removed,
-                op_head,
                 view = partition.consensus().view(),
                 "dropped {removed} uncommitted partition entries from op {from_op} that \
                  disagreed with the view's log; the primary's retransmission refills the range"

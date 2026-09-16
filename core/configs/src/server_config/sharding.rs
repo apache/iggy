@@ -107,6 +107,11 @@ pub struct ShardingConfig {
     pub deferred_poll_max_pending_per_session: usize,
     pub deferred_poll_max_read_bytes: usize,
     pub deferred_poll_max_inflight_bytes: usize,
+    /// Active partition file jobs and results awaiting owner acceptance.
+    pub partition_io_capacity: usize,
+    /// Retained job allocations, resolved at boot against the largest legal record.
+    /// Omission selects max(256 MiB, the single-job minimum).
+    pub partition_io_bytes_max: Option<usize>,
     /// Wall-clock budget for a single shard's bus drain on shutdown.
     /// Drives `IggyMessageBus::shutdown(..)` from the per-shard watchdog
     /// and the parallel-join survivor path. Sized larger than typical
@@ -167,6 +172,8 @@ impl Default for ShardingConfig {
                 .sharding
                 .deferred_poll_max_inflight_bytes
                 as usize,
+            partition_io_capacity: SERVER_CONFIG.sharding.partition_io_capacity as usize,
+            partition_io_bytes_max: None,
             shutdown_drain_timeout: SERVER_CONFIG
                 .sharding
                 .shutdown_drain_timeout
@@ -193,6 +200,17 @@ impl Default for ShardingConfig {
 
 impl Validatable<ConfigurationError> for ShardingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        if self.partition_io_capacity == 0
+            || self.partition_io_capacity > INBOX_CAPACITY_MAX
+            || self
+                .partition_io_bytes_max
+                .is_some_and(|bytes| bytes == 0 || bytes > isize::MAX as usize)
+        {
+            eprintln!(
+                "Invalid sharding configuration: partition I/O limits must be positive and fit addressable capacity"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.inbox_capacity == 0 {
             eprintln!(
                 "Invalid sharding configuration: inbox_capacity must be > 0 (crossfire silently \
@@ -351,6 +369,49 @@ mod tests {
     #[test]
     fn defaults_validate() {
         assert!(ShardingConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn partition_io_limits_preserve_omission_and_accept_explicit_env_mappings() {
+        let omitted: ShardingConfig = Figment::new()
+            .merge(Toml::string("inbox_capacity = 7"))
+            .extract()
+            .unwrap();
+        assert_eq!(omitted.partition_io_capacity, 16);
+        assert_eq!(omitted.partition_io_bytes_max, None);
+
+        let configured: ShardingConfig = Figment::new()
+            .merge(Toml::string(
+                "partition_io_capacity = 3\npartition_io_bytes_max = 8589934592",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(configured.partition_io_capacity, 3);
+        assert_eq!(
+            configured.partition_io_bytes_max,
+            Some(8 * 1024 * 1024 * 1024)
+        );
+        assert!(configured.validate().is_ok());
+        let mappings = <ShardingConfig as configs::ConfigEnvMappings>::env_mappings();
+        for name in ["PARTITION_IO_CAPACITY", "PARTITION_IO_BYTES_MAX"] {
+            assert!(mappings.iter().any(|mapping| mapping.env_name == name));
+        }
+        for (capacity, bytes) in [
+            (0, None),
+            (INBOX_CAPACITY_MAX + 1, None),
+            (1, Some(0)),
+            (1, Some(usize::MAX)),
+        ] {
+            let invalid = ShardingConfig {
+                partition_io_capacity: capacity,
+                partition_io_bytes_max: bytes,
+                ..ShardingConfig::default()
+            };
+            assert!(
+                invalid.validate().is_err(),
+                "capacity={capacity}, bytes={bytes:?}"
+            );
+        }
     }
 
     #[test]

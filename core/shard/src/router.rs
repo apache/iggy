@@ -23,14 +23,15 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
+use futures::future::poll_fn;
 use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
-use partitions::FatalCommit;
+use partitions::{FatalCommit, PartitionIncarnation};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
-use std::future::poll_fn;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +44,37 @@ use std::task::Poll;
 /// the tick counts it feeds share one unit; public so the simulator can
 /// advance its virtual clock in whole tick intervals.
 pub use consensus::TICK_INTERVAL as CONSENSUS_TICK_INTERVAL;
+
+pub const COOPERATIVE_EVENT_BUDGET: usize = 64;
+
+#[derive(Default)]
+pub struct LoopbackRound {
+    pub(super) entries: VecDeque<(Option<PartitionIncarnation>, Message<GenericHeader>)>,
+    pub(super) scratch: Vec<Message<GenericHeader>>,
+}
+
+impl<B: MessageBus, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB> {
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn cooperate(&self) {
+        let serviced = self.cooperative_events.get() + 1;
+        if serviced < COOPERATIVE_EVENT_BUDGET {
+            self.cooperative_events.set(serviced);
+            return;
+        }
+        self.cooperative_events.set(0);
+        let mut yielded = false;
+        poll_fn(|context| {
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
 
 /// Inter-shard dispatch logic.
 ///
@@ -289,9 +321,17 @@ where
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
+        SB: 'static,
     {
         let _completion_pump = self.poll_completions.pump_guard();
         let _deferred_pump = self.deferred_polls.pump_guard();
+        self.plane.partitions().set_io_notifier(
+            self.partition_io.notifier(),
+            self.partition_io.limits.bytes_max(),
+        );
+        if let Some(consensus) = self.plane.metadata().consensus.as_ref() {
+            consensus.set_loopback_notifier(Some(self.plane.partitions().loopback_wake_notifier()));
+        }
         if let Some(sender) = self.senders.get(self.id as usize).cloned() {
             let metrics = self.metrics.clone();
             self.plane
@@ -308,7 +348,7 @@ where
         }
         // Reused across every pump iteration; pre-size to skip the
         // first-drain reallocation.
-        let mut loopback_buf = Vec::with_capacity(64);
+        let mut loopback_buf = LoopbackRound::default();
         let mut namespace_scratch: Vec<IggyNamespace> = Vec::with_capacity(64);
         // Consensus timer driver, folded into the pump: running the tick as a
         // select! arm (not a sibling task) serializes it with frame processing,
@@ -396,6 +436,7 @@ where
                     self.apply_reconcile_ops();
                     self.deferred_polls.maintenance();
                     consensus_tick.set(rearm_tick());
+                    self.process_loopback(&mut loopback_buf).await;
                 }
                 () = deferred_deadline.as_mut() => {
                     armed_deadline = None;
@@ -408,10 +449,11 @@ where
                     // the inbox preserves park order without making a full
                     // queue stall ticks and commit broadcasts for other groups.
                     self.dispatch_redispatched_frame(frame).await;
+                    self.cooperate().await;
                     // A request handled by a solo primary self-acks here. If
                     // loopback waited for another inbox frame, the request
                     // would remain uncommitted indefinitely on a quiet shard.
-                    self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                    self.process_loopback(&mut loopback_buf).await;
                     self.apply_reconcile_ops();
                     // Same guaranteed reply-lane service as the inbox arm: this
                     // arm outranks both lanes, so a deep drain would otherwise
@@ -421,14 +463,14 @@ where
                     {
                         self.process_frame(reply).await;
                     }
-                    self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
+                    self.process_one_poll_completion(&mut loopback_buf).await;
                 }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
                         Ok(frame) => {
                             if self.accept_frame_for_self(&frame) {
                                 self.process_frame(frame).await;
-                                self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                                self.process_loopback(&mut loopback_buf).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
                                 // Anything it stages is served by the arm above
                                 // on the next pass, before this arm can run again.
@@ -447,7 +489,7 @@ where
                             {
                                 self.process_frame(reply).await;
                             }
-                            self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
+                            self.process_one_poll_completion(&mut loopback_buf).await;
                         }
                         Err(_) => break,
                     }
@@ -461,7 +503,16 @@ where
                             if self.accept_frame_for_self(&frame) {
                                 self.process_frame(frame).await;
                             }
-                            self.process_one_poll_completion(&mut loopback_buf, &mut namespace_scratch).await;
+                            self.process_one_poll_completion(&mut loopback_buf).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                completion = self.partition_io.recv().fuse() => {
+                    match completion {
+                        Ok(token) => {
+                            self.accept_partition_io_completion(token);
+                            self.cooperate().await;
                         }
                         Err(_) => break,
                     }
@@ -470,14 +521,28 @@ where
                     match completion {
                         Ok(completion) => {
                             self.on_poll_completed(*completion).await;
-                            self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                    self.cooperate().await;
+                            self.process_loopback(&mut loopback_buf).await;
                             self.apply_reconcile_ops();
                         }
                         Err(_) => break,
                     }
                 }
                 () = poll_fn(|context| self.deferred_polls.poll_ready(context)).fuse() => {}
+                () = poll_fn(|context| {
+                    self.plane.partitions().register_loopback_waker(context.waker());
+                    self.partition_io.register_waker(context.waker());
+                    if self.has_pending_loopback(&loopback_buf) || self.partition_io.has_ready() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }).fuse() => {
+                    self.process_loopback(&mut loopback_buf).await;
+                    self.apply_reconcile_ops();
+                }
             }
+            self.service_partition_io().await;
         }
 
         self.poll_completions.close();
@@ -500,7 +565,7 @@ where
         // fault owes them.
         if fatal.is_none() {
             fatal = self
-                .drain_queued_frames_for_shutdown(&mut loopback_buf, &mut namespace_scratch)
+                .drain_queued_frames_for_shutdown(&mut loopback_buf)
                 .await;
         }
 
@@ -520,7 +585,8 @@ where
         // is cluster-committed data, so writing what still reaches disk is
         // strictly better than dropping it, and a second failure of an
         // already-fenced partition is warned rather than propagated.
-        self.flush_partitions().await;
+        self.flush_partitions(&mut loopback_buf).await;
+        self.partition_io.close();
 
         // A failed flush fences its partition: the data it could not write is
         // cluster-committed and now lives only in this process's memory, so a
@@ -532,14 +598,87 @@ where
         fatal
     }
 
+    #[allow(clippy::future_not_send)]
+    async fn flush_partitions(&self, loopback: &mut LoopbackRound)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+        SB: 'static,
+    {
+        let partitions = self.plane.partitions();
+        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        for namespace in &namespaces {
+            if let Some(partition) = partitions.get_io_owner(namespace) {
+                partition.begin_shutdown_io();
+            }
+        }
+        let rearm = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
+        let mut tick = std::pin::pin!(rearm());
+        let mut namespace_scratch = Vec::with_capacity(namespaces.len());
+        let mut inbox_closed = false;
+        let mut replies_closed = false;
+        loop {
+            self.process_one_poll_completion(loopback).await;
+            self.service_partition_io().await;
+            self.process_loopback(loopback).await;
+            let finished = namespaces.iter().all(|namespace| {
+                partitions
+                    .get_io_owner(namespace)
+                    .is_none_or(|partition| partition.shutdown_io_complete())
+            });
+            if finished && self.partition_io.outstanding() == 0 {
+                break;
+            }
+            futures::select_biased! {
+                () = tick.as_mut() => {
+                    for namespace in &namespaces {
+                        if let Some(partition) = partitions.get_io_owner(namespace) {
+                            partition.drive_persistence().await;
+                            partition.notify_io();
+                        }
+                    }
+                    self.tick_metadata().await;
+                    let _ = self.tick_partitions(&mut namespace_scratch).await;
+                    tick.set(rearm());
+                }
+                completion = self.partition_io.recv().fuse() => {
+                    if let Ok(token) = completion {
+                        self.accept_partition_io_completion(token);
+                        self.cooperate().await;
+                    }
+                }
+                frame = (if inbox_closed { futures::future::Either::Left(futures::future::pending()) } else { futures::future::Either::Right(self.inbox.recv()) }).fuse() => {
+                    match frame {
+                        Ok(frame) if self.accept_frame_for_self(&frame) => self.process_frame(frame).await,
+                        Ok(_) => {},
+                        Err(_) => inbox_closed = true,
+                    }
+                }
+                frame = (if replies_closed { futures::future::Either::Left(futures::future::pending()) } else { futures::future::Either::Right(self.reply_inbox.recv()) }).fuse() => {
+                    match frame {
+                        Ok(frame) if self.accept_frame_for_self(&frame) => self.process_frame(frame).await,
+                        Ok(_) => {},
+                        Err(_) => replies_closed = true,
+                    }
+                }
+                () = poll_fn(|context| {
+                    self.partition_io.register_waker(context.waker());
+                    if self.partition_io.has_ready() || self.has_pending_loopback(loopback) {
+                        Poll::Ready(())
+                    } else { Poll::Pending }
+                }).fuse() => {}
+            }
+        }
+    }
+
     /// A busy ordinary lane yields one completion per frame. Keeping this
     /// service bounded lets ordinary work progress under a completion flood.
     #[allow(clippy::future_not_send)]
-    async fn process_one_poll_completion(
-        &self,
-        loopback_buf: &mut Vec<Message<GenericHeader>>,
-        namespace_scratch: &mut Vec<IggyNamespace>,
-    ) where
+    async fn process_one_poll_completion(&self, loopback_buf: &mut LoopbackRound)
+    where
         B: MessageBus + 'static,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
@@ -548,7 +687,8 @@ where
     {
         if let Ok(completion) = self.poll_completions.try_recv() {
             self.on_poll_completed(*completion).await;
-            self.process_loopback(loopback_buf, namespace_scratch).await;
+            self.cooperate().await;
+            self.process_loopback(loopback_buf).await;
             self.apply_reconcile_ops();
         }
     }
@@ -559,8 +699,7 @@ where
     #[allow(clippy::future_not_send)]
     async fn drain_queued_frames_for_shutdown(
         &self,
-        loopback_buf: &mut Vec<Message<GenericHeader>>,
-        namespace_scratch: &mut Vec<IggyNamespace>,
+        loopback_buf: &mut LoopbackRound,
     ) -> Option<FatalCommit>
     where
         B: MessageBus + 'static,
@@ -572,13 +711,13 @@ where
         loop {
             while let Some(frame) = self.pop_redispatched_frame() {
                 self.dispatch_redispatched_frame(frame).await;
-                self.process_loopback(loopback_buf, namespace_scratch).await;
+                self.cooperate().await;
+                self.process_loopback(loopback_buf).await;
                 self.apply_reconcile_ops();
                 if let Some(fault) = self.first_partition_commit_fault() {
                     return Some(fault);
                 }
-                self.process_one_poll_completion(loopback_buf, namespace_scratch)
-                    .await;
+                self.process_one_poll_completion(loopback_buf).await;
                 if let Some(fault) = self.first_partition_commit_fault() {
                     return Some(fault);
                 }
@@ -586,7 +725,8 @@ where
             let Ok(frame) = self.inbox.try_recv() else {
                 if let Ok(completion) = self.poll_completions.try_recv() {
                     self.on_poll_completed(*completion).await;
-                    self.process_loopback(loopback_buf, namespace_scratch).await;
+                    self.cooperate().await;
+                    self.process_loopback(loopback_buf).await;
                     self.apply_reconcile_ops();
                     if let Some(fault) = self.first_partition_commit_fault() {
                         return Some(fault);
@@ -595,18 +735,25 @@ where
                     // to the main drain before accepting another completion.
                     continue;
                 }
+                if self.has_pending_loopback(loopback_buf) {
+                    self.process_loopback(loopback_buf).await;
+                    self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        return Some(fault);
+                    }
+                    continue;
+                }
                 break;
             };
             if self.accept_frame_for_self(&frame) {
                 self.process_frame(frame).await;
-                self.process_loopback(loopback_buf, namespace_scratch).await;
+                self.process_loopback(loopback_buf).await;
                 self.apply_reconcile_ops();
                 if let Some(fault) = self.first_partition_commit_fault() {
                     return Some(fault);
                 }
             }
-            self.process_one_poll_completion(loopback_buf, namespace_scratch)
-                .await;
+            self.process_one_poll_completion(loopback_buf).await;
             if let Some(fault) = self.first_partition_commit_fault() {
                 return Some(fault);
             }
@@ -636,7 +783,7 @@ where
         let partitions = self.plane.partitions();
         partitions.namespaces().find_map(|namespace| {
             partitions
-                .get_by_ns(namespace)
+                .get_io_owner(namespace)
                 .and_then(|partition| partition.fatal().cloned())
         })
     }
@@ -698,6 +845,7 @@ where
             }
             ShardFrame::Lifecycle(payload) => self.process_lifecycle(payload).await,
         }
+        self.cooperate().await;
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -989,6 +1137,7 @@ where
                     && partition.applied_purge_generation() < generation
                 {
                     match partition.purge(&config, generation).await {
+                        Err(partitions::PurgeError::Pending) => {}
                         Ok(()) => {
                             // The purge unlinked the very bytes this shard is
                             // serving: the cached offer still advertises the
@@ -1068,8 +1217,7 @@ where
                             // Fenced, but the caches still describe the
                             // pre-purge bytes until the rebuild lands.
                             self.drop_partition_transfer_state(namespace, partition);
-                            self.fence_partition_for_rebuild(namespace, partition, None)
-                                .await;
+                            self.fence_partition_for_rebuild(namespace, partition, None);
                         }
                     }
                 }
