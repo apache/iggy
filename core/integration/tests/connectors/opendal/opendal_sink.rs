@@ -26,7 +26,10 @@ use crate::connectors::fixtures::OpenDalSinkFixture;
     server(connectors_runtime(config_path = "tests/connectors/opendal/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn json_messages_sink_to_opendal(harness: &TestHarness, fixture: OpenDalSinkFixture) {
+async fn given_json_messages_when_consumed_should_write_each_payload_to_fs(
+    harness: &TestHarness,
+    fixture: OpenDalSinkFixture,
+) {
     let client = harness.root_client().await.expect("client should connect");
     let stream_id: Identifier = seeds::names::STREAM
         .try_into()

@@ -90,7 +90,7 @@ fn timestamp_to_datetime(micros: u64) -> Result<DateTime<Utc>, Error> {
     let seconds = (micros / 1_000_000) as i64;
     let nanoseconds = ((micros % 1_000_000) * 1_000) as u32;
     DateTime::<Utc>::from_timestamp(seconds, nanoseconds).ok_or_else(|| {
-        Error::CannotStoreData(format!(
+        Error::InvalidRecordValue(format!(
             "Invalid message timestamp: {micros} micros is out of range"
         ))
     })
@@ -100,6 +100,30 @@ fn timestamp_to_datetime(micros: u64) -> Result<DateTime<Utc>, Error> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn given_custom_template_when_building_path_should_render_and_sanitize_segments() {
+        let context = PathContext {
+            stream: "event stream",
+            topic: "orders/eu",
+            partition_id: 7,
+            first_timestamp_micros: 1_710_597_600_000_000,
+        };
+
+        let path = object_path(
+            "archive",
+            "{stream}/{topic}/{partition}/{date}/{hour}/{timestamp}",
+            &context,
+            42,
+            Schema::Json,
+        )
+        .expect("path should be rendered");
+
+        assert_eq!(
+            path,
+            "archive/event_stream/orders_eu/7/2024-03-16/14/1710597600000/\
+             00007-00000000000000000042.json"
+        );
+    }
     #[test]
     fn given_out_of_range_timestamp_when_building_path_should_return_error() {
         let context = PathContext {
@@ -118,6 +142,6 @@ mod tests {
         )
         .expect_err("timestamp should be rejected");
 
-        assert!(matches!(error, Error::CannotStoreData(_)));
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
     }
 }
