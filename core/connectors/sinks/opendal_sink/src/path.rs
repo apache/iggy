@@ -16,7 +16,9 @@
 // under the License.
 
 use chrono::{DateTime, Utc};
-use iggy_connector_sdk::{Error, Schema};
+use iggy_connector_sdk::Error;
+
+use crate::OutputFormat;
 
 pub(crate) struct PathContext<'a> {
     pub(crate) stream: &'a str,
@@ -29,23 +31,22 @@ pub(crate) fn object_path(
     path_prefix: &str,
     path_template: &str,
     context: &PathContext<'_>,
-    offset: u64,
-    schema: Schema,
+    offset_start: u64,
+    offset_end: u64,
+    format: OutputFormat,
 ) -> Result<String, Error> {
     let rendered = render_template(path_template, context)?;
-    let extension = match schema {
-        Schema::Json => "json",
-        Schema::Raw => "bin",
-        Schema::Text => "txt",
-        Schema::Proto => "proto",
-        Schema::FlatBuffer => "flatbuffer",
-        Schema::Avro => "avro",
-    };
 
     // Partition ID is always embedded in the filename to prevent cross-partition
     // key collisions because partitions have independent offset spaces starting at
     // 0.
-    let filename = format!("{:05}-{:020}.{}", context.partition_id, offset, extension);
+    let filename = format!(
+        "{:05}-{:020}-{:020}.{}",
+        context.partition_id,
+        offset_start,
+        offset_end,
+        format.file_extension()
+    );
 
     if path_prefix.is_empty() {
         Ok(format!("{rendered}/{filename}"))
@@ -114,14 +115,15 @@ mod tests {
             "{stream}/{topic}/{partition}/{date}/{hour}/{timestamp}",
             &context,
             42,
-            Schema::Json,
+            84,
+            OutputFormat::JsonLines,
         )
         .expect("path should be rendered");
 
         assert_eq!(
             path,
             "archive/event_stream/orders_eu/7/2024-03-16/14/1710597600000/\
-             00007-00000000000000000042.json"
+             00007-00000000000000000042-00000000000000000084.jsonl"
         );
     }
     #[test]
@@ -138,7 +140,8 @@ mod tests {
             "{stream}/{topic}/{date}/{hour}",
             &context,
             42,
-            Schema::Json,
+            84,
+            OutputFormat::JsonLines,
         )
         .expect_err("timestamp should be rejected");
 

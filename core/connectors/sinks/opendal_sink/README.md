@@ -27,6 +27,9 @@ consumer_group = "opendal_sink"
 service = "fs"
 path_prefix = "archive"
 path_template = "{stream}/{topic}/{date}/{hour}"
+output_format = "json_lines"
+include_metadata = true
+include_headers = false
 max_attempts = 3
 retry_delay = "1s"
 verbose_logging = false
@@ -37,15 +40,18 @@ root = "/var/lib/iggy-objects"
 
 ### Plugin options
 
-| Option            | Type     | Default                          | Description                            |
-| ----------------- | -------- | -------------------------------- | -------------------------------------- |
-| `service`         | String   | **required**                     | OpenDAL service name                   |
-| `path_prefix`     | String   | empty                            | Prefix before the rendered object path |
-| `path_template`   | String   | `{stream}/{topic}/{date}/{hour}` | Object directory template              |
-| `options`         | Map      | empty                            | OpenDAL service options.               |
-| `max_attempts`    | Integer  | `3`                              | Total write attempts.                  |
-| `retry_delay`     | Duration | `1s`                             | Delay before the first retry           |
-| `verbose_logging` | Boolean  | `false`                          | Log each consumed batch at info level  |
+| Option                  | Type     | Default                          | Description                                   |
+| ----------------------- | -------- | -------------------------------- | --------------------------------------------- |
+| `service`               | String   | **required**                     | OpenDAL service name                          |
+| `path_prefix`           | String   | empty                            | Prefix before the rendered object path        |
+| `path_template`         | String   | `{stream}/{topic}/{date}/{hour}` | Object directory template                     |
+| `options`               | Map      | empty                            | Secret OpenDAL service options                |
+| `output_format`         | String   | `json_lines`                     | `json_lines`, `json_array`, or `raw`           |
+| `include_metadata`      | Boolean  | `true`                           | Add message metadata to JSON output            |
+| `include_headers`       | Boolean  | `false`                          | Add message headers to JSON output             |
+| `max_attempts`          | Integer  | `3`                              | Total write attempts                           |
+| `retry_delay`           | Duration | `1s`                             | Delay before the first retry                   |
+| `verbose_logging`       | Boolean  | `false`                          | Log each consumed batch at info level          |
 
 ### Default services
 
@@ -97,23 +103,33 @@ secret_access_key = "..."
 
 ### Object layout
 
-Each object path contains an optional prefix, the rendered path template, and a per-message filename:
+Each object path contains an optional prefix, the rendered path template, and a
+batch filename:
 
 ```text
-{path_prefix}/{rendered_path_template}/{partition_id:05}-{offset:020}.{extension}
+{path_prefix}/{rendered_path_template}/{partition_id:05}-{offset_start:020}-{offset_end:020}.{extension}
 ```
 
 The default `{stream}/{topic}/{date}/{hour}` template produces paths such as:
 
 ```text
-archive/events/orders/2024-03-16/14/00007-00000000000000000042.json
+archive/events/orders/2024-03-16/14/00007-00000000000000000042-00000000000000000141.jsonl
 ```
 
-A custom `path_template` replaces the default template part. The `{partition}` variable can appear in that template, but the partition ID and offset are always present in the filename.
+A custom `path_template` replaces the default template part. The `{partition}`
+variable can appear in that template, but the partition ID and offset range are
+always present in the filename.
 
-The sink writes one object for each message. It does not combine payloads from
-a runtime batch because binary schemas do not define a record separator. Use
-the S3 sink if you need JSON Lines or JSON array objects.
+The sink writes one object for each non-empty batch passed to `consume()`. Its
+output formats match the S3 sink:
+
+- `json_lines` writes one JSON object per line and uses `.jsonl`.
+- `json_array` writes one JSON array and uses `.json`.
+- `raw` concatenates payload bytes without separators and uses `.bin`.
+
+JSON output includes message metadata by default. Set `include_metadata = false`
+to write only the `payload` field. Set `include_headers = true` to include
+message headers.
 
 ### Path template variables
 
@@ -126,7 +142,7 @@ the S3 sink if you need JSON Lines or JSON array objects.
 | `{hour}`      | Message timestamp hour in UTC, formatted as `00` to `23` |
 | `{timestamp}` | Message timestamp as Unix milliseconds                   |
 
-File extensions are `json`, `txt`, `bin`, `proto`, `flatbuffer`, and `avro`.
+File extensions are selected by `output_format`: `jsonl`, `json`, or `bin`.
 
 ## Building
 

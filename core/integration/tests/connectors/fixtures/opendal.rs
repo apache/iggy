@@ -39,8 +39,12 @@ pub struct OpenDalSinkFixture {
 }
 
 impl OpenDalSinkFixture {
-    pub async fn wait_for_object(&self, offset: u64) -> Result<Vec<u8>, TestBinaryError> {
-        let path = self.object_path(offset);
+    pub async fn wait_for_object(
+        &self,
+        offset_start: u64,
+        offset_end: u64,
+    ) -> Result<Vec<u8>, TestBinaryError> {
+        let path = self.object_path(offset_start, offset_end);
 
         for _ in 0..POLL_ATTEMPTS {
             match tokio::fs::read(&path).await {
@@ -55,9 +59,10 @@ impl OpenDalSinkFixture {
         })
     }
 
-    fn object_path(&self, offset: u64) -> PathBuf {
+    fn object_path(&self, offset_start: u64, offset_end: u64) -> PathBuf {
         self.object_root.join(format!(
-            "iggy/messages/test_stream/test_topic/00000-{offset:020}.json"
+            "iggy/messages/test_stream/test_topic/\
+             00000-{offset_start:020}-{offset_end:020}.jsonl"
         ))
     }
 }
@@ -99,6 +104,9 @@ consumer_group = "opendal_sink_integration"
 service = "fs"
 path_prefix = "iggy/messages"
 path_template = "{{stream}}/{{topic}}"
+output_format = "json_lines"
+include_metadata = false
+include_headers = false
 max_attempts = 1
 retry_delay = "1ms"
 verbose_logging = false
