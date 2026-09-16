@@ -109,10 +109,10 @@ below it are still open for the issues that build on top of it.
       not part of `bridge/`'s own scope.
 - [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
       exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
-- [ ] Document partition mapping in `docs/BRIDGE_MAPPING.md`:
+- [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
-  - Iggy **consumer groups exist** — map Kafka group APIs to Iggy consumer group APIs
-  - Use `Partitioning::balanced()` only when Kafka sends `partition == -1`; otherwise use request partition ID
+  - Kafka consumer groups do **not** map onto Iggy consumer groups. Assignment stays client-side, and Iggy's group registry is used as an offset key only ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md))
+  - `Partitioning::partition_id(index)` on every Produce. A Kafka producer resolves the partition before it builds the request, so `Partitioning::balanced()` has no trigger there. The `-1` default-partition-count case belongs to CreateTopics
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
 ### `kafka-protocol` crate adoption — superseded, done differently
@@ -130,11 +130,17 @@ above).
 
 ### Phase 3 — Consumer groups (~7 API keys)
 
+Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
+[`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
+
 - [ ] OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
 - [ ] JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning
+
+InitProducerId and idempotent producers
+([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 - [ ] SASL (17, 36) if required by deployment
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
