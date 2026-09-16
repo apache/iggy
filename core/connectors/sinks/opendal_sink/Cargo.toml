@@ -52,6 +52,7 @@ opendal = { workspace = true, features = [
     "executors-tokio",
     "reqwest-rustls-tls",
 ] }
+secrecy = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

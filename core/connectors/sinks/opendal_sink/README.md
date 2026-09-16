@@ -111,6 +111,10 @@ archive/events/orders/2024-03-16/14/00007-00000000000000000042.json
 
 A custom `path_template` replaces the default template part. The `{partition}` variable can appear in that template, but the partition ID and offset are always present in the filename.
 
+The sink writes one object for each message. It does not combine payloads from
+a runtime batch because binary schemas do not define a record separator. Use
+the S3 sink if you need JSON Lines or JSON array objects.
+
 ### Path template variables
 
 | Variable      | Value                                                    |
