@@ -35,6 +35,7 @@ use tracing::{debug, error, info};
 
 use crate::path::{PathContext, object_path};
 
+mod formatter;
 mod path;
 
 sink_connector!(OpenDalSink);
@@ -43,6 +44,7 @@ const CONNECTOR_NAME: &str = "OpenDAL sink";
 const DEFAULT_PATH_TEMPLATE: &str = "{stream}/{topic}/{date}/{hour}";
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
+const DEFAULT_OUTPUT_FORMAT: &str = "json_lines";
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Deserialize)]
@@ -54,6 +56,12 @@ pub struct OpenDalSinkConfig {
     pub path_template: String,
     #[serde(default)]
     pub options: BTreeMap<String, SecretString>,
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
+    #[serde(default = "default_true")]
+    pub include_metadata: bool,
+    #[serde(default)]
+    pub include_headers: bool,
     #[serde(default)]
     pub max_attempts: Option<u32>,
     #[serde(default)]
@@ -70,6 +78,9 @@ impl fmt::Debug for OpenDalSinkConfig {
             .field("path_prefix", &self.path_prefix)
             .field("path_template", &self.path_template)
             .field("option_keys", &self.options.keys().collect::<Vec<_>>())
+            .field("output_format", &self.output_format)
+            .field("include_metadata", &self.include_metadata)
+            .field("include_headers", &self.include_headers)
             .field("max_attempts", &self.max_attempts)
             .field("retry_delay", &self.retry_delay)
             .field("verbose_logging", &self.verbose_logging)
@@ -85,6 +96,7 @@ pub struct OpenDalSink {
     retry_policy: RetryPolicy,
     verbose: bool,
     operator: Option<Operator>,
+    output_format: Option<OutputFormat>,
     messages_processed: AtomicU64,
     write_errors: AtomicU64,
 }
@@ -113,47 +125,70 @@ impl OpenDalSink {
                 max_delay: MAX_BACKOFF,
             },
             verbose,
+            output_format: None,
             operator: None,
             messages_processed: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
         }
     }
 
-    async fn write_message(
+    async fn write_batch(
         &self,
         operator: &Operator,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-        message: ConsumedMessage,
-        retry_context: &str,
+        messages: &[ConsumedMessage],
+        output_format: OutputFormat,
     ) -> Result<(), Error> {
+        let Some(first_message) = messages.first() else {
+            return Ok(());
+        };
+        let last_offset = messages
+            .last()
+            .map_or(first_message.offset, |message| message.offset);
         let context = PathContext {
             stream: &topic_metadata.stream,
             topic: &topic_metadata.topic,
             partition_id: messages_metadata.partition_id,
-            first_timestamp_micros: message.timestamp,
+            first_timestamp_micros: first_message.timestamp,
         };
         let path = object_path(
             &self.path_prefix,
             &self.config.path_template,
             &context,
-            message.offset,
-            messages_metadata.schema,
+            first_message.offset,
+            last_offset,
+            output_format,
         )?;
-        let payload = message.payload.try_into_vec()?;
-        let buffer = Buffer::from(payload);
+        let entries = messages
+            .iter()
+            .map(|message| {
+                formatter::format_message(
+                    message,
+                    topic_metadata,
+                    messages_metadata,
+                    self.config.include_metadata,
+                    self.config.include_headers,
+                    output_format,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let data = formatter::finalize_buffer(entries.iter().map(Vec::as_slice), output_format);
+        let buffer = Buffer::from(data);
+        let retry_context = format!("{CONNECTOR_NAME} connector ID {} batch write", self.id);
 
         retry_async(
             self.retry_policy,
-            retry_context,
+            &retry_context,
             opendal::Error::is_temporary,
             || operator.write(&path, buffer.clone()),
         )
         .await
         .map_err(|failure| {
             Error::CannotStoreData(format!(
-                "Failed to write OpenDAL object '{path}' after {} attempt(s): {}",
-                failure.attempts, failure.error
+                "Failed to write OpenDAL batch object '{path}' with offsets {}-{last_offset} \
+                 after {} attempt(s): {}",
+                first_message.offset, failure.attempts, failure.error
             ))
         })?;
 
@@ -176,6 +211,7 @@ impl Sink for OpenDalSink {
             ));
         }
 
+        let output_format = OutputFormat::try_from(self.config.output_format.as_str())?;
         opendal::install_default();
         let options = self
             .config
@@ -205,6 +241,7 @@ impl Sink for OpenDalSink {
             self.id,
             operator.info().root()
         );
+        self.output_format = Some(output_format);
         self.operator = Some(operator);
         Ok(())
     }
@@ -220,6 +257,14 @@ impl Sink for OpenDalSink {
                 "OpenDAL operator is not initialized".to_string(),
             ));
         };
+        let Some(output_format) = self.output_format else {
+            return Err(Error::InitError(
+                "OpenDAL output format is not initialized".to_string(),
+            ));
+        };
+        if messages.is_empty() {
+            return Ok(());
+        }
 
         if self.verbose {
             info!(
@@ -232,50 +277,43 @@ impl Sink for OpenDalSink {
                 messages_metadata.partition_id,
                 messages_metadata.current_offset
             );
-        } else {
-            debug!(
-                "{CONNECTOR_NAME} connector ID: {} consuming {} messages",
-                self.id,
-                messages.len()
-            );
         }
 
-        let retry_context = format!("{CONNECTOR_NAME} connector ID {} write", self.id);
-        let mut last_error = None;
-        for message in messages {
-            match self
-                .write_message(
-                    operator,
-                    topic_metadata,
-                    &messages_metadata,
-                    message,
-                    &retry_context,
-                )
-                .await
-            {
-                Ok(()) => {
-                    self.messages_processed.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(write_error) => {
-                    self.write_errors.fetch_add(1, Ordering::Relaxed);
-                    error!(
-                        "Failed to write message with {CONNECTOR_NAME} connector ID: {}, error: \
-                         {write_error}",
-                        self.id
-                    );
-                    last_error = Some(write_error);
-                }
+        let message_count = messages.len() as u64;
+        match self
+            .write_batch(
+                operator,
+                topic_metadata,
+                &messages_metadata,
+                &messages,
+                output_format,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.messages_processed
+                    .fetch_add(message_count, Ordering::Relaxed);
+                debug!(
+                    "{CONNECTOR_NAME} connector ID: {} uploaded one object with {} messages",
+                    self.id, message_count
+                );
+                Ok(())
             }
-        }
-
-        match last_error {
-            Some(write_error) => Err(write_error),
-            None => Ok(()),
+            Err(write_error) => {
+                self.write_errors
+                    .fetch_add(message_count, Ordering::Relaxed);
+                error!(
+                    "{CONNECTOR_NAME} connector ID: {} failed to upload {} messages: {write_error}",
+                    self.id, message_count
+                );
+                Err(write_error)
+            }
         }
     }
 
     async fn close(&mut self) -> Result<(), Error> {
         self.operator.take();
+        self.output_format.take();
         info!(
             "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, errors: {}",
             self.id,
@@ -288,6 +326,46 @@ impl Sink for OpenDalSink {
 
 fn default_path_template() -> String {
     DEFAULT_PATH_TEMPLATE.to_string()
+}
+
+fn default_output_format() -> String {
+    DEFAULT_OUTPUT_FORMAT.to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    JsonLines,
+    JsonArray,
+    Raw,
+}
+
+impl TryFrom<&str> for OutputFormat {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "json_lines" | "jsonl" | "jsonlines" => Ok(Self::JsonLines),
+            "json_array" => Ok(Self::JsonArray),
+            "raw" => Ok(Self::Raw),
+            other => Err(Error::InvalidConfigValue(format!(
+                "Unknown output format: '{other}'. Expected: json_lines, json_array, or raw"
+            ))),
+        }
+    }
+}
+
+impl OutputFormat {
+    fn file_extension(self) -> &'static str {
+        match self {
+            Self::JsonLines => "jsonl",
+            Self::JsonArray => "json",
+            Self::Raw => "bin",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +388,9 @@ mod tests {
             path_prefix: Some("iggy/messages".to_string()),
             path_template: default_path_template(),
             options: BTreeMap::from([("root".to_string(), SecretString::from(root.to_string()))]),
+            output_format: default_output_format(),
+            include_metadata: false,
+            include_headers: false,
             max_attempts: Some(1),
             retry_delay: None,
             verbose_logging: None,
@@ -441,16 +522,20 @@ mod tests {
                 };
                 let messages_metadata = MessagesMetadata {
                     partition_id: 2,
-                    current_offset: 4,
+                    current_offset: 5,
                     schema: Schema::Raw,
                 };
                 sink.consume(
                     &topic_metadata,
                     messages_metadata,
-                    vec![test_message(4, Payload::Raw(vec![1, 2, 3]))],
+                    vec![
+                        test_message(4, Payload::Raw(vec![1, 2, 3])),
+                        test_message(5, Payload::Raw(vec![4, 5, 6])),
+                    ],
                 )
                 .await
                 .expect("temporary S3 error should be retried");
+                assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 2);
             };
 
             let (server_result, client_result) = tokio::join!(
@@ -492,7 +577,8 @@ mod tests {
         runtime.block_on(async {
             let temp_dir = TempDir::new().expect("temp directory should be created");
             let root = temp_dir.path().to_path_buf();
-            let mut sink = OpenDalSink::new(1, test_config(&root.to_string_lossy()));
+            let config = test_config(&root.to_string_lossy());
+            let mut sink = OpenDalSink::new(1, config);
             sink.open().await.expect("sink should open");
             fs::remove_dir_all(&root).expect("storage root should be removed");
             fs::write(&root, b"not a directory").expect("storage root should become a file");
@@ -510,19 +596,22 @@ mod tests {
                 .consume(
                     &topic_metadata,
                     messages_metadata,
-                    vec![test_message(4, Payload::Raw(vec![1, 2, 3]))],
+                    vec![
+                        test_message(4, Payload::Raw(vec![1, 2, 3])),
+                        test_message(5, Payload::Raw(vec![4, 5, 6])),
+                    ],
                 )
                 .await
                 .expect_err("unwritable storage should reject the message");
 
             assert!(matches!(error, Error::CannotStoreData(_)));
             assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 0);
-            assert_eq!(sink.write_errors.load(Ordering::Relaxed), 1);
+            assert_eq!(sink.write_errors.load(Ordering::Relaxed), 2);
         });
     }
 
     #[test]
-    fn given_fs_service_when_consuming_batch_should_write_each_payload_object() {
+    fn given_fs_service_when_consuming_batch_should_write_single_json_lines_object() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
             let temp_dir = TempDir::new().expect("temp directory should be created");
@@ -536,7 +625,7 @@ mod tests {
             };
             let messages_metadata = MessagesMetadata {
                 partition_id: 2,
-                current_offset: 4,
+                current_offset: 5,
                 schema: Schema::Json,
             };
             let mut first_json = br#"{"id":1}"#.to_vec();
@@ -555,19 +644,66 @@ mod tests {
                 ],
             )
             .await
-            .expect("messages should be written");
+            .expect("batch should be written");
             sink.close().await.expect("sink should close");
 
-            for (offset, expected) in [
-                (4, br#"{"id":1}"#.as_slice()),
-                (5, br#"{"id":2}"#.as_slice()),
-            ] {
-                let path = temp_dir.path().join(format!(
-                    "iggy/messages/events/orders/1970-01-01/00/00002-{offset:020}.json"
-                ));
-                let stored = fs::read(path).expect("stored object should be readable");
-                assert_eq!(stored, expected);
+            let path = temp_dir.path().join(
+                "iggy/messages/events/orders/1970-01-01/00/\
+                 00002-00000000000000000004-00000000000000000005.jsonl",
+            );
+            let stored = fs::read(path).expect("stored batch object should be readable");
+            assert_eq!(
+                stored,
+                br#"{"payload":{"id":1}}
+{"payload":{"id":2}}
+"#
+            );
+            assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 2);
+        });
+    }
+
+    #[test]
+    fn given_json_array_batch_when_consumed_should_write_single_object() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let temp_dir = TempDir::new().expect("temp directory should be created");
+            let root = temp_dir.path().to_string_lossy();
+            let mut config = test_config(&root);
+            config.output_format = "json_array".to_string();
+            let mut sink = OpenDalSink::new(1, config);
+            sink.open().await.expect("sink should open");
+            let topic_metadata = TopicMetadata {
+                stream: "events".to_string(),
+                topic: "orders".to_string(),
+            };
+            let mut messages = Vec::with_capacity(2);
+            for (offset, id) in [(4, 1), (5, 2)] {
+                let mut json = format!(r#"{{"id":{id}}}"#).into_bytes();
+                let payload =
+                    simd_json::to_owned_value(&mut json).expect("JSON payload should be valid");
+                messages.push(test_message(offset, Payload::Json(payload)));
             }
+
+            sink.consume(
+                &topic_metadata,
+                MessagesMetadata {
+                    partition_id: 2,
+                    current_offset: 4,
+                    schema: Schema::Json,
+                },
+                messages,
+            )
+            .await
+            .expect("batch should be uploaded");
+
+            let path = temp_dir.path().join(
+                "iggy/messages/events/orders/1970-01-01/00/\
+                 00002-00000000000000000004-00000000000000000005.json",
+            );
+            let stored = fs::read(path).expect("stored batch object should be readable");
+            assert_eq!(stored, br#"[{"payload":{"id":1}},{"payload":{"id":2}}]"#);
+            assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 2);
+            sink.close().await.expect("sink should close");
         });
     }
 
@@ -599,6 +735,23 @@ mod tests {
                 .open()
                 .await
                 .expect_err("empty path template should fail");
+
+            assert!(matches!(error, Error::InvalidConfigValue(_)));
+        });
+    }
+
+    #[test]
+    fn given_unknown_output_format_when_opening_should_reject_config() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let mut config = test_config("/tmp");
+            config.output_format = "csv".to_string();
+            let mut sink = OpenDalSink::new(1, config);
+
+            let error = sink
+                .open()
+                .await
+                .expect_err("unknown output format should fail");
 
             assert!(matches!(error, Error::InvalidConfigValue(_)));
         });

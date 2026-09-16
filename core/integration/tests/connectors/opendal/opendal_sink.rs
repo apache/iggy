@@ -26,7 +26,7 @@ use crate::connectors::fixtures::OpenDalSinkFixture;
     server(connectors_runtime(config_path = "tests/connectors/opendal/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_json_messages_when_consumed_should_write_each_payload_to_fs(
+async fn given_json_batch_when_consumed_should_write_single_json_lines_object_to_fs(
     harness: &TestHarness,
     fixture: OpenDalSinkFixture,
 ) {
@@ -63,11 +63,14 @@ async fn given_json_messages_when_consumed_should_write_each_payload_to_fs(
         .await
         .expect("messages should be sent");
 
-    for (offset, expected) in payloads.iter().enumerate() {
-        let stored = fixture
-            .wait_for_object(offset as u64)
-            .await
-            .expect("OpenDAL object should be written");
-        assert_eq!(stored, expected.as_ref());
-    }
+    let stored = fixture
+        .wait_for_object(0, 1)
+        .await
+        .expect("OpenDAL batch object should be written");
+    assert_eq!(
+        stored,
+        br#"{"payload":{"id":1}}
+{"payload":{"id":2}}
+"#
+    );
 }
