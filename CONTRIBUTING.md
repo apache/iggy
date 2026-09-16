@@ -200,3 +200,5 @@ never labeled or closed by it. A closed PR can be reopened.
 ## Questions?
 
 [Discussions](https://github.com/apache/iggy/discussions), [Discord](https://discord.gg/apache-iggy) or the [dev@iggy.apache.org](https://iggy.apache.org/community/mailing-lists/) mailing list (subscribe by emailing <dev-subscribe@iggy.apache.org>)
+
+GitHub Discussions are mirrored to dev@. The mirror only runs one way: replies sent to the list do not appear in Discussions.
