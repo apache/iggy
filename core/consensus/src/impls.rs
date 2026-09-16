@@ -1198,9 +1198,9 @@ where
 
     timeouts: RefCell<TimeoutManager>,
 
-    /// Monotonic timestamp from the most recent accepted commit heartbeat.
-    /// Old/replayed commit messages with a lower timestamp are ignored.
-    heartbeat_timestamp: Cell<u64>,
+    /// View and counter of the last emitted or accepted heartbeat. A new
+    /// primary's counter can be lower, so freshness is scoped to its view.
+    heartbeat_watermark: Cell<(u32, u64)>,
 
     /// Time source for [`Self::next_monotonic_timestamp`]; see
     /// [`ConsensusClock`].
@@ -1489,7 +1489,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
-            heartbeat_timestamp: Cell::new(0),
+            heartbeat_watermark: Cell::new((0, 0)),
             clock,
         }
     }
@@ -2837,8 +2837,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // After view change the new primary may have commit_min < commit_max
         // until commit_journal catches up. Send commit_min (what we've
         // actually applied) so backups don't advance past us.
-        let ts = self.heartbeat_timestamp.get() + 1;
-        self.heartbeat_timestamp.set(ts);
+        let ts = self.heartbeat_watermark.get().1 + 1;
+        self.heartbeat_watermark.set((self.view.get(), ts));
 
         vec![VsrAction::SendCommit {
             view: self.view.get(),
@@ -3493,8 +3493,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// so it doesn't start a spurious view change. Returns `true` if
     /// `commit_max` advanced, signalling the caller to run `commit_journal`.
     ///
-    /// Only accepts heartbeats with a strictly newer monotonic timestamp
-    /// to prevent old/replayed messages from suppressing view changes.
+    /// Only refreshes liveness for a newer heartbeat within its view, so
+    /// old/replayed messages cannot suppress view changes.
     ///
     /// # Panics
     /// If `header.group` does not match this replica's namespace.
@@ -3548,10 +3548,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return CommitOutcome::Accepted;
         }
 
-        // Only accept heartbeats with a strictly newer timestamp to prevent
-        // old/replayed commit messages from resetting the timeout.
-        if self.heartbeat_timestamp.get() < header.timestamp_monotonic {
-            self.heartbeat_timestamp.set(header.timestamp_monotonic);
+        let heartbeat = (header.view, header.timestamp_monotonic);
+        if self.heartbeat_watermark.get() < heartbeat {
+            self.heartbeat_watermark.set(heartbeat);
             self.timeouts
                 .borrow_mut()
                 .reset(TimeoutKind::NormalHeartbeat);
@@ -4591,6 +4590,7 @@ mod pipeline_entry_tests {
 #[cfg(test)]
 pub mod test_bus {
     use super::{Command, METADATA_GROUP, Message, StartViewHeader};
+    use iggy_binary_protocol::{CommitHeader, ConsensusHeader};
     use message_bus::{BusMessage, MessageBus};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
@@ -4625,6 +4625,26 @@ pub mod test_bus {
         header.group = METADATA_GROUP;
         header.size = size as u32;
         msg
+    }
+
+    /// A `Commit` heartbeat from `replica` in `view` stamped with `counter`.
+    ///
+    /// # Panics
+    /// Never: the header size fits in `u32`.
+    #[must_use]
+    pub fn make_commit(view: u32, replica: u8, counter: u64) -> Message<CommitHeader> {
+        Message::<CommitHeader>::new(std::mem::size_of::<CommitHeader>()).transmute_header(
+            |_, header: &mut CommitHeader| {
+                header.command = Command::Commit;
+                header.cluster = 1;
+                header.replica = replica;
+                header.view = view;
+                header.group = METADATA_GROUP;
+                header.timestamp_monotonic = counter;
+                header.size = u32::try_from(std::mem::size_of::<CommitHeader>()).unwrap();
+                header.seal();
+            },
+        )
     }
 
     /// A [`MessageBus`] that accepts everything and remembers nothing.
@@ -5249,6 +5269,93 @@ mod vsr_consensus_tests {
                 .iter()
                 .any(|action| matches!(action, VsrAction::SendCommit { .. })),
             "a healthy primary must heartbeat"
+        );
+    }
+
+    #[test]
+    fn given_an_old_primary_when_the_new_primary_heartbeats_should_remain_in_the_new_view() {
+        for enters_election in [false, true] {
+            let consensus =
+                VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+            consensus.init();
+            for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+                let _ = consensus.tick(PlaneKind::Metadata);
+            }
+            assert_eq!(
+                consensus.heartbeat_watermark.get(),
+                (
+                    0,
+                    TimeoutManager::NORMAL_HEARTBEAT_TICKS / TimeoutManager::COMMIT_MESSAGE_TICKS
+                ),
+                "the old primary must have emitted a full timeout's worth of heartbeats"
+            );
+
+            if enters_election {
+                let _ = consensus.start_election(
+                    PlaneKind::Metadata,
+                    ViewChangeReason::NormalHeartbeatTimeout,
+                );
+            }
+            let start_view = test_bus::make_start_view(1, 0, 0, 1, 0);
+            let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+
+            for tick in 1..=TimeoutManager::NORMAL_HEARTBEAT_TICKS * 2 {
+                if tick % TimeoutManager::COMMIT_MESSAGE_TICKS == 0 {
+                    let heartbeat =
+                        test_bus::make_commit(1, 1, tick / TimeoutManager::COMMIT_MESSAGE_TICKS);
+                    consensus.handle_commit(heartbeat.header());
+                }
+                let _ = consensus.tick(PlaneKind::Metadata);
+                assert_eq!(
+                    consensus.view(),
+                    1,
+                    "fresh heartbeats must keep the adopted view alive at tick {tick}, \
+                     enters_election={enters_election}"
+                );
+            }
+
+            for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+                let _ = consensus.tick(PlaneKind::Metadata);
+            }
+            assert_eq!(
+                consensus.view(),
+                2,
+                "losing the new primary must still trigger an election"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_adopted_view_when_heartbeats_are_stale_or_foreign_should_time_out() {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let start_view = test_bus::make_start_view(1, 0, 0, 1, 0);
+        let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+        let heartbeat = test_bus::make_commit(1, 1, 1);
+        consensus.handle_commit(heartbeat.header());
+        // Re-adopting the same view restarts the timer but must keep the
+        // watermark; the replayed heartbeat below proves it.
+        let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+
+        let invalid_heartbeats = [
+            heartbeat,
+            test_bus::make_commit(1, 1, 0),
+            test_bus::make_commit(0, 0, u64::MAX),
+            test_bus::make_commit(1, 2, u64::MAX),
+        ];
+        for tick in 1..=TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if tick % TimeoutManager::COMMIT_MESSAGE_TICKS == 0 {
+                for heartbeat in &invalid_heartbeats {
+                    consensus.handle_commit(heartbeat.header());
+                }
+            }
+            let _ = consensus.tick(PlaneKind::Metadata);
+        }
+        assert_eq!(
+            consensus.view(),
+            2,
+            "replayed, older-view, and non-primary heartbeats must not suppress an election"
         );
     }
 

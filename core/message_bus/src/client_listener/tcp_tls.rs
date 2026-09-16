@@ -24,13 +24,9 @@
 //! ([`crate::installer::install_client_tcp_tls`]) so a slow or
 //! malicious peer cannot block subsequent accepts.
 //!
-//! TCP-TLS is shard-0 terminal. Pre-handshake the fd is plain TCP and
-//! could in principle be dup'd to another shard, but the receiving shard
-//! would then have to perform the rustls handshake against a config that
-//! lives on shard 0 — losing the point of the cross-shard handover.
-//! Post-handshake the rustls connection state holds per-record sequence
-//! numbers, key schedule, and write buffers tied to the local task, with
-//! no dupable plaintext fd.
+//! The coordinator delegates the raw fd and shared configuration before
+//! any TLS bytes are consumed. The destination shard creates all
+//! per-connection TLS state and owns subsequent encrypted I/O.
 //!
 //! The TLS plane structurally cannot preserve `Frozen<MESSAGE_ALIGN>`
 //! ownership: rustls's encrypt step copies plaintext bytes into the
@@ -38,8 +34,8 @@
 //! TCP does not carry over.
 
 use crate::AcceptedTlsClientFn;
+use crate::client_listener::bind_nodelay_listener;
 use crate::lifecycle::ShutdownToken;
-use crate::socket_opts::bind_reusable_tcp_listener;
 use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
 use compio::net::TcpListener;
 use futures::FutureExt;
@@ -67,8 +63,8 @@ use tracing::{debug, error, info};
 ///
 /// # Errors
 ///
-/// - [`IggyError::IoError`] if the rustls server config cannot be built
-///   from `credentials` (cert / key mismatch).
+/// - [`IggyError::IoError`] if building the TLS config, configuring
+///   `TCP_NODELAY`, or reading the bound address fails.
 /// - [`IggyError::CannotBindToSocket`] if the TCP bind fails.
 #[allow(clippy::future_not_send)]
 pub fn bind(
@@ -86,11 +82,7 @@ pub fn bind(
     // cannot enable it accidentally.
     cfg.max_early_data_size = 0;
 
-    let listener = bind_reusable_tcp_listener(addr)
-        .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
-    let actual = listener
-        .local_addr()
-        .map_err(|e| IggyError::IoError(e.to_string()))?;
+    let (listener, actual) = bind_nodelay_listener(addr)?;
     Ok((listener, Arc::new(cfg), actual))
 }
 
@@ -99,9 +91,8 @@ pub fn bind(
 /// Each accepted [`compio::net::TcpStream`] is handed to `on_accepted`
 /// together with a clone of the shared [`Arc<rustls::ServerConfig>`].
 /// The callback owns the stream from that point on; production wiring
-/// routes through shard 0's coordinator (mints a `client_id`, builds
-/// the install context, calls
-/// [`crate::installer::install_client_tcp_tls`]).
+/// delegates the raw fd and configuration through shard 0's coordinator.
+/// The destination shard calls [`crate::installer::install_client_tcp_tls`].
 #[allow(clippy::future_not_send)]
 pub async fn run(
     listener: TcpListener,

@@ -99,7 +99,8 @@ pub struct MessageBusConfig {
     pub client_queue_capacity: usize,
 
     /// Interval between outbound reconnect attempts to peers with
-    /// `peer_id > self_id`.
+    /// `peer_id > self_id`. Also bounds each dial, so a peer that drops
+    /// SYNs cannot stall the sweep.
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub reconnect_period: IggyDuration,

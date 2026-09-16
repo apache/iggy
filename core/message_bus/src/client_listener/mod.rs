@@ -24,12 +24,10 @@
 //!   work runs in the install path (per [`crate::installer`]) so a slow
 //!   peer cannot block the accept loop.
 //! - The `on_accepted` callback is responsible for minting a
-//!   `client_id`. The plain TCP and pre-upgrade WS paths route to the
-//!   owning shard via `shard::LifecycleFrame::ClientConnectionSetup` and
-//!   `ClientWsConnectionSetup` respectively. TCP-TLS, WSS, and QUIC
-//!   stay shard-0 terminal: their connection state is not serialisable
-//!   so the callback installs locally on shard 0 instead of shipping a
-//!   setup frame.
+//!   `client_id`. TCP, WS, TCP-TLS and WSS delegate the raw TCP fd to the
+//!   owning shard before any handshake. TLS configuration accompanies
+//!   TCP-TLS and WSS setup frames. QUIC installs locally on shard 0
+//!   because its connections share the endpoint's UDP socket.
 //!
 //! `bind` signature families:
 //!
@@ -102,7 +100,7 @@ pub mod ws;
 pub mod wss;
 
 /// Bind a TCP listener with `TCP_NODELAY` set, the shared shape used by
-/// the plain-TCP and WS pre-upgrade client listeners.
+/// the plain-TCP, TCP-TLS and WS pre-upgrade client listeners.
 ///
 /// Binding stays synchronous through `bind_reusable_tcp_listener` so shard
 /// startup does not depend on compio's `IORING_OP_BIND` and
@@ -141,7 +139,8 @@ mod tests {
     use server_common::executor::create_shard_executor;
     use socket2::SockRef;
 
-    use super::bind_nodelay_listener;
+    use super::{tcp, tcp_tls};
+    use crate::transports::tls::self_signed_for_loopback;
 
     #[test]
     fn given_a_shard_executor_when_binding_a_client_listener_should_preserve_nodelay() {
@@ -149,10 +148,20 @@ mod tests {
         runtime.block_on(async {
             let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
 
-            let (listener, bound_addr) = bind_nodelay_listener(addr).unwrap();
+            let (tcp_listener, tcp_addr) = tcp::bind(addr).unwrap();
+            let (tls_listener, _, tls_addr) =
+                tcp_tls::bind(addr, self_signed_for_loopback()).unwrap();
 
-            assert_ne!(bound_addr.port(), 0);
-            assert!(SockRef::from(&listener).tcp_nodelay().unwrap());
+            for (transport, listener, bound_addr) in [
+                ("TCP", tcp_listener, tcp_addr),
+                ("TCP-TLS", tls_listener, tls_addr),
+            ] {
+                assert_ne!(bound_addr.port(), 0);
+                assert!(
+                    SockRef::from(&listener).tcp_nodelay().unwrap(),
+                    "{transport} listener must disable Nagle"
+                );
+            }
         });
     }
 }
