@@ -39,6 +39,26 @@ max-threads = 1
 filter = 'package(integration) and test(/connectors::elasticsearch::/)'
 test-group = "elasticsearch"
 
+# Each test in this binary spawns its own real iggy-server subprocess (isolated data dir, port
+# from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
+# under nextest - nextest runs every test as its own process, and #[serial]'s mutex only excludes
+# within one process (nextest does not support #[serial] macro, same gap the workaround above
+# documents). Without this override, nextest's default scheduler runs several of these processes
+# at once. The test file's own harness sets IGGY_SHARDING_PIN_CORES=false for every spawned
+# server, so pinned-core contention itself isn't the remaining risk; cpu_allocation = "numa:auto"
+# (config.toml) still is - nothing sets IGGY_SHARDING_CPU_ALLOCATION, so every spawned server still
+# sizes its shard pool to the whole box, and several such servers running at once compete for it,
+# the same reason core/integration's own harness (harness/handle/server.rs) overrides both
+# settings for its spawned test servers. Keep this override even if that gets fixed too: it's also
+# what keeps this crate's own real-server tests from adding to contention against unrelated
+# packages' tests in the same nextest run.
+[test-groups.kafka_bridge]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)'
+test-group = "kafka_bridge"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 

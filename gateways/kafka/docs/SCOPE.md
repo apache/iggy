@@ -89,7 +89,7 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
 | **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
-| **3 — Iggy bridge** | Out of scope | Produce/Fetch → Iggy SDK; deferred to a follow-on issue |
+| **3 — Iggy bridge** | Landed, not wired in | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed; Produce/Fetch handler wiring itself is a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
 
@@ -97,14 +97,22 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 
 Items from the [hybrid architecture review](https://github.com/apache/iggy/discussions/3252) and maintainer feedback. **Not part of #3421.**
 
-### Phase 2 — Iggy bridge (new issue)
+### Phase 2 — Iggy bridge
 
-- [ ] Add `bridge/` module (`iggy_bridge`): Produce → `send_messages`, Fetch → `poll_messages`
+[#3533](https://github.com/apache/iggy/issues/3533) landed the bridge module itself; the items
+below it are still open for the issues that build on top of it.
+
+- [x] Add `bridge/` module (`iggy_bridge`) - connection lifecycle, topic mapping, provisioning,
+      high watermark, error mapping. See [README.md](../README.md#iggy-bridge-3533). Produce →
+      `send_messages` / Fetch → `poll_messages` handler wiring itself is
+      [#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536),
+      not part of `bridge/`'s own scope.
+- [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
+      exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
 - [ ] Document partition mapping in `docs/BRIDGE_MAPPING.md`:
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
   - Iggy **consumer groups exist** — map Kafka group APIs to Iggy consumer group APIs
   - Use `Partitioning::balanced()` only when Kafka sends `partition == -1`; otherwise use request partition ID
-- [ ] Idempotent `ensure_stream_and_topic()` (create-if-not-exists)
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
 ### `kafka-protocol` crate adoption — superseded, done differently
