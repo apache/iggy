@@ -98,7 +98,10 @@ pub(crate) fn build_string_body(
     let mut buf = Vec::with_capacity(messages.len() * 64);
     for msg in messages {
         match &msg.payload {
-            Payload::Text(s) => {
+            // `Payload::Proto` holds proto text, so a passthrough body takes
+            // it the same way it takes `Payload::Text`. The JSON and RowBinary
+            // builders above cannot: they need a parsed document.
+            Payload::Text(s) | Payload::Proto(s) => {
                 buf.extend_from_slice(s.as_bytes());
                 if string_format.requires_newline() && !s.ends_with('\n') {
                     buf.push(b'\n');
@@ -278,6 +281,16 @@ mod tests {
             msg(Payload::Json(json_null())),
         ];
         assert!(build_string_body(&messages, StringFormat::Csv).is_empty());
+    }
+
+    /// A `proto_convert` transform that cannot encode falls back to proto text,
+    /// and the runtime tags that run `Schema::Proto`. Passthrough mode takes it
+    /// as text, the way it reached this sink before batches were tagged from
+    /// the payload.
+    #[test]
+    fn string_body_proto_payload_is_written_as_text() {
+        let messages = vec![msg(Payload::Proto("a,b,c".to_owned()))];
+        assert_eq!(build_string_body(&messages, StringFormat::Csv), b"a,b,c\n");
     }
 
     // ── build_row_binary_body ────────────────────────────────────────────────

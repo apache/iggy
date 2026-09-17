@@ -598,8 +598,11 @@ async fn process_messages(
 
     // One `Schema` tag covers a whole FFI call, so messages are grouped into
     // contiguous runs of the same payload variant and each run is sent on its
-    // own. Every decoder and transform in tree is deterministic per instance, so
-    // a run holds the entire batch in practice and there is one call.
+    // own. No decoder mixes variants within one configured instance, but a
+    // transform can: `ProtoConvert` returns `Payload::Raw` when it can encode a
+    // message against its descriptor and `Payload::Proto` when it cannot, which
+    // turns on the message rather than the config. A uniform batch stays one run
+    // and one call.
     let mut runs: Vec<(Schema, Vec<RawMessage>)> = Vec::with_capacity(1);
     let mut remaining = decoded.len();
     for message in decoded {
@@ -737,7 +740,10 @@ async fn process_messages(
 
     // A batch that lost every message still reaches the sink, as it always has.
     // There is no payload to read a tag from, so it carries the stream's
-    // configured schema.
+    // configured schema. That is the decoder's wire format rather than a payload
+    // variant, which is safe only because the run is empty: a tag is read back
+    // once per message, so an empty run never has it interpreted. Anything that
+    // starts branching on the tag for whole-batch behaviour has to revisit this.
     if runs.is_empty() {
         runs.push((decoder.schema(), Vec::new()));
     }
@@ -815,7 +821,9 @@ mod tests {
     use dashmap::DashMap;
     use iggy::prelude::IggyMessageHeader;
     use iggy_connector_sdk::transforms::TransformType;
+    use iggy_connector_sdk::transforms::{ProtoConvert, ProtoConvertConfig};
     use iggy_connector_sdk::{Error, Payload};
+    use prost::Message as _;
     use std::sync::LazyLock;
     use std::sync::atomic::AtomicU32;
 
@@ -1061,5 +1069,61 @@ mod tests {
         // Nothing survived to read a tag from, so the stream's configured
         // schema stands in.
         assert_eq!(batches[0].metadata_schema, Schema::Avro);
+    }
+
+    #[tokio::test]
+    async fn given_a_proto_convert_transform_when_a_batch_mixes_variants_should_split_into_runs() {
+        // `ProtoConvert` encodes a top-level object against its descriptor and
+        // falls back to proto text for anything else, so one configured
+        // instance returns `Raw` for one message and `Proto` for the next.
+        let plugin_id = next_plugin_id();
+        let descriptor = protox_parse::parse(
+            "record.proto",
+            r#"syntax = "proto3";
+            message StringRecord {
+                string first = 1;
+            }"#,
+        )
+        .expect("test schema must parse");
+        let transform = Arc::new(ProtoConvert::new(ProtoConvertConfig {
+            source_format: Schema::Json,
+            target_format: Schema::Proto,
+            message_type: Some("StringRecord".to_owned()),
+            descriptor_set: Some(
+                prost_types::FileDescriptorSet {
+                    file: vec![descriptor],
+                }
+                .encode_to_vec(),
+            ),
+            ..ProtoConvertConfig::default()
+        }));
+        let messages = vec![
+            test_message(0, br#"{"first":"encoded"}"#.to_vec()),
+            test_message(1, br#"[1,2,3]"#.to_vec()),
+            test_message(2, br#"{"first":"encoded"}"#.to_vec()),
+        ];
+
+        let timing = run(plugin_id, Schema::Json.decoder(), vec![transform], messages).await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(timing.processed_count, 3, "no message may be lost");
+        assert_eq!(
+            batches.len(),
+            3,
+            "each variant change starts a new FFI call"
+        );
+        assert_eq!(batches[0].metadata_schema, Schema::Raw);
+        assert_eq!(batches[0].offsets, vec![0]);
+        assert_eq!(batches[1].metadata_schema, Schema::Proto);
+        assert_eq!(batches[1].offsets, vec![1]);
+        assert_eq!(batches[2].metadata_schema, Schema::Raw);
+        assert_eq!(batches[2].offsets, vec![2]);
+
+        // The tag has to survive the trip back, or the sink sees a variant the
+        // transform never produced.
+        let rebuilt =
+            Payload::try_from_schema(batches[1].messages_schema, batches[1].payloads[0].clone())
+                .expect("the proto run must rebuild");
+        assert_eq!(rebuilt.schema(), Schema::Proto);
     }
 }

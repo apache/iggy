@@ -21,7 +21,9 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::log::{CallbackLayer, LogCallback};
-use crate::{ConsumedMessage, MessagesMetadata, RawMessages, Sink, TopicMetadata, get_runtime};
+use crate::{
+    ConsumedMessage, MessagesMetadata, Payload, RawMessages, Sink, TopicMetadata, get_runtime,
+};
 
 pub type ConsumeCallback = extern "C" fn(
     plugin_id: u32,
@@ -196,7 +198,12 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                     }
                 };
 
-                let payload = match messages_metadata.schema.try_into_payload(message.payload) {
+                // The runtime tags each run from `Payload::schema`, so the
+                // tag names a variant here rather than a wire format.
+                let payload = match Payload::try_from_schema(
+                    messages_metadata.schema,
+                    message.payload,
+                ) {
                     Ok(payload) => payload,
                     Err(err) => {
                         error!(

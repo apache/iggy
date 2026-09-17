@@ -360,7 +360,9 @@ impl MeilisearchSink {
                     ]),
                 }
             }
-            Payload::Text(text) => Map::from_iter([
+            // `Payload::Proto` holds proto text, so it indexes the same
+            // way `Payload::Text` does.
+            Payload::Text(text) | Payload::Proto(text) => Map::from_iter([
                 ("text".to_string(), Value::String(text)),
                 ("data_type".to_string(), Value::String("text".to_string())),
             ]),
