@@ -32,6 +32,8 @@ use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
 use std::net::SocketAddr;
+use std::path::Path;
+use tracing::warn;
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -407,8 +409,18 @@ impl ServerConfig {
 
     /// The listener the client-facing address is derived from must not bind a
     /// wildcard unless that address is declared outright.
+    ///
+    /// When running inside a container, a loopback listener means the server
+    /// is unreachable from outside the container, which is warned.
     fn validate_client_facing_address(&self) -> Result<(), ConfigurationError> {
-        if self.cluster.enabled || self.node.advertised_address.is_some() {
+        self.validate_client_facing_address_in_env(is_container())
+    }
+
+    fn validate_client_facing_address_in_env(
+        &self,
+        is_container: bool,
+    ) -> Result<(), ConfigurationError> {
+        if self.cluster.enabled {
             return Ok(());
         }
         // No client-facing listener runs, so no client dials this node and
@@ -417,19 +429,90 @@ impl ServerConfig {
             return Ok(());
         };
         let bind = parse_bind_address(listener.key, listener.address)?;
-        if !bind.ip().to_canonical().is_unspecified() {
+        let ip = bind.ip().to_canonical();
+        if ip.is_unspecified() {
+            if self.node.advertised_address.is_none() {
+                eprintln!(
+                    "{COMPONENT} - {} binds the wildcard {bind}, which says which interfaces this node \
+                     accepts on rather than where a client reaches it, so cluster metadata would carry no \
+                     address for this node. Set node.advertised_address to the address clients dial, or \
+                     bind a concrete address.",
+                    listener.key
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
             return Ok(());
         }
 
-        eprintln!(
-            "{COMPONENT} - {} binds the wildcard {bind}, which says which interfaces this node \
-             accepts on rather than where a client reaches it, so cluster metadata would carry no \
-             address for this node. Set node.advertised_address to the address clients dial, or \
-             bind a concrete address.",
-            listener.key
-        );
-        Err(ConfigurationError::InvalidConfigurationValue)
+        if ip.is_loopback() && is_container {
+            let env_var = format!("IGGY_{}", listener.key.replace('.', "_").to_uppercase());
+            let port = bind.port();
+            if self.node.advertised_address.is_none() {
+                warn!(
+                    "{COMPONENT} - {} binds the loopback address {bind} inside a container; the \
+                     server will not be reachable from outside the container. Set {env_var}=0.0.0.0:{port} \
+                     together with IGGY_NODE_ADVERTISED_ADDRESS, or bind a concrete address.",
+                    listener.key
+                );
+            } else {
+                warn!(
+                    "{COMPONENT} - {} binds the loopback address {bind} inside a container; the \
+                     server will not be reachable from outside the container. Set {env_var}=0.0.0.0:{port} \
+                     or bind a concrete address.",
+                    listener.key
+                );
+            }
+        }
+
+        Ok(())
     }
+}
+
+/// Returns true when the process is executing inside a container.
+fn is_container() -> bool {
+    is_container_indicators(
+        Path::new("/.dockerenv"),
+        Path::new("/run/.containerenv"),
+        "/proc/self/cgroup",
+    )
+}
+
+fn is_container_indicators(
+    dockerenv_path: &Path,
+    containerenv_path: &Path,
+    cgroup_path: &str,
+) -> bool {
+    if dockerenv_path.exists() || containerenv_path.exists() {
+        return true;
+    }
+
+    if std::env::var_os("container").is_some()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cgroup) = std::fs::read_to_string(cgroup_path)
+            && cgroup.lines().any(|line| {
+                line.contains("/docker/")
+                    || line.contains("/docker-")
+                    || line.contains("/libpod-")
+                    || line.contains("/podman/")
+                    || line.contains("/kubepods/")
+                    || line.contains("/kubepods-")
+                    || line.contains("/containerd/")
+                    || line.contains("/lxc/")
+            })
+        {
+            return true;
+        }
+    }
+
+    let _ = cgroup_path;
+
+    false
 }
 
 /// A listener's bind address, which is a literal IP and a port and nothing
@@ -532,6 +615,64 @@ mod tests {
             "[tcp]\naddress = \"192.0.2.10:8090\"\n[cluster]\nenabled = false\n",
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_loopback_bind_in_container_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate_client_facing_address_in_env(true).is_ok());
+    }
+
+    #[test]
+    fn given_loopback_bind_outside_container_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate_client_facing_address_in_env(false).is_ok());
+    }
+
+    #[test]
+    fn given_loopback_bind_in_container_with_advertised_address_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n\
+             [node]\nadvertised_address = \"broker-1.example.com\"\n",
+        );
+        assert!(config.validate_client_facing_address_in_env(true).is_ok());
+    }
+
+    #[test]
+    fn given_dockerenv_file_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let marker = temp_dir.join(format!("test_dockerenv_{}", std::process::id()));
+        std::fs::write(&marker, "").unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result = is_container_indicators(&marker, &non_existent, "/non/existent/cgroup");
+        let _ = std::fs::remove_file(&marker);
+        assert!(result);
+    }
+
+    #[test]
+    fn given_containerenv_file_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let marker = temp_dir.join(format!("test_containerenv_{}", std::process::id()));
+        std::fs::write(&marker, "").unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result = is_container_indicators(&non_existent, &marker, "/non/existent/cgroup");
+        let _ = std::fs::remove_file(&marker);
+        assert!(result);
+    }
+
+    #[test]
+    fn given_missing_container_indicators_when_checking_container_should_return_false() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        // Safe check without environment variables
+        assert!(!is_container_indicators(
+            non_existent,
+            non_existent,
+            "/non/existent/cgroup"
+        ));
     }
 
     #[test]
