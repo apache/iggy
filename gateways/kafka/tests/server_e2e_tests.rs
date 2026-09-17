@@ -19,6 +19,8 @@
 
 #[path = "common/codec.rs"]
 mod codec;
+#[path = "common/fake_bridge.rs"]
+mod fake_bridge;
 #[path = "common/fixtures.rs"]
 mod fixtures;
 #[path = "common/server.rs"]
@@ -28,14 +30,17 @@ mod tcp;
 #[path = "common/wire.rs"]
 mod wire;
 
+use std::sync::Arc;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use fake_bridge::FakeBridge;
+
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 use codec::Decoder;
@@ -54,7 +59,7 @@ use wire::{
 
 #[tokio::test]
 async fn e2e_apiversions_v1_preserves_correlation_id() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 1, 42_001, &[]).await;
     assert_eq!(corr, 42_001);
     let mut d = Decoder::new(body);
@@ -63,7 +68,7 @@ async fn e2e_apiversions_v1_preserves_correlation_id() {
 
 #[tokio::test]
 async fn e2e_apiversions_v3_flexible_preserves_correlation_id() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let request = wire::build_api_versions_flexible_request("iggy-test", "0.1.0");
     let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 3, 42_002, &request).await;
     assert_eq!(corr, 42_002);
@@ -75,7 +80,7 @@ async fn e2e_apiversions_v3_flexible_preserves_correlation_id() {
 
 #[tokio::test]
 async fn e2e_metadata_v0_returns_stub_broker() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut req = BytesMut::new();
     req.put_i32(0); // empty topics
     let (corr, body) = round_trip(addr, API_KEY_METADATA, 0, 77, &req).await;
@@ -89,7 +94,7 @@ async fn e2e_metadata_v0_returns_stub_broker() {
 
 #[tokio::test]
 async fn e2e_produce_v3_round_trip_with_fixture() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let Some(body) = load_fixture_body_or_skip(0, "Produce", 3) else {
         return;
     };
@@ -100,7 +105,7 @@ async fn e2e_produce_v3_round_trip_with_fixture() {
 
 #[tokio::test]
 async fn e2e_unsupported_api_key_closes_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     // Unknown api key (8, OffsetCommit) has no response schema this gateway can encode, so the
@@ -117,7 +122,7 @@ async fn e2e_unsupported_api_key_closes_connection() {
 
 #[tokio::test]
 async fn e2e_sequential_requests_on_one_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     let requests = [(API_KEY_API_VERSIONS, 1i16), (API_KEY_METADATA, 0i16)];
@@ -150,7 +155,7 @@ async fn e2e_sequential_requests_on_one_connection() {
 
 #[tokio::test]
 async fn e2e_produce_v3_acks_zero_sends_no_response() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let body = build_produce_v3_body(0, 0);
@@ -173,7 +178,7 @@ async fn e2e_produce_v3_acks_zero_sends_no_response() {
 
 #[tokio::test]
 async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     // acks=0, claims one topic, no topic bytes - decode fails after acks is read.
@@ -209,7 +214,7 @@ async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
 
 #[tokio::test]
 async fn e2e_produce_v3_acks_one_still_returns_response() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let body = build_produce_v3_body(1, 0);
@@ -237,7 +242,7 @@ async fn e2e_list_offsets_v0_closes_connection() {
     // (it predates the schema the crate generates from - see `responses::encode_list_offsets_error_response`),
     // so a v0 request - already below the firewall's min=1 - now closes instead of getting the
     // pre-migration downgraded response.
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let request_body = build_list_offsets_v0_request_with_topic_t();
@@ -270,7 +275,7 @@ async fn e2e_metadata_v1_response_contains_requested_topic_name() {
     // anywhere in the response" (e.g. leaked into an unrelated field, or byte-coincidentally
     // matching padding), and can't assert the *absence* of a wrong name without that same
     // false-positive risk.
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let topic = "orders";
     let request_body = build_metadata_legacy_request(&[topic]);
     let (corr, body) = round_trip(addr, API_KEY_METADATA, 1, 9, &request_body).await;
@@ -288,7 +293,7 @@ async fn e2e_metadata_v1_response_contains_requested_topic_name() {
 
 #[tokio::test]
 async fn e2e_produce_v3_acks_all_minus_one_returns_response() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let body = build_produce_v3_body(-1, 0);
     let (corr, resp) = round_trip(addr, API_KEY_PRODUCE, 3, 501, &body).await;
     assert_eq!(corr, 501);
@@ -297,7 +302,7 @@ async fn e2e_produce_v3_acks_all_minus_one_returns_response() {
 
 #[tokio::test]
 async fn e2e_produce_v9_flexible_header_with_empty_topics() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let body = build_produce_flexible_empty_request(1);
     let (corr, resp) = round_trip(addr, API_KEY_PRODUCE, 9, 502, &body).await;
     assert_eq!(corr, 502);
@@ -310,7 +315,7 @@ async fn e2e_produce_v9_flexible_header_with_empty_topics() {
 
 #[tokio::test]
 async fn produce_v3_through_v9_e2e_preserve_correlation_id() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     for version in 3i16..=9 {
         let body = if version >= 9 {
@@ -327,9 +332,12 @@ async fn produce_v3_through_v9_e2e_preserve_correlation_id() {
 
 // ── ListOffsets supported versions ──────────────────────────────────────────
 
+/// The spawned server's bridge has never heard of "offsets-topic", so every version reports the
+/// real per-partition answer for that condition - `UNKNOWN_TOPIC_OR_PARTITION` (3) - not the old
+/// stub's blanket retriable code.
 #[tokio::test]
-async fn list_offsets_v1_through_v6_e2e_return_retriable_not_leader() {
-    let (addr, _shutdown) = spawn_test_server().await;
+async fn list_offsets_v1_through_v6_e2e_return_unknown_topic_or_partition() {
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     for version in 1i16..=6 {
         let body = build_list_offsets_request(version, "offsets-topic", 0);
@@ -355,8 +363,8 @@ async fn list_offsets_v1_through_v6_e2e_return_retriable_not_leader() {
         d.read_i32().unwrap();
         assert_eq!(
             d.read_i16().unwrap(),
-            ERROR_NOT_LEADER_OR_FOLLOWER,
-            "ListOffsets v{version} stub partition error"
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            "ListOffsets v{version} partition error"
         );
     }
 }
@@ -365,7 +373,7 @@ async fn list_offsets_v1_through_v6_e2e_return_retriable_not_leader() {
 
 #[tokio::test]
 async fn create_topics_v2_through_v5_empty_request_e2e_succeeds() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     for version in 2i16..=5 {
         let body = build_create_topics_empty_request(version);
@@ -389,7 +397,7 @@ async fn create_topics_v2_through_v5_empty_request_e2e_succeeds() {
 
 #[tokio::test]
 async fn fetch_v4_through_v12_e2e_preserve_correlation_id() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     for version in 4i16..=12 {
         let body = load_fixture_body_or_skip(1, "Fetch", version)
@@ -404,7 +412,7 @@ async fn fetch_v4_through_v12_e2e_preserve_correlation_id() {
 
 #[tokio::test]
 async fn metadata_all_topics_null_array_e2e_returns_broker() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let request = wire::build_metadata_all_topics_legacy(0);
     let (corr, body) = round_trip(addr, API_KEY_METADATA, 0, 360, &request).await;
     assert_eq!(corr, 360);
@@ -419,7 +427,7 @@ async fn metadata_all_topics_null_array_e2e_returns_broker() {
 
 #[tokio::test]
 async fn metadata_empty_body_e2e_closes_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     let frame = build_request_frame(API_KEY_METADATA, 0, 361, Some("empty-md"), &[]);
     stream.write_all(&frame).await.expect("write");
@@ -434,7 +442,7 @@ async fn metadata_empty_body_e2e_closes_connection() {
 
 #[tokio::test]
 async fn out_of_scope_api_keys_e2e_close() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     for &(api_key, name) in &OUT_OF_SCOPE_API_KEYS[..4] {
         let mut stream = TcpStream::connect(addr).await.expect("connect");

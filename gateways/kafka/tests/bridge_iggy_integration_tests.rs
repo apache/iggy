@@ -1027,3 +1027,182 @@ async fn high_watermark_rejects_a_padded_kafka_topic_name() {
         .expect_err("a padded Kafka topic name must be rejected before any Iggy lookup");
     assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
 }
+
+// ── get_kafka_topic / list_kafka_topics (#3534 Metadata) ───────────────────
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_returns_none_for_a_topic_that_does_not_exist() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    let result = bridge
+        .get_kafka_topic("never-created")
+        .await
+        .expect("lookup itself must not fail just because the topic is missing");
+    assert!(
+        result.is_none(),
+        "a never-created topic must read as absent, not auto-create it \
+         (get_kafka_topic is read-only discovery, unlike ensure_stream_and_topic)"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_reports_partitions_count_after_creation() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 4)
+        .await
+        .expect("stream and topic must exist before the lookup");
+
+    let metadata = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup call")
+        .expect("topic exists after ensure_stream_and_topic");
+    assert_eq!(metadata.kafka_topic, "orders");
+    assert_eq!(metadata.partitions_count, 4);
+}
+
+/// Regression test for the Kafka-side vs Iggy-side name distinction `get_kafka_topic` shares
+/// with `ensure_stream_and_topic`/`high_watermark`: a mapping override renames the Iggy side, so
+/// looking the topic up by its *Kafka* name must still resolve, even though no Iggy topic is
+/// literally named that.
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_resolves_through_a_topic_mapping_override() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let mut topics = HashMap::new();
+    topics.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: "billing".to_string(),
+            topic: "orders_v2".to_string(),
+        },
+    );
+    config.topic_mapping = TopicMapping::new("kafka".to_string(), topics)
+        .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("must create the mapped Iggy stream/topic");
+
+    let metadata = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup call")
+        .expect("topic exists under its Iggy-side name");
+    assert_eq!(
+        metadata.kafka_topic, "orders",
+        "must report the Kafka-side name the caller asked about, not the Iggy-side 'orders_v2'"
+    );
+    assert_eq!(metadata.partitions_count, 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_is_empty_for_a_fresh_default_stream() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    // No ensure_stream_and_topic call at all: the default_stream ("kafka") has never been
+    // created, so list_kafka_topics must not error just because get_stream finds nothing.
+    let topics = bridge
+        .list_kafka_topics()
+        .await
+        .expect("listing must succeed even when the default stream doesn't exist yet");
+    assert!(topics.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_reports_every_topic_in_the_default_stream() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("create orders");
+    bridge
+        .ensure_stream_and_topic("payments", 1)
+        .await
+        .expect("create payments");
+
+    let mut topics = bridge.list_kafka_topics().await.expect("listing call");
+    topics.sort_by(|a, b| a.kafka_topic.cmp(&b.kafka_topic));
+
+    assert_eq!(topics.len(), 2, "must report both topics, not just one");
+    assert_eq!(topics[0].kafka_topic, "orders");
+    assert_eq!(topics[0].partitions_count, 2);
+    assert_eq!(topics[1].kafka_topic, "payments");
+    assert_eq!(topics[1].partitions_count, 1);
+}
+
+/// `list_kafka_topics` must also surface topics reachable only through a mapping override -
+/// its own doc comment explains why one bulk `get_topics(default_stream)` call cannot see these
+/// (a different target stream, or a different Iggy topic name under the same stream).
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_includes_a_created_override_target_but_not_an_uncreated_one() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let mut topics = HashMap::new();
+    topics.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: "billing".to_string(),
+            topic: "orders_v2".to_string(),
+        },
+    );
+    topics.insert(
+        "never-created".to_string(),
+        TopicOverride {
+            stream: "billing".to_string(),
+            topic: "never_created_v2".to_string(),
+        },
+    );
+    config.topic_mapping = TopicMapping::new("kafka".to_string(), topics)
+        .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 3)
+        .await
+        .expect("create the override target for 'orders'");
+    // Deliberately never call ensure_stream_and_topic("never-created", ..): real Kafka Metadata
+    // lists existing topics, not configured-but-uncreated ones.
+
+    let listed = bridge.list_kafka_topics().await.expect("listing call");
+    assert_eq!(
+        listed.len(),
+        1,
+        "must report only the override target that was actually created: {listed:?}"
+    );
+    assert_eq!(listed[0].kafka_topic, "orders");
+    assert_eq!(listed[0].partitions_count, 3);
+}

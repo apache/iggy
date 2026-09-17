@@ -22,19 +22,17 @@ use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::fetch_request::FetchTopic;
 use kafka_protocol::messages::list_offsets_request::ListOffsetsTopic;
 use kafka_protocol::messages::produce_request::TopicProduceData;
-use kafka_protocol::messages::{
-    BrokerId, CreateTopicsRequest, FetchRequest, ListOffsetsRequest, TopicName,
-};
+use kafka_protocol::messages::{BrokerId, FetchRequest, ListOffsetsRequest, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 use iggy_gateway_kafka::protocol::api::{
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
-    ERROR_NOT_CONTROLLER, ERROR_UNSUPPORTED_VERSION,
+    ERROR_UNSUPPORTED_VERSION,
 };
 use iggy_gateway_kafka::protocol::responses::{
     encode_create_topics_error_response, encode_create_topics_response,
     encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
-    encode_produce_error_response,
+    encode_produce_error_response, validate_create_topic_shape,
 };
 
 use codec::Decoder;
@@ -50,59 +48,35 @@ fn creatable_topic(name: &str, num_partitions: i32, replication_factor: i16) -> 
         .with_replication_factor(replication_factor)
 }
 
+// `validate_create_topic_shape` is the format-validation gate `handle_create_topics` (a bridge
+// call away, needing a real or fake `TopicCatalog` - see `api_handler_tests.rs`/
+// `gateway_bridge_e2e_tests.rs` for those) runs before ever touching the bridge. Tested directly
+// here rather than through the full request/response round trip: the shape rules themselves
+// (KIP-464's `-1` sentinel, the assignment carve-out) don't depend on bridge behavior at all.
+
 #[test]
 fn create_topics_response_flags_non_positive_partition_count_v2() {
-    let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic("bad-topic", 0, 1)]);
-    let body = encode_create_topics_response(2, &req).unwrap();
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 0); // throttle
-    assert_eq!(d.read_i32().unwrap(), 1); // topics len
+    let topic = creatable_topic("bad-topic", 0, 1);
     assert_eq!(
-        d.read_nullable_string().unwrap(),
-        Some("bad-topic".to_string())
+        validate_create_topic_shape(&topic, 2),
+        Err(ERROR_INVALID_PARTITIONS)
     );
-    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_PARTITIONS);
 }
 
 #[test]
-fn create_topics_v5_broker_default_partitions_is_not_invalid_partitions() {
-    // KIP-464: -1 = broker default on CreateTopics v4+; stub still returns NOT_CONTROLLER.
-    let req = CreateTopicsRequest::default()
-        .with_topics(vec![creatable_topic("default-parts", -1, 2)])
-        .with_validate_only(true);
-    let body = encode_create_topics_response(5, &req).unwrap();
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 0); // throttle
-    assert_eq!(d.read_varint().unwrap(), 2); // one topic
-    assert_eq!(
-        d.read_compact_nullable_string().unwrap(),
-        Some("default-parts".to_string())
-    );
-    assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
-    assert_eq!(d.read_compact_nullable_string().unwrap(), None);
-    assert_eq!(d.read_i32().unwrap(), -1);
-    assert_eq!(d.read_i16().unwrap(), 2);
+fn create_topics_v5_broker_default_partitions_resolves_to_default_count() {
+    // KIP-464: -1 = broker default on CreateTopics v4+.
+    let topic = creatable_topic("default-parts", -1, 2);
+    assert_eq!(validate_create_topic_shape(&topic, 5), Ok(1));
 }
 
 #[test]
 fn create_topics_v5_flags_zero_and_below_minus_one_partition_count() {
     for num_partitions in [0i32, -2] {
-        let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic(
-            "bad-parts",
-            num_partitions,
-            1,
-        )]);
-        let body = encode_create_topics_response(5, &req).unwrap();
-        let mut d = Decoder::new(body);
-        assert_eq!(d.read_i32().unwrap(), 0);
-        assert_eq!(d.read_varint().unwrap(), 2);
+        let topic = creatable_topic("bad-parts", num_partitions, 1);
         assert_eq!(
-            d.read_compact_nullable_string().unwrap(),
-            Some("bad-parts".to_string())
-        );
-        assert_eq!(
-            d.read_i16().unwrap(),
-            ERROR_INVALID_PARTITIONS,
+            validate_create_topic_shape(&topic, 5),
+            Err(ERROR_INVALID_PARTITIONS),
             "num_partitions={num_partitions}"
         );
     }
@@ -111,22 +85,10 @@ fn create_topics_v5_flags_zero_and_below_minus_one_partition_count() {
 #[test]
 fn create_topics_v5_flags_invalid_replication_factor() {
     for replication_factor in [0i16, -2] {
-        let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic(
-            "bad-rf",
-            1,
-            replication_factor,
-        )]);
-        let body = encode_create_topics_response(5, &req).unwrap();
-        let mut d = Decoder::new(body);
-        assert_eq!(d.read_i32().unwrap(), 0);
-        assert_eq!(d.read_varint().unwrap(), 2);
+        let topic = creatable_topic("bad-rf", 1, replication_factor);
         assert_eq!(
-            d.read_compact_nullable_string().unwrap(),
-            Some("bad-rf".to_string())
-        );
-        assert_eq!(
-            d.read_i16().unwrap(),
-            ERROR_INVALID_REPLICATION_FACTOR,
+            validate_create_topic_shape(&topic, 5),
+            Err(ERROR_INVALID_REPLICATION_FACTOR),
             "replication_factor={replication_factor}"
         );
     }
@@ -135,16 +97,11 @@ fn create_topics_v5_flags_invalid_replication_factor() {
 #[test]
 fn create_topics_v2_rejects_broker_default_sentinel() {
     // KIP-464 defaults apply from v4; on v2 without assignments, -1 is INVALID_PARTITIONS.
-    let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic("legacy", -1, 1)]);
-    let body = encode_create_topics_response(2, &req).unwrap();
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i32().unwrap(), 1);
+    let topic = creatable_topic("legacy", -1, 1);
     assert_eq!(
-        d.read_nullable_string().unwrap(),
-        Some("legacy".to_string())
+        validate_create_topic_shape(&topic, 2),
+        Err(ERROR_INVALID_PARTITIONS)
     );
-    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_PARTITIONS);
 }
 
 #[test]
@@ -155,18 +112,10 @@ fn create_topics_v2_with_assignments_allows_broker_default_sentinels() {
     let assignment = CreatableReplicaAssignment::default()
         .with_partition_index(0)
         .with_broker_ids(vec![BrokerId(1)]);
-    let req = CreateTopicsRequest::default().with_topics(vec![
-        creatable_topic("assigned", -1, -1).with_assignments(vec![assignment]),
-    ]);
-    let body = encode_create_topics_response(2, &req).unwrap();
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(
-        d.read_nullable_string().unwrap(),
-        Some("assigned".to_string())
-    );
-    assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
+    let topic = creatable_topic("assigned", -1, -1).with_assignments(vec![assignment]);
+    // -1 partitions resolves to the broker default (1) same as the no-assignments case;
+    // assignments only widen *which versions* accept the sentinel, not what it resolves to.
+    assert_eq!(validate_create_topic_shape(&topic, 2), Ok(1));
 }
 
 #[test]
@@ -263,14 +212,17 @@ fn success_responses_can_still_encode_empty_request_vectors() {
 
     let list_offsets = ListOffsetsRequest::default().with_topics(Vec::<ListOffsetsTopic>::new());
     assert!(
-        !iggy_gateway_kafka::protocol::responses::encode_list_offsets_response(1, &list_offsets)
-            .unwrap()
-            .is_empty()
+        !iggy_gateway_kafka::protocol::responses::encode_list_offsets_response(
+            1,
+            &list_offsets,
+            &[]
+        )
+        .unwrap()
+        .is_empty()
     );
 
-    let create_topics = CreateTopicsRequest::default().with_topics(Vec::<CreatableTopic>::new());
     assert!(
-        !encode_create_topics_response(2, &create_topics)
+        !encode_create_topics_response(&Vec::<CreatableTopic>::new(), &[], 2)
             .unwrap()
             .is_empty()
     );

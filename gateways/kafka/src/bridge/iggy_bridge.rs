@@ -526,4 +526,86 @@ impl IggyBridge {
             );
         watermark
     }
+
+    /// Looks up `kafka_topic` without creating it. Unlike [`Self::ensure_stream_and_topic`],
+    /// Metadata is read-only discovery - a client asking "does this topic exist" must not have
+    /// the asking itself create the topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
+    /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] for connectivity/auth failures.
+    pub async fn get_kafka_topic(
+        &self,
+        kafka_topic: &str,
+    ) -> Result<Option<KafkaTopicMetadata>, BridgeError> {
+        validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+        if with_request_timeout(self.client.get_stream(&stream_id))
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        let Some(topic) =
+            with_request_timeout(self.client.get_topic(&stream_id, &topic_id)).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(KafkaTopicMetadata {
+            kafka_topic: kafka_topic.to_string(),
+            partitions_count: topic.partitions_count,
+        }))
+    }
+
+    /// Every Kafka-facing topic this bridge currently knows about, for a Metadata request with a
+    /// null (all-topics) `topics` array.
+    ///
+    /// Two sources, not one `get_topics(default_stream)` call: every topic actually present in
+    /// `default_stream` resolves back to a Kafka topic of the identical name (`TopicMapping::new`
+    /// already rejects any override that could alias that path - see its own doc), so those are
+    /// free to list in bulk. An override's *target* is a different stream (or the same stream
+    /// under a different Iggy topic name), invisible to that one bulk call, so each is checked
+    /// individually - and only included if the Iggy side has actually been created, since real
+    /// Kafka Metadata lists existing topics, not configured-but-uncreated ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Timeout`] if a call takes longer than `REQUEST_TIMEOUT`. Returns
+    /// [`BridgeError::Iggy`] for connectivity/auth failures.
+    pub async fn list_kafka_topics(&self) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
+        let default_stream = self.config.topic_mapping.default_stream();
+        let default_stream_id = Identifier::named(default_stream).map_err(BridgeError::Iggy)?;
+        let mut topics = Vec::new();
+        if with_request_timeout(self.client.get_stream(&default_stream_id))
+            .await?
+            .is_some()
+        {
+            let default_topics =
+                with_request_timeout(self.client.get_topics(&default_stream_id)).await?;
+            topics.extend(default_topics.into_iter().map(|topic| KafkaTopicMetadata {
+                kafka_topic: topic.name,
+                partitions_count: topic.partitions_count,
+            }));
+        }
+        for kafka_topic in self.config.topic_mapping.overrides().keys() {
+            if let Some(metadata) = self.get_kafka_topic(kafka_topic).await? {
+                topics.push(metadata);
+            }
+        }
+        Ok(topics)
+    }
+}
+
+/// Kafka-facing topic name plus partition count, as `handle_metadata` needs to report it.
+///
+/// A `Topic`/`TopicDetails` (`core/common`) carries far more than Metadata's wire shape uses, and
+/// neither carries the *Kafka-side* name a mapping override may have renamed away from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaTopicMetadata {
+    pub kafka_topic: String,
+    pub partitions_count: u32,
 }

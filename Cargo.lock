@@ -7013,6 +7013,7 @@ dependencies = [
 name = "iggy-gateway-kafka"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "iggy",
  "kafka-protocol",

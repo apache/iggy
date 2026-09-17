@@ -19,26 +19,36 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::broadcast;
 
+use iggy_gateway_kafka::bridge::TopicCatalog;
 use iggy_gateway_kafka::server::bind_listener;
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
-/// Bind an ephemeral port, start `KafkaGateway`, return address + shutdown sender.
-pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
-    spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: 8 * 1024 * 1024,
-        max_connections: 1024,
-        idle_timeout: Duration::from_secs(5),
-        read_timeout: Duration::from_secs(5),
-        write_timeout: Duration::from_secs(5),
-        shutdown_drain_timeout: Duration::from_secs(5),
-    })
+/// Bind an ephemeral port, start `KafkaGateway` against `bridge`, return address + shutdown
+/// sender. Callers own the bridge (typically `tests/common/fake_bridge.rs`'s `FakeBridge`, or a
+/// connected `IggyBridge` for suites that spawn a real `iggy-server`) - this helper has no
+/// opinion on which.
+pub async fn spawn_test_server(
+    bridge: Arc<dyn TopicCatalog>,
+) -> (SocketAddr, broadcast::Sender<()>) {
+    spawn_test_server_with_config(
+        GatewayConfig {
+            bind_addr: String::new(),
+            advertised_host: None,
+            advertised_port: None,
+            max_frame_size: 8 * 1024 * 1024,
+            max_connections: 1024,
+            idle_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            shutdown_drain_timeout: Duration::from_secs(5),
+        },
+        bridge,
+    )
     .await
 }
 
@@ -51,6 +61,7 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
 #[allow(clippy::unused_async)]
 pub async fn spawn_test_server_with_config(
     mut config: GatewayConfig,
+    bridge: Arc<dyn TopicCatalog>,
 ) -> (SocketAddr, broadcast::Sender<()>) {
     // Routed through the same tuned bind path as `main` (deep accept backlog via socket2), not a
     // bare `TcpListener::bind`, so integration tests actually exercise it.
@@ -59,7 +70,7 @@ pub async fn spawn_test_server_with_config(
 
     config.bind_addr = addr.to_string();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let server = KafkaGateway::new(config);
+    let server = KafkaGateway::new(config, bridge);
     tokio::spawn(async move {
         let _ = server.run(listener, shutdown_rx).await;
     });

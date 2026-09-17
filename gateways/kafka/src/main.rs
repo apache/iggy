@@ -17,13 +17,13 @@
 
 use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
-use tracing::warn;
 
-use iggy_gateway_kafka::bridge::IggyBridgeConfig;
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig};
 use iggy_gateway_kafka::server::{bind_listener, init_tracing};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -36,9 +36,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = load_config()?;
 
+    // Connected before the listener binds: an unreachable Iggy backend at startup should fail
+    // fast and loud (a non-zero exit an orchestrator's readiness probe sees immediately), not
+    // accept Kafka connections that can then only ever answer bridge-backed requests with a
+    // connectivity error. `IggyBridge::connect` itself bounds this in wall-clock time (see its
+    // own `REQUEST_TIMEOUT` doc) - it cannot hang here even against a silently-dropping address.
+    let bridge_config = IggyBridgeConfig::from_env()?;
+    let bridge = IggyBridge::connect(bridge_config)
+        .await
+        .map_err(|e| format!("failed to connect to Iggy: {e}"))?;
+    let bridge: Arc<dyn iggy_gateway_kafka::bridge::TopicCatalog> = Arc::new(bridge);
+
     let listener = bind_listener(&config.bind_addr)
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
-    let server = KafkaGateway::new(config);
+    let server = KafkaGateway::new(config, bridge);
 
     let (tx, rx) = broadcast::channel(1);
     let mut server_task = tokio::spawn(async move { server.run(listener, rx).await });
@@ -100,34 +111,11 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     Ok(())
 }
 
-/// Warns if any bridge-specific env var is set, since `main` doesn't read `IggyBridgeConfig` or
-/// call `IggyBridge::connect` yet (`#3535`/`#3536`).
-///
-/// `reject_unknown_kafka_env_vars`'s own accepted-but-unread carve-out for these vars exists so a
-/// user exporting them ahead of that wiring landing isn't told the name is unrecognized - but that
-/// silence is exactly what the guard's own doc comment warns an unread var would otherwise cause.
-/// This closes that gap: still accepted, no longer silent.
-fn warn_on_unused_bridge_env_vars() {
-    let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
-        .iter()
-        .copied()
-        .filter(|var| std::env::var(var).is_ok())
-        .collect();
-    if !set.is_empty() {
-        warn!(
-            "{} set but not yet used: the Kafka <-> Iggy bridge isn't wired into the running \
-             gateway until #3535/#3536 land",
-            set.join(", ")
-        );
-    }
-}
-
 /// Build [`GatewayConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
 /// break the listener (a zero connection cap serves nothing, a zero timeout drops every
 /// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
 fn load_config() -> Result<GatewayConfig, String> {
     reject_unknown_kafka_env_vars()?;
-    warn_on_unused_bridge_env_vars();
     let mut config = GatewayConfig::default();
 
     if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {

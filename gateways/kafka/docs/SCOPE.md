@@ -4,7 +4,9 @@
 
 Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. **No Iggy backend integration.**
 
-**Stub semantics (important):** Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). CreateTopics validates the request but answers with `NOT_CONTROLLER` (41) so clients do not believe topics were created. Do not treat `ec=0` stub success as durable storage — that arrives in the Iggy bridge phase.
+**Stub semantics (important):** Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6); Fetch is likewise still a stub. Both land with [#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536).
+
+Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)) and ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) are no longer stubs — they call through `IggyBridge` to a real Iggy backend; see [README.md](../README.md#iggy-bridge-3533).
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
@@ -43,11 +45,11 @@ it knows the server supports flexible encoding.
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
-| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
+| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Real topic listing/lookup via `IggyBridge` ([#3534](https://github.com/apache/iggy/issues/3534)); broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | Decode request; stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
-| 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
-| 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
+| 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Real earliest/latest resolution via `IggyBridge::high_watermarks` ([#3537](https://github.com/apache/iggy/issues/3537)) |
+| 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Real provisioning via `IggyBridge::ensure_stream_and_topic` ([#3538](https://github.com/apache/iggy/issues/3538)); `-1` partitions/RF = broker default (1 partition) on v4+; non-empty `configs` rejected (`INVALID_CONFIG`, 40) |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above). Any unlisted API key also closes the connection: no api-specific response schema exists for it, so any body this gateway could send would be misparsed by the client against the schema it expected.
 
@@ -88,8 +90,8 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
-| **3 — Iggy bridge** | Landed, not wired in | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed; Produce/Fetch handler wiring itself is a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; Produce/Fetch still stub responses |
+| **3 — Iggy bridge** | Wired into Metadata/CreateTopics/ListOffsets | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed and now called from real handlers ([#3534](https://github.com/apache/iggy/issues/3534)/[#3537](https://github.com/apache/iggy/issues/3537)/[#3538](https://github.com/apache/iggy/issues/3538)); Produce/Fetch handler wiring is still a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
 
@@ -109,11 +111,23 @@ below it are still open for the issues that build on top of it.
       not part of `bridge/`'s own scope.
 - [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
       exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
+- [x] Metadata handler wired to `IggyBridge` ([#3534](https://github.com/apache/iggy/issues/3534)) -
+      real topic listing (`list_kafka_topics`) and per-topic lookup (`get_kafka_topic`), each
+      exercised against a real `iggy-server` in `tests/bridge_iggy_integration_tests.rs` and at the
+      wire level in `tests/api_handler_tests.rs`/`tests/server_e2e_tests.rs`.
+- [x] CreateTopics handler wired to `IggyBridge` ([#3538](https://github.com/apache/iggy/issues/3538)) -
+      real provisioning via `ensure_stream_and_topic`; non-empty per-topic Kafka `configs` rejected
+      (`INVALID_CONFIG`, no Iggy topic option any of them maps onto today).
+- [x] ListOffsets handler wired to `IggyBridge` ([#3537](https://github.com/apache/iggy/issues/3537)) -
+      earliest (`-2`)/latest (`-1`) timestamp sentinels only; an actual timestamp value is not
+      supported (`INVALID_REQUEST`) - see the handler's own doc comment.
 - [ ] Document partition mapping in `docs/BRIDGE_MAPPING.md`:
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
   - Iggy **consumer groups exist** — map Kafka group APIs to Iggy consumer group APIs
   - Use `Partitioning::balanced()` only when Kafka sends `partition == -1`; otherwise use request partition ID
-- [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
+- [x] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state - see the
+      Metadata handler item above. Still single-broker: every partition reports broker id 1 as
+      leader/replica/ISR, since this gateway has no second broker to be anything else.
 
 ### `kafka-protocol` crate adoption — superseded, done differently
 

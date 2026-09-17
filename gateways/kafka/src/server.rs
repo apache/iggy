@@ -31,6 +31,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
+use crate::bridge::TopicCatalog;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     BrokerAdvertise, DEFAULT_KAFKA_PORT, HandleOutcome, handle_request_bounded,
@@ -162,13 +163,15 @@ pub fn bind_listener(addr: &str) -> Result<TcpListener> {
 
 pub struct KafkaGateway {
     config: Arc<GatewayConfig>,
+    bridge: Arc<dyn TopicCatalog>,
 }
 
 impl KafkaGateway {
     #[must_use]
-    pub fn new(config: GatewayConfig) -> Self {
+    pub fn new(config: GatewayConfig, bridge: Arc<dyn TopicCatalog>) -> Self {
         Self {
             config: Arc::new(config),
+            bridge,
         }
     }
 
@@ -239,11 +242,14 @@ impl KafkaGateway {
                             }
                             let cfg = Arc::clone(&self.config);
                             let broker = Arc::clone(&broker);
+                            let bridge = Arc::clone(&self.bridge);
                             let conn_cancel = cancel.child_token();
                             tracker.spawn(async move {
                                 let _permit = permit;
-                                if let Err(err) =
-                                    handle_connection(stream, cfg, peer, broker, conn_cancel).await
+                                if let Err(err) = handle_connection(
+                                    stream, cfg, peer, broker, bridge, conn_cancel,
+                                )
+                                .await
                                 {
                                     // debug!, not warn!: every `KafkaProtocolError` that can
                                     // reach here is either a malformed/oversized frame from the
@@ -312,6 +318,7 @@ async fn handle_connection(
     config: Arc<GatewayConfig>,
     peer: SocketAddr,
     broker: Arc<BrokerAdvertise>,
+    bridge: Arc<dyn TopicCatalog>,
     cancel: CancellationToken,
 ) -> Result<()> {
     debug!(%peer, "connection accepted");
@@ -356,7 +363,9 @@ async fn handle_connection(
             body,
             &broker,
             config.max_frame_size,
-        );
+            bridge.as_ref(),
+        )
+        .await;
         if dispatch_outcome(&mut stream, &peer, &config, &req, resp_hdr_ver, outcome).await? {
             return Ok(());
         }
@@ -567,9 +576,51 @@ pub fn init_tracing() -> WorkerGuard {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use serial_test::serial;
 
     use super::*;
+    use crate::bridge::{BridgeError, KafkaTopicMetadata};
+
+    /// This module's tests exercise connection lifecycle (accept, shutdown, drain, connection
+    /// limits) - never a request that reaches Metadata/CreateTopics/ListOffsets, so every method
+    /// here is unreachable in practice. `unimplemented!()` makes that assumption loud if a
+    /// future test here ever breaks it, instead of a fake bridge silently answering with made-up
+    /// data.
+    struct NullBridge;
+
+    #[async_trait]
+    impl TopicCatalog for NullBridge {
+        async fn ensure_stream_and_topic(
+            &self,
+            _kafka_topic: &str,
+            _partition_count: u32,
+        ) -> std::result::Result<(), BridgeError> {
+            unimplemented!("server.rs's own tests never reach the bridge")
+        }
+
+        async fn high_watermarks(
+            &self,
+            _kafka_topic: &str,
+            _partitions: &[u32],
+        ) -> std::result::Result<Vec<(u32, std::result::Result<i64, BridgeError>)>, BridgeError>
+        {
+            unimplemented!("server.rs's own tests never reach the bridge")
+        }
+
+        async fn get_kafka_topic(
+            &self,
+            _kafka_topic: &str,
+        ) -> std::result::Result<Option<KafkaTopicMetadata>, BridgeError> {
+            unimplemented!("server.rs's own tests never reach the bridge")
+        }
+
+        async fn list_kafka_topics(
+            &self,
+        ) -> std::result::Result<Vec<KafkaTopicMetadata>, BridgeError> {
+            unimplemented!("server.rs's own tests never reach the bridge")
+        }
+    }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -703,13 +754,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = broadcast::channel(1);
-        let server = KafkaGateway::new(GatewayConfig {
-            // Idle timeout is intentionally long - cancellation + drain deadline, not the
-            // idle timeout, must bound shutdown here.
-            idle_timeout: Duration::from_mins(10),
-            shutdown_drain_timeout: Duration::from_millis(200),
-            ..GatewayConfig::default()
-        });
+        let server = KafkaGateway::new(
+            GatewayConfig {
+                // Idle timeout is intentionally long - cancellation + drain deadline, not the
+                // idle timeout, must bound shutdown here.
+                idle_timeout: Duration::from_mins(10),
+                shutdown_drain_timeout: Duration::from_millis(200),
+                ..GatewayConfig::default()
+            },
+            Arc::new(NullBridge),
+        );
         let handle = tokio::spawn(async move { server.run(listener, rx).await });
 
         // Held open, never sends a frame: without cancellation the task would park in
@@ -738,10 +792,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = broadcast::channel(1);
-        let server = KafkaGateway::new(GatewayConfig {
-            max_connections: 1,
-            ..GatewayConfig::default()
-        });
+        let server = KafkaGateway::new(
+            GatewayConfig {
+                max_connections: 1,
+                ..GatewayConfig::default()
+            },
+            Arc::new(NullBridge),
+        );
         let handle = tokio::spawn(async move { server.run(listener, rx).await });
 
         // First connection holds the only permit by never sending a frame.
@@ -768,7 +825,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (tx, rx) = broadcast::channel(1);
         drop(tx);
-        let server = KafkaGateway::new(GatewayConfig::default());
+        let server = KafkaGateway::new(GatewayConfig::default(), Arc::new(NullBridge));
         assert!(server.run(listener, rx).await.is_ok());
     }
 
@@ -778,7 +835,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(1);
         tx.send(()).unwrap();
         tx.send(()).unwrap();
-        let server = KafkaGateway::new(GatewayConfig::default());
+        let server = KafkaGateway::new(GatewayConfig::default(), Arc::new(NullBridge));
         assert!(server.run(listener, rx).await.is_ok());
     }
 
@@ -787,7 +844,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = broadcast::channel(1);
-        let server = KafkaGateway::new(GatewayConfig::default());
+        let server = KafkaGateway::new(GatewayConfig::default(), Arc::new(NullBridge));
         let handle = tokio::spawn(async move { server.run(listener, rx).await });
 
         let stream = TcpStream::connect(addr).await.unwrap();

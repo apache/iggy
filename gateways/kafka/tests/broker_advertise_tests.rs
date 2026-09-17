@@ -19,6 +19,8 @@
 
 #[path = "common/codec.rs"]
 mod codec;
+#[path = "common/fake_bridge.rs"]
+mod fake_bridge;
 
 use std::net::SocketAddr;
 
@@ -26,6 +28,13 @@ use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::protocol::api::{API_KEY_METADATA, BrokerAdvertise, handle_request};
 
 use codec::{Decoder, Encoder};
+use fake_bridge::FakeBridge;
+
+/// Empty catalog - this file tests `BrokerAdvertise` host/port reflection, not bridge business
+/// logic.
+fn bridge() -> FakeBridge {
+    FakeBridge::new()
+}
 
 #[test]
 fn default_matches_standard_gateway_port() {
@@ -34,15 +43,16 @@ fn default_matches_standard_gateway_port() {
     assert_eq!(b.port, 9093);
 }
 
-#[test]
-fn metadata_reflects_broker_addr() {
+#[tokio::test]
+async fn metadata_reflects_broker_addr() {
     let broker = BrokerAdvertise {
         host: "203.0.113.7".to_string(),
         port: 9093,
     };
     let mut req = Encoder::with_capacity(4);
     req.write_i32(0);
-    let body = handle_request(API_KEY_METADATA, 0, req.freeze(), &broker)
+    let body = handle_request(API_KEY_METADATA, 0, req.freeze(), &broker, &bridge())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
     let mut d = Decoder::new(body);

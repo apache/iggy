@@ -19,6 +19,8 @@
 
 #[path = "common/codec.rs"]
 mod codec;
+#[path = "common/fake_bridge.rs"]
+mod fake_bridge;
 #[path = "common/server.rs"]
 mod server;
 #[path = "common/tcp.rs"]
@@ -26,6 +28,7 @@ mod tcp;
 #[path = "common/wire.rs"]
 mod wire;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
@@ -40,6 +43,14 @@ use iggy_gateway_kafka::protocol::api::{
 };
 use iggy_gateway_kafka::protocol::header::response_header_version;
 
+use fake_bridge::FakeBridge;
+
+/// Empty catalog - this file tests TCP framing/pipelining/concurrency, not bridge business
+/// logic.
+fn bridge() -> FakeBridge {
+    FakeBridge::new()
+}
+
 use codec::Decoder;
 use server::{spawn_test_server, spawn_test_server_with_config};
 use tcp::{
@@ -49,7 +60,7 @@ use tcp::{
 
 #[tokio::test]
 async fn e2e_pipelined_requests_receive_responses_in_order() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let frame1 = build_request_frame(API_KEY_API_VERSIONS, 1, 1, Some("pipe-test"), &[]);
@@ -70,7 +81,7 @@ async fn e2e_pipelined_requests_receive_responses_in_order() {
 
 #[tokio::test]
 async fn e2e_partial_length_prefix_then_remainder_accepted() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 42, Some("partial-test"), &[]);
@@ -88,17 +99,20 @@ async fn e2e_partial_length_prefix_then_remainder_accepted() {
 #[tokio::test]
 async fn e2e_frame_within_custom_max_frame_size_accepted() {
     let max_frame = 512;
-    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: max_frame,
-        max_connections: 1024,
-        idle_timeout: Duration::from_secs(5),
-        read_timeout: Duration::from_secs(5),
-        write_timeout: Duration::from_secs(5),
-        shutdown_drain_timeout: Duration::from_secs(5),
-    })
+    let (addr, _shutdown) = spawn_test_server_with_config(
+        GatewayConfig {
+            bind_addr: String::new(),
+            advertised_host: None,
+            advertised_port: None,
+            max_frame_size: max_frame,
+            max_connections: 1024,
+            idle_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            shutdown_drain_timeout: Duration::from_secs(5),
+        },
+        Arc::new(FakeBridge::new()),
+    )
     .await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -119,17 +133,20 @@ async fn e2e_frame_within_custom_max_frame_size_accepted() {
 #[tokio::test]
 async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
     let max_frame = 64;
-    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: max_frame,
-        max_connections: 1024,
-        idle_timeout: Duration::from_secs(5),
-        read_timeout: Duration::from_secs(5),
-        write_timeout: Duration::from_secs(5),
-        shutdown_drain_timeout: Duration::from_secs(5),
-    })
+    let (addr, _shutdown) = spawn_test_server_with_config(
+        GatewayConfig {
+            bind_addr: String::new(),
+            advertised_host: None,
+            advertised_port: None,
+            max_frame_size: max_frame,
+            max_connections: 1024,
+            idle_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            shutdown_drain_timeout: Duration::from_secs(5),
+        },
+        Arc::new(FakeBridge::new()),
+    )
     .await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -149,17 +166,20 @@ async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
 async fn e2e_truncated_frame_body_closes_connection() {
     // A truncated in-flight body closes only once the server's read_timeout elapses, so use a
     // short read_timeout and wait longer than it to observe a genuine close, not a mere stall.
-    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: 8 * 1024 * 1024,
-        max_connections: 1024,
-        idle_timeout: Duration::from_secs(5),
-        read_timeout: Duration::from_secs(1),
-        write_timeout: Duration::from_secs(5),
-        shutdown_drain_timeout: Duration::from_secs(5),
-    })
+    let (addr, _shutdown) = spawn_test_server_with_config(
+        GatewayConfig {
+            bind_addr: String::new(),
+            advertised_host: None,
+            advertised_port: None,
+            max_frame_size: 8 * 1024 * 1024,
+            max_connections: 1024,
+            idle_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(5),
+            shutdown_drain_timeout: Duration::from_secs(5),
+        },
+        Arc::new(FakeBridge::new()),
+    )
     .await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -181,7 +201,7 @@ async fn e2e_truncated_frame_body_closes_connection() {
 
 #[tokio::test]
 async fn e2e_multiple_concurrent_connections_are_independent() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     let (r1, r2, r3) = tokio::join!(
         tcp::round_trip(addr, API_KEY_API_VERSIONS, 1, 101, &[]),
@@ -196,7 +216,7 @@ async fn e2e_multiple_concurrent_connections_are_independent() {
 
 #[tokio::test]
 async fn e2e_client_disconnect_mid_frame_allows_new_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -221,7 +241,7 @@ async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
     // calling `handle_request` in-process with the identical input - same production encoder,
     // different code path from the TCP server under test - so a length-prefix endianness bug is
     // caught by direct value comparison instead of by timeout side effect.
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let request = wire::build_api_versions_flexible_request("iggy-test", "0.1.0");
@@ -230,7 +250,9 @@ async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
         3,
         request.clone(),
         &BrokerAdvertise::default(),
+        &bridge(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response")
     .len();
     // The wire frame also carries the response header `handle_request`'s return value doesn't
@@ -268,7 +290,7 @@ async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
 
 #[tokio::test]
 async fn e2e_zero_frame_length_closes_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     stream
@@ -284,7 +306,7 @@ async fn e2e_zero_frame_length_closes_connection() {
 
 #[tokio::test]
 async fn e2e_negative_frame_length_closes_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     stream
@@ -300,17 +322,20 @@ async fn e2e_negative_frame_length_closes_connection() {
 
 #[tokio::test]
 async fn e2e_slow_client_can_complete_request_within_read_timeout() {
-    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: 8 * 1024 * 1024,
-        max_connections: 1024,
-        idle_timeout: Duration::from_secs(5),
-        read_timeout: Duration::from_secs(5),
-        write_timeout: Duration::from_secs(5),
-        shutdown_drain_timeout: Duration::from_secs(5),
-    })
+    let (addr, _shutdown) = spawn_test_server_with_config(
+        GatewayConfig {
+            bind_addr: String::new(),
+            advertised_host: None,
+            advertised_port: None,
+            max_frame_size: 8 * 1024 * 1024,
+            max_connections: 1024,
+            idle_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            shutdown_drain_timeout: Duration::from_secs(5),
+        },
+        Arc::new(FakeBridge::new()),
+    )
     .await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -333,7 +358,7 @@ async fn e2e_slow_client_can_complete_request_within_read_timeout() {
 
 #[tokio::test]
 async fn e2e_many_sequential_requests_on_one_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     for index in 0..20_i32 {
@@ -350,7 +375,7 @@ async fn e2e_many_sequential_requests_on_one_connection() {
 
 #[tokio::test]
 async fn e2e_empty_client_id_request_succeeds() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 400, None, &[]);
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream.write_all(&frame).await.expect("write");
@@ -363,7 +388,7 @@ async fn e2e_empty_client_id_request_succeeds() {
 
 #[tokio::test]
 async fn e2e_flexible_apiversions_v3_request_succeeds() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let request = wire::build_api_versions_flexible_request("iggy-test", "0.1.0");
     let (corr, body) = tcp::round_trip(addr, API_KEY_API_VERSIONS, 3, 401, &request).await;
     assert_eq!(corr, 401);
@@ -375,7 +400,7 @@ async fn e2e_flexible_apiversions_v3_request_succeeds() {
 
 #[tokio::test]
 async fn e2e_frame_payload_shorter_than_kafka_header_closes_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let mut frame = BytesMut::new();
@@ -392,7 +417,7 @@ async fn e2e_frame_payload_shorter_than_kafka_header_closes_connection() {
 
 #[tokio::test]
 async fn e2e_mixed_api_key_pipeline_returns_responses_in_order() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let frames = [
@@ -432,7 +457,7 @@ async fn e2e_mixed_api_key_pipeline_returns_responses_in_order() {
 
 #[tokio::test]
 async fn e2e_connection_idle_after_response_accepts_next_request() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let first = build_request_frame(API_KEY_API_VERSIONS, 1, 601, Some("idle-test"), &[]);
@@ -457,7 +482,7 @@ async fn e2e_connection_idle_after_response_accepts_next_request() {
 
 #[tokio::test]
 async fn e2e_flexible_metadata_v9_empty_topics_round_trip() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
 
     let body = wire::build_metadata_flexible_request(&[]);
     let (corr, resp) = tcp::round_trip(addr, API_KEY_METADATA, 9, 701, &body).await;
@@ -474,7 +499,7 @@ async fn e2e_flexible_metadata_v9_empty_topics_round_trip() {
 
 #[tokio::test]
 async fn e2e_quiet_connection_accepts_request_after_short_idle() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     time::sleep(Duration::from_secs(2)).await;
@@ -496,20 +521,23 @@ async fn e2e_quiet_connection_accepts_request_after_short_idle() {
 
 #[tokio::test]
 async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
-    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: 8 * 1024 * 1024,
-        max_connections: 1024,
-        // 30s, not the 5s every other test in this file uses: this test's own sleep (4s) must
-        // clear read_timeout (3s) without approaching idle_timeout, or CI scheduler jitter could
-        // push the 5s-vs-4s 1s margin negative and flake. 30s leaves 26s of slack instead.
-        idle_timeout: Duration::from_secs(30),
-        read_timeout: Duration::from_secs(3),
-        write_timeout: Duration::from_secs(5),
-        shutdown_drain_timeout: Duration::from_secs(5),
-    })
+    let (addr, _shutdown) = spawn_test_server_with_config(
+        GatewayConfig {
+            bind_addr: String::new(),
+            advertised_host: None,
+            advertised_port: None,
+            max_frame_size: 8 * 1024 * 1024,
+            max_connections: 1024,
+            // 30s, not the 5s every other test in this file uses: this test's own sleep (4s) must
+            // clear read_timeout (3s) without approaching idle_timeout, or CI scheduler jitter could
+            // push the 5s-vs-4s 1s margin negative and flake. 30s leaves 26s of slack instead.
+            idle_timeout: Duration::from_secs(30),
+            read_timeout: Duration::from_secs(3),
+            write_timeout: Duration::from_secs(5),
+            shutdown_drain_timeout: Duration::from_secs(5),
+        },
+        Arc::new(FakeBridge::new()),
+    )
     .await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -543,7 +571,7 @@ async fn corrupt_produce_body_e2e_stays_silent_without_disconnect() {
     // `acks` was nonzero (unlike the pre-migration field-by-field decoder, which could still
     // answer with INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure
     // now stays silent - see `api::handle_produce_request` - but must not drop the connection.
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let bad = build_request_frame(
@@ -575,7 +603,7 @@ async fn corrupt_produce_body_e2e_stays_silent_without_disconnect() {
 
 #[tokio::test]
 async fn corrupt_fetch_body_e2e_returns_error_without_disconnect() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let bad = build_request_frame(
@@ -606,7 +634,7 @@ async fn corrupt_fetch_body_e2e_returns_error_without_disconnect() {
 
 #[tokio::test]
 async fn e2e_client_eof_after_valid_frame_closes_connection_cleanly() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    let (addr, _shutdown) = spawn_test_server(Arc::new(FakeBridge::new())).await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let frame = build_request_frame(18, 1, 901, Some("eof-test"), &[]);

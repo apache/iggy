@@ -250,6 +250,14 @@ impl TopicMapping {
         &self.default_stream
     }
 
+    /// Every configured override, keyed by Kafka topic name. `handle_metadata`'s "list all
+    /// topics" path uses this to find override targets outside `default_stream` - `resolve`
+    /// alone only answers "where does *this* Kafka topic go," not "what Kafka topics exist."
+    #[must_use]
+    pub(crate) const fn overrides(&self) -> &HashMap<String, TopicOverride> {
+        &self.topics
+    }
+
     /// Resolves a Kafka topic name to `(iggy_stream, iggy_topic)`.
     ///
     /// Not injective: two distinct Kafka topics can resolve to the same Iggy stream/topic pair,

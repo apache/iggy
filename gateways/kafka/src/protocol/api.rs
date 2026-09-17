@@ -17,23 +17,27 @@
 
 use bytes::{Buf, Bytes};
 use kafka_protocol::messages::api_versions_response::ApiVersion;
-use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, MetadataResponseTopic};
+use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use kafka_protocol::messages::metadata_response::{
+    MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+};
 use kafka_protocol::messages::{
     ApiVersionsRequest, ApiVersionsResponse, BrokerId, CreateTopicsRequest, FetchRequest,
     ListOffsetsRequest, MetadataRequest, MetadataResponse, ProduceRequest, TopicName,
 };
 use kafka_protocol::protocol::{Decodable, StrBytes};
 
+use crate::bridge::{BridgeError, TopicCatalog};
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::bounds_guard::{
     validate_api_versions_shape, validate_create_topics_shape, validate_fetch_shape,
     validate_list_offsets_shape, validate_metadata_shape, validate_produce_shape,
 };
 use crate::protocol::responses::{
-    encode_create_topics_error_response, encode_create_topics_response,
-    encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
-    encode_list_offsets_response, encode_message, encode_produce_error_response,
-    encode_produce_response,
+    CreateTopicResult, ListOffsetsPartitionResult, encode_create_topics_error_response,
+    encode_create_topics_response, encode_fetch_error_response, encode_fetch_response,
+    encode_list_offsets_error_response, encode_list_offsets_response, encode_message,
+    encode_produce_error_response, encode_produce_response, validate_create_topic_shape,
 };
 
 pub const API_KEY_PRODUCE: i16 = 0;
@@ -85,8 +89,17 @@ pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
+///
+/// Not sent once `#3538` wires real provisioning in - kept for the closed set of paths that can
+/// still fail before any bridge call is attempted (decode failure, unsupported version).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// `CreateTopics`: a requested topic carried one or more per-topic Kafka configs.
+///
+/// None of `retention.ms`, `cleanup.policy`, etc. maps onto an Iggy topic option this bridge
+/// applies, so every non-empty `configs` list is rejected outright rather than silently
+/// dropping a subset an operator might believe took effect.
+pub const ERROR_INVALID_CONFIG: i16 = 40;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -192,13 +205,28 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 const DEFAULT_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
 /// Handles one decoded request frame and returns how the connection should proceed.
-pub fn handle_request(
+///
+/// `bridge` is only actually called for Metadata, `CreateTopics` and `ListOffsets` today; every
+/// other API key never touches it. It is still a required parameter (not an `Option`) rather
+/// than plumbed in only where used: `handle_other_request`'s dispatch is one `match` on
+/// `api_key`, and a caller that gets this wrong for one of the three bridge-backed keys would
+/// fail at the call site with a type error, not silently at runtime with a missing bridge.
+pub async fn handle_request(
     api_key: i16,
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
+    bridge: &dyn TopicCatalog,
 ) -> HandleOutcome {
-    handle_request_bounded(api_key, api_version, body, broker, DEFAULT_MAX_FRAME_SIZE)
+    handle_request_bounded(
+        api_key,
+        api_version,
+        body,
+        broker,
+        DEFAULT_MAX_FRAME_SIZE,
+        bridge,
+    )
+    .await
 }
 
 /// Same as [`handle_request`], but rejects a request whose declared array/string lengths project
@@ -208,17 +236,18 @@ pub fn handle_request(
 /// docs for the CPU/memory amplification this closes (a request within the old element budget
 /// alone could still produce a multi-megabyte response from a single synchronous, non-yielding
 /// call).
-pub fn handle_request_bounded(
+pub async fn handle_request_bounded(
     api_key: i16,
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
     max_frame_size: usize,
+    bridge: &dyn TopicCatalog,
 ) -> HandleOutcome {
     if api_key == API_KEY_PRODUCE {
         return handle_produce_request(api_version, body, max_frame_size);
     }
-    handle_other_request(api_key, api_version, body, broker, max_frame_size)
+    handle_other_request(api_key, api_version, body, broker, max_frame_size, bridge).await
 }
 
 /// Decode `T` from the whole request body and reject unconsumed trailing bytes.
@@ -329,16 +358,19 @@ fn handle_produce_request(api_version: i16, body: Bytes, max_frame_size: usize) 
     }
 }
 
-fn handle_other_request(
+async fn handle_other_request(
     api_key: i16,
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
     max_frame_size: usize,
+    bridge: &dyn TopicCatalog,
 ) -> HandleOutcome {
     match api_key {
         API_KEY_API_VERSIONS => handle_api_versions(api_version, body),
-        API_KEY_METADATA => handle_metadata(api_version, body, broker, max_frame_size),
+        API_KEY_METADATA => {
+            handle_metadata(api_version, body, broker, max_frame_size, bridge).await
+        }
         API_KEY_FETCH => handle_versioned_request(
             API_KEY_FETCH,
             api_version,
@@ -352,32 +384,12 @@ fn handle_other_request(
             encode_fetch_error_response,
             "Fetch",
         ),
-        API_KEY_LIST_OFFSETS => handle_versioned_request(
-            API_KEY_LIST_OFFSETS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<ListOffsetsRequest>(v, b, |v, b| {
-                    validate_list_offsets_shape(v, b, max_frame_size)
-                })
-            },
-            encode_list_offsets_response,
-            encode_list_offsets_error_response,
-            "ListOffsets",
-        ),
-        API_KEY_CREATE_TOPICS => handle_versioned_request(
-            API_KEY_CREATE_TOPICS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<CreateTopicsRequest>(v, b, |v, b| {
-                    validate_create_topics_shape(v, b, max_frame_size)
-                })
-            },
-            encode_create_topics_response,
-            encode_create_topics_error_response,
-            "CreateTopics",
-        ),
+        API_KEY_LIST_OFFSETS => {
+            handle_list_offsets(api_version, body, max_frame_size, bridge).await
+        }
+        API_KEY_CREATE_TOPICS => {
+            handle_create_topics(api_version, body, max_frame_size, bridge).await
+        }
         // Unknown API key: no api-specific response schema exists, so any body we send is
         // misparsed by the client against the schema it expected. Close is unambiguous.
         _ => HandleOutcome::Close,
@@ -409,11 +421,12 @@ fn handle_api_versions(api_version: i16, body: Bytes) -> HandleOutcome {
     }
 }
 
-fn handle_metadata(
+async fn handle_metadata(
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
     max_frame_size: usize,
+    bridge: &dyn TopicCatalog,
 ) -> HandleOutcome {
     if !is_supported_version(API_KEY_METADATA, api_version) {
         // Clamping the response to the supported max leaves a body the client parses at its own
@@ -426,11 +439,8 @@ fn handle_metadata(
         );
         return HandleOutcome::Close;
     }
-    match decode_metadata_topics(api_version, body, max_frame_size) {
-        Ok(topics) => respond_or_close(
-            encode_metadata_response(api_version, &topics, broker, ERROR_NONE),
-            "Metadata",
-        ),
+    let requested = match decode_metadata_topics(api_version, body, max_frame_size) {
+        Ok(topics) => topics,
         Err(error) => {
             // Metadata has no top-level error field; a malformed body cannot carry
             // INVALID_REQUEST in a version-correct way for every client. Close.
@@ -440,9 +450,56 @@ fn handle_metadata(
                 api_version,
                 "Failed to decode Metadata request; closing connection"
             );
-            HandleOutcome::Close
+            return HandleOutcome::Close;
         }
-    }
+    };
+
+    // Empty means "all topics" (decode_metadata_topics collapses the legacy null-array sentinel
+    // to this - see its own doc). Listing is one bridge call per stream this gateway's topic
+    // mapping can resolve to; looking up N specific topics is N bridge calls, one per name,
+    // since Metadata's per-topic error_code needs to distinguish "doesn't exist" from a real
+    // bridge failure for each name independently.
+    let resolved: Vec<(String, i16, Option<u32>)> = if requested.is_empty() {
+        match bridge.list_kafka_topics().await {
+            Ok(topics) => topics
+                .into_iter()
+                .map(|topic| (topic.kafka_topic, ERROR_NONE, Some(topic.partitions_count)))
+                .collect(),
+            Err(error) => {
+                // Metadata has no top-level error field (same reason the decode-failure arm
+                // above closes rather than encoding one): silently answering "zero topics
+                // exist" here would be a lie, not a graceful degradation - the bridge failed to
+                // answer, it did not confirm an empty catalog.
+                tracing::warn!(%error, "failed to list Kafka topics from Iggy bridge; closing connection");
+                return HandleOutcome::Close;
+            }
+        }
+    } else {
+        let mut out = Vec::with_capacity(requested.len());
+        for name in &requested {
+            let kafka_topic = name.as_str();
+            match bridge.get_kafka_topic(kafka_topic).await {
+                Ok(Some(topic)) => {
+                    out.push((topic.kafka_topic, ERROR_NONE, Some(topic.partitions_count)));
+                }
+                Ok(None) => out.push((
+                    kafka_topic.to_string(),
+                    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    None,
+                )),
+                Err(error) => {
+                    tracing::warn!(%error, kafka_topic, "failed to look up Kafka topic from Iggy bridge");
+                    out.push((kafka_topic.to_string(), error.to_kafka_error_code(), None));
+                }
+            }
+        }
+        out
+    };
+
+    respond_or_close(
+        encode_metadata_response(api_version, &resolved, broker),
+        "Metadata",
+    )
 }
 
 fn handle_versioned_request<T>(
@@ -468,6 +525,173 @@ fn handle_versioned_request<T>(
             encode_err(version, ERROR_UNSUPPORTED_VERSION)
         })
     }
+}
+
+/// `CreateTopics` (`#3538`): decodes the request, validates and (unless `validate_only`)
+/// provisions each requested topic through `bridge.ensure_stream_and_topic`, and reports one
+/// result per topic - never fails the whole response for one bad topic among several.
+async fn handle_create_topics(
+    api_version: i16,
+    body: Bytes,
+    max_frame_size: usize,
+    bridge: &dyn TopicCatalog,
+) -> HandleOutcome {
+    if !is_supported_version(API_KEY_CREATE_TOPICS, api_version) {
+        return unsupported_version_response(API_KEY_CREATE_TOPICS, api_version, |v| {
+            encode_create_topics_error_response(v, ERROR_UNSUPPORTED_VERSION)
+        });
+    }
+    let req = match decode_guarded::<CreateTopicsRequest>(api_version, body, |v, b| {
+        validate_create_topics_shape(v, b, max_frame_size)
+    }) {
+        Ok(req) => req,
+        Err(error) => {
+            // debug!, not warn!: attacker-controlled, not operator-actionable.
+            tracing::debug!(%error, "Failed to decode CreateTopics request");
+            return respond_or_close(
+                encode_create_topics_error_response(api_version, ERROR_INVALID_REQUEST),
+                "CreateTopics",
+            );
+        }
+    };
+
+    let mut results: Vec<CreateTopicResult> = Vec::with_capacity(req.topics.len());
+    for topic in &req.topics {
+        results.push(create_one_topic(topic, api_version, req.validate_only, bridge).await);
+    }
+    respond_or_close(
+        encode_create_topics_response(&req.topics, &results, api_version),
+        "CreateTopics",
+    )
+}
+
+/// Validates and (unless `validate_only`) creates one requested topic.
+///
+/// Sequential across a multi-topic request, not concurrent: `IggyBridge` holds one lockstep
+/// `IggyClient` (`bridge::iggy_bridge`'s own doc - "the connection is lockstep, one request in
+/// flight at a time"), so concurrent calls here would only queue behind each other on the same
+/// mutex anyway; sequential keeps each topic's failure independent and easy to reason about,
+/// with no ordering surprise from a scheduler interleaving them differently across runs.
+async fn create_one_topic(
+    topic: &CreatableTopic,
+    api_version: i16,
+    validate_only: bool,
+    bridge: &dyn TopicCatalog,
+) -> CreateTopicResult {
+    if !topic.configs.is_empty() {
+        return Err(ERROR_INVALID_CONFIG);
+    }
+    let partition_count = validate_create_topic_shape(topic, api_version)?;
+
+    if validate_only {
+        // KIP-4: "check that the topics can be created as specified, but don't create
+        // anything." Format is already checked above; going further (does ensure_topic's
+        // eventual PartitionCountMismatch also apply here) would mean calling the bridge with
+        // create-on-miss semantics anyway, defeating the "don't create anything" contract - so
+        // this reports success on format alone rather than fully simulating the real call.
+        return Ok(partition_count);
+    }
+
+    bridge
+        .ensure_stream_and_topic(topic.name.0.as_str(), partition_count)
+        .await
+        .map(|()| partition_count)
+        .map_err(|error| error.to_kafka_error_code())
+}
+
+/// `ListOffsets` (`#3537`): resolves `earliest`/`latest` timestamp sentinels (`-2`/`-1`) per
+/// requested partition through `bridge.high_watermarks`, one bridge call per topic covering all
+/// its requested partitions at once.
+async fn handle_list_offsets(
+    api_version: i16,
+    body: Bytes,
+    max_frame_size: usize,
+    bridge: &dyn TopicCatalog,
+) -> HandleOutcome {
+    if !is_supported_version(API_KEY_LIST_OFFSETS, api_version) {
+        return unsupported_version_response(API_KEY_LIST_OFFSETS, api_version, |v| {
+            encode_list_offsets_error_response(v, ERROR_UNSUPPORTED_VERSION)
+        });
+    }
+    let req = match decode_guarded::<ListOffsetsRequest>(api_version, body, |v, b| {
+        validate_list_offsets_shape(v, b, max_frame_size)
+    }) {
+        Ok(req) => req,
+        Err(error) => {
+            // debug!, not warn!: attacker-controlled, not operator-actionable.
+            tracing::debug!(%error, "Failed to decode ListOffsets request");
+            return respond_or_close(
+                encode_list_offsets_error_response(api_version, ERROR_INVALID_REQUEST),
+                "ListOffsets",
+            );
+        }
+    };
+
+    let mut results: Vec<Vec<ListOffsetsPartitionResult>> = Vec::with_capacity(req.topics.len());
+    for topic in &req.topics {
+        results.push(resolve_list_offsets_topic(topic, bridge).await);
+    }
+    respond_or_close(
+        encode_list_offsets_response(api_version, &req, &results),
+        "ListOffsets",
+    )
+}
+
+/// Resolves every partition of one `ListOffsetsTopic`, in request order.
+///
+/// One `high_watermarks` call for the whole topic (covering every partition this topic's
+/// request carries, valid or not), not one call per partition - matches
+/// `IggyBridge::high_watermarks`'s own one-round-trip batching contract. A partition index that
+/// cannot even be a real Iggy partition (negative) is filtered out before the bridge call rather
+/// than sent - `IggyBridge` takes `partitions: &[u32]`, so a negative index has no wire
+/// representation to send anyway - and reported as `UNKNOWN_TOPIC_OR_PARTITION` directly.
+async fn resolve_list_offsets_topic(
+    topic: &kafka_protocol::messages::list_offsets_request::ListOffsetsTopic,
+    bridge: &dyn TopicCatalog,
+) -> Vec<ListOffsetsPartitionResult> {
+    let kafka_topic = topic.name.0.as_str();
+    let valid_indices: Vec<u32> = topic
+        .partitions
+        .iter()
+        .filter_map(|p| u32::try_from(p.partition_index).ok())
+        .collect();
+
+    let watermarks = match bridge.high_watermarks(kafka_topic, &valid_indices).await {
+        Ok(watermarks) => watermarks,
+        // Call-level failure (bad topic name, mapped stream doesn't exist, bridge timeout) -
+        // every partition of this topic fails the same way, matching how a real broker answers
+        // every partition of a topic it cannot see identically.
+        Err(error) => {
+            let error_code = error.to_kafka_error_code();
+            return topic.partitions.iter().map(|_| Err(error_code)).collect();
+        }
+    };
+    let watermarks: std::collections::HashMap<u32, std::result::Result<i64, BridgeError>> =
+        watermarks.into_iter().collect();
+
+    topic
+        .partitions
+        .iter()
+        .map(|partition| {
+            let Ok(index) = u32::try_from(partition.partition_index) else {
+                return Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+            };
+            match watermarks.get(&index) {
+                // -2 (earliest): every topic this bridge creates has message_expiry left at
+                // ServerDefault (never-expire - see IggyBridge::ensure_topic's own doc), and
+                // nothing in this gateway ever trims a partition yet, so the earliest available
+                // offset is always 0 for a topic this bridge actually manages. Real Kafka's
+                // own `timestamp` field for an earliest/latest sentinel query is -1 regardless
+                // (it only carries a real value for an actual timestamp-based lookup, which
+                // this bridge does not support - see the `_ =>` arm below).
+                Some(Ok(_watermark)) if partition.timestamp == -2 => Ok((-1, 0)),
+                Some(Ok(watermark)) if partition.timestamp == -1 => Ok((-1, *watermark)),
+                Some(Ok(_)) => Err(ERROR_INVALID_REQUEST),
+                Some(Err(error)) => Err(error.to_kafka_error_code()),
+                None => Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            }
+        })
+        .collect()
 }
 
 /// Unsupported-version policy for APIs whose encoders only implement up to
@@ -550,26 +774,36 @@ fn encode_api_versions_response(api_version: i16, error_code: i16) -> Result<Byt
     encode_message(&resp, api_version, 128)
 }
 
+/// `topics` is `(kafka_topic, error_code, partitions_count)` - `partitions_count` is `None`
+/// exactly when `error_code != ERROR_NONE` (a failed lookup has no partitions to report), `Some`
+/// otherwise. Single-broker gateway: every partition of every topic reports broker id 1 as its
+/// leader, sole replica and sole in-sync replica - there is no second broker to be anything else.
 fn encode_metadata_response(
     response_version: i16,
-    topics: &[StrBytes],
+    topics: &[(String, i16, Option<u32>)],
     broker: &BrokerAdvertise,
-    topic_error_override: i16,
 ) -> Result<Bytes> {
-    // Stub has no topic catalog: echo requested names with UNKNOWN_TOPIC_OR_PARTITION,
-    // or a forced override (unused today; kept for symmetry with other encoders).
-    let topic_error = if topic_error_override == ERROR_NONE {
-        ERROR_UNKNOWN_TOPIC_OR_PARTITION
-    } else {
-        topic_error_override
-    };
-
     let response_topics = topics
         .iter()
-        .map(|name| {
+        .map(|(name, error_code, partitions_count)| {
+            let partitions = partitions_count.map_or_else(Vec::new, |count| {
+                (0..count)
+                    .map(|index| {
+                        MetadataResponsePartition::default()
+                            .with_error_code(ERROR_NONE)
+                            .with_partition_index(i32::try_from(index).unwrap_or(i32::MAX))
+                            .with_leader_id(BrokerId(1))
+                            .with_leader_epoch(0)
+                            .with_replica_nodes(vec![BrokerId(1)])
+                            .with_isr_nodes(vec![BrokerId(1)])
+                            .with_offline_replicas(Vec::new())
+                    })
+                    .collect()
+            });
             MetadataResponseTopic::default()
-                .with_error_code(topic_error)
-                .with_name(Some(TopicName(name.clone())))
+                .with_error_code(*error_code)
+                .with_name(Some(TopicName(StrBytes::from_string(name.clone()))))
+                .with_partitions(partitions)
         })
         .collect();
 

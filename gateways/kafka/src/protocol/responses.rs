@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Kafka response encoders (stub implementations).
+//! Kafka response encoders.
 //!
 //! Wire encoding (field order, version gating, compact vs. legacy shapes) is
-//! `kafka_protocol`'s responsibility; everything here is stub *policy* - which placeholder
-//! values and error codes a request gets back before the Iggy bridge lands.
+//! `kafka_protocol`'s responsibility. Produce/Fetch stay stub *policy* - which placeholder error
+//! code a request gets back before `#3535`/`#3536` land - while Metadata (`#3534`, in
+//! `protocol::api`), `CreateTopics` and `ListOffsets` below are backed by real `IggyBridge` results.
 
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
@@ -30,14 +31,14 @@ use kafka_protocol::messages::list_offsets_response::{
 };
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{
-    CreateTopicsRequest, CreateTopicsResponse, FetchRequest, FetchResponse, ListOffsetsRequest,
-    ListOffsetsResponse, ProduceRequest, ProduceResponse,
+    CreateTopicsResponse, FetchRequest, FetchResponse, ListOffsetsRequest, ListOffsetsResponse,
+    ProduceRequest, ProduceResponse,
 };
 use kafka_protocol::protocol::Encodable;
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_NONE, ERROR_NOT_CONTROLLER,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_NONE,
     ERROR_NOT_LEADER_OR_FOLLOWER,
 };
 
@@ -192,28 +193,49 @@ pub fn encode_list_offsets_error_response(version: i16, error_code: i16) -> Resu
     encode_list_offsets_response_inner(version, topics)
 }
 
-/// Stub: discard the payload and return a retriable error, matching Produce/Fetch - a genuine
-/// offset lookup requires the same partition-leadership the stub doesn't have yet.
+/// One resolved `ListOffsets` answer for a single requested partition.
+///
+/// The wire `(timestamp, offset)` pair on success, or the error code to report for that
+/// partition alone - a topic-level failure (bad topic name, bridge timeout, topic doesn't exist)
+/// still lets other topics in the same request succeed, so this stays per-partition rather than
+/// failing the whole response.
+pub type ListOffsetsPartitionResult = std::result::Result<(i64, i64), i16>;
+
+/// Bridge-backed `ListOffsets` response.
+///
+/// One [`ListOffsetsPartitionResult`] per partition in `req`, in the same topic/partition order
+/// as the request (`handle_list_offsets` builds this by resolving each topic against
+/// [`crate::bridge::TopicCatalog::high_watermarks`]).
 ///
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
-pub fn encode_list_offsets_response(version: i16, req: &ListOffsetsRequest) -> Result<Bytes> {
+pub fn encode_list_offsets_response(
+    version: i16,
+    req: &ListOffsetsRequest,
+    results: &[Vec<ListOffsetsPartitionResult>],
+) -> Result<Bytes> {
     let topics = req
         .topics
         .iter()
-        .map(|topic| {
+        .zip(results)
+        .map(|(topic, partition_results)| {
             ListOffsetsTopicResponse::default()
                 .with_name(topic.name.clone())
                 .with_partitions(
                     topic
                         .partitions
                         .iter()
-                        .map(|p| {
-                            list_offsets_partition_response(
-                                p.partition_index,
-                                ERROR_NOT_LEADER_OR_FOLLOWER,
-                            )
+                        .zip(partition_results)
+                        .map(|(p, result)| match result {
+                            Ok((timestamp, offset)) => ListOffsetsPartitionResponse::default()
+                                .with_partition_index(p.partition_index)
+                                .with_error_code(ERROR_NONE)
+                                .with_timestamp(*timestamp)
+                                .with_offset(*offset),
+                            Err(error_code) => {
+                                list_offsets_partition_response(p.partition_index, *error_code)
+                            }
                         })
                         .collect(),
                 )
@@ -230,6 +252,9 @@ fn encode_list_offsets_response_inner(
     encode_message(&resp, version, 256)
 }
 
+/// `timestamp`/`offset` default to `-1`, matching a real broker's own error-path convention
+/// (`kafka_protocol`'s `#[derive(Default)]` would otherwise zero them, which reads as "offset 0",
+/// a genuinely valid answer, rather than "no answer").
 fn list_offsets_partition_response(
     partition: i32,
     error_code: i16,
@@ -237,53 +262,111 @@ fn list_offsets_partition_response(
     ListOffsetsPartitionResponse::default()
         .with_partition_index(partition)
         .with_error_code(error_code)
+        .with_timestamp(-1)
+        .with_offset(-1)
 }
 
 // ── CreateTopics ─────────────────────────────────────────────────────────────
 
-/// Well-formed `CreateTopics` response with a single placeholder topic.
+/// Whole-request `CreateTopics` failure (decode error, unsupported version).
+///
+/// One placeholder topic result carrying `error_code`, since no real per-topic breakdown is
+/// possible when the request itself couldn't be read.
 ///
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
 pub fn encode_create_topics_error_response(version: i16, error_code: i16) -> Result<Bytes> {
     let topics = vec![
-        CreatableTopic::default()
-            .with_num_partitions(1)
-            .with_replication_factor(1),
+        CreatableTopicResult::default()
+            .with_error_code(error_code)
+            .with_error_message(None)
+            .with_num_partitions(-1)
+            .with_replication_factor(-1),
     ];
-    encode_create_topics_response_inner(version, &topics, error_code)
+    let resp = CreateTopicsResponse::default().with_topics(topics);
+    encode_message(&resp, version, 256)
 }
 
+/// One resolved `CreateTopics` outcome.
+///
+/// `Ok(partitions_created)` on success, `Err(error_code)` otherwise - a per-topic failure (bad
+/// config, already exists with a different count) must not fail sibling topics in the same
+/// request.
+pub type CreateTopicResult = std::result::Result<u32, i16>;
+
+/// Bridge-backed `CreateTopics` response.
+///
+/// One [`CreateTopicResult`] per topic in `topics`, in the same order (`handle_create_topics`
+/// builds this by resolving each topic against
+/// [`crate::bridge::TopicCatalog::ensure_stream_and_topic`]).
+///
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
-pub fn encode_create_topics_response(version: i16, req: &CreateTopicsRequest) -> Result<Bytes> {
-    encode_create_topics_response_inner(version, &req.topics, ERROR_NONE)
+pub fn encode_create_topics_response(
+    topics: &[CreatableTopic],
+    results: &[CreateTopicResult],
+    version: i16,
+) -> Result<Bytes> {
+    let response_results = topics
+        .iter()
+        .zip(results)
+        .map(|(topic, result)| match result {
+            Ok(partitions_count) => CreatableTopicResult::default()
+                .with_name(topic.name.clone())
+                .with_error_code(ERROR_NONE)
+                .with_error_message(None)
+                .with_num_partitions(i32::try_from(*partitions_count).unwrap_or(i32::MAX))
+                // Iggy's replication is cluster-wide (Raft over the whole stream), not a
+                // per-topic knob this bridge can set - echoed back as 1 regardless of what was
+                // requested, matching this bridge's documented "RF is accepted, not applied"
+                // policy (see README's CreateTopics section).
+                .with_replication_factor(1),
+            Err(error_code) => CreatableTopicResult::default()
+                .with_name(topic.name.clone())
+                .with_error_code(*error_code)
+                .with_error_message(None)
+                .with_num_partitions(-1)
+                .with_replication_factor(-1),
+        })
+        .collect();
+    let resp = CreateTopicsResponse::default().with_topics(response_results);
+    encode_message(&resp, version, 256)
 }
 
-/// Resolve per-topic `CreateTopics` error.
+/// Broker default when `num_partitions == -1` (KIP-464). Real Kafka's own broker default
+/// (`num.partitions`) is 1 out of the box; this bridge has no equivalent per-deployment config
+/// yet, so 1 is hardcoded rather than invented.
+const DEFAULT_PARTITION_COUNT: u32 = 1;
+
+/// Validates one requested topic's `num_partitions`/`replication_factor` shape.
+///
+/// Not whether the bridge call itself would succeed - existence conflicts surface later, from
+/// `ensure_stream_and_topic`'s own result - and resolves the KIP-464 broker-default sentinel
+/// (`-1`) to a concrete partition count.
 ///
 /// KIP-464: `num_partitions = -1` / `replication_factor = -1` mean broker default when either
 /// (a) the version is v4+, or (b) the topic carries a manual partition assignment (valid on
-/// v2/v3 as well). Otherwise non-positive values are [`ERROR_INVALID_PARTITIONS`] /
-/// [`ERROR_INVALID_REPLICATION_FACTOR`]. When validation passes, the stub returns
-/// [`ERROR_NOT_CONTROLLER`] so clients do not believe the topic was created.
-const fn create_topics_topic_error(version: i16, topic: &CreatableTopic, forced_error: i16) -> i16 {
-    if forced_error != ERROR_NONE {
-        return forced_error;
-    }
-
+/// v2/v3 as well).
+///
+/// # Errors
+///
+/// Returns [`ERROR_INVALID_PARTITIONS`] or [`ERROR_INVALID_REPLICATION_FACTOR`] if the shape is
+/// invalid for `version`.
+pub fn validate_create_topic_shape(
+    topic: &CreatableTopic,
+    version: i16,
+) -> std::result::Result<u32, i16> {
     let broker_default_ok = version >= 4 || !topic.assignments.is_empty();
 
-    let partitions_ok = if broker_default_ok {
-        topic.num_partitions == -1 || topic.num_partitions > 0
+    let partition_count = if topic.num_partitions == -1 && broker_default_ok {
+        DEFAULT_PARTITION_COUNT
+    } else if topic.num_partitions > 0 {
+        u32::try_from(topic.num_partitions).map_err(|_| ERROR_INVALID_PARTITIONS)?
     } else {
-        topic.num_partitions > 0
+        return Err(ERROR_INVALID_PARTITIONS);
     };
-    if !partitions_ok {
-        return ERROR_INVALID_PARTITIONS;
-    }
 
     let replication_ok = if broker_default_ok {
         topic.replication_factor == -1 || topic.replication_factor > 0
@@ -291,28 +374,8 @@ const fn create_topics_topic_error(version: i16, topic: &CreatableTopic, forced_
         topic.replication_factor > 0
     };
     if !replication_ok {
-        return ERROR_INVALID_REPLICATION_FACTOR;
+        return Err(ERROR_INVALID_REPLICATION_FACTOR);
     }
 
-    ERROR_NOT_CONTROLLER
-}
-
-fn encode_create_topics_response_inner(
-    version: i16,
-    topics: &[CreatableTopic],
-    topic_error: i16,
-) -> Result<Bytes> {
-    let results = topics
-        .iter()
-        .map(|topic| {
-            CreatableTopicResult::default()
-                .with_name(topic.name.clone())
-                .with_error_code(create_topics_topic_error(version, topic, topic_error))
-                .with_error_message(None)
-                .with_num_partitions(topic.num_partitions)
-                .with_replication_factor(topic.replication_factor)
-        })
-        .collect();
-    let resp = CreateTopicsResponse::default().with_topics(results);
-    encode_message(&resp, version, 256)
+    Ok(partition_count)
 }

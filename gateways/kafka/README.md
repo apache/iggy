@@ -1,8 +1,15 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and dispatches to real or stub handlers depending on the API.
 
-> **Stub warning:** no API persists or reads real data yet. Produce, Fetch, and ListOffsets return retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of trusting a fake success. CreateTopics does **not** create topics; valid requests return `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. Persistence lands with the Iggy bridge (see [docs/SCOPE.md](docs/SCOPE.md)).
+> **Partial stub warning:** Produce and Fetch still discard/never read data - both return retriable
+> `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of trusting a
+> fake success, until [#3535](https://github.com/apache/iggy/issues/3535)/
+> [#3536](https://github.com/apache/iggy/issues/3536) land. Metadata
+> ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
+> ([#3538](https://github.com/apache/iggy/issues/3538)) and ListOffsets
+> ([#3537](https://github.com/apache/iggy/issues/3537)) are real: they call through to a real Iggy
+> backend via `IggyBridge` (see [docs/SCOPE.md](docs/SCOPE.md)).
 
 ## Run
 
@@ -63,10 +70,12 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
 streams/topics, provisions them on demand, and looks up high watermarks (one or many partitions of
 a topic per call) for `ListOffsets`.
-**Not wired into the live Produce/Fetch dispatch path yet** - that lands with
+**Wired into Metadata, CreateTopics and ListOffsets** - not yet into the live Produce/Fetch
+dispatch path, which lands with
 [#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536).
-Exercised today by `bridge`'s own unit tests and `tests/bridge_iggy_integration_tests.rs` (spawns a
-real `iggy-server`).
+Exercised by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` (bridge methods
+against a real `iggy-server`), and `tests/api_handler_tests.rs`/`tests/server_e2e_tests.rs`
+(the three wired handlers, against an in-memory fake catalog for fast wire-level coverage).
 
 ### Connection config
 
