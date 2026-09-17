@@ -32,6 +32,7 @@ import org.apache.iggy.examples.streambuilder.StreamBasic;
 import org.apache.iggy.examples.tcptls.consumer.TcpTlsConsumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
@@ -40,6 +41,7 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -57,15 +59,18 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@Timeout(15)
+@Timeout(30)
 class ConsumerOffsetTest {
     private static final int MAX_BATCH_SIZE = 2;
     private static final int MESSAGES_COUNT = 10;
+    private static final int CONSUMER_TIMEOUT_SECONDS = 20;
+    private static final long IDLE_POLL_MILLIS = 100;
 
     @ParameterizedTest(name = "{0}, first retained offset {1}")
     @MethodSource("blockingConsumers")
@@ -90,36 +95,70 @@ class ConsumerOffsetTest {
     void shouldAdvanceAsynchronouslyOnlyAfterProcessing(int firstOffset, boolean failFirstProcessing) throws Exception {
         var retained = new RetainedMessages(firstOffset, MESSAGES_COUNT, false);
         List<BigInteger> requestedOffsets = new ArrayList<>();
+        List<DeferredPollOptions> requestedOptions = new ArrayList<>();
+        var messages = new DeferredMessages((strategy, count, options) -> {
+            requestedOffsets.add(strategy.value());
+            requestedOptions.add(options);
+            if (failFirstProcessing && requestedOffsets.size() == 1) {
+                var message = retained.retained.get(0);
+                var invalid = new Message(message.header(), null, message.userHeaders());
+                return CompletableFuture.completedFuture(
+                        new PolledMessages(0L, message.header().offset(), 1L, List.of(invalid)));
+            }
+            return CompletableFuture.completedFuture(retained.poll(strategy, count));
+        });
+        runConsumer(messages);
+        retained.assertConsumedOnce();
+        assertThat(requestedOptions)
+                .as("the example asks the server to hold the poll instead of sleeping")
+                .isNotEmpty()
+                .allMatch(DeferredPollOptions.defaults()::equals);
+        if (failFirstProcessing) {
+            assertThat(requestedOffsets)
+                    .as("processing failure must retry the same polling offset")
+                    .startsWith(BigInteger.ZERO, BigInteger.ZERO);
+        }
+    }
+
+    @Test
+    void shouldNotAdvanceOnEmptyDeferredPolls() throws Exception {
+        var retained = new RetainedMessages(0, MESSAGES_COUNT, false);
+        List<BigInteger> requestedOffsets = new ArrayList<>();
+        var emptyPolls = new AtomicInteger();
+        var messages = new DeferredMessages((strategy, count, options) -> {
+            requestedOffsets.add(strategy.value());
+            // Two quiet replies before every batch: an empty deferred reply
+            // advances nothing, so the next poll repeats the same offset.
+            if (emptyPolls.incrementAndGet() % 3 != 0) {
+                return CompletableFuture.completedFuture(new PolledMessages(0L, BigInteger.ZERO, 0L, List.of()));
+            }
+            return CompletableFuture.completedFuture(retained.poll(strategy, count));
+        });
+        runConsumer(messages);
+        retained.assertConsumedOnce();
+        assertThat(requestedOffsets).startsWith(BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO);
+    }
+
+    @Test
+    void shouldStopAfterTheIdleLimitWithoutMessages() throws Exception {
+        var polls = new AtomicInteger();
+        // A held poll costs real time on a server, so the double spends some
+        // too; otherwise the idle limit would be measured against a hot loop.
+        var messages = new DeferredMessages((strategy, count, options) -> {
+            polls.incrementAndGet();
+            return CompletableFuture.supplyAsync(
+                    () -> new PolledMessages(0L, BigInteger.ZERO, 0L, List.of()),
+                    CompletableFuture.delayedExecutor(IDLE_POLL_MILLIS, TimeUnit.MILLISECONDS));
+        });
+        runConsumer(messages);
+        assertThat(polls.get()).isGreaterThan(1);
+    }
+
+    private static void runConsumer(DeferredMessages messages) throws Exception {
         var client = new AsyncIggyTcpClient("localhost", 8090) {
             @Override
             public org.apache.iggy.client.async.MessagesClient messages() {
-                return new org.apache.iggy.client.async.MessagesClient() {
-                    @Override
-                    public CompletableFuture<PolledMessages> pollMessages(
-                            StreamId streamId,
-                            TopicId topicId,
-                            Optional<Long> partitionId,
-                            Consumer consumer,
-                            PollingStrategy strategy,
-                            Long count,
-                            boolean autoCommit) {
-                        requestedOffsets.add(strategy.value());
-                        if (failFirstProcessing && requestedOffsets.size() == 1) {
-                            var message = retained.retained.get(0);
-                            var invalid = new Message(message.header(), null, message.userHeaders());
-                            return CompletableFuture.completedFuture(
-                                    new PolledMessages(0L, message.header().offset(), 1L, List.of(invalid)));
-                        }
-                        return CompletableFuture.completedFuture(retained.pollMessages(
-                                streamId, topicId, partitionId, consumer, strategy, count, autoCommit));
-                    }
-
-                    @Override
-                    public CompletableFuture<SendMessagesResponse> sendMessages(
-                            StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
-                        throw new AssertionError("Consumer must not send messages");
-                    }
-                };
+                return messages;
             }
         };
         ExecutorService processingPool = Executors.newSingleThreadExecutor();
@@ -128,13 +167,7 @@ class ConsumerOffsetTest {
                     "pollMessagesAsync", AsyncIggyTcpClient.class, ExecutorService.class);
             consume.setAccessible(true);
             var completed = (CompletableFuture<?>) consume.invoke(null, client, processingPool);
-            completed.get(10, TimeUnit.SECONDS);
-            retained.assertConsumedOnce();
-            if (failFirstProcessing) {
-                assertThat(requestedOffsets)
-                        .as("processing failure must retry the same polling offset")
-                        .startsWith(BigInteger.ZERO, BigInteger.ZERO);
-            }
+            completed.get(CONSUMER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } finally {
             processingPool.shutdownNow();
             assertThat(processingPool.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
@@ -150,6 +183,54 @@ class ConsumerOffsetTest {
                         MessageEnvelopeConsumer.class,
                         StreamBasic.class)
                 .flatMap(consumer -> Stream.of(0, 25).map(firstOffset -> Arguments.of(consumer, firstOffset)));
+    }
+
+    /**
+     * An async client that only answers deferred polls. An immediate poll fails
+     * the test, so a consumer that stops asking the server to wait is caught.
+     */
+    private static final class DeferredMessages implements org.apache.iggy.client.async.MessagesClient {
+        private final Reply reply;
+
+        private DeferredMessages(Reply reply) {
+            this.reply = reply;
+        }
+
+        @Override
+        public CompletableFuture<PolledMessages> pollMessagesDeferred(
+                StreamId streamId,
+                TopicId topicId,
+                Optional<Long> partitionId,
+                Consumer consumer,
+                PollingStrategy strategy,
+                Long count,
+                boolean autoCommit,
+                DeferredPollOptions options) {
+            return reply.poll(strategy, count, options);
+        }
+
+        @Override
+        public CompletableFuture<PolledMessages> pollMessages(
+                StreamId streamId,
+                TopicId topicId,
+                Optional<Long> partitionId,
+                Consumer consumer,
+                PollingStrategy strategy,
+                Long count,
+                boolean autoCommit) {
+            throw new AssertionError("Consumer must poll with an explicit readiness wait");
+        }
+
+        @Override
+        public CompletableFuture<SendMessagesResponse> sendMessages(
+                StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
+            throw new AssertionError("Consumer must not send messages");
+        }
+
+        @FunctionalInterface
+        private interface Reply {
+            CompletableFuture<PolledMessages> poll(PollingStrategy strategy, Long count, DeferredPollOptions options);
+        }
     }
 
     private static final class RetainedMessages implements MessagesClient {
@@ -186,6 +267,10 @@ class ConsumerOffsetTest {
                 PollingStrategy strategy,
                 Long count,
                 boolean autoCommit) {
+            return poll(strategy, count);
+        }
+
+        private PolledMessages poll(PollingStrategy strategy, Long count) {
             var batch = retained.stream()
                     .filter(message -> message.header().offset().compareTo(strategy.value()) >= 0)
                     .limit(Math.min(count, MAX_BATCH_SIZE))

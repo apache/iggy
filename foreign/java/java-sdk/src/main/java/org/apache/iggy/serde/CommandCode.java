@@ -96,7 +96,9 @@ public interface CommandCode {
         POLL(100),
         SEND(101),
         GET_POLL_ROUTING(103),
-        POLL_ON_PRIMARY(104);
+        POLL_ON_PRIMARY(104),
+        POLL_DEFERRED(105),
+        POLL_DEFERRED_ON_PRIMARY(106);
 
         private final int value;
 

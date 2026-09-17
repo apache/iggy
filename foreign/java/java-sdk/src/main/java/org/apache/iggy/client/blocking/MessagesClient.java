@@ -20,8 +20,10 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
@@ -59,6 +61,79 @@ public interface MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit);
+
+    /**
+     * Polls messages with a deferred wait using numeric identifiers.
+     *
+     * <p>See {@link #pollMessagesDeferred(StreamId, TopicId, Optional, Consumer, PollingStrategy,
+     * Long, boolean, DeferredPollOptions)} for full documentation.
+     *
+     * @param streamId    the numeric stream ID
+     * @param topicId     the numeric topic ID
+     * @param partitionId optional partition ID
+     * @param consumerId  the numeric consumer ID
+     * @param strategy    the polling strategy
+     * @param count       the maximum number of messages to return
+     * @param autoCommit  whether to auto-commit offsets
+     * @param options     the readiness, byte and request-time limits
+     * @return the polled messages
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    default PolledMessages pollMessagesDeferred(
+            Long streamId,
+            Long topicId,
+            Optional<Long> partitionId,
+            Long consumerId,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        return pollMessagesDeferred(
+                StreamId.of(streamId),
+                TopicId.of(topicId),
+                partitionId,
+                Consumer.of(consumerId),
+                strategy,
+                count,
+                autoCommit,
+                options);
+    }
+
+    /**
+     * Polls messages, letting the server hold the request until data is ready.
+     *
+     * <p>Unlike {@link #pollMessages}, which reads whatever is resident and returns, this
+     * waits up to {@link DeferredPollOptions#maxWait()} for {@link DeferredPollOptions#minCount()}
+     * messages, caps the encoded response at {@link DeferredPollOptions#maxBytes()}, and bounds
+     * the whole exchange by {@link DeferredPollOptions#requestTimeout()}. An expired readiness
+     * wait can still return partial or empty data; an expired request timeout is an error.
+     *
+     * <p>The HTTP client accepts only a plain consumer, because its JSON poll query cannot
+     * carry a consumer kind. A group consumer is rejected before any request is sent.
+     *
+     * @param streamId    the stream identifier (numeric or string-based)
+     * @param topicId     the topic identifier (numeric or string-based)
+     * @param partitionId optional partition ID to poll from
+     * @param consumer    the consumer identity
+     * @param strategy    the polling strategy controlling where to start reading
+     * @param count       the maximum number of messages to return
+     * @param autoCommit  whether the server should automatically commit the consumer offset
+     * @param options     the readiness, byte and request-time limits
+     * @return the polled messages
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    default PolledMessages pollMessagesDeferred(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        throw new IggyOperationNotSupportedException(
+                "pollMessagesDeferred", getClass().getSimpleName());
+    }
 
     default SendMessagesResponse sendMessages(
             Long streamId, Long topicId, Partitioning partitioning, List<Message> messages) {

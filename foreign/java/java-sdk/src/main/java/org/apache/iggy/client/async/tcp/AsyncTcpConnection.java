@@ -49,6 +49,7 @@ import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
 import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrResponseHandler;
 import org.apache.iggy.exception.IggyClientException;
@@ -82,6 +83,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
+import java.util.function.IntSupplier;
 
 /**
  * Async TCP connection using Netty for non-blocking I/O.
@@ -124,12 +126,21 @@ public class AsyncTcpConnection {
     private final TransientFailoverHandler transientFailoverHandler;
     private final IntConsumer sessionResetListener;
     private final Consumer<Throwable> connectionFailureListener;
+    private final ConnectionInfo endpoint;
+    private final int maxVsrFrameSize;
     private final long requestTimeoutNanos;
     private final long heartbeatIntervalNanos;
     private final Object heartbeatLock = new Object();
     private ByteBuf loginPayload;
     private ScheduledFuture<?> heartbeatTask;
     private boolean heartbeatRunning;
+
+    /**
+     * Frames a deferred exchange may accept on this connection, header
+     * included. A held poll declares its own response limit, so the channel
+     * must refuse a larger body before accumulating it.
+     */
+    private volatile int deferredFrameLimit = Integer.MAX_VALUE;
 
     private volatile int loginCommandCode;
     private volatile boolean authenticated = false;
@@ -175,6 +186,8 @@ public class AsyncTcpConnection {
             TransientFailoverHandler transientFailoverHandler,
             IntConsumer sessionResetListener,
             Consumer<Throwable> connectionFailureListener) {
+        this.endpoint = new ConnectionInfo(host, port);
+        this.maxVsrFrameSize = maxVsrFrameSize;
         this.transientFailoverHandler = transientFailoverHandler;
         this.sessionResetListener = sessionResetListener;
         this.connectionFailureListener = connectionFailureListener;
@@ -222,7 +235,7 @@ public class AsyncTcpConnection {
                         sslContext,
                         dialTimeoutMillis,
                         consensusSession,
-                        maxVsrFrameSize,
+                        this::currentMaxFrameSize,
                         this::onSessionEvicted,
                         channels::add),
                 ChannelHealthChecker.ACTIVE,
@@ -238,12 +251,18 @@ public class AsyncTcpConnection {
      * Validates server reachability by eagerly acquiring and releasing one connection.
      */
     public CompletableFuture<Void> connect() {
+        return connect(true);
+    }
+
+    private CompletableFuture<Void> connect(boolean withHeartbeat) {
         CompletableFuture<Void> future = new CompletableFuture<>();
         channelPool.acquire().addListener((FutureListener<Channel>) f -> {
             if (f.isSuccess()) {
                 channelPool.release(f.getNow()).addListener(release -> {
                     if (release.isSuccess()) {
-                        startHeartbeat();
+                        if (withHeartbeat) {
+                            startHeartbeat();
+                        }
                         future.complete(null);
                     } else {
                         future.completeExceptionally(release.cause());
@@ -259,6 +278,19 @@ public class AsyncTcpConnection {
             }
         });
         return future;
+    }
+
+    /**
+     * Connects a deferred data connection. A held poll occupies the server's
+     * per-connection drain, so an automatic ping would queue behind it and
+     * time out against its own shorter budget, closing a valid exchange. The
+     * parent keeps its heartbeat and the server's active-request protection
+     * covers this one.
+     *
+     * @return a future completing once the connection is usable
+     */
+    CompletableFuture<Void> connectWithoutHeartbeat() {
+        return connect(false);
     }
 
     private void startHeartbeat() {
@@ -338,6 +370,18 @@ public class AsyncTcpConnection {
 
     long metadataWatermark() {
         return consensusSession.metadataWatermark();
+    }
+
+    ConnectionInfo endpoint() {
+        return endpoint;
+    }
+
+    Optional<ConsensusSession.Snapshot> sessionSnapshot() {
+        return consensusSession.snapshot();
+    }
+
+    private int currentMaxFrameSize() {
+        return Math.min(maxVsrFrameSize, deferredFrameLimit);
     }
 
     long sessionGeneration() {
@@ -463,6 +507,24 @@ public class AsyncTcpConnection {
         });
 
         return callerFuture;
+    }
+
+    /**
+     * Sends one deferred poll under the caller's absolute deadline, refusing a
+     * reply larger than the response limit the request declared.
+     *
+     * @param commandCode      105 or 106
+     * @param payload          the encoded deferred poll body
+     * @param deadlineNanos    the caller's absolute {@link System#nanoTime()} deadline
+     * @param maxResponseBytes the response body limit the request declared
+     * @return a future completing with the reply body
+     */
+    CompletableFuture<ByteBuf> sendDeferredPoll(
+            int commandCode, ByteBuf payload, long deadlineNanos, long maxResponseBytes) {
+        deferredFrameLimit = (int) Math.min(VsrHeaders.HEADER_SIZE + maxResponseBytes, maxVsrFrameSize);
+        CompletableFuture<ByteBuf> sent = send(commandCode, payload, deadlineNanos);
+        sent.whenComplete((response, error) -> deferredFrameLimit = Integer.MAX_VALUE);
+        return sent;
     }
 
     CompletableFuture<ByteBuf> sendPrimaryPoll(ByteBuf payload, long sessionGeneration) {
@@ -764,7 +826,9 @@ public class AsyncTcpConnection {
         return commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()
                 || commandCode == CommandCode.System.ATTACH_CONSUMER_SESSION.getValue()
                 || commandCode == CommandCode.Messages.GET_POLL_ROUTING.getValue()
-                || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue();
+                || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue()
+                || commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()
+                || commandCode == CommandCode.Messages.POLL_DEFERRED_ON_PRIMARY.getValue();
     }
 
     private static boolean mutatesSessionState(int commandCode) {
@@ -1096,7 +1160,7 @@ public class AsyncTcpConnection {
         private final SslContext sslContext;
         private final long dialTimeoutMillis;
         private final ConsensusSession consensusSession;
-        private final int maxVsrFrameSize;
+        private final IntSupplier maxVsrFrameSize;
         private final IntConsumer onEviction;
         private final Consumer<Channel> onChannelCreated;
 
@@ -1108,7 +1172,7 @@ public class AsyncTcpConnection {
                 SslContext sslContext,
                 long dialTimeoutMillis,
                 ConsensusSession consensusSession,
-                int maxVsrFrameSize,
+                IntSupplier maxVsrFrameSize,
                 IntConsumer onEviction,
                 Consumer<Channel> onChannelCreated) {
             this.host = host;

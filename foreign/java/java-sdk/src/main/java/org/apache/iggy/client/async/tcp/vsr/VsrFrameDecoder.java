@@ -25,6 +25,7 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.DecoderException;
 
 import java.util.List;
+import java.util.function.IntSupplier;
 
 /**
  * Decoder for VSR response frames: a 256-byte consensus header whose total
@@ -36,18 +37,34 @@ public class VsrFrameDecoder extends ByteToMessageDecoder {
     /** Matches the server's default {@code max_message_size} (64 MB). */
     public static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024;
 
-    private final int maxFrameSize;
+    private final IntSupplier maxFrameSize;
 
     public VsrFrameDecoder() {
         this(DEFAULT_MAX_FRAME_SIZE);
     }
 
     public VsrFrameDecoder(int maxFrameSize) {
+        this(fixed(maxFrameSize));
+    }
+
+    /**
+     * A deferred poll declares how many response bytes it will accept, and that
+     * bound has to reach the decoder before it accumulates a body, not after.
+     * The supplier is read per frame so one exchange can tighten the limit and
+     * the connection's ordinary replies keep the configured ceiling.
+     *
+     * @param maxFrameSize the current frame ceiling, never below the header size
+     */
+    public VsrFrameDecoder(IntSupplier maxFrameSize) {
+        this.maxFrameSize = maxFrameSize;
+    }
+
+    private static IntSupplier fixed(int maxFrameSize) {
         if (maxFrameSize < VsrHeaders.HEADER_SIZE) {
             throw new IllegalArgumentException(
                     "Maximum VSR frame size must be at least " + VsrHeaders.HEADER_SIZE + " bytes");
         }
-        this.maxFrameSize = maxFrameSize;
+        return () -> maxFrameSize;
     }
 
     @Override
@@ -56,7 +73,7 @@ public class VsrFrameDecoder extends ByteToMessageDecoder {
             return;
         }
         long totalSize = VsrHeaders.readSize(in);
-        if (totalSize < VsrHeaders.HEADER_SIZE || totalSize > maxFrameSize) {
+        if (totalSize < VsrHeaders.HEADER_SIZE || totalSize > maxFrameSize.getAsInt()) {
             throw new DecoderException("Invalid VSR frame size " + totalSize + ", connection is desynchronized");
         }
         if (in.readableBytes() < totalSize) {

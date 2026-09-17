@@ -22,6 +22,7 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
@@ -148,6 +149,58 @@ class TlsConnectionTest extends BaseIntegrationTest {
                             false);
 
             assertThat(polled.messages()).hasSize(3);
+        } finally {
+            try {
+                client.streams().deleteStream(streamId);
+            } catch (RuntimeException e) {
+                log.debug("Cleanup failed: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * A deferred poll runs on its own data connection, so it repeats the TLS
+     * handshake with the configured certificate rather than reusing the
+     * coordinator's channel.
+     */
+    @Test
+    void deferredPollOverTlsShouldWork() {
+        var client = IggyTcpClient.builder()
+                .host(TLS_HOST)
+                .port(serverTcpPort())
+                .enableTls()
+                .tlsCertificate(CERTS_DIR.resolve("iggy_ca_cert.pem").toFile())
+                .credentials("iggy", "iggy")
+                .buildAndLogin();
+
+        String streamName = "tls-deferred-stream";
+        StreamId streamId = StreamId.of(streamName);
+        String topicName = "tls-deferred-topic";
+        TopicId topicId = TopicId.of(topicName);
+
+        try {
+            client.streams().createStream(streamName);
+            client.topics()
+                    .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, topicName);
+            client.messages()
+                    .sendMessages(
+                            streamId,
+                            topicId,
+                            Partitioning.partitionId(0L),
+                            List.of(Message.of("tls-deferred-1"), Message.of("tls-deferred-2")));
+
+            PolledMessages polled = client.messages()
+                    .pollMessagesDeferred(
+                            streamId,
+                            topicId,
+                            Optional.of(0L),
+                            org.apache.iggy.consumergroup.Consumer.of(0L),
+                            PollingStrategy.first(),
+                            10L,
+                            false,
+                            DeferredPollOptions.defaults().withMinCount(2));
+
+            assertThat(polled.messages()).hasSize(2);
         } finally {
             try {
                 client.streams().deleteStream(streamId);

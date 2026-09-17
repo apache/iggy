@@ -22,6 +22,7 @@ package org.apache.iggy.client.async.tcp.vsr;
 import org.apache.iggy.exception.IggyNotConnectedException;
 
 import java.security.SecureRandom;
+import java.util.Optional;
 
 /**
  * VSR client identity and dedup state, mirroring
@@ -151,6 +152,21 @@ public final class ConsensusSession {
         }
     }
 
+    /**
+     * The identity a deferred data connection attaches to its parent, read in
+     * one critical section. Taken field by field, a re-login in between would
+     * pair a fresh client id with the previous epoch and the server would
+     * refuse the attachment, or worse accept a mismatched one.
+     *
+     * @return the snapshot, or empty while no session is bound
+     */
+    public synchronized Optional<Snapshot> snapshot() {
+        if (session == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new Snapshot(clientIdLow, clientIdHigh, session, metadataWatermark, generation));
+    }
+
     synchronized long clientIdLow() {
         return clientIdLow;
     }
@@ -165,4 +181,17 @@ public final class ConsensusSession {
             clientIdHigh = RANDOM.nextLong();
         } while (clientIdLow == 0 && clientIdHigh == 0);
     }
+
+    /**
+     * A bound session, its client id halves and the metadata watermark the
+     * client has seen. The generation is local fencing state, not a wire field.
+     *
+     * @param clientIdLow       low half of the {@code u128} client id
+     * @param clientIdHigh      high half of the {@code u128} client id
+     * @param session           the bound fence epoch
+     * @param metadataWatermark the highest observed metadata commit
+     * @param generation        the local session generation
+     */
+    public record Snapshot(
+            long clientIdLow, long clientIdHigh, long session, long metadataWatermark, long generation) {}
 }

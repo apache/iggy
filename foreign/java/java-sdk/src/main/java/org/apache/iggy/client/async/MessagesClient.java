@@ -20,8 +20,10 @@
 package org.apache.iggy.client.async;
 
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
@@ -137,6 +139,83 @@ public interface MessagesClient {
                 strategy,
                 count,
                 autoCommit);
+    }
+
+    /**
+     * Polls messages asynchronously, letting the server hold the request until data is ready.
+     *
+     * <p>Unlike {@link #pollMessages}, which reads whatever is resident and returns, this
+     * waits up to {@link DeferredPollOptions#maxWait()} for {@link DeferredPollOptions#minCount()}
+     * messages, caps the encoded response at {@link DeferredPollOptions#maxBytes()}, and bounds
+     * the whole exchange by {@link DeferredPollOptions#requestTimeout()}. An expired readiness
+     * wait can still return partial or empty data; an expired request timeout is an error.
+     *
+     * <p>The server must support command 105. An older one answers
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND}, which also covers an
+     * operator wait limit below the requested wait and a request this client encoded wrongly.
+     * Never retry it and never infer the cause from the code alone.
+     *
+     * @param streamId    the stream identifier (numeric or string-based)
+     * @param topicId     the topic identifier (numeric or string-based)
+     * @param partitionId optional partition ID to poll from; when empty and polling with a
+     *                    group consumer, the client selects the partition round-robin from
+     *                    the member's synced group assignment
+     * @param consumer    the consumer identity, either individual or group
+     * @param strategy    the polling strategy controlling where to start reading
+     * @param count       the maximum number of messages to return
+     * @param autoCommit  whether the server should automatically commit the consumer offset
+     * @param options     the readiness, byte and request-time limits
+     * @return a {@link CompletableFuture} that completes with the {@link PolledMessages}
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    default CompletableFuture<PolledMessages> pollMessagesDeferred(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        return CompletableFuture.failedFuture(new IggyOperationNotSupportedException(
+                "pollMessagesDeferred", getClass().getSimpleName()));
+    }
+
+    /**
+     * Polls messages asynchronously with a deferred wait using numeric identifiers.
+     *
+     * <p>See {@link #pollMessagesDeferred(StreamId, TopicId, Optional, Consumer, PollingStrategy,
+     * Long, boolean, DeferredPollOptions)} for full documentation.
+     *
+     * @param streamId    the numeric stream ID
+     * @param topicId     the numeric topic ID
+     * @param partitionId optional partition ID
+     * @param consumerId  the numeric consumer ID
+     * @param strategy    the polling strategy
+     * @param count       the maximum number of messages to return
+     * @param autoCommit  whether to auto-commit offsets
+     * @param options     the readiness, byte and request-time limits
+     * @return a {@link CompletableFuture} that completes with the {@link PolledMessages}
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    default CompletableFuture<PolledMessages> pollMessagesDeferred(
+            Long streamId,
+            Long topicId,
+            Optional<Long> partitionId,
+            Long consumerId,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        return pollMessagesDeferred(
+                StreamId.of(streamId),
+                TopicId.of(topicId),
+                partitionId,
+                Consumer.of(consumerId),
+                strategy,
+                count,
+                autoCommit,
+                options);
     }
 
     /**

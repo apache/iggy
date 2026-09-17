@@ -26,6 +26,8 @@ import io.netty.handler.codec.DecoderException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -113,6 +115,46 @@ class VsrFrameDecoderTest {
             } catch (DecoderException ignored) {
                 // Closing a failed decoder can replay its exception.
             }
+        }
+    }
+
+    @Test
+    void shouldFollowALimitTightenedForOneExchange() {
+        int tightened = VsrHeaders.HEADER_SIZE + 16;
+        AtomicInteger limit = new AtomicInteger(VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE);
+        EmbeddedChannel tightenedChannel = new EmbeddedChannel(new VsrFrameDecoder(limit::get));
+        try {
+            limit.set(tightened);
+            ByteBuf oversized = Unpooled.buffer(VsrHeaders.HEADER_SIZE);
+            oversized.writeZero(VsrHeaders.HEADER_SIZE);
+            oversized.setIntLE(VsrHeaders.SIZE_OFFSET, tightened + 1);
+
+            assertThatThrownBy(() -> tightenedChannel.writeInbound(oversized)).isInstanceOf(DecoderException.class);
+        } finally {
+            try {
+                tightenedChannel.finishAndReleaseAll();
+            } catch (DecoderException ignored) {
+                // Closing a failed decoder can replay its exception.
+            }
+        }
+    }
+
+    @Test
+    void shouldAcceptAFrameInsideTheTightenedLimitBeforeAccumulatingIt() {
+        int tightened = VsrHeaders.HEADER_SIZE + 16;
+        AtomicInteger limit = new AtomicInteger(tightened);
+        EmbeddedChannel tightenedChannel = new EmbeddedChannel(new VsrFrameDecoder(limit::get));
+        try {
+            ByteBuf frame = Unpooled.buffer(tightened);
+            frame.writeZero(tightened);
+            frame.setIntLE(VsrHeaders.SIZE_OFFSET, tightened);
+
+            assertThat(tightenedChannel.writeInbound(frame)).isTrue();
+            ByteBuf decoded = tightenedChannel.readInbound();
+            assertThat(decoded.readableBytes()).isEqualTo(tightened);
+            decoded.release();
+        } finally {
+            tightenedChannel.finishAndReleaseAll();
         }
     }
 }

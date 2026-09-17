@@ -21,6 +21,9 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.client.async.tcp.VsrLoopbackPeer.Request;
+import org.apache.iggy.client.async.tcp.VsrLoopbackPeer.RequestHandler;
+import org.apache.iggy.client.async.tcp.VsrLoopbackPeer.Response;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyErrorCode;
@@ -34,16 +37,10 @@ import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 
-import java.io.EOFException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -56,25 +53,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.apache.iggy.client.async.tcp.VsrLoopbackPeer.clusterMetadata;
+import static org.apache.iggy.client.async.tcp.VsrLoopbackPeer.registerBody;
+import static org.apache.iggy.client.async.tcp.VsrLoopbackPeer.serve;
+import static org.apache.iggy.client.async.tcp.VsrLoopbackPeer.singleNodeMetadata;
+import static org.apache.iggy.client.async.tcp.VsrLoopbackPeer.threeNodeMetadata;
+import static org.apache.iggy.client.async.tcp.VsrLoopbackPeer.transientResult;
+import static org.apache.iggy.client.async.tcp.VsrLoopbackPeer.writeNode;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncIggyTcpClientTransientFailoverTest {
-    private static final int HEADER_SIZE = 256;
-    private static final int SIZE_OFFSET = 48;
-    private static final int COMMAND_OFFSET = 60;
-    private static final int REQUEST_ID_OFFSET = 168;
-    private static final int REQUEST_OPERATION_OFFSET = 176;
-    private static final int REQUEST_CODE_OFFSET = 196;
-    private static final int REPLY_REQUEST_ID_OFFSET = 200;
-    private static final int REPLY_OPERATION_OFFSET = 208;
-    private static final int REPLY_STATUS_OFFSET = 216;
-    private static final int REPLY_COMMIT_OFFSET = 184;
-    private static final int REQUEST_CLIENT_OFFSET = 128;
-    private static final int EVICTION_REASON_OFFSET = 255;
-
-    private static final int COMMAND_REPLY = 8;
-    private static final int COMMAND_EVICTION = 13;
     private static final int OPERATION_REGISTER = 1;
     private static final int OPERATION_NON_REPLICATED = 2;
     private static final int OPERATION_LOGOUT = 3;
@@ -1428,213 +1417,5 @@ class AsyncIggyTcpClientTransientFailoverTest {
             return Response.success(OPERATION_CREATE_STREAM, body);
         }
         throw new IllegalStateException("Unexpected request to new leader: " + request);
-    }
-
-    private static CompletableFuture<Void> serve(ServerSocket server, RequestHandler handler) {
-        return serve(server, 1, handler);
-    }
-
-    /**
-     * Runs blocking socket I/O on one dedicated daemon thread per mock node.
-     * The common fork-join pool has only cores minus one workers on small CI
-     * runners, so three blocking nodes can starve the client continuations the
-     * test is waiting for when the full suite runs concurrently.
-     */
-    private static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
-        CompletableFuture<Void> serving = new CompletableFuture<>();
-        Thread serverThread = new Thread(
-                () -> {
-                    try {
-                        for (int connection = 0; connection < connectionCount; connection++) {
-                            try (Socket socket = server.accept()) {
-                                InputStream input = socket.getInputStream();
-                                OutputStream output = socket.getOutputStream();
-                                Request request;
-                                while ((request = readRequest(input)) != null) {
-                                    Response response = handler.handle(request);
-                                    if (response.command() == -1) {
-                                        break;
-                                    }
-                                    writeResponse(output, request, response);
-                                    if (response.closeAfterReply()) {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        serving.complete(null);
-                    } catch (IOException error) {
-                        serving.completeExceptionally(new IllegalStateException("Mock VSR server failed", error));
-                    } catch (RuntimeException error) {
-                        serving.completeExceptionally(error);
-                    }
-                },
-                "transient-failover-server-" + server.getLocalPort());
-        serverThread.setDaemon(true);
-        serverThread.start();
-        return serving;
-    }
-
-    private static Request readRequest(InputStream input) throws IOException {
-        byte[] header = input.readNBytes(HEADER_SIZE);
-        if (header.length == 0) {
-            return null;
-        }
-        if (header.length != HEADER_SIZE) {
-            throw new EOFException("Truncated VSR request header");
-        }
-        ByteBuffer fields = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-        int size = fields.getInt(SIZE_OFFSET);
-        byte[] body = input.readNBytes(size - HEADER_SIZE);
-        if (body.length != size - HEADER_SIZE) {
-            throw new EOFException("Truncated VSR request body");
-        }
-        return new Request(
-                Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
-                fields.getInt(REQUEST_CODE_OFFSET),
-                fields.getLong(REQUEST_ID_OFFSET),
-                fields.getLong(REQUEST_CLIENT_OFFSET),
-                fields.getLong(REQUEST_CLIENT_OFFSET + Long.BYTES),
-                body);
-    }
-
-    private static void writeResponse(OutputStream output, Request request, Response response) throws IOException {
-        if (response.command() == -2) {
-            return;
-        }
-        byte[] body = new byte[response.body().readableBytes()];
-        response.body().readBytes(body);
-        response.body().release();
-        byte[] header = new byte[HEADER_SIZE];
-        ByteBuffer fields = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-        fields.putInt(SIZE_OFFSET, HEADER_SIZE + body.length);
-        header[COMMAND_OFFSET] = (byte) response.command();
-        if (response.command() == COMMAND_EVICTION) {
-            header[EVICTION_REASON_OFFSET] = (byte) response.evictionReason();
-        } else {
-            fields.putLong(REPLY_REQUEST_ID_OFFSET, request.requestId());
-            header[REPLY_OPERATION_OFFSET] = (byte) response.operation();
-            fields.putInt(REPLY_STATUS_OFFSET, response.status());
-            fields.putLong(REPLY_COMMIT_OFFSET, response.commit());
-        }
-        output.write(header);
-        output.write(body);
-        output.flush();
-    }
-
-    private static ByteBuf registerBody(long session) {
-        ByteBuf body = Unpooled.buffer();
-        body.writeIntLE(0);
-        body.writeIntLE(1);
-        body.writeLongLE(session);
-        body.writeIntLE(11 << 10);
-        body.writeByte(0);
-        return body;
-    }
-
-    private static ByteBuf transientResult(int errorCode) {
-        ByteBuf body = Unpooled.buffer(3 * Integer.BYTES);
-        body.writeIntLE(1);
-        body.writeIntLE(0);
-        body.writeIntLE(errorCode);
-        return body;
-    }
-
-    private static ByteBuf singleNodeMetadata(int port) {
-        ByteBuf body = Unpooled.buffer();
-        writeString(body, "test-cluster");
-        body.writeIntLE(1);
-        writeNode(body, "node", port, true);
-        return body;
-    }
-
-    private static ByteBuf clusterMetadata(int oldLeaderPort, int newLeaderPort, int leaderPort) {
-        ByteBuf body = Unpooled.buffer();
-        writeString(body, "test-cluster");
-        body.writeIntLE(2);
-        writeNode(body, "old-node", oldLeaderPort, oldLeaderPort == leaderPort);
-        writeNode(body, "new-node", newLeaderPort, newLeaderPort == leaderPort);
-        return body;
-    }
-
-    private static ByteBuf threeNodeMetadata(int firstPort, int secondPort, int thirdPort) {
-        ByteBuf body = Unpooled.buffer();
-        writeString(body, "test-cluster");
-        body.writeIntLE(3);
-        writeNode(body, "metadata-leader", firstPort, true);
-        writeNode(body, "follower", secondPort, false);
-        writeNode(body, "partition-primary", thirdPort, false);
-        return body;
-    }
-
-    private static void writeNode(ByteBuf body, String name, int port, boolean leader) {
-        writeString(body, name);
-        writeString(body, InetAddress.getLoopbackAddress().getHostAddress());
-        body.writeShortLE(port);
-        body.writeShortLE(0);
-        body.writeShortLE(0);
-        body.writeShortLE(0);
-        body.writeByte(leader ? 0 : 1);
-        body.writeByte(0);
-    }
-
-    private static void writeString(ByteBuf body, String value) {
-        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-        body.writeIntLE(bytes.length);
-        body.writeBytes(bytes);
-    }
-
-    private record Request(
-            int operation, int commandCode, long requestId, long clientLow, long clientHigh, byte[] body) {
-        boolean is(int expectedCode, int expectedOperation) {
-            return commandCode == expectedCode && operation == expectedOperation;
-        }
-
-        /** The request body as text, for asserting which user a login names. */
-        String bodyAsText() {
-            return new String(body, StandardCharsets.UTF_8);
-        }
-    }
-
-    private record Response(
-            int command,
-            int operation,
-            int status,
-            int evictionReason,
-            long commit,
-            ByteBuf body,
-            boolean closeAfterReply) {
-        static Response success(int operation, ByteBuf body) {
-            return new Response(COMMAND_REPLY, operation, 0, 0, 0, body, false);
-        }
-
-        static Response error(int operation, int status) {
-            return new Response(COMMAND_REPLY, operation, status, 0, 0, Unpooled.EMPTY_BUFFER, false);
-        }
-
-        static Response eviction(int reason) {
-            return new Response(COMMAND_EVICTION, 0, 0, reason, 0, Unpooled.EMPTY_BUFFER, false);
-        }
-
-        static Response committed(int operation, long commit, ByteBuf body) {
-            return new Response(COMMAND_REPLY, operation, 0, 0, commit, body, false);
-        }
-
-        static Response disconnect() {
-            return new Response(-1, 0, 0, 0, 0, Unpooled.EMPTY_BUFFER, false);
-        }
-
-        static Response noReply() {
-            return new Response(-2, 0, 0, 0, 0, Unpooled.EMPTY_BUFFER, false);
-        }
-
-        static Response successAndDisconnect(int operation, ByteBuf body) {
-            return new Response(COMMAND_REPLY, operation, 0, 0, 0, body, true);
-        }
-    }
-
-    @FunctionalInterface
-    private interface RequestHandler {
-        Response handle(Request request);
     }
 }

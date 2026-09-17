@@ -26,11 +26,14 @@ import org.apache.iggy.client.async.MessagesClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyMalformedResponseException;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.exception.IggyResourceNotFoundException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.hash.XxHash32;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PartitioningKind;
@@ -50,6 +53,7 @@ import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.function.LongFunction;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.encodeMessagesBatchInto;
@@ -72,6 +76,9 @@ public class MessagesTcpClient implements MessagesClient {
 
     private static final int GROUP_POLL_MAX_ATTEMPTS = 2;
     private static final int PARTITION_NOT_OWNED_ERROR_CODE = 5009;
+
+    /** {@code partition_id:u32}, {@code current_offset:u64}, {@code count:u32}. */
+    private static final int POLL_RESPONSE_PREFIX_BYTES = 16;
 
     /**
      * Staleness budget for the client-side routing caches: group assignments
@@ -131,17 +138,171 @@ public class MessagesTcpClient implements MessagesClient {
             // The VSR broker fences group polls against unowned partitions
             // instead of picking one, so the partition is selected here from
             // the member's synced assignment, matching the Rust SDK.
-            PollCancellation cancellation = new PollCancellation();
-            CompletableFuture<PolledMessages> result = pollGroupMessages(
-                    streamId, topicId, consumer, strategy, count, autoCommit, GROUP_POLL_MAX_ATTEMPTS, cancellation);
-            result.whenComplete((response, error) -> {
-                if (result.isCancelled()) {
-                    cancellation.cancel();
-                }
-            });
-            return result;
+            return pollAssignedPartition(
+                    streamId,
+                    topicId,
+                    consumer,
+                    partition -> pollPartition(
+                            streamId, topicId, Optional.of(partition), consumer, strategy, count, autoCommit));
         }
         return pollPartition(streamId, topicId, partitionId, consumer, strategy, count, autoCommit);
+    }
+
+    @Override
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    public CompletableFuture<PolledMessages> pollMessagesDeferred(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        try {
+            options.validate(count);
+        } catch (RuntimeException invalid) {
+            return CompletableFuture.failedFuture(invalid);
+        }
+        if (pollRouter == null) {
+            return CompletableFuture.failedFuture(
+                    new IggyOperationNotSupportedException(
+                            "A deferred poll runs on a dedicated data connection; build the client with Iggy.tcpClientBuilder()"));
+        }
+        // One monotonic budget for the whole call, taken before group sync,
+        // route lookup, queuing, connection setup, login and attachment.
+        long startNanos = System.nanoTime();
+        long waitDeadlineNanos = startNanos + options.maxWait().toNanos();
+        long requestDeadlineNanos = startNanos + options.requestTimeout().toNanos();
+        if (consumer.kind() == Consumer.Kind.ConsumerGroup && partitionId.isEmpty()) {
+            return pollAssignedPartition(
+                    streamId,
+                    topicId,
+                    consumer,
+                    partition -> pollDeferredPartition(
+                            streamId,
+                            topicId,
+                            Optional.of(partition),
+                            consumer,
+                            strategy,
+                            count,
+                            autoCommit,
+                            options,
+                            waitDeadlineNanos,
+                            requestDeadlineNanos));
+        }
+        return pollDeferredPartition(
+                streamId,
+                topicId,
+                partitionId,
+                consumer,
+                strategy,
+                count,
+                autoCommit,
+                options,
+                waitDeadlineNanos,
+                requestDeadlineNanos);
+    }
+
+    private CompletableFuture<PolledMessages> pollAssignedPartition(
+            StreamId streamId,
+            TopicId topicId,
+            Consumer consumer,
+            LongFunction<CompletableFuture<PolledMessages>> pollPartition) {
+        PollCancellation cancellation = new PollCancellation();
+        CompletableFuture<PolledMessages> result =
+                pollGroupMessages(streamId, topicId, consumer, pollPartition, GROUP_POLL_MAX_ATTEMPTS, cancellation);
+        result.whenComplete((response, error) -> {
+            if (result.isCancelled()) {
+                cancellation.cancel();
+            }
+        });
+        return result;
+    }
+
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private CompletableFuture<PolledMessages> pollDeferredPartition(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options,
+            long waitDeadlineNanos,
+            long requestDeadlineNanos) {
+        ByteBuf payload = encodePoll(streamId, topicId, partitionId, consumer, strategy, count, autoCommit);
+        PollCancellation cancellation = new PollCancellation();
+        // Only an auto-commit poll needs the primary route; a manual one attaches
+        // the parent session on the coordinator's own endpoint.
+        CompletableFuture<Boolean> clusteredRoute =
+                autoCommit ? clustered.get() : CompletableFuture.completedFuture(false);
+        CompletableFuture<ByteBuf> sent = clusteredRoute
+                .handle((isClustered, error) -> {
+                    if (error != null || cancellation.isCancelled()) {
+                        payload.release();
+                        return CompletableFuture.<ByteBuf>failedFuture(
+                                error != null ? error : new CancellationException());
+                    }
+                    CompletableFuture<ByteBuf> deferred = pollRouter.pollDeferred(
+                            payload, options, isClustered, waitDeadlineNanos, requestDeadlineNanos);
+                    cancellation.track(deferred);
+                    return deferred;
+                })
+                .thenCompose(deferred -> deferred);
+        CompletableFuture<PolledMessages> result = sent.thenApply(response -> {
+            try {
+                return readDeferredResponse(response, count);
+            } finally {
+                response.release();
+            }
+        });
+        result.whenComplete((response, error) -> {
+            if (result.isCancelled()) {
+                cancellation.cancel();
+            }
+        });
+        return result;
+    }
+
+    /**
+     * A deferred reply is bounded before it is accumulated, so what remains to
+     * check is that the body describes itself consistently: a reply claiming
+     * more messages than it carries, or more than the caller asked for, must not
+     * escape as a partially decoded batch.
+     */
+    private static PolledMessages readDeferredResponse(ByteBuf response, Long count) {
+        if (response.readableBytes() < POLL_RESPONSE_PREFIX_BYTES) {
+            throw new IggyMalformedResponseException(
+                    "Truncated deferred poll response: " + response.readableBytes() + " bytes");
+        }
+        PolledMessages polled = BytesDeserializer.readPolledMessages(response);
+        if (polled.messages().size() != polled.count() || polled.count() > count || response.isReadable()) {
+            throw new IggyMalformedResponseException(
+                    "Deferred poll response advertised " + polled.count() + " messages for a request of " + count
+                            + " but carried " + polled.messages().size());
+        }
+        return polled;
+    }
+
+    private static ByteBuf encodePoll(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit) {
+        var payload = Unpooled.buffer();
+        payload.writeBytes(toBytes(consumer));
+        payload.writeBytes(toBytes(streamId));
+        payload.writeBytes(toBytes(topicId));
+        payload.writeBytes(toBytes(partitionId));
+        payload.writeBytes(toBytes(strategy));
+        payload.writeIntLE(count.intValue());
+        payload.writeByte(autoCommit ? 1 : 0);
+        return payload;
     }
 
     private CompletableFuture<PolledMessages> pollPartition(
@@ -152,29 +313,8 @@ public class MessagesTcpClient implements MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit) {
-
-        var payload = Unpooled.buffer();
-
-        var consumerBytes = toBytes(consumer);
-        payload.writeBytes(consumerBytes);
-
-        var streamBytes = toBytes(streamId);
-        payload.writeBytes(streamBytes);
-
-        var topicBytes = toBytes(topicId);
-        payload.writeBytes(topicBytes);
-
-        payload.writeBytes(toBytes(partitionId));
-
-        var strategyBytes = toBytes(strategy);
-        payload.writeBytes(strategyBytes);
-
-        payload.writeIntLE(count.intValue());
-
-        payload.writeByte(autoCommit ? 1 : 0);
-
-        // Send async request and transform response
-        CompletableFuture<ByteBuf> sent = sendPoll(payload, autoCommit);
+        CompletableFuture<ByteBuf> sent =
+                sendPoll(encodePoll(streamId, topicId, partitionId, consumer, strategy, count, autoCommit), autoCommit);
         CompletableFuture<PolledMessages> result = sent.thenApply(response -> {
             try {
                 return BytesDeserializer.readPolledMessages(response);
@@ -293,14 +433,11 @@ public class MessagesTcpClient implements MessagesClient {
      * re-sync after the coordinator rejects a stale assignment, then one
      * retry; an exhausted budget is an empty poll, not an error.
      */
-    @SuppressWarnings("checkstyle:ParameterNumber")
     private CompletableFuture<PolledMessages> pollGroupMessages(
             StreamId streamId,
             TopicId topicId,
             Consumer consumer,
-            PollingStrategy strategy,
-            Long count,
-            boolean autoCommit,
+            LongFunction<CompletableFuture<PolledMessages>> pollPartition,
             int attemptsLeft,
             PollCancellation cancellation) {
         if (cancellation.isCancelled()) {
@@ -328,22 +465,14 @@ public class MessagesTcpClient implements MessagesClient {
                         Optional.empty(),
                         Optional.empty()));
             }
-            CompletableFuture<PolledMessages> polledPartition = pollPartition(
-                    streamId, topicId, Optional.of(partitionId.getAsLong()), consumer, strategy, count, autoCommit);
+            CompletableFuture<PolledMessages> polledPartition = pollPartition.apply(partitionId.getAsLong());
             cancellation.track(polledPartition);
             return polledPartition
                     .thenCompose(polled -> {
                         if (polled.messages().isEmpty() && polled.partitionId() == RESYNC_REQUIRED_PARTITION_SENTINEL) {
                             routingState.invalidateAssignment(groupKey);
                             return pollGroupMessages(
-                                    streamId,
-                                    topicId,
-                                    consumer,
-                                    strategy,
-                                    count,
-                                    autoCommit,
-                                    attemptsLeft - 1,
-                                    cancellation);
+                                    streamId, topicId, consumer, pollPartition, attemptsLeft - 1, cancellation);
                         }
                         return CompletableFuture.completedFuture(polled);
                     })
@@ -353,14 +482,7 @@ public class MessagesTcpClient implements MessagesClient {
                         }
                         routingState.invalidateAssignment(groupKey);
                         return pollGroupMessages(
-                                streamId,
-                                topicId,
-                                consumer,
-                                strategy,
-                                count,
-                                autoCommit,
-                                attemptsLeft - 1,
-                                cancellation);
+                                streamId, topicId, consumer, pollPartition, attemptsLeft - 1, cancellation);
                     });
         });
     }

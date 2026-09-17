@@ -241,6 +241,36 @@ info.getGitCommit();   // Git commit hash
 info.getUserAgent();   // User-Agent string for HTTP
 ```
 
+## Polling
+
+`pollMessages` returns whatever the server already holds. An empty topic answers
+at once, so the caller has to poll again.
+
+`pollMessagesDeferred` lets the server hold the request instead. It waits up to
+`maxWait` for `minCount` messages, caps the encoded response at `maxBytes`, and
+bounds the whole call by `requestTimeout`.
+
+```java
+import org.apache.iggy.message.DeferredPollOptions;
+
+// Defaults: 1 s wait, 1 message, 1 MiB, 11 s budget.
+var options = DeferredPollOptions.defaults()
+    .withMaxWait(Duration.ofSeconds(5))
+    .withMinCount(10);
+
+var polled = client.messages().pollMessagesDeferred(
+    streamId, topicId, Optional.of(0L), Consumer.of(1L),
+    PollingStrategy.next(), 100L, false, options);
+```
+
+If the readiness wait expires, the server still answers, with a partial batch or
+an empty one. If the request timeout expires, the call fails.
+
+A deferred poll runs on a connection of its own, so a held request never delays
+other traffic. The TCP client must come from `Iggy.tcpClientBuilder()`, because a
+client built directly on a single connection rejects the call. The HTTP client
+accepts a plain consumer only, because its poll query carries no consumer kind.
+
 ## Exception Handling
 
 The SDK's custom exception types inherit from `IggyException`. Joining a failed future can wrap the cause in `CompletionException`; the HTTP client's `close()` method declares `IOException`. Handle those boundaries as well as specific SDK errors.
