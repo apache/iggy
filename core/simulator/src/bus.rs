@@ -27,7 +27,7 @@ use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn,
-    SendError,
+    SendError, SharedTlsServerConfig,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
@@ -366,6 +366,26 @@ impl ConnectionInstaller for SharedSimOutbox {
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: ws client install is unreachable");
+    }
+
+    fn install_client_tcp_tls_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _on_request: RequestHandler,
+    ) {
+        panic!("simulator has no fd transfer: tcp tls client install is unreachable");
+    }
+
+    fn install_client_wss_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _on_request: RequestHandler,
+    ) {
+        panic!("simulator has no fd transfer: wss client install is unreachable");
     }
 
     // Real, unlike the fd installs above: dispatch reads client_meta to seed

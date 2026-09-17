@@ -130,12 +130,11 @@ where
     })
 }
 
-/// Build the shard's one client-request handler: per-client FIFO queues
-/// drained one task per client, and the bus connection-lost hook that
-/// logs a dropped connection out. Every transport on the shard must
-/// share the instance (shard 0 hands it to its local QUIC, TCP-TLS and
-/// WSS listeners as well), or a client's ordering guarantee and the
-/// disconnect hook split by transport.
+/// Build the shard's client-request handler with per-client FIFO queues
+/// and a connection-lost hook. All connections installed on this shard
+/// share it to preserve ordering and disconnect cleanup across transports.
+/// The destination shard supplies it for delegated TCP/WS/TCP-TLS/WSS
+/// connections; shard 0 also supplies it for local QUIC connections.
 pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
