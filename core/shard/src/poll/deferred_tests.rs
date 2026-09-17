@@ -416,3 +416,13 @@ async fn read_crossing_readiness_deadline_finishes_within_request_budget() {
         );
     }
 }
+
+#[compio::test]
+async fn poll_admission_is_independent_of_resident_journal_size() {
+    // 1.5 MiB resident, one message polled: the read budget bounds the reply,
+    // not how much the partition holds.
+    let payload = "x".repeat(768 * 1024);
+    let owner = owner(&[payload.as_str(); 2]).await;
+    let replies = submit(&owner, request(&owner, 1, false, false)).await;
+    assert_eq!(offsets(&replies), [0]);
+}

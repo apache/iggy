@@ -554,21 +554,13 @@ where
         };
         // Snapshot, disk selection and index loading can coexist.
         let max_bytes = reservation.bytes / READ_BUDGET_PARTS;
-        let plan = match self.plane.partitions().build_bounded_poll_snapshot(
+        let Some(plan) = self.plane.partitions().build_poll_snapshot(
             &waiter.namespace,
             waiter.request.consumer,
             &waiter.request.args,
-            max_bytes,
-        ) {
-            Ok(Some(plan)) => plan,
-            Ok(None) => {
-                self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
-                return;
-            }
-            Err(error) => {
-                self.reject_deferred_poll(id, &waiter, error);
-                return;
-            }
+        ) else {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
         };
         waiter.last_visibility = Some(visibility);
         if plan.needs_off_pump_io() {
