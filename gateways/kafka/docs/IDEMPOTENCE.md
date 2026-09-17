@@ -50,14 +50,26 @@ request v0 to v5 and response v0 to v6, flexible from v2.
 InitProducerId with no `transactional_id`:
 
 - allocate the next producer id, return it with epoch 0 and error code 0
-- draw ids from a counter seeded per gateway instance, so two instances never hand out the same
-  id. Nothing reads the id today. Seeding it now is what stops a later deduplication layer from
-  being born broken
+- build the id from an instance number in the high 16 bits and a counter in the low 47 bits,
+  leaving bit 63 clear. `producer_id` is an `i64` and `-1` means no producer id, so the value has
+  to stay non-negative. That leaves room for 65536 instances holding 140 trillion ids each
+
+The instance number comes from configuration (`IGGY_KAFKA_INSTANCE_ID`, default 0), not from a
+draw at startup. A random 16-bit number collides with even odds at around 300 instances. That is
+a birthday collision, not a remote one. Nothing reads the id today. Fixing the layout now is what
+stops a later deduplication layer from being born broken.
 
 InitProducerId with a `transactional_id`:
 
 - answer `UNSUPPORTED_VERSION` (35), unchanged. Transactions stay out of scope, and so do
   AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26) and TxnOffsetCommit (28)
+
+35 rather than `INVALID_REQUEST` (42), because of the same fatal set quoted above.
+`maybeTransitionToErrorState` holds ClusterAuthorization, TransactionalIdAuthorization,
+ProducerFenced, UnsupportedVersion and InvalidPidMapping. `INVALID_REQUEST` is not in it, so a
+transactional producer moves to an abortable error instead, and the application is told to abort
+and retry something that can never succeed. `COORDINATOR_NOT_AVAILABLE` (15) is worse again. It
+is retriable, so the producer never stops trying.
 
 Produce:
 

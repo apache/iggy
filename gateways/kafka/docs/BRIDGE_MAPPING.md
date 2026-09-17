@@ -38,7 +38,7 @@ Produce, per record:
 | record value | `payload` |
 | record key | `kafka.key` user header, `Raw` |
 | record header `name` | `kafka.h.<name>` user header, `Raw` |
-| record timestamp (CreateTime) | `origin_timestamp` |
+| record timestamp (CreateTime), milliseconds | `origin_timestamp`, microseconds |
 | record offset | partition offset, assigned by Iggy |
 | partition index | partition index, both 0-based |
 | topic | stream and topic per `TopicMapping` |
@@ -49,13 +49,32 @@ encodes as a Kafka record with a null key, its Iggy user headers as Kafka header
 when the origin timestamp is zero). Iggy header kinds other than `Raw` and `String` are emitted
 as their raw value bytes.
 
+### Timestamps
+
+Kafka carries a record timestamp in milliseconds. Iggy carries `origin_timestamp` in
+microseconds (`core/common/src/types/message/iggy_message.rs:191`). Produce multiplies by 1000.
+Fetch divides by 1000 and truncates toward zero.
+
+A record that arrived through Produce survives the round trip exactly, because its microsecond
+value is always a whole number of milliseconds. A message an Iggy client wrote does not. Its
+sub-millisecond digits are lost on the way out, and Kafka has no field to keep them in.
+
+Kafka sends `-1` for a record with no timestamp. That is stored as `0`, and Fetch already reads
+a zero origin timestamp as an instruction to use the server-assigned timestamp instead. A real
+broker does the same thing under `LogAppendTime`, so the two agree.
+
 ## Records Iggy cannot hold natively
 
 Iggy rejects an empty payload (`core/common/src/types/message/iggy_message.rs:169`), caps a
 user header value at 255 bytes (`core/common/src/types/message/user_headers.rs:631`), keys
-headers in a `BTreeMap` so a name cannot repeat, and caps all user headers of a message at
-100 KB (`MAX_USER_HEADERS_SIZE`). Kafka allows all of the shapes those rules exclude, so two
-mechanisms cover them.
+headers in a `BTreeMap` so a name cannot repeat, and caps all user headers of one message at
+100 KB (`MAX_USER_HEADERS_SIZE`, `iggy_message.rs:58`). Kafka allows all of the shapes those
+rules exclude, so two mechanisms cover them.
+
+None of those four numbers is a gateway setting. They are fixed constants on the server's
+message type, with no configuration knob and no recorded rationale. The header budget works out
+to roughly 350 headers at the 255-byte value cap, so in practice the key-length rule below is
+what sends a record into the fallback and the budget is not.
 
 ### Null and empty values
 
@@ -77,9 +96,32 @@ A record takes the fallback when any of these hold:
 - two headers share a name
 - the headers together would exceed the 100 KB user-header budget
 
-Such a record is stored with a `kafka.envelope` header carrying the format version, and the
-Kafka record body (key, value, headers) verbatim in the payload. Fetch checks for that header
-first and takes the plain path only when it is absent.
+Such a record is stored with a `kafka.envelope` header whose value is one byte, the format
+version, currently `1`. The payload holds the key, the value and the headers in the layout
+below. Fetch checks for that header first and takes the plain path only when it is absent.
+
+The layout is fixed here rather than left to the implementation, because `kafka_protocol` hands
+a handler a decoded `Record` and never a raw slice of the record, so there is no verbatim body
+to copy. All integers are little-endian.
+
+```text
+u8   flags           bit 0 key present, bit 1 value present
+u32  key_len         0 when the key is absent
+..   key
+u32  value_len       0 when the value is absent
+..   value
+u32  header_count
+     repeated header_count times:
+       u32  name_len
+       ..   name
+       u8   value_present
+       u32  value_len   0 when the header value is absent
+       ..   value
+```
+
+That is 13 bytes of fixed overhead plus 9 bytes per header. Re-encoding the record as a
+one-record Kafka batch would also work and would cost less code, but it puts batch framing back
+into storage, which is the thing this document decided against.
 
 The cost is that these messages are opaque to Iggy consumers and connectors. That is the point
 of confining the fallback to record shapes that are rare in practice, rather than making it the
@@ -107,6 +149,18 @@ what Produce accepts, so this section holds under either answer.
 Produce decompresses gzip, snappy, lz4 and zstd batches, which means turning those features back
 on for the `kafka-protocol` dependency (`Cargo.toml:217` currently builds it with
 `default-features = false, features = ["broker"]`). Fetch emits uncompressed batches.
+
+Decompression needs its own bound. `max_frame_size` bounds the frame a client sent, which is the
+compressed size, and zstd reaches 1000 to 1 on repetitive input without being asked, so an 8 MiB
+frame can expand to gigabytes. Produce therefore decompresses through a reader capped at
+`max_frame_size`, so a compressed batch can never yield more than the same client could have sent
+uncompressed, and rejects a batch that passes the cap with `MESSAGE_TOO_LARGE` (10) before it
+allocates the output. Each decompressed record value has to clear Iggy's own `MAX_PAYLOAD_SIZE`
+(64 MB, `iggy_message.rs:44`) separately, since one record becomes one message.
+
+Nothing decompresses today. The record batch stays an opaque `Bytes` on both paths, so the bound
+above is a requirement on [#3535](https://github.com/apache/iggy/issues/3535) rather than a
+description of current behavior.
 
 ## Offsets
 

@@ -72,6 +72,20 @@ Converting on write instead, and storing the Kafka offset minus one, breaks at o
 makes an empty commit look the same as a commit of the first record. Storing verbatim is the
 smaller problem.
 
+### A commit of -1
+
+Kafka does not validate the sign of a committed offset. `OffsetMetadataManager` checks the
+metadata length and nothing else, so a real broker stores `-1` and hands it back on the next
+OffsetFetch, where a consumer reads it as no committed offset.
+
+Iggy cannot store that value, because `store_consumer_offset` takes a `u64`. A commit of `-1`
+therefore calls `delete_consumer_offset` on the key. What a client can observe is the same: the
+next OffsetFetch finds nothing and the gateway answers `-1`.
+
+Deleting a key that is not there returns `ConsumerOffsetNotFound` (3021). On this path that
+counts as success, because the client asked for the offset to be absent and it is absent. Any
+other negative offset is rejected with `OFFSET_OUT_OF_RANGE` (1).
+
 ## OffsetFetch with no topics named
 
 OffsetFetch v2 and later let a client pass a null topic list, which asks for every offset the
@@ -103,6 +117,11 @@ code exists.
 
 Consumer groups and plain consumers count against separate limits, so Kafka groups do not
 compete with native Iggy consumers for the same 4096.
+
+A client cannot act on that error, so the operator has to. `partition.consumer_offsets_max` is
+named in the gateway README for that reason, and a handler that hits the limit logs the Iggy
+error at `error!` level, which is what `bridge/error.rs` already asks handlers to do wherever the
+Kafka code it sends is less specific than the Iggy error it received.
 
 An Iggy name is capped at 255 bytes (`core/common/src/lib.rs:168`), which leaves 246 for a Kafka
 group id after the prefix. A longer group id is rejected with `INVALID_GROUP_ID` (24).
