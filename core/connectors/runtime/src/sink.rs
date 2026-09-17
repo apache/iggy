@@ -28,8 +28,7 @@ use crate::{
 use dlopen2::wrapper::Container;
 use futures::StreamExt;
 use iggy::prelude::{
-    AutoCommit, AutoCommitWhen, IggyClient, IggyConsumer, IggyDuration, IggyMessage,
-    PollingStrategy,
+    AutoCommit, AutoCommitWhen, IggyClient, IggyConsumer, IggyMessage, PollingStrategy,
 };
 use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
@@ -38,7 +37,6 @@ use iggy_connector_sdk::{
 };
 use std::{
     collections::HashMap,
-    str::FromStr,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -501,12 +499,12 @@ pub(crate) async fn setup_sink_consumers(
 
     let mut consumers = Vec::new();
     for stream in config.streams.iter() {
-        let poll_interval = IggyDuration::from_str(
-            stream.poll_interval.as_deref().unwrap_or("5ms"),
-        )
-        .map_err(|error| {
-            RuntimeError::InvalidConfiguration(format!("Invalid poll interval: {error}"))
-        })?;
+        if stream.poll_interval.is_some() {
+            warn!(
+                "Sink connector: {key}, stream: {} configures deprecated poll_interval; the consumer now uses long polling",
+                stream.stream
+            );
+        }
         let default_consumer_group = format!("iggy-connect-sink-{key}");
         let consumer_group = stream
             .consumer_group
@@ -520,7 +518,6 @@ pub(crate) async fn setup_sink_consumers(
                 .create_consumer_group_if_not_exists()
                 .auto_join_consumer_group()
                 .polling_strategy(PollingStrategy::next())
-                .poll_interval(poll_interval)
                 .batch_length(batch_length)
                 .build();
             consumer.init().await?;

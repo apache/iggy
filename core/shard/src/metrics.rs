@@ -202,6 +202,63 @@ const fn consumer_kind_index(kind: ConsumerKind) -> usize {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DeferredPollMetrics {
+    pub pending: Gauge,
+    pub inflight_bytes: Gauge,
+    pub rejected: Counter,
+    pub failed: Counter,
+    pub cancelled: Counter,
+    pub expired: Counter,
+    pub filled: Counter,
+    pub late: Counter,
+}
+
+impl DeferredPollMetrics {
+    fn register(&self, registry: &mut Registry) {
+        registry.register(
+            "deferred_poll_pending",
+            "pending deferred polls",
+            self.pending.clone(),
+        );
+        registry.register(
+            "deferred_poll_inflight_bytes",
+            "reserved bytes for running or queued deferred reads",
+            self.inflight_bytes.clone(),
+        );
+        registry.register(
+            "deferred_poll_rejected",
+            "deferred polls rejected before admission",
+            self.rejected.clone(),
+        );
+        registry.register(
+            "deferred_poll_failed",
+            "admitted deferred polls rejected by a read error or fence",
+            self.failed.clone(),
+        );
+        registry.register(
+            "deferred_poll_cancelled",
+            "deferred polls cancelled by their caller",
+            self.cancelled.clone(),
+        );
+        registry.register(
+            "deferred_poll_expired",
+            "deferred polls completed at their deadline",
+            self.expired.clone(),
+        );
+        registry.register(
+            "deferred_poll_filled",
+            "deferred polls that filled their requested count",
+            self.filled.clone(),
+        );
+        registry.register(
+            "deferred_poll_late",
+            "deferred read completions discarded after expiry or cancellation",
+            self.late.clone(),
+        );
+    }
+}
+
 /// Per-shard metric handles.
 ///
 /// Cheap to clone (`Arc` of a `Family` under the hood). Each shard owns
@@ -220,6 +277,7 @@ const fn consumer_kind_index(kind: ConsumerKind) -> usize {
 /// resolved at scrape time via the per-shard registry, not as a label.
 #[derive(Clone)]
 pub struct ShardMetrics {
+    pub(crate) deferred_polls: DeferredPollMetrics,
     partition_wal_disk_bytes: Gauge,
     partition_wal_retained_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
@@ -291,6 +349,7 @@ impl ShardMetrics {
             .clone();
         let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
+            deferred_polls: DeferredPollMetrics::default(),
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
@@ -768,6 +827,7 @@ impl ShardMetrics {
     /// counters.
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        self.deferred_polls.register(registry);
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",

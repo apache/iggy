@@ -24,6 +24,7 @@ mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
+pub use poll::deferred::{DeferredPollContext, DeferredPollRequest, PollQuotaIdentity};
 pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
@@ -333,6 +334,7 @@ const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::fr
 #[derive(Debug)]
 pub enum PartitionRead {
     Primary,
+    DeferredPoll(Box<DeferredPollRequest>),
     PollOnPrimary {
         consumer: PollingConsumer,
         args: PollingArgs,
@@ -1488,6 +1490,7 @@ where
     /// Disk reads reserve this lane before I/O so ordinary frames cannot
     /// displace their results. Only the owner pump validates completions.
     poll_completions: poll::completion::PollCompletionLane,
+    deferred_polls: poll::deferred::DeferredPolls,
 
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
@@ -1792,6 +1795,7 @@ where
             inbox,
             reply_inbox,
             poll_completions,
+            deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
             shards_table,
             partition_consensus,
             coordinator,
@@ -2045,8 +2049,29 @@ where
     pub async fn partition_read(
         &self,
         namespace: IggyNamespace,
-        read: PartitionRead,
+        mut read: PartitionRead,
     ) -> Option<PartitionReadReply> {
+        let timeout = if let PartitionRead::DeferredPoll(request) = &mut read {
+            let Some(deadline) = self
+                .bus
+                .monotonic_micros()
+                .checked_add(request.options.max_wait.as_micros())
+            else {
+                return Some(PartitionReadReply::Rejected(IggyError::InvalidCommand));
+            };
+            request.deadline = deadline;
+            let Some(request_deadline) = self
+                .bus
+                .monotonic_micros()
+                .checked_add(request.options.request_timeout.as_micros())
+            else {
+                return Some(PartitionReadReply::Rejected(IggyError::InvalidCommand));
+            };
+            request.request_deadline = request_deadline;
+            request.options.request_timeout.get_duration()
+        } else {
+            PARTITION_READ_TIMEOUT
+        };
         let Some(target) = self.shards_table.shard_for(namespace) else {
             tracing::warn!(
                 shard = self.id,
@@ -2078,7 +2103,7 @@ where
                 IggyError::TransientNotAccepted,
             ));
         }
-        match bus_timeout(&self.bus, PARTITION_READ_TIMEOUT, reply_rx.recv()).await {
+        match bus_timeout(&self.bus, timeout, reply_rx.recv()).await {
             Some(Ok(reply)) => Some(reply),
             Some(Err(_)) => {
                 tracing::warn!(
@@ -2288,6 +2313,7 @@ where
             shard_count: 1,
             inbox,
             reply_inbox,
+            deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
             poll_completions: poll::completion::PollCompletionLane::new(
                 POLL_COMPLETION_CAPACITY,
                 &metrics,

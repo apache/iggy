@@ -43,7 +43,7 @@ use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireDecode};
 use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
@@ -58,7 +58,10 @@ use partitions::{PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
-use shard::{ConsumerAttachment, PartitionRead, PartitionReadReply};
+use shard::{
+    ConsumerAttachment, DeferredPollContext, DeferredPollRequest, PartitionRead,
+    PartitionReadReply, PollQuotaIdentity,
+};
 use std::rc::Rc;
 use tracing::{debug, warn};
 
@@ -519,6 +522,95 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     .await;
 }
 
+pub(super) fn resolve_deferred_poll<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    wire: &DeferredPollMessagesRequest,
+    context: (u128, SessionAttachment, u32, bool),
+) -> Result<(IggyNamespace, u32, PartitionRead), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let (consumer_client_id, session, user_id, primary) = context;
+    shard.validate_deferred_poll(wire.poll.count, wire.into())?;
+    if let Some(status) = authorize_partition_read(
+        shard,
+        &wire.poll.stream_id,
+        &wire.poll.topic_id,
+        Some(user_id),
+        |permissioner, user_id, stream_id, topic_id| {
+            permissioner.poll_messages(user_id, stream_id, topic_id)
+        },
+    ) {
+        return Err(IggyError::from_code(status));
+    }
+    let (namespace, partition_id, consumer, args) =
+        resolve_poll_request(shard, &wire.poll, consumer_client_id)?;
+    let group_id = match consumer {
+        PollingConsumer::ConsumerGroup(group, _) => Some(group as u64),
+        PollingConsumer::Consumer(..) => None,
+    };
+    let metadata = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace, group_id, consumer_client_id)
+        .ok_or(IggyError::TransientNotAccepted)?;
+    let request = DeferredPollRequest::new(
+        consumer,
+        args,
+        DeferredPollContext {
+            session: Some(session),
+            metadata,
+            user_id,
+            quota: PollQuotaIdentity::Session(consumer_client_id),
+            primary,
+        },
+        wire.into(),
+    );
+    Ok((
+        namespace,
+        partition_id,
+        PartitionRead::DeferredPoll(Box::new(request)),
+    ))
+}
+
+#[allow(clippy::future_not_send)]
+pub(super) async fn read_deferred_poll<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: &Message<RoutedRequestHeader>,
+    (namespace, partition_id, read): (IggyNamespace, u32, PartitionRead),
+) -> Result<BusMessage, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    match shard.partition_read(namespace, read).await {
+        Some(PartitionReadReply::Poll {
+            fragments,
+            current_offset,
+        }) => build_polled_messages_reply(
+            request.header(),
+            current_metadata_commit(shard),
+            partition_id,
+            current_offset,
+            fragments,
+            shard.plane.partitions().config().encryptor.as_deref(),
+        )
+        .map_err(|_| IggyError::CannotReadMessage),
+        Some(PartitionReadReply::Rejected(error)) => Err(error),
+        Some(PartitionReadReply::NotFound) => Err(IggyError::TransientNotAccepted),
+        _ => Err(IggyError::ShardCommunicationError),
+    }
+}
+
 /// Run the resolved poll on the owning shard and re-encode the stored
 /// batches into the wire `PolledMessages` reply. Owner rejections preserve
 /// their error; a missing reply reports a communication error without claiming
@@ -622,7 +714,7 @@ enum ReadPolledMessagesError {
 /// 16-byte empty poll for `partition_id`, riding the re-sync sentinel
 /// channel when the id is the sentinel and the empty-frame channel
 /// otherwise.
-fn empty_poll_fallback(partition_id: u32) -> (Bytes, FrameChannel) {
+pub(super) fn empty_poll_fallback(partition_id: u32) -> (Bytes, FrameChannel) {
     let channel = if partition_id == RESYNC_REQUIRED_PARTITION_SENTINEL {
         FrameChannel::ResyncSentinel
     } else {

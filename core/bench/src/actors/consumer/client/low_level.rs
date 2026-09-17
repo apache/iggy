@@ -74,7 +74,7 @@ impl ConsumerClient for LowLevelConsumerClient {
         };
         let before_poll = Instant::now();
         let polled = client
-            .poll_messages_with_strategy_for(
+            .poll_messages_with_strategy_for_and_options(
                 &self.stream_id,
                 &self.topic_id,
                 self.partition_id,
@@ -82,6 +82,7 @@ impl ConsumerClient for LowLevelConsumerClient {
                 &strategy_for,
                 messages_to_receive,
                 self.auto_commit,
+                Some(self.config.poll_options),
             )
             .await;
 

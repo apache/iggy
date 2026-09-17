@@ -173,7 +173,6 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     .consumer("consumer_name", "stream_name", "topic_name", 1)?
 ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
 ///     .polling_strategy(PollingStrategy::next())
-///     .poll_interval(IggyDuration::ONE_SECOND)
 ///     .batch_length(1000)
 ///     .build();
 /// consumer.init().await?;
@@ -625,7 +624,6 @@ impl IggyClient {
     ///     .consumer("consumer_name", "stream_name", "topic_name", 1)? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -655,7 +653,6 @@ impl IggyClient {
             topic.try_into()?,
             Some(partition),
             self.encryptor.clone(),
-            None,
         ))
     }
 
@@ -697,7 +694,6 @@ impl IggyClient {
     ///     .consumer_group("group_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -726,7 +722,6 @@ impl IggyClient {
             topic.try_into()?,
             None,
             self.encryptor.clone(),
-            None,
         ))
     }
 

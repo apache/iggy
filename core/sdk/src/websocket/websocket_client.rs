@@ -145,6 +145,17 @@ impl BinaryTransport for WebSocketClient {
     ) -> Result<Bytes, IggyError> {
         self.poll_router.poll(self, request).await
     }
+
+    async fn send_poll_with_response_and_options(
+        &self,
+        request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        options: Option<iggy_common::DeferredPollOptions>,
+    ) -> Result<Bytes, IggyError> {
+        match options {
+            Some(options) => self.poll_router.poll_deferred(self, request, options).await,
+            None => self.poll_router.poll(self, request).await,
+        }
+    }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
     }
@@ -492,6 +503,33 @@ impl BinaryClient for WebSocketClient {}
 #[async_trait]
 impl PollTransport for WebSocketClient {
     const PROTOCOL: TransportProtocol = TransportProtocol::WebSocket;
+
+    async fn local_poll_session(
+        &self,
+    ) -> Result<
+        (
+            String,
+            iggy_binary_protocol::requests::system::AttachConsumerSessionRequest,
+        ),
+        IggyError,
+    > {
+        let endpoint = self.current_server_address.lock().await.clone();
+        let session = self
+            .consensus_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok((
+            endpoint,
+            iggy_binary_protocol::requests::system::AttachConsumerSessionRequest {
+                client_id: session.client_id(),
+                session: session.session().ok_or(IggyError::Unauthenticated)?,
+                metadata_watermark: self
+                    .poll_router
+                    .metadata_watermark
+                    .load(std::sync::atomic::Ordering::Acquire),
+            },
+        ))
+    }
 
     async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
         let mut config = (*self.config).clone();
@@ -1094,11 +1132,23 @@ impl WebSocketClient {
         let stream = self.stream.clone();
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
+        let deferred_timeout = crate::poll_routing::deferred_exchange_timeout(code, &payload)?;
+        let response_limit = crate::poll_routing::deferred_response_limit(code, &payload)?;
         // The spawned task owns the lockstep exchange to completion. Cancelling
         // the caller after a partial WebSocket frame or response header must
         // not release the stream lock while leaving that connection reusable.
-        tokio::spawn(async move {
-            let mut stream_guard = stream.lock().await;
+        let task = tokio::spawn(async move {
+            let mut held_stream = stream.lock().await;
+            let mut disposable = if deferred_timeout.is_zero() {
+                None
+            } else {
+                held_stream.take()
+            };
+            let stream_guard = if deferred_timeout.is_zero() {
+                &mut *held_stream
+            } else {
+                &mut disposable
+            };
             if stream_guard.is_none() {
                 trace!("Cannot send data. Client is not connected.");
                 return Err(IggyError::NotConnected);
@@ -1122,7 +1172,8 @@ impl WebSocketClient {
                 request.len()
             );
             // One deadline bounds the whole request including transient replays.
-            let retry_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+            let retry_deadline =
+                tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT + deferred_timeout;
             // `TransientNotAccepted` gets a short same-connection window only:
             // past it the refusal is a verdict about who leads, not load, and
             // the caller runs a leader recheck or roster walk. Login/register
@@ -1160,6 +1211,7 @@ impl WebSocketClient {
 
                     let response_size = crate::vsr::response_size(&response_header)?;
                     let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                    if body_size > response_limit { return Err(IggyError::InvalidSizeBytes); }
                     let body = if body_size > 0 {
                         let mut body = vec![0u8; body_size];
                         let body_read =
@@ -1209,10 +1261,13 @@ impl WebSocketClient {
             if !frame_complete {
                 stream_guard.take();
             }
+            if !deferred_timeout.is_zero() && frame_complete {
+                *held_stream = disposable;
+            }
             outcome
-        })
-        .await
-        .map_err(|error| {
+        });
+        let _cancellation = crate::poll_routing::DeferredExchangeTask::new(deferred_timeout, &task);
+        task.await.map_err(|error| {
             error!("Task execution failed during {NAME} request: {error}");
             IggyError::WebSocketSendError
         })?

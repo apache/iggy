@@ -19,6 +19,7 @@
 //! defaults read from the embedded `core/server/config.toml`.
 
 use iggy_common::IggyDuration;
+use iggy_common::MAX_DEFERRED_POLL_WAIT_US;
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
@@ -101,6 +102,11 @@ pub struct ShardingConfig {
     /// rejects new disk polls before I/O. Main and reply inbox traffic uses
     /// separate capacity. This counts operations, not retained message bytes.
     pub poll_completion_capacity: usize,
+    pub deferred_poll_max_wait_us: u64,
+    pub deferred_poll_max_pending: usize,
+    pub deferred_poll_max_pending_per_session: usize,
+    pub deferred_poll_max_read_bytes: usize,
+    pub deferred_poll_max_inflight_bytes: usize,
     /// Wall-clock budget for a single shard's bus drain on shutdown.
     /// Drives `IggyMessageBus::shutdown(..)` from the per-shard watchdog
     /// and the parallel-join survivor path. Sized larger than typical
@@ -149,6 +155,18 @@ impl Default for ShardingConfig {
             inbox_capacity: SERVER_CONFIG.sharding.inbox_capacity as usize,
             reply_inbox_capacity: SERVER_CONFIG.sharding.reply_inbox_capacity as usize,
             poll_completion_capacity: SERVER_CONFIG.sharding.poll_completion_capacity as usize,
+            deferred_poll_max_wait_us: SERVER_CONFIG.sharding.deferred_poll_max_wait_us as u64,
+            deferred_poll_max_pending: SERVER_CONFIG.sharding.deferred_poll_max_pending as usize,
+            deferred_poll_max_pending_per_session: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_pending_per_session
+                as usize,
+            deferred_poll_max_read_bytes: SERVER_CONFIG.sharding.deferred_poll_max_read_bytes
+                as usize,
+            deferred_poll_max_inflight_bytes: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_inflight_bytes
+                as usize,
             shutdown_drain_timeout: SERVER_CONFIG
                 .sharding
                 .shutdown_drain_timeout
@@ -220,6 +238,21 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                  cap (each shard preallocates a completion lane of this size)",
                 self.poll_completion_capacity, INBOX_CAPACITY_MAX
             );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        const MAX_DEFERRED_BYTES: usize = 1024 * 1024 * 1024;
+        if self.deferred_poll_max_wait_us == 0
+            || self.deferred_poll_max_wait_us > MAX_DEFERRED_POLL_WAIT_US
+            || self.deferred_poll_max_pending == 0
+            || self.deferred_poll_max_pending > INBOX_CAPACITY_MAX
+            || self.deferred_poll_max_pending_per_session == 0
+            || self.deferred_poll_max_pending_per_session > self.deferred_poll_max_pending
+            || self.deferred_poll_max_read_bytes == 0
+            || self.deferred_poll_max_read_bytes > self.deferred_poll_max_inflight_bytes
+            || self.deferred_poll_max_inflight_bytes > MAX_DEFERRED_BYTES
+        {
+            eprintln!("Invalid sharding configuration: inconsistent deferred poll limits");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 

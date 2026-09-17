@@ -90,7 +90,11 @@ use compio_quic::{
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
-use iggy_binary_protocol::{Command, HEADER_SIZE, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::codes::{
+    POLL_MESSAGES_DEFERRED_CODE, POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE,
+};
+use iggy_binary_protocol::requests::messages::DeferredPollMessagesRequest;
+use iggy_binary_protocol::{Command, HEADER_SIZE, ReplyHeader, RequestHeader, WireDecode};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -436,6 +440,25 @@ impl TransportConn for QuicTransportConn {
                 .and_then(|bytes| bytemuck::checked::try_from_bytes::<RequestHeader>(bytes).ok())
                 .map(|header| header.request);
 
+            let deferred_wait =
+                bytemuck::checked::try_from_bytes::<RequestHeader>(&req.as_slice()[..HEADER_SIZE])
+                    .ok()
+                    .and_then(|header| {
+                        let code = u32::from_le_bytes(
+                            header.reserved[..size_of::<u32>()].try_into().ok()?,
+                        );
+                        if !matches!(
+                            code,
+                            POLL_MESSAGES_DEFERRED_CODE | POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE
+                        ) {
+                            return None;
+                        }
+                        DeferredPollMessagesRequest::decode_from(&req.as_slice()[HEADER_SIZE..])
+                            .ok()
+                            .map(|request| Duration::from_micros(request.request_timeout_us))
+                    })
+                    .unwrap_or_default();
+
             if in_tx.send(req).await.is_err() {
                 debug!(%label, %peer, "quic: inbound queue dropped");
                 break;
@@ -455,10 +478,20 @@ impl TransportConn for QuicTransportConn {
             let mut matched: Option<BusMessage> = None;
             let mut connection_gone = false;
             {
-                let mut reply_deadline =
-                    std::pin::pin!(compio::time::sleep(REPLY_WAIT_BACKSTOP).fuse());
+                let mut reply_deadline = std::pin::pin!(
+                    compio::time::sleep(REPLY_WAIT_BACKSTOP.saturating_add(deferred_wait)).fuse()
+                );
                 loop {
                     futures::select! {
+                        _ = async {
+                            if deferred_wait.is_zero() {
+                                std::future::pending::<()>().await;
+                            }
+                            send.stopped().await
+                        }.fuse() => {
+                            connection_gone = true;
+                            break;
+                        }
                         () = shutdown_fut.as_mut() => {
                             debug!(%label, %peer, "quic: shutdown during reply wait");
                             connection_gone = true;
@@ -494,7 +527,7 @@ impl TransportConn for QuicTransportConn {
             if connection_gone {
                 break;
             }
-            let Some(first) = matched else {
+            let Some(mut first) = matched else {
                 // Unreachable in practice: every no-reply path above sets
                 // `connection_gone`. Close the send half defensively.
                 if let Err(e) = send.finish() {
@@ -507,6 +540,7 @@ impl TransportConn for QuicTransportConn {
             // quinn-proto flushes pending data + a FIN, signalling the SDK
             // that the reply is complete.
             let mut write_failed = false;
+            let write_receipt = first.take_write_receipt();
             for fragment in first.into_fragments() {
                 let BufResult(result, _frozen) = send.write_all(fragment).await;
                 if let Err(e) = result {
@@ -520,6 +554,8 @@ impl TransportConn for QuicTransportConn {
             }
             if let Err(e) = send.finish() {
                 debug!(%label, %peer, error = ?e, "quic: send.finish() failed");
+            } else if let Some(receipt) = write_receipt {
+                receipt.complete();
             }
             // (send, recv) drop here -> stream fully closed.
         }

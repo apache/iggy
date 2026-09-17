@@ -56,6 +56,22 @@ pub trait BinaryTransport {
         self.send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
             .await
     }
+    /// Positive waits require an isolated, bounded connection lease.
+    async fn send_poll_with_response_and_options(
+        &self,
+        request: &PollMessagesRequest,
+        options: Option<crate::DeferredPollOptions>,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        if options.is_none() {
+            self.send_poll_with_response(request).await
+        } else {
+            Err(IggyError::FeatureUnavailable)
+        }
+    }
+
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve

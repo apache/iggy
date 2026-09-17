@@ -3328,6 +3328,7 @@ where
         // registered handle must keep reading the same cells.
         let end = next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
+        self.publish_poll_visibility();
         self.dirty_offset.store(end, Ordering::Relaxed);
         self.set_offset_space_used(next_offset > 0);
         self.recovered_durable_offset = installed_end;
@@ -3637,6 +3638,7 @@ where
         // claim goes back to None; the partition is honestly lagging.
         let end = minted_next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
+        self.publish_poll_visibility();
         self.dirty_offset.store(end, Ordering::Relaxed);
         self.set_offset_space_used(minted_next_offset > 0);
         self.recovered_durable_offset = None;

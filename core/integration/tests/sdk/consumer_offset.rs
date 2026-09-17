@@ -143,7 +143,7 @@ async fn given_standalone_stream_consumer_when_creating_topic_should_select_part
             .create_topic_if_not_exists(true)
             .partitions_count(partitions_count)
             .maybe_partition_id(partition_id)
-            .polling_interval("1ms".parse().unwrap())
+            .poll_options(iggy::prelude::DeferredPollOptions::default())
             .polling_strategy(PollingStrategy::first())
             .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
             .init_retries(0)

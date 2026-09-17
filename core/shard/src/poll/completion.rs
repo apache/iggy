@@ -37,7 +37,7 @@ use iggy_common::IggyError;
 use partitions::PollReadResult;
 use server_common::sharding::IggyNamespace;
 
-use super::{ConsumerAttachment, PollCompleted};
+use super::{ConsumerAttachment, PollCompleted, PollTarget};
 use crate::coordinator::classify_try_send_err;
 use crate::metrics::{FrameDropMetrics, ShardMetrics, frame_drop_reason, frame_drop_variant};
 use crate::{PartitionReadReply, Receiver, Sender, channel};
@@ -79,29 +79,56 @@ impl PollCompletionLane {
         reply: Sender<PartitionReadReply>,
         attachment: Option<ConsumerAttachment>,
     ) -> Option<PollCompletionSender> {
+        let slot = match self.reserve_slot() {
+            Ok(slot) => slot,
+            Err(reason) => {
+                reject(&reply, &self.state.metrics, reason);
+                return None;
+            }
+        };
+        Some(PollCompletionSender {
+            inbox: self.sender.clone(),
+            slot,
+            namespace,
+            target: PollTarget::Immediate { reply, attachment },
+        })
+    }
+
+    pub(crate) fn try_reserve_deferred(
+        &self,
+        namespace: IggyNamespace,
+        request_id: u64,
+        reservation: super::deferred::ReadReservation,
+    ) -> Result<PollCompletionSender, IggyError> {
+        let slot = self.reserve_slot().map_err(|reason| {
+            self.state
+                .metrics
+                .record(frame_drop_variant::PARTITION_POLL_COMPLETION, reason);
+            IggyError::TransientNotAccepted
+        })?;
+        Ok(PollCompletionSender {
+            inbox: self.sender.clone(),
+            slot,
+            namespace,
+            target: PollTarget::Deferred {
+                request_id,
+                _reservation: reservation,
+            },
+        })
+    }
+
+    fn reserve_slot(&self) -> Result<CompletionSlot, &'static str> {
         if self.state.closed.load(Ordering::Relaxed) || self.sender.is_disconnected() {
-            reject(&reply, &self.state.metrics, frame_drop_reason::DISCONNECTED);
-            return None;
+            return Err(frame_drop_reason::DISCONNECTED);
         }
-        if self
-            .state
+        self.state
             .reserved
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 (reserved < self.state.capacity).then_some(reserved + 1)
             })
-            .is_err()
-        {
-            reject(&reply, &self.state.metrics, frame_drop_reason::FULL);
-            return None;
-        }
-        Some(PollCompletionSender {
-            inbox: self.sender.clone(),
-            slot: CompletionSlot {
-                state: self.state.clone(),
-            },
-            namespace,
-            reply,
-            attachment,
+            .map_err(|_| frame_drop_reason::FULL)?;
+        Ok(CompletionSlot {
+            state: self.state.clone(),
         })
     }
 
@@ -153,8 +180,7 @@ pub struct PollCompletionSender {
     inbox: Sender<QueuedCompletion>,
     slot: CompletionSlot,
     namespace: IggyNamespace,
-    reply: Sender<PartitionReadReply>,
-    attachment: Option<ConsumerAttachment>,
+    target: PollTarget,
 }
 
 impl PollCompletionSender {
@@ -163,8 +189,8 @@ impl PollCompletionSender {
     /// owner rejects the result and releases the reservation.
     pub(crate) fn complete(self, result: PollReadResult) {
         if self.slot.state.closed.load(Ordering::Relaxed) || self.inbox.is_disconnected() {
-            reject(
-                &self.reply,
+            reject_target(
+                &self.target,
                 &self.slot.state.metrics,
                 frame_drop_reason::DISCONNECTED,
             );
@@ -174,8 +200,7 @@ impl PollCompletionSender {
             result: Box::new(PollCompleted {
                 namespace: self.namespace,
                 result,
-                reply: self.reply,
-                attachment: self.attachment,
+                target: self.target,
                 #[cfg(feature = "poll-diagnostics")]
                 queued_at: Some(std::time::Instant::now()),
             }),
@@ -190,8 +215,8 @@ impl PollCompletionSender {
                 }
                 TrySendError::Disconnected(completion) => completion,
             };
-            reject(
-                &completion.result.reply,
+            reject_target(
+                &completion.result.target,
                 &completion.slot.state.metrics,
                 reason,
             );
@@ -224,6 +249,15 @@ pub(super) fn reject(
     let _ = reply.try_send(PartitionReadReply::Rejected(
         IggyError::TransientNotAccepted,
     ));
+}
+
+fn reject_target(target: &PollTarget, metrics: &FrameDropMetrics, reason: &'static str) {
+    match target {
+        PollTarget::Immediate { reply, .. } => reject(reply, metrics, reason),
+        PollTarget::Deferred { .. } => {
+            metrics.record(frame_drop_variant::PARTITION_POLL_COMPLETION, reason);
+        }
+    }
 }
 
 struct LaneState {

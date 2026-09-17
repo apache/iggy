@@ -141,7 +141,6 @@ pub async fn run_consumer(harness: &mut TestHarness) {
         .expect("Failed to create consumer builder")
         .polling_strategy(PollingStrategy::next())
         .batch_length(10)
-        .poll_interval(IggyDuration::from_str("100ms").unwrap())
         .polling_retry_interval(NonZeroIggyDuration::from_str("500ms").unwrap())
         .build();
 

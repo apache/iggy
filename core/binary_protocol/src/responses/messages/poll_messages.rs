@@ -30,7 +30,7 @@ use crate::error::WireError;
 use bytes::{BufMut, BytesMut};
 
 /// Size of the `PollMessages` response header: `partition_id(4) + current_offset(8) + count(4)`.
-const POLL_RESPONSE_HEADER_SIZE: usize = 16;
+pub const POLL_RESPONSE_HEADER_SIZE: usize = 16;
 
 /// The 16-byte metadata prefix of a `PollMessages` response.
 ///

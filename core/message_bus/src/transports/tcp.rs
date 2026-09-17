@@ -247,6 +247,7 @@ async fn writer_loop(
     let mut iovecs: Vec<Frozen<MESSAGE_ALIGN>> = Vec::with_capacity(max_batch);
     // Sized by the first wide batch; most connections never need it.
     let mut scratch: Vec<Frozen<MESSAGE_ALIGN>> = Vec::new();
+    let mut write_receipts = Vec::new();
     let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
 
     loop {
@@ -278,7 +279,8 @@ async fn writer_loop(
 
         // `drain(..)` keeps the batch allocation for the next round.
         #[allow(clippy::iter_with_drain)]
-        for frame in batch.drain(..) {
+        for mut frame in batch.drain(..) {
+            write_receipts.extend(frame.take_write_receipt());
             iovecs.extend(frame.into_fragments());
         }
         let result = write_iovecs(&mut write_half, &mut iovecs, &mut scratch).await;
@@ -292,6 +294,10 @@ async fn writer_loop(
                 "tcp writer: writev failed, dropping batch"
             );
             return;
+        }
+        #[allow(clippy::iter_with_drain)]
+        for receipt in write_receipts.drain(..) {
+            receipt.complete();
         }
     }
 }

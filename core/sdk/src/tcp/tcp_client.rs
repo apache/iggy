@@ -205,6 +205,17 @@ impl BinaryTransport for TcpClient {
     ) -> Result<Bytes, IggyError> {
         self.poll_router.poll(self, request).await
     }
+
+    async fn send_poll_with_response_and_options(
+        &self,
+        request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        options: Option<iggy_common::DeferredPollOptions>,
+    ) -> Result<Bytes, IggyError> {
+        match options {
+            Some(options) => self.poll_router.poll_deferred(self, request, options).await,
+            None => self.poll_router.poll(self, request).await,
+        }
+    }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
     }
@@ -493,6 +504,33 @@ impl BinaryClient for TcpClient {}
 impl PollTransport for TcpClient {
     const PROTOCOL: TransportProtocol = TransportProtocol::Tcp;
 
+    async fn local_poll_session(
+        &self,
+    ) -> Result<
+        (
+            String,
+            iggy_binary_protocol::requests::system::AttachConsumerSessionRequest,
+        ),
+        IggyError,
+    > {
+        let endpoint = self.current_server_address.lock().await.clone();
+        let session = self
+            .consensus_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok((
+            endpoint,
+            iggy_binary_protocol::requests::system::AttachConsumerSessionRequest {
+                client_id: session.client_id(),
+                session: session.session().ok_or(IggyError::Unauthenticated)?,
+                metadata_watermark: self
+                    .poll_router
+                    .metadata_watermark
+                    .load(std::sync::atomic::Ordering::Acquire),
+            },
+        ))
+    }
+
     async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
         let mut config = (*self.config).clone();
         config.server_address = endpoint.to_owned();
@@ -508,9 +546,17 @@ impl PollTransport for TcpClient {
     }
 
     async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        let wait = crate::poll_routing::deferred_exchange_timeout(code, &payload)?;
         let now = tokio::time::Instant::now();
         let (_, result) = self
-            .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT, false)
+            .send_raw_vsr_attempt(
+                code,
+                payload,
+                None,
+                now,
+                now + RESPONSE_READ_TIMEOUT + wait,
+                false,
+            )
             .await;
         if matches!(result, Err(IggyError::Disconnected | IggyError::TcpError)) {
             self.set_state(ClientState::Disconnected).await;
@@ -1505,12 +1551,31 @@ impl TcpClient {
         Option<iggy_binary_protocol::consensus::RequestHeader>,
         Result<Bytes, IggyError>,
     ) {
+        let deferred_timeout = match crate::poll_routing::deferred_exchange_timeout(code, &payload)
+        {
+            Ok(wait) => wait,
+            Err(error) => return (None, Err(error)),
+        };
+        let response_limit = match crate::poll_routing::deferred_response_limit(code, &payload) {
+            Ok(limit) => limit,
+            Err(error) => return (None, Err(error)),
+        };
         let stream = self.stream.clone();
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
-        let joined = tokio::spawn(async move {
-            let mut stream_guard = stream.lock().await;
+        let task = tokio::spawn(async move {
+            let mut held_stream = stream.lock().await;
+            let mut disposable = if deferred_timeout.is_zero() {
+                None
+            } else {
+                held_stream.take()
+            };
+            let stream_guard = if deferred_timeout.is_zero() {
+                &mut *held_stream
+            } else {
+                &mut disposable
+            };
             let Some(stream) = stream_guard.as_mut() else {
                 error!("Cannot send data. Client is not connected.");
                 return (None, Err(IggyError::NotConnected));
@@ -1589,6 +1654,7 @@ impl TcpClient {
 
                     let response_size = crate::vsr::response_size(&response_header)?;
                     let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                    if body_size > response_limit { return Err(IggyError::InvalidSizeBytes); }
                     let body = if body_size > 0 {
                         let mut body = BytesMut::with_capacity(body_size);
                         let body_read = tokio::time::timeout_at(
@@ -1652,9 +1718,13 @@ impl TcpClient {
             if !frame_complete {
                 stream_guard.take();
             }
+            if !deferred_timeout.is_zero() && frame_complete {
+                *held_stream = disposable;
+            }
             (Some(request_header), outcome)
-        })
-        .await;
+        });
+        let _cancellation = crate::poll_routing::DeferredExchangeTask::new(deferred_timeout, &task);
+        let joined = task.await;
         match joined {
             Ok(result) => result,
             Err(e) => {

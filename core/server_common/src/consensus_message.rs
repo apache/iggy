@@ -18,6 +18,7 @@
 use crate::iobuf::{Frozen, Owned};
 use crate::sharding::METADATA_GROUP;
 use aligned_vec::{AVec, ConstAlign};
+use futures::channel::oneshot;
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
@@ -29,6 +30,7 @@ use iggy_binary_protocol::{
     prepare_identity_checksum_bytes,
 };
 use smallvec::SmallVec;
+use std::sync::{Arc, Mutex};
 use std::{
     marker::PhantomData,
     mem::{offset_of, size_of},
@@ -86,12 +88,41 @@ pub struct RequestBacking {
 #[derive(Debug, Clone)]
 pub struct ResponseBacking {
     fragments: ResponseFragments,
+    write_receipt: Option<WriteReceipt>,
+}
+
+/// Completed by the transport only after the whole frame is written and flushed.
+/// Dropping every copy without completion cancels the observer.
+#[derive(Debug, Clone)]
+pub struct WriteReceipt(Arc<Mutex<Option<oneshot::Sender<()>>>>);
+
+impl WriteReceipt {
+    pub fn complete(self) {
+        if let Some(sender) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
 }
 
 impl RequestBackingKind for RequestBacking {}
 impl ResponseBackingKind for ResponseBacking {}
 
 impl ResponseBacking {
+    pub fn track_write(&mut self) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.write_receipt = Some(WriteReceipt(Arc::new(Mutex::new(Some(sender)))));
+        receiver
+    }
+
+    pub fn take_write_receipt(&mut self) -> Option<WriteReceipt> {
+        self.write_receipt.take()
+    }
+
     /// The fragment carrying the frame header.
     #[must_use]
     pub fn first(&self) -> &Frozen<MESSAGE_ALIGN> {
@@ -138,6 +169,7 @@ impl From<Frozen<MESSAGE_ALIGN>> for ResponseBacking {
     fn from(frozen: Frozen<MESSAGE_ALIGN>) -> Self {
         Self {
             fragments: smallvec::smallvec![frozen],
+            write_receipt: None,
         }
     }
 }
@@ -606,7 +638,12 @@ where
             });
         }
 
-        Ok(unsafe { Self::from_backing_unchecked(ResponseBacking { fragments }) })
+        Ok(unsafe {
+            Self::from_backing_unchecked(ResponseBacking {
+                fragments,
+                write_receipt: None,
+            })
+        })
     }
 }
 

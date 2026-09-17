@@ -17,7 +17,7 @@
 
 use crate::WireError;
 use crate::WireIdentifier;
-use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le};
+use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
 use crate::primitives::consumer::WireConsumer;
 use crate::primitives::polling_strategy::WirePollingStrategy;
 use bytes::{BufMut, BytesMut};
@@ -48,6 +48,10 @@ const PARTITION_VALUE_SIZE: usize = 4;
 const STRATEGY_SIZE: usize = 9;
 const COUNT_SIZE: usize = 4;
 const AUTO_COMMIT_SIZE: usize = 1;
+
+/// Finite protocol ceiling; servers may configure a lower admission limit.
+pub const MAX_DEFERRED_POLL_WAIT_US: u64 = 600_000_000;
+pub const MAX_DEFERRED_POLL_TIMEOUT_US: u64 = MAX_DEFERRED_POLL_WAIT_US + 30_000_000;
 
 impl WireEncode for PollMessagesRequest {
     fn encoded_size(&self) -> usize {
@@ -116,6 +120,70 @@ impl WireDecode for PollMessagesRequest {
                 auto_commit,
             },
             pos,
+        ))
+    }
+}
+
+/// Readiness-based polling with explicit message and response-byte limits.
+/// New command codes prevent older servers from silently ignoring the wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredPollMessagesRequest {
+    pub poll: PollMessagesRequest,
+    pub wait_us: u64,
+    pub min_count: u32,
+    pub max_bytes: u32,
+    pub request_timeout_us: u64,
+}
+
+impl WireEncode for DeferredPollMessagesRequest {
+    fn encoded_size(&self) -> usize {
+        self.poll.encoded_size() + 2 * size_of::<u64>() + 2 * size_of::<u32>()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        self.poll.encode(buf);
+        buf.put_u64_le(self.wait_us);
+        buf.put_u32_le(self.min_count);
+        buf.put_u32_le(self.max_bytes);
+        buf.put_u64_le(self.request_timeout_us);
+    }
+}
+
+impl WireDecode for DeferredPollMessagesRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let (poll, consumed) = PollMessagesRequest::decode(buf)?;
+        if buf.len() - consumed != 2 * size_of::<u64>() + 2 * size_of::<u32>() {
+            return Err(WireError::Validation(
+                "deferred poll requires wait, minimum count, byte limit and request timeout".into(),
+            ));
+        }
+        let wait_us = read_u64_le(buf, consumed)?;
+        let min_count = read_u32_le(buf, consumed + size_of::<u64>())?;
+        let max_bytes = read_u32_le(buf, consumed + size_of::<u64>() + size_of::<u32>())?;
+        let request_timeout_us =
+            read_u64_le(buf, consumed + size_of::<u64>() + 2 * size_of::<u32>())?;
+        if wait_us > MAX_DEFERRED_POLL_WAIT_US
+            || min_count == 0
+            || min_count > poll.count
+            || request_timeout_us == 0
+            || request_timeout_us < wait_us
+            || request_timeout_us > MAX_DEFERRED_POLL_TIMEOUT_US
+            || (max_bytes as usize)
+                < crate::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE
+        {
+            return Err(WireError::Validation(
+                "invalid deferred poll wait, message counts or byte limit".into(),
+            ));
+        }
+        Ok((
+            Self {
+                poll,
+                wait_us,
+                min_count,
+                max_bytes,
+                request_timeout_us,
+            },
+            buf.len(),
         ))
     }
 }
@@ -214,6 +282,83 @@ mod tests {
             assert!(
                 PollMessagesRequest::decode(&bytes[..i]).is_err(),
                 "expected error for truncation at byte {i}"
+            );
+        }
+    }
+    #[test]
+    fn deferred_preserves_legacy_prefix_and_validates_limits() {
+        let request = DeferredPollMessagesRequest {
+            poll: PollMessagesRequest {
+                consumer: WireConsumer::consumer_group(WireIdentifier::named("group").unwrap()),
+                stream_id: WireIdentifier::named("stream").unwrap(),
+                topic_id: WireIdentifier::numeric(2),
+                partition_id: Some(3),
+                strategy: WirePollingStrategy::offset(42),
+                count: 5,
+                auto_commit: true,
+            },
+            wait_us: MAX_DEFERRED_POLL_WAIT_US,
+            min_count: 1,
+            max_bytes: 1024,
+            request_timeout_us: MAX_DEFERRED_POLL_TIMEOUT_US,
+        };
+        for wait_us in [0, 1, MAX_DEFERRED_POLL_WAIT_US] {
+            let request = DeferredPollMessagesRequest {
+                wait_us,
+                ..request.clone()
+            };
+            let bytes = request.to_bytes();
+            let prefix = request.poll.to_bytes();
+            assert_eq!(&bytes[..prefix.len()], prefix.as_ref());
+            assert_eq!(bytes.len(), prefix.len() + 24);
+            assert_eq!(
+                &bytes[prefix.len()..prefix.len() + 8],
+                &wait_us.to_le_bytes()
+            );
+            assert_eq!(
+                DeferredPollMessagesRequest::decode(&bytes).unwrap(),
+                (request, bytes.len())
+            );
+            for end in 0..bytes.len() {
+                assert!(DeferredPollMessagesRequest::decode(&bytes[..end]).is_err());
+            }
+            let mut extra = bytes.to_vec();
+            extra.push(0);
+            assert!(DeferredPollMessagesRequest::decode(&extra).is_err());
+        }
+        for invalid in [
+            DeferredPollMessagesRequest {
+                wait_us: MAX_DEFERRED_POLL_WAIT_US + 1,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                min_count: 0,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                min_count: 6,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                max_bytes: 15,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                request_timeout_us: 0,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                request_timeout_us: MAX_DEFERRED_POLL_WAIT_US - 1,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                request_timeout_us: MAX_DEFERRED_POLL_TIMEOUT_US + 1,
+                ..request
+            },
+        ] {
+            assert!(
+                DeferredPollMessagesRequest::decode(&invalid.to_bytes()).is_err(),
+                "accepted {invalid:?}"
             );
         }
     }

@@ -28,8 +28,11 @@ use iggy_binary_protocol::codes::{
     ATTACH_CONSUMER_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
     GET_POLL_ROUTING_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
 };
+use iggy_binary_protocol::codes::{
+    POLL_MESSAGES_DEFERRED_CODE, POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE,
+};
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
@@ -42,15 +45,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::error;
 
 const MAX_CACHED_ROUTES: usize = 4096;
 const MAX_DATA_CONNECTIONS: usize = 256;
+pub(crate) const MAX_DEFERRED_CONNECTIONS: usize = 16;
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
-const ROUTING_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const ROUTING_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const ROUTING_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const ROUTING_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const ROSTER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) const fn is_poll_routing_code(code: u32) -> bool {
@@ -59,6 +63,8 @@ pub(crate) const fn is_poll_routing_code(code: u32) -> bool {
         ATTACH_CONSUMER_SESSION_CODE
             | GET_POLL_ROUTING_CODE
             | POLL_MESSAGES_ON_PRIMARY_CODE
+            | POLL_MESSAGES_DEFERRED_CODE
+            | POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE
             | GET_CONSUMER_OFFSET_ROUTING_CODE
     )
 }
@@ -68,6 +74,12 @@ pub(crate) trait PollTransport: BinaryClient + Send + Sync + Sized {
     const PROTOCOL: TransportProtocol;
 
     async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError>;
+
+    async fn local_poll_session(
+        &self,
+    ) -> Result<(String, AttachConsumerSessionRequest), IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 
     /// One exchange on this connection, with no node movement or automatic
     /// replay of an ambiguous outcome, including replicated offset writes.
@@ -108,6 +120,8 @@ pub(crate) struct PollRouter<T> {
     session_generation: AtomicU64,
     routes: Mutex<HashMap<RouteKey, Arc<PollRoute>>>,
     connections: Mutex<HashMap<String, ConnectionSlot<T>>>,
+    deferred_connections: Mutex<Vec<(String, ConnectionSlot<T>)>>,
+    deferred_leases: Semaphore,
     credentials: Mutex<Option<(Credentials, u32)>>,
     next_heartbeat: Mutex<Option<Instant>>,
 }
@@ -120,6 +134,8 @@ impl<T> Default for PollRouter<T> {
             session_generation: AtomicU64::new(0),
             routes: Mutex::default(),
             connections: Mutex::default(),
+            deferred_connections: Mutex::default(),
+            deferred_leases: Semaphore::new(MAX_DEFERRED_CONNECTIONS),
             credentials: Mutex::default(),
             next_heartbeat: Mutex::default(),
         }
@@ -144,6 +160,10 @@ impl<T> PollRouter<T> {
         self.session_generation.fetch_add(1, Ordering::AcqRel);
         routes.clear();
         connections.clear();
+        self.deferred_connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     pub(crate) fn remember_credentials(&self, credentials: Credentials, user_id: u32) {
@@ -254,6 +274,234 @@ impl<T: PollTransport> PollRouter<T> {
                 .store(metadata.nodes.len(), Ordering::Release);
         }
         Ok(self.roster_size.load(Ordering::Acquire) > 1)
+    }
+
+    pub(crate) async fn poll_deferred(
+        &self,
+        coordinator: &T,
+        request: &PollMessagesRequest,
+        options: iggy_common::DeferredPollOptions,
+    ) -> Result<Bytes, IggyError> {
+        options.validate(request.count)?;
+        let started = Instant::now();
+        let deadline = started + options.request_timeout.get_duration();
+        let wait_deadline = started + options.max_wait.get_duration();
+        let operation = async {
+            let primary = request.auto_commit && self.is_clustered(coordinator).await?;
+            let payload = request.to_bytes();
+            let prefix_len = request.consumer.encoded_size()
+                + request.stream_id.encoded_size()
+                + request.topic_id.encoded_size()
+                + size_of::<u8>()
+                + size_of::<u32>();
+            let key = (GET_POLL_ROUTING_CODE, payload.slice(..prefix_len));
+            let mut retry_interval = ROUTING_RETRY_INTERVAL;
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(IggyError::TransientNotAccepted);
+                }
+                let result = self
+                    .deferred_attempt(
+                        coordinator,
+                        request,
+                        primary,
+                        &key,
+                        &payload,
+                        deadline,
+                        wait_deadline,
+                        options,
+                    )
+                    .await;
+                if !matches!(result, Err(IggyError::TransientNotAccepted)) {
+                    return result;
+                }
+                self.routes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+                if Instant::now() + retry_interval >= deadline {
+                    return result;
+                }
+                sleep(retry_interval).await;
+                retry_interval = (retry_interval * 2).min(ROUTING_RETRY_MAX_INTERVAL);
+            }
+        };
+        tokio::select! {
+            result = timeout_at(deadline, operation) => result.unwrap_or(Err(IggyError::TransientNotCommitted)),
+            _ = self.maintain_poll_parent(coordinator) => Err(IggyError::TransientNotCommitted),
+        }
+    }
+
+    async fn maintain_poll_parent(&self, coordinator: &T) {
+        let interval = coordinator.get_heartbeat_interval().get_duration();
+        loop {
+            sleep((interval / 2).max(Duration::from_nanos(1))).await;
+            let now = Instant::now();
+            let due = {
+                let mut next = self
+                    .next_heartbeat
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if next.is_none_or(|next| now >= next) {
+                    *next = Some(now + interval);
+                    true
+                } else {
+                    false
+                }
+            };
+            if due
+                && coordinator
+                    .send_poll_control(PING_CODE, Bytes::new())
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn deferred_attempt(
+        &self,
+        coordinator: &T,
+        request: &PollMessagesRequest,
+        primary: bool,
+        key: &RouteKey,
+        payload: &Bytes,
+        deadline: Instant,
+        wait_deadline: Instant,
+        options: iggy_common::DeferredPollOptions,
+    ) -> Result<Bytes, IggyError> {
+        let route = if primary {
+            self.route(coordinator, key, payload).await?
+        } else {
+            let generation = self.session_generation.load(Ordering::Acquire);
+            let (endpoint, consumer_session) = coordinator.local_poll_session().await?;
+            Arc::new(PollRoute {
+                generation,
+                endpoint,
+                consumer_session,
+            })
+        };
+        let _permit = timeout_at(deadline, self.deferred_leases.acquire())
+            .await
+            .map_err(|_| IggyError::TransientNotAccepted)?
+            .map_err(|_| IggyError::ClientShutdown)?;
+        let mut lease = DeferredLease(self.lease_deferred_connection(&route)?);
+        if lease
+            .0
+            .as_ref()
+            .is_some_and(|connection| !connection.usable)
+        {
+            lease.0.take();
+        }
+        if lease.0.is_none() {
+            let client = timeout_at(deadline, coordinator.connect_poll_client(&route.endpoint))
+                .await
+                .map_err(|_| IggyError::TransientNotAccepted)?
+                .map_err(unaccepted_data_error)?;
+            self.validate_route(&route)?;
+            *lease.0 = Some(PollConnection {
+                client,
+                consumer_session: None,
+                usable: true,
+            });
+        }
+        let connection = lease.0.as_mut().ok_or(IggyError::NotConnected)?;
+        connection.usable = false;
+        if connection.consumer_session != Some(route.consumer_session) {
+            timeout_at(
+                deadline,
+                connection.client.send_poll_request(
+                    ATTACH_CONSUMER_SESSION_CODE,
+                    route.consumer_session.to_bytes(),
+                ),
+            )
+            .await
+            .map_err(|_| IggyError::TransientNotAccepted)?
+            .map_err(unaccepted_data_error)?;
+            connection.consumer_session = Some(route.consumer_session);
+        }
+        self.validate_route(&route)?;
+        let now = Instant::now();
+        let wait_us = u64::try_from(wait_deadline.saturating_duration_since(now).as_micros())
+            .map_err(|_| IggyError::InvalidCommand)?;
+        let request_timeout_us = u64::try_from(deadline.saturating_duration_since(now).as_micros())
+            .map_err(|_| IggyError::InvalidCommand)?;
+        if request_timeout_us == 0 {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        let code = if primary {
+            POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE
+        } else {
+            POLL_MESSAGES_DEFERRED_CODE
+        };
+        let wire = DeferredPollMessagesRequest {
+            poll: request.clone(),
+            wait_us,
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            request_timeout_us,
+        };
+        let result = connection
+            .client
+            .send_poll_request(code, wire.to_bytes())
+            .await;
+        connection.usable = !result.as_ref().is_err_and(poll_connection_failed);
+        if result
+            .as_ref()
+            .is_ok_and(|bytes| bytes.len() > options.max_bytes as usize)
+        {
+            connection.usable = false;
+            return Err(IggyError::InvalidSizeBytes);
+        }
+        if route.generation != self.session_generation.load(Ordering::Acquire) {
+            return Err(IggyError::StaleClient);
+        }
+        if matches!(result, Err(IggyError::TransientNotAccepted)) {
+            connection.consumer_session = None;
+        }
+        result.map_err(|error| {
+            if poll_connection_failed(&error) {
+                IggyError::TransientNotCommitted
+            } else {
+                error
+            }
+        })
+    }
+
+    fn lease_deferred_connection(
+        &self,
+        route: &PollRoute,
+    ) -> Result<OwnedMutexGuard<Option<PollConnection<T>>>, IggyError> {
+        let mut pool = self
+            .deferred_connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.validate_route(route)?;
+        for (endpoint, slot) in pool.iter() {
+            if endpoint == &route.endpoint
+                && let Ok(guard) = Arc::clone(slot).try_lock_owned()
+            {
+                return Ok(guard);
+            }
+        }
+        if pool.len() < MAX_DEFERRED_CONNECTIONS {
+            let slot = Arc::new(AsyncMutex::new(None));
+            let guard = Arc::clone(&slot)
+                .try_lock_owned()
+                .map_err(|_| IggyError::TransientNotAccepted)?;
+            pool.push((route.endpoint.clone(), slot));
+            return Ok(guard);
+        }
+        for (endpoint, slot) in pool.iter_mut() {
+            if let Ok(mut guard) = Arc::clone(slot).try_lock_owned() {
+                guard.take();
+                *endpoint = route.endpoint.clone();
+                return Ok(guard);
+            }
+        }
+        Err(IggyError::TransientNotAccepted)
     }
 
     async fn send_routed(
@@ -510,6 +758,60 @@ fn unaccepted_data_error(error: IggyError) -> IggyError {
     }
 }
 
+struct DeferredLease<T>(OwnedMutexGuard<Option<PollConnection<T>>>);
+
+impl<T> Drop for DeferredLease<T> {
+    fn drop(&mut self) {
+        if self.0.as_ref().is_some_and(|connection| !connection.usable) {
+            self.0.take();
+        }
+    }
+}
+
+pub(crate) fn deferred_response_limit(code: u32, payload: &[u8]) -> Result<usize, IggyError> {
+    if matches!(
+        code,
+        POLL_MESSAGES_DEFERRED_CODE | POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE
+    ) {
+        let request = DeferredPollMessagesRequest::decode_from(payload)
+            .map_err(|_| IggyError::InvalidCommand)?;
+        Ok(request.max_bytes as usize)
+    } else {
+        Ok(usize::MAX)
+    }
+}
+
+pub(crate) fn deferred_exchange_timeout(code: u32, payload: &[u8]) -> Result<Duration, IggyError> {
+    if matches!(
+        code,
+        POLL_MESSAGES_DEFERRED_CODE | POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE
+    ) {
+        let request = DeferredPollMessagesRequest::decode_from(payload)
+            .map_err(|_| IggyError::InvalidCommand)?;
+        Ok(Duration::from_micros(request.request_timeout_us))
+    } else {
+        Ok(Duration::ZERO)
+    }
+}
+
+/// Deferred exchanges own a disposable socket. Cancelling them must also
+/// cancel the detached reader so a parked owner request sees disconnection.
+pub(crate) struct DeferredExchangeTask(Option<tokio::task::AbortHandle>);
+
+impl DeferredExchangeTask {
+    pub(crate) fn new<T>(wait: Duration, task: &tokio::task::JoinHandle<T>) -> Self {
+        Self((!wait.is_zero()).then(|| task.abort_handle()))
+    }
+}
+
+impl Drop for DeferredExchangeTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +861,7 @@ mod tests {
         exchanges: Mutex<VecDeque<Exchange>>,
         route_queries: AtomicUsize,
         attachments: Mutex<Vec<AttachConsumerSessionRequest>>,
+        deferred_waits: Mutex<Vec<u64>>,
         connections: AtomicUsize,
         pause: Mutex<Option<Arc<Pause>>>,
     }
@@ -606,6 +909,16 @@ mod tests {
                 GET_POLL_ROUTING_CODE | GET_CONSUMER_OFFSET_ROUTING_CODE
             ) {
                 self.script.route_queries.fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(
+                code,
+                POLL_MESSAGES_DEFERRED_CODE | POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE
+            ) {
+                self.script.deferred_waits.lock().unwrap().push(
+                    DeferredPollMessagesRequest::decode_from(payload)
+                        .unwrap()
+                        .wait_us,
+                );
             }
             if code == ATTACH_CONSUMER_SESSION_CODE {
                 self.script
@@ -675,6 +988,18 @@ mod tests {
     #[async_trait]
     impl PollTransport for Transport {
         const PROTOCOL: TransportProtocol = TransportProtocol::Tcp;
+        async fn local_poll_session(
+            &self,
+        ) -> Result<(String, AttachConsumerSessionRequest), IggyError> {
+            Ok((
+                "127.0.0.1:8090".to_string(),
+                AttachConsumerSessionRequest {
+                    client_id: 7,
+                    session: 1,
+                    metadata_watermark: 1,
+                },
+            ))
+        }
         async fn connect_poll_client(&self, _endpoint: &str) -> Result<Self, IggyError> {
             self.script.connections.fetch_add(1, Ordering::Relaxed);
             self.script.pause_at(PausePoint::Connect).await;
@@ -1231,6 +1556,187 @@ mod tests {
             _ => panic!("unexpected routed command: {code}"),
         };
         router.write_offset(coordinator, code, payload).await
+    }
+
+    #[tokio::test]
+    async fn deferred_manual_polls_lease_separate_connections_and_leave_control_available() {
+        let (router, coordinator, mut request) = fixture([
+            (
+                Channel::Data,
+                ATTACH_CONSUMER_SESSION_CODE,
+                Ok(Bytes::new()),
+            ),
+            (
+                Channel::Data,
+                POLL_MESSAGES_DEFERRED_CODE,
+                Ok(Bytes::from_static(b"first")),
+            ),
+            (Channel::Coordinator, PING_CODE, Ok(Bytes::new())),
+            (
+                Channel::Data,
+                ATTACH_CONSUMER_SESSION_CODE,
+                Ok(Bytes::new()),
+            ),
+            (
+                Channel::Data,
+                POLL_MESSAGES_DEFERRED_CODE,
+                Ok(Bytes::from_static(b"second")),
+            ),
+        ]);
+        request.auto_commit = false;
+        let pause = Arc::new(Pause {
+            point: PausePoint::Reply(POLL_MESSAGES_DEFERRED_CODE),
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        *coordinator.script.pause.lock().unwrap() = Some(Arc::clone(&pause));
+        let mut first = Box::pin(router.poll_deferred(
+            &coordinator,
+            &request,
+            iggy_common::DeferredPollOptions::default(),
+        ));
+        tokio::select! {
+            _ = pause.reached.notified() => {}
+            _ = &mut first => panic!("first poll must remain parked"),
+        }
+        coordinator
+            .send_poll_request(PING_CODE, Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            router
+                .poll_deferred(
+                    &coordinator,
+                    &request,
+                    iggy_common::DeferredPollOptions::default()
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"second")
+        );
+        assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 2);
+        pause.resume.notify_one();
+        assert_eq!(first.await.unwrap(), Bytes::from_static(b"first"));
+        assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_deferred_poll_discards_its_connection() {
+        let (router, coordinator, mut request) = fixture([
+            (
+                Channel::Data,
+                ATTACH_CONSUMER_SESSION_CODE,
+                Ok(Bytes::new()),
+            ),
+            (Channel::Data, POLL_MESSAGES_DEFERRED_CODE, Ok(Bytes::new())),
+            (
+                Channel::Data,
+                ATTACH_CONSUMER_SESSION_CODE,
+                Ok(Bytes::new()),
+            ),
+            (Channel::Data, POLL_MESSAGES_DEFERRED_CODE, Ok(Bytes::new())),
+        ]);
+        request.auto_commit = false;
+        let pause = Arc::new(Pause {
+            point: PausePoint::Reply(POLL_MESSAGES_DEFERRED_CODE),
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        *coordinator.script.pause.lock().unwrap() = Some(Arc::clone(&pause));
+        let mut first = Box::pin(router.poll_deferred(
+            &coordinator,
+            &request,
+            iggy_common::DeferredPollOptions::default(),
+        ));
+        tokio::select! {
+            _ = pause.reached.notified() => {}
+            _ = &mut first => panic!("first poll must remain parked"),
+        }
+        drop(first);
+        router
+            .poll_deferred(
+                &coordinator,
+                &request,
+                iggy_common::DeferredPollOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_retries_only_nonadmission_and_keeps_one_deadline() {
+        for failure in [
+            IggyError::TransientNotAccepted,
+            IggyError::CannotReadMessage,
+        ] {
+            let mut exchanges = vec![
+                (
+                    Channel::Data,
+                    ATTACH_CONSUMER_SESSION_CODE,
+                    Ok(Bytes::new()),
+                ),
+                (
+                    Channel::Data,
+                    POLL_MESSAGES_DEFERRED_CODE,
+                    Err(failure.clone()),
+                ),
+            ];
+            if matches!(failure, IggyError::TransientNotAccepted) {
+                exchanges.extend([
+                    (
+                        Channel::Data,
+                        ATTACH_CONSUMER_SESSION_CODE,
+                        Ok(Bytes::new()),
+                    ),
+                    (Channel::Data, POLL_MESSAGES_DEFERRED_CODE, Ok(Bytes::new())),
+                ]);
+            }
+            let (router, coordinator, mut request) = fixture(exchanges);
+            request.auto_commit = false;
+            let result = router
+                .poll_deferred(
+                    &coordinator,
+                    &request,
+                    iggy_common::DeferredPollOptions::default(),
+                )
+                .await;
+            let waits = coordinator.script.deferred_waits.lock().unwrap();
+            if matches!(failure, IggyError::TransientNotAccepted) {
+                assert!(result.is_ok());
+                assert_eq!(waits.len(), 2);
+                assert!(waits[1] < waits[0]);
+            } else {
+                assert!(matches!(result, Err(IggyError::CannotReadMessage)));
+                assert_eq!(waits.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_pool_is_bounded_and_lease_wait_uses_request_deadline() {
+        let (router, coordinator, mut request) = fixture([]);
+        request.auto_commit = false;
+        let _leases = router
+            .deferred_leases
+            .acquire_many(u32::try_from(MAX_DEFERRED_CONNECTIONS).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            router
+                .poll_deferred(
+                    &coordinator,
+                    &request,
+                    iggy_common::DeferredPollOptions {
+                        max_wait: 1_000.into(),
+                        request_timeout: 1_000.into(),
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 0);
     }
 
     fn fixture(

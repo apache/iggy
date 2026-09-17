@@ -219,7 +219,6 @@ async fn create_consumer(client: &IggyClient) -> IggyConsumer {
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .batch_length(10)
-        .poll_interval(IggyDuration::from_str("100ms").unwrap())
         .polling_strategy(PollingStrategy::next())
         .auto_join_consumer_group()
         .create_consumer_group_if_not_exists()

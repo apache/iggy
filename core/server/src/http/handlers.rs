@@ -117,7 +117,9 @@ use metadata::permissioner::Permissioner;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{
+    DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
+};
 
 use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
@@ -1258,6 +1260,85 @@ pub(in crate::http) async fn poll_messages(
     Query(query): Query<PollMessages>,
     Query(consistency): Query<ConsistencyQuery>,
 ) -> Result<Json<PolledMessages>, ReadError> {
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        None,
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub(in crate::http) struct DeferredPollQuery {
+    pub wait_us: u64,
+    pub min_count: u32,
+    pub max_bytes: u32,
+    pub request_timeout_us: u64,
+}
+
+impl Default for DeferredPollQuery {
+    fn default() -> Self {
+        let options = iggy_common::DeferredPollOptions::default();
+        Self {
+            wait_us: options.max_wait.as_micros(),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            request_timeout_us: options.request_timeout.as_micros(),
+        }
+    }
+}
+
+impl From<DeferredPollQuery> for iggy_common::DeferredPollOptions {
+    fn from(query: DeferredPollQuery) -> Self {
+        Self {
+            max_wait: query.wait_us.into(),
+            min_count: query.min_count,
+            max_bytes: query.max_bytes,
+            request_timeout: query.request_timeout_us.into(),
+        }
+    }
+}
+
+pub(in crate::http) async fn poll_messages_deferred(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+) -> Result<Json<PolledMessages>, ReadError> {
+    let options = iggy_common::DeferredPollOptions::from(wait);
+    state
+        .shard
+        .validate_deferred_poll(query.count, options)
+        .map_err(ReadError::Rejected)?;
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        Some(options),
+    )
+    .await
+}
+
+async fn poll_messages_impl(
+    state: HttpState,
+    identity: Identity,
+    stream_id: String,
+    topic_id: String,
+    query: PollMessages,
+    consistency: ConsistencyQuery,
+    options: Option<iggy_common::DeferredPollOptions>,
+) -> Result<Json<PolledMessages>, ReadError> {
+    let started = std::time::Instant::now();
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     SendWrapper::new(gate_local_read(
@@ -1294,12 +1375,33 @@ pub(in crate::http) async fn poll_messages(
             // as the legacy 404 body.
             Err(_) => return Err(ReadError::NotFound),
         };
-    let reply = SendWrapper::new(
-        state
+    let read = if let Some(options) = options {
+        let metadata = state
             .shard
-            .partition_read(namespace, PartitionRead::Poll { consumer, args }),
-    )
-    .await;
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .poll_metadata(namespace, None, HTTP_READ_CLIENT_ID)
+            .ok_or(ReadError::Rejected(IggyError::TransientNotAccepted))?;
+        PartitionRead::DeferredPoll(Box::new(DeferredPollRequest::new(
+            consumer,
+            args,
+            DeferredPollContext {
+                session: None,
+                metadata,
+                user_id: identity.user_id,
+                quota: PollQuotaIdentity::User(identity.user_id),
+                primary: query.auto_commit,
+            },
+            options
+                .remaining(started.elapsed())
+                .map_err(ReadError::Rejected)?,
+        )))
+    } else {
+        PartitionRead::Poll { consumer, args }
+    };
+    let reply = SendWrapper::new(state.shard.partition_read(namespace, read)).await;
     match reply {
         Some(PartitionReadReply::Poll {
             fragments,
@@ -1924,5 +2026,26 @@ mod tests {
         let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
             .expect("confirmations serialize");
         assert_eq!(json, r#"{"confirmations":[]}"#);
+    }
+    #[test]
+    fn deferred_query_uses_ordinary_numeric_fields_and_default_options() {
+        let uri = "/messages/deferred?consumer_id=0&consumer_kind=consumer&kind=offset&value=0&partition_id=0&count=2&auto_commit=false&wait_us=1000".parse().unwrap();
+        let Query(poll) = Query::<PollMessages>::try_from_uri(&uri).unwrap();
+        let Query(wait) = Query::<DeferredPollQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(poll.partition_id, Some(0));
+        assert_eq!(poll.count, 2);
+        assert_eq!(wait.wait_us, 1000);
+        let Query(defaults) = Query::<DeferredPollQuery>::try_from_uri(
+            &"/messages/deferred?count=2".parse().unwrap(),
+        )
+        .unwrap();
+        let options = iggy_common::DeferredPollOptions::default();
+        assert_eq!(defaults.wait_us, options.max_wait.as_micros());
+        assert_eq!(defaults.min_count, options.min_count);
+        assert_eq!(defaults.max_bytes, options.max_bytes);
+        assert_eq!(
+            defaults.request_timeout_us,
+            options.request_timeout.as_micros()
+        );
     }
 }

@@ -23,7 +23,6 @@ use iggy_examples::shared::messages::{
     OrderCreated, OrderRejected,
 };
 use std::error::Error;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
@@ -59,7 +58,6 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     .create_consumer_group_if_not_exists()
     .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .poll_interval(IggyDuration::from_str(&args.interval)?)
     .batch_length(args.messages_per_batch)
     .build();
 
@@ -73,16 +71,11 @@ pub async fn consume_messages(
     args: &Args,
     consumer: &mut IggyConsumer,
 ) -> Result<(), Box<dyn Error>> {
-    let interval = args.get_interval();
     let mut consumed_messages = 0;
 
     info!(
-        "Messages will be polled by consumer: {} from stream: {}, topic: {}, partition: {} with interval {}.",
-        args.consumer_id,
-        args.stream_id,
-        args.topic_id,
-        args.partition_id,
-        interval.map_or("none".to_string(), |i| i.as_human_time_string())
+        "Messages will be polled by consumer: {} from stream: {}, topic: {}, partition: {} with long polling.",
+        args.consumer_id, args.stream_id, args.topic_id, args.partition_id
     );
 
     let total_messages_to_consume = args.message_batches_limit * args.messages_per_batch as u64;

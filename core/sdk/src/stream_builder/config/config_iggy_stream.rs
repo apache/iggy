@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::prelude::{Identifier, IggyDuration, IggyError};
+use crate::prelude::{DeferredPollOptions, Identifier, IggyDuration, IggyError};
 use crate::stream_builder::{IggyConsumerConfig, IggyProducerConfig};
 use bon::Builder;
 
@@ -44,7 +44,7 @@ impl IggyStreamConfig {
     }
 
     /// Creates a new `IggyStreamConfig` from the given stream and topic names, along with the max
-    /// batch size, the send interval and the polling interval.
+    /// batch size, send interval and poll limits.
     ///
     /// # Args
     ///
@@ -52,7 +52,7 @@ impl IggyStreamConfig {
     /// * `topic` - The topic name.
     /// * `batch_length` - The max number of messages to send in a batch.
     /// * `linger_time` - The interval between messages sent.
-    /// * `polling_interval` - The interval between polling for new messages.
+    /// * `poll_options` - Readiness, response size and request timeout limits.
     ///
     /// Returns:
     /// A new `IggyStreamConfig`.
@@ -62,10 +62,10 @@ impl IggyStreamConfig {
         topic: &str,
         batch_length: u32,
         linger_time: IggyDuration,
-        polling_interval: IggyDuration,
+        poll_options: DeferredPollOptions,
     ) -> Result<Self, IggyError> {
         let consumer_config =
-            IggyConsumerConfig::from_stream_topic(stream, topic, batch_length, polling_interval)?;
+            IggyConsumerConfig::from_stream_topic(stream, topic, batch_length, poll_options)?;
 
         let producer_config =
             IggyProducerConfig::from_stream_topic(stream, topic, batch_length, linger_time)?;
@@ -114,7 +114,7 @@ mod tests {
             "test_stream",
             "test_topic",
             100,
-            IggyDuration::from_str("5ms").unwrap(),
+            DeferredPollOptions::default(),
         )
         .unwrap();
 
@@ -131,8 +131,8 @@ mod tests {
         assert_eq!(config.consumer_config().batch_length(), 100);
         assert_eq!(config.producer_config().batch_length(), 100);
         assert_eq!(
-            config.consumer_config().polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
+            config.consumer_config().poll_options(),
+            DeferredPollOptions::default()
         );
         assert_eq!(
             config.producer_config().linger_time(),
@@ -148,8 +148,8 @@ mod tests {
         assert_eq!(config.consumer_config().batch_length(), 100);
         assert_eq!(config.producer_config().batch_length(), 100);
         assert_eq!(
-            config.consumer_config().polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
+            config.consumer_config().poll_options(),
+            DeferredPollOptions::default()
         );
         assert_eq!(
             config.producer_config().linger_time(),
@@ -164,7 +164,7 @@ mod tests {
             "test_topic",
             100,
             IggyDuration::from_str("5ms").unwrap(),
-            IggyDuration::from_str("5ms").unwrap(),
+            DeferredPollOptions::default(),
         );
 
         assert!(res.is_ok());
@@ -175,8 +175,8 @@ mod tests {
         assert_eq!(config.consumer_config().batch_length(), 100);
         assert_eq!(config.producer_config().batch_length(), 100);
         assert_eq!(
-            config.consumer_config().polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
+            config.consumer_config().poll_options(),
+            DeferredPollOptions::default()
         );
         assert_eq!(
             config.producer_config().linger_time(),

@@ -303,6 +303,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
     .map_err(ServerError::ShardConstruction)?;
 
     let shard = Rc::new(built.shard);
+    shard.set_deferred_poll_config(shard::config::DeferredPollConfig {
+        max_wait_us: config.sharding.deferred_poll_max_wait_us,
+        max_pending: config.sharding.deferred_poll_max_pending,
+        max_pending_per_session: config.sharding.deferred_poll_max_pending_per_session,
+        max_read_bytes: config.sharding.deferred_poll_max_read_bytes,
+        max_inflight_bytes: config.sharding.deferred_poll_max_inflight_bytes,
+    });
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));

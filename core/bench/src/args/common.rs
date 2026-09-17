@@ -30,8 +30,8 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{
-    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize, IggyDuration, IggyExpiry,
-    TransportProtocol,
+    DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, DeferredPollOptions,
+    IggyByteSize, IggyDuration, IggyExpiry, TransportProtocol,
 };
 use std::num::NonZeroU32;
 use std::str::FromStr;
@@ -51,6 +51,22 @@ pub struct IggyBenchArgs {
     /// Number of messages per batch
     #[arg(long, short = 'P', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()))]
     pub messages_per_batch: BenchmarkNumericParameter,
+
+    /// Maximum deliberate wait for the readiness minimum.
+    #[arg(long, default_value_t = IggyDuration::ONE_SECOND)]
+    pub max_wait: IggyDuration,
+
+    /// Readiness minimum, independent of the maximum messages per batch.
+    #[arg(long, default_value_t = 1)]
+    pub min_count: u32,
+
+    /// Maximum encoded poll reply bytes, including response and batch headers.
+    #[arg(long, default_value_t = DEFAULT_POLL_MAX_BYTES)]
+    pub max_bytes: u32,
+
+    /// Overall budget for routing, readiness, I/O and response handling.
+    #[arg(long, default_value_t = DeferredPollOptions::default().request_timeout)]
+    pub request_timeout: IggyDuration,
 
     /// Number of message batches per actor (producer / consumer / producing consumer).
     /// This argument is mutually exclusive with `total_messages_size`.
@@ -116,6 +132,15 @@ pub struct IggyBenchArgs {
 }
 
 impl IggyBenchArgs {
+    pub const fn poll_options(&self) -> DeferredPollOptions {
+        DeferredPollOptions {
+            max_wait: self.max_wait,
+            min_count: self.min_count,
+            max_bytes: self.max_bytes,
+            request_timeout: self.request_timeout,
+        }
+    }
+
     pub fn transport_command(&self) -> &BenchmarkTransportCommand {
         self.benchmark_kind.transport_command()
     }
@@ -136,6 +161,11 @@ impl IggyBenchArgs {
     }
 
     pub fn validate(&mut self) {
+        if let Err(error) = self.poll_options().validate(self.messages_per_batch.min()) {
+            Self::command()
+                .error(ErrorKind::ValueValidation, error.to_string())
+                .exit();
+        }
         if self.output_dir().is_none()
             && (self.gitref().is_some()
                 || self.identifier().is_some()
@@ -409,6 +439,11 @@ impl IggyBenchArgs {
             transport.to_string(),
         ];
 
+        parts.push(format!(
+            "wait{}_min{}_bytes{}_timeout{}",
+            self.max_wait, self.min_count, self.max_bytes, self.request_timeout
+        ));
+
         if let Some(remark) = &self.remark() {
             parts.push(remark.clone());
         }
@@ -458,6 +493,11 @@ impl IggyBenchArgs {
             consumer_or_producer,
             self.message_size(),
             self.messages_per_batch(),
+        );
+
+        name = format!(
+            "{name}, wait {}, min {}, max {}B, timeout {}",
+            self.max_wait, self.min_count, self.max_bytes, self.request_timeout
         );
 
         if let Some(remark) = &self.remark() {

@@ -48,6 +48,11 @@ pub struct Fragment<const ALIGN: usize = 4096> {
 
 impl<const ALIGN: usize> Fragment<ALIGN> {
     #[must_use]
+    pub fn allocation_bytes(&self) -> usize {
+        self.source.allocation_bytes()
+    }
+
+    #[must_use]
     pub fn whole(source: Frozen<ALIGN>) -> Self {
         let end = source.len();
         Self {
@@ -108,7 +113,7 @@ pub struct PollingArgs {
 }
 
 pub type PollFragments<const ALIGN: usize = 4096> = SmallVec<[Fragment<ALIGN>; 4]>;
-pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>);
+pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>, u32);
 
 impl PollingArgs {
     #[must_use]

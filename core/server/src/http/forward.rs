@@ -83,7 +83,7 @@ use crate::http::error::{
     CustomError, error_response, gateway_timeout_response, primary_http_socket, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, resolve_credential};
-use crate::http::handlers::DURABILITY_HEADER;
+use crate::http::handlers::{DURABILITY_HEADER, DeferredPollQuery};
 use crate::http::state::{APPLIED_OP_HEADER, ForwardState, HttpInner, VIEW_HEADER};
 use crate::server_error::ServerError;
 
@@ -344,6 +344,7 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
     if request.method() == Method::GET && !wants_auto_commit(request.uri().query()) {
         return next.run(request).await;
     }
+    let deferred_deadline = deferred_poll_deadline(&request);
     let bearer = match bearer_token(request.headers()) {
         Ok(bearer) => bearer,
         Err(error) => return CustomError::from(error).into_response(),
@@ -388,7 +389,10 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
         .consensus
         .as_ref()
         .map(consensus::VsrConsensus::replica);
-    let deadline = Instant::now() + FORWARD_RETRY_DEADLINE;
+    let deadline = deferred_deadline.map_or_else(
+        || Instant::now() + FORWARD_RETRY_DEADLINE,
+        |deadline| deadline.request,
+    );
     let mut skip_node = self_id;
     loop {
         for socket in partition_http_sockets(&state.roster, skip_node) {
@@ -396,10 +400,26 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
                 break;
             }
             let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
-            match attempt(&state, &method, &request_headers, &body, &url, false).await {
+            match attempt(
+                &state,
+                &method,
+                &request_headers,
+                &body,
+                &url,
+                false,
+                deferred_deadline,
+            )
+            .await
+            {
                 AttemptOutcome::Relay(response) => {
                     return if method == Method::GET && response.status().is_success() {
-                        retain_forward_guard(response, guard, FORWARD_ATTEMPT_TIMEOUT)
+                        retain_forward_guard(
+                            response,
+                            guard,
+                            deferred_deadline.map_or(FORWARD_ATTEMPT_TIMEOUT, |deadline| {
+                                deadline.request.saturating_duration_since(Instant::now())
+                            }),
+                        )
                     } else {
                         response
                     };
@@ -446,7 +466,16 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
             None => AttemptOutcome::Retry,
             Some(socket) => {
                 let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
-                attempt(state, &parts.method, &parts.headers, &body, &url, true).await
+                attempt(
+                    state,
+                    &parts.method,
+                    &parts.headers,
+                    &body,
+                    &url,
+                    true,
+                    None,
+                )
+                .await
             }
         };
         match outcome {
@@ -486,6 +515,7 @@ async fn attempt(
     body: &Bytes,
     url: &str,
     retry_redirect: bool,
+    deferred_deadline: Option<DeferredPollDeadline>,
 ) -> AttemptOutcome {
     let builder = match state.forward.client.request(method.clone(), url) {
         Ok(builder) => builder,
@@ -494,18 +524,33 @@ async fn attempt(
             return AttemptOutcome::Relay(bad_gateway());
         }
     };
-    let request = builder
+    let mut request = builder
         .headers(forwarded_headers(request_headers))
         .body(body.clone())
         .build();
+    let timeout = match deferred_deadline {
+        Some(deadline) => {
+            let Some(remaining) = reduce_deferred_wait(&mut request, deadline) else {
+                return AttemptOutcome::Retry;
+            };
+            remaining
+        }
+        None => FORWARD_ATTEMPT_TIMEOUT,
+    };
     let attempt = async {
         let response = match state.forward.client.execute(request).await {
             Ok(response) => response,
             Err(error) => return classify_transport_error(&error),
         };
-        classify_forwarded_reply(response, method, retry_redirect).await
+        classify_forwarded_reply(
+            response,
+            method,
+            retry_redirect,
+            deferred_deadline.map(|deadline| deadline.request),
+        )
+        .await
     };
-    match compio::time::timeout(FORWARD_ATTEMPT_TIMEOUT, attempt).await {
+    match compio::time::timeout(timeout, attempt).await {
         // Elapsed: the request may be mid-commit on the primary. Outcome
         // unknown, so never retried - 504, same contract as a local commit
         // wait that timed out.
@@ -517,10 +562,57 @@ async fn attempt(
     }
 }
 
+#[derive(Clone, Copy)]
+struct DeferredPollDeadline {
+    wait: Instant,
+    request: Instant,
+}
+
+fn deferred_poll_deadline(request: &Request) -> Option<DeferredPollDeadline> {
+    if request.method() != Method::GET || !request.uri().path().ends_with("/messages/deferred") {
+        return None;
+    }
+    let Query(query) = Query::<DeferredPollQuery>::try_from_uri(request.uri()).ok()?;
+    let options = iggy_common::DeferredPollOptions::from(query);
+    options.validate(options.min_count).ok()?;
+    let now = Instant::now();
+    Some(DeferredPollDeadline {
+        wait: now.checked_add(options.max_wait.get_duration())?,
+        request: now.checked_add(options.request_timeout.get_duration())?,
+    })
+}
+
+fn reduce_deferred_wait(
+    request: &mut cyper::Request,
+    deadline: DeferredPollDeadline,
+) -> Option<Duration> {
+    let now = Instant::now();
+    let remaining = deadline.request.checked_duration_since(now)?;
+    let wait_us = deadline.wait.saturating_duration_since(now).as_micros();
+    if remaining.as_micros() == 0 {
+        return None;
+    }
+    let query: Vec<_> = request
+        .url()
+        .query_pairs()
+        .filter(|(key, _)| key != "wait_us" && key != "request_timeout_us")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    request
+        .url_mut()
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(query)
+        .append_pair("wait_us", &wait_us.to_string())
+        .append_pair("request_timeout_us", &remaining.as_micros().to_string());
+    Some(remaining)
+}
+
 async fn classify_forwarded_reply(
     response: cyper::Response,
     method: &Method,
     retry_redirect: bool,
+    deadline: Option<Instant>,
 ) -> AttemptOutcome {
     let status = response.status();
     // Only the relayed subset survives; the response is consumed by the
@@ -533,7 +625,7 @@ async fn classify_forwarded_reply(
         })
         .collect();
     if method == Method::GET && !retry_redirect && status.is_success() {
-        let mut response = Response::new(stream_poll_body(response.bytes_stream()));
+        let mut response = Response::new(stream_poll_body(response.bytes_stream(), deadline));
         *response.status_mut() = status;
         for (name, value) in relayed_headers {
             response.headers_mut().insert(name, value);
@@ -577,9 +669,15 @@ async fn classify_forwarded_reply(
     classify_reply(status, relayed_headers, Bytes::from(body), retry_redirect)
 }
 
-fn stream_poll_body(stream: impl Stream<Item = Result<Bytes, cyper::Error>> + 'static) -> Body {
-    let stream = futures::stream::try_unfold(Box::pin(stream), |mut stream| async move {
-        match compio::time::timeout(FORWARD_ATTEMPT_TIMEOUT, stream.next()).await {
+fn stream_poll_body(
+    stream: impl Stream<Item = Result<Bytes, cyper::Error>> + 'static,
+    deadline: Option<Instant>,
+) -> Body {
+    let stream = futures::stream::try_unfold(Box::pin(stream), move |mut stream| async move {
+        let timeout = deadline.map_or(FORWARD_ATTEMPT_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        match compio::time::timeout(timeout, stream.next()).await {
             Ok(Some(Ok(bytes))) => Ok(Some((bytes, stream))),
             Ok(None) => Ok(None),
             Ok(Some(Err(error))) => Err(std::io::Error::other(error.to_string())),
@@ -931,6 +1029,79 @@ mod tests {
     }
 
     #[test]
+    fn deferred_forward_keeps_one_wait_budget_and_preserves_other_query_fields() {
+        let mut request = cyper::Request::new(
+            Method::GET,
+            "http://localhost/streams/0/topics/0/messages/deferred?%77ait_us=2000000&auto_commit=true&consistency=linearizable"
+                .parse()
+                .unwrap(),
+        );
+        let remaining = reduce_deferred_wait(
+            &mut request,
+            DeferredPollDeadline {
+                wait: Instant::now() + Duration::from_secs(1),
+                request: Instant::now() + Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        let query: Vec<_> = request.url().query_pairs().collect();
+        let waits: Vec<_> = query.iter().filter(|(key, _)| key == "wait_us").collect();
+        assert_eq!(waits.len(), 1);
+        assert!(waits[0].1.parse::<u128>().unwrap() <= remaining.as_micros());
+        assert!(remaining.as_micros() > 0 && remaining <= Duration::from_secs(1));
+        assert!(
+            query
+                .iter()
+                .any(|(key, value)| key == "auto_commit" && value == "true")
+        );
+        assert!(
+            query
+                .iter()
+                .any(|(key, value)| key == "consistency" && value == "linearizable")
+        );
+        let previous = request.url().clone();
+        assert!(
+            reduce_deferred_wait(
+                &mut request,
+                DeferredPollDeadline {
+                    wait: Instant::now(),
+                    request: Instant::now()
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            request.url(),
+            &previous,
+            "request timeout must stop forwarding"
+        );
+    }
+
+    #[test]
+    fn forwarding_extends_only_valid_deferred_poll_requests() {
+        for (path, deferred) in [
+            (
+                "/streams/0/topics/0/messages/deferred?wait_us=1000000",
+                true,
+            ),
+            ("/streams/0/topics/0/messages?wait_us=1000000", false),
+            ("/streams/0/topics/0/messages/deferred", true),
+            ("/streams/0/topics/0/messages/deferred?wait_us=0", true),
+            (
+                "/streams/0/topics/0/messages/deferred?wait_us=600000001",
+                false,
+            ),
+        ] {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            assert_eq!(
+                deferred_poll_deadline(&request).is_some(),
+                deferred,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
     fn transient_not_accepted_body_matches_only_its_code() {
         let accepted = format!(
             r#"{{"id":{},"code":"transient_not_accepted","reason":"x","field":null}}"#,
@@ -1025,7 +1196,7 @@ mod tests {
             Ok::<_, cyper::Error>(chunk.clone())
         }));
         let response = retain_forward_guard(
-            Response::new(stream_poll_body(stream)),
+            Response::new(stream_poll_body(stream, None)),
             guard,
             FORWARD_ATTEMPT_TIMEOUT,
         );
@@ -1046,7 +1217,7 @@ mod tests {
         let in_flight = Rc::new(Cell::new(0));
         let guard = ForwardGuard::admit(&in_flight).expect("forward admitted");
         let response = retain_forward_guard(
-            Response::new(stream_poll_body(futures::stream::pending())),
+            Response::new(stream_poll_body(futures::stream::pending(), None)),
             guard,
             FORWARD_ATTEMPT_TIMEOUT,
         );
@@ -1066,8 +1237,11 @@ mod tests {
         let stream = futures::stream::unfold(held, |held| async move {
             Some((Ok::<_, cyper::Error>(Bytes::from_static(b"chunk")), held))
         });
-        let response =
-            retain_forward_guard(Response::new(stream_poll_body(stream)), guard, BODY_TIMEOUT);
+        let response = retain_forward_guard(
+            Response::new(stream_poll_body(stream, None)),
+            guard,
+            BODY_TIMEOUT,
+        );
         compio::time::sleep(BODY_TIMEOUT * 3).await;
         assert_eq!(in_flight.get(), 0, "unread bodies must release admission");
         assert_eq!(Rc::strong_count(&upstream), 1, "upstream must be dropped");
@@ -1112,7 +1286,7 @@ mod tests {
             .expect("poll response");
         assert_eq!(response.content_length(), Some(65 * 1024 * 1024));
         let AttemptOutcome::Relay(response) =
-            classify_forwarded_reply(response, &Method::GET, false).await
+            classify_forwarded_reply(response, &Method::GET, false, None).await
         else {
             panic!("successful poll must not be retried")
         };

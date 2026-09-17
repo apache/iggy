@@ -265,6 +265,11 @@ impl MessageBus for SimOutbox {
         // prepare-timestamp clock agree to the microsecond.
         SimClock::new(self.timer.clone()).realtime().as_micros()
     }
+
+    fn monotonic_micros(&self) -> u64 {
+        u64::try_from(Duration::from_nanos(self.timer.now().as_nanos()).as_micros())
+            .unwrap_or(u64::MAX)
+    }
 }
 
 /// Newtype wrapper for shared [`SimOutbox`] that implements [`MessageBus`]
@@ -322,6 +327,10 @@ impl MessageBus for SharedSimOutbox {
 
     fn realtime_micros(&self) -> u64 {
         self.0.realtime_micros()
+    }
+
+    fn monotonic_micros(&self) -> u64 {
+        self.0.monotonic_micros()
     }
 }
 

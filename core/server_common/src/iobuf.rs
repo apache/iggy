@@ -286,6 +286,13 @@ impl<const ALIGN: usize> From<Owned<ALIGN>> for Frozen<ALIGN> {
 }
 
 impl<const ALIGN: usize> Frozen<ALIGN> {
+    /// Bytes pinned by this view, including its allocation's control block.
+    pub fn allocation_bytes(&self) -> usize {
+        // SAFETY: this live extent retains the immutable capacity in its control block.
+        let capacity = unsafe { self.inner.ctrlb.as_ref().capacity };
+        capacity.saturating_add(size_of::<ControlBlock>())
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         self.inner.as_slice()
     }

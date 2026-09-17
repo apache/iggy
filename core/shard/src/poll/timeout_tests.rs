@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
@@ -483,13 +483,18 @@ type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
 /// Detached tasks are captured so dispatch tests can observe admission without
 /// executing their synthetic disk plans.
 #[derive(Clone, Default)]
-struct PollTestBus {
+pub(super) struct PollTestBus {
+    pub(super) now: Rc<Cell<u64>>,
     next_timeout: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
-    spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
+    pub(super) spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
 }
 
 #[allow(clippy::future_not_send)]
 impl MessageBus for PollTestBus {
+    fn monotonic_micros(&self) -> u64 {
+        self.now.get()
+    }
+
     fn spawn(&self, future: impl Future<Output = ()> + 'static) {
         self.spawned_tasks.borrow_mut().push(Box::pin(future));
     }

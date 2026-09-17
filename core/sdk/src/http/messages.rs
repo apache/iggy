@@ -29,6 +29,54 @@ use iggy_common::flush_unsaved_buffer::FlushUnsavedBuffer;
 
 #[async_trait]
 impl MessageClient for HttpClient {
+    async fn poll_messages_with_strategy_for_and_options(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+        options: Option<iggy_common::DeferredPollOptions>,
+    ) -> Result<PolledMessages, IggyError> {
+        let Some(options) = options else {
+            return self
+                .poll_messages_with_strategy_for(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy_for,
+                    count,
+                    auto_commit,
+                )
+                .await;
+        };
+        options.validate(count)?;
+        if consumer.kind == iggy_common::ConsumerKind::ConsumerGroup && partition_id.is_none() {
+            return Err(IggyError::FeatureUnavailable);
+        }
+        let path = format!(
+            "{}/deferred",
+            get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str())
+        );
+        self.get_deferred_poll(
+            &path,
+            &PollMessages {
+                stream_id: stream_id.clone(),
+                topic_id: topic_id.clone(),
+                partition_id,
+                consumer: consumer.clone(),
+                strategy: strategy_for(partition_id.unwrap_or(0)),
+                count,
+                auto_commit,
+            },
+            options,
+        )
+        .await
+    }
+
     async fn poll_messages(
         &self,
         stream_id: &Identifier,

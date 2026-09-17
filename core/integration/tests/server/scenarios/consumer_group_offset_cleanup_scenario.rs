@@ -153,7 +153,6 @@ async fn create_consumer(client: &IggyClient, consumer_group_name: &str) -> Iggy
         .consumer_group(consumer_group_name, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .batch_length(10)
-        .poll_interval(IggyDuration::from_str("10ms").expect("Invalid duration"))
         .polling_strategy(PollingStrategy::next())
         .auto_join_consumer_group()
         .auto_commit(AutoCommit::IntervalOrAfter(

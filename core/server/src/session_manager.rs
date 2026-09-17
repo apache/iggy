@@ -28,9 +28,11 @@
 use crate::cluster_meta::ClusterRoster;
 use ahash::AHashMap;
 use consensus::client_table::SessionAttachment;
+use futures::future::{AbortHandle, AbortRegistration};
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -117,6 +119,7 @@ pub struct Connection {
     /// session it binds.
     pub metadata_watermark: u64,
     consumer_session: Option<(u128, SessionAttachment)>,
+    deferred_request: Option<(Instant, AbortHandle)>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -185,6 +188,7 @@ impl SessionManager {
                 sdk: None,
                 metadata_watermark: 0,
                 consumer_session: None,
+                deferred_request: None,
             });
     }
 
@@ -224,6 +228,11 @@ impl SessionManager {
         self.connections
             .iter()
             .filter(|(_, conn)| !matches!(conn.state, ConnectionState::Connected))
+            .filter(|(_, conn)| {
+                conn.deferred_request
+                    .as_ref()
+                    .is_none_or(|(deadline, _)| now >= *deadline)
+            })
             .filter(|(_, conn)| now.duration_since(conn.last_heartbeat) > max_age)
             .map(|(&id, _)| id)
             .collect()
@@ -255,15 +264,48 @@ impl SessionManager {
     /// one, so the caller can submit a session-matched `Logout` (the committed
     /// apply releases the client-table slot cluster-wide).
     pub fn remove_connection(&mut self, connection_id: u128) -> Option<(u128, u64)> {
-        if let Some(conn) = self.connections.remove(&connection_id)
-            && let ConnectionState::Bound {
+        if let Some(conn) = self.connections.remove(&connection_id) {
+            if let Some((_, abort)) = conn.deferred_request {
+                abort.abort();
+            }
+            if let ConnectionState::Bound {
                 client_id, session, ..
             } = conn.state
-        {
-            self.client_to_connection.remove(&client_id);
-            return Some((client_id, session));
+            {
+                self.client_to_connection.remove(&client_id);
+                return Some((client_id, session));
+            }
         }
         None
+    }
+
+    /// # Errors
+    /// Rejects a missing connection, another active request or an overflowing watchdog.
+    pub fn begin_deferred_request(
+        sessions: &Rc<RefCell<Self>>,
+        connection_id: u128,
+        watchdog: Duration,
+    ) -> Result<(DeferredRequestGuard, AbortRegistration), IggyError> {
+        let deadline = Instant::now()
+            .checked_add(watchdog)
+            .ok_or(IggyError::InvalidCommand)?;
+        let (abort, registration) = AbortHandle::new_pair();
+        let mut manager = sessions.borrow_mut();
+        let connection = manager
+            .connections
+            .get_mut(&connection_id)
+            .ok_or(IggyError::StaleClient)?;
+        if connection.deferred_request.is_some() {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        connection.deferred_request = Some((deadline, abort));
+        Ok((
+            DeferredRequestGuard {
+                sessions: Rc::clone(sessions),
+                connection_id,
+            },
+            registration,
+        ))
     }
 
     /// Transition to `Authenticated` after successful login.
@@ -499,6 +541,41 @@ impl SessionManager {
     }
 }
 
+pub struct DeferredRequestGuard {
+    sessions: Rc<RefCell<SessionManager>>,
+    connection_id: u128,
+}
+
+impl DeferredRequestGuard {
+    pub fn written(&self) {
+        if let Some(connection) = self
+            .sessions
+            .borrow_mut()
+            .connections
+            .get_mut(&self.connection_id)
+            && connection
+                .deferred_request
+                .as_ref()
+                .is_some_and(|(deadline, _)| Instant::now() < *deadline)
+        {
+            connection.last_heartbeat = Instant::now();
+        }
+    }
+}
+
+impl Drop for DeferredRequestGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self
+            .sessions
+            .borrow_mut()
+            .connections
+            .get_mut(&self.connection_id)
+        {
+            connection.deferred_request = None;
+        }
+    }
+}
+
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
@@ -567,6 +644,8 @@ const fn state_name(state: &ConnectionState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt;
+
     use super::*;
     use crate::responses::build_empty_reply;
     use consensus::ClientTable;
@@ -870,5 +949,69 @@ mod tests {
         let mut mgr = SessionManager::new();
         mgr.record_metadata_watermark(9, 5);
         assert_eq!(mgr.metadata_watermark(9), 0);
+    }
+    #[test]
+    fn deferred_guard_is_connection_local_finite_and_refreshes_only_after_write() {
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let old = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
+        for connection in [1, 2] {
+            let mut manager = sessions.borrow_mut();
+            manager.ensure_connection(connection, addr(5000), ClientTransportKind::Tcp);
+            manager.login(connection, 0).unwrap();
+            manager
+                .connections
+                .get_mut(&connection)
+                .unwrap()
+                .last_heartbeat = old;
+        }
+        let (guard, _) =
+            SessionManager::begin_deferred_request(&sessions, 2, Duration::from_secs(60)).unwrap();
+        let now = Instant::now();
+        assert_eq!(
+            sessions
+                .borrow()
+                .collect_stale(Duration::from_secs(10), now),
+            [1]
+        );
+        assert_eq!(sessions.borrow().connections[&1].last_heartbeat, old);
+        assert_eq!(
+            sessions
+                .borrow()
+                .collect_stale(Duration::from_secs(10), now + Duration::from_secs(61))
+                .len(),
+            2
+        );
+        assert!(
+            SessionManager::begin_deferred_request(&sessions, 2, Duration::from_secs(60)).is_err()
+        );
+        guard.written();
+        drop(guard);
+        assert_eq!(
+            sessions
+                .borrow()
+                .collect_stale(Duration::from_secs(10), Instant::now()),
+            [1]
+        );
+        assert_eq!(sessions.borrow().connections[&1].last_heartbeat, old);
+        let (failed, registration) =
+            SessionManager::begin_deferred_request(&sessions, 1, Duration::from_secs(60)).unwrap();
+        sessions.borrow_mut().remove_connection(1);
+        let cancelled = futures::future::Abortable::new(std::future::pending::<()>(), registration);
+        assert!(cancelled.now_or_never().unwrap().is_err());
+        drop(failed);
+    }
+
+    #[test]
+    fn dropped_deferred_guard_does_not_extend_heartbeat() {
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions
+            .borrow_mut()
+            .ensure_connection(1, addr(5000), ClientTransportKind::Tcp);
+        let before = sessions.borrow().connections[&1].last_heartbeat;
+        let (guard, _) =
+            SessionManager::begin_deferred_request(&sessions, 1, Duration::from_secs(1)).unwrap();
+        drop(guard);
+        assert_eq!(sessions.borrow().connections[&1].last_heartbeat, before);
+        assert!(sessions.borrow().connections[&1].deferred_request.is_none());
     }
 }

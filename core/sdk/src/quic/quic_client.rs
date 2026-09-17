@@ -151,6 +151,17 @@ impl BinaryTransport for QuicClient {
     ) -> Result<Bytes, IggyError> {
         self.poll_router.poll(self, request).await
     }
+
+    async fn send_poll_with_response_and_options(
+        &self,
+        request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        options: Option<iggy_common::DeferredPollOptions>,
+    ) -> Result<Bytes, IggyError> {
+        match options {
+            Some(options) => self.poll_router.poll_deferred(self, request, options).await,
+            None => self.poll_router.poll(self, request).await,
+        }
+    }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
     }
@@ -496,6 +507,33 @@ impl BinaryClient for QuicClient {}
 #[async_trait]
 impl PollTransport for QuicClient {
     const PROTOCOL: TransportProtocol = TransportProtocol::Quic;
+
+    async fn local_poll_session(
+        &self,
+    ) -> Result<
+        (
+            String,
+            iggy_binary_protocol::requests::system::AttachConsumerSessionRequest,
+        ),
+        IggyError,
+    > {
+        let endpoint = self.current_server_address.lock().await.clone();
+        let session = self
+            .consensus_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok((
+            endpoint,
+            iggy_binary_protocol::requests::system::AttachConsumerSessionRequest {
+                client_id: session.client_id(),
+                session: session.session().ok_or(IggyError::Unauthenticated)?,
+                metadata_watermark: self
+                    .poll_router
+                    .metadata_watermark
+                    .load(std::sync::atomic::Ordering::Acquire),
+            },
+        ))
+    }
 
     async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
         let mut config = (*self.config).clone();
@@ -1024,8 +1062,11 @@ impl QuicClient {
         let response_buffer_size = self.config.response_buffer_size;
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
+        let deferred_timeout = crate::poll_routing::deferred_exchange_timeout(code, &payload)?;
+        let response_limit = crate::poll_routing::deferred_response_limit(code, &payload)?
+            .saturating_add(iggy_binary_protocol::HEADER_SIZE);
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let connection = connection.lock().await;
             let Some(connection) = connection.as_ref() else {
                 error!("Cannot send data. Client is not connected.");
@@ -1033,106 +1074,105 @@ impl QuicClient {
             };
 
             let (request_header, request_size) = {
-                    let mut consensus_session = consensus_session
-                        .lock()
-                        .expect("consensus session mutex poisoned");
-                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
-                };
-                trace!("Sending a QUIC VSR request of size {request_size} with code: {code}");
-                // Same-connection transient resend, gated on the EXPLICIT
-                // `TransientNotCommitted` frame only. The server answers every
-                // transient submit with that frame (it is pre-commit by
-                // construction, so replaying the SAME request header on a fresh
-                // bidi cannot double-commit), and it no longer abandons a bidi
-                // whose op is still committing. Silence therefore is NOT a
-                // retry signal: the partition plane has no dedup or reply
-                // cache, so resending a silently-unanswered request whose
-                // first attempt was buffered and later commits would commit it
-                // twice (duplicate `SendMessages`, or a succeeded delete coming
-                // back as terminal `ConsumerOffsetNotFound`). A silent deadline
-                // expiry surfaces `Disconnected` and takes the
-                // reconnect path in `send_raw_with_response`, same as TCP.
-                let header_bytes = bytemuck::bytes_of(&request_header);
-                let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-                // `TransientNotAccepted` gets a short same-connection window
-                // only: past it the refusal is a verdict about who leads, not
-                // load, and the caller runs a leader recheck or roster walk.
-                // Login/register keeps the full budget on this connection: the
-                // connect flow owns its leader settlement.
-                let not_accepted_deadline = if is_login_register_code(code) {
-                    deadline
-                } else {
-                    deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
-                };
-                loop {
-                    let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
-                        error!("Failed to open a bidirectional stream: {error}");
+                let mut consensus_session = consensus_session
+                    .lock()
+                    .expect("consensus session mutex poisoned");
+                crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
+            };
+            trace!("Sending a QUIC VSR request of size {request_size} with code: {code}");
+            // Same-connection transient resend, gated on the EXPLICIT
+            // `TransientNotCommitted` frame only. The server answers every
+            // transient submit with that frame (it is pre-commit by
+            // construction, so replaying the SAME request header on a fresh
+            // bidi cannot double-commit), and it no longer abandons a bidi
+            // whose op is still committing. Silence therefore is NOT a
+            // retry signal: the partition plane has no dedup or reply
+            // cache, so resending a silently-unanswered request whose
+            // first attempt was buffered and later commits would commit it
+            // twice (duplicate `SendMessages`, or a succeeded delete coming
+            // back as terminal `ConsumerOffsetNotFound`). A silent deadline
+            // expiry surfaces `Disconnected` and takes the
+            // reconnect path in `send_raw_with_response`, same as TCP.
+            let header_bytes = bytemuck::bytes_of(&request_header);
+            let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT + deferred_timeout;
+            // `TransientNotAccepted` gets a short same-connection window
+            // only: past it the refusal is a verdict about who leads, not
+            // load, and the caller runs a leader recheck or roster walk.
+            // Login/register keeps the full budget on this connection: the
+            // connect flow owns its leader settlement.
+            let not_accepted_deadline = if is_login_register_code(code) {
+                deadline
+            } else {
+                deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
+            };
+            loop {
+                let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
+                    error!("Failed to open a bidirectional stream: {error}");
+                    IggyError::QuicError
+                })?;
+                send.write_all(header_bytes).await.map_err(|error| {
+                    error!("Failed to write VSR request header: {error}");
+                    IggyError::QuicError
+                })?;
+                if !payload.is_empty() {
+                    send.write_all(&payload).await.map_err(|error| {
+                        error!("Failed to write VSR request payload: {error}");
                         IggyError::QuicError
                     })?;
-                    send.write_all(header_bytes).await.map_err(|error| {
-                        error!("Failed to write VSR request header: {error}");
-                        IggyError::QuicError
-                    })?;
-                    if !payload.is_empty() {
-                        send.write_all(&payload).await.map_err(|error| {
-                            error!("Failed to write VSR request payload: {error}");
-                            IggyError::QuicError
-                        })?;
-                    }
-                    send.finish().map_err(|error| {
-                        error!("Failed to finish VSR request stream: {error}");
-                        IggyError::QuicError
-                    })?;
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(IggyError::Disconnected);
-                    }
-                    match QuicClient::handle_response(
-                        &mut recv,
-                        response_buffer_size as usize,
-                        remaining,
-                        &metadata_watermark,
-                    )
-                    .await
-                    {
-                        Ok(reply) => return Ok(reply),
-                        Err(error) if !retry_transient => return Err(error),
-                        // `TransientNotCommitted` = the server replied with an
-                        // explicit retry frame with an outcome that may still
-                        // be resolving (not-caught-up / in-flight /
-                        // pipeline-full / view-change cancel). Replaying the
-                        // same request id on the same session is safe because
-                        // metadata dedup returns the committed reply if needed.
-                        // Anything else, including a silent read timeout, is
-                        // terminal here and handled by the caller.
-                        Err(IggyError::TransientNotAccepted)
-                            if tokio::time::Instant::now() >= not_accepted_deadline =>
-                        {
-                            // Never admitted, so re-issuable anywhere: hand it
-                            // back for a leader recheck or a roster walk
-                            // instead of replaying into the same refusal for
-                            // the whole request budget.
-                            return Err(IggyError::TransientNotAccepted);
-                        }
-                        Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
-                            if tokio::time::Instant::now() < deadline =>
-                        {
-                            // The explicit frame returns promptly (no read
-                            // timeout elapsed), so pace the replay.
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
-                            warn!(
-                                "QUIC request code {code} not committed (transient); resending on a new stream"
-                            );
-                        }
-                        Err(error) => return Err(error),
-                    }
                 }
-        })
-        .await
-        .map_err(|e| {
+                send.finish().map_err(|error| {
+                    error!("Failed to finish VSR request stream: {error}");
+                    IggyError::QuicError
+                })?;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(IggyError::Disconnected);
+                }
+                match QuicClient::handle_response(
+                    &mut recv,
+                    (response_buffer_size as usize).min(response_limit),
+                    remaining,
+                    &metadata_watermark,
+                )
+                .await
+                {
+                    Ok(reply) => return Ok(reply),
+                    Err(error) if !retry_transient => return Err(error),
+                    // `TransientNotCommitted` = the server replied with an
+                    // explicit retry frame with an outcome that may still
+                    // be resolving (not-caught-up / in-flight /
+                    // pipeline-full / view-change cancel). Replaying the
+                    // same request id on the same session is safe because
+                    // metadata dedup returns the committed reply if needed.
+                    // Anything else, including a silent read timeout, is
+                    // terminal here and handled by the caller.
+                    Err(IggyError::TransientNotAccepted)
+                        if tokio::time::Instant::now() >= not_accepted_deadline =>
+                    {
+                        // Never admitted, so re-issuable anywhere: hand it
+                        // back for a leader recheck or a roster walk
+                        // instead of replaying into the same refusal for
+                        // the whole request budget.
+                        return Err(IggyError::TransientNotAccepted);
+                    }
+                    Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        // The explicit frame returns promptly (no read
+                        // timeout elapsed), so pace the replay.
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                        warn!(
+                            "QUIC request code {code} not committed (transient); resending on a new stream"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+        let _cancellation = crate::poll_routing::DeferredExchangeTask::new(deferred_timeout, &task);
+        task.await.map_err(|e| {
             error!("Task execution failed during QUIC request: {}", e);
             IggyError::QuicError
         })?

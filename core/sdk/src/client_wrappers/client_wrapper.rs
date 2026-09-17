@@ -20,6 +20,8 @@ use crate::http::http_client::HttpClient;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
+use iggy_common::locking::IggyRwLockFn;
+use iggy_common::{BinaryTransport, Identifier, IggyError, sync_group_assignment};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -29,4 +31,63 @@ pub enum ClientWrapper {
     Tcp(TcpClient),
     Quic(QuicClient),
     WebSocket(WebSocketClient),
+}
+
+impl ClientWrapper {
+    pub(crate) async fn deferred_group_state(
+        &self,
+    ) -> Result<std::sync::Arc<iggy_common::ConsumerGroupClientState>, IggyError> {
+        match self {
+            Self::Tcp(client) => Ok(client.consumer_group_state()),
+            Self::Quic(client) => Ok(client.consumer_group_state()),
+            Self::WebSocket(client) => Ok(client.consumer_group_state()),
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => Box::pin(client.client.read().await.deferred_group_state()).await,
+        }
+    }
+
+    pub(crate) async fn deferred_poll_partitions(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        group: &Identifier,
+        refresh: bool,
+    ) -> Result<(u64, u64, Vec<u32>), IggyError> {
+        if let Self::Iggy(client) = self {
+            return Box::pin(
+                client
+                    .client
+                    .read()
+                    .await
+                    .deferred_poll_partitions(stream, topic, group, refresh),
+            )
+            .await;
+        }
+        let state = match self {
+            Self::Tcp(client) => client.consumer_group_state(),
+            Self::Quic(client) => client.consumer_group_state(),
+            Self::WebSocket(client) => client.consumer_group_state(),
+            Self::Http(_) => return Err(IggyError::FeatureUnavailable),
+            Self::Iggy(_) => unreachable!("nested clients handled above"),
+        };
+        let key = format!("{stream}|{topic}|{group}");
+        if refresh || !state.is_registered(&key) {
+            match self {
+                Self::Tcp(client) => sync_group_assignment(client, stream, topic, group).await?,
+                Self::Quic(client) => sync_group_assignment(client, stream, topic, group).await?,
+                Self::WebSocket(client) => {
+                    sync_group_assignment(client, stream, topic, group).await?
+                }
+                Self::Http(_) | Self::Iggy(_) => unreachable!("binary transport selected above"),
+            }
+        }
+        if !state.is_registered(&key) {
+            return Err(IggyError::ConsumerGroupMemberNotFound(
+                0,
+                group.clone(),
+                topic.clone(),
+            ));
+        }
+        Ok(state.assignment_snapshot(&key))
+    }
 }

@@ -488,6 +488,26 @@ where
         Some(partition.build_poll_plan(consumer, args, validate_checksum))
     }
 
+    /// Snapshot a deferred read after checking its resident allocation budget.
+    ///
+    /// # Errors
+    /// Returns a size error when the snapshot exceeds the budget, or a read
+    /// error when a resident journal entry cannot be decoded.
+    pub fn build_bounded_poll_snapshot(
+        &self,
+        namespace: &IggyNamespace,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+        max_bytes: usize,
+    ) -> Result<Option<PollPlan>, IggyError> {
+        let validate_checksum = self.config.validate_checksum;
+        self.get_mut_by_ns(namespace)
+            .map(|partition| {
+                partition.build_bounded_poll_plan(consumer, args, validate_checksum, max_bytes)
+            })
+            .transpose()
+    }
+
     /// Validate and accept a poll synchronously on the owning pump.
     /// Attempt the reply synchronously, then immediately await any returned
     /// continuation through [`Self::replicate_poll_completion`] on the same pump.
@@ -947,7 +967,7 @@ mod tests {
         // D = 0 (last disk match), so a straddle would continue at offset 1.
         // A raw snapshot walk from offset 1 falls through to the next resident
         // op (offset 3): exactly the silent skip the gate prevents.
-        let (_, leaky_offset) = crate::journal::select_resident(
+        let (_, leaky_offset, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: 1,
@@ -975,7 +995,7 @@ mod tests {
         let from_offset = 3u64;
         let contiguous = oldest_resident.is_some_and(|oldest| oldest <= from_offset);
         assert!(contiguous, "offset 3 is resident; gate must allow it");
-        let (_, contiguous_offset) = crate::journal::select_resident(
+        let (_, contiguous_offset, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: from_offset,
@@ -1073,7 +1093,7 @@ mod tests {
         }
 
         let entries = partition.log.journal().inner.resident_entries();
-        let (_, last) = crate::journal::select_resident(
+        let (_, last, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: 0,

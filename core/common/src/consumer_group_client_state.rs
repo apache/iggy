@@ -29,6 +29,7 @@
 use crate::Identifier;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default, Clone)]
 struct GroupAssignment {
@@ -43,6 +44,7 @@ struct GroupAssignment {
 #[derive(Debug, Default)]
 pub struct ConsumerGroupClientState {
     assignments: Mutex<HashMap<String, GroupAssignment>>,
+    session_generation: AtomicU64,
     balanced_cursors: Mutex<HashMap<String, usize>>,
     partition_counts: Mutex<HashMap<String, u32>>,
     /// Identifiers of the joined groups, so the heartbeat can rebuild a sync
@@ -52,6 +54,40 @@ pub struct ConsumerGroupClientState {
 }
 
 impl ConsumerGroupClientState {
+    /// Snapshot of the session generation, assignment generation and partitions.
+    pub fn assignment_snapshot(&self, key: &str) -> (u64, u64, Vec<u32>) {
+        let assignments = self
+            .assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = self.session_generation.load(Ordering::Acquire);
+        assignments.get(key).map_or_else(
+            || (session, 0, Vec::new()),
+            |assignment| {
+                (
+                    session,
+                    assignment.generation,
+                    assignment.partitions.clone(),
+                )
+            },
+        )
+    }
+
+    /// Validate a buffered batch against the latest locally observed assignment.
+    pub fn is_current_assignment(&self, key: &str, version: (u64, u64), partition: u32) -> bool {
+        if !self.is_registered(key) {
+            return false;
+        }
+        let assignments = self
+            .assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.session_generation.load(Ordering::Acquire) == version.0
+            && assignments.get(key).is_some_and(|assignment| {
+                assignment.generation == version.1 && assignment.partitions.contains(&partition)
+            })
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -193,10 +229,14 @@ impl ConsumerGroupClientState {
     /// produce round-robin at partition 0 and cost a metadata round trip per
     /// topic on every reconnect.
     pub fn clear_session_scoped(&self) {
-        self.assignments
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        {
+            let mut assignments = self
+                .assignments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assignments.clear();
+            self.session_generation.fetch_add(1, Ordering::Release);
+        }
         self.joined_groups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -269,7 +309,15 @@ mod tests {
         assert_eq!(state.next_balanced_partition("s|t", 3), 0);
         state.set_partition_count("s|t".to_owned(), 3);
 
+        let before = state.assignment_snapshot("s|t|g");
         state.clear_session_scoped();
+        state.set_assignment("s|t|g".to_owned(), before.1, before.2.clone());
+        let after = state.assignment_snapshot("s|t|g");
+        assert_ne!(
+            before.0, after.0,
+            "same group generation in a new session must fence queued batches"
+        );
+        state.invalidate_assignment("s|t|g");
 
         assert!(state.registered_groups().is_empty());
         assert!(!state.is_registered("s|t|g"));

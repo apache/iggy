@@ -50,7 +50,11 @@ fn topic_cache_key(stream_id: &Identifier, topic_id: &Identifier) -> String {
 
 /// Sync the requesting member's assignment from the coordinator into the
 /// transport cache. An empty reply means the client is not a member.
-async fn sync_group_assignment<B: BinaryClient>(
+///
+/// # Errors
+/// Propagates transport and assignment-decoding failures.
+#[doc(hidden)]
+pub async fn sync_group_assignment<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
@@ -166,6 +170,7 @@ async fn resolve_partitioning<B: BinaryClient>(
 /// (round-robin), ask `strategy_for` where to read it from and send an
 /// explicit-partition poll. A coordinator fence rejection (stale assignment
 /// after a rebalance) triggers one re-sync + retry.
+#[allow(clippy::too_many_arguments)]
 async fn poll_group_messages<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -174,7 +179,9 @@ async fn poll_group_messages<B: BinaryClient>(
     strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
     count: u32,
     auto_commit: bool,
+    options: Option<crate::DeferredPollOptions>,
 ) -> Result<PolledMessages, IggyError> {
+    let started = std::time::Instant::now();
     let key = group_cache_key(stream_id, topic_id, &consumer.id);
     if !client.consumer_group_state().has_assignment(&key) {
         sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;
@@ -209,7 +216,13 @@ async fn poll_group_messages<B: BinaryClient>(
             count,
             auto_commit,
         };
-        match client.send_poll_with_response(&request).await {
+        let remaining = options
+            .map(|options| options.remaining(started.elapsed()))
+            .transpose()?;
+        match client
+            .send_poll_with_response_and_options(&request, remaining)
+            .await
+        {
             Ok(response) => {
                 let polled = PolledMessages::from_bytes(response)?;
                 // The coordinator can't yet signal a generation fence as a typed
@@ -237,6 +250,9 @@ async fn poll_group_messages<B: BinaryClient>(
     // empty poll rather than `ConsumerGroupPartitionNotOwned(0, 0)`: the (0, 0)
     // ids are fabricated and a normal rebalance must not look like a hard error
     // to a CG app that doesn't special-case 5009. The caller just re-polls.
+    if options.is_some() {
+        return Err(IggyError::TransientNotAccepted);
+    }
     Ok(PolledMessages::empty())
 }
 
@@ -305,6 +321,33 @@ impl<B: BinaryClient> MessageClient for B {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_strategy_for_and_options(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy_for,
+            count,
+            auto_commit,
+            None,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_strategy_for_and_options(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+        options: Option<crate::DeferredPollOptions>,
+    ) -> Result<PolledMessages, IggyError> {
+        if let Some(options) = options {
+            options.validate(count)?;
+        }
         fail_if_not_authenticated(self).await?;
         // VSR: a consumer-group poll without an explicit partition is resolved
         // client-side from the member's cached assignment (the broker routes
@@ -318,6 +361,7 @@ impl<B: BinaryClient> MessageClient for B {
                 strategy_for,
                 count,
                 auto_commit,
+                options,
             )
             .await;
         }
@@ -331,7 +375,9 @@ impl<B: BinaryClient> MessageClient for B {
             count,
             auto_commit,
         };
-        let response = self.send_poll_with_response(&req).await?;
+        let response = self
+            .send_poll_with_response_and_options(&req, options)
+            .await?;
         PolledMessages::from_bytes(response)
     }
 

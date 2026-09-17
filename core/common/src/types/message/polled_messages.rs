@@ -17,7 +17,9 @@
 
 use crate::{IggyMessage, IggyMessageHeader, error::IggyError};
 use bytes::Bytes;
-use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchMessageHeader};
+use iggy_binary_protocol::batch::{
+    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, BatchMessageHeader,
+};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
@@ -97,6 +99,9 @@ impl PolledMessages {
 /// values. Payload and user-header `Bytes` are zero-copy slices of the
 /// response buffer.
 fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, IggyError> {
+    if count as usize > buffer.len() / BATCH_MESSAGE_HEADER_SIZE {
+        return Err(IggyError::InvalidMessagesCount);
+    }
     let mut messages = Vec::with_capacity(count as usize);
     let mut position = 0usize;
     while position < buffer.len() {
@@ -140,6 +145,9 @@ fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, 
             } else {
                 None
             };
+            if messages.len() == count as usize {
+                return Err(IggyError::InvalidMessagesCount);
+            }
             messages.push(IggyMessage {
                 header,
                 payload,
@@ -150,5 +158,23 @@ fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, 
         position = batch_end;
     }
 
+    if messages.len() != count as usize {
+        return Err(IggyError::InvalidMessagesCount);
+    }
     Ok(messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_impossible_count_before_allocating_messages() {
+        let mut prefix = vec![0; 16];
+        prefix[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            PolledMessages::from_bytes(prefix.into()),
+            Err(IggyError::InvalidMessagesCount)
+        ));
+    }
 }

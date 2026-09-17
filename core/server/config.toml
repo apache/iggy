@@ -737,6 +737,11 @@ reply_inbox_capacity = 1024
 # new disk polls are rejected before I/O. Main and reply inbox traffic uses
 # separate capacity. This limits operation count, not retained message bytes.
 poll_completion_capacity = 1024
+deferred_poll_max_wait_us = 30000000
+deferred_poll_max_pending = 1024
+deferred_poll_max_pending_per_session = 64
+deferred_poll_max_read_bytes = 16777216
+deferred_poll_max_inflight_bytes = 67108864
 
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized

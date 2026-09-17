@@ -72,9 +72,9 @@ use crate::http::handlers::{
     delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
     get_clients, get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats,
     get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
-    login_with_personal_access_token, logout_user, ping, poll_messages, purge_stream, purge_topic,
-    refresh_token, send_messages, store_consumer_offset, update_permissions, update_stream,
-    update_topic, update_user,
+    login_with_personal_access_token, logout_user, ping, poll_messages, poll_messages_deferred,
+    purge_stream, purge_topic, refresh_token, send_messages, store_consumer_offset,
+    update_permissions, update_stream, update_topic, update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
@@ -426,6 +426,10 @@ fn partition_write_routes(state: HttpState) -> Router<HttpState> {
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
             post(send_messages).get(poll_messages),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages/deferred",
+            get(poll_messages_deferred),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",

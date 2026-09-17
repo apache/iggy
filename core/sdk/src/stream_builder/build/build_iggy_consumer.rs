@@ -49,7 +49,7 @@ pub(crate) async fn build_iggy_consumer(
     let consumer_kind = config.consumer_kind();
     let consumer_name = config.consumer_name();
     let batch_length = config.batch_length();
-    let polling_interval = config.polling_interval();
+    let poll_options = config.poll_options();
     let polling_strategy = config.polling_strategy();
     let partition = config.partition_id();
     let polling_retry_interval = config.polling_retry_interval();
@@ -63,7 +63,9 @@ pub(crate) async fn build_iggy_consumer(
     .create_consumer_group_if_not_exists()
     .auto_join_consumer_group()
     .polling_strategy(polling_strategy)
-    .poll_interval(polling_interval)
+    .poll_options(poll_options)
+    .prefetch_bytes(config.prefetch_bytes())
+    .prefetch_messages(config.prefetch_messages())
     .batch_length(batch_length)
     .polling_retry_interval(polling_retry_interval);
 

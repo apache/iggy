@@ -16,6 +16,7 @@
 // under the License.
 
 use iggy_binary_protocol::{Operation, PrepareHeader};
+use iggy_common::IggyError;
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
@@ -481,7 +482,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     ) -> PollQueryResult<4096> {
         let count = query.count();
         if count == 0 {
-            return (PollFragments::new(), None);
+            return (PollFragments::new(), None, 0);
         }
 
         // Disjoint `UnsafeCell`s: this borrows `op_to_storage_offset` while the
@@ -515,7 +516,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             );
         }
 
-        (fragments, last_matching_offset)
+        (fragments, last_matching_offset, matched_messages)
     }
 
     /// Drain all accumulated batches, matching the legacy `PartitionJournal` API.
@@ -765,6 +766,24 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             }
         }
         entries
+    }
+
+    /// Conservative snapshot charge without allocating an entry vector.
+    pub fn resident_message_bytes(&self) -> Result<usize, IggyError> {
+        let offset_to_op = unsafe { &*self.offset_to_op.get() };
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let inner = unsafe { &*self.inner.get() };
+        offset_to_op.values().try_fold(0usize, |bytes, op| {
+            let entry = op_to_storage_offset
+                .get(op)
+                .and_then(|offset| inner.storage.read_at_sync(*offset))
+                .ok_or(IggyError::CannotReadMessage)?;
+            decode_prepare_slice_trusted(entry.as_slice())
+                .map_err(|_| IggyError::CannotReadMessage)?;
+            Ok(bytes
+                .saturating_add(entry.allocation_bytes())
+                .saturating_add(size_of::<JournalBuffer>()))
+        })
     }
 
     /// Owned, append-ordered clones of every resident entry above the purge
@@ -1437,7 +1456,7 @@ pub fn select_resident(
         );
     }
 
-    (!fragments.is_empty()).then_some((fragments, last_matching_offset))
+    (!fragments.is_empty()).then_some((fragments, last_matching_offset, matched_messages))
 }
 
 #[cfg(test)]
@@ -1981,8 +2000,9 @@ mod tests {
             "fixture must select a sparse fraction of the prepare"
         );
 
-        let (fragments, last_matching_offset) =
+        let (fragments, last_matching_offset, matched) =
             select_resident(std::slice::from_ref(&prepare), query).expect("one record matches");
+        assert_eq!(matched, 1);
         assert_eq!(last_matching_offset, Some(500));
         assert_eq!(fragments.len(), 2, "rewritten header plus body slice");
         let (header, body) = (&fragments[0], &fragments[1]);
@@ -2004,9 +2024,10 @@ mod tests {
     fn resident_whole_batch_selection_keeps_the_zero_copy_slice() {
         let prepare = build_resident_prepare(1_000, 300);
 
-        let (fragments, last_matching_offset) =
+        let (fragments, last_matching_offset, matched) =
             select_resident(std::slice::from_ref(&prepare), offset_lookup(0, 1_000))
                 .expect("whole batch matches");
+        assert_eq!(matched, 1_000);
         assert_eq!(last_matching_offset, Some(999));
         assert_eq!(fragments.len(), 1, "a whole batch ships its original bytes");
         assert!(
@@ -2032,7 +2053,7 @@ mod tests {
             "fixture must select a sparse fraction that is over the copy cap"
         );
 
-        let (fragments, _) =
+        let (fragments, _, _) =
             select_resident(std::slice::from_ref(&prepare), query).expect("records match");
         assert_eq!(fragments.len(), 2, "rewritten header plus body slice");
         assert!(
@@ -2085,5 +2106,24 @@ mod tests {
             fragments[0].borrows_from(&chunk),
             "dense slice keeps the zero-copy path"
         );
+    }
+    #[test]
+    fn selected_message_count_does_not_include_offset_holes() {
+        let entries = vec![
+            build_message_prepare(1, 0, 1, 8),
+            build_message_prepare(2, 100, 1, 8),
+        ];
+        let (fragments, last, count) = select_resident(
+            &entries,
+            MessageLookup::Offset {
+                offset: 0,
+                count: 3,
+                ceiling: 100,
+            },
+        )
+        .unwrap();
+        assert!(!fragments.is_empty());
+        assert_eq!(last, Some(100));
+        assert_eq!(count, 2);
     }
 }

@@ -31,7 +31,8 @@ use crate::dispatch::failure::{
     FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
 };
 use crate::dispatch::partition::{
-    handle_get_consumer_offset, handle_poll_messages, resolve_poll_request,
+    empty_poll_fallback, handle_get_consumer_offset, handle_poll_messages, read_deferred_poll,
+    resolve_deferred_poll, resolve_poll_request,
 };
 use crate::responses::{
     build_empty_reply, build_get_me_response, build_get_personal_access_tokens_response,
@@ -45,19 +46,21 @@ use crate::wire::request_body;
 use bytes::Bytes;
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
-use futures::future::{Either, select};
+use consensus::client_table::SessionAttachment;
+use futures::future::{Abortable, Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     ATTACH_CONSUMER_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
     GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
     GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE,
-    GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+    GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+    POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
     SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
@@ -68,7 +71,10 @@ use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::{ClusterNodeRole, IggyError, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{
+    ClusterNodeRole, IggyError, RESYNC_REQUIRED_PARTITION_SENTINEL, SnapshotCompression,
+    SystemSnapshotType,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::framing::MAX_MESSAGE_SIZE;
@@ -77,7 +83,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
 use shard::{PartitionRead, PartitionReadReply};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
@@ -203,6 +209,8 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
             | GET_CLUSTER_METADATA_CODE
             | POLL_MESSAGES_CODE
             | POLL_MESSAGES_ON_PRIMARY_CODE
+            | POLL_MESSAGES_DEFERRED_CODE
+            | POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE
             | GET_CONSUMER_OFFSET_CODE
             | GET_SNAPSHOT_FILE_CODE
     ) && lookup_command(code).is_some()
@@ -535,6 +543,17 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 }
             }
         }
+        POLL_MESSAGES_DEFERRED_CODE | POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE => {
+            handle_deferred_poll(
+                shard,
+                sessions,
+                transport_client_id,
+                &request,
+                user_id,
+                code == POLL_MESSAGES_DEFERRED_ON_PRIMARY_CODE,
+            )
+            .await;
+        }
         POLL_MESSAGES_CODE | POLL_MESSAGES_ON_PRIMARY_CODE => {
             let consumer_client = if code == POLL_MESSAGES_ON_PRIMARY_CODE {
                 sessions
@@ -622,6 +641,30 @@ where
     let wire = AttachConsumerSessionRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
     let watermark = wire.metadata_watermark.max(wire.session);
+    let attachment = attach_poll_session(shard, &wire, user_id).await?;
+    sessions.borrow_mut().attach_consumer_session(
+        transport_client_id,
+        wire.client_id,
+        attachment,
+        watermark,
+    )?;
+    Ok(Bytes::new())
+}
+
+#[allow(clippy::future_not_send)]
+async fn attach_poll_session<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    wire: &AttachConsumerSessionRequest,
+    user_id: u32,
+) -> Result<SessionAttachment, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let watermark = wire.metadata_watermark.max(wire.session);
     await_metadata_read_frontier(shard, watermark).await?;
     let attachment = if shard.id == 0 {
         shard
@@ -650,13 +693,148 @@ where
             Either::Right(_) => return Err(IggyError::TransientNotAccepted),
         }
     };
-    sessions.borrow_mut().attach_consumer_session(
-        transport_client_id,
-        wire.client_id,
-        attachment,
-        watermark,
-    )?;
-    Ok(Bytes::new())
+    Ok(attachment)
+}
+
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+async fn handle_deferred_poll<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: &Message<RoutedRequestHeader>,
+    user_id: Option<u32>,
+    primary: bool,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let started = shard.bus.monotonic_micros();
+    let Ok(mut wire) = DeferredPollMessagesRequest::decode_from(request_body(request)) else {
+        send_non_replicated_deny(
+            shard,
+            request,
+            transport_client_id,
+            IggyError::InvalidCommand.as_code(),
+        )
+        .await;
+        return;
+    };
+    let setup_timeout = Duration::from_micros(wire.request_timeout_us);
+    let setup = async {
+        let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+        shard.validate_deferred_poll(wire.poll.count, (&wire).into())?;
+        let attached = sessions
+            .borrow()
+            .attached_consumer_session(transport_client_id)?;
+        let (consumer_client_id, attachment) = if let Some(attached) = attached {
+            attached
+        } else {
+            let (client_id, session) = sessions
+                .borrow()
+                .get_session(transport_client_id)
+                .ok_or(IggyError::Unauthenticated)?;
+            let metadata_watermark = sessions.borrow().metadata_watermark(transport_client_id);
+            let attachment = attach_poll_session(
+                shard,
+                &AttachConsumerSessionRequest {
+                    client_id,
+                    session,
+                    metadata_watermark,
+                },
+                user_id,
+            )
+            .await?;
+            (client_id, attachment)
+        };
+        let remaining = iggy_common::DeferredPollOptions::from(&wire).remaining(
+            Duration::from_micros(shard.bus.monotonic_micros().saturating_sub(started)),
+        )?;
+        wire.wait_us = remaining.max_wait.as_micros();
+        wire.request_timeout_us = remaining.request_timeout.as_micros();
+        let watchdog = remaining.request_timeout.get_duration();
+        let resolved = resolve_deferred_poll(
+            shard,
+            &wire,
+            (consumer_client_id, attachment, user_id, primary),
+        )?;
+        Ok::<_, IggyError>((resolved, watchdog))
+    };
+    let setup = match select(pin!(setup), pin!(shard.bus.sleep(setup_timeout))).await {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => Err(IggyError::TransientNotCommitted),
+    };
+    let (resolved, watchdog) = match setup {
+        Ok(setup) => setup,
+        Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
+            let (body, channel) = empty_poll_fallback(RESYNC_REQUIRED_PARTITION_SENTINEL);
+            send_non_replicated_bytes(
+                shard,
+                request,
+                transport_client_id,
+                body,
+                channel,
+                "poll_deferred_resync",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            return;
+        }
+    };
+    let (guard, cancellation) =
+        match SessionManager::begin_deferred_request(sessions, transport_client_id, watchdog) {
+            Ok(active) => active,
+            Err(error) => {
+                send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
+        };
+    let response_queued = Cell::new(false);
+    let outcome = {
+        let operation = Abortable::new(
+            async {
+                let mut reply = read_deferred_poll(shard, request, resolved).await?;
+                let written = reply.track_write();
+                shard
+                    .bus
+                    .send_to_client(transport_client_id, reply)
+                    .await
+                    .map_err(|_| IggyError::ShardCommunicationError)?;
+                response_queued.set(true);
+                written
+                    .await
+                    .map_err(|_| IggyError::ShardCommunicationError)
+            },
+            cancellation,
+        );
+        let operation = pin!(operation);
+        let timeout = pin!(shard.bus.sleep(watchdog));
+        match select(operation, timeout).await {
+            Either::Left((Ok(result), _)) => Some(result),
+            Either::Left((Err(_), _)) => None,
+            Either::Right(_) => Some(Err(IggyError::ShardCommunicationError)),
+        }
+    };
+    if matches!(outcome, Some(Ok(()))) {
+        guard.written();
+    }
+    drop(guard);
+    // A queued reply can still reach the peer after the write watchdog expires.
+    if let Some(Err(error)) = outcome
+        && !response_queued.get()
+    {
+        send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+    }
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]

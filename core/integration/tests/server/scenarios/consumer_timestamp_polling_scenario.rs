@@ -183,7 +183,6 @@ async fn consume_with_strategy(
             AutoCommitWhen::ConsumingAllMessages,
         ))
         .polling_strategy(strategy)
-        .poll_interval(IggyDuration::from_str("2ms").unwrap())
         .batch_length(BATCH_LENGTH)
         .build();
 

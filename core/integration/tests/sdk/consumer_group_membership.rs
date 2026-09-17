@@ -105,7 +105,6 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .batch_length(1)
-        .poll_interval(IggyDuration::new(Duration::from_millis(100)))
         .auto_join_consumer_group()
         .do_not_create_consumer_group_if_not_exists()
         .build();

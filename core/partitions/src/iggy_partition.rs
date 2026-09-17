@@ -222,6 +222,7 @@ where
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Identity shared with pending polls and replaced when their history retires.
     poll_history: PollHistoryId,
+    poll_notifier: Option<Rc<dyn Fn()>>,
     /// Committed consumer-offset membership and values. This is deliberately
     /// separate from the eager poll maps because follower-local and uncommitted
     /// auto-commit progress must never consume a durable slot or enter a state
@@ -614,6 +615,7 @@ where
             fatal: None,
             pending_consumer_offset_commits: HashMap::new(),
             poll_history: PollHistoryId::default(),
+            poll_notifier: None,
             durable_consumer_offsets: DurableConsumerOffsets::default(),
             consumer_offset_capacity: ConsumerOffsetCapacity::new(
                 ConsumerKind::Consumer,
@@ -1611,6 +1613,7 @@ where
             let raise = !seeded || self.offset.load(Ordering::Acquire) < committed_end;
             if raise {
                 self.offset.store(committed_end, Ordering::Release);
+                self.publish_poll_visibility();
             }
             raise
         });
@@ -1634,6 +1637,7 @@ where
         // the pre-first-flush shape, where the committed counter still seeds
         // nothing.
         self.offset_space.committed_seeded |= frontier > 0;
+        self.publish_poll_visibility();
     }
 
     /// Path of the anchor whose lifecycle is this segment's.
@@ -1654,11 +1658,12 @@ where
     /// because a segment on disk holds committed messages only). Everything on
     /// the live path moves ONE bit -- see [`Self::note_append_live`] and
     /// [`Self::note_committed_seeded`].
-    pub const fn set_offset_space_used(&mut self, used: bool) {
+    pub fn set_offset_space_used(&mut self, used: bool) {
         self.offset_space = OffsetSpace {
             append_live: used,
             committed_seeded: used,
         };
+        self.publish_poll_visibility();
     }
 
     /// The append counter is live: an offset has been journaled, so the next
@@ -1679,9 +1684,10 @@ where
     /// Implies the append counter is live too -- nothing commits that was not
     /// journaled first -- but the reverse does not hold, which is the whole
     /// reason the two bits are separate.
-    pub const fn note_committed_seeded(&mut self) {
+    pub fn note_committed_seeded(&mut self) {
         self.offset_space.append_live = true;
         self.offset_space.committed_seeded = true;
+        self.publish_poll_visibility();
     }
 
     /// Whether this partition ever stamped an offset, i.e. whether its offset
@@ -1762,6 +1768,7 @@ where
             .max(durable)
             .max(self.dirty_offset.load(Ordering::Relaxed));
         self.offset.store(durable, Ordering::Release);
+        self.publish_poll_visibility();
         self.dirty_offset.store(dirty, Ordering::Relaxed);
         self.set_offset_space_used(true);
         // Everything carried over is already persisted as far as this replica is
@@ -2971,7 +2978,27 @@ where
     /// their reads have already completed.
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.poll_history = PollHistoryId::default();
+        self.publish_poll_visibility();
         self.discard_queued_auto_commits();
+    }
+
+    pub fn poll_visibility(&self) -> (PollHistoryId, Option<u64>) {
+        (
+            self.poll_history,
+            self.offset_space
+                .committed_seeded
+                .then(|| self.offset.load(Ordering::Acquire)),
+        )
+    }
+
+    pub fn set_poll_notifier(&mut self, notifier: Option<Rc<dyn Fn()>>) {
+        self.poll_notifier = notifier;
+    }
+
+    pub(crate) fn publish_poll_visibility(&self) {
+        if let Some(notify) = &self.poll_notifier {
+            notify();
+        }
     }
 
     fn discard_queued_auto_commits(&self) {
@@ -3793,6 +3820,35 @@ where
         }
     }
 
+    pub(crate) fn build_bounded_poll_plan(
+        &mut self,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+        validate_checksum: bool,
+        max_bytes: usize,
+    ) -> Result<PollPlan, IggyError> {
+        // Source snapshots, sparse copies and fragment descriptors can coexist.
+        const RESIDENT_ALLOCATION_FACTOR: usize = 4;
+        // Covers file paths, read handles and fixed IO/selection bookkeeping.
+        const READ_METADATA_BYTES: usize = 64 * 1024;
+        let resident_bytes = self.log.journal().inner.resident_message_bytes()?;
+        let segment_bytes = self
+            .log
+            .segments()
+            .len()
+            .saturating_mul(size_of::<DiskSegment>());
+        // Selection may copy sparse fragments while the source snapshot remains live.
+        if resident_bytes
+            .saturating_mul(RESIDENT_ALLOCATION_FACTOR)
+            .saturating_add(segment_bytes)
+            .saturating_add(READ_METADATA_BYTES)
+            > max_bytes
+        {
+            return Err(IggyError::InvalidSizeBytes);
+        }
+        Ok(self.build_poll_plan(consumer, args, validate_checksum))
+    }
+
     /// Snapshot read resources synchronously on the partition owner.
     /// Only the owned snapshot crosses a suspension during disk I/O.
     #[allow(clippy::too_many_lines)]
@@ -3886,9 +3942,10 @@ where
 
         if serve_journal_first {
             let tier = match self.journal_get_sync(&query) {
-                Some((fragments, last_matching_offset)) => PollTier::Resident {
+                Some((fragments, last_matching_offset, message_count)) => PollTier::Resident {
                     fragments,
                     last_matching_offset,
+                    message_count,
                 },
                 None => PollTier::Empty,
             };
@@ -6051,6 +6108,7 @@ where
         if let Some(durable_offset) = durable_offset {
             self.note_committed_seeded();
             self.offset.store(durable_offset, Ordering::Release);
+            self.publish_poll_visibility();
             self.stats.set_current_offset(durable_offset);
         }
         Ok(true)
@@ -6541,6 +6599,7 @@ where
                         .is_none_or(|durable| end_offset > durable)
                     {
                         self.offset.store(end_offset, Ordering::Release);
+                        self.publish_poll_visibility();
                         self.stats.set_current_offset(end_offset);
                         // Advance the aggregate stats with the visible offset. Disk
                         // persistence is threshold-gated in `commit_messages`, which
@@ -7778,6 +7837,7 @@ where
         // reads the counter, and the partition write lock is held across this
         // whole body.
         self.offset.store(start_offset, Ordering::Release);
+        self.publish_poll_visibility();
         self.dirty_offset.store(start_offset, Ordering::Relaxed);
         self.set_offset_space_used(false);
 
@@ -12349,6 +12409,8 @@ mod tests {
             fragments,
             commit_offset: partition.offsets().commit_offset,
             last_matching_offset,
+            message_count: u32::from(last_matching_offset.is_some()),
+            read_error: None,
         }
     }
 

@@ -30,6 +30,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 
+const PREFETCH_BATCHES: u32 = 16;
+
 pub struct HighLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
     config: BenchmarkConsumerConfig,
@@ -56,6 +58,10 @@ impl HighLevelConsumerClient {
 }
 
 impl ConsumerClient for HighLevelConsumerClient {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The borrowed consumer retains reservations until its buffered messages are drained."
+    )]
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
         let consumer = self.consumer.as_mut().expect("Consumer not initialized");
 
@@ -108,38 +114,47 @@ impl ConsumerClient for HighLevelConsumerClient {
 }
 
 impl BenchmarkInit for HighLevelConsumerClient {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The initialized consumer moves into self and must retain its prefetch reservations."
+    )]
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id_str = "topic-1";
         let client = self.client_factory.create_authenticated_client().await?;
-
-        let stream_id_str = self.config.stream_id.clone();
-
-        let mut consumer = if let Some(cg_id) = self.config.consumer_group_id {
-            let consumer_group_name = format!("cg_{cg_id}");
+        let stream_id_str = &self.config.stream_id;
+        let builder = if let Some(cg_id) = self.config.consumer_group_id {
             client
-                .consumer_group(&consumer_group_name, &stream_id_str, topic_id_str)?
-                .batch_length(self.config.messages_per_batch.get())
+                .consumer_group(&format!("cg_{cg_id}"), stream_id_str, topic_id_str)?
                 .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
                 .create_consumer_group_if_not_exists()
                 .auto_join_consumer_group()
-                .build()
         } else {
-            // TODO(hubcio): as of now, there is no way to mimic the behavior of
-            // PollingKind::Offset, because high level API doesn't provide method
-            // to commit local offset manually, only auto-commit on server.
             client
                 .consumer(
                     &format!("hl_consumer_{}", self.config.consumer_id),
-                    &stream_id_str,
+                    stream_id_str,
                     topic_id_str,
                     0,
                 )?
                 .polling_strategy(PollingStrategy::offset(0))
-                .batch_length(self.config.messages_per_batch.get())
                 .auto_commit(AutoCommit::Disabled)
-                .build()
         };
-
+        let mut consumer = builder
+            .batch_length(self.config.messages_per_batch.get())
+            .poll_options(self.config.poll_options)
+            .prefetch_messages(
+                self.config
+                    .messages_per_batch
+                    .get()
+                    .saturating_mul(PREFETCH_BATCHES),
+            )
+            .prefetch_bytes(
+                self.config
+                    .poll_options
+                    .max_bytes
+                    .saturating_mul(PREFETCH_BATCHES),
+            )
+            .build();
         consumer.init().await?;
         self.consumer = Some(consumer);
         self.client = Some(Box::new(client));

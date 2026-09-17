@@ -76,6 +76,7 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
+pub use iggy_binary_protocol::requests::messages::MAX_DEFERRED_POLL_WAIT_US;
 pub use iggy_binary_protocol::responses::messages::{
     SendMessagesConfirmationResponse, SendMessagesResponse,
 };
@@ -86,7 +87,6 @@ pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;
 pub use traits::consumer_group_client::ConsumerGroupClient;
 pub use traits::consumer_offset_client::ConsumerOffsetClient;
-pub use traits::decode_send_confirmations;
 pub use traits::message_client::MessageClient;
 pub use traits::partition_client::PartitionClient;
 pub use traits::partitioner::Partitioner;
@@ -98,6 +98,7 @@ pub use traits::system_client::SystemClient;
 pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
+pub use traits::{decode_send_confirmations, sync_group_assignment};
 pub use types::args::*;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;

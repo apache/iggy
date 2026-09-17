@@ -49,6 +49,10 @@ Supported scalar fields and indexed list entries use environment variables with 
 
 Source destination topics must persist every acknowledged batch before the runtime checkpoints the source or invokes its Ack hook. Missing topics are therefore created with `durability = "persisted"` and `messages_required_to_save = 1`. An existing topic must use `durability = "persisted"`; its save threshold may differ because persisted acknowledgments already wait for durable storage.
 
+Sink consumers use the Rust SDK's default long polling. A configured stream
+`poll_interval` is deprecated: the runtime logs a warning and ignores it.
+Existing explicit sink auto-commit policies still apply.
+
 ## State storage
 
 Source plugins can supply optional checkpoint bytes. The runtime stores these opaque bytes using the backend selected by `state.storage`:

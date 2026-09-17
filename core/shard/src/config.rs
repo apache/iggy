@@ -46,3 +46,26 @@ impl Default for CoordinatorConfig {
         }
     }
 }
+
+/// Owner-local deferred poll limits. Running reads retain their byte reservation
+/// until I/O and completion delivery end, even if their caller disconnects.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredPollConfig {
+    pub max_wait_us: u64,
+    pub max_pending: usize,
+    pub max_pending_per_session: usize,
+    pub max_read_bytes: usize,
+    pub max_inflight_bytes: usize,
+}
+
+impl Default for DeferredPollConfig {
+    fn default() -> Self {
+        Self {
+            max_wait_us: 30_000_000,
+            max_pending: 1024,
+            max_pending_per_session: 64,
+            max_read_bytes: 16 * 1024 * 1024,
+            max_inflight_bytes: 64 * 1024 * 1024,
+        }
+    }
+}

@@ -112,6 +112,63 @@ pub trait MessageClient {
         .await
     }
 
+    /// Wait for the readiness minimum and return up to `count` messages.
+    /// Expiry returns an available partial; response bytes are independently bounded.
+    /// A lost response can follow progress admission; see `poll_messages`.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_messages_deferred(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        count: u32,
+        auto_commit: bool,
+        options: crate::DeferredPollOptions,
+    ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_strategy_for_and_options(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            &|_| *strategy,
+            count,
+            auto_commit,
+            Some(options),
+        )
+        .await
+    }
+
+    /// Deferred polling with the strategy resolved after choosing a partition.
+    /// Custom transports must opt in; positive waits never silently downgrade.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_messages_with_strategy_for_and_options(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+        options: Option<crate::DeferredPollOptions>,
+    ) -> Result<PolledMessages, IggyError> {
+        if options.is_some() {
+            return Err(IggyError::FeatureUnavailable);
+        }
+        self.poll_messages_with_strategy_for(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy_for,
+            count,
+            auto_commit,
+        )
+        .await
+    }
+
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to send the messages.
