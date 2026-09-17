@@ -37,7 +37,7 @@ use iggy_common::IggyError;
 use partitions::PollReadResult;
 use server_common::sharding::IggyNamespace;
 
-use super::PollCompleted;
+use super::{ConsumerAttachment, PollCompleted};
 use crate::coordinator::classify_try_send_err;
 use crate::metrics::{FrameDropMetrics, ShardMetrics, frame_drop_reason, frame_drop_variant};
 use crate::{PartitionReadReply, Receiver, Sender, channel};
@@ -77,6 +77,7 @@ impl PollCompletionLane {
         &self,
         namespace: IggyNamespace,
         reply: Sender<PartitionReadReply>,
+        attachment: Option<ConsumerAttachment>,
     ) -> Option<PollCompletionSender> {
         if self.state.closed.load(Ordering::Relaxed) || self.sender.is_disconnected() {
             reject(&reply, &self.state.metrics, frame_drop_reason::DISCONNECTED);
@@ -100,6 +101,7 @@ impl PollCompletionLane {
             },
             namespace,
             reply,
+            attachment,
         })
     }
 
@@ -152,6 +154,7 @@ pub struct PollCompletionSender {
     slot: CompletionSlot,
     namespace: IggyNamespace,
     reply: Sender<PartitionReadReply>,
+    attachment: Option<ConsumerAttachment>,
 }
 
 impl PollCompletionSender {
@@ -172,6 +175,7 @@ impl PollCompletionSender {
                 namespace: self.namespace,
                 result,
                 reply: self.reply,
+                attachment: self.attachment,
                 #[cfg(feature = "poll-diagnostics")]
                 queued_at: Some(std::time::Instant::now()),
             }),
@@ -284,7 +288,7 @@ mod tests {
         let (pending_read, _pending_replies) = reserve_read(&lane);
         let (reply, rejected_replies) = channel(1);
 
-        assert!(lane.try_reserve(namespace(), reply).is_none());
+        assert!(lane.try_reserve(namespace(), reply, None).is_none());
         assert!(matches!(
             rejected_replies.try_recv(),
             Ok(PartitionReadReply::Rejected(
@@ -312,7 +316,7 @@ mod tests {
         ));
 
         let (next_reply, _next_replies) = channel(1);
-        assert!(lane.try_reserve(namespace(), next_reply).is_none());
+        assert!(lane.try_reserve(namespace(), next_reply, None).is_none());
 
         // Dequeue frees capacity even while owner validation still holds bytes.
         let _result_for_owner = lane.try_recv().expect("result reaches owner");
@@ -330,7 +334,7 @@ mod tests {
         let (pending_read, replies) = reserve_read(&lane);
         drop(replies);
         let (next_reply, _next_replies) = channel(1);
-        assert!(lane.try_reserve(namespace(), next_reply).is_none());
+        assert!(lane.try_reserve(namespace(), next_reply, None).is_none());
 
         pending_read.complete(read_empty_partition());
         assert_eq!(
@@ -361,7 +365,7 @@ mod tests {
         assert_eq!(lane.len(), 0);
         assert_eq!(lane.state.reserved.load(Ordering::Relaxed), 0);
         let (next_reply, next_replies) = channel(1);
-        assert!(lane.try_reserve(namespace(), next_reply).is_none());
+        assert!(lane.try_reserve(namespace(), next_reply, None).is_none());
         assert!(matches!(
             next_replies.try_recv(),
             Ok(PartitionReadReply::Rejected(
@@ -453,7 +457,7 @@ mod tests {
     ) -> (PollCompletionSender, Receiver<PartitionReadReply>) {
         let (reply, replies) = channel(1);
         let reservation = lane
-            .try_reserve(namespace(), reply)
+            .try_reserve(namespace(), reply, None)
             .expect("scenario has capacity for this read");
         (reservation, replies)
     }

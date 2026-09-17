@@ -910,10 +910,9 @@ async fn shard_main(
     }
 
     // Listeners (replica + every client transport) bind on shard 0 only.
-    // Shard 0's coordinator round-robins inbound TCP/WS connections to
-    // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
-    // locally on shard 0 (their per-connection state is non-portable -
-    // see `LifecycleFrame::ClientWsConnectionSetup` rustdoc).
+    // The coordinator delegates TCP/WS/TCP-TLS/WSS before any handshake;
+    // the destination shard owns all connection state and I/O.
+    // QUIC terminates locally on shard 0 through its shared UDP endpoint.
     if shard_id == 0 {
         let coord = shard
             .coordinator()

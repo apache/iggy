@@ -45,11 +45,43 @@ pub const API_KEY_CREATE_TOPICS: i16 = 19;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
+/// Generic catch-all. Not sent by any stub response today; the `bridge` module's error mapping
+/// uses it for an `IggyError` with no closer Kafka analogue.
+pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 pub const ERROR_NONE: i16 = 0;
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 /// Retriable; Produce stub uses this until the Iggy bridge persists records.
 pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
+/// `bridge`'s mapping for `IggyError::TransientNotCommitted`: the request's outcome is genuinely
+/// unknown (neither confirmed applied nor confirmed rejected).
+///
+/// Retriable in real Kafka too (`TimeoutException extends RetriableException`; the Java producer's
+/// `Sender.canRetry` treats it the same as `NOT_LEADER_OR_FOLLOWER`) - this is not chosen to make
+/// clients stop retrying. It is chosen because it is the code a real broker sends for the same
+/// unknown-outcome shape (an ack that timed out with no confirmation either way), and Kafka has no
+/// dedicated "outcome unknown, retry could duplicate" code. The duplicate-write risk on retry is
+/// real regardless of which retriable code is sent; it closes only once `#3535` has an idempotent
+/// produce path, not by picking a different error code here.
+pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
+/// `bridge`'s mapping for a Kafka-side topic name that fails Kafka's own naming rules.
+///
+/// Empty, whitespace-padded, over 249 bytes, or outside `[A-Za-z0-9._-]`, checked before any Iggy
+/// call is made - a real Kafka client library validates topic names client-side and would never
+/// send one of these, but a raw/non-conformant client could.
+pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
+/// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
+///
+/// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
+/// misstate the failure point. Not sent by any stub response today.
+pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
+/// `bridge`'s mapping for `BridgeError::PartitionCountMismatch`: the topic exists, just not with
+/// the requested partition count.
+///
+/// Not [`ERROR_INVALID_PARTITIONS`] - `kafka-protocol`'s own error table (`error.rs`) defines that
+/// code's text as "Number of partitions is below 1", which is a different condition (a client
+/// asking for zero/negative partitions) than "this topic already exists with a different count".
+pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).

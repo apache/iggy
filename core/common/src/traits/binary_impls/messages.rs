@@ -29,9 +29,7 @@ use bytes::BytesMut;
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
-use iggy_binary_protocol::codes::{
-    FLUSH_UNSAVED_BUFFER_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
-};
+use iggy_binary_protocol::codes::{FLUSH_UNSAVED_BUFFER_CODE, SEND_MESSAGES_CODE};
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
     FlushUnsavedBufferRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
@@ -211,10 +209,7 @@ async fn poll_group_messages<B: BinaryClient>(
             count,
             auto_commit,
         };
-        match client
-            .send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
-            .await
-        {
+        match client.send_poll_with_response(&request).await {
             Ok(response) => {
                 let polled = PolledMessages::from_bytes(response)?;
                 // The coordinator can't yet signal a generation fence as a typed
@@ -336,9 +331,7 @@ impl<B: BinaryClient> MessageClient for B {
             count,
             auto_commit,
         };
-        let response = self
-            .send_raw_with_response(POLL_MESSAGES_CODE, req.to_bytes())
-            .await?;
+        let response = self.send_poll_with_response(&req).await?;
         PolledMessages::from_bytes(response)
     }
 

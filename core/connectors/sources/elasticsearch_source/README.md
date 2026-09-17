@@ -1,19 +1,29 @@
 # Elasticsearch Source Connector with State Management
 
-This Elasticsearch source connector provides comprehensive state management capabilities to track processing progress and enable fault-tolerant data ingestion.
+This connector polls Elasticsearch documents and returns JSON messages with a
+checkpoint to the Iggy connectors runtime.
 
 ## Features
 
-- **Incremental Data Processing**: Track last processed timestamp to avoid reprocessing data
-- **Cursor-based Pagination**: Support for document ID-based cursors
-- **Scroll-based Pagination**: Support for Elasticsearch scroll API
-- **Error Tracking**: Monitor error counts and last error messages
-- **Processing Statistics**: Track performance metrics and processing times
-- **Persistent State Storage**: Multiple storage backends (file, Elasticsearch, Redis)
-- **Auto-save**: Configurable automatic state persistence
-- **State Recovery**: Resume processing from last known position after restart
+- **Incremental Data Processing**: Use a top-level RFC3339 timestamp string as a watermark, subject to the timestamp limitations below.
+- **Error Tracking**: Monitor error counts and last error messages.
+- **Processing Statistics**: Track fetched documents, payload bytes and successful-poll durations, including empty polls.
+- **Persistent State Storage**: Return MessagePack checkpoints to the runtime's file or HTTP state backend.
+- **State Recovery**: Restore the runtime checkpoint on restart; optional plugin JSON snapshots can override it.
 
 ## Configuration
+
+From the matching 0.9.0/edge Iggy checkout root, build the plugin:
+
+```bash
+cargo build --release -p iggy_connector_elasticsearch_source
+```
+
+Use the [source guide](https://iggy.apache.org/docs/connectors/sources/source/)
+for the broker credentials and main runtime configuration. The
+[Elasticsearch source walkthrough](https://iggy.apache.org/docs/connectors/sources/elasticsearch/)
+provides local backend, index and Iggy CLI commands. Create a matching index
+before starting the connector and start the runtime from the checkout root.
 
 ### Basic Configuration
 
@@ -38,238 +48,105 @@ index = "logs-*"
 polling_interval = "30s"
 batch_size = 100
 timestamp_field = "@timestamp"
-query = {
-  "match_all": {}
-}
+
+[plugin_config.query.match_all]
 ```
 
-### State Management Configuration
+| Field | Default | Behavior |
+| --- | --- | --- |
+| `url` | required | Elasticsearch URL. |
+| `index` | required | Index expression; startup checks that it exists and is accessible. |
+| `username` / `password` | none | Basic authentication is enabled only when both are present. |
+| `query` | `match_all` | Structured Elasticsearch Query DSL object, represented by TOML tables. |
+| `polling_interval` | `10s` | Delay before each poll; invalid strings fall back to `10s`, zero is accepted. |
+| `batch_size` | `100` | Search size per poll; zero returns no hits. Elasticsearch applies its result-window limit. |
+| `timestamp_field` | none | Top-level RFC3339 string field used to advance the watermark. |
+| `scroll_timeout` | none | Accepted but unused; the connector does not use scroll. |
+| `state` | none | Optional, separate plugin JSON snapshot configuration described below. |
 
-```toml
-[plugin_config]
-# ... basic config ...
-state = {
-  enabled = true
-  storage_type = "file"  # "file", "elasticsearch", "redis"
-  storage_config = {
-    base_path = "./connector_states"  # for file storage
-    # index = "connector_states"      # for elasticsearch storage
-    # url = "redis://localhost:6379"  # for redis storage
-  }
-  state_id = "elasticsearch_logs_connector"
-  auto_save_interval = "5m"
-  tracked_fields = [
-    "last_poll_timestamp",
-    "last_document_id",
-    "total_documents_fetched"
-  ]
-}
-```
+The local connector file remains TOML. `plugin_config_format` selects the default
+format of the HTTP API's plugin-config response; it does not change local file
+parsing or the JSON passed through the FFI.
+
+## Polling and Delivery
+
+Each poll sleeps first, then searches with the configured query and batch size,
+sorted ascending by `timestamp_field`, or `@timestamp` when it is unset. The
+index mapping must support that sort. Each hit with `_source` becomes one JSON
+message. Elasticsearch `_id` is not included automatically or used as an Iggy
+message ID. The plugin leaves message headers and timestamps unset.
+
+With a timestamp field, searches filter values strictly greater than the last
+acknowledged watermark. The watermark is extracted only from top-level RFC3339
+strings; numeric dates, date-only strings and nested paths do not advance it.
+Without a usable timestamp, polls repeat the first matching batch.
+
+There is no document-ID tiebreaker, scroll or `search_after` pagination. If a
+timestamp group spans multiple batches, the remaining tied documents are skipped
+after the watermark advances. Late arrivals and updates at or below the watermark
+are also skipped. This is not a complete change-data-capture feed.
+
+The candidate watermark is returned in the checkpoint and committed in memory
+only after the runtime sends the batch, saves the checkpoint and returns `Ack`.
+`Nack` keeps the previous watermark, making those documents eligible for another
+poll. Fetched counters include these retries. Replayed messages have no stable
+Iggy ID from this plugin, so consumers must allow for duplicates.
+
+HTTP/search/JSON failures, `timed_out: true` and nonzero `_shards.failed` return a
+poll error without advancing progress. The next poll retries after the configured
+delay. There is no per-query retry loop or configured HTTP request timeout.
+Poll errors are logged by the SDK; they do not change runtime connector status
+or increment the runtime forwarding-error counter.
 
 ## State Information
 
-The connector tracks the following state information:
+The runtime checkpoint contains:
 
-### Processing State
+- `last_poll_timestamp`: Timestamp watermark for the returned batch.
+- `total_documents_fetched`: Number of `_source` records fetched, including retries.
+- `poll_count`: Successful search polls, including empty ones.
+- `error_count` and `last_error`: Search failures and the latest error text.
+- `processing_stats`: Payload bytes, average successful-poll elapsed milliseconds, last successful poll, empty polls and successful polls.
 
-- `last_poll_timestamp`: Last successful poll timestamp
-- `total_documents_fetched`: Total number of documents processed
-- `poll_count`: Number of polling cycles executed
-- `last_document_id`: Last processed document ID (for cursor pagination)
-- `last_scroll_id`: Last scroll ID (for scroll pagination)
-- `last_offset`: Last processed offset
+Successful polls include empty polls. Average duration includes the configured
+polling delay, and payload bytes count serialized `_source` values, excluding
+Elasticsearch response metadata. `last_document_id`, `last_scroll_id` and
+`last_offset` remain in snapshots but do not drive polling.
 
-### Error Tracking
+The runtime saves the MessagePack checkpoint after sending the batch, including
+empty successful polls. Its default file backend uses
+`local_state/source_<key>.state`; the main runtime `[state]` configuration can
+change that location or select HTTP storage. Invalid MessagePack state warns
+and starts fresh. No plugin state configuration is required for this path.
 
-- `error_count`: Total number of errors encountered
-- `last_error`: Last error message
+### Optional Plugin JSON Snapshot
 
-### Performance Statistics
-
-- `total_bytes_processed`: Total bytes processed
-- `avg_batch_processing_time_ms`: Average processing time per batch
-- `last_successful_poll`: Timestamp of last successful poll
-- `empty_polls_count`: Number of polls that returned no documents
-- `successful_polls_count`: Number of successful polls
-
-## Storage Backends
-
-### File Storage (Default)
+Append this configuration only when the separate plugin snapshot is needed:
 
 ```toml
-state = {
-  enabled = true
-  storage_type = "file"
-  storage_config = {
-    base_path = "./connector_states"
-  }
-}
+[plugin_config.state]
+enabled = true
+storage_type = "file"
+state_id = "elasticsearch_logs_connector"
+
+[plugin_config.state.storage_config]
+base_path = "./connector_states"
 ```
 
-### Elasticsearch Storage
+The plugin loads this JSON snapshot during `open()` and saves it during `close()`.
+Its loaded values can override the already-restored runtime checkpoint. The
+file name is `<state_id>.json`; without a state ID it uses
+`elasticsearch_source_<numeric_plugin_id>.json`, and the default base path is
+`./connector_states`. Missing directories are created when saving.
 
-```toml
-state = {
-  enabled = true
-  storage_type = "elasticsearch"
-  storage_config = {
-    index = "connector_states"
-    url = "http://localhost:9200"
-  }
-}
-```
+Only file storage is implemented. `storage_type = "elasticsearch"`, `"redis"` or
+an unknown type warns and falls back to `./connector_states`, ignoring the
+configured backend location. `auto_save_interval` and `tracked_fields` do not
+affect the runtime plugin. It does not start the separately exported
+`StateManager` background task.
 
-### Redis Storage
-
-```toml
-state = {
-  enabled = true
-  storage_type = "redis"
-  storage_config = {
-    url = "redis://localhost:6379"
-    key_prefix = "connector_states:"
-  }
-}
-```
-
-## Usage Examples
-
-### Basic Usage with State Management
-
-```rust
-use elasticsearch_source::{ElasticsearchSource, StateManagerExt};
-
-// Create connector with state management enabled
-let mut connector = ElasticsearchSource::new(id, config);
-
-// Open connector (automatically loads state if available)
-connector.open().await?;
-
-// Start polling (automatically saves state)
-let messages = connector.poll().await?;
-
-// Close connector (automatically saves final state)
-connector.close().await?;
-```
-
-### Manual State Management
-
-```rust
-use elasticsearch_source::{ElasticsearchSource, StateManagerExt};
-
-let mut connector = ElasticsearchSource::new(id, config);
-
-// Load state manually
-connector.load_state().await?;
-
-// Get current state
-let state = connector.get_state().await?;
-println!("Current state: {:?}", state);
-
-// Export state to JSON
-let state_json = connector.export_state().await?;
-println!("State JSON: {}", serde_json::to_string_pretty(&state_json)?);
-
-// Import state from JSON
-connector.import_state(state_json).await?;
-
-// Reset state
-connector.reset_state().await?;
-```
-
-### State Manager Utilities
-
-```rust
-use elasticsearch_source::{ElasticsearchSource, StateManagerExt};
-
-let connector = ElasticsearchSource::new(id, config);
-
-// Get state manager
-if let Some(state_manager) = connector.get_state_manager() {
-    // Get state statistics
-    let stats = state_manager.get_state_stats().await?;
-    println!("Total states: {}", stats.total_states);
-
-    // Clean up old states (older than 30 days)
-    let deleted_count = state_manager.cleanup_old_states(30).await?;
-    println!("Deleted {} old states", deleted_count);
-}
-```
-
-## State File Format
-
-State files are stored as JSON with the following structure:
-
-```json
-{
-  "id": "elasticsearch_logs_connector",
-  "last_updated": "2024-01-15T10:30:00Z",
-  "version": 1,
-  "data": {
-    "last_poll_timestamp": "2024-01-15T10:30:00Z",
-    "total_documents_fetched": 15000,
-    "poll_count": 150,
-    "last_document_id": "doc_12345",
-    "last_scroll_id": "scroll_abc123",
-    "last_offset": 15000,
-    "error_count": 2,
-    "last_error": "Connection timeout",
-    "processing_stats": {
-      "total_bytes_processed": 1048576,
-      "avg_batch_processing_time_ms": 125.5,
-      "last_successful_poll": "2024-01-15T10:30:00Z",
-      "empty_polls_count": 5,
-      "successful_polls_count": 145
-    }
-  },
-  "metadata": {
-    "connector_type": "elasticsearch_source",
-    "connector_id": 1,
-    "index": "logs-*",
-    "url": "http://localhost:9200"
-  }
-}
-```
-
-## Best Practices
-
-1. **State ID Uniqueness**: Use unique state IDs for different connector instances
-2. **Auto-save Interval**: Set appropriate auto-save intervals based on your data volume
-3. **Storage Location**: Use persistent storage locations for production deployments
-4. **State Cleanup**: Regularly clean up old state files to prevent disk space issues
-5. **Error Handling**: Monitor error counts and implement appropriate alerting
-6. **Backup**: Regularly backup state files for disaster recovery
-
-## Troubleshooting
-
-### Common Issues
-
-1. **State Not Loading**: Check file permissions and storage path
-2. **State Corruption**: Delete corrupted state files to start fresh
-3. **Performance Issues**: Adjust auto-save interval and batch sizes
-4. **Storage Full**: Implement state cleanup policies
-
-### Monitoring
-
-Monitor the following metrics:
-
-- State save/load success rates
-- Processing statistics
-- Error counts and types
-- Storage usage for state files
-
-## Migration
-
-To migrate from a connector without state management:
-
-1. Add state configuration to your connector config
-2. Set `enabled = true` in state config
-3. Restart the connector
-4. The connector will start tracking state from the next poll cycle
-
-To migrate between storage backends:
-
-1. Export state from current storage
-2. Update storage configuration
-3. Import state to new storage
-4. Restart connector
+This snapshot uses a direct JSON file write, separate from the runtime's atomic
+checkpoint protocol. Snapshot read/write failures warn and do not fail startup
+or close. To reset progress, stop the runtime and remove its checkpoint and any
+configured plugin snapshot. Removing only the runtime file leaves the plugin
+snapshot available for restoration.

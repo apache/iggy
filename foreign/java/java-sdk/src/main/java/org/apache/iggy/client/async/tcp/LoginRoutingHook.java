@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.user.IdentityInfo;
 
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
@@ -47,4 +48,6 @@ interface LoginRoutingHook {
      * is no session left to restore, and a redial must not resurrect one.
      */
     default void forgetLogin() {}
+
+    default void refreshLogin(String oldUsername, Optional<String> username, Optional<String> password) {}
 }

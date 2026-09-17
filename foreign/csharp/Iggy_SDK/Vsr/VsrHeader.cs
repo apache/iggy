@@ -45,6 +45,7 @@ internal static class VsrHeader
     internal const int REQUEST_RESERVED_OFFSET = 196;
 
     internal const int REPLY_OPERATION_OFFSET = 208;
+    internal const int REPLY_COMMIT_OFFSET = 184;
     internal const int REPLY_STATUS_OFFSET = 216;
 
     internal const int EVICTION_CLIENT_OFFSET = 128;

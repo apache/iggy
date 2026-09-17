@@ -467,7 +467,7 @@ mod tests {
 
         let sharding = &config.sharding;
         assert!(sharding.pin_cores);
-        assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.inbox_capacity, 65536);
         assert_eq!(sharding.reply_inbox_capacity, 1024);
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
@@ -487,7 +487,7 @@ mod tests {
             .expect("partial sharding table deserializes");
 
         assert!(!sharding.pin_cores);
-        assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.inbox_capacity, 65536);
         assert_eq!(sharding.reply_inbox_capacity, 1024);
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
@@ -504,7 +504,7 @@ mod tests {
             .expect("empty sharding table deserializes");
 
         assert!(sharding.pin_cores);
-        assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.inbox_capacity, 65536);
         assert_eq!(sharding.reply_inbox_capacity, 1024);
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
