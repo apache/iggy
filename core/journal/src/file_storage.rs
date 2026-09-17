@@ -207,7 +207,7 @@ mod tests {
     /// shard executor with no blocking pool. A modern test kernel supports
     /// `IORING_OP_FTRUNCATE`, so this does not reproduce compio's fallback.
     /// Unix-only: `create_shard_executor` keeps the zero blocking-pool limit
-    /// on io_uring targets only, so the premise does not hold elsewhere.
+    /// on `io_uring` targets only, so the premise does not hold elsewhere.
     #[cfg(unix)]
     #[test]
     fn given_a_shard_executor_with_no_blocking_pool_when_truncating_should_repair_the_file() {
