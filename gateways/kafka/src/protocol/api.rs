@@ -20,7 +20,8 @@ use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, MetadataResponseTopic};
 use kafka_protocol::messages::{
     ApiVersionsRequest, ApiVersionsResponse, BrokerId, CreateTopicsRequest, FetchRequest,
-    ListOffsetsRequest, MetadataRequest, MetadataResponse, ProduceRequest, TopicName,
+    ListOffsetsRequest, MetadataRequest, MetadataResponse, ProduceRequest, SaslAuthenticateRequest,
+    SaslHandshakeRequest, TopicName,
 };
 use kafka_protocol::protocol::{Decodable, StrBytes};
 
@@ -28,20 +29,24 @@ use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::bounds_guard::{
     validate_api_versions_shape, validate_create_topics_shape, validate_fetch_shape,
     validate_list_offsets_shape, validate_metadata_shape, validate_produce_shape,
+    validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
 use crate::protocol::responses::{
     encode_create_topics_error_response, encode_create_topics_response,
     encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
     encode_list_offsets_response, encode_message, encode_produce_error_response,
-    encode_produce_response,
+    encode_produce_response, encode_sasl_authenticate_response, encode_sasl_handshake_response,
 };
+use crate::protocol::sasl::SaslMechanism;
 
 pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
 pub const API_KEY_LIST_OFFSETS: i16 = 2;
 pub const API_KEY_METADATA: i16 = 3;
+pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
@@ -74,6 +79,12 @@ pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
 /// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
 /// misstate the failure point. Not sent by any stub response today.
 pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+/// The mechanism a client asked for in `SaslHandshake` is not one this gateway enables. The
+/// response still carries the enabled mechanism list, which is what the client prints.
+pub const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+/// A request arrived that is legal on the wire but not in this connection's SASL state: a token
+/// before a handshake, a normal request before authenticating, or a SASL request after.
+pub const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 /// `bridge`'s mapping for `BridgeError::PartitionCountMismatch`: the topic exists, just not with
 /// the requested partition count.
@@ -87,6 +98,12 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// The credentials themselves were rejected.
+///
+/// The accompanying message stays generic. Iggy's own login path runs a dummy hash for an unknown
+/// user specifically to avoid a user-enumeration oracle, and distinguishing "no such user" from
+/// "wrong password" here would reintroduce one.
+pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -95,6 +112,13 @@ pub enum HandleOutcome {
     Respond(Bytes),
     /// Produce with `acks=0`: write nothing, keep the connection open.
     NoResponse,
+    /// Write this response body, then close the TCP connection.
+    ///
+    /// Kafka's authentication failures are shaped this way: the client parses a correctly-shaped
+    /// error body at its own version and only then sees the connection drop. [`Self::Close`]
+    /// alone would leave it guessing, and [`Self::Respond`] would leave an unauthenticated
+    /// connection open.
+    RespondThenClose(Bytes),
     /// No parseable response exists for this request; close the TCP connection.
     Close,
 }
@@ -108,7 +132,7 @@ impl HandleOutcome {
     #[must_use]
     pub fn expect_response(self, msg: &str) -> Bytes {
         match self {
-            Self::Respond(body) => body,
+            Self::Respond(body) | Self::RespondThenClose(body) => body,
             Self::NoResponse => panic!("{msg}: got NoResponse"),
             Self::Close => panic!("{msg}: got Close"),
         }
@@ -122,6 +146,15 @@ impl HandleOutcome {
     #[must_use]
     pub const fn is_close(&self) -> bool {
         matches!(self, Self::Close)
+    }
+
+    /// Whether applying this outcome ends the connection, whether or not it writes first.
+    ///
+    /// Distinct from [`Self::is_close`], which asks only whether the connection ends *without* a
+    /// response. Callers deciding whether to keep reading want this one.
+    #[must_use]
+    pub const fn closes_connection(&self) -> bool {
+        matches!(self, Self::Close | Self::RespondThenClose(_))
     }
 }
 
@@ -185,6 +218,156 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
     SUPPORTED_RANGES
 }
 
+/// Advertised only when SASL is switched on, and deliberately absent from [`SUPPORTED_RANGES`].
+///
+/// These two keys never reach [`handle_request_bounded`]: the connection loop routes them through
+/// the SASL state machine before dispatch. Keeping them out of the firewall table means a gateway
+/// with SASL off treats them as any other unknown key and closes, which is what stops enabling the
+/// feature later from silently widening what an unauthenticated client can send today.
+///
+/// `SaslHandshake` is pinned to v1 on both ends. v0 selects the headerless token framing (KIP-152)
+/// that the frame reader cannot parse, so advertising it would invite exactly the shape this
+/// gateway refuses.
+static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
+    ApiVersionRange {
+        // Advertised from v0 even though only v1 is accepted, the same split
+        // [`advertised_min_version`] already applies to Produce. librdkafka gates its whole
+        // SASL-handshake feature on `SaslHandshake` v0 appearing in the advertisement
+        // (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so advertising v1
+        // alone makes it report "SASL Handshake not supported by broker" and give up before it
+        // ever sends one. It then picks v1 anyway, because `SaslAuthenticate` being advertised is
+        // what selects the KIP-152 framing. A client that really only knows v0 still gets
+        // `UNSUPPORTED_VERSION` and a closed connection from the state machine.
+        api_key: API_KEY_SASL_HANDSHAKE,
+        min_version: 0,
+        max_version: 1,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_SASL_AUTHENTICATE,
+        min_version: 0,
+        max_version: 2,
+    },
+];
+
+/// Sent with every `SASL_AUTHENTICATION_FAILED`, whatever the real cause.
+///
+/// Iggy's own login runs a dummy hash for an unknown user precisely so that "no such user" and
+/// "wrong password" are indistinguishable from the outside. Naming the cause here would undo that
+/// server-side care at the gateway. An unreachable Iggy reaches the client the same way, and the
+/// gateway's own log is where the difference is recorded.
+pub const SASL_AUTH_FAILED_MESSAGE: &str = "Authentication failed";
+
+/// Reads the mechanism name out of a `SaslHandshake` body without consuming the caller's copy.
+///
+/// # Errors
+///
+/// Returns an error when the body is not a well-formed `SaslHandshake` request at `api_version`.
+pub fn decode_sasl_mechanism(api_version: i16, body: Bytes) -> Result<String> {
+    let req = decode_guarded::<SaslHandshakeRequest>(api_version, body, |v, b| {
+        validate_sasl_handshake_shape(v, b)
+    })?;
+    Ok(req.mechanism.to_string())
+}
+
+/// Reads the opaque token out of a `SaslAuthenticate` body.
+///
+/// # Errors
+///
+/// Returns an error when the body is not a well-formed `SaslAuthenticate` request at
+/// `api_version`, including when its token exceeds the guard's size cap.
+pub fn decode_sasl_auth_bytes(api_version: i16, body: Bytes) -> Result<Bytes> {
+    let req = decode_guarded::<SaslAuthenticateRequest>(api_version, body, |v, b| {
+        validate_sasl_authenticate_shape(v, b)
+    })?;
+    Ok(req.auth_bytes)
+}
+
+/// `SaslHandshake` answer. `close` marks the refusal paths, where the response is written and the
+/// connection then dropped.
+#[must_use]
+pub fn sasl_handshake_outcome(api_version: i16, error_code: i16, close: bool) -> HandleOutcome {
+    // The mechanism list is what a client prints to tell its operator what to configure, so an
+    // unsupported-mechanism refusal carries it. `ILLEGAL_SASL_STATE` does not: the request was out
+    // of order, not mis-configured, and a real broker answers that one with an empty list. It also
+    // means a gateway with SASL switched off stops telling an unauthenticated scanner that it
+    // could speak PLAIN.
+    let mechanisms: &[&str] = if error_code == ERROR_ILLEGAL_SASL_STATE {
+        &[]
+    } else {
+        SaslMechanism::advertised()
+    };
+    let encoded = encode_sasl_handshake_response(api_version, error_code, mechanisms);
+    finish_sasl(encoded, close, "SaslHandshake")
+}
+
+/// `SaslAuthenticate` answer. `close` marks the refusal paths.
+#[must_use]
+pub fn sasl_authenticate_outcome(api_version: i16, error_code: i16, close: bool) -> HandleOutcome {
+    // Only a credential rejection carries the generic message. An `ILLEGAL_SASL_STATE` also
+    // travels on this response, and calling a protocol-ordering mistake an authentication failure
+    // would send the operator looking at credentials that were never presented.
+    let message =
+        (error_code == ERROR_SASL_AUTHENTICATION_FAILED).then_some(SASL_AUTH_FAILED_MESSAGE);
+    let encoded = encode_sasl_authenticate_response(api_version, error_code, message);
+    finish_sasl(encoded, close, "SaslAuthenticate")
+}
+
+fn finish_sasl(encoded: Result<Bytes>, close: bool, api_name: &str) -> HandleOutcome {
+    match encoded {
+        Ok(body) if close => HandleOutcome::RespondThenClose(body),
+        Ok(body) => HandleOutcome::Respond(body),
+        Err(error) => {
+            tracing::warn!(%error, "failed to encode {api_name} response; closing connection");
+            HandleOutcome::Close
+        }
+    }
+}
+
+/// Builds a well-formed error response for `api_key`, shaped for `api_version`.
+///
+/// Used when a request is refused for a reason that belongs to the connection rather than the
+/// request body, which today means `ILLEGAL_SASL_STATE` on an unauthenticated connection. A real
+/// broker answers from the offending request's own schema so the client can parse the body at the
+/// version it asked for, then drops the connection.
+///
+/// Two keys get [`HandleOutcome::Close`] with no body instead. Produce, because `acks=0` forbids a
+/// response and the acks value is not knowable without decoding a body this connection has not
+/// earned the right to have decoded. Metadata, because it carries no top-level error field at the
+/// versions this gateway supports, so there is no well-formed place to put the code.
+#[must_use]
+pub fn encode_error_for_key(
+    api_key: i16,
+    api_version: i16,
+    error_code: i16,
+    sasl_enabled: bool,
+) -> HandleOutcome {
+    // The firewall applies here too, and it has to be checked explicitly. `kafka_protocol`'s
+    // encoders accept a wider version range than `SUPPORTED_RANGES` does (Fetch to 18 against a
+    // firewall max of 12, for instance), so encoding at the version the client asked for would
+    // answer a pre-authentication Fetch v13 with a well-formed v13 body on the one path where the
+    // caller has proven nothing, while the dispatch path closes on the same request.
+    if !is_supported_version(api_key, api_version) {
+        return HandleOutcome::Close;
+    }
+    let encoded = match api_key {
+        API_KEY_FETCH => encode_fetch_error_response(api_version, error_code),
+        API_KEY_LIST_OFFSETS => encode_list_offsets_error_response(api_version, error_code),
+        API_KEY_CREATE_TOPICS => encode_create_topics_error_response(api_version, error_code),
+        // Carries the live SASL setting, not a hardcoded `false`: answering an illegal-state
+        // ApiVersions with a SASL-less key set contradicts the advertisement sent one frame
+        // earlier on the same connection.
+        API_KEY_API_VERSIONS => encode_api_versions_response(api_version, error_code, sasl_enabled),
+        _ => return HandleOutcome::Close,
+    };
+    match encoded {
+        Ok(body) => HandleOutcome::RespondThenClose(body),
+        Err(error) => {
+            tracing::debug!(%error, api_key, "no encodable error response; closing connection");
+            HandleOutcome::Close
+        }
+    }
+}
+
 /// Default `max_frame_size` used by [`handle_request`] - the ~150 direct call sites across this
 /// crate's test suite that don't care about the response-size guard specifically. Production
 /// traffic goes through [`handle_request_bounded`] instead (see `server.rs`'s call site), with
@@ -198,7 +381,14 @@ pub fn handle_request(
     body: Bytes,
     broker: &BrokerAdvertise,
 ) -> HandleOutcome {
-    handle_request_bounded(api_key, api_version, body, broker, DEFAULT_MAX_FRAME_SIZE)
+    handle_request_bounded(
+        api_key,
+        api_version,
+        body,
+        broker,
+        DEFAULT_MAX_FRAME_SIZE,
+        false,
+    )
 }
 
 /// Same as [`handle_request`], but rejects a request whose declared array/string lengths project
@@ -214,11 +404,19 @@ pub fn handle_request_bounded(
     body: Bytes,
     broker: &BrokerAdvertise,
     max_frame_size: usize,
+    sasl_enabled: bool,
 ) -> HandleOutcome {
     if api_key == API_KEY_PRODUCE {
         return handle_produce_request(api_version, body, max_frame_size);
     }
-    handle_other_request(api_key, api_version, body, broker, max_frame_size)
+    handle_other_request(
+        api_key,
+        api_version,
+        body,
+        broker,
+        max_frame_size,
+        sasl_enabled,
+    )
 }
 
 /// Decode `T` from the whole request body and reject unconsumed trailing bytes.
@@ -335,9 +533,10 @@ fn handle_other_request(
     body: Bytes,
     broker: &BrokerAdvertise,
     max_frame_size: usize,
+    sasl_enabled: bool,
 ) -> HandleOutcome {
     match api_key {
-        API_KEY_API_VERSIONS => handle_api_versions(api_version, body),
+        API_KEY_API_VERSIONS => handle_api_versions(api_version, body, sasl_enabled),
         API_KEY_METADATA => handle_metadata(api_version, body, broker, max_frame_size),
         API_KEY_FETCH => handle_versioned_request(
             API_KEY_FETCH,
@@ -384,17 +583,17 @@ fn handle_other_request(
     }
 }
 
-fn handle_api_versions(api_version: i16, body: Bytes) -> HandleOutcome {
+fn handle_api_versions(api_version: i16, body: Bytes, sasl_enabled: bool) -> HandleOutcome {
     if !is_supported_version(API_KEY_API_VERSIONS, api_version) {
         // KIP-511: reply with v0 when the requested version is not understood.
         return respond_or_close(
-            encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION),
+            encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION, sasl_enabled),
             "ApiVersions",
         );
     }
     match decode_guarded::<ApiVersionsRequest>(api_version, body, validate_api_versions_shape) {
         Ok(_) => respond_or_close(
-            encode_api_versions_response(api_version, ERROR_NONE),
+            encode_api_versions_response(api_version, ERROR_NONE, sasl_enabled),
             "ApiVersions",
         ),
         Err(error) => {
@@ -402,7 +601,7 @@ fn handle_api_versions(api_version: i16, body: Bytes) -> HandleOutcome {
             // note on the Produce decode-failure arm above).
             tracing::debug!(%error, "failed to decode ApiVersions request");
             respond_or_close(
-                encode_api_versions_response(api_version, ERROR_INVALID_REQUEST),
+                encode_api_versions_response(api_version, ERROR_INVALID_REQUEST, sasl_enabled),
                 "ApiVersions",
             )
         }
@@ -534,9 +733,23 @@ pub const fn advertised_min_version(api_key: i16, firewall_min: i16) -> i16 {
     }
 }
 
-fn encode_api_versions_response(api_version: i16, error_code: i16) -> Result<Bytes> {
-    let api_keys = SUPPORTED_RANGES
-        .iter()
+fn encode_api_versions_response(
+    api_version: i16,
+    error_code: i16,
+    sasl_enabled: bool,
+) -> Result<Bytes> {
+    let sasl_ranges = if sasl_enabled {
+        SASL_ADVERTISED_RANGES
+    } else {
+        &[]
+    };
+    // Ascending by api_key, as every real broker emits it. Chaining the SASL rows onto the end
+    // would otherwise produce 0,1,2,3,18,19,17,36. Java and librdkafka both re-key on receipt so
+    // they cope, but anything binary-searching the array would not.
+    let mut rows: Vec<&ApiVersionRange> = SUPPORTED_RANGES.iter().chain(sasl_ranges).collect();
+    rows.sort_unstable_by_key(|r| r.api_key);
+    let api_keys = rows
+        .into_iter()
         .map(|r| {
             ApiVersion::default()
                 .with_api_key(r.api_key)
