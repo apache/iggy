@@ -45,7 +45,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::*;
-use integration::harness::disk::leader_node_index_via;
+use integration::harness::disk::{leader_node_index_via, read_metadata_superblock_state};
 use integration::iggy_harness;
 use tokio::time::{Instant, sleep};
 
@@ -63,24 +63,7 @@ const REJOIN_SETTLE: Duration = Duration::from_secs(10);
 const SEND_BUDGET: Duration = Duration::from_secs(20);
 /// How long the late replica gets to show it has caught up.
 const CONVERGE_BUDGET: Duration = Duration::from_secs(30);
-const MARKER_POLL: Duration = Duration::from_millis(250);
-
-/// The late replica joining the view the others elected without it. Its own
-/// recorded view is 0, which names ITSELF primary, so this line is where it
-/// gives that up.
-const VIEW_ADOPTED_MARKER: &str = "adopting view from StartView";
-
-/// Markers that each independently prove the late replica pulled committed
-/// state it did not have. Which one fires depends on whether the gap sits
-/// above or below the serving peers' retained journal floor: repair refills
-/// from the peers' journals, state transfer is what a gap below the retained
-/// floor converts into. A cluster this small usually stays above the floor and
-/// repairs, but the size of the founding quorum's log is not something this
-/// test fixes, so either counts.
-const CAUGHT_UP_MARKERS: [&str; 2] = [
-    "metadata journal repair walked",
-    "metadata state transfer installed",
-];
+const CONVERGENCE_POLL: Duration = Duration::from_millis(250);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
@@ -119,12 +102,12 @@ async fn given_replica_zero_arrives_late_when_producing_to_a_fresh_topic_should_
         .root_client_for_node(leader)
         .await
         .expect("root client on the metadata leader");
-    setup
+    let created_stream = setup
         .create_stream(STREAM_NAME)
         .await
         .expect("create stream");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");
-    setup
+    let created_topic = setup
         .create_topic(
             &stream_id,
             TOPIC_NAME,
@@ -155,26 +138,28 @@ async fn given_replica_zero_arrives_late_when_producing_to_a_fresh_topic_should_
          be accepted, got {accepted:?}"
     );
 
-    // The late replica missed every op committed before it arrived. Read off
-    // its own log rather than through a client: the SDK redirects to the
-    // leader on connect, so a client dialing node 0 reports the leader's state,
-    // not node 0's.
+    // Local materialization requires applying CreateTopic and every preceding
+    // metadata op. Normal commit processing can finish catch-up without a
+    // repair-completion log, and an SDK read could redirect to another node.
+    let late_data_path = harness.node(0).data_path();
+    let partition_path = late_data_path.join(format!(
+        "streams/{}/topics/{}/partitions/{PARTITION_ID}",
+        created_stream.id, created_topic.id
+    ));
     let deadline = Instant::now() + CONVERGE_BUDGET;
     loop {
-        let late = harness.node(0);
-        let adopted_view = late.stdout_contains(VIEW_ADOPTED_MARKER);
-        let caught_up = CAUGHT_UP_MARKERS
-            .iter()
-            .any(|marker| late.stdout_contains(marker));
+        let adopted_view =
+            read_metadata_superblock_state(&late_data_path).is_some_and(|state| state.view > 0);
+        let caught_up = partition_path.is_dir();
         if adopted_view && caught_up {
             break;
         }
         assert!(
             Instant::now() < deadline,
             "the late replica 0 never converged within {CONVERGE_BUDGET:?} \
-             (adopted the live view: {adopted_view}, caught up on committed ops: {caught_up}); \
+             (adopted the live view: {adopted_view}, materialized replicated topic: {caught_up}); \
              the harness's all-nodes mesh gate is what normally keeps a node out of this position"
         );
-        sleep(MARKER_POLL).await;
+        sleep(CONVERGENCE_POLL).await;
     }
 }

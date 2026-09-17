@@ -218,7 +218,11 @@ impl TransportConn for TcpTlsTransportConn {
         let mut tls = match self.state {
             ConnState::Established(tls) => *tls,
             ConnState::Pending { stream, role } => {
-                match compio::time::timeout(handshake_grace, handshake(role, stream)).await {
+                let outcome = futures::select_biased! {
+                    () = ctx.shutdown.wait().fuse() => return,
+                    outcome = compio::time::timeout(handshake_grace, handshake(role, stream)).fuse() => outcome,
+                };
+                match outcome {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
                         warn!(

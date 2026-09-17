@@ -281,7 +281,7 @@ impl ServerHandle {
     fn build_envs(&mut self) -> Result<(), TestBinaryError> {
         // Pass through IGGY_* env vars from parent process, except those critical for test isolation.
         const PROTECTED_PREFIXES: &[&str] = &[
-            "IGGY_SYSTEM_PATH",
+            "IGGY_PATH",
             "IGGY_TCP_ADDRESS",
             "IGGY_HTTP_ADDRESS",
             "IGGY_QUIC_ADDRESS",
@@ -309,13 +309,13 @@ impl ServerHandle {
             Err(_) => "0..4".to_string(),
         };
         self.envs
-            .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
+            .entry("IGGY_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
         // On a 4-core CI runner every server computes the same `0..4` range, so
         // pinned shards of concurrently running tests pile onto the same cores
         // and starve each other. Leave thread placement to the scheduler.
         self.envs
-            .entry("IGGY_SYSTEM_SHARDING_PIN_CORES".to_string())
+            .entry("IGGY_SHARDING_PIN_CORES".to_string())
             .or_insert_with(|| "false".to_string());
 
         self.envs
@@ -326,10 +326,8 @@ impl ServerHandle {
             .or_insert_with(|| DEFAULT_ROOT_PASSWORD.to_string());
 
         let data_path = self.data_path();
-        self.envs.insert(
-            "IGGY_SYSTEM_PATH".to_string(),
-            data_path.display().to_string(),
-        );
+        self.envs
+            .insert("IGGY_PATH".to_string(), data_path.display().to_string());
 
         // Protocol enablement (special handling for defaults)
         if !self.config.quic_enabled {
@@ -351,10 +349,10 @@ impl ServerHandle {
         // Encryption (special handling for key injection)
         if let Some(ref enc) = self.config.encryption {
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string())
+                .entry("IGGY_ENCRYPTION_ENABLED".to_string())
                 .or_insert_with(|| "true".to_string());
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_KEY".to_string())
+                .entry("IGGY_ENCRYPTION_KEY".to_string())
                 .or_insert_with(|| enc.key.clone());
         }
 
@@ -951,7 +949,7 @@ impl TestBinary for ServerHandle {
             })?
         };
 
-        command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
+        command.env("IGGY_PATH", data_path.display().to_string());
         // VSR multi-node tests spawn N shards per node * M nodes per test;
         // the 4096-entry per-ring default exhausts dev memlock budgets
         // (`ulimit -l` is commonly 8 MiB). Shrink unless the caller already
@@ -966,11 +964,7 @@ impl TestBinary for ServerHandle {
         // ambient value could silently filter out markers the test asserts.
         // A caller that explicitly puts `RUST_LOG` in `extra_envs` adds it back
         // through `command.envs` below.
-        if self
-            .config
-            .extra_envs
-            .contains_key("IGGY_SYSTEM_LOGGING_LEVEL")
-        {
+        if self.config.extra_envs.contains_key("IGGY_LOGGING_LEVEL") {
             command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);

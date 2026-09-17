@@ -30,14 +30,15 @@
 //!   * source state-load failure (unreachable state file),
 //!   * post-container setup failure (invalid duration in stream config).
 
+use iggy_common::{Identifier, IggyMessage, MessageClient, Partitioning};
 use iggy_connector_sdk::api::{
-    ConnectorStatus, HealthResponse, SinkInfoResponse, SourceInfoResponse,
+    ConnectorRuntimeStats, ConnectorStatus, HealthResponse, SinkInfoResponse, SourceInfoResponse,
 };
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 async fn assert_runtime_healthy(http_client: &Client, api_address: &str) {
     let response = http_client
@@ -319,4 +320,81 @@ async fn source_with_invalid_config_does_not_abort_runtime(harness: &TestHarness
         valid_source.last_error.is_none(),
         "Healthy sibling source should have no last_error"
     );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(
+        config_path = "tests/connectors/runtime/sink_transform_error.toml"
+    )),
+    seed = seeds::connector_stream
+)]
+async fn given_sink_transform_error_when_batch_processed_should_not_count_filter(
+    harness: &TestHarness,
+) {
+    const SINK_KEY: &str = "stdout_transform_error";
+    const STATS_TIMEOUT: Duration = Duration::from_secs(10);
+    const STATS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("root client should connect");
+    let stream_id: Identifier = seeds::names::STREAM.try_into().expect("valid stream name");
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("valid topic name");
+    let mut messages = vec![
+        IggyMessage::from("not JSON"),
+        IggyMessage::from(r#"{"message":"valid"}"#),
+    ];
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("messages should reach Iggy");
+
+    let stats_url = format!(
+        "{}/stats",
+        harness
+            .connectors_runtime()
+            .expect("connector runtime should be available")
+            .http_url()
+    );
+    let http_client = Client::new();
+    let sink = timeout(STATS_TIMEOUT, async {
+        loop {
+            let snapshot: ConnectorRuntimeStats = http_client
+                .get(&stats_url)
+                .send()
+                .await
+                .expect("stats request should complete")
+                .error_for_status()
+                .expect("stats endpoint should succeed")
+                .json()
+                .await
+                .expect("stats response should decode");
+            let sink = snapshot
+                .connectors
+                .into_iter()
+                .find(|connector| connector.key == SINK_KEY)
+                .expect("sink should be reported");
+            if sink.messages_processed == Some(1) && sink.errors > 0 {
+                break sink;
+            }
+            sleep(STATS_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the valid message should survive the other message's transform failure");
+
+    assert_eq!(sink.messages_consumed, Some(2));
+    assert_eq!(sink.errors, 1);
+    assert_eq!(
+        sink.messages_filtered,
+        Some(0),
+        "transform errors are not intentional filters"
+    );
+    assert_eq!(sink.status, ConnectorStatus::Running);
 }

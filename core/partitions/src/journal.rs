@@ -24,7 +24,7 @@ use server_common::{
 use std::io;
 use std::{
     cell::{Cell, UnsafeCell},
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap},
     ops::RangeInclusive,
 };
 use tracing::warn;
@@ -185,7 +185,7 @@ where
     /// entries left the resident journal at flush. Bounded by
     /// [`EVICTED_RING_CAPACITY`]; requests older than the ring answer
     /// `RangeEvicted` honestly.
-    evicted_ring: UnsafeCell<VecDeque<(u64, JournalBuffer)>>,
+    evicted_ring: UnsafeCell<BTreeMap<u64, JournalBuffer>>,
     /// Running byte total of the buffers held by `evicted_ring`.
     evicted_ring_bytes: Cell<u64>,
     /// Entry-count ceiling for `evicted_ring`. Defaults to
@@ -206,17 +206,24 @@ where
     /// serve purged bytes. Survives only as long as the journal (in-memory),
     /// same lifetime argument as the partition's `purge_floor_op`.
     poll_floor: Cell<u64>,
+    /// Resident entries that are not `SendMessages` (consumer offset stores
+    /// and deletes). They carry no segment bytes, so the message-count and
+    /// byte flush thresholds never see them, yet the flush is the only
+    /// eviction: without a bound on this count a consume-only workload, one
+    /// replicated auto-commit per poll, grows the journal for as long as it
+    /// runs. Rebuilt by every drain-and-re-append.
+    resident_control_ops: Cell<usize>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
 /// cover a few seconds of traffic around a node restart; anything older is
 /// bulk-sync (phase 3) territory.
-pub const EVICTED_RING_CAPACITY: usize = 4096;
+pub const EVICTED_RING_CAPACITY: usize = 65536;
 
-/// Byte ceiling for the evicted ring: the entry cap alone lets each
-/// partition pin up to 4096 full-sized batches, which is unbounded in byte
-/// terms across many partitions. Whichever cap trips first evicts.
-pub const EVICTED_RING_BYTES_MAX: u64 = 16 * 1024 * 1024;
+/// Byte ceiling for the evicted ring. Every retained entry pins a full
+/// batch, so an entry cap alone can consume too much memory across many
+/// partitions. Whichever cap trips first evicts.
+pub const EVICTED_RING_BYTES_MAX: u64 = 64 * 1024 * 1024;
 
 impl<S> Default for PartitionJournal<S>
 where
@@ -231,12 +238,13 @@ where
             inner: UnsafeCell::new(JournalInner {
                 storage: S::default(),
             }),
-            evicted_ring: UnsafeCell::new(VecDeque::new()),
+            evicted_ring: UnsafeCell::new(BTreeMap::new()),
             evicted_ring_bytes: Cell::new(0),
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
             poll_floor: Cell::new(0),
+            resident_control_ops: Cell::new(0),
         }
     }
 }
@@ -262,16 +270,11 @@ impl PartitionJournalMemStorage {
     /// storage never hits the reactor (it copies from an in-memory `Vec`), so
     /// the read can run under a partition borrow without crossing an `.await`
     /// - the property that keeps poll-read sound.
-    fn read_at_sync(&self, offset: usize) -> JournalBuffer {
+    fn read_at_sync(&self, offset: usize) -> Option<JournalBuffer> {
         let offset_to_index = unsafe { &*self.offset_to_index.get() };
-        let Some(&index) = offset_to_index.get(&offset) else {
-            return Owned::<4096>::zeroed(0).into();
-        };
+        let index = *offset_to_index.get(&offset)?;
         let entries = unsafe { &*self.entries.get() };
-        entries
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| Owned::<4096>::zeroed(0).into())
+        entries.get(index).cloned()
     }
 
     fn entries(&self) -> Vec<JournalBuffer> {
@@ -324,6 +327,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         unsafe { &mut *self.headers.get() }.clear();
         unsafe { &mut *self.evicted_ring.get() }.clear();
         self.evicted_ring_bytes.set(0);
+        self.resident_control_ops.set(0);
     }
 
     /// Disable repair retention (single-replica groups: nobody to repair).
@@ -345,10 +349,33 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         self.evicted_ring_bytes_max.set(bytes_max);
     }
 
+    /// Entries and payload bytes the repair ring retains, for the shard sweep.
+    ///
+    /// Excludes unused allocation capacity, alignment and index overhead.
+    /// The newest entry is retained even when it exceeds the byte budget.
+    pub fn evicted_ring_occupancy(&self) -> (usize, u64) {
+        let ring = unsafe { &*self.evicted_ring.get() };
+        (ring.len(), self.evicted_ring_bytes.get())
+    }
+
     /// Resident (un-evicted) entry count; diagnostics only.
     pub fn resident_count(&self) -> usize {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         op_to_storage_offset.len()
+    }
+
+    /// Resident entries that are not `SendMessages`; the partition's flush
+    /// gate bounds this the way the message thresholds bound batches.
+    pub const fn resident_control_ops(&self) -> usize {
+        self.resident_control_ops.get()
+    }
+
+    /// Restore the materialized commit point for elections and body repair.
+    pub fn restore_checkpoint_prepare(&self, op: u64, prepare: JournalBuffer) {
+        let ring = unsafe { &mut *self.evicted_ring.get() };
+        debug_assert!(ring.is_empty());
+        self.evicted_ring_bytes.set(prepare.len() as u64);
+        ring.insert(op, prepare);
     }
 
     /// Entry bytes for `op`, from the resident journal or the evicted ring.
@@ -359,13 +386,11 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
             if let Some(&storage_offset) = op_to_storage_offset.get(&op) {
                 let inner = unsafe { &*self.inner.get() };
-                return Some(inner.storage.read_at_sync(storage_offset));
+                return inner.storage.read_at_sync(storage_offset);
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        ring.iter()
-            .find(|(ring_op, _)| *ring_op == op)
-            .map(|(_, entry)| entry.clone())
+        ring.get(&op).cloned()
     }
 
     /// The header at `op`, over exactly the range [`Self::repair_entry`] serves.
@@ -379,32 +404,32 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// The entry is still servable from the evicted ring, which is what makes
     /// the blank wrong rather than merely pessimistic.
     ///
-    /// The ring drops from the front, so the highest evicted op -- the commit
-    /// point of the last flush -- is the last thing it forgets.
+    /// Retention drops the lowest op, including when repair backfills arrive
+    /// out of order, so the commit point is the last thing it forgets.
     pub fn repair_header(&self, op: u64) -> Option<PrepareHeader> {
         if let Some(header) = self.header_by_op(op) {
             return Some(header);
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        let (_, entry) = ring.iter().find(|(ring_op, _)| *ring_op == op)?;
+        let entry = ring.get(&op)?;
         let header_bytes = entry.as_slice().get(..PREPARE_HEADER_SIZE)?;
         bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .ok()
             .copied()
     }
 
-    /// Every repairable header with an op in `ops`, in ONE pass over the resident
-    /// headers and ONE over the evicted ring.
+    /// Every repairable header with an op in `ops`, scanning resident headers
+    /// once and seeking the retained repair range by op.
     ///
-    /// [`Self::repair_header`] is two linear scans, so probing it per op costs
-    /// O(window x (headers + ring)), and the `DoViewChange` suffix build does
-    /// exactly that, up to `DVC_HEADERS_MAX` probes, on every SVC/DVC arrival and
-    /// non-Normal tick, on the pump. Result size is bounded by what the journal
-    /// holds, not by the width of `ops`. Resident wins over ring, as `repair_header`
-    /// probes.
+    /// Avoid repeating the resident header scan for each op in a view-change
+    /// suffix. Result size is bounded by what the journal holds, not by the
+    /// width of `ops`. Resident entries take precedence over retained repairs.
     #[must_use]
     pub fn repair_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
         let mut found = BTreeMap::new();
+        if ops.is_empty() {
+            return found;
+        }
         {
             let headers = unsafe { &*self.headers.get() };
             for header in headers.iter().filter(|header| ops.contains(&header.op)) {
@@ -412,7 +437,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        for (op, entry) in ring.iter().filter(|(op, _)| ops.contains(op)) {
+        for (op, entry) in ring.range(ops) {
             if found.contains_key(op) {
                 continue;
             }
@@ -426,17 +451,16 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         found
     }
 
-    /// Oldest op this journal can still serve for repair (ring front, else
-    /// resident head), or `None` when it holds nothing at all.
+    /// Oldest op this journal can still serve for repair, including resident
+    /// backfills older than the retained repair range.
     pub fn repair_retained_from(&self) -> Option<u64> {
-        {
-            let ring = unsafe { &*self.evicted_ring.get() };
-            if let Some((op, _)) = ring.front() {
-                return Some(*op);
-            }
-        }
-        let headers = unsafe { &*self.headers.get() };
-        headers.first().map(|header| header.op)
+        let ring = unsafe { &*self.evicted_ring.get() };
+        let resident = unsafe { &*self.op_to_storage_offset.get() };
+        ring.first_key_value()
+            .map(|(op, _)| *op)
+            .into_iter()
+            .chain(resident.first_key_value().map(|(op, _)| *op))
+            .min()
     }
 
     /// Synchronous resident-range poll read. Never awaits (mem storage reads
@@ -476,7 +500,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
             let bytes = {
                 let inner = unsafe { &*self.inner.get() };
-                inner.storage.read_at_sync(storage_offset)
+                let Some(bytes) = inner.storage.read_at_sync(storage_offset) else {
+                    break;
+                };
+                bytes
             };
 
             try_push_resident_entry(
@@ -506,6 +533,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         offset_to_op.clear();
         let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
         timestamp_to_op.clear();
+        self.resident_control_ops.set(0);
 
         entries
     }
@@ -574,6 +602,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             offset_to_op.clear();
             let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
             timestamp_to_op.clear();
+            self.resident_control_ops.set(0);
         }
 
         let mut all_entries = all_entries.into_iter();
@@ -585,11 +614,13 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                     break;
                 };
                 ring_bytes += entry.len() as u64;
-                ring.push_back((op, entry));
+                if let Some(previous) = ring.insert(op, entry) {
+                    ring_bytes -= previous.len() as u64;
+                }
                 while ring.len() > self.evicted_ring_capacity.get()
                     || (ring_bytes > self.evicted_ring_bytes_max.get() && ring.len() > 1)
                 {
-                    if let Some((_, dropped)) = ring.pop_front() {
+                    if let Some((_, dropped)) = ring.pop_first() {
                         ring_bytes -= dropped.len() as u64;
                     }
                 }
@@ -682,6 +713,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
             op_to_storage_offset.insert(op, storage_offset);
         }
+        if header.operation != Operation::SendMessages {
+            self.resident_control_ops
+                .set(self.resident_control_ops.get() + 1);
+        }
 
         // Poll-index only ops above the purge floor: `op_to_storage_offset`
         // above stays unconditional (consensus history for the repair and
@@ -705,16 +740,42 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         inner.storage.is_empty()
     }
 
-    /// Owned, op-ascending clones of the resident journal entries a poll may
-    /// serve. Each clone is a `Frozen` refcount bump, not a deep copy. Used to
-    /// snapshot the resident tail at poll-plan time so a disk-tier straddle can
-    /// be spliced off the partition borrow on owned data
-    /// ([`crate::iggy_partition`]).
+    /// Owned, offset-ascending clones of the resident `SendMessages` entries a
+    /// poll may serve, one `Frozen` refcount bump each. Snapshots the resident
+    /// tail at poll-plan time so a disk-tier straddle can be spliced off the
+    /// partition borrow on owned data ([`crate::iggy_partition`]).
+    ///
+    /// Walks the offset index rather than the storage vector: the snapshot walk
+    /// only ever matches message batches, and control ops (one per auto-commit
+    /// poll) outnumber them by orders of magnitude between flushes, so cloning
+    /// every entry made each disk-tier poll pay for every poll since the last
+    /// flush. The index also carries the purge fence: it holds indexed batches
+    /// above the poll floor only, and [`Self::clear_poll_index`] empties it, so
+    /// a fenced entry never reaches the snapshot.
+    pub fn resident_message_entries(&self) -> Vec<JournalBuffer> {
+        let offset_to_op = unsafe { &*self.offset_to_op.get() };
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let inner = unsafe { &*self.inner.get() };
+        let mut entries = Vec::with_capacity(offset_to_op.len());
+        for op in offset_to_op.values() {
+            if let Some(&storage_offset) = op_to_storage_offset.get(op)
+                && let Some(entry) = inner.storage.read_at_sync(storage_offset)
+            {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    /// Owned, append-ordered clones of every resident entry above the purge
+    /// floor, control ops included; one `Frozen` refcount bump each. Linear in
+    /// the resident journal, so not for the poll path, which takes
+    /// [`Self::resident_message_entries`].
     ///
     /// Entries at or below the purge floor are filtered out. They stay resident
     /// (consensus history for backups, repair and retransmission) but are
     /// poll-fenced exactly like the offset/timestamp indexes
-    /// [`Self::clear_poll_index`] sealed: the snapshot walk matches on the batch
+    /// [`Self::clear_poll_index`] sealed: a walk over these matches on the batch
     /// contents alone, so an unfiltered list re-exposes purged bytes as soon as
     /// one post-purge append puts an entry back into the index.
     pub fn resident_entries(&self) -> Vec<JournalBuffer> {
@@ -748,12 +809,13 @@ where
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
             headers: UnsafeCell::new(Vec::new()),
             inner: UnsafeCell::new(JournalInner { storage }),
-            evicted_ring: UnsafeCell::new(VecDeque::new()),
+            evicted_ring: UnsafeCell::new(BTreeMap::new()),
             evicted_ring_bytes: Cell::new(0),
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
             poll_floor: Cell::new(0),
+            resident_control_ops: Cell::new(0),
         }
     }
 
@@ -792,7 +854,7 @@ where
     /// [`Self::header_by_op`] is a linear scan with no index, so asking it
     /// op-by-op over a window is O(window x headers): on the floor-refusal path
     /// the replica is gap-stopped, so nothing evicts and the header vec grows
-    /// with the live tail, and the default 4096-op window over ~100k resident
+    /// with the live tail, and even a 4096-op window over ~100k resident
     /// headers is on the order of 4e8 comparisons -- synchronous, on the shard
     /// pump, per repair round. Long enough to miss heartbeat and view-change
     /// deadlines for every group on the core and turn one rejoin into an
@@ -1083,6 +1145,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
             unsafe { &mut *self.op_to_storage_offset.get() }.clear();
             unsafe { &mut *self.offset_to_op.get() }.clear();
             unsafe { &mut *self.timestamp_to_op.get() }.clear();
+            self.resident_control_ops.set(0);
         }
 
         let mut removed = 0usize;
@@ -1479,6 +1542,55 @@ mod tests {
     }
 
     #[compio::test]
+    async fn repair_retention_keeps_the_newest_ops_after_out_of_order_backfill() {
+        const CAPACITY: usize = 4;
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(CAPACITY, u64::MAX);
+        for op in [4, 2, 8, 6, 3, 1, 7, 5] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix(8).await;
+        assert_eq!(journal.evicted_ring_occupancy().0, CAPACITY);
+        assert_eq!(journal.repair_retained_from(), Some(5));
+        for op in 1..=4 {
+            assert!(journal.repair_entry(op).is_none());
+            assert!(journal.repair_header(op).is_none());
+        }
+        for op in 5..=8 {
+            assert_eq!(journal.repair_header(op).unwrap().op, op);
+            assert_eq!(
+                journal.repair_entry(op).unwrap().as_slice(),
+                build_prepare(op, HEADER_SIZE + 16).as_slice()
+            );
+        }
+        assert_eq!(
+            journal
+                .repair_headers_in(6..=7)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            vec![6, 7]
+        );
+        let empty_start = 7;
+        assert!(journal.repair_headers_in(empty_start..=6).is_empty());
+        for op in [3, 1] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .unwrap();
+        }
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        journal.evict_prefix(8).await;
+        assert_eq!(journal.repair_retained_from(), Some(5));
+        assert_eq!(journal.evicted_ring_occupancy().0, CAPACITY);
+        journal.clear_all();
+        assert_eq!(journal.evicted_ring_occupancy(), (0, 0));
+        assert!(journal.repair_entry(8).is_none());
+    }
+
+    #[compio::test]
     async fn repair_headers_in_serves_the_commit_point_from_the_evicted_ring() {
         // Blank AT the commit point is the one slot a merge can neither adopt nor
         // discard, so a quorum that all flushed there deadlocks. A flushed replica has
@@ -1679,6 +1791,17 @@ mod tests {
     /// the `[PrepareHeader][256B batch header][blob]` layout
     /// `try_push_resident_entry` decodes.
     fn build_resident_prepare(message_count: usize, payload_len: usize) -> Frozen<4096> {
+        build_message_prepare(1, 0, message_count, payload_len)
+    }
+
+    /// [`build_resident_prepare`] at a chosen op and stamped base offset, so a
+    /// journal can hold several batches in offset order.
+    fn build_message_prepare(
+        op: u64,
+        base_offset: u64,
+        message_count: usize,
+        payload_len: usize,
+    ) -> Frozen<4096> {
         let mut messages = IggyMessages::with_capacity(message_count);
         for index in 0..message_count {
             let fill = u8::try_from(index % usize::from(u8::MAX)).expect("bounded by u8::MAX");
@@ -1691,11 +1814,12 @@ mod tests {
                 user_headers: None,
             });
         }
-        let owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+        let mut owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
             .expect("build send_messages batch");
+        owned.header.base_offset = base_offset;
         let record = stamped_batch_record(owned);
 
-        let mut prepare = build_prepare(1, PREPARE_HEADER_SIZE + record.len()).transmute_header(
+        let mut prepare = build_prepare(op, PREPARE_HEADER_SIZE + record.len()).transmute_header(
             |header: PrepareHeader, send_messages: &mut PrepareHeader| {
                 *send_messages = header;
                 send_messages.operation = Operation::SendMessages;
@@ -1703,6 +1827,96 @@ mod tests {
         );
         prepare.as_mut_slice()[PREPARE_HEADER_SIZE..].copy_from_slice(&record);
         prepare.into_frozen()
+    }
+
+    /// A header-only consumer offset prepare: the shape every auto-commit
+    /// journals, carrying no batch.
+    fn build_control_prepare(op: u64) -> Frozen<4096> {
+        build_prepare(op, HEADER_SIZE + 16)
+            .transmute_header(|header: PrepareHeader, control: &mut PrepareHeader| {
+                *control = header;
+                control.operation = Operation::StoreConsumerOffset;
+            })
+            .into_frozen()
+    }
+
+    fn entry_ops(entries: &[Frozen<4096>]) -> Vec<u64> {
+        entries
+            .iter()
+            .map(|entry| {
+                bytemuck::checked::try_from_bytes::<PrepareHeader>(&entry[..PREPARE_HEADER_SIZE])
+                    .expect("entry holds a valid prepare header")
+                    .op
+            })
+            .collect()
+    }
+
+    #[compio::test]
+    async fn resident_message_entries_skip_control_ops_and_fenced_batches() {
+        // Batches at ops 1, 3, 5 (three offsets each) interleaved with the
+        // offset ops a polling group journals between them.
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in 1..=6u64 {
+            let entry = if op % 2 == 1 {
+                build_message_prepare(op, (op - 1) / 2 * 3, 3, 8)
+            } else {
+                build_control_prepare(op)
+            };
+            journal.append(entry).await.expect("append");
+        }
+        assert_eq!(
+            entry_ops(&journal.resident_message_entries()),
+            vec![1, 3, 5]
+        );
+        assert_eq!(journal.resident_control_ops(), 3);
+
+        // The purge seal empties the poll view, and the first post-purge
+        // append re-arms it with that batch alone.
+        journal.clear_poll_index(3);
+        assert!(journal.resident_message_entries().is_empty());
+        journal
+            .append(build_message_prepare(7, 9, 3, 8))
+            .await
+            .expect("append");
+        assert_eq!(entry_ops(&journal.resident_message_entries()), vec![7]);
+
+        // Eviction re-appends the retained tail: op 5 is above the floor and
+        // comes back into the poll view, op 3 stays fenced.
+        journal.evict_prefix(2).await;
+        assert_eq!(entry_ops(&journal.resident_message_entries()), vec![5, 7]);
+        assert_eq!(journal.resident_control_ops(), 2);
+    }
+
+    #[compio::test]
+    async fn resident_control_ops_follow_every_rebuild() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in 1..=4u64 {
+            journal
+                .append(build_control_prepare(op))
+                .await
+                .expect("append");
+        }
+        journal
+            .append(build_message_prepare(5, 0, 3, 8))
+            .await
+            .expect("append");
+        assert_eq!(journal.resident_control_ops(), 4);
+
+        journal.evict_prefix(2).await;
+        assert_eq!(journal.resident_control_ops(), 2, "ops 3 and 4 stay");
+
+        journal.truncate_from(4).await.expect("truncate");
+        assert_eq!(journal.resident_control_ops(), 1, "only op 3 survives");
+
+        journal.commit();
+        assert_eq!(journal.resident_control_ops(), 0);
+
+        journal
+            .append(build_control_prepare(6))
+            .await
+            .expect("append");
+        journal.clear_all();
+        assert_eq!(journal.resident_control_ops(), 0);
     }
 
     fn offset_lookup(offset: u64, count: u32) -> MessageLookup {

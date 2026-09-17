@@ -70,6 +70,8 @@ use serde_with::{DisplayFromStr, serde_as};
 /// failure until both are reconciled.
 pub const IOV_MAX_LIMIT: usize = 512;
 
+const DEFAULT_CLIENT_QUEUE_CAPACITY: usize = 256;
+
 /// Tunables for the message bus that ships consensus traffic between
 /// replicas and SDK-client traffic between shards.
 #[serde_as]
@@ -86,13 +88,19 @@ pub struct MessageBusConfig {
     #[config_env(leaf)]
     pub max_message_size: IggyByteSize,
 
-    /// Bound on the per-peer mpsc queue. Writer task drains; the
+    /// Bound on each replica peer's mpsc queue. Writer task drains; the
     /// `send_to_*` path enqueues. Too small drops under burst; too
     /// large delays backpressure signalling.
     pub peer_queue_capacity: usize,
 
+    /// Bound on each SDK connection's inbound and outbound queues. Separate
+    /// from replica queues so repair bursts do not enlarge every client allocation.
+    #[serde(default = "default_client_queue_capacity")]
+    pub client_queue_capacity: usize,
+
     /// Interval between outbound reconnect attempts to peers with
-    /// `peer_id > self_id`.
+    /// `peer_id > self_id`. Also bounds each dial, so a peer that drops
+    /// SYNs cannot stall the sweep.
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub reconnect_period: IggyDuration,
@@ -141,6 +149,10 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
             eprintln!("{COMPONENT} message_bus.peer_queue_capacity must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.client_queue_capacity == 0 {
+            eprintln!("{COMPONENT} message_bus.client_queue_capacity must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.max_message_size.as_bytes_u64() == 0 {
             eprintln!("{COMPONENT} message_bus.max_message_size must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -173,6 +185,10 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
         }
         Ok(())
     }
+}
+
+const fn default_client_queue_capacity() -> usize {
+    DEFAULT_CLIENT_QUEUE_CAPACITY
 }
 
 #[cfg(test)]
@@ -214,6 +230,27 @@ mod tests {
         let mut c = baseline();
         c.peer_queue_capacity = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn missing_client_queue_capacity_keeps_independent_default() {
+        let mut config = serde_json::to_value(baseline()).unwrap();
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("client_queue_capacity");
+        config["peer_queue_capacity"] = serde_json::json!(8192);
+        let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(decoded.client_queue_capacity, DEFAULT_CLIENT_QUEUE_CAPACITY);
+        assert_eq!(decoded.peer_queue_capacity, 8192);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_client_queue_capacity() {
+        let mut config = baseline();
+        config.client_queue_capacity = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

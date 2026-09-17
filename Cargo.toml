@@ -50,6 +50,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sinks/surrealdb_sink",
     "core/connectors/sources/elasticsearch_source",
+    "core/connectors/sources/http_source",
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
@@ -91,6 +92,7 @@ aligned-vec = "0.6.4"
 anyhow = "1.0.104"
 apache-avro = "0.22.0"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+arc-swap = "1.9.2"
 argon2 = "0.6.0"
 # arrow 58: iceberg 0.10.1 and deltalake 0.32.4 still require it.
 arrow = "58.4.0"
@@ -112,8 +114,8 @@ bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
 bit-set = "0.11.1"
 blake3 = "1.8.7"
-bon = "3.10.0"
-byte-unit = { version = "5.2.5", default-features = false, features = ["serde", "byte", "std"] }
+bon = "3.10.1"
+byte-unit = { version = "5.2.6", default-features = false, features = ["serde", "byte", "std"] }
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 bytes = "1.12.1"
 cfg_aliases = "0.2.2"
@@ -146,8 +148,8 @@ configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
 cpu_allocation = { path = "core/cpu_allocation" }
-crossbeam = "0.8.4"
-crossfire = "3.1.19"
+crossbeam = "0.8.5"
+crossfire = "3.1.20"
 csv = "1.4.0"
 ctor = "1.0.13"
 ctrlc = { version = "3.5", features = ["termination"] }
@@ -162,14 +164,14 @@ derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }
 dircpy = "0.3.20"
-dirs = "6.0.0"
+dirs = "7.0.0"
 dlopen2 = "0.9.0"
 dotenvy = "0.15.7"
 dtor = "1.0.6"
 elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
 enumset = "1.1"
 env_logger = "0.11.11"
-err_trail = { version = "0.11.1", features = ["tracing"] }
+err_trail = { version = "0.11.2", features = ["tracing"] }
 error_set = "0.9.2"
 figlet-rs = "1.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
@@ -199,16 +201,16 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
 iceberg-storage-opendal = "0.10.1"
-iggy = { path = "core/sdk", version = "0.11.0-edge.7" }
-iggy-cli = { path = "core/cli", version = "0.14.0-edge.7" }
+iggy = { path = "core/sdk", version = "0.11.0" }
+iggy-cli = { path = "core/cli", version = "0.14.0" }
 iggy-gateway-kafka = { path = "gateways/kafka" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.7" }
-iggy_common = { path = "core/common", version = "0.11.0-edge.7" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0" }
+iggy_common = { path = "core/common", version = "0.11.0" }
 iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.4" }
-indexmap = "2.14.1"
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0" }
+indexmap = "2.14.2"
 integration = { path = "core/integration" }
-ipnet = "2.12.1"
+ipnet = "2.12.2"
 journal = { path = "core/journal" }
 js-sys = "0.3"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
@@ -234,11 +236,11 @@ metadata = { path = "core/metadata" }
 mimalloc = "0.1"
 mime_guess = "2.0"
 mockall = "0.15.0"
-mongodb = { version = "3.8.2", features = ["rustls-tls"] }
+mongodb = { version = "3.9.1", features = ["rustls-tls"] }
 nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
-octocrab = "0.54.1"
+octocrab = "0.54.2"
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
 opentelemetry-otlp = { version = "0.32.0", features = [
@@ -278,19 +280,19 @@ rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
 rcgen = "0.14.10"
 regex = "1.13.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.2", features = ["json", "query"] }
 reqwest-retry = "0.9.1"
 reqwest-tracing = "0.7.1"
 ring = "0.17.14"
 ringbuffer = "0.16.0"
-rmcp = "3.2.0"
+rmcp = "3.3.0"
 rmp = "0.8.15"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
 rust-embed = "8.12.0"
 rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rustls-tls", "tags"] }
-rustls = { version = "0.23.43", features = ["ring"] }
+rustls = { version = "0.23.45", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 scopeguard = "1.2.0"
 sd-notify = "0.5"
@@ -298,7 +300,7 @@ secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
-serde_with = { version = "3.22.0", features = ["base64", "macros"] }
+serde_with = { version = "3.23.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "4.0.1"
 server = { path = "core/server", default-features = false }
@@ -307,12 +309,15 @@ shard = { path = "core/shard" }
 simd-json = { version = "0.18.1", features = ["serde_impl"] }
 smallvec = "1.16"
 socket2 = "0.6.5"
-sqlparser = { version = "0.62.0", features = ["visitor"] }
+sqlparser = { version = "0.63.0", features = ["visitor"] }
 sqlx = { version = "0.9.0", features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
-    # "mysql": the Doris integration fixture talks to Doris over its MySQL frontend.
+    "bigdecimal",
+    # "mysql": Doris exposes a MySQL-wire frontend; the Doris sink's
+    # integration-test fixture talks to it over this driver. Cargo unifies
+    # features across the workspace, so it is declared once here.
     "mysql",
     "chrono",
     "uuid",
@@ -334,10 +339,10 @@ testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wai
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-postgres = "0.7.18"
-tokio-rustls = "0.26.4"
+tokio-rustls = "0.26.5"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
-toml = "1.1.4"
+toml = "1.1.6"
 tower-http = { version = "0.7.1", features = ["add-extension", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
@@ -353,7 +358,7 @@ twox-hash = { version = "2.1.4", features = ["xxhash32"] }
 ulid = "3.0.0"
 ureq = "3.4"
 url = "2.5.8"
-uuid = { version = "1.26.0", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
+uuid = { version = "1.26.1", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
 vergen-git2 = { version = "10.0.1", features = ["build", "cargo", "rustc", "si"] }
 walkdir = "2.5.0"
 wasm-bindgen = "0.2"

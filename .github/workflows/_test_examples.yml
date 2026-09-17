@@ -106,6 +106,16 @@ jobs:
         with:
           download-deps: "false"
 
+      - name: Test Go examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
+        working-directory: examples/go
+        run: go test -race ./...
+
+      - name: Test Java examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
+        working-directory: examples/java
+        run: ./gradlew test
+
       - name: Build common binaries for all examples
         if: startsWith(inputs.component, 'examples-')
         run: |

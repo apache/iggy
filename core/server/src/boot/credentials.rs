@@ -145,7 +145,7 @@ pub(in crate::boot) fn validate_root_credentials_env(
     // already stored. `--fresh` has already wiped by this point, so a wiped
     // replica is correctly treated as a first boot.
     let fresh_cluster = config.cluster.enabled
-        && !Path::new(&config.system.path)
+        && !Path::new(&config.path)
             .join(metadata::impls::METADATA_DIR)
             .exists();
 

@@ -69,7 +69,7 @@ const REPLY_WAIT: Duration = Duration::from_secs(10);
 const COMMIT_BUDGET: Duration = Duration::from_secs(20);
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_committed_send_when_replayed_should_absorb_without_a_second_copy(
     harness: &mut TestHarness,
 ) {
@@ -102,7 +102,7 @@ async fn given_committed_send_when_replayed_should_absorb_without_a_second_copy(
     );
 }
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_committed_send_when_next_request_id_arrives_should_admit_it(
     harness: &mut TestHarness,
 ) {
@@ -128,7 +128,7 @@ async fn given_committed_send_when_next_request_id_arrives_should_admit_it(
     assert_eq!(polled, 3, "each distinct request id must append once");
 }
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_gapped_request_id_when_sent_should_commit(harness: &mut TestHarness) {
     // One client counter feeds every group it writes to, so a slice only ever
     // sees a subset of the ids minted. Gaps must be legal, not a wedge.
@@ -152,7 +152,7 @@ async fn given_gapped_request_id_when_sent_should_commit(harness: &mut TestHarne
     assert_eq!(polled, 3, "a gapped id is new, not a duplicate");
 }
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_committed_consumer_offset_when_replayed_should_absorb(harness: &mut TestHarness) {
     // Dedup covers every replicated partition write, not just produces. A
     // replayed offset store must answer success rather than committing twice.
@@ -211,7 +211,7 @@ const WRITER_CLIENT_BASE: u128 = 0x0DED_C0DE_0000;
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         partition.prepare_queue_depth = "4"
     )
 )]
@@ -315,7 +315,7 @@ const DISCONNECTED: u32 = u32::MAX - 1;
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         partition.evicted_ring_capacity = "64"
     )
 )]

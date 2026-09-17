@@ -30,7 +30,7 @@ use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus,
-    ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
 };
 use metadata::impls::metadata::IggySnapshot;
 use metadata::stm::stream::Streams;
@@ -144,6 +144,22 @@ impl ConnectionInstaller for SpyBus {
         _on_request: RequestHandler,
     ) {
     }
+    fn install_client_tcp_tls_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _on_request: RequestHandler,
+    ) {
+    }
+    fn install_client_wss_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _on_request: RequestHandler,
+    ) {
+    }
     fn client_meta(&self, _client_id: u128) -> Option<Rc<ClientConnMeta>> {
         None
     }
@@ -183,8 +199,7 @@ pub fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u12
         PartitionsConfig {
             messages_required_to_save: 1,
             size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-            enforce_fsync: false,
-            consumer_offset_enforce_fsync: false,
+
             validate_checksum: true,
             segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
             preallocate_segments: false,

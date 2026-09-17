@@ -226,7 +226,7 @@ internal sealed class VsrCluster : IAsyncDisposable
             .WithName($"iggy-vsr-{_name}-{node}-{_idSuffix}")
             .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
             .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
-            .WithEnvironment("IGGY_SYSTEM_PATH", $"local_data_vsr_{node}")
+            .WithEnvironment("IGGY_PATH", $"local_data_vsr_{node}")
             .WithEnvironment("IGGY_TCP_ADDRESS", $"0.0.0.0:{ports.Tcp}")
             .WithEnvironment("IGGY_HTTP_ADDRESS", $"0.0.0.0:{ports.Http}")
             .WithEnvironment("IGGY_QUIC_ADDRESS", $"0.0.0.0:{ports.Quic}")
@@ -259,7 +259,7 @@ internal sealed class VsrCluster : IAsyncDisposable
         if (_traceLogs)
         {
             builder = builder
-                .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
+                .WithEnvironment("IGGY_LOGGING_LEVEL", "trace")
                 .WithEnvironment("RUST_LOG", "trace");
         }
 

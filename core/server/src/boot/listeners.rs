@@ -152,7 +152,7 @@ pub(in crate::boot) async fn start_tcp_runtime(
             &config.http,
             config.metadata.clients_table_max,
             config.personal_access_token.max_tokens_per_user,
-            Arc::clone(&config.system),
+            Arc::new(config.clone()),
             roster,
             shard_metrics_all,
         )?;
@@ -403,11 +403,10 @@ pub(in crate::boot) fn make_replica_delegation_fns(
     (accepted, dialed)
 }
 
-/// Shard-0 client accept callbacks. TCP and WS clients are delegated via
-/// the coordinator (round-robin to peer shards); QUIC and TCP-TLS install
-/// locally on shard 0 because their per-connection state is not portable
-/// across shards (`compio_quic` endpoint binds one UDP socket; rustls TLS
-/// state ties to the post-handshake reactor).
+/// Shard-0 client accept callbacks. TCP, WS, TCP-TLS and WSS delegate
+/// raw sockets through the coordinator before any handshake. The
+/// destination shard supplies its handler and owns handshakes and I/O.
+/// The QUIC callback installs locally through shard 0's UDP endpoint.
 // ws/wss bindings intentionally mirror the transport names (same convention as
 // `replica_io::start_on_shard_zero`).
 #[allow(clippy::similar_names)]
@@ -417,11 +416,7 @@ pub(in crate::boot) fn make_shard_zero_client_accept_fns(
     on_request: RequestHandler,
 ) -> LocalClientAcceptFns {
     let quic_bus = Rc::clone(bus);
-    let tcp_tls_bus = Rc::clone(bus);
-    let wss_bus = Rc::clone(bus);
-    let quic_request = on_request.clone();
-    let wss_request = on_request.clone();
-    let tcp_tls_request = on_request;
+    let quic_request = on_request;
 
     let tcp_coord = Rc::clone(&coord);
     let tcp = Rc::new(move |stream| match tcp_coord.delegate_client(stream) {
@@ -435,9 +430,9 @@ pub(in crate::boot) fn make_shard_zero_client_accept_fns(
         Err(error) => warn!(error = ?error, "delegate_ws_client failed; dropping WS client"),
     });
 
-    // QUIC and TCP-TLS terminate locally on shard 0 but mint their client
+    // QUIC terminates locally on shard 0 but mints its client
     // ids through the coordinator's `client_seq`, the same counter the
-    // delegated TCP/WS path uses. A separate counter here would let a
+    // delegated TCP/WS/TCP-TLS/WSS paths use. A separate counter here would let a
     // shard-0-local id collide with a delegated id that round-robined to
     // shard 0 (both encode target shard 0) in shard 0's connection
     // registry.
@@ -449,30 +444,20 @@ pub(in crate::boot) fn make_shard_zero_client_accept_fns(
 
     let tcp_tls_coord = Rc::clone(&coord);
     let tcp_tls = Rc::new(move |stream, tls_config| {
-        let Some(meta) =
-            client_meta_from_stream(&stream, &tcp_tls_coord, ClientTransportKind::TcpTls)
-        else {
-            return;
-        };
-        installer::install_client_tcp_tls(
-            &tcp_tls_bus,
-            meta,
-            stream,
-            tls_config,
-            tcp_tls_request.clone(),
-        );
+        match tcp_tls_coord.delegate_tcp_tls_client(stream, tls_config) {
+            Ok(client_id) => info!(client_id, "TCP-TLS client delegated"),
+            Err(error) => {
+                warn!(error = ?error, "delegate_tcp_tls_client failed; dropping TCP-TLS client");
+            }
+        }
     });
 
-    // WSS terminates locally on shard 0 like TCP-TLS (rustls state is not
-    // serialisable across the delegate path), minting ids through the same
-    // coordinator counter.
     let wss_coord = coord;
     let wss = Rc::new(move |stream, tls_config| {
-        let Some(meta) = client_meta_from_stream(&stream, &wss_coord, ClientTransportKind::Wss)
-        else {
-            return;
-        };
-        installer::install_client_wss(&wss_bus, meta, stream, tls_config, wss_request.clone());
+        match wss_coord.delegate_wss_client(stream, tls_config) {
+            Ok(client_id) => info!(client_id, "WSS client delegated"),
+            Err(error) => warn!(error = ?error, "delegate_wss_client failed; dropping WSS client"),
+        }
     });
 
     LocalClientAcceptFns {
@@ -482,21 +467,6 @@ pub(in crate::boot) fn make_shard_zero_client_accept_fns(
         tcp_tls,
         wss,
     }
-}
-
-fn client_meta_from_stream(
-    stream: &compio::net::TcpStream,
-    coord: &shard::coordinator::ShardZeroCoordinator,
-    transport: ClientTransportKind,
-) -> Option<ClientConnMeta> {
-    let peer_addr = match stream.peer_addr() {
-        Ok(peer_addr) => peer_addr,
-        Err(error) => {
-            warn!(error = %error, "dropping accepted client with unknown peer address");
-            return None;
-        }
-    };
-    Some(mint_client_meta(coord, peer_addr, transport))
 }
 
 fn mint_client_meta(

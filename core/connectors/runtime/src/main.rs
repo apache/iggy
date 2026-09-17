@@ -18,6 +18,7 @@
 use crate::configs::connectors::{
     ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, create_connectors_config_provider,
 };
+use crate::metrics::ConnectorType;
 use ::configs::ConfigProvider;
 use clap::Parser;
 use configs::connectors::ConfigFormat;
@@ -186,7 +187,7 @@ async fn main() -> Result<(), RuntimeError> {
     let mut source_wrappers = vec![];
     let mut source_containers_by_key: HashMap<String, Arc<Container<SourceApi>>> = HashMap::new();
     for (_path, source) in sources {
-        let container = Arc::new(source.container);
+        let container = source.container;
         let handle_callback = container.iggy_source_handle_v2;
         let batch_result_callback = container.iggy_source_batch_result;
         for plugin in &source.plugins {
@@ -456,8 +457,30 @@ struct SinkConnectorWrapper {
     plugins: Vec<SinkConnectorPlugin>,
 }
 
+/// Closes a plugin instance whose setup did not finish, reporting a refusal
+/// rather than returning it: every caller is already on a failure path with an
+/// error of its own to surface.
+///
+/// The two sides had this body inline, one word apart. That word is the label
+/// [`ConnectorType`] already defines, so it is taken as the enum rather than a
+/// string nothing constrains.
+pub(crate) fn close_plugin_instance(
+    close: &dyn Fn(u32) -> i32,
+    kind: ConnectorType,
+    plugin_id: u32,
+    key: &str,
+) {
+    let close_result = close(plugin_id);
+    if close_result != 0 {
+        let kind = kind.as_label();
+        warn!(
+            "iggy_{kind}_close returned {close_result} while cleaning up failed {kind} connector with ID: {plugin_id} ({key})"
+        );
+    }
+}
+
 struct SourceConnector {
-    container: Container<SourceApi>,
+    container: Arc<Container<SourceApi>>,
     plugins: Vec<SourceConnectorPlugin>,
 }
 

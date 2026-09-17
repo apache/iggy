@@ -336,27 +336,21 @@ pub enum RepairConclusion {
 }
 
 /// Where partition directories live on disk, mirroring the server's
-/// `SystemConfig` path scheme so segment files created by the partition plane
+/// `ServerConfig` path scheme so segment files created by the partition plane
 /// land next to the ones the server bootstrap created.
 #[derive(Debug, Clone)]
 pub struct PartitionPathLayout {
-    /// `{system.path}/{stream.path}`: the directory holding per-stream dirs.
+    /// `{path}/streams`: the directory holding per-stream dirs.
     pub streams_root: String,
-    /// Directory name of the per-topic level (`topic.path`).
-    pub topics_dir: String,
-    /// Directory name of the per-partition level (`partition.path`).
-    pub partitions_dir: String,
 }
 
 /// Synthetic layout for tests and the simulator, where paths only key the
 /// sim storage and never touch a real filesystem. The server always wires
-/// the real layout from its `SystemConfig`.
+/// the real layout from its `ServerConfig`.
 impl Default for PartitionPathLayout {
     fn default() -> Self {
         Self {
             streams_root: "/tmp/iggy_stub/streams".to_string(),
-            topics_dir: "topics".to_string(),
-            partitions_dir: "partitions".to_string(),
         }
     }
 }
@@ -364,7 +358,7 @@ impl Default for PartitionPathLayout {
 /// Configuration for partition operations.
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
-/// `SegmentConfig` (`core/server/src/configs/system.rs`).
+/// the server partition configuration and resolved topic options.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PartitionsConfig {
@@ -372,12 +366,6 @@ pub struct PartitionsConfig {
     pub messages_required_to_save: u32,
     /// Flush journal to disk when it accumulates this many bytes.
     pub size_of_messages_required_to_save: IggyByteSize,
-    /// Whether to enforce fsync after writes.
-    pub enforce_fsync: bool,
-    /// Whether consumer-offset files are written crash-safe (data-synced,
-    /// renamed, directory synced). Independent of `enforce_fsync`, which
-    /// governs message and index files.
-    pub consumer_offset_enforce_fsync: bool,
     /// Whether a disk poll verifies each batch's `batch_checksum` against the bytes
     /// it just read.
     ///
@@ -409,10 +397,8 @@ impl PartitionsConfig {
         partition_id: usize,
     ) -> String {
         format!(
-            "{}/{stream_id}/{}/{topic_id}/{}/{partition_id}",
+            "{}/{stream_id}/topics/{topic_id}/partitions/{partition_id}",
             self.path_layout.streams_root,
-            self.path_layout.topics_dir,
-            self.path_layout.partitions_dir,
         )
     }
 

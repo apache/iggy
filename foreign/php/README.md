@@ -11,7 +11,7 @@ future resolves; it does not provide fiber-aware or non-blocking I/O.
 ## Requirements
 
 - Rust and Cargo
-- PHP 8.3 or newer with `php-config`
+- PHP 8.3 or newer with `php-config` (non-thread-safe builds only, no ZTS)
 - `cargo-php`
 - Composer, for installing PHPUnit
 - Docker, for running the integration test server
@@ -33,9 +33,12 @@ cargo build --release
 Generate IDE stubs after changing the exported PHP API:
 
 ```sh
-cargo php stubs --manifest Cargo.toml -o iggy-php.stubs.php
+cargo build
+cargo php stubs target/debug/libiggy_php.so -o /tmp/iggy-php.stubs.php
 ```
 
+Stub generation requires a debug build. On macOS, use `libiggy_php.dylib`.
+Preserve the existing Apache license header when updating `iggy-php.stubs.php`.
 The CI lint job regenerates this file and fails if the checked-in stubs drift
 from the Rust signatures.
 
@@ -60,12 +63,18 @@ php -r 'var_dump(extension_loaded("iggy-php"));'
 
 ## Run Iggy
 
+Use Iggy 0.9.0. When testing unreleased SDK changes, build the server from the
+same source checkout.
+
 ```sh
 docker run --rm --name iggy-php-test \
+  --cap-add=SYS_NICE --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
   -p 8090:8090 \
   -p 3000:3000 \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 -e IGGY_HTTP_ADDRESS=0.0.0.0:3000 \
   -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
-  apache/iggy:latest
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=iggy \
+  apache/iggy:0.9.0
 ```
 
 You can also run a local server from the repository root:
@@ -73,6 +82,10 @@ You can also run a local server from the repository root:
 ```sh
 cargo run --bin iggy-server -- --fresh --with-default-root-credentials
 ```
+
+The root variables bootstrap a new data directory; they do not replace stored
+credentials. Environment credentials override `--with-default-root-credentials`.
+Use `--fresh` only with disposable development data: it deletes local replica state.
 
 The tests assume:
 
@@ -100,7 +113,8 @@ $client->createStream($stream);
 $client->createTopic($stream, $topic, 1, null, null, null, null);
 
 $client->sendMessages($stream, $topic, $partitionId, [
-    new \Iggy\SendMessage('hello from PHP'),
+    new \Iggy\SendMessage('hello from PHP 1'),
+    new \Iggy\SendMessage('hello from PHP 2'),
 ]);
 
 $messages = $client->pollMessages(
@@ -119,7 +133,8 @@ foreach ($messages as $message) {
 
 Consumer group callbacks require a finite message limit. The partition id
 argument is ignored for a consumer group, since the member reads the partitions
-the server assigns to it:
+the server assigns to it. After the example above, each loop below consumes one
+of its two messages:
 
 ```php
 <?php
@@ -143,19 +158,17 @@ $consumer = $client->consumerGroup(
 
 $consumer->consumeMessages(
     function (\Iggy\ReceiveMessage $message) use ($consumer): void {
-        process($message->payload());
+        echo $message->payload(), PHP_EOL;
         $consumer->storeOffset($message->offset(), $message->partitionId());
     },
-    100,
+    1,
 );
 
 foreach ($consumer->iterMessages() as $message) {
-    process($message->payload());
+    echo $message->payload(), PHP_EOL;
     $consumer->storeOffset($message->offset(), $message->partitionId());
 
-    if (shouldStop()) {
-        break;
-    }
+    break;
 }
 ```
 
@@ -174,10 +187,11 @@ composer install
 composer test
 ```
 
-Run Rust verification:
+Run Rust verification with a matching PHP embedding library (`libphp`) available
+to the linker and dynamic loader:
 
 ```sh
-cargo test
+cargo test --features ext-php-rs/embed
 ```
 
 TLS tests are opt-in because they require a TLS-enabled Iggy server and certificate
@@ -215,8 +229,8 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
 - `Iggy\SendMessage::payload` and `Iggy\ReceiveMessage::payload()` copy the payload
   bytes into a PHP string on each read. Cache large payloads in PHP if they will
   be read repeatedly.
-- Large unsigned values that can overflow PHP integers, such as message checksums,
-  are returned as decimal strings.
+- Message IDs and checksums are returned as decimal strings. Offset and timestamp
+  getters return PHP integers and are limited to `PHP_INT_MAX`.
 - `Iggy\Client::sendBinaryRequest(int $code, string $payload): string` sends a
   command code and payload and returns the raw response body.
 - `Iggy\Client` is synchronous and blocks the current PHP thread.

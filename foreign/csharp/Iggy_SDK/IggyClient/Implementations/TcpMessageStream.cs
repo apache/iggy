@@ -127,10 +127,13 @@ public sealed partial class TcpMessageStream : IIggyClient
         _heartbeatCancellation.Cancel();
         _connection?.Dispose();
         _connection = null;
+        ClearPollSession();
 
         // Nothing can reconnect after this, and the remembered sign-in holds a plain-string password
         // or token.
         _rememberedLogin = null;
+        _rememberedUserId = null;
+        _configuredLoginOverride = null;
 
         SetConnectionState(ConnectionState.Disconnected);
         _connectionEvents.Clear();
@@ -261,6 +264,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
         IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
     {
+
+        options = TopicOptions.WithDurabilityDefaults(options);
         var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
         var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm,
             messageExpiryValue, maxTopicSize, options);
@@ -563,7 +568,9 @@ public sealed partial class TcpMessageStream : IIggyClient
             return null;
         }
 
-        return BinaryMapper.MapClusterMetadata(responseBuffer.Memory.Span);
+        var metadata = BinaryMapper.MapClusterMetadata(responseBuffer.Memory.Span);
+        RememberRoster(metadata);
+        return metadata;
     }
 
     /// <inheritdoc />
@@ -700,6 +707,10 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.UpdateUser(userId, userName, status);
         await SendAckAsync(CommandCodes.UPDATE_USER_CODE, message, token);
+        if (userName is not null)
+        {
+            RefreshPollCredentials(userId, userName, null);
+        }
     }
 
     /// <inheritdoc />
@@ -716,6 +727,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
         await SendAckAsync(CommandCodes.CHANGE_PASSWORD_CODE, message, token);
+        RefreshPollCredentials(userId, null, newPassword);
     }
 
     /// <inheritdoc />
@@ -734,6 +746,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             Username = userName,
             Password = password
         };
+        _rememberedUserId = identity?.UserId;
 
         return identity;
     }
@@ -753,6 +766,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             // does not outlive it. Credentials configured as AutoLoginSettings are a different promise -
             // they are what every connect signs in with - and a reconnect still uses them.
             _rememberedLogin = null;
+            _rememberedUserId = null;
 
             if (State == ConnectionState.Authenticated)
             {
@@ -806,6 +820,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         var identity = await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE,
             LoginRegister.SerializeWithPersonalAccessToken(token), ct);
         _rememberedLogin = new AutoLoginSettings { Enabled = true, PersonalAccessToken = token };
+        _rememberedUserId = identity?.UserId;
 
         return identity;
     }
@@ -951,8 +966,11 @@ public sealed partial class TcpMessageStream : IIggyClient
             TcpContracts.GetMessages(payload.AsSpan(0, messageBufferSize), consumer, streamId,
                 topicId, pollingStrategy, count, autoCommit, partitionId);
 
-            responseBuffer = await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE,
-                payload.AsMemory(0, messageBufferSize), token: token);
+            responseBuffer = autoCommit
+                ? await PollAutoCommitAsync(new PollRouteKey(streamId, topicId, consumer.Type,
+                        consumer.ConsumerId, partitionId), payload.AsMemory(0, messageBufferSize), token)
+                : await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE,
+                    payload.AsMemory(0, messageBufferSize), token: token);
             if (responseBuffer.Memory.Length == 0)
             {
                 responseBuffer.Dispose();
@@ -1115,7 +1133,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 {
                     _connection = new VsrConnection(connectionStream, _consensusSession,
                         _configuration.MaxResponseFrameSize, VsrRequestTimeoutMs, DropVsrConnectionLocked,
-                        _logger);
+                        _logger, ObserveMetadataCommit);
                 }
                 finally
                 {
@@ -1324,7 +1342,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         if (_configuration.AutoLoginSettings.Enabled)
         {
-            return _configuration.AutoLoginSettings;
+            return _configuredLoginOverride ?? _configuration.AutoLoginSettings;
         }
 
         return _rememberedLogin;

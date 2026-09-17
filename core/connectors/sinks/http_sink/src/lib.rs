@@ -1194,8 +1194,8 @@ impl Sink for HttpSink {
     ///
     /// **Runtime note**: The FFI boundary in `sdk/src/sink.rs` maps `consume()`'s `Result` to
     /// `i32` (0=ok, 1=err), but the runtime's `process_messages()` in `runtime/src/sink.rs`
-    /// discards that return code. All retry logic lives inside this method — returning `Err`
-    /// does not trigger a runtime-level retry.
+    /// logs and counts a nonzero code, records no processed messages for that batch,
+    /// and continues polling. Returning `Err` does not trigger a runtime retry.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,
@@ -1235,10 +1235,7 @@ impl Sink for HttpSink {
         };
 
         if let Err(ref e) = result {
-            error!(
-                "HTTP sink ID: {} — consume() returning error (runtime ignores FFI status code): {}",
-                self.id, e
-            );
+            error!("HTTP sink ID: {} - consume() failed: {}", self.id, e);
         }
 
         result

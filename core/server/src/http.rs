@@ -58,7 +58,7 @@ use axum::routing::{delete, get, post, put};
 use compio::net::TcpListener;
 use configs::cluster::{ClusterConfig, http_forwarding_key_material};
 use configs::http::{HttpConfig, HttpCorsConfig};
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use iggy_common::IggyError;
 use message_bus::client_listener;
 use send_wrapper::SendWrapper;
@@ -203,7 +203,7 @@ pub fn start(
     http_config: &HttpConfig,
     clients_table_max: usize,
     max_tokens_per_user: u32,
-    system_config: Arc<ServerSystemConfig>,
+    server_config: Arc<ServerConfig>,
     roster: Rc<ClusterRoster>,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
@@ -223,7 +223,7 @@ pub fn start(
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
         jwt,
-        system_config,
+        server_config,
         sessions: RefCell::new(HashMap::new()),
         registrations: RegistrationBarrier::default(),
         roster,
@@ -351,10 +351,6 @@ fn router(
             post(login_with_personal_access_token),
         )
         .route(
-            "/streams/{stream_id}/topics/{topic_id}/messages",
-            get(poll_messages),
-        )
-        .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
             get(get_consumer_offset),
         )
@@ -418,11 +414,18 @@ fn router(
 /// Acknowledged partition writes use a bounded HTTP roster fallback. This is
 /// a correctness path for the existing stateless HTTP transport. Direct
 /// partition-primary routing remains the scalable long-term design.
+///
+/// A poll rides the same fallback, because an automatic commit is a partition
+/// write in every sense but the verb: only a replica that can originate the
+/// offset operation may serve one, and the refusal it would otherwise return
+/// is terminal for an HTTP caller, which has no roster of its own to walk.
+/// [`forward::forward_partition_write`] leaves a poll without automatic commit
+/// entirely local, so an ordinary read still pays nothing for this.
 fn partition_write_routes(state: HttpState) -> Router<HttpState> {
     Router::new()
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
-            post(send_messages),
+            post(send_messages).get(poll_messages),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",

@@ -67,35 +67,10 @@ impl MessageClient for HttpClient {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
-        let batch = IggyMessagesBatch::from(&*messages);
         let response = self
-            .post(
-                &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-                &SendMessages {
-                    metadata_length: 0, // this field is used only for TCP/QUIC
-                    stream_id: stream_id.clone(),
-                    topic_id: topic_id.clone(),
-                    partitioning: partitioning.clone(),
-                    batch,
-                },
-            )
+            .post_messages(stream_id, topic_id, partitioning, messages)
             .await?;
-        let body = response
-            .bytes()
-            .await
-            .map_err(|_| IggyError::InvalidBytesResponse)?;
-        // The legacy server answers a successful send with 201 and no content
-        // at all. That is not JSON, and it must not read as a decode failure on
-        // a write that already committed: no body means the batch landed with
-        // no offsets reported, which is an empty list.
-        if body.is_empty() {
-            return Ok(SendMessagesResponse {
-                confirmations: Vec::new(),
-            });
-        }
-        let confirmations: SendMessagesConfirmations =
-            serde_json::from_slice(&body).map_err(|_| IggyError::InvalidJsonResponse)?;
-        Ok(SendMessagesResponse::from(confirmations))
+        decode_send_response(response).await
     }
 
     async fn flush_unsaved_buffer(
@@ -121,6 +96,76 @@ impl MessageClient for HttpClient {
             .await?;
         Ok(())
     }
+}
+
+impl HttpClient {
+    /// Send messages and expose the completion guarantee advertised by HTTP.
+    /// An absent or unrecognized header returns None without turning a
+    /// committed write into a retryable failure.
+    ///
+    /// # Errors
+    /// Returns a request or confirmation-decoding error.
+    pub async fn send_messages_with_durability(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitioning: &Partitioning,
+        messages: &mut [IggyMessage],
+    ) -> Result<(SendMessagesResponse, Option<iggy_common::Durability>), IggyError> {
+        let response = self
+            .post_messages(stream_id, topic_id, partitioning, messages)
+            .await?;
+        let durability = response
+            .headers()
+            .get("iggy-durability")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
+        Ok((decode_send_response(response).await?, durability))
+    }
+
+    async fn post_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitioning: &Partitioning,
+        messages: &mut [IggyMessage],
+    ) -> Result<reqwest::Response, IggyError> {
+        let batch = IggyMessagesBatch::from(&*messages);
+        let response = self
+            .post(
+                &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+                &SendMessages {
+                    metadata_length: 0, // this field is used only for TCP/QUIC
+                    stream_id: stream_id.clone(),
+                    topic_id: topic_id.clone(),
+                    partitioning: partitioning.clone(),
+                    batch,
+                },
+            )
+            .await?;
+        Ok(response)
+    }
+}
+
+async fn decode_send_response(
+    response: reqwest::Response,
+) -> Result<SendMessagesResponse, IggyError> {
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| IggyError::InvalidBytesResponse)?;
+    // The legacy server answers a successful send with 201 and no content
+    // at all. That is not JSON, and it must not read as a decode failure on
+    // a write that already committed: no body means the batch landed with
+    // no offsets reported, which is an empty list.
+    if body.is_empty() {
+        return Ok(SendMessagesResponse {
+            confirmations: Vec::new(),
+        });
+    }
+    let confirmations: SendMessagesConfirmations =
+        serde_json::from_slice(&body).map_err(|_| IggyError::InvalidJsonResponse)?;
+    Ok(SendMessagesResponse::from(confirmations))
 }
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {

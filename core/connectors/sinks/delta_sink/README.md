@@ -8,7 +8,37 @@ The Delta Lake Sink Connector allows you to consume messages from Iggy topics an
 - **Intelligent type coercion** to match Delta table schemas (e.g. ISO 8601 strings to timestamps)
 - **Transactional writes** with atomic flush-and-commit operations
 
+The table must already exist. The connector appends each successful nonempty batch in one Delta transaction and keeps its schema snapshot until restart. The plugin has no failed-batch retry loop; the Delta library can retry eligible commit conflicts and storage requests. Write or commit errors clear the writer buffers and return an error. The runtime uses consumer auto-commit and does not replay failed sink batches, so end-to-end at-least-once delivery is not guaranteed.
+
 ## How to configure a Delta Sink connector
+
+First, make sure that the Delta table already exists in the location you're providing. You can use this script for an example workload:
+
+```python
+import pyarrow as pa
+from deltalake import DeltaTable
+
+table_uri = "s3://test_location/tables/test"
+
+schema = pa.schema([
+    pa.field("user_id", pa.string(), nullable=True),
+    pa.field("user_type", pa.uint8(), nullable=True),
+    pa.field("email", pa.string(), nullable=True),
+    pa.field("source", pa.string(), nullable=True),
+    pa.field("state", pa.string(), nullable=True),
+    pa.field("message", pa.string(), nullable=True),
+    pa.field("created_at", pa.timestamp("us"), nullable=True),
+])
+
+DeltaTable.create(
+    table_uri,
+    schema,
+    name="test",
+    storage_options={"AWS_REGION": "us-east-1"},
+)
+
+print(f"Created table at {table_uri}")
+```
 
 The configuration is usually wrtitten individually for every connector and consists of two parts: the runtime settings which are registering the sink and telling which streams should plug into it, and the plugin's settings themselves. Here's an example of a working configuration:
 
@@ -33,6 +63,7 @@ The configuration is usually wrtitten individually for every connector and consi
 
   # these settings are specific to each plugin, and in case of Delta sink, to the type of storage used
   [plugin_config]
+  # the table must exist in the given location
   table_uri = "s3://iggy-sandbox/tables/test"
   storage_backend_type = "s3"
   aws_s3_region = "eu-central-1"

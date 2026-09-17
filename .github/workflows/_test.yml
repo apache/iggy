@@ -256,6 +256,14 @@ jobs:
           override_pr: ${{ github.event.pull_request.number }}
 
       # Web UI
+      - name: Setup Node.js for Web UI
+        if: inputs.component == 'web-ui'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Run Web UI task
         if: inputs.component == 'web-ui'
         run: |
@@ -263,6 +271,8 @@ jobs:
           npm ci
           if [ "${{ inputs.task }}" = "lint" ]; then
             npm run lint
+          elif [ "${{ inputs.task }}" = "test" ]; then
+            npm test
           elif [ "${{ inputs.task }}" = "build" ]; then
             npm run build
           fi
