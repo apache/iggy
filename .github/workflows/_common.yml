@@ -82,6 +82,25 @@ jobs:
       - name: Check version consistency
         run: ./scripts/extract-version.sh --check
 
+  edge-image-catalog:
+    name: Check edge image catalog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Check edge image catalog matches publish.yml
+        run: ./scripts/ci/edge-image-catalog.sh --check
+
   license-headers:
     name: Check license headers
     runs-on: ubuntu-latest
@@ -222,6 +241,7 @@ jobs:
         python-interpreter-versions,
         python-lockfiles,
         version-consistency,
+        edge-image-catalog,
         license-headers,
         third-party-licenses,
         markdown,
@@ -290,6 +310,15 @@ jobs:
             echo "| ❌ Version Consistency | failure | Version mismatch detected |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "| ⏭️ Version Consistency | $VERSION_CONSISTENCY | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          EDGE_IMAGE_CATALOG="${{ needs.edge-image-catalog.result }}"
+          if [ "$EDGE_IMAGE_CATALOG" = "success" ]; then
+            echo "| ✅ Edge Image Catalog | success | Every Docker image has an :edge catalog row |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$EDGE_IMAGE_CATALOG" = "failure" ]; then
+            echo "| ❌ Edge Image Catalog | failure | Catalog drifted from publish.yml (see job log) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ⏭️ Edge Image Catalog | $EDGE_IMAGE_CATALOG | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "$LICENSE_HEADERS" = "success" ]; then
