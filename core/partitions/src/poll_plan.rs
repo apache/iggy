@@ -873,6 +873,13 @@ impl DiskReadPlan {
     }
 
     /// Read one chunk for a disk poll, retrying transient IO failures.
+    #[cfg_attr(
+        not(feature = "poll-diagnostics"),
+        allow(
+            clippy::needless_pass_by_ref_mut,
+            reason = "The mutable reference is needed to update counters when poll diagnostics are enabled"
+        )
+    )]
     async fn read_chunk_with_retry(
         &self,
         file: &compio::fs::File,
