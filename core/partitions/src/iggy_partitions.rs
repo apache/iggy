@@ -587,26 +587,6 @@ where
         Some(partition.build_poll_plan(consumer, args, validate_checksum))
     }
 
-    /// Snapshot a deferred read after checking its resident allocation budget.
-    ///
-    /// # Errors
-    /// Returns a size error when the snapshot exceeds the budget, or a read
-    /// error when a resident journal entry cannot be decoded.
-    pub fn build_bounded_poll_snapshot(
-        &self,
-        namespace: &IggyNamespace,
-        consumer: PollingConsumer,
-        args: &PollingArgs,
-        max_bytes: usize,
-    ) -> Result<Option<PollPlan>, IggyError> {
-        let validate_checksum = self.config.validate_checksum;
-        self.get_mut_by_ns(namespace)
-            .map(|partition| {
-                partition.build_bounded_poll_plan(consumer, args, validate_checksum, max_bytes)
-            })
-            .transpose()
-    }
-
     /// Validate and accept a poll synchronously on the owning pump.
     /// Attempt the reply synchronously, then immediately await any returned
     /// continuation through [`Self::replicate_poll_completion`] on the same pump.

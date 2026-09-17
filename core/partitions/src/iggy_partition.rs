@@ -4598,35 +4598,6 @@ where
         }
     }
 
-    pub(crate) fn build_bounded_poll_plan(
-        &mut self,
-        consumer: PollingConsumer,
-        args: &PollingArgs,
-        validate_checksum: bool,
-        max_bytes: usize,
-    ) -> Result<PollPlan, IggyError> {
-        // Source snapshots, sparse copies and fragment descriptors can coexist.
-        const RESIDENT_ALLOCATION_FACTOR: usize = 4;
-        // Covers file paths, read handles and fixed IO/selection bookkeeping.
-        const READ_METADATA_BYTES: usize = 64 * 1024;
-        let resident_bytes = self.log.journal().inner.resident_message_bytes()?;
-        let segment_bytes = self
-            .log
-            .segments()
-            .len()
-            .saturating_mul(size_of::<DiskSegment>());
-        // Selection may copy sparse fragments while the source snapshot remains live.
-        if resident_bytes
-            .saturating_mul(RESIDENT_ALLOCATION_FACTOR)
-            .saturating_add(segment_bytes)
-            .saturating_add(READ_METADATA_BYTES)
-            > max_bytes
-        {
-            return Err(IggyError::InvalidSizeBytes);
-        }
-        Ok(self.build_poll_plan(consumer, args, validate_checksum))
-    }
-
     /// Snapshot read resources synchronously on the partition owner.
     /// Only the owned snapshot crosses a suspension during disk I/O.
     #[allow(clippy::too_many_lines)]

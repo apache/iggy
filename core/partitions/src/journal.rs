@@ -16,7 +16,6 @@
 // under the License.
 
 use iggy_binary_protocol::{Operation, PrepareHeader};
-use iggy_common::IggyError;
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
@@ -756,24 +755,6 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             }
         }
         entries
-    }
-
-    /// Conservative snapshot charge without allocating an entry vector.
-    pub fn resident_message_bytes(&self) -> Result<usize, IggyError> {
-        let offset_to_op = unsafe { &*self.offset_to_op.get() };
-        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-        let inner = unsafe { &*self.inner.get() };
-        offset_to_op.values().try_fold(0usize, |bytes, op| {
-            let entry = op_to_storage_offset
-                .get(op)
-                .and_then(|offset| inner.storage.read_at_sync(*offset))
-                .ok_or(IggyError::CannotReadMessage)?;
-            decode_prepare_slice_trusted(entry.as_slice())
-                .map_err(|_| IggyError::CannotReadMessage)?;
-            Ok(bytes
-                .saturating_add(entry.allocation_bytes())
-                .saturating_add(size_of::<JournalBuffer>()))
-        })
     }
 
     /// Owned, append-ordered clones of every resident entry above the purge

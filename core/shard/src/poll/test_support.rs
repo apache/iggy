@@ -33,6 +33,8 @@ use server_common::sharding::IggyNamespace;
 
 pub(super) type PollTestMetadata = MuxStateMachine<variadic!(Users, Streams)>;
 
+const SEGMENT_FLOOR: u64 = 1024 * 1024;
+
 /// Commit one batch starting at offset zero and keep it resident. Each call
 /// creates an independent partition history, even for the same namespace.
 #[allow(clippy::future_not_send)]
@@ -44,7 +46,11 @@ pub(super) async fn partition_with_messages<B: MessageBus + Clone>(
     let cluster_id = 1;
     let replica_id = 0;
     let replica_count = 3;
-    let segment_size = IggyByteSize::from(1_048_576_u64);
+    // The batch must fit one segment or it never materialises, and it must stay
+    // under the flush threshold or it stops being resident. Doubling the payload
+    // total covers framing; the floor keeps small fixtures where they were.
+    let payload_bytes: u64 = payloads.iter().map(|payload| payload.len() as u64).sum();
+    let segment_size = IggyByteSize::from(SEGMENT_FLOOR.max(payload_bytes.saturating_mul(2)));
     let config = PartitionsConfig {
         messages_required_to_save: 100,
         size_of_messages_required_to_save: segment_size,
