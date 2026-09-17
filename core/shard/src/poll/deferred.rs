@@ -626,12 +626,7 @@ where
                 return;
             }
         };
-        let config = *self.deferred_polls.config.borrow();
-        if result.retained_bytes() > config.max_read_bytes {
-            self.reject_deferred_poll(id, &waiter, IggyError::InvalidSizeBytes);
-            return;
-        }
-        let (result, byte_limited) =
+        let (mut result, byte_limited) =
             match result.limit_bytes(waiter.request.options.max_bytes as usize) {
                 Ok(result) => result,
                 Err(error) => {
@@ -639,6 +634,13 @@ where
                     return;
                 }
             };
+        // Charge what the reply carries, not what the read walked over. A
+        // selection that borrows journal buffers can still pin more than the
+        // reservation, so copy it out instead of refusing a serveable poll.
+        let config = *self.deferred_polls.config.borrow();
+        if result.retained_bytes() > config.max_read_bytes {
+            result = result.compacted();
+        }
         if result.message_count() >= waiter.request.options.min_count
             || byte_limited
             || waiter.terminal

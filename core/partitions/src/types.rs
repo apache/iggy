@@ -102,6 +102,13 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
     pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
         self.source.shares_allocation(source)
     }
+
+    /// Whether both fragments keep the same allocation alive, so a byte charge
+    /// counts it once instead of once per slice.
+    #[must_use]
+    pub fn shares_allocation_with(&self, other: &Self) -> bool {
+        self.source.shares_allocation(&other.source)
+    }
 }
 
 /// Arguments for polling messages from a partition.

@@ -271,15 +271,50 @@ impl PollReadResult {
         Ok((self, limited))
     }
 
-    /// Conservative charge: shared allocations count once for each fragment.
+    /// Memory this result keeps alive, counting every backing allocation once
+    /// however many fragments slice it.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
-        self.fragments.iter().fold(
-            self.fragments
-                .capacity()
-                .saturating_mul(size_of::<crate::Fragment>()),
-            |bytes, fragment| bytes.saturating_add(fragment.allocation_bytes()),
-        )
+        let mut bytes = self
+            .fragments
+            .capacity()
+            .saturating_mul(size_of::<crate::Fragment>());
+        for (index, fragment) in self.fragments.iter().enumerate() {
+            if !self.fragments[..index]
+                .iter()
+                .any(|earlier| earlier.shares_allocation_with(fragment))
+            {
+                bytes = bytes.saturating_add(fragment.allocation_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// Copy the selection into one exact-size allocation and drop the borrowed
+    /// buffers. A reply that slices a few bytes out of segment-sized journal
+    /// buffers pins all of them, so the copy trades one pass over the reply for
+    /// a charge that tracks the reply itself. Fragment boundaries survive, which
+    /// keeps batch framing intact.
+    #[must_use]
+    pub fn compacted(mut self) -> Self {
+        let total: usize = self.fragments.iter().map(Fragment::len).sum();
+        let mut buffer = Owned::with_capacity(total);
+        for fragment in &self.fragments {
+            buffer.extend_from_slice(fragment.as_slice());
+        }
+        let compacted = Frozen::from(buffer);
+        let mut start = 0;
+        self.fragments = self
+            .fragments
+            .iter()
+            .map(|fragment| {
+                let end = start + fragment.len();
+                let piece = Fragment::slice(compacted.clone(), start, end);
+                start = end;
+                piece
+            })
+            .collect();
+        self
     }
 
     #[must_use]
@@ -1719,5 +1754,57 @@ mod tests {
         assert!(walk.limited);
         assert_eq!(walk.matched, 0);
         assert!(walk.fragments.is_empty());
+    }
+
+    fn resident(fragments: PollFragments) -> PollReadResult {
+        PollPlan {
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(0, 0),
+                auto_commit: true,
+            },
+            commit_offset: 0,
+            tier: PollTier::Resident {
+                fragments,
+                last_matching_offset: None,
+                message_count: 0,
+            },
+        }
+        .execute_resident()
+    }
+
+    fn windows(source: &Frozen<4096>, count: usize) -> PollFragments {
+        (0..count)
+            .map(|window| Fragment::slice(source.clone(), window * 4096, window * 4096 + 512))
+            .collect()
+    }
+
+    #[test]
+    fn retained_bytes_counts_one_allocation_once_however_many_slices_borrow_it() {
+        let source: Frozen<4096> = Owned::copy_from_slice(&vec![7; 1 << 20]).into();
+        let one = resident(windows(&source, 1)).retained_bytes();
+        let four = resident(windows(&source, 4)).retained_bytes();
+        assert_eq!(one, four);
+        assert!(four < 2 * source.allocation_bytes());
+    }
+
+    #[test]
+    fn compacting_releases_the_borrowed_allocation_and_preserves_the_selection() {
+        let source: Frozen<4096> = Owned::copy_from_slice(&vec![7; 1 << 20]).into();
+        let borrowed = resident(windows(&source, 4));
+        let selection: Vec<Vec<u8>> = borrowed
+            .fragments
+            .iter()
+            .map(|fragment| fragment.as_slice().to_vec())
+            .collect();
+        let charge = borrowed.retained_bytes();
+        let compacted = borrowed.compacted();
+        assert!(compacted.retained_bytes() < charge);
+        let kept: Vec<Vec<u8>> = compacted
+            .fragments
+            .iter()
+            .map(|fragment| fragment.as_slice().to_vec())
+            .collect();
+        assert_eq!(kept, selection);
     }
 }
