@@ -44,7 +44,7 @@ pub(crate) fn build_storage_options(
                 (None, None) => {}
                 _ => {
                     return Err(Error::InitError(
-                        "S3 backend requires either for the access and secret key to be set together, or for both of them be be unset".into(),
+                        "S3 backend requires either for the access and secret key to be set together, or for both of them to be unset".into(),
                     ));
                 }
             }
