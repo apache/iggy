@@ -17,4 +17,6 @@
 
 mod fixture;
 
-pub use fixture::{DeltaFixture, DeltaS3Fixture};
+pub use fixture::{
+    DeltaFixture, DeltaS3Fixture, DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps,
+};

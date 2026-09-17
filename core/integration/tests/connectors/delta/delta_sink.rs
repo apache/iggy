@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::connectors::create_test_messages;
-use crate::connectors::fixtures::{DeltaFixture, DeltaS3Fixture};
+use crate::connectors::fixtures::{
+    DeltaFixture, DeltaS3Fixture, DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps,
+};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
@@ -234,4 +236,42 @@ async fn delta_sink_writes_to_s3(harness: &TestHarness, fixture: DeltaS3Fixture)
         .expect("Data should be written to S3 Delta table");
 
     assert_eq!(row_count, message_count);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_bucket_absence_on_s3(
+    harness: &TestHarness,
+    _fixture: DeltaS3NoBucketFixture,
+) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("failed to list table_url") && logs.contains("ERROR"),
+        "the error is expected since the bucket is not created"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_table_absence_on_s3(
+    harness: &TestHarness,
+    _fixture: DeltaS3NoTableFixture,
+) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("No delta table found in") && logs.contains("ERROR"),
+        "the error is expected since no table is written into the destination"
+    );
 }

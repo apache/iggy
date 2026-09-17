@@ -53,7 +53,9 @@ pub(crate) fn unique_container_name(service: &str) -> String {
 pub use clickhouse::{
     ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
 };
-pub use delta::{DeltaFixture, DeltaS3Fixture};
+pub use delta::{
+    DeltaFixture, DeltaS3Fixture, DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps,
+};
 pub use doris::{
     DorisOps, DorisSinkColumnsMappingFixture, DorisSinkCsvFixture, DorisSinkFixture,
     DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
