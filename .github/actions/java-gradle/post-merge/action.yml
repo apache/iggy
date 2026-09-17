@@ -86,7 +86,7 @@ runs:
           echo ""
           echo "Artifacts that would be published:"
           find . -path "*/build/libs/*.jar" -type f 2>/dev/null | while read jar; do
-            echo "  - $(basename $jar)"
+            echo "  - $(basename "$jar")"
           done
         else
           if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PW" ]; then
