@@ -1206,3 +1206,57 @@ async fn list_kafka_topics_includes_a_created_override_target_but_not_an_uncreat
     assert_eq!(listed[0].kafka_topic, "orders");
     assert_eq!(listed[0].partitions_count, 3);
 }
+
+/// `list_kafka_topics`'s bulk `get_topics(default_stream)` branch must not report a Kafka topic
+/// name that is itself another override's key - `resolve()` on such a name always uses that
+/// override, never falls back to identity, so listing it under its raw Iggy-side name would
+/// report a Kafka topic whose own individual lookup answers about a completely different
+/// physical topic.
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_excludes_a_default_stream_name_that_collides_with_another_overrides_key()
+{
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let mut topics = HashMap::new();
+    // "reports" physically creates (kafka/orders_internal) - the literal name a naive bulk
+    // listing would report.
+    topics.insert(
+        "reports".to_string(),
+        TopicOverride {
+            stream: "kafka".to_string(),
+            topic: "orders_internal".to_string(),
+        },
+    );
+    // "orders_internal" is itself an override key redirecting elsewhere, so the literal string
+    // "orders_internal" does not identity-resolve to (kafka, orders_internal) even though a
+    // physical topic with that exact name lives there.
+    topics.insert(
+        "orders_internal".to_string(),
+        TopicOverride {
+            stream: "billing".to_string(),
+            topic: "whatever".to_string(),
+        },
+    );
+    config.topic_mapping = TopicMapping::new("kafka".to_string(), topics)
+        .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("reports", 2)
+        .await
+        .expect("create the override target for 'reports'");
+    // Deliberately never create the "orders_internal" override's own target (billing/whatever).
+
+    let listed = bridge.list_kafka_topics().await.expect("listing call");
+    assert_eq!(
+        listed.len(),
+        1,
+        "must report 'reports' once, never the raw Iggy-side name 'orders_internal': {listed:?}"
+    );
+    assert_eq!(listed[0].kafka_topic, "reports");
+    assert_eq!(listed[0].partitions_count, 2);
+}

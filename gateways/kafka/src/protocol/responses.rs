@@ -360,8 +360,20 @@ pub fn validate_create_topic_shape(
 ) -> std::result::Result<u32, i16> {
     let broker_default_ok = version >= 4 || !topic.assignments.is_empty();
 
+    // `num_partitions == -1` covers two distinct cases the wire can't tell apart by that field
+    // alone (`CreatableTopic`'s own doc: "-1 if we are either specifying a manual partition
+    // assignment or using the default partitions"): a client that left partitioning to the
+    // broker, or one that supplied an explicit `assignments` list - one entry per intended
+    // partition - and expects that count honored even though this bridge can't honor the
+    // per-partition broker placement inside it. Falling back to `DEFAULT_PARTITION_COUNT`
+    // unconditionally here would silently create a 1-partition topic for a client that asked
+    // for N.
     let partition_count = if topic.num_partitions == -1 && broker_default_ok {
-        DEFAULT_PARTITION_COUNT
+        if topic.assignments.is_empty() {
+            DEFAULT_PARTITION_COUNT
+        } else {
+            u32::try_from(topic.assignments.len()).map_err(|_| ERROR_INVALID_PARTITIONS)?
+        }
     } else if topic.num_partitions > 0 {
         u32::try_from(topic.num_partitions).map_err(|_| ERROR_INVALID_PARTITIONS)?
     } else {

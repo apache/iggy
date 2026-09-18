@@ -113,9 +113,29 @@ fn create_topics_v2_with_assignments_allows_broker_default_sentinels() {
         .with_partition_index(0)
         .with_broker_ids(vec![BrokerId(1)]);
     let topic = creatable_topic("assigned", -1, -1).with_assignments(vec![assignment]);
-    // -1 partitions resolves to the broker default (1) same as the no-assignments case;
-    // assignments only widen *which versions* accept the sentinel, not what it resolves to.
+    // One assignment entry -> one intended partition; coincides with DEFAULT_PARTITION_COUNT
+    // here, so this alone can't distinguish "resolved from assignments.len()" from "always
+    // defaults to 1" - see the 3-assignment test below for that.
     assert_eq!(validate_create_topic_shape(&topic, 2), Ok(1));
+}
+
+#[test]
+fn create_topics_with_manual_assignment_resolves_partition_count_from_assignments_len() {
+    // `CreatableTopic::num_partitions`'s own doc: -1 means "either manual assignment or broker
+    // default" - the two are different intents and only `assignments`'s length tells them
+    // apart. A client requesting 3 explicit partition assignments must get 3 partitions, not
+    // DEFAULT_PARTITION_COUNT (1).
+    use kafka_protocol::messages::create_topics_request::CreatableReplicaAssignment;
+
+    let assignments = (0..3)
+        .map(|index| {
+            CreatableReplicaAssignment::default()
+                .with_partition_index(index)
+                .with_broker_ids(vec![BrokerId(1)])
+        })
+        .collect();
+    let topic = creatable_topic("assigned", -1, -1).with_assignments(assignments);
+    assert_eq!(validate_create_topic_shape(&topic, 5), Ok(3));
 }
 
 #[test]

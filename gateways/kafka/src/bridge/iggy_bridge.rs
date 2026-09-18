@@ -586,10 +586,21 @@ impl IggyBridge {
         {
             let default_topics =
                 with_request_timeout(self.client.get_topics(&default_stream_id)).await?;
-            topics.extend(default_topics.into_iter().map(|topic| KafkaTopicMetadata {
-                kafka_topic: topic.name,
-                partitions_count: topic.partitions_count,
-            }));
+            let overrides = self.config.topic_mapping.overrides();
+            topics.extend(
+                default_topics
+                    .into_iter()
+                    // A physical topic whose Iggy-side name is also an override *key* does not
+                    // identity-resolve to itself - `TopicMapping::resolve` looks the name up in
+                    // `overrides` first, and that lookup can point at a completely different
+                    // stream/topic. Listing it under this name here would report a Kafka topic
+                    // that, looked up individually, answers about a different physical topic.
+                    .filter(|topic| !overrides.contains_key(&topic.name))
+                    .map(|topic| KafkaTopicMetadata {
+                        kafka_topic: topic.name,
+                        partitions_count: topic.partitions_count,
+                    }),
+            );
         }
         for kafka_topic in self.config.topic_mapping.overrides().keys() {
             if let Some(metadata) = self.get_kafka_topic(kafka_topic).await? {
