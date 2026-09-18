@@ -472,6 +472,7 @@ impl ServerConfig {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 const CONTAINER_CGROUP_MARKERS: &[&str] = &[
     "/docker/",
     "/docker-",
