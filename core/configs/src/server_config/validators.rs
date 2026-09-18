@@ -31,6 +31,7 @@ use crate::common::http::HMAC_JWT_ALGORITHMS;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::Path;
 use tracing::warn;
@@ -413,20 +414,21 @@ impl ServerConfig {
     /// When running inside a container, a loopback listener means the server
     /// is unreachable from outside the container, which is warned.
     fn validate_client_facing_address(&self) -> Result<(), ConfigurationError> {
-        self.validate_client_facing_address_in_env(is_container())
+        self.validate_client_facing_address_in_env(is_container())?;
+        Ok(())
     }
 
     fn validate_client_facing_address_in_env(
         &self,
         is_container: bool,
-    ) -> Result<(), ConfigurationError> {
+    ) -> Result<Option<String>, ConfigurationError> {
         if self.cluster.enabled {
-            return Ok(());
+            return Ok(None);
         }
         // No client-facing listener runs, so no client dials this node and
         // there is no address to demand.
         let Some(listener) = self.derived_address_listener() else {
-            return Ok(());
+            return Ok(None);
         };
         let bind = parse_bind_address(listener.key, listener.address)?;
         let ip = bind.ip().to_canonical();
@@ -441,30 +443,32 @@ impl ServerConfig {
                 );
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
-            return Ok(());
+            return Ok(None);
         }
 
         if ip.is_loopback() && is_container {
             let env_var = format!("IGGY_{}", listener.key.replace('.', "_").to_uppercase());
             let port = bind.port();
-            if self.node.advertised_address.is_none() {
-                warn!(
+            let msg = if self.node.advertised_address.is_none() {
+                format!(
                     "{COMPONENT} - {} binds the loopback address {bind} inside a container; the \
                      server will not be reachable from outside the container. Set {env_var}=0.0.0.0:{port} \
                      together with IGGY_NODE_ADVERTISED_ADDRESS, or bind a concrete address.",
                     listener.key
-                );
+                )
             } else {
-                warn!(
+                format!(
                     "{COMPONENT} - {} binds the loopback address {bind} inside a container; the \
                      server will not be reachable from outside the container. Set {env_var}=0.0.0.0:{port} \
                      or bind a concrete address.",
                     listener.key
-                );
-            }
+                )
+            };
+            warn!("{msg}");
+            return Ok(Some(msg));
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -473,6 +477,8 @@ fn is_container() -> bool {
     is_container_indicators(
         Path::new("/.dockerenv"),
         Path::new("/run/.containerenv"),
+        std::env::var_os("container").as_deref(),
+        std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
         "/proc/self/cgroup",
     )
 }
@@ -480,15 +486,15 @@ fn is_container() -> bool {
 fn is_container_indicators(
     dockerenv_path: &Path,
     containerenv_path: &Path,
+    container_env: Option<&OsStr>,
+    k8s_env: Option<&OsStr>,
     cgroup_path: &str,
 ) -> bool {
     if dockerenv_path.exists() || containerenv_path.exists() {
         return true;
     }
 
-    if std::env::var_os("container").is_some()
-        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
-    {
+    if container_env.is_some() || k8s_env.is_some() {
         return true;
     }
 
@@ -618,28 +624,53 @@ mod tests {
     }
 
     #[test]
-    fn given_loopback_bind_in_container_when_validating_should_pass() {
+    fn given_loopback_bind_in_container_when_validating_should_warn_and_pass() {
         let config = config_with_override(
             "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
         );
-        assert!(config.validate_client_facing_address_in_env(true).is_ok());
+        let warning = config
+            .validate_client_facing_address_in_env(true)
+            .expect("validation should pass");
+        assert!(
+            warning.is_some(),
+            "loopback inside container must produce a warning"
+        );
+        let message = warning.unwrap();
+        assert!(message.contains("IGGY_TCP_ADDRESS=0.0.0.0:8090"));
+        assert!(message.contains("together with IGGY_NODE_ADVERTISED_ADDRESS"));
     }
 
     #[test]
-    fn given_loopback_bind_outside_container_when_validating_should_pass() {
+    fn given_loopback_bind_outside_container_when_validating_should_pass_without_warning() {
         let config = config_with_override(
             "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
         );
-        assert!(config.validate_client_facing_address_in_env(false).is_ok());
+        let warning = config
+            .validate_client_facing_address_in_env(false)
+            .expect("validation should pass");
+        assert!(
+            warning.is_none(),
+            "loopback outside container must not produce a warning"
+        );
     }
 
     #[test]
-    fn given_loopback_bind_in_container_with_advertised_address_when_validating_should_pass() {
+    fn given_loopback_bind_in_container_with_advertised_address_when_validating_should_warn_and_pass()
+     {
         let config = config_with_override(
             "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n\
              [node]\nadvertised_address = \"broker-1.example.com\"\n",
         );
-        assert!(config.validate_client_facing_address_in_env(true).is_ok());
+        let warning = config
+            .validate_client_facing_address_in_env(true)
+            .expect("validation should pass");
+        assert!(
+            warning.is_some(),
+            "loopback inside container must produce a warning"
+        );
+        let message = warning.unwrap();
+        assert!(message.contains("IGGY_TCP_ADDRESS=0.0.0.0:8090"));
+        assert!(!message.contains("together with IGGY_NODE_ADVERTISED_ADDRESS"));
     }
 
     #[test]
@@ -648,7 +679,8 @@ mod tests {
         let marker = temp_dir.join(format!("test_dockerenv_{}", std::process::id()));
         std::fs::write(&marker, "").unwrap();
         let non_existent = temp_dir.join("non_existent_indicator");
-        let result = is_container_indicators(&marker, &non_existent, "/non/existent/cgroup");
+        let result =
+            is_container_indicators(&marker, &non_existent, None, None, "/non/existent/cgroup");
         let _ = std::fs::remove_file(&marker);
         assert!(result);
     }
@@ -659,18 +691,44 @@ mod tests {
         let marker = temp_dir.join(format!("test_containerenv_{}", std::process::id()));
         std::fs::write(&marker, "").unwrap();
         let non_existent = temp_dir.join("non_existent_indicator");
-        let result = is_container_indicators(&non_existent, &marker, "/non/existent/cgroup");
+        let result =
+            is_container_indicators(&non_existent, &marker, None, None, "/non/existent/cgroup");
         let _ = std::fs::remove_file(&marker);
         assert!(result);
     }
 
     #[test]
+    fn given_container_env_var_when_checking_container_should_return_true() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(is_container_indicators(
+            non_existent,
+            non_existent,
+            Some(OsStr::new("docker")),
+            None,
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[test]
+    fn given_kubernetes_env_var_when_checking_container_should_return_true() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(is_container_indicators(
+            non_existent,
+            non_existent,
+            None,
+            Some(OsStr::new("10.0.0.1")),
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[test]
     fn given_missing_container_indicators_when_checking_container_should_return_false() {
         let non_existent = Path::new("/non/existent/path/to/indicator");
-        // Safe check without environment variables
         assert!(!is_container_indicators(
             non_existent,
             non_existent,
+            None,
+            None,
             "/non/existent/cgroup"
         ));
     }
