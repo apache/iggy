@@ -64,6 +64,17 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
 
+### Delivery guarantees
+
+Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
+restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
+a producer id so that it starts, but its retries are not deduplicated: a retry after a network
+timeout writes the record twice, and both copies reach the stream with their own offsets.
+
+Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
+guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
+[docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
+
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
