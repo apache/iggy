@@ -90,6 +90,8 @@ and served like any other record and nothing acts on it.
 
 A record takes the fallback when any of these hold:
 
+- the key is present and zero-length, which is not the same as a null key. Iggy rejects an
+  empty header value on the same rule that caps it at 255 bytes, so `kafka.key` cannot carry it
 - the key is longer than 255 bytes
 - a header name, prefixed with `kafka.h.`, is longer than 255 bytes
 - a header value is null, empty, or longer than 255 bytes
@@ -150,13 +152,18 @@ Produce decompresses gzip, snappy, lz4 and zstd batches, which means turning tho
 on for the `kafka-protocol` dependency (`Cargo.toml:217` currently builds it with
 `default-features = false, features = ["broker"]`). Fetch emits uncompressed batches.
 
-Decompression needs its own bound. `max_frame_size` bounds the frame a client sent, which is the
-compressed size, and zstd reaches 1000 to 1 on repetitive input without being asked, so an 8 MiB
-frame can expand to gigabytes. Produce therefore decompresses through a reader capped at
-`max_frame_size`, so a compressed batch can never yield more than the same client could have sent
-uncompressed, and rejects a batch that passes the cap with `MESSAGE_TOO_LARGE` (10) before it
-allocates the output. Each decompressed record value has to clear Iggy's own `MAX_PAYLOAD_SIZE`
-(64 MB, `iggy_message.rs:44`) separately, since one record becomes one message.
+Decompression needs its own bound, and the bound is per request rather than per batch.
+`max_frame_size` bounds the frame a client sent, which is the compressed size, and zstd reaches
+1000 to 1 on repetitive input without being asked, so an 8 MiB frame can expand to gigabytes. One
+frame also carries many batches: the request holds up to `MAX_REQUEST_ELEMENTS` (4096) topic and
+partition entries, each with its own records blob. A cap applied to one batch at a time would
+therefore still admit 4096 times that much output.
+
+Produce keeps a single decompression budget for the whole request, set to `max_frame_size`, so a
+compressed request can never yield more than the same client could have sent uncompressed. A
+batch that exhausts the budget is rejected with `MESSAGE_TOO_LARGE` (10) before the output is
+allocated. Each decompressed record value has to clear Iggy's own `MAX_PAYLOAD_SIZE` (64 MB,
+`iggy_message.rs:44`) separately, since one record becomes one message.
 
 Nothing decompresses today. The record batch stays an opaque `Bytes` on both paths, so the bound
 above is a requirement on [#3535](https://github.com/apache/iggy/issues/3535) rather than a
@@ -176,6 +183,16 @@ ListOffsets LATEST is the high watermark from `IggyBridge::high_watermarks`. EAR
 server-side field today (`Partition` carries no log start offset), so it reads the first
 retained message instead, and the `(messages_count, current_offset) == (0, 0)` ambiguity
 documented on `high_watermarks` applies to both.
+
+### Header order
+
+Kafka carries record headers as an ordered list. Iggy keys them in a `BTreeMap`, so Fetch emits
+them sorted by name and the producer's order is gone.
+
+There is no fallback for this, because the gateway cannot tell whether a record's header order
+carries meaning. The envelope does preserve order, since it stores the headers as a list, but a
+record only reaches the envelope for one of the reasons above. A consumer that depends on header
+order therefore sees a different order through the gateway than a real broker would give it.
 
 ## Partitioning
 

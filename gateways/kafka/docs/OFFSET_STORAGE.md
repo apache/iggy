@@ -95,6 +95,18 @@ Iggy has no lookup by consumer. Offsets are read one partition at a time
 (`core/common/src/traits/consumer_offset_client.rs:41`). The gateway answers by enumerating the
 topics in the mapped stream and querying each partition of each one.
 
+Answering also means naming each topic the way the client named it, and `TopicMapping::resolve`
+runs the wrong way. Its own doc says it is not injective, so it cannot be inverted in general.
+Two cases divide it. A topic with no override resolves to `(default_stream, kafka_topic)`, so the
+Iggy topic name is the Kafka name and reverses for free. A topic with an override needs a reverse
+index, built once at config load, which `TopicMapping::new` already makes safe by rejecting two
+overrides that share a target.
+
+What neither case covers is an unlisted Kafka topic whose name collides with an override's target
+inside the default stream. `new` rejects the shapes it can check, but the space of unlisted names
+is unbounded, so the collision is disclosed rather than prevented. An offset under a colliding
+name is reported against whichever Kafka name the reverse index holds.
+
 That is one round trip per partition on an admin call. The cost is bounded by the topic and
 partition count of one stream. This is an admin path and not a data path, so the cost is
 acceptable. It is written here so nobody discovers it in a test.
