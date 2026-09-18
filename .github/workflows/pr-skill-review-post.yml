@@ -1,0 +1,447 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Skill Review Post
+
+# Second stage of the /skill review command. Reads the artifact that
+# pr-skill-review-run.yml uploaded and turns findings.json into one pull
+# request review with inline comments.
+#
+# Why a separate workflow: the agent reads pull request content, which can
+# carry text aimed at it, so the step that runs it never holds a write token.
+# This workflow fires through workflow_run, which runs against the default
+# branch with the permissions below, and it reads the artifact as data only.
+#
+# Outcome rules:
+#   denied / usage / unknown skill  -> reply on the pull request, confused face
+#   ok, agent produced no findings  -> reply naming the run and its conclusion
+#   ok, findings present            -> one review (event COMMENT) with inline
+#                                      comments, +1 on the trigger comment
+#
+# Anchoring: GitHub accepts an inline comment only on a line that the diff
+# carries, and a single createReview call keeps only the first 30 inline
+# comments, dropping the rest without an error. Findings outside a diff hunk,
+# and findings past the cap, move into the review body.
+
+on:
+  workflow_run:
+    workflows: ["PR Skill Review Run"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+  # Required to fetch the review-out artifact from the run above.
+  actions: read
+
+jobs:
+  post:
+    # Every conclusion gets an answer. A cancelled or timed out run is exactly
+    # the case where the committer waits for a reply that would never come, and
+    # the outcomes below carry it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download the run output
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: review-out
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: out/
+
+      - name: Post the outcome
+        uses: actions/github-script@v9
+        env:
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            // The control file is written by the run before its agent step, in
+            // the artifact root. The agent can write only the agent/ directory
+            // below it, so this file is the run's own word.
+            const REQUEST_PATH = 'out/request.json';
+            // A run that died before its first step leaves no artifact and no
+            // pull request number to answer on. The red run is the signal.
+            if (!fs.existsSync(REQUEST_PATH)) {
+              core.warning('no review-out artifact: the run failed before it ' +
+                'wrote the control file, nothing to post');
+              return;
+            }
+            let request;
+            try {
+              request = JSON.parse(fs.readFileSync(REQUEST_PATH, 'utf8'));
+            } catch (e) {
+              core.warning(`the control file is not valid JSON: ${e.message}`);
+              return;
+            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const commentId = Number(request.comment_id) || null;
+            if (!commentId) {
+              core.setFailed('the request carries no comment id');
+              return;
+            }
+
+            const withRetry = async (fn, label) => {
+              const delays = [500, 1500, 4000];
+              for (let attempt = 0; ; attempt++) {
+                try {
+                  return await fn();
+                } catch (e) {
+                  const s = e.status;
+                  const transient = s === undefined || s === 429
+                                 || (s >= 500 && s < 600);
+                  if (!transient || attempt >= delays.length) throw e;
+                  core.warning(`${label}: transient failure ` +
+                    `(${s ?? e.code ?? 'network'}), retry ` +
+                    `${attempt + 1}/${delays.length}`);
+                  await new Promise((r) => setTimeout(r, delays[attempt]));
+                }
+              }
+            };
+
+            const react = async (content) => {
+              try {
+                await withRetry(() => github.rest.reactions.createForIssueComment({
+                  owner, repo, comment_id: commentId, content,
+                }), `react ${content}`);
+              } catch (e) {
+                core.warning(`reaction ${content} failed: ${e.message}`);
+              }
+            };
+            const reply = async (text) => {
+              try {
+                await withRetry(() => github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber, body: text,
+                }), 'createComment');
+              } catch (e) {
+                core.warning(`reply failed: ${e.message}`);
+              }
+            };
+            const skills = () => {
+              try {
+                return fs.readFileSync('out/skills.txt', 'utf8')
+                  .split('\n').map((s) => s.trim()).filter(Boolean);
+              } catch {
+                return [];
+              }
+            };
+            const available = () => {
+              const names = skills();
+              return names.length
+                ? names.map((n) => `\`${n}\``).join(', ')
+                : 'none';
+            };
+
+            // Every value this post acts on is read back from the API: the
+            // comment that asked, its author and the pull request it sits on.
+            // The control file supplies the comment id and nothing that could
+            // move the review to another pull request.
+            let trigger;
+            try {
+              trigger = await withRetry(() => github.rest.issues.getComment({
+                owner, repo, comment_id: commentId,
+              }), 'getComment');
+            } catch (e) {
+              if (e.status === 404) {
+                core.warning('the trigger comment is gone, nothing to answer');
+                return;
+              }
+              throw e;
+            }
+            const comment = trigger.data;
+            const author = comment.user.login;
+            const prNumber = Number(String(comment.issue_url).split('/').pop());
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed(`cannot read a pull request from ${comment.issue_url}`);
+              return;
+            }
+            const committer = ['MEMBER', 'COLLABORATOR', 'OWNER']
+              .includes(comment.author_association) && !author.endsWith('[bot]');
+
+            // The command has to be a line of the comment, the same rule the
+            // run workflow applies before it spends a runner. A comment that
+            // only mentions the command gets no answer.
+            const asked = String(comment.body || '').split('\n')
+              .some((line) => /^\s*\/skill(\s|$)/.test(line));
+            if (!asked) {
+              core.info('the trigger comment carries no /skill command');
+              return;
+            }
+            if (!committer) {
+              await react('confused');
+              await reply('`/skill` is limited to repository committers, and ' +
+                `\`${author}\` does not have write access.`);
+              return;
+            }
+
+            if (request.status !== 'ok') {
+              // The name reaches a reply only, and the charset keeps it literal.
+              const rejected = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(String(request.skill || ''))
+                ? String(request.skill)
+                : 'that name';
+              const reasons = {
+                // The run holds the accurate gate, so it decides this case.
+                denied: '`/skill` is limited to repository committers, and ' +
+                  `\`${author}\` does not have write access.`,
+                usage: `\`/skill\` needs a skill name. Available here: ${available()}.`,
+                unknown_skill: `No skill named \`${rejected}\` on the ` +
+                  `default branch. Available here: ${available()}.`,
+                bad_name: `\`${rejected}\` is not a valid skill name.`,
+              };
+              await react('confused');
+              await reply(reasons[request.status]
+                || `The command was rejected (${request.status}).`);
+              return;
+            }
+
+            // agent/ is the one directory the agent could write. Everything
+            // read from it below is checked field by field.
+            const FINDINGS_PATH = 'out/agent/findings.json';
+            if (!fs.existsSync(FINDINGS_PATH)) {
+              await react('confused');
+              await reply('The review run ended with ' +
+                `\`${process.env.CONCLUSION}\` and produced no findings. ` +
+                `[Run log](${process.env.RUN_URL}).`);
+              return;
+            }
+
+            let payload;
+            try {
+              payload = JSON.parse(fs.readFileSync(FINDINGS_PATH, 'utf8'));
+            } catch (e) {
+              await react('confused');
+              await reply('The findings file is not valid JSON. ' +
+                `[Run log](${process.env.RUN_URL}).`);
+              return;
+            }
+            // A payload without the array is the run failing, not a clean
+            // review, and the committer has to hear which one it was.
+            if (!Array.isArray(payload.findings)) {
+              await react('confused');
+              await reply('The review run ended with ' +
+                `\`${process.env.CONCLUSION}\` and wrote no findings list. ` +
+                `[Run log](${process.env.RUN_URL}).`);
+              return;
+            }
+            const findings = payload.findings;
+
+            let pr;
+            try {
+              pr = await withRetry(() => github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              }), 'pulls.get');
+            } catch (e) {
+              if (e.status === 404) {
+                core.info('pull request not found, skipping');
+                return;
+              }
+              throw e;
+            }
+            // A review lands on an open pull request only, a closed one would
+            // 422, but a committer who waited for the run still gets an answer.
+            if (pr.data.state !== 'open') {
+              core.warning(`pull request state is ${pr.data.state}`);
+              await react('confused');
+              await reply('The pull request was ' + `\`${pr.data.state}\` when ` +
+                `the review finished. [Run log](${process.env.RUN_URL}).`);
+              return;
+            }
+
+            // The run read the head when it started; a push while the agent
+            // worked moves every hunk of the diff. An anchor is safe only while
+            // the head is the one the findings describe, so a moved head sends
+            // them to the body instead.
+            const reviewedSha = String(request.reviewed_sha || '');
+            const headMoved = reviewedSha !== pr.data.head.sha;
+            if (headMoved) {
+              core.warning('the head moved during the run, findings go to the ' +
+                `body (reviewed ${reviewedSha.slice(0, 9) || 'unknown'}, ` +
+                `now ${pr.data.head.sha.slice(0, 9)})`);
+            }
+
+            // New-side line ranges of every file the diff touches. A comment
+            // outside them is rejected by the API, so it becomes body text.
+            const files = await withRetry(() => github.paginate(
+              github.rest.pulls.listFiles,
+              { owner, repo, pull_number: prNumber, per_page: 100 },
+            ), 'listFiles');
+            const ranges = new Map();
+            for (const file of files) {
+              const list = [];
+              const hunks = (file.patch || '')
+                .matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm);
+              for (const match of hunks) {
+                const start = Number(match[1]);
+                const count = match[2] === undefined ? 1 : Number(match[2]);
+                if (count > 0) list.push([start, start + count - 1]);
+              }
+              ranges.set(file.filename, list);
+            }
+
+            const SEVERITIES = new Set(
+              ['critical', 'warning', 'nit', 'simplification']);
+            // The review skills write `[simplify]` where this file writes
+            // `simplification`, so one severity has two spellings.
+            const normalizeSeverity = (raw) => {
+              const text = String(raw || '').toLowerCase().trim();
+              if (text === 'simplify') return 'simplification';
+              return SEVERITIES.has(text) ? text : '';
+            };
+            const inline = [];
+            const loose = [];
+            const seen = new Set();
+            const counts = { critical: 0, warning: 0, nit: 0, simplification: 0 };
+
+            // The skills state their own verdict in these two words. A model
+            // that writes REQUEST_CHANGES or "approved" still says what it
+            // means, so both spellings land on the same line.
+            const normalizeVerdict = (raw) => {
+              const text = String(raw || '').trim().toUpperCase()
+                .replace(/[_-]+/g, ' ');
+              if (text === 'APPROVE' || text === 'APPROVED') return 'APPROVE';
+              if (text === 'REQUEST CHANGES' || text === 'REQUEST CHANGE') {
+                return 'REQUEST CHANGES';
+              }
+              return '';
+            };
+
+            for (const finding of findings) {
+              // The prompt asks for the text without a prefix. Strip one when
+              // the model added it anyway, so the severity never doubles.
+              const body = String(finding.body || '').trim()
+                .replace(/^(?:\[(?:critical|warning|nit|simplify|simplification)\]\s*|(?:critical|warning|nit|simplify|simplification):\s*)/i, '');
+              if (!body) continue;
+
+              const path = String(finding.path || '').replace(/^\.\//, '');
+              // Number(null) is 0, so null, a missing line and a NaN all have
+              // to fall out here rather than reach the anchor test.
+              const parsed = Number(finding.line);
+              const line = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+              const severity = normalizeSeverity(finding.severity);
+              const text = severity ? `${severity}: ${body}` : body;
+
+              const key = `${path}:${line}:${text}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              if (severity) counts[severity] += 1;
+
+              const hunks = ranges.get(path) || [];
+              const anchored = !headMoved && line !== null
+                && hunks.some(([start, end]) => line >= start && line <= end);
+              if (anchored) {
+                inline.push({ path, line, body: text });
+              } else {
+                loose.push({ path, line, text });
+              }
+            }
+
+            // One createReview call keeps the first 30 inline comments and
+            // drops the rest silently, so the overflow joins the body findings.
+            const MAX_INLINE = 30;
+            const overflow = inline
+              .splice(MAX_INLINE)
+              .map((c) => ({ path: c.path, line: c.line, text: c.body }));
+
+            const parts = [];
+            const verdict = normalizeVerdict(payload.verdict);
+            if (!verdict) {
+              core.warning('the findings file carries no usable verdict');
+            }
+            const summary = String(payload.summary || '').trim();
+            const unanchored = [...loose, ...overflow];
+            const posted = inline.length + unanchored.length;
+
+            if (verdict) parts.push(`Verdict: ${verdict}`);
+            if (summary) parts.push(`Reason: ${summary}`);
+            if (headMoved) {
+              parts.push('', 'The head moved while this review ran ' +
+                `(\`${reviewedSha.slice(0, 9) || 'unknown'}\` reviewed, ` +
+                `\`${pr.data.head.sha.slice(0, 9)}\` now), so the findings ` +
+                'stay in this body instead of on lines.');
+            }
+            if (posted > 0) {
+              parts.push('', 'Counts: ' + Object.entries(counts)
+                .map(([name, n]) => `${name} ${n}`).join(', '));
+            }
+            // The verdict and the severities have to agree: the skills let a
+            // critical or a warning decide it, and nothing else.
+            const blocking = counts.critical + counts.warning;
+            if (verdict === 'APPROVE' && blocking > 0) {
+              core.warning(`verdict APPROVE with ${blocking} blocking finding(s)`);
+            }
+            if (verdict === 'REQUEST CHANGES' && blocking === 0) {
+              core.warning('verdict REQUEST CHANGES with no critical or warning finding');
+            }
+
+            if (unanchored.length) {
+              parts.push('', 'Findings without an anchor on a changed line:');
+              for (const item of unanchored) {
+                const where = item.line === null
+                  ? `\`${item.path}\``
+                  : `\`${item.path}:${item.line}\``;
+                parts.push(`- ${where} ${item.text}`);
+              }
+            }
+
+            if (!inline.length && !parts.length) {
+              await react('+1');
+              await reply('The review run finished with no findings.');
+              return;
+            }
+
+            // The footer names what produced the review. It goes in after the
+            // empty check, so a run with nothing to say replies instead of
+            // posting a review that carries only the footer.
+            const toolchain = request.toolchain || {};
+            if (toolchain.claude_code) {
+              parts.push('', '---', 'This review was generated by Claude Code ' +
+                `${toolchain.claude_code} on ${toolchain.model}. Review the ` +
+                'output before you act on it.');
+            }
+
+            const params = {
+              owner,
+              repo,
+              pull_number: prNumber,
+              commit_id: pr.data.head.sha,
+              event: 'COMMENT',
+              body: parts.join('\n').trim(),
+            };
+            if (inline.length) params.comments = inline;
+            try {
+              await withRetry(
+                () => github.rest.pulls.createReview(params),
+                'createReview',
+              );
+            } catch (e) {
+              // The helper above absorbs the transient failures. What reaches
+              // here is permanent, and the findings must not vanish with it.
+              core.warning(`createReview failed: ${e.message}`);
+              await react('confused');
+              await reply('The review could not be posted to this pull ' +
+                `request. [Run log](${process.env.RUN_URL}).`);
+              return;
+            }
+            core.info(`posted ${inline.length} inline comments and ` +
+              `${unanchored.length} body findings`);
+            await react('+1');
