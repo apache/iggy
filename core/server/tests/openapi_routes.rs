@@ -150,6 +150,8 @@ fn registered_routes(file: &Path) -> BTreeMap<Operation, String> {
     routes
 }
 
+/// True only for exactly `#[cfg(test)]`. `cfg(not(test))` is code that ships,
+/// and a feature name containing "test" is not the test cfg.
 fn is_cfg_test(item: &syn::Item) -> bool {
     let attrs = match item {
         syn::Item::Mod(item) => &item.attrs,
@@ -158,7 +160,7 @@ fn is_cfg_test(item: &syn::Item) -> bool {
         _ => return false,
     };
     attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg") && attr.meta.to_token_stream().to_string().contains("test")
+        attr.path().is_ident("cfg") && attr.parse_args::<syn::Ident>().is_ok_and(|id| id == "test")
     })
 }
 
