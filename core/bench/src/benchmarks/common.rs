@@ -182,22 +182,7 @@ pub fn build_consumer_futures(
 
     let global_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
-    // When measuring true E2E latency, apply read_amplification multiplier to consumer rate
-    // to ensure they can keep up with producers and not inflate latency due to queue buildup
-    let read_amplification = args.read_amplification().unwrap_or(1.0);
-    let rate_limit = rate_limit_per_actor(args.rate_limit(), actors).map(|rl| {
-        if origin_timestamp_latency_calculation {
-            #[allow(
-                clippy::cast_sign_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_precision_loss
-            )]
-            let amplified = (rl.as_bytes_u64() as f64 * f64::from(read_amplification)) as u64;
-            IggyByteSize::from(amplified)
-        } else {
-            rl
-        }
-    });
+    let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
     let use_high_level_api = args.high_level_api();
 
     (1..=consumers)

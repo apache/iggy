@@ -19,7 +19,7 @@ use crate::actors::{
     ApiLabel, BatchMetrics, BenchmarkInit,
     consumer::client::{
         BenchmarkConsumerClient,
-        interface::{BenchmarkConsumerConfig, ConsumerClient},
+        interface::{BenchmarkConsumerConfig, ConsumerClient, clear_consumer_offsets},
     },
 };
 
@@ -31,6 +31,7 @@ use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 
 const PREFETCH_BATCHES: u32 = 16;
+const TOPIC_ID: &str = "topic-1";
 
 pub struct HighLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
@@ -54,6 +55,58 @@ impl HighLevelConsumerClient {
             client: None,
             consumer: None,
         }
+    }
+
+    /// The name the SDK registers for this actor, which is also its identity inside a group.
+    /// Building the consumer and clearing its offsets have to agree on it.
+    fn consumer_name(&self) -> String {
+        self.config.consumer_group_id.map_or_else(
+            || format!("hl_consumer_{}", self.config.consumer_id),
+            |cg_id| format!("cg_{cg_id}"),
+        )
+    }
+
+    /// The consumer the SDK registers for this actor, rebuilt from the config: the built
+    /// `IggyConsumer` keeps its own copy, and the offset reset has to name the same one.
+    fn consumer_identifier(&self) -> Result<Consumer, IggyError> {
+        let name = self.consumer_name();
+        Ok(match self.config.consumer_group_id {
+            Some(_) => Consumer::group(name.as_str().try_into()?),
+            None => Consumer::new(name.as_str().try_into()?),
+        })
+    }
+
+    fn build_consumer(&self, client: &IggyClient) -> Result<IggyConsumer, IggyError> {
+        let name = self.consumer_name();
+        let stream_id_str = &self.config.stream_id;
+        let builder = if self.config.consumer_group_id.is_some() {
+            client
+                .consumer_group(&name, stream_id_str, TOPIC_ID)?
+                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+                .create_consumer_group_if_not_exists()
+                .auto_join_consumer_group()
+        } else {
+            client
+                .consumer(&name, stream_id_str, TOPIC_ID, 0)?
+                .polling_strategy(PollingStrategy::offset(0))
+                .auto_commit(AutoCommit::Disabled)
+        };
+        Ok(builder
+            .batch_length(self.config.messages_per_batch.get())
+            .poll_options(self.config.poll_options)
+            .prefetch_messages(
+                self.config
+                    .messages_per_batch
+                    .get()
+                    .saturating_mul(PREFETCH_BATCHES),
+            )
+            .prefetch_bytes(
+                self.config
+                    .poll_options
+                    .max_bytes
+                    .saturating_mul(PREFETCH_BATCHES),
+            )
+            .build())
     }
 }
 
@@ -111,6 +164,31 @@ impl ConsumerClient for HighLevelConsumerClient {
             }))
         }
     }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The initialized consumer moves into self and must retain its prefetch reservations."
+    )]
+    async fn reset_offsets(&mut self) -> Result<(), IggyError> {
+        let stream_id: Identifier = self.config.stream_id.as_str().try_into()?;
+        let topic_id: Identifier = TOPIC_ID.try_into()?;
+        let consumer = self.consumer_identifier()?;
+        let client = self.client.as_deref().expect("Client not initialized");
+
+        // Built here, initialized after the deletes: `init()` is what starts the deferred
+        // polls, and one running during the reset would fetch from the warmup position.
+        let mut replacement = self.build_consumer(client)?;
+
+        // Dropping the old consumer stops its polling. A bare drop does not leave the
+        // group, so the re-join below is the same member and keeps its partitions.
+        self.consumer = None;
+
+        clear_consumer_offsets(client, &consumer, &stream_id, &topic_id).await?;
+
+        replacement.init().await?;
+        self.consumer = Some(replacement);
+        Ok(())
+    }
 }
 
 impl BenchmarkInit for HighLevelConsumerClient {
@@ -119,42 +197,8 @@ impl BenchmarkInit for HighLevelConsumerClient {
         reason = "The initialized consumer moves into self and must retain its prefetch reservations."
     )]
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let topic_id_str = "topic-1";
         let client = self.client_factory.create_authenticated_client().await?;
-        let stream_id_str = &self.config.stream_id;
-        let builder = if let Some(cg_id) = self.config.consumer_group_id {
-            client
-                .consumer_group(&format!("cg_{cg_id}"), stream_id_str, topic_id_str)?
-                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
-                .create_consumer_group_if_not_exists()
-                .auto_join_consumer_group()
-        } else {
-            client
-                .consumer(
-                    &format!("hl_consumer_{}", self.config.consumer_id),
-                    stream_id_str,
-                    topic_id_str,
-                    0,
-                )?
-                .polling_strategy(PollingStrategy::offset(0))
-                .auto_commit(AutoCommit::Disabled)
-        };
-        let mut consumer = builder
-            .batch_length(self.config.messages_per_batch.get())
-            .poll_options(self.config.poll_options)
-            .prefetch_messages(
-                self.config
-                    .messages_per_batch
-                    .get()
-                    .saturating_mul(PREFETCH_BATCHES),
-            )
-            .prefetch_bytes(
-                self.config
-                    .poll_options
-                    .max_bytes
-                    .saturating_mul(PREFETCH_BATCHES),
-            )
-            .build();
+        let mut consumer = self.build_consumer(&client)?;
         consumer.init().await?;
         self.consumer = Some(consumer);
         self.client = Some(Box::new(client));

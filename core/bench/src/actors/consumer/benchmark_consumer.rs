@@ -71,12 +71,29 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
     pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         self.client.setup().await?;
 
+        // Warmup runs under the same limiter as the measured phase, so the phase boundary is
+        // a step rather than a burst far above the rate being measured.
+        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+
         if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
             while Instant::now() < warmup_end {
-                let _ = self.client.consume_batch().await?;
+                if let Some(batch) = self.client.consume_batch().await?
+                    && let Some(rate_limiter) = &rate_limiter
+                {
+                    rate_limiter
+                        .wait_until_necessary(batch.user_data_bytes)
+                        .await;
+                }
             }
+        }
+
+        // The measured phase starts at the first message of every partition. Kinds whose
+        // latency is the age of the message are excluded: re-reading warmup messages would
+        // report the whole warmup as latency.
+        if !self.config.origin_timestamp_latency_calculation {
+            self.client.reset_offsets().await?;
         }
 
         self.log_setup_info();
@@ -88,7 +105,6 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         let mut bytes_processed = 0;
         let mut user_data_bytes_processed = 0;
         let start_timestamp = Instant::now();
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
         while !self.finish_condition.is_done() {
             let batch_opt = self.client.consume_batch().await?;

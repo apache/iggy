@@ -112,12 +112,20 @@ where
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.producer_config.warmup_time.get_duration();
 
+            // Warmup sends under the same limiter as the measured phase, so the phase boundary
+            // is a step rather than a burst far above the rate being measured.
             while Instant::now() < warmup_end {
-                let _ = self.producer.produce_batch(&mut batch_generator).await;
+                if let Ok(Some(batch)) = self.producer.produce_batch(&mut batch_generator).await
+                    && let Some(limiter) = &rate_limiter
+                {
+                    limiter.wait_until_necessary(batch.user_data_bytes).await;
+                }
                 let _ = self.consumer.consume_batch().await;
             }
         }
 
+        // No offset reset here, unlike the standalone consumer: this kind reports the age of
+        // the message, so re-reading warmup messages would report the whole warmup as latency.
         self.log_setup_info();
         let max_capacity = self
             .send_finish_condition
@@ -125,7 +133,6 @@ where
             .max(self.poll_finish_condition.max_capacity());
         let mut records = Vec::with_capacity(max_capacity);
 
-        let mut rl_value = 0;
         let mut sent_user_bytes = 0;
         let mut sent_total_bytes = 0;
         let mut sent_messages = 0;
@@ -151,12 +158,17 @@ where
                 && (!require_reply || !awaiting_reply)
                 && let Some(batch) = self.producer.produce_batch(&mut batch_generator).await?
             {
-                rl_value += batch.user_data_bytes;
                 sent_user_bytes += batch.user_data_bytes;
                 sent_total_bytes += batch.total_bytes;
                 sent_messages += u64::from(batch.messages);
                 sent_batches += 1;
                 awaiting_reply = is_consumer;
+
+                // Only the send side is charged. A poll is paced by the data it waits for,
+                // so throttling it would only add latency to the measurement.
+                if let Some(limiter) = &rate_limiter {
+                    limiter.wait_until_necessary(batch.user_data_bytes).await;
+                }
 
                 if self
                     .send_finish_condition
@@ -179,7 +191,6 @@ where
                 && !self.poll_finish_condition.is_done()
                 && let Some(batch) = self.consumer.consume_batch().await?
             {
-                rl_value += batch.user_data_bytes;
                 recv_user_bytes += batch.user_data_bytes;
                 recv_total_bytes += batch.total_bytes;
                 recv_messages += u64::from(batch.messages);
@@ -196,11 +207,6 @@ where
                     user_data_bytes: sent_user_bytes + recv_user_bytes,
                     total_bytes: sent_total_bytes + recv_total_bytes,
                 });
-
-                if let Some(limiter) = &rate_limiter {
-                    limiter.wait_until_necessary(rl_value).await;
-                    rl_value = 0;
-                }
 
                 self.poll_finish_condition
                     .account_and_check(batch.user_data_bytes);

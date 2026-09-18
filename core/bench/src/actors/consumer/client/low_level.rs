@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::actors::consumer::client::BenchmarkConsumerClient;
-use crate::actors::consumer::client::interface::{BenchmarkConsumerConfig, ConsumerClient};
+use crate::actors::consumer::client::interface::{
+    BenchmarkConsumerConfig, ConsumerClient, clear_consumer_offsets,
+};
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 use crate::benchmarks::common::create_consumer;
 use crate::utils::ClientFactory;
@@ -123,6 +125,17 @@ impl ConsumerClient for LowLevelConsumerClient {
             total_bytes,
             latency,
         }))
+    }
+
+    async fn reset_offsets(&mut self) -> Result<(), IggyError> {
+        let client = self.client.as_ref().expect("client not initialized");
+        let consumer = self.consumer.as_ref().expect("consumer not initialized");
+
+        // The cursor this client keeps while polling with an offset strategy. The delete
+        // alone would not move where the next poll of such a partition starts.
+        self.next_offsets.clear();
+
+        clear_consumer_offsets(client, consumer, &self.stream_id, &self.topic_id).await
     }
 }
 
