@@ -27,11 +27,20 @@
 //! and emits them via `compio::io::AsyncWriteExt::write_vectored_all`
 //! (one writev in the common case, looping on short writes; zero
 //! intermediate copies of `Frozen`).
+//!
+//! The replica plane wraps its read half through
+//! [`TcpTransportConn::with_replica_read`]: socket reads are counted on
+//! every link, and above a nonzero `replica_read_buffer_size` one read
+//! fills a buffer the framing layer then decodes many frames out of. The
+//! client plane keeps the bare read half.
 
 use super::{ActorContext, TransportConn, TransportListener};
+use crate::ReplicaReadStats;
 use crate::framing;
 use crate::lifecycle::BusMessage;
-use compio::io::AsyncWriteExt;
+use compio::BufResult;
+use compio::buf::IoBufMut;
+use compio::io::{AsyncRead, AsyncWriteExt, BufReader};
 use compio::net::{TcpListener, TcpStream};
 use compio::runtime::fd::PollFd;
 use futures::FutureExt;
@@ -41,6 +50,7 @@ use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 use tracing::{debug, error, trace};
 
 /// Inbound TCP listener wrapper.
@@ -88,18 +98,44 @@ impl TransportListener for TcpTransportListener {
 /// reader and writer tasks internally.
 pub(crate) struct TcpTransportConn {
     stream: TcpStream,
+    /// Replica plane only: read-ahead capacity in bytes (0 selects the
+    /// unbuffered path) paired with the link's socket-read counters.
+    /// `None` on the client plane, which never wraps its read half.
+    replica_read: Option<(usize, Rc<ReplicaReadStats>)>,
 }
 
 impl TcpTransportConn {
     #[must_use]
     pub(crate) const fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            replica_read: None,
+        }
+    }
+
+    /// Count socket reads on this link, and read ahead into a buffer of
+    /// `capacity` bytes when that is nonzero.
+    ///
+    /// Called only from the replica installer. The client installer
+    /// stays on [`Self::new`], so no client connection pays for either.
+    #[must_use]
+    pub(crate) fn with_replica_read(
+        mut self,
+        capacity: usize,
+        stats: Rc<ReplicaReadStats>,
+    ) -> Self {
+        self.replica_read = Some((capacity, stats));
+        self
     }
 }
 
 impl TransportConn for TcpTransportConn {
     #[allow(clippy::future_not_send)]
     async fn run(self, ctx: ActorContext) {
+        let Self {
+            stream,
+            replica_read,
+        } = self;
         // Capture a refcounted poll fd BEFORE `into_split` so the
         // shutdown watchdog can wake the reader's parked io_uring read
         // SQE via `libc::shutdown(SHUT_RD)`. No `select!` over a TCP
@@ -108,8 +144,8 @@ impl TransportConn for TcpTransportConn {
         // io_uring read is not cancel-safe in the protocol sense).
         // compio 0.19 dropped `TcpStream::to_shared_fd`; `to_poll_fd`
         // gives an equivalently refcounted fd handle (PollFd: AsRawFd).
-        let poll_fd = self.stream.to_poll_fd().ok();
-        let (read_half, write_half) = self.stream.into_split();
+        let poll_fd = stream.to_poll_fd().ok();
+        let (read_half, write_half) = stream.into_split();
         let ActorContext {
             in_tx,
             rx,
@@ -127,13 +163,39 @@ impl TransportConn for TcpTransportConn {
 
         let writer_shutdown = shutdown;
         let reader_peer = peer.clone();
-        let reader_handle = compio::runtime::spawn(reader_loop(
-            read_half,
-            in_tx,
-            max_message_size,
-            label,
-            reader_peer,
-        ));
+        // A `BufReader` hands its buffer to the inner read and cannot take
+        // it back if the `fill_buf` future is dropped mid-read; the next
+        // call on it then panics. Invariant that keeps that unreachable:
+        // the reader task owns the `BufReader` and nothing else can call
+        // it, so the one path that drops a pending fill (the registry
+        // force-cancelling this task at `close_peer_timeout` or drain)
+        // drops the `BufReader` along with it.
+        let reader_handle = match replica_read {
+            Some((capacity, stats)) if capacity > 0 => compio::runtime::spawn(reader_loop(
+                BufReader::with_capacity(capacity, CountingRead::new(read_half, Rc::clone(&stats))),
+                in_tx,
+                max_message_size,
+                Some(stats),
+                label,
+                reader_peer,
+            )),
+            Some((_, stats)) => compio::runtime::spawn(reader_loop(
+                CountingRead::new(read_half, Rc::clone(&stats)),
+                in_tx,
+                max_message_size,
+                Some(stats),
+                label,
+                reader_peer,
+            )),
+            None => compio::runtime::spawn(reader_loop(
+                read_half,
+                in_tx,
+                max_message_size,
+                None,
+                label,
+                reader_peer,
+            )),
+        };
         let writer_handle = compio::runtime::spawn(writer_loop(
             write_half,
             rx,
@@ -187,26 +249,64 @@ fn spawn_shutdown_watchdog(
     .detach();
 }
 
+/// [`AsyncRead`] adapter that counts completed reads of the inner
+/// source.
+///
+/// Sits under the [`BufReader`], so it sees socket reads rather than the
+/// buffer hits the framing layer makes against the buffer. Wraps the
+/// replica read half even when read-ahead is off, so the unbuffered arm
+/// of an A/B run reports the same ratio as the buffered ones.
+pub(crate) struct CountingRead<R> {
+    inner: R,
+    stats: Rc<ReplicaReadStats>,
+}
+
+impl<R> CountingRead<R> {
+    pub(crate) const fn new(inner: R, stats: Rc<ReplicaReadStats>) -> Self {
+        Self { inner, stats }
+    }
+}
+
+impl<R: AsyncRead> AsyncRead for CountingRead<R> {
+    #[allow(clippy::future_not_send)]
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        // Counted regardless of outcome: an error and an `Ok(0)` each
+        // cost the same submit and completion as a full read.
+        self.stats.record_read();
+        self.inner.read(buf).await
+    }
+}
+
 /// Read framed consensus messages off the wire and forward each to
 /// [`ActorContext::in_tx`]. Exits on EOF, framing error, or send-side
 /// closure.
+///
+/// Generic over the read half so the replica plane can hand in a
+/// [`BufReader`] wrapping [`CountingRead`] while the client plane hands
+/// in the bare `TcpStream`. `stats` is `Some` on every replica link and
+/// counts decoded frames against the socket reads `CountingRead` counts.
 ///
 /// No `select!` over the TCP read. Cooperative shutdown is delivered
 /// via [`spawn_shutdown_watchdog`], which calls `libc::shutdown(SHUT_RD)`
 /// when the bus token fires; the in-flight read returns `Ok(0)` and
 /// `framing::read_message` surfaces it as an EOF error on the next
-/// iteration.
+/// iteration. Frames already complete in the read-ahead buffer are still
+/// decoded and delivered before that happens.
 #[allow(clippy::future_not_send)]
-async fn reader_loop(
-    mut read_half: TcpStream,
+async fn reader_loop<R: AsyncRead>(
+    mut read_half: R,
     in_tx: async_channel::Sender<server_common::Message<iggy_binary_protocol::GenericHeader>>,
     max_message_size: usize,
+    stats: Option<Rc<ReplicaReadStats>>,
     label: &'static str,
     peer: String,
 ) {
     loop {
         match framing::read_message(&mut read_half, max_message_size).await {
             Ok(msg) => {
+                if let Some(stats) = &stats {
+                    stats.record_frame();
+                }
                 if in_tx.send(msg).await.is_err() {
                     debug!(%label, %peer, "tcp reader: inbound queue dropped");
                     return;
@@ -371,6 +471,12 @@ mod tests {
         (client_res.unwrap(), server)
     }
 
+    /// The shipped default, so a bump in `config.toml` is exercised here
+    /// rather than pinned to a stale literal.
+    fn default_replica_read_buffer() -> usize {
+        crate::MessageBusConfig::default().replica_read_buffer_size
+    }
+
     #[allow(clippy::future_not_send)]
     fn drive(
         conn: TcpTransportConn,
@@ -438,6 +544,91 @@ mod tests {
         assert_eq!(a.header().command, Command::Ping);
         assert_eq!(b.header().command, Command::Prepare);
         assert_eq!(c.header().command, Command::Request);
+
+        client_shutdown.trigger();
+        server_shutdown.trigger();
+        let _ = client_handle.await;
+        let _ = server_handle.await;
+    }
+
+    /// Same contract as the plaintext twin above, with the replica
+    /// plane's read-ahead buffer at the configured default, plus the
+    /// counters the A/B run reads.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn run_pumps_three_frames_through_buffered_reader() {
+        let (client, server) = local_pair().await;
+        let stats = Rc::new(ReplicaReadStats::default());
+        let (client_out, _client_in, client_shutdown, client_handle) =
+            drive(TcpTransportConn::new(client));
+        let (_server_out, server_in, server_shutdown, server_handle) = drive(
+            TcpTransportConn::new(server)
+                .with_replica_read(default_replica_read_buffer(), Rc::clone(&stats)),
+        );
+
+        for cmd in [Command::Ping, Command::Prepare, Command::Request] {
+            client_out.send(header_only(cmd).into()).await.unwrap();
+        }
+
+        let recv_with_timeout = |rx: &async_channel::Receiver<Message<GenericHeader>>| {
+            let rx = rx.clone();
+            async move {
+                compio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("recv within 2s")
+                    .expect("ok")
+            }
+        };
+        let a = recv_with_timeout(&server_in).await;
+        let b = recv_with_timeout(&server_in).await;
+        let c = recv_with_timeout(&server_in).await;
+        assert_eq!(a.header().command, Command::Ping);
+        assert_eq!(b.header().command, Command::Prepare);
+        assert_eq!(c.header().command, Command::Request);
+
+        let counts = stats.take();
+        assert_eq!(counts.frames, 3);
+        assert!(
+            counts.reads >= 1,
+            "three frames cannot arrive in zero reads"
+        );
+
+        client_shutdown.trigger();
+        server_shutdown.trigger();
+        let _ = client_handle.await;
+        let _ = server_handle.await;
+    }
+
+    /// Capacity 0 keeps the unbuffered read path and still counts, so the
+    /// baseline arm of an A/B run reports the same ratio as the buffered
+    /// arms instead of zeros.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn unbuffered_replica_read_still_counts() {
+        let (client, server) = local_pair().await;
+        let stats = Rc::new(ReplicaReadStats::default());
+        let (client_out, _client_in, client_shutdown, client_handle) =
+            drive(TcpTransportConn::new(client));
+        let (_server_out, server_in, server_shutdown, server_handle) =
+            drive(TcpTransportConn::new(server).with_replica_read(0, Rc::clone(&stats)));
+
+        for cmd in [Command::Ping, Command::Prepare, Command::Request] {
+            client_out.send(header_only(cmd).into()).await.unwrap();
+            let read = compio::time::timeout(Duration::from_secs(2), server_in.recv())
+                .await
+                .expect("recv within 2s")
+                .expect("ok");
+            assert_eq!(read.header().command, cmd);
+        }
+
+        let counts = stats.take();
+        assert_eq!(counts.frames, 3);
+        assert!(
+            counts.reads >= counts.frames,
+            "the unbuffered path costs at least one read per frame, got {} for {}",
+            counts.reads,
+            counts.frames
+        );
 
         client_shutdown.trigger();
         server_shutdown.trigger();
@@ -535,6 +726,22 @@ mod tests {
     async fn run_exits_on_shutdown_signal() {
         let (client, _server) = local_pair().await;
         let (_out_tx, _in_rx, shutdown, handle) = drive(TcpTransportConn::new(client));
+        shutdown.trigger();
+        let res = compio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(res.is_ok(), "run must exit within 2s of shutdown");
+    }
+
+    /// The `SHUT_RD` watchdog still tears the reader down when its read
+    /// half sits under a `BufReader`.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn buffered_run_exits_on_shutdown_signal() {
+        let (client, _server) = local_pair().await;
+        let conn = TcpTransportConn::new(client).with_replica_read(
+            default_replica_read_buffer(),
+            Rc::new(ReplicaReadStats::default()),
+        );
+        let (_out_tx, _in_rx, shutdown, handle) = drive(conn);
         shutdown.trigger();
         let res = compio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(res.is_ok(), "run must exit within 2s of shutdown");

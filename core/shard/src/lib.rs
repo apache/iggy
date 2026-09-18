@@ -7674,6 +7674,8 @@ where
         }
         self.metrics.record_persistence(&persistence_metrics);
         self.metrics
+            .record_replica_reads(&self.bus.take_replica_read_stats());
+        self.metrics
             .set_repair_ring(repair_ring_entries, repair_ring_bytes);
 
         // Counted at most ONCE per sweep and only if a re-arm actually fires,

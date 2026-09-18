@@ -72,6 +72,18 @@ pub const IOV_MAX_LIMIT: usize = 512;
 
 const DEFAULT_CLIENT_QUEUE_CAPACITY: usize = 256;
 
+/// Default for [`MessageBusConfig::replica_read_buffer_size`]. Holds 64
+/// average Prepares or 1024 PrepareOks of one burst, and twice the
+/// kernel's default receive buffer (`tcp_rmem[1]`, 128 KiB). Kernel
+/// autotuning grows the receive queue well past that default once the
+/// reader falls behind, so under a CPU-bound reader this value alone
+/// sets the batching factor.
+const DEFAULT_REPLICA_READ_BUFFER_BYTES: u64 = 256 * 1024;
+
+/// Floor for a nonzero [`MessageBusConfig::replica_read_buffer_size`].
+/// A buffer below one page costs more reads and copies than no buffer.
+const MIN_REPLICA_READ_BUFFER_BYTES: u64 = 4 * 1024;
+
 /// Tunables for the message bus that ships consensus traffic between
 /// replicas and SDK-client traffic between shards.
 #[serde_as]
@@ -87,6 +99,16 @@ pub struct MessageBusConfig {
     /// down.
     #[config_env(leaf)]
     pub max_message_size: IggyByteSize,
+
+    /// Read-ahead buffer per plaintext replica link. One socket read
+    /// fills it and the framing layer decodes every complete frame it
+    /// holds, so a burst costs one read instead of one or two per frame.
+    /// Zero keeps the unbuffered path. No effect under `cluster.tls`,
+    /// whose reader buffers inside compio's `SyncStream` adapter, nor on
+    /// the client plane, which never wraps its read half.
+    #[serde(default = "default_replica_read_buffer_size")]
+    #[config_env(leaf)]
+    pub replica_read_buffer_size: IggyByteSize,
 
     /// Bound on each replica peer's mpsc queue. Writer task drains; the
     /// `send_to_*` path enqueues. Too small drops under burst; too
@@ -145,6 +167,17 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        // The one key in this section where zero is legal: it selects the
+        // unbuffered read path, so the A/B baseline is a config change
+        // rather than a separate build.
+        let replica_read_buffer = self.replica_read_buffer_size.as_bytes_u64();
+        if replica_read_buffer != 0 && replica_read_buffer < MIN_REPLICA_READ_BUFFER_BYTES {
+            eprintln!(
+                "{COMPONENT} message_bus.replica_read_buffer_size ({replica_read_buffer}) must be \
+                 0 (unbuffered) or at least {MIN_REPLICA_READ_BUFFER_BYTES} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.peer_queue_capacity == 0 {
             eprintln!("{COMPONENT} message_bus.peer_queue_capacity must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -189,6 +222,12 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
 
 const fn default_client_queue_capacity() -> usize {
     DEFAULT_CLIENT_QUEUE_CAPACITY
+}
+
+/// Named default rather than `#[serde(default)]`: the derived default of
+/// [`IggyByteSize`] is 0 bytes, which turns the read-ahead buffer off.
+const fn default_replica_read_buffer_size() -> IggyByteSize {
+    IggyByteSize::new(DEFAULT_REPLICA_READ_BUFFER_BYTES)
 }
 
 #[cfg(test)]
@@ -251,6 +290,62 @@ mod tests {
         let mut config = baseline();
         config.client_queue_capacity = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn default_replica_read_buffer_is_256_kib() {
+        assert_eq!(
+            baseline().replica_read_buffer_size.as_bytes_u64(),
+            256 * 1024
+        );
+    }
+
+    /// Zero is the unbuffered path, not a misconfiguration: it is the
+    /// A/B baseline arm and must survive validation.
+    #[test]
+    fn accepts_zero_replica_read_buffer() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(0_u64);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_replica_read_buffer_at_floor() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(MIN_REPLICA_READ_BUFFER_BYTES);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_replica_read_buffer_below_floor() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(MIN_REPLICA_READ_BUFFER_BYTES - 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn replica_read_buffer_parses_byte_size_strings() {
+        for (text, expected) in [("0", 0_u64), ("64 KiB", 64 * 1024)] {
+            let mut config = serde_json::to_value(baseline()).unwrap();
+            config["replica_read_buffer_size"] = serde_json::json!(text);
+            let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
+            assert_eq!(decoded.replica_read_buffer_size.as_bytes_u64(), expected);
+            decoded.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_replica_read_buffer_keeps_named_default() {
+        let mut config = serde_json::to_value(baseline()).unwrap();
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("replica_read_buffer_size");
+        let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            decoded.replica_read_buffer_size.as_bytes_u64(),
+            DEFAULT_REPLICA_READ_BUFFER_BYTES
+        );
     }
 
     #[test]

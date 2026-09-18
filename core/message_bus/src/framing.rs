@@ -174,8 +174,12 @@ fn to_read_error(e: &std::io::Error) -> IggyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReplicaReadStats;
+    use crate::transports::tcp::CountingRead;
+    use compio::io::BufReader;
     use compio::net::{TcpListener, TcpStream};
     use iggy_binary_protocol::{Command, SIZE_FIELD_OFFSET};
+    use std::rc::Rc;
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_header_only(command: Command) -> Message<GenericHeader> {
@@ -222,6 +226,87 @@ mod tests {
 
         let res = read_message(&mut b, MAX_MESSAGE_SIZE).await;
         assert!(matches!(res, Err(IggyError::InvalidCommand)));
+    }
+
+    /// The one place the batching factor is asserted: here the traffic
+    /// shape is controlled, so many frames provably land in one socket
+    /// read. On a live link the ratio depends on arrival timing.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn buffered_read_batches_many_frames_per_socket_read() {
+        const FRAMES: usize = 64;
+        const CAPACITY: usize = 64 * 1024;
+
+        let (mut a, b) = local_pair().await;
+        let batch: Vec<_> = (0..FRAMES)
+            .map(|_| make_header_only(Command::Ping).into_frozen())
+            .collect();
+        a.write_vectored_all(batch).await.0.unwrap();
+
+        let stats = Rc::new(ReplicaReadStats::default());
+        let mut reader =
+            BufReader::with_capacity(CAPACITY, CountingRead::new(b, Rc::clone(&stats)));
+        for _ in 0..FRAMES {
+            let read = read_message(&mut reader, MAX_MESSAGE_SIZE).await.unwrap();
+            assert_eq!(read.header().command, Command::Ping);
+        }
+
+        let reads = stats.take().reads;
+        assert!(
+            (1..FRAMES as u64 / 8).contains(&reads),
+            "{FRAMES} frames of one write cost {reads} reads; unbuffered would cost {FRAMES}"
+        );
+    }
+
+    /// A frame larger than the buffer crosses it in buffer-sized pieces
+    /// and still decodes intact.
+    #[compio::test]
+    #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
+    async fn buffered_read_decodes_frame_larger_than_buffer() {
+        const CAPACITY: usize = 4 * 1024;
+        let frame_len = 2 * CAPACITY;
+
+        let mut msg = Message::<GenericHeader>::new(frame_len).transmute_header(
+            |_, h: &mut GenericHeader| {
+                h.command = Command::Ping;
+                h.size = frame_len as u32;
+            },
+        );
+        for (at, byte) in msg.as_mut_slice()[HEADER_SIZE..].iter_mut().enumerate() {
+            *byte = (at % 251) as u8;
+        }
+        let expected = msg.as_slice().to_vec();
+
+        let (mut a, b) = local_pair().await;
+        let stats = Rc::new(ReplicaReadStats::default());
+        let mut reader =
+            BufReader::with_capacity(CAPACITY, CountingRead::new(b, Rc::clone(&stats)));
+        write_message(&mut a, msg).await.unwrap();
+
+        let read = read_message(&mut reader, MAX_MESSAGE_SIZE).await.unwrap();
+        assert_eq!(read.as_slice(), expected.as_slice());
+        assert!(
+            stats.take().reads >= 2,
+            "a frame twice the buffer cannot arrive in one read"
+        );
+    }
+
+    /// EOF partway through a header stays a closed connection rather than
+    /// a framing error once the read half is buffered.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn buffered_read_reports_eof_after_partial_header() {
+        use compio::io::AsyncWriteExt;
+        let (mut a, b) = local_pair().await;
+        a.write_all(vec![0u8; HEADER_SIZE / 2]).await.0.unwrap();
+        drop(a);
+
+        let mut reader = BufReader::with_capacity(
+            4 * 1024,
+            CountingRead::new(b, Rc::new(ReplicaReadStats::default())),
+        );
+        let res = read_message(&mut reader, MAX_MESSAGE_SIZE).await;
+        assert!(matches!(res, Err(IggyError::ConnectionClosed)));
     }
 
     #[compio::test]

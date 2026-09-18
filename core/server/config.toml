@@ -1067,6 +1067,11 @@ max_batch = 256
 # also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
 
+# Read-ahead buffer per plaintext replica link. One io_uring read fills it and
+# the framing layer decodes every complete frame it holds. 0 keeps the
+# unbuffered path (one read per header, one per body). No-op under cluster.tls.
+replica_read_buffer_size = "256 KiB"
+
 # Bound on each replica peer's mpsc queue. The writer task drains; the
 # send_to_* path enqueues.
 peer_queue_capacity = 4096

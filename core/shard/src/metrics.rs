@@ -44,6 +44,7 @@ use prometheus_client::registry::Registry;
 use std::sync::{Arc, OnceLock};
 
 use iggy_common::ConsumerKind;
+use message_bus::ReplicaReadMetrics;
 
 /// Label for `frame_drops_total`.
 ///
@@ -310,6 +311,8 @@ pub struct ShardMetrics {
     metadata_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
+    replica_socket_reads_total: Counter,
+    replica_inbound_frames_total: Counter,
     partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
     consumer_offset_denied_counters: [Counter; 2],
     partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
@@ -390,6 +393,8 @@ impl ShardMetrics {
             metadata_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
+            replica_socket_reads_total: Counter::default(),
+            replica_inbound_frames_total: Counter::default(),
             partition_consumer_offsets_denied_total,
             consumer_offset_denied_counters,
             partition_consumer_offsets_stranded,
@@ -415,6 +420,27 @@ impl ShardMetrics {
         self.partition_wal_checkpoints
             .inc_by(metrics.completed_checkpoints);
         self.partition_wal_errors.inc_by(metrics.failed_writes);
+    }
+
+    /// Fold one sweep's worth of replica socket-read deltas in.
+    ///
+    /// Deltas, never running totals: [`ReplicaReadMetrics`] comes from a
+    /// take that resets the source, so feeding cumulative values here
+    /// would double count every sweep. Both counters stay at zero on a
+    /// shard that owns no plaintext replica link, which is what makes
+    /// them identify the link shard.
+    pub fn record_replica_reads(&self, metrics: &ReplicaReadMetrics) {
+        self.replica_socket_reads_total.inc_by(metrics.reads);
+        self.replica_inbound_frames_total.inc_by(metrics.frames);
+    }
+
+    /// Snapshot of the replica read counters. Test accessor.
+    #[must_use]
+    pub fn replica_read_counts(&self) -> (u64, u64) {
+        (
+            self.replica_socket_reads_total.get(),
+            self.replica_inbound_frames_total.get(),
+        )
     }
 
     fn register_persistence(&self, registry: &mut Registry) {
@@ -940,6 +966,16 @@ impl ShardMetrics {
             "partition_prepare_gap_drops",
             "replicated prepares dropped out of order by a backup's gap check",
             self.partition_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "replica_socket_reads",
+            "completed socket reads on this shard's plaintext replica links",
+            self.replica_socket_reads_total.clone(),
+        );
+        registry.register(
+            "replica_inbound_frames",
+            "frames decoded off this shard's plaintext replica links",
+            self.replica_inbound_frames_total.clone(),
         );
         registry.register(
             "metadata_prepare_gap_drops",
