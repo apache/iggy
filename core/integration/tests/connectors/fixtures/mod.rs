@@ -54,7 +54,8 @@ pub use clickhouse::{
     ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
 };
 pub use delta::{
-    DeltaFixture, DeltaS3Fixture, DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps,
+    DeltaCorruptedLogFixture, DeltaFixture, DeltaS3Fixture, DeltaS3MissingSecretKeyFixture,
+    DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps, DeltaS3WrongCredentialsFixture,
 };
 pub use doris::{
     DorisOps, DorisSinkColumnsMappingFixture, DorisSinkCsvFixture, DorisSinkFixture,
