@@ -763,8 +763,9 @@ pub fn validate_sasl_handshake_shape(_version: i16, body: &Bytes) -> Result<()> 
 ///
 /// # Errors
 ///
-/// Returns [`KafkaProtocolError::FrameTooLarge`] when the body exceeds [`MAX_SASL_AUTH_BYTES`],
-/// or an error when the declared length does not fit the remaining frame.
+/// Returns [`KafkaProtocolError::FrameTooLarge`] when the body exceeds this module's
+/// `MAX_SASL_AUTH_BYTES` cap, or an error when the declared length does not fit the remaining
+/// frame.
 pub fn validate_sasl_authenticate_shape(version: i16, body: &Bytes) -> Result<()> {
     if body.len() > MAX_SASL_AUTH_BYTES {
         return Err(KafkaProtocolError::FrameTooLarge {

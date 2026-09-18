@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 
 use crate::protocol::sasl::PlainCredentials;
 
-/// Bound on one credential verification, covering the dial, the login, and the teardown.
+/// Bound on one credential verification.
 ///
 /// Covers the dial and the login. Teardown has its own, much smaller budget
 /// ([`TEARDOWN_TIMEOUT`]) so that one attempt cannot hold an authentication permit for twice this
@@ -70,7 +70,7 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 pub enum AuthError {
     /// Iggy rejected the credentials.
     Rejected,
-    /// Iggy could not be reached, or did not answer inside [`VERIFY_TIMEOUT`].
+    /// Iggy could not be reached, or did not answer inside the verification timeout.
     Unavailable,
 }
 
@@ -89,18 +89,6 @@ pub trait SaslAuthenticator: Send + Sync + std::fmt::Debug {
     async fn authenticate(&self, credentials: &PlainCredentials) -> Result<(), AuthError>;
 }
 
-/// Verifies credentials by logging into a real Iggy server with them.
-///
-/// Every verification opens its own connection, logs in, and shuts down again. That is one Argon2
-/// verify and one replicated `Register` per authenticated Kafka connection, which is the cost
-/// `docs/AUTHENTICATION.md` describes and does not hide.
-///
-/// It is also why there is no credential cache here. Caching a verification keyed on the username
-/// alone would let a second connection present any password for a principal already seen, which
-/// is an authentication bypass rather than an optimisation. Caching it keyed on the credential
-/// means storing something password-equivalent in gateway memory. Neither is worth doing before
-/// there is a handler whose throughput the login cost actually limits, and today Produce and Fetch
-/// are still stubs, so no verified session has a consumer to be held for.
 /// How the verifier reaches Iggy.
 ///
 /// Separate from the gateway's own listener security. A deployment can terminate TLS on the Kafka
@@ -115,6 +103,18 @@ pub struct IggyTls {
     pub ca_file: Option<String>,
 }
 
+/// Verifies credentials by logging into a real Iggy server with them.
+///
+/// Every verification opens its own connection, logs in, and shuts down again. That is one Argon2
+/// verify and one replicated `Register` per authenticated Kafka connection, which is the cost
+/// `docs/AUTHENTICATION.md` describes and does not hide.
+///
+/// It is also why there is no credential cache here. Caching a verification keyed on the username
+/// alone would let a second connection present any password for a principal already seen, which
+/// is an authentication bypass rather than an optimisation. Caching it keyed on the credential
+/// means storing something password-equivalent in gateway memory. Neither is worth doing before
+/// there is a handler whose throughput the login cost actually limits, and today Produce and Fetch
+/// are still stubs, so no verified session has a consumer to be held for.
 #[derive(Debug)]
 pub struct IggyAuthenticator {
     address: String,
