@@ -71,8 +71,11 @@ The configuration is usually wrtitten individually for every connector and consi
   ```
 
 ### `[[streams]]` section
+
 - Find a topic that you need and the corresponding stream that this topic is in and add it into the configuration.
-- `batch_length` and `poll_interval` have to be carefully set for Delta tables. The write happens when there is either `batch_length` number of records in the buffer or we hit `poll_interval` timeout. For Delta, writing means creating a log entry and a separate Parquet file, so if these values are too low (roughly `batch_length` < 1000 and `poll_interval` < 1s), the connector is going to write lots of small files. This is highly undesirable for the reader as it will have to read from many small files instead of a few larger ones. For query performance optimization, the system consuming these files will have to apply `OPTIMIZE` query in order to consolidate the files. We recommend setting these values pretty high based on your workload so that ideally the files are already optimized for reading. The guideline recommended by the developers of Delta is to keep individual file sizes between 128 MB and 1 GB. In the context of this document, it means that ideally `batch_length` + `poll_interval` should cut off the files in the way that their size is in the suggested range. The given range is only a rough guideline and you need to find a good setting based on the patterns of reading and writing in your systems.
+- `batch_length` and `poll_interval` have to be carefully set for Delta tables. The write happens when there is either `batch_length` number of records in the buffer or we hit `poll_interval` timeout. For Delta, writing means creating a log entry and a separate Parquet file, so if these values are too low (roughly `batch_length` < 1000 and `poll_interval` < 1s), the connector is going to write lots of small files.
+  This is highly undesirable for the reader as it will have to read from many small files instead of a few larger ones. For query performance optimization, the system consuming these files will have to apply `OPTIMIZE` query in order to consolidate the files. We recommend setting these values pretty high based on your workload so that ideally the files are already optimized for reading.
+  The guideline recommended by the developers of Delta is to keep individual file sizes between 128 MB and 1 GB. In the context of this document, it means that ideally `batch_length` + `poll_interval` should cut off the files in the way that their size is in the suggested range. The given range is only a rough guideline and you need to find a good setting based on the patterns of reading and writing in your systems.
 
 ### Plugin configuration
 
@@ -141,11 +144,11 @@ Currently the implementation offers two possible ways of accessing the bucket.
 
 Parameter descriptions:
 
-  - **aws_s3_access_key**: Optional. AWS access key ID. Can only be passed together with the secret key.
-  - **aws_s3_secret_key**: Optional. AWS secret access key. Can only be passed together with the access key.
-  - **aws_s3_region**: Required. AWS region (e.g. `us-east-1`). 
-  - **aws_s3_endpoint_url**: Optional. S3 endpoint URL. Use for S3-compatible services. Make sure that the URL implies the same regions that is set in **aws_s3_region**, otherwise you'll have an error.
-  - **aws_s3_allow_http**: Optional. Set to `true` to allow HTTP connections (for local development).
+- **aws_s3_access_key**: Optional. AWS access key ID. Can only be passed together with the secret key.
+- **aws_s3_secret_key**: Optional. AWS secret access key. Can only be passed together with the access key.
+- **aws_s3_region**: Required. AWS region (e.g. `us-east-1`).
+- **aws_s3_endpoint_url**: Optional. S3 endpoint URL. Use for S3-compatible services. Make sure that the URL implies the same regions that is set in **aws_s3_region**, otherwise you'll have an error.
+- **aws_s3_allow_http**: Optional. Set to `true` to allow HTTP connections (for local development).
 
 #### Azure Blob Storage
 
