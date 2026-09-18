@@ -31,13 +31,15 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
-use crate::auth::{AuthError, SaslAuthenticator};
+use crate::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise, DEFAULT_KAFKA_PORT,
-    ERROR_ILLEGAL_SASL_STATE, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
-    ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, HandleOutcome,
-    decode_sasl_auth_bytes, decode_sasl_mechanism, encode_error_for_key, handle_request_bounded,
+    API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
+    DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST, ERROR_NONE,
+    ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM,
+    ERROR_UNSUPPORTED_VERSION, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS,
+    decode_acl_filter, decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome,
+    encode_error_for_key, handle_request_bounded, respond_describe_acls_error,
     sasl_authenticate_outcome, sasl_handshake_outcome,
 };
 use crate::protocol::header::{request_header_version, response_header_version};
@@ -431,6 +433,7 @@ struct ConnectionContext<'a> {
 async fn route_frame(
     ctx: &ConnectionContext<'_>,
     sasl_state: &mut SaslState,
+    principal: &mut Option<AuthenticatedPrincipal>,
     req: &RequestHeader,
     body: Bytes,
 ) -> HandleOutcome {
@@ -451,6 +454,15 @@ async fn route_frame(
         mechanism.as_deref(),
     );
     match action {
+        // Answered here rather than in the stateless dispatch, because it describes the principal
+        // this connection authenticated as, which only the connection knows. Gated on the feature
+        // as well as the key: with SASL off there is no principal, and the key is not advertised,
+        // so it falls through to ordinary dispatch and is refused as the unlisted key it is.
+        SaslAction::Dispatch
+            if ctx.config.sasl_enabled && req.request_api_key == API_KEY_DESCRIBE_ACLS =>
+        {
+            describe_acls(principal.as_ref(), req.request_api_version, body, peer)
+        }
         SaslAction::Dispatch => handle_request_bounded(
             req.request_api_key,
             req.request_api_version,
@@ -507,7 +519,7 @@ async fn route_frame(
             HandleOutcome::Close
         }
         SaslAction::Authenticate => {
-            let outcome = authenticate_token(
+            let (outcome, verified) = authenticate_token(
                 ctx.authenticator,
                 ctx.auth_slots,
                 ctx.config.pre_auth_timeout,
@@ -520,6 +532,7 @@ async fn route_frame(
             // `RespondThenClose`, so the state advances on exactly the accepting branch.
             if matches!(outcome, HandleOutcome::Respond(_)) {
                 *sasl_state = SaslState::Authenticated;
+                *principal = verified;
             }
             outcome
         }
@@ -556,6 +569,7 @@ async fn handle_connection(
     } else {
         SaslState::Authenticated
     };
+    let mut principal: Option<AuthenticatedPrincipal> = None;
     let ctx = ConnectionContext {
         config: &config,
         broker: &broker,
@@ -605,7 +619,7 @@ async fn handle_connection(
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
-        let outcome = route_frame(&ctx, &mut sasl_state, &req, body).await;
+        let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
         if dispatch_outcome(&mut stream, &peer, &config, &req, resp_hdr_ver, outcome).await? {
             return Ok(());
         }
@@ -624,8 +638,13 @@ async fn authenticate_token(
     api_version: i16,
     body: Bytes,
     peer: &SocketAddr,
-) -> HandleOutcome {
-    let failed = || sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true);
+) -> (HandleOutcome, Option<AuthenticatedPrincipal>) {
+    let failed = || {
+        (
+            sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true),
+            None,
+        )
+    };
 
     let Some(authenticator) = authenticator else {
         // Unreachable: `run` refuses to start in this combination. Fail closed anyway, since the
@@ -662,13 +681,16 @@ async fn authenticate_token(
         // code as fatal and surfaces it to the application, and nothing here says the credentials
         // were wrong. A close reads as a transport failure, which is retriable.
         warn!(%peer, "authentication did not complete within the pre-authentication budget");
-        return HandleOutcome::Close;
+        return (HandleOutcome::Close, None);
     };
 
     match result {
-        Ok(()) => {
+        Ok(authenticated) => {
             debug!(%peer, "SASL authentication succeeded");
-            sasl_authenticate_outcome(api_version, ERROR_NONE, false)
+            (
+                sasl_authenticate_outcome(api_version, ERROR_NONE, false),
+                Some(authenticated),
+            )
         }
         // A rejection is the client's problem and is terminal, so it earns a parseable 58.
         Err(AuthError::Rejected) => {
@@ -682,7 +704,57 @@ async fn authenticate_token(
         // the account exists.
         Err(AuthError::Unavailable) => {
             warn!(%peer, "SASL authentication could not be completed; Iggy is unreachable");
-            HandleOutcome::Close
+            (HandleOutcome::Close, None)
+        }
+    }
+}
+
+/// Answers `DescribeAcls` from the permissions captured when this connection authenticated.
+///
+/// Only reachable on an authenticated connection: the SASL gate refuses every key but one before a
+/// principal exists, and the caller additionally gates this on the feature being on, so a gateway
+/// with SASL off never routes here. The `None` arm is a fail-closed guard, not a reachable path.
+fn describe_acls(
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+    peer: &SocketAddr,
+) -> HandleOutcome {
+    let Some(principal) = principal else {
+        // `error!` rather than `debug!` on purpose, unlike every other refusal here: reaching this
+        // means the routing guards above disagree with each other, which is a gateway fault and not
+        // something a client can provoke.
+        error!(%peer, "DescribeAcls reached a connection with no authenticated principal");
+        // Not `encode_error_for_key`: key 29 is absent from `SUPPORTED_RANGES`, so that helper
+        // always returns `Close` here and the code would read as if it answers when it cannot.
+        return respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, true);
+    };
+    // The firewall table cannot cover this key: it is kept out of `SUPPORTED_RANGES` on purpose,
+    // so the advertised range would otherwise be enforced only by whatever `kafka_protocol`'s
+    // schema happens to accept. A crate bump adding v4 would start answering v4 while ApiVersions
+    // still says 3, which is exactly what the sibling SASL keys pin explicitly against.
+    if !SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.contains(&api_version) {
+        debug!(%peer, api_version, "DescribeAcls version outside the advertised range");
+        return HandleOutcome::Close;
+    }
+    if !principal.permissions_known {
+        // The permission read failed after a successful login, so this connection holds no real
+        // answer. Reporting the empty fallback would tell an operator the principal has no access,
+        // which is a different statement from "we could not find out".
+        warn!(%peer, "DescribeAcls asked on a connection whose permissions were never read");
+        return respond_describe_acls_error(api_version, ERROR_UNKNOWN_SERVER_ERROR, false);
+    }
+    match decode_acl_filter(api_version, body) {
+        Ok(filter) => describe_acls_outcome(
+            api_version,
+            &principal.username,
+            &principal.permissions,
+            &filter,
+        ),
+        Err(error) => {
+            debug!(%peer, %error, "failed to decode DescribeAcls filter");
+            // Kept open: a client that sent one bad filter may send a good one.
+            respond_describe_acls_error(api_version, ERROR_INVALID_REQUEST, false)
         }
     }
 }
@@ -713,6 +785,12 @@ fn illegal_state_outcome(
         }
         API_KEY_SASL_AUTHENTICATE => {
             sasl_authenticate_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
+        }
+        // `encode_error_for_key` consults the firewall table, and this key is deliberately absent
+        // from it, so routing through there would answer an unauthenticated client with a bodyless
+        // close while the unreachable guard above is the one that speaks. Answer it directly.
+        API_KEY_DESCRIBE_ACLS if sasl_enabled => {
+            respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
         _ => encode_error_for_key(api_key, api_version, ERROR_ILLEGAL_SASL_STATE, sasl_enabled),
     }

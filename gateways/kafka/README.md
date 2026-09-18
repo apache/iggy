@@ -67,6 +67,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
+- [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
 
 ### Delivery guarantees
 
@@ -120,12 +121,23 @@ Four things to know before switching it on:
   replicated registration. Verification is deliberately not cached, since caching it per username
   would let a second connection present any password. Connection churn is therefore server load,
   bounded by `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS`.
-- **Authentication only, for now.** The gateway verifies the credentials and then drops the
-  session, because no handler consumes one yet. Iggy's permissions will decide what a principal can
-  do once Produce and Fetch are wired to it
+- **Authentication and an ACL view, not enforcement.** The gateway verifies the credentials and
+  can describe what Iggy grants the principal, but nothing gates an operation yet. Iggy's
+  permissions decide that once Produce and Fetch are wired to it
   ([#3535](https://github.com/apache/iggy/issues/3535),
-  [#3536](https://github.com/apache/iggy/issues/3536)); until then this is an admission gate, not
-  an identity carried onto the data plane. Do not read it as per-topic authorization yet.
+  [#3536](https://github.com/apache/iggy/issues/3536)).
+
+### ACLs
+
+`DescribeAcls` renders the authenticated principal's Iggy permissions as Kafka ACL bindings, so
+`kafka-acls.sh --list` works against the gateway. It is read only: `CreateAcls` and `DeleteAcls`
+are not implemented and not advertised.
+
+A principal sees its own permissions and nobody else's, because the gateway holds no administrative
+credentials. Only global permissions are rendered, as wildcard bindings, and the view is a snapshot
+taken when the connection authenticated, so a permission changed afterwards is invisible until the
+client reconnects. [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is
+deliberately left out.
 
 Full reasoning, including what was rejected and why, is in
 [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).

@@ -24,17 +24,20 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use iggy::prelude::{AutoLogin, Client, Credentials, IggyClientBuilder, IggyError};
+use iggy::prelude::{
+    AutoLogin, Client, Credentials, Identifier, IggyClientBuilder, IggyError, Permissions,
+};
 use tracing::{debug, warn};
 
+use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::sasl::PlainCredentials;
 
 /// Bound on one credential verification.
 ///
-/// Covers the dial and the login. Teardown has its own, much smaller budget
-/// ([`TEARDOWN_TIMEOUT`]) so that one attempt cannot hold an authentication permit for twice this
-/// long. The caller bounds the whole thing again from outside, against its pre-authentication
-/// budget, because a permit wait is not covered here at all.
+/// Covers the dial and the login only. The permission read and the teardown have their own, much
+/// smaller budgets ([`PERMISSION_READ_TIMEOUT`] and [`TEARDOWN_TIMEOUT`]), so the three together
+/// stay inside the caller's pre-authentication budget rather than exceeding it. The caller bounds
+/// the whole thing again from outside, because a permit wait is not covered here at all.
 ///
 /// A verification that has not answered inside this is indistinguishable, from the Kafka client's
 /// side, from one that failed, and the client is holding a connection open waiting for it. Shorter
@@ -53,12 +56,26 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// hide the failure underneath one the client cannot see.
 const VERIFY_RECONNECTION_RETRIES: u32 = 1;
 
+/// Budget for the permission read that follows a successful login.
+///
+/// Much smaller than [`VERIFY_TIMEOUT`] on purpose, and deliberately small in absolute terms. The
+/// caller bounds the whole exchange at its pre-authentication budget, which must also absorb the
+/// wait for an authentication slot, so every second spent here is a second that wait does not get.
+/// At one second the inner worst case is 12s against a 15s outer budget, leaving the queue three
+/// seconds rather than one.
+///
+/// It also bounds only *this* future, not the SDK's work. A cancelled call leaves the SDK's own
+/// read running on a detached task that holds its connection lock until that task's own deadline,
+/// so a shorter budget here does not stop that work, it only stops the caller waiting on it. The
+/// login has already succeeded by this point, so abandoning the read costs an ACL view and nothing
+/// else.
+const PERMISSION_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Budget for tearing the verification client down again.
 ///
 /// Deliberately far shorter than [`VERIFY_TIMEOUT`]. Teardown happens while the caller still holds
-/// an authentication permit, so giving it the full verify budget would let one attempt occupy a
-/// slot for twice as long as the doc on [`VERIFY_TIMEOUT`] claims the whole operation can take.
-/// Nothing is lost by cutting it short: `Drop` aborts the heartbeat task regardless.
+/// an authentication permit, so every second here is a second some other connection waits. Nothing
+/// is lost by cutting it short: `Drop` aborts the heartbeat task regardless.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Why a SASL exchange did not produce a verified identity.
@@ -74,19 +91,45 @@ pub enum AuthError {
     Unavailable,
 }
 
+/// Who authenticated, and what Iggy already allows them to do.
+///
+/// The permissions are a snapshot taken during the login that verified the credentials, not a live
+/// view. Refreshing them would mean either holding an Iggy session open per connection, which the
+/// authentication design rejects on cost, or keeping the password, which it rejects outright. A
+/// permission changed mid-connection is therefore invisible until the client reconnects, the same
+/// way Iggy's own data plane lags a revocation until the owning shard applies it.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedPrincipal {
+    pub username: String,
+    pub permissions: PrincipalPermissions,
+    /// Whether [`Self::permissions`] is a real answer or a fallback.
+    ///
+    /// A read that failed after a successful login degrades to an empty set, which is
+    /// indistinguishable on the wire from a principal that genuinely holds nothing. Silently
+    /// reporting "no access" for "we could not tell" is the wrong answer to give an operator
+    /// debugging access, so the two are kept apart here and answered differently.
+    ///
+    /// This matters more once Produce and Fetch consume the snapshot: nothing may authorize off a
+    /// value that was never read.
+    pub permissions_known: bool,
+}
+
 /// Verifies Kafka-supplied credentials.
 ///
 /// A trait rather than a concrete type so the protocol tests can drive the whole SASL exchange
 /// over a socket without an Iggy server behind it.
 #[async_trait]
 pub trait SaslAuthenticator: Send + Sync + std::fmt::Debug {
-    /// Returns `Ok(())` when `credentials` name a real, active Iggy user.
+    /// Returns the principal when `credentials` name a real, active Iggy user.
     ///
     /// # Errors
     ///
     /// Returns [`AuthError::Rejected`] when Iggy refuses the credentials and
     /// [`AuthError::Unavailable`] when it cannot be asked.
-    async fn authenticate(&self, credentials: &PlainCredentials) -> Result<(), AuthError>;
+    async fn authenticate(
+        &self,
+        credentials: &PlainCredentials,
+    ) -> Result<AuthenticatedPrincipal, AuthError>;
 }
 
 /// How the verifier reaches Iggy.
@@ -219,7 +262,10 @@ impl std::fmt::Display for IggyAuthenticator {
 
 #[async_trait]
 impl SaslAuthenticator for IggyAuthenticator {
-    async fn authenticate(&self, credentials: &PlainCredentials) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        credentials: &PlainCredentials,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
         let auto_login = AutoLogin::Enabled(Credentials::UsernamePassword(
             credentials.username.clone(),
             credentials.password.clone(),
@@ -244,7 +290,12 @@ impl SaslAuthenticator for IggyAuthenticator {
         let outcome = match connected {
             Err(_elapsed) => Err(AuthError::Unavailable),
             Ok(Err(error)) => Err(classify(&error)),
-            Ok(Ok(())) => Ok(()),
+            // The login already proved the credentials. Reading the principal's own record on the
+            // same session is the one extra round trip that lets `DescribeAcls` answer later
+            // without a second login or a stored password. A user may always read itself, with no
+            // permission required (`dispatch/authz.rs` exempts a self-targeted read), so this
+            // cannot fail for want of a grant.
+            Ok(Ok(())) => fetch_permissions(&client, &credentials.username).await,
         };
 
         // Shut down on both paths, and not `disconnect`: only `shutdown` stops the heartbeat task,
@@ -265,7 +316,92 @@ impl SaslAuthenticator for IggyAuthenticator {
             }
         }
 
-        outcome
+        outcome.map(|(permissions, permissions_known)| AuthenticatedPrincipal {
+            username: credentials.username.clone(),
+            permissions,
+            permissions_known,
+        })
+    }
+}
+
+/// Reads the just-authenticated user's own record and projects its global permissions.
+///
+/// A missing record or absent permissions both yield an empty set rather than an error: the
+/// credentials were already accepted, so refusing the connection here would reject a valid login
+/// over an authorization view it never asked for.
+async fn fetch_permissions(
+    client: &impl Client,
+    username: &str,
+) -> Result<(PrincipalPermissions, bool), AuthError> {
+    // Unreachable in practice: a username that reached a successful login is already inside
+    // Identifier's own length bounds. Propagating rather than degrading is still the wrong shape
+    // for this function, so it degrades like every other failure below.
+    let Ok(identifier) = Identifier::named(username) else {
+        warn!("authenticated, but the principal's name is not a valid Iggy identifier");
+        return Ok((PrincipalPermissions::default(), false));
+    };
+    // Deliberately not propagated as a failure. The credentials were already accepted by the login
+    // above, so turning a stumble on this second round trip into a rejection would answer a correct
+    // password with `SASL_AUTHENTICATION_FAILED`, which a Kafka client treats as fatal and raises
+    // to the application. Losing the ACL view is the lesser harm, and it degrades to an empty one.
+    let fetched = tokio::time::timeout(PERMISSION_READ_TIMEOUT, client.get_user(&identifier)).await;
+    let mut known = true;
+    let user = match fetched {
+        Ok(Ok(None)) => {
+            known = false;
+            // Distinct from an error: the login succeeded, so the account exists. A record that
+            // resolves to nothing here means the read raced a deletion, and silently reporting an
+            // empty ACL view for it would look identical to a principal with no grants.
+            warn!("authenticated, but the principal's own record resolved to nothing");
+            None
+        }
+        Ok(Ok(user)) => user,
+        Ok(Err(error)) => {
+            known = false;
+            warn!(%error, "authenticated, but could not read the principal's permissions");
+            None
+        }
+        Err(_elapsed) => {
+            known = false;
+            warn!("authenticated, but timed out reading the principal's permissions");
+            None
+        }
+    };
+
+    // A record that resolved but carries no permissions is a real answer: the principal holds
+    // nothing. Only a read that did not resolve is unknown.
+    Ok((
+        user.and_then(|user| user.permissions)
+            .as_ref()
+            .map(PrincipalPermissions::from)
+            .unwrap_or_default(),
+        known,
+    ))
+}
+
+/// Projects Iggy's global permissions onto the subset that has a Kafka meaning.
+///
+/// Stream flags fold into the topic ones because Kafka has no resource above a topic and every
+/// Kafka topic lives inside an Iggy stream, so a stream grant is in practice a grant over the
+/// topics a Kafka client can reach. `docs/ACL_MAPPING.md` has the full table.
+impl From<&Permissions> for PrincipalPermissions {
+    fn from(permissions: &Permissions) -> Self {
+        let global = &permissions.global;
+        // Iggy's enforcement is hierarchical, so a flag-for-flag copy describes a principal that
+        // cannot do things Iggy will in fact let it do. The rules are in
+        // `core/metadata/src/permissioner/permissioner_rules/`: polling is granted by any of the
+        // four read/manage flags on topics or streams, appending by either manage flag, and
+        // reading server state by either server flag. Mirroring that here is the difference
+        // between describing a consumer and describing a principal that appears unable to consume.
+        let manages = global.manage_topics || global.manage_streams;
+        let reads = global.read_topics || global.read_streams;
+        Self {
+            read_servers: global.read_servers || global.manage_servers,
+            read_topics: reads || manages,
+            manage_topics: manages,
+            poll_messages: global.poll_messages || reads || manages,
+            send_messages: global.send_messages || manages,
+        }
     }
 }
 
@@ -302,6 +438,51 @@ mod tests {
             username: "alice".to_string(),
             password: SecretString::from("s3cret".to_string()),
         }
+    }
+
+    /// Iggy grants polling to anyone holding any of the four read/manage flags on topics or
+    /// streams, not only to the explicit `poll_messages` flag. Copying flags one for one described
+    /// such a principal as unable to consume, which is the exact falsehood the derived group
+    /// binding exists to avoid.
+    #[test]
+    fn given_only_read_topics_when_projected_should_still_be_able_to_poll() {
+        let mut permissions = Permissions::default();
+        permissions.global.read_topics = true;
+        let projected = PrincipalPermissions::from(&permissions);
+        assert!(
+            projected.poll_messages,
+            "read_topics grants polling in Iggy"
+        );
+        assert!(projected.read_topics);
+        assert!(!projected.send_messages, "it does not grant appending");
+    }
+
+    #[test]
+    fn given_only_manage_streams_when_projected_should_grant_both_directions() {
+        // Managing streams grants appending and polling, and implies the topic-level reads.
+        let mut permissions = Permissions::default();
+        permissions.global.manage_streams = true;
+        let projected = PrincipalPermissions::from(&permissions);
+        assert!(projected.send_messages);
+        assert!(projected.poll_messages);
+        assert!(projected.manage_topics);
+    }
+
+    #[test]
+    fn given_only_manage_servers_when_projected_should_also_allow_describing_the_cluster() {
+        let mut permissions = Permissions::default();
+        permissions.global.manage_servers = true;
+        let projected = PrincipalPermissions::from(&permissions);
+        assert!(
+            projected.read_servers,
+            "managing implies reading, as the permissioner's own rule does"
+        );
+    }
+
+    #[test]
+    fn given_no_grants_when_projected_should_stay_empty() {
+        let projected = PrincipalPermissions::from(&Permissions::default());
+        assert_eq!(projected, PrincipalPermissions::default());
     }
 
     #[test]

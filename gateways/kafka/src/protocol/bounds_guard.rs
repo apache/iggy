@@ -743,6 +743,39 @@ pub fn validate_api_versions_shape(version: i16, body: &Bytes) -> Result<()> {
 /// reaches `parse_plain`, and what a future mechanism would carry into a credential exchange.
 const MAX_SASL_AUTH_BYTES: usize = 4096;
 
+/// `DescribeAcls` carries a fixed-shape filter: four enums and three nullable strings.
+///
+/// No arrays and nothing echoed into the response, so there is no amplification to project. The
+/// walk exists to reject a truncated filter before `kafka_protocol` reads past the frame.
+///
+/// # Errors
+///
+/// Returns an error when a declared string length does not fit the remaining frame.
+pub fn validate_describe_acls_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    let flexible = version >= 2;
+    c.read_i8()?;
+    if flexible {
+        c.compact_string(true)?;
+    } else {
+        c.legacy_string(true)?;
+    }
+    c.read_i8()?;
+    if flexible {
+        c.compact_string(true)?;
+        c.compact_string(true)?;
+    } else {
+        c.legacy_string(true)?;
+        c.legacy_string(true)?;
+    }
+    c.read_i8()?;
+    c.read_i8()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// `SaslHandshake` carries one non-nullable string, the mechanism name.
 ///
 /// `_version` is unused: the message is never flexible, so v0 and v1 share this shape, and the
@@ -790,6 +823,50 @@ mod tests {
     use super::*;
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn describe_acls_v1_with_all_strings_present_accepted() {
+        // Both wire fixtures null every string, so without this the walk's string readers ran in
+        // no test, which is exactly where a byte-count desync hides.
+        let body = Bytes::from_static(&[
+            0x02, // resource_type_filter
+            0x00, 0x01, b'x', // resource_name_filter
+            0x03, // pattern_type_filter
+            0x00, 0x04, b'U', b's', b'e', b'r', // principal_filter
+            0x00, 0x01, b'*', // host_filter
+            0x03, // operation
+            0x03, // permission_type
+        ]);
+        assert!(validate_describe_acls_shape(1, &body).is_ok());
+    }
+
+    #[test]
+    fn describe_acls_v3_compact_strings_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // resource_type_filter
+            0x02, b'x', // compact name, len + 1
+            0x03, // pattern_type_filter
+            0x05, b'U', b's', b'e', b'r', // compact principal
+            0x02, b'*', // compact host
+            0x03, // operation
+            0x03, // permission_type
+            0x00, // tagged fields
+        ]);
+        assert!(validate_describe_acls_shape(3, &body).is_ok());
+    }
+
+    #[test]
+    fn describe_acls_declared_string_past_the_frame_rejected() {
+        let body = Bytes::from_static(&[0x02, 0x00, 0x40, b'x', b'y']);
+        assert!(validate_describe_acls_shape(1, &body).is_err());
+    }
+
+    #[test]
+    fn describe_acls_truncated_after_the_filter_rejected() {
+        // Every string null, then nothing where the two trailing enums belong.
+        let body = Bytes::from_static(&[0x02, 0xFF, 0xFF, 0x03, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_describe_acls_shape(1, &body).is_err());
+    }
 
     #[test]
     fn sasl_handshake_well_formed_mechanism_accepted() {

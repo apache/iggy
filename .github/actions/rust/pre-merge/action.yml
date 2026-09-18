@@ -393,6 +393,28 @@ runs:
           # Fixtures are expected to exist from here on; a missing one now means
           # generation silently failed, not a legitimate local-dev skip.
           export KAFKA_FIXTURES_REQUIRED=1
+          # Same reasoning for the real-client suite: Docker and a built iggy-server are both
+          # present in this job, so a skip here means the prerequisite broke rather than a
+          # legitimate local-dev skip, and an unarmed guard would report a pass over zero
+          # assertions.
+          export KAFKA_E2E_REQUIRED=1
+          # Pull the client images here rather than letting the first test pull them. A cold
+          # runner fetches ~400 MB for the Kafka distribution, and inside a test that competes
+          # with nextest's per-test kill budget, so a slow registry surfaces as a test timeout
+          # naming the feature under test instead of naming the pull. Failure stays a warning:
+          # the test still tries, and the guard above still fails the job if it cannot run.
+          # Read the tags out of the suite itself; hardcoding them here lets a bump in the test
+          # desync silently, which pre-pulls the superseded image and puts the real one back
+          # inside the budget this block exists to avoid.
+          E2E_IMAGES=$(grep -oP '^const (KCAT|KAFKA)_IMAGE: &str = "\K[^"]+' \
+            gateways/kafka/tests/kafka_client_e2e_tests.rs)
+          if [[ -z "$E2E_IMAGES" ]]; then
+            echo "::warning::could not read client image tags from kafka_client_e2e_tests.rs; skipping pre-pull"
+          fi
+          for image in $E2E_IMAGES; do
+            timeout 300 docker pull -q "$image" \
+              || echo "::warning::docker pull $image failed; the real-client suite will retry it inside the test"
+          done
         fi
 
         # Start D-Bus and unlock keyring right before test execution to avoid

@@ -24,19 +24,21 @@
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
+use kafka_protocol::messages::describe_acls_response::{AclDescription, DescribeAclsResource};
 use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
 use kafka_protocol::messages::list_offsets_response::{
     ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
 };
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{
-    CreateTopicsRequest, CreateTopicsResponse, FetchRequest, FetchResponse, ListOffsetsRequest,
-    ListOffsetsResponse, ProduceRequest, ProduceResponse, SaslAuthenticateResponse,
-    SaslHandshakeResponse,
+    CreateTopicsRequest, CreateTopicsResponse, DescribeAclsResponse, FetchRequest, FetchResponse,
+    ListOffsetsRequest, ListOffsetsResponse, ProduceRequest, ProduceResponse,
+    SaslAuthenticateResponse, SaslHandshakeResponse,
 };
 use kafka_protocol::protocol::{Encodable, StrBytes};
 
 use crate::error::{KafkaProtocolError, Result};
+use crate::protocol::acl::{self, AclBinding};
 use crate::protocol::api::{
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_NONE, ERROR_NOT_CONTROLLER,
     ERROR_NOT_LEADER_OR_FOLLOWER,
@@ -290,6 +292,72 @@ pub fn encode_sasl_authenticate_response(
         .with_error_message(error_message.map(|msg| StrBytes::from_string(msg.to_string())))
         .with_auth_bytes(Bytes::new())
         .with_session_lifetime_ms(0);
+    encode_message(&resp, version, 64)
+}
+
+// ── DescribeAcls ─────────────────────────────────────────────────────────────
+
+/// `DescribeAcls` response, grouping the selected bindings by resource.
+///
+/// Kafka nests ACLs under the resource they apply to, so bindings that share a resource type and
+/// name become one entry with several operations. An empty result is `error_code` 0 with no
+/// resources, never an error: a real broker distinguishes "nothing matched" from "the request
+/// failed", and an admin tool prints them very differently.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_describe_acls_response(
+    version: i16,
+    principal: &str,
+    bindings: &[AclBinding],
+) -> Result<Bytes> {
+    let mut grouped: Vec<DescribeAclsResource> = Vec::new();
+    for binding in bindings {
+        let description = AclDescription::default()
+            .with_principal(StrBytes::from_string(format!("User:{principal}")))
+            .with_host(StrBytes::from_static_str(acl::ANY_HOST))
+            .with_operation(binding.operation)
+            .with_permission_type(acl::permission_type::ALLOW);
+
+        if let Some(resource) = grouped.iter_mut().find(|resource| {
+            resource.resource_type == binding.resource_type
+                && resource.resource_name.as_str() == binding.resource_name
+        }) {
+            resource.acls.push(description);
+        } else {
+            grouped.push(
+                DescribeAclsResource::default()
+                    .with_resource_type(binding.resource_type)
+                    .with_resource_name(StrBytes::from_static_str(binding.resource_name))
+                    .with_pattern_type(acl::pattern_type::LITERAL)
+                    .with_acls(vec![description]),
+            );
+        }
+    }
+
+    // `error_message` is explicitly null, not left at the type's default: that default is
+    // `Some("")`, and Java substitutes its own text for an error only when the field is null, so a
+    // defaulted empty string reaches an operator as a failure with no stated cause.
+    let resp = DescribeAclsResponse::default()
+        .with_error_code(ERROR_NONE)
+        .with_error_message(None)
+        .with_resources(grouped);
+    encode_message(&resp, version, 256)
+}
+
+/// Well-formed `DescribeAcls` response carrying only an error.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_describe_acls_error_response(version: i16, error_code: i16) -> Result<Bytes> {
+    // Null rather than the type's default `Some("")`, so the client substitutes the standard text
+    // for the code instead of printing an empty reason.
+    let resp = DescribeAclsResponse::default()
+        .with_error_code(error_code)
+        .with_error_message(None)
+        .with_resources(Vec::new());
     encode_message(&resp, version, 64)
 }
 
