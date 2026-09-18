@@ -76,8 +76,10 @@ pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
-/// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
-/// misstate the failure point. Not sent by any stub response today.
+/// Still not `SASL_AUTHENTICATION_FAILED`, and now for a firmer reason than when this was written:
+/// a connection reaching the bridge has already completed its SASL exchange, so a credential or
+/// permission rejection from Iggy at that point is not an authentication failure and saying so
+/// would send an operator to the wrong hop. Not sent by any stub response today.
 pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 /// The mechanism a client asked for in `SaslHandshake` is not one this gateway enables. The
 /// response still carries the enabled mechanism list, which is what the client prints.

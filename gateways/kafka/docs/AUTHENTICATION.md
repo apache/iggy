@@ -243,7 +243,7 @@ has to resolve it first.
 ## References
 
 - Scope and phases: [`SCOPE.md`](SCOPE.md)
-- Record mapping: `BRIDGE_MAPPING.md`, pending in [#4205](https://github.com/apache/iggy/pull/4205)
+- Record mapping: [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md)
 - Credential storage: `core/metadata/src/stm/user.rs`, `core/server_common/src/crypto.rs`
 - Login and session binding: `core/server/src/dispatch/session_ops.rs`, `core/server/src/session_manager.rs`
 - Permissions: `core/common/src/types/permissions/`, `core/metadata/src/permissioner/`
