@@ -156,8 +156,9 @@ The sink uses a layered design:
 A serialization error rejects its whole chunk. Later chunks are still attempted after failures,
 and the first error is returned after the loop. `max_retries = 3` allows two retries; `0` and
 `1` both allow one attempt. Backoff starts at `retry_delay`, doubles with ±20% jitter and is
-capped by `retry_max_delay`. Integer-seconds `Retry-After` on a 429 overrides that cap;
-HTTP-date values are ignored. Startup uses its own attempt budget/cap and retries any failed
+capped by `retry_max_delay`. Integer-seconds `Retry-After` on a 429 or any 5xx replaces
+the calculated delay, still capped by `retry_max_delay`. Zero, HTTP-date and unparsable
+values are ignored. Startup uses its own attempt budget/cap and retries any failed
 health check. Invalid duration strings warn and fall back to `1s`.
 
 The runtime records a plugin error and continues polling with consumer auto-commit. Failed
