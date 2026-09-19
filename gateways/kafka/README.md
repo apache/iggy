@@ -23,6 +23,9 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
+| `IGGY_KAFKA_SASL_ENABLED` | `false` | Require SASL/PLAIN authentication before serving any other API (`true` or `false`, nothing else) |
+| `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames, and the ceiling on waiting for an authentication slot plus the verification itself. Separate from the 10-minute idle timeout that applies once authenticated |
+| `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `16` | Credential verifications allowed to run at once, across all connections. Each costs a password hash on an Iggy shard thread, so this bounds what unauthenticated traffic can demand of the server. Size it below the Iggy node's shard count |
 
 ## Test
 
@@ -63,6 +66,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
+- [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 
 ### Delivery guarantees
 
@@ -74,6 +78,57 @@ timeout writes the record twice, and both copies reach the stream with their own
 Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
 guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
 [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
+
+## Authentication ([#3549](https://github.com/apache/iggy/issues/3549))
+
+Off by default. With `IGGY_KAFKA_SASL_ENABLED=true` the gateway requires SASL/PLAIN before it serves
+any other API, and it verifies the credentials by logging into Iggy with them.
+
+The username and password a Kafka client sends are an **Iggy** username and password. There is no
+mapping table and no credential store in the gateway: create an Iggy user for each Kafka principal
+and point the client at it. Credentials are verified against `IGGY_KAFKA_IGGY_ADDR`.
+
+```bash
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 cargo run -p iggy-gateway-kafka
+```
+
+Transport security to Iggy is configured separately from the Kafka side, because the two protect
+different hops:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IGGY_KAFKA_IGGY_TLS_ENABLED` | `false` | Encrypt the gateway's link to Iggy (`true` or `false`, nothing else). Required if the Iggy server only accepts TLS, otherwise every verification fails as unreachable |
+| `IGGY_KAFKA_IGGY_TLS_DOMAIN` | derived from the address | Name checked against the Iggy server certificate |
+| `IGGY_KAFKA_IGGY_TLS_CA_FILE` | SDK bundled roots | PEM roots to trust. Note the SDK does not use the system trust store |
+
+Client side, for example with `kcat`:
+
+```bash
+kcat -b 127.0.0.1:9093 -X security.protocol=SASL_PLAINTEXT -X sasl.mechanisms=PLAIN \
+     -X sasl.username=alice -X sasl.password=s3cret -L
+```
+
+Four things to know before switching it on:
+
+- **PLAIN sends the password in the clear**, on the Kafka hop and on the Iggy hop. The gateway
+  listener has no TLS yet, so this is only safe on a trusted network until that lands. SCRAM cannot
+  be offered at all, because Iggy stores one Argon2 hash per user and SCRAM needs PBKDF2-derived
+  keys that cannot come from it.
+- **Enabling it breaks every existing client at once.** The two SASL keys appear in the
+  `ApiVersions` advertisement only while it is on, and unauthenticated clients are refused.
+- **Every connection costs a login**, meaning one password hash on an Iggy shard thread and one
+  replicated registration. Verification is deliberately not cached, since caching it per username
+  would let a second connection present any password. Connection churn is therefore server load,
+  bounded by `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS`.
+- **Authentication only, for now.** The gateway verifies the credentials and then drops the
+  session, because no handler consumes one yet. Iggy's permissions will decide what a principal can
+  do once Produce and Fetch are wired to it
+  ([#3535](https://github.com/apache/iggy/issues/3535),
+  [#3536](https://github.com/apache/iggy/issues/3536)); until then this is an admission gate, not
+  an identity carried onto the data plane. Do not read it as per-topic authorization yet.
+
+Full reasoning, including what was rejected and why, is in
+[docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
 
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 

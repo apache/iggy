@@ -31,9 +31,10 @@ use kafka_protocol::messages::list_offsets_response::{
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{
     CreateTopicsRequest, CreateTopicsResponse, FetchRequest, FetchResponse, ListOffsetsRequest,
-    ListOffsetsResponse, ProduceRequest, ProduceResponse,
+    ListOffsetsResponse, ProduceRequest, ProduceResponse, SaslAuthenticateResponse,
+    SaslHandshakeResponse,
 };
-use kafka_protocol::protocol::Encodable;
+use kafka_protocol::protocol::{Encodable, StrBytes};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
@@ -237,6 +238,59 @@ fn list_offsets_partition_response(
     ListOffsetsPartitionResponse::default()
         .with_partition_index(partition)
         .with_error_code(error_code)
+}
+
+// ── SASL ─────────────────────────────────────────────────────────────────────
+
+/// `SaslHandshake` response: the outcome plus the mechanisms this gateway enables.
+///
+/// The mechanism list is sent on every outcome, not just success. A client that asked for an
+/// unsupported mechanism prints the list to tell its operator what to configure instead, so
+/// omitting it on the error path turns a fixable misconfiguration into an opaque failure.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_sasl_handshake_response(
+    version: i16,
+    error_code: i16,
+    mechanisms: &[&str],
+) -> Result<Bytes> {
+    let resp = SaslHandshakeResponse::default()
+        .with_error_code(error_code)
+        .with_mechanisms(
+            mechanisms
+                .iter()
+                .map(|name| StrBytes::from_string((*name).to_string()))
+                .collect(),
+        );
+    encode_message(&resp, version, 64)
+}
+
+/// `SaslAuthenticate` response.
+///
+/// `session_lifetime_ms` is always 0, meaning the session never needs re-authenticating (KIP-368).
+/// That is not only a simplification: Iggy's sole correct re-authentication is logout followed by
+/// login, which drops and re-mints the session, and re-login on a still-bound connection takes a
+/// replay branch that reports the new user while leaving the server bound to the old one. Until
+/// that is resolved, promising a finite lifetime would promise something unsafe to deliver.
+///
+/// `auth_bytes` is empty on success, which is what PLAIN's server completion looks like.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_sasl_authenticate_response(
+    version: i16,
+    error_code: i16,
+    error_message: Option<&str>,
+) -> Result<Bytes> {
+    let resp = SaslAuthenticateResponse::default()
+        .with_error_code(error_code)
+        .with_error_message(error_message.map(|msg| StrBytes::from_string(msg.to_string())))
+        .with_auth_bytes(Bytes::new())
+        .with_session_lifetime_ms(0);
+    encode_message(&resp, version, 64)
 }
 
 // ── CreateTopics ─────────────────────────────────────────────────────────────

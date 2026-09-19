@@ -98,6 +98,7 @@ async fn e2e_frame_within_custom_max_frame_size_accepted() {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        ..GatewayConfig::default()
     })
     .await;
 
@@ -129,6 +130,7 @@ async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        ..GatewayConfig::default()
     })
     .await;
 
@@ -159,6 +161,7 @@ async fn e2e_truncated_frame_body_closes_connection() {
         read_timeout: Duration::from_secs(1),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        ..GatewayConfig::default()
     })
     .await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -310,6 +313,7 @@ async fn e2e_slow_client_can_complete_request_within_read_timeout() {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        ..GatewayConfig::default()
     })
     .await;
 
@@ -509,6 +513,7 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
         read_timeout: Duration::from_secs(3),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        ..GatewayConfig::default()
     })
     .await;
 

@@ -17,12 +17,14 @@
 
 use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
-use tracing::warn;
+use tracing::{info, warn};
 
+use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::IggyBridgeConfig;
 use iggy_gateway_kafka::server::{bind_listener, init_tracing};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
@@ -38,7 +40,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = bind_listener(&config.bind_addr)
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
-    let server = KafkaGateway::new(config);
+    let sasl_enabled = config.sasl_enabled;
+    let mut server = KafkaGateway::new(config);
+    if sasl_enabled {
+        let authenticator = IggyAuthenticator::from_env()?;
+        // Unconditional, because the Kafka listener has no TLS at any setting. This is the hop the
+        // Kafka client's password actually crosses, and gating the warning on the Iggy hop meant
+        // encrypting that one silenced the only notice about this one.
+        warn!(
+            "SASL/PLAIN sends the password in the clear and the Kafka listener has no TLS; only \
+             run this on a trusted network until listener TLS lands"
+        );
+        if !authenticator.is_tls_enabled() {
+            warn!(
+                "the link from this gateway to Iggy is also unencrypted; set \
+                 IGGY_KAFKA_IGGY_TLS_ENABLED=true to close the second hop"
+            );
+        }
+        info!("SASL/PLAIN enabled; credentials verified against {authenticator}");
+        server = server.with_authenticator(Arc::new(authenticator));
+    }
 
     let (tx, rx) = broadcast::channel(1);
     let mut server_task = tokio::spawn(async move { server.run(listener, rx).await });
@@ -75,6 +96,9 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_READ_TIMEOUT_SECS",
     "IGGY_KAFKA_WRITE_TIMEOUT_SECS",
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
+    "IGGY_KAFKA_SASL_ENABLED",
+    "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
+    "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
 ];
 
 /// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] or
@@ -90,6 +114,7 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
         if key.starts_with("IGGY_KAFKA_")
             && !KNOWN_KAFKA_ENV_VARS.contains(&key.as_str())
             && !IggyBridgeConfig::KNOWN_ENV_VARS.contains(&key.as_str())
+            && !IggyAuthenticator::KNOWN_ENV_VARS.contains(&key.as_str())
         {
             return Err(format!(
                 "unknown Kafka gateway env var '{key}' (not in the recognized IGGY_KAFKA_* set - \
@@ -100,17 +125,24 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     Ok(())
 }
 
-/// Warns if any bridge-specific env var is set, since `main` doesn't read `IggyBridgeConfig` or
-/// call `IggyBridge::connect` yet (`#3535`/`#3536`).
+/// Warns if any bridge-specific env var is set while nothing reads it.
+///
+/// `IGGY_KAFKA_IGGY_ADDR` stops being unread once SASL is on, since that is the server credentials
+/// are verified against, so only that variable drops out of the warning. Every other bridge
+/// variable is still unread, and a set-but-ignored credential is worth saying so about.
 ///
 /// `reject_unknown_kafka_env_vars`'s own accepted-but-unread carve-out for these vars exists so a
 /// user exporting them ahead of that wiring landing isn't told the name is unrecognized - but that
 /// silence is exactly what the guard's own doc comment warns an unread var would otherwise cause.
 /// This closes that gap: still accepted, no longer silent.
-fn warn_on_unused_bridge_env_vars() {
+fn warn_on_unused_bridge_env_vars(sasl_enabled: bool) {
     let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
         .iter()
         .copied()
+        // With SASL on, the address is the one bridge variable that is genuinely read, so it drops
+        // out of the warning. Suppressing the whole list instead made this quieter than it was
+        // before SASL existed, hiding a set credential that still goes nowhere.
+        .filter(|var| !(sasl_enabled && *var == "IGGY_KAFKA_IGGY_ADDR"))
         .filter(|var| std::env::var(var).is_ok())
         .collect();
     if !set.is_empty() {
@@ -127,7 +159,6 @@ fn warn_on_unused_bridge_env_vars() {
 /// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
 fn load_config() -> Result<GatewayConfig, String> {
     reject_unknown_kafka_env_vars()?;
-    warn_on_unused_bridge_env_vars();
     let mut config = GatewayConfig::default();
 
     if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {
@@ -164,6 +195,19 @@ fn load_config() -> Result<GatewayConfig, String> {
         config.write_timeout =
             Duration::from_secs(parse_positive("IGGY_KAFKA_WRITE_TIMEOUT_SECS", &raw)?);
     }
+    if let Some(raw) = env_var("IGGY_KAFKA_SASL_ENABLED") {
+        config.sasl_enabled = parse_bool("IGGY_KAFKA_SASL_ENABLED", &raw)?;
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS") {
+        config.pre_auth_timeout =
+            Duration::from_secs(parse_positive("IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS", &raw)?);
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS") {
+        // Rejecting zero matters more here than elsewhere: a zero-permit semaphore never yields,
+        // so every authentication would wait out its budget and no client could ever log in.
+        config.max_concurrent_authentications =
+            parse_positive("IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS", &raw)?;
+    }
     // Drain of 0 is valid: abandon in-flight connections immediately on shutdown.
     if let Some(raw) = env_var("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
         let secs: u64 = raw
@@ -172,11 +216,27 @@ fn load_config() -> Result<GatewayConfig, String> {
         config.shutdown_drain_timeout = Duration::from_secs(secs);
     }
 
+    warn_on_unused_bridge_env_vars(config.sasl_enabled);
     Ok(config)
 }
 
 fn env_var(key: &str) -> Option<String> {
     std::env::var(key).ok()
+}
+
+/// Parses a boolean switch, accepting only the two spellings an operator can check by eye.
+///
+/// Not `str::parse::<bool>` alone, because the failure mode matters here: a typo in the value of
+/// the one variable that turns authentication on must stop the process, never quietly leave it
+/// serving unauthenticated traffic.
+fn parse_bool(key: &str, raw: &str) -> Result<bool, String> {
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "invalid {key} `{other}`: expected `true` or `false`"
+        )),
+    }
 }
 
 /// Parse a strictly-positive value, rejecting `0` (which for connection caps and timeouts would
@@ -224,7 +284,7 @@ async fn shutdown_signal() {
 mod tests {
     use serial_test::serial;
 
-    use super::{parse_positive, reject_unknown_kafka_env_vars};
+    use super::{parse_bool, parse_positive, reject_unknown_kafka_env_vars};
 
     /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - this binary's
     /// default group). This is the only `#[serial]` test compiled into *this* binary
@@ -280,6 +340,22 @@ mod tests {
             bridge_var_result.is_ok(),
             "known bridge IGGY_KAFKA_ var must be accepted"
         );
+    }
+
+    /// The one variable that turns authentication on must fail loudly on a typo, never default to
+    /// off. Every spelling a person might reach for is rejected except the two documented ones.
+    #[test]
+    fn parse_bool_accepts_only_the_two_documented_spellings() {
+        assert_eq!(parse_bool("KEY", "true"), Ok(true));
+        assert_eq!(parse_bool("KEY", "false"), Ok(false));
+        for typo in [
+            "1", "0", "TRUE", "False", "yes", "no", "on", "off", "", " true",
+        ] {
+            assert!(
+                parse_bool("KEY", typo).is_err(),
+                "{typo:?} must not be silently treated as a boolean"
+            );
+        }
     }
 
     #[test]
