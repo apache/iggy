@@ -27,25 +27,33 @@ pub(crate) fn build_storage_options(
 
     match config.storage_backend_type {
         Some(StorageBackendType::S3) => {
-            let access_key = config.aws_s3_access_key.as_ref().ok_or_else(|| {
-                Error::InitError("S3 backend requires 'aws_s3_access_key'".into())
-            })?;
-            let secret_key = config.aws_s3_secret_key.as_ref().ok_or_else(|| {
-                Error::InitError("S3 backend requires 'aws_s3_secret_key'".into())
-            })?;
+            match (
+                config.aws_s3_access_key.as_ref(),
+                config.aws_s3_secret_key.as_ref(),
+            ) {
+                (Some(access_key), Some(secret_key)) => {
+                    opts.insert(
+                        "AWS_ACCESS_KEY_ID".into(),
+                        access_key.expose_secret().to_owned(),
+                    );
+                    opts.insert(
+                        "AWS_SECRET_ACCESS_KEY".into(),
+                        secret_key.expose_secret().to_owned(),
+                    );
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::InitError(
+                        "S3 backend requires either for the access and secret key to be set together, or for both of them to be unset".into(),
+                    ));
+                }
+            }
+
             let region = config
                 .aws_s3_region
                 .as_ref()
                 .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_region'".into()))?;
 
-            opts.insert(
-                "AWS_ACCESS_KEY_ID".into(),
-                access_key.expose_secret().to_owned(),
-            );
-            opts.insert(
-                "AWS_SECRET_ACCESS_KEY".into(),
-                secret_key.expose_secret().to_owned(),
-            );
             opts.insert("AWS_REGION".into(), region.clone());
 
             if let Some(endpoint_url) = config.aws_s3_endpoint_url.as_ref() {
@@ -204,6 +212,16 @@ mod tests {
         let mut config = s3_config();
         config.aws_s3_secret_key = None;
         assert!(build_storage_options(&config).is_err());
+    }
+
+    #[test]
+    fn s3_backend_without_access_and_secret_keys_succeeds() {
+        let mut config = s3_config();
+        config.aws_s3_access_key = None;
+        config.aws_s3_secret_key = None;
+        let opts = build_storage_options(&config).unwrap();
+        assert!(!opts.contains_key("AWS_ACCESS_KEY_ID"));
+        assert!(!opts.contains_key("AWS_SECRET_ACCESS_KEY"));
     }
 
     #[test]

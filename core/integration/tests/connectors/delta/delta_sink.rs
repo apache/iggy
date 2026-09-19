@@ -16,7 +16,10 @@
 // under the License.
 
 use crate::connectors::create_test_messages;
-use crate::connectors::fixtures::{DeltaFixture, DeltaS3Fixture};
+use crate::connectors::fixtures::{
+    DeltaCorruptedLogFixture, DeltaFixture, DeltaS3Fixture, DeltaS3MissingSecretKeyFixture,
+    DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps, DeltaS3WrongCredentialsFixture,
+};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
@@ -234,4 +237,118 @@ async fn delta_sink_writes_to_s3(harness: &TestHarness, fixture: DeltaS3Fixture)
         .expect("Data should be written to S3 Delta table");
 
     assert_eq!(row_count, message_count);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_bucket_absence_on_s3(
+    harness: &TestHarness,
+    _fixture: DeltaS3NoBucketFixture,
+) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("failed to list table_url") && logs.contains("ERROR"),
+        "the error is expected since the bucket is not created"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_table_absence_on_s3(
+    harness: &TestHarness,
+    _fixture: DeltaS3NoTableFixture,
+) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("No delta table found in") && logs.contains("ERROR"),
+        "the error is expected since no table is written into the destination"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(
+        config_path = "tests/connectors/delta/malformed_table_uri_sink.toml"
+    )),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_malformed_table_uri(harness: &TestHarness) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("failed to parse table_uri") && logs.contains("ERROR"),
+        "the error is expected since the table_uri is malformed"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_missing_secret_key_on_s3(
+    harness: &TestHarness,
+    _fixture: DeltaS3MissingSecretKeyFixture,
+) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("Connector configuration: invalid storage configuration")
+            && logs.contains("ERROR"),
+        "the error is expected since only the access key is set and the secret key is missing"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_invalid_credentials_on_s3(
+    harness: &TestHarness,
+    _fixture: DeltaS3WrongCredentialsFixture,
+) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("failed to list table_url") && logs.contains("ERROR"),
+        "the error is expected since the S3 credentials are wrong"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delta_sink_handles_corrupted_delta_log(
+    harness: &TestHarness,
+    _fixture: DeltaCorruptedLogFixture,
+) {
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        logs.contains("failed to load the table's latest snapshot") && logs.contains("ERROR"),
+        "the error is expected since the delta log's commit file is corrupted"
+    );
 }
