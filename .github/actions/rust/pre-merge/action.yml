@@ -79,113 +79,15 @@ runs:
         fi
       shell: bash
 
-    # DAG-based test scoping: use cargo-rail to compute affected crates from the
-    # workspace dependency graph + git diff, avoiding the full test suite when only
-    # a subset of crates changed.
-    # Safety: cargo check/clippy run on the full workspace separately, catching all
-    # compilation errors. This only scopes test BUILD and EXECUTION.
-    # test-storage-compat is excluded from the DAG and coverage setup below:
-    # storage-compat.sh builds two explicit binaries and drives its own nextest
-    # run, and reads none of the /tmp plan files or the llvm-cov environment.
-    - name: Fetch base branch for DAG analysis
+    # Planning is an optimization. A planner or selector failure restores the
+    # full-workspace build and test path below.
+    - name: Plan affected Rust work
+      id: rail
       if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
-      run: git fetch origin master --depth=1 2>/dev/null || true
-      shell: bash
-
-    # Pinned: 0.24 dropped `-f json` and 0.25 retired `[change-detection]` in
-    # rail.toml. Either failure falls back to the full test suite on every PR,
-    # so bump on purpose together with `cargo rail config migrate`.
-    - name: Install cargo-rail
-      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
-      uses: taiki-e/install-action@v2
+      continue-on-error: true
+      uses: loadingalias/cargo-rail-action@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
       with:
-        tool: cargo-rail@0.23.0
-
-    - name: Compute affected crates (cargo-rail)
-      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
-      run: |
-        METADATA_JSON=$(cargo metadata --format-version 1 --no-deps 2>/dev/null || echo "{}")
-        TOTAL_CRATES=$(echo "$METADATA_JSON" | jq '.workspace_members | length' 2>/dev/null || echo "?")
-        echo "$TOTAL_CRATES" > /tmp/total-crates.txt
-        # Extract packages with binary or cdylib targets — integration tests may
-        # invoke binaries via assert_cmd (CARGO_BIN_EXE_<name>), and connector
-        # plugins (cdylib) are loaded at runtime via dlopen by iggy-connectors.
-        # Both must always be compiled alongside affected crates.
-        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] | (. == "bin" or . == "cdylib")) | .name' 2>/dev/null > /tmp/bin-packages.txt || true
-        # Connector plugins on their own. The same dlopen edge that keeps them
-        # out of the DAG also hides the integration suites that exercise them,
-        # which the filter below puts back.
-        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] | . == "cdylib") | .name' 2>/dev/null > /tmp/plugin-packages.txt || true
-
-        PLAN_JSON=$(cargo rail plan --since origin/master -f json 2>/tmp/affected-stderr.txt || echo "")
-
-        if [[ -n "$PLAN_JSON" ]]; then
-          MODE=$(echo "$PLAN_JSON" | jq -r '.scope.mode')
-          if [[ "$MODE" == "crates" ]]; then
-            CRATES=$(echo "$PLAN_JSON" | jq -r '.scope.crates[]')
-            # `integration` launches the binaries of these packages through
-            # `Command::cargo_bin`, an edge cargo cannot record. The DAG selects
-            # them when their code or a crate they link (e.g. `partitions`)
-            # changes, but it does not select `integration`, so add it here.
-            # Keep this list in sync with the `cargo_bin` calls in core/integration.
-            SPAWNED_BINARY_PACKAGES=(server iggy-connectors iggy-mcp iggy-bench iggy-cli)
-            if ! grep -qx integration <<< "$CRATES"; then
-              for package in "${SPAWNED_BINARY_PACKAGES[@]}"; do
-                if grep -qx "$package" <<< "$CRATES"; then
-                  echo "::notice::Testing integration because it launches the binary of affected package ${package}"
-                  CRATES=$(printf '%s\nintegration\n' "$CRATES")
-                  break
-                fi
-              done
-            fi
-            # `iggy_connector_<name>_{sink,source}` is exercised by
-            # `integration::connectors::<name>`, but the plugin reaches the
-            # runtime through dlopen, so cargo records no edge and the DAG drops
-            # those tests. Name the suite of every affected plugin that has one.
-            PLUGIN_TESTS=""
-            PLUGIN_SUITES=0
-            while read -r plugin; do
-              if [[ ! -d "core/integration/tests/connectors/$plugin" ]]; then
-                echo "::warning::No integration suite at core/integration/tests/connectors/${plugin}, leaving it out of the test scope"
-                continue
-              fi
-              PLUGIN_TESTS+=" | (package(integration) & test(/^connectors::${plugin}::/))"
-              PLUGIN_SUITES=$(( PLUGIN_SUITES + 1 ))
-            done < <(comm -12 <(sort -u /tmp/plugin-packages.txt) <(echo "$CRATES" | sort -u) \
-              | sed -nE 's/^iggy_connector_(.*)_(sink|source)$/\1/p' | sort -u)
-            echo "$PLUGIN_SUITES" > /tmp/plugin-suites.txt
-            # Those suites live in the integration test binary, so it has to be
-            # built even when the DAG left it out of scope. Only the build set
-            # grows: the `cargo test` fallback below has no filter, and adding
-            # the package there would run the whole integration suite.
-            BUILD_CRATES="$CRATES"
-            if (( PLUGIN_SUITES > 0 )); then
-              BUILD_CRATES=$(printf '%s\nintegration\n' "$CRATES" | sort -u)
-            fi
-            CRATE_COUNT=$(echo "$CRATES" | wc -l)
-            # Build nextest filter expression for cargo nextest run (affected crates only)
-            FILTER=$(echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd '|' - | sed 's/|/ | /g')
-            echo "${FILTER}${PLUGIN_TESTS}" > /tmp/nextest-filter.txt
-            # Save affected-only -p flags for cargo test fallback (no nextest filter)
-            echo "$CRATES" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/test-packages.txt
-            # Build -p flags: affected crates + packages with bin/cdylib targets.
-            # Binary packages: nextest sets CARGO_BIN_EXE_<name> from compiled
-            # artifacts; cdylib packages: connector plugins loaded via dlopen.
-            # Both must be in the build even if not directly in the DAG scope.
-            BIN_PKGS=$(cat /tmp/bin-packages.txt 2>/dev/null || echo "")
-            ALL_BUILD_PKGS=$(printf '%s\n%s\n' "$BUILD_CRATES" "$BIN_PKGS" | sort -u | grep -v '^$')
-            echo "$ALL_BUILD_PKGS" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/packages.txt
-            BUILD_COUNT=$(echo "$ALL_BUILD_PKGS" | wc -l)
-            echo "::notice::DAG analysis: testing ${CRATE_COUNT} crates + ${PLUGIN_SUITES} connector suites, building ${BUILD_COUNT} (of ${TOTAL_CRATES} total, +$(( BUILD_COUNT - CRATE_COUNT )) extra pkgs)"
-          else
-            echo "::notice::Full workspace affected (${TOTAL_CRATES} crates)"
-          fi
-        else
-          STDERR=$(cat /tmp/affected-stderr.txt 2>/dev/null || echo "")
-          echo "::warning::Could not compute affected crates, running full test suite. ${STDERR}"
-          rm -f /tmp/nextest-filter.txt /tmp/packages.txt /tmp/plugin-suites.txt
-        fi
-      shell: bash
+        version: 0.28.1
 
     # Individual lint tasks for parallel execution
     - name: Cargo check
@@ -260,10 +162,16 @@ runs:
     - name: Build and test with coverage
       # test-storage-compat drives its own nextest invocation from
       # scripts/ci/storage-compat.sh. Without this exclusion it would also run
-      # here with an empty PARTITION_FLAG, i.e. a fourth *unpartitioned* copy
+      # here without partition arguments, i.e. a fourth *unpartitioned* copy
       # of the whole suite on top of test-1/2/3.
       if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
+      env:
+        PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        PLAN_STATUS: ${{ steps.rail.outcome }}
+        TASK: ${{ inputs.task }}
       run: |
+        set -euo pipefail
+
         # Parse partition index from task name (test-1 -> hash:1/3, test-2 -> hash:2/3, ...).
         # TEST_PARTITIONS must match the number of test-N tasks in
         # .github/config/components.yml. Cluster bootstrap makes each test
@@ -272,44 +180,71 @@ runs:
         # (test-storage-compat) opt out of partitioning rather than producing
         # an out-of-range hash:N/3.
         TEST_PARTITIONS=3
-        TASK="${{ inputs.task }}"
-        PARTITION_FLAG=""
+        PARTITION_ARGS=()
         if [[ "$TASK" =~ ^test-([0-9]+)$ ]]; then
           PARTITION_INDEX="${BASH_REMATCH[1]}"
-          PARTITION_FLAG="--partition hash:${PARTITION_INDEX}/${TEST_PARTITIONS}"
+          PARTITION_ARGS=(--partition "hash:${PARTITION_INDEX}/${TEST_PARTITIONS}")
           echo "::notice::Running test partition ${PARTITION_INDEX}/${TEST_PARTITIONS}"
         fi
 
-        # Read DAG-based affected crate filter (computed in earlier step)
-        NEXTEST_FILTER=""
-        PACKAGE_FLAGS=""
-        TEST_PACKAGE_FLAGS=""
-        TOTAL_CRATES="?"
-        PLUGIN_SUITES=0
-        if [[ -f /tmp/nextest-filter.txt ]]; then
-          NEXTEST_FILTER=$(cat /tmp/nextest-filter.txt)
-        fi
-        if [[ -f /tmp/packages.txt ]]; then
-          PACKAGE_FLAGS=$(cat /tmp/packages.txt)
-        fi
-        if [[ -f /tmp/test-packages.txt ]]; then
-          TEST_PACKAGE_FLAGS=$(cat /tmp/test-packages.txt)
-        fi
-        if [[ -f /tmp/total-crates.txt ]]; then
-          TOTAL_CRATES=$(cat /tmp/total-crates.txt)
-        fi
-        if [[ -f /tmp/plugin-suites.txt ]]; then
-          PLUGIN_SUITES=$(cat /tmp/plugin-suites.txt)
+        # Read only validated selectors through the v10 runtime. Any planner or
+        # selector failure restores the previous full-workspace behavior.
+        PLAN_OUTPUT_DIR="${RUNNER_TEMP:?RUNNER_TEMP is required}/cargo-rail-selectors-${TASK}"
+        mkdir -p "$PLAN_OUTPUT_DIR"
+        PLAN_USABLE=false
+        TEST_SCOPE=workspace
+        RUNTIME_SCOPE=workspace
+        TEST_CARGO_ARGS=()
+        TEST_TARGET_ARGS=()
+        TEST_PACKAGES=()
+        RUNTIME_PACKAGES=()
+
+        if [[ "$PLAN_STATUS" == "success" ]] &&
+          TEST_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" cargo.test) &&
+          RUNTIME_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" runtime-artifacts) &&
+          cargo-rail-action plan cargo-args "$PLAN_FILE" cargo.test > "$PLAN_OUTPUT_DIR/test-args" &&
+          cargo-rail-action plan target-args "$PLAN_FILE" cargo.test > "$PLAN_OUTPUT_DIR/test-target-args" &&
+          cargo-rail-action plan package-names "$PLAN_FILE" cargo.test > "$PLAN_OUTPUT_DIR/test-packages" &&
+          cargo-rail-action plan package-names "$PLAN_FILE" runtime-artifacts > "$PLAN_OUTPUT_DIR/runtime-packages"; then
+          mapfile -d '' -t TEST_CARGO_ARGS < "$PLAN_OUTPUT_DIR/test-args"
+          mapfile -d '' -t TEST_TARGET_ARGS < "$PLAN_OUTPUT_DIR/test-target-args"
+          mapfile -d '' -t TEST_PACKAGES < "$PLAN_OUTPUT_DIR/test-packages"
+          mapfile -d '' -t RUNTIME_PACKAGES < "$PLAN_OUTPUT_DIR/runtime-packages"
+          PLAN_USABLE=true
+        else
+          TEST_SCOPE=workspace
+          RUNTIME_SCOPE=workspace
+          TEST_CARGO_ARGS=()
+          TEST_TARGET_ARGS=()
+          TEST_PACKAGES=()
+          RUNTIME_PACKAGES=()
+          echo "::warning::Cargo-Rail plan unavailable or invalid; running the full workspace"
         fi
 
-        if [[ -n "$PACKAGE_FLAGS" ]]; then
-          # Each connector suite contributes its own `package(integration)`, so
-          # subtract them to keep the crate count a crate count.
-          TEST_CRATE_COUNT=$(( $(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l) - PLUGIN_SUITES ))
-          BUILD_CRATE_COUNT=$(echo "$PACKAGE_FLAGS" | grep -o '\-p ' | wc -l)
-          echo "::notice::DAG-scoped: testing ${TEST_CRATE_COUNT} crates + ${PLUGIN_SUITES} connector suites, building ${BUILD_CRATE_COUNT} (cargo check/clippy cover full workspace separately)"
+        if [[ "$PLAN_USABLE" == true && "$TEST_SCOPE" == "skipped" ]]; then
+          echo "::notice::Cargo-Rail reports no affected Rust tests"
+          exit 0
+        fi
+
+        BUILD_ARGS=()
+        BUILD_SCOPE=workspace
+        if [[ "$PLAN_USABLE" == true && "$TEST_SCOPE" == "packages" &&
+          ( "$RUNTIME_SCOPE" == "packages" || "$RUNTIME_SCOPE" == "skipped" ) ]]; then
+          declare -A SEEN_BUILD_PACKAGES=()
+          BUILD_PACKAGES=()
+          for package in "${TEST_PACKAGES[@]}" "${RUNTIME_PACKAGES[@]}"; do
+            if [[ -n "$package" && -z "${SEEN_BUILD_PACKAGES[$package]:-}" ]]; then
+              SEEN_BUILD_PACKAGES["$package"]=1
+              BUILD_PACKAGES+=("$package")
+              BUILD_ARGS+=(-p "$package")
+            fi
+          done
+          BUILD_SCOPE=packages
+          echo "::notice::Cargo-Rail: testing ${#TEST_PACKAGES[@]} packages, building ${#BUILD_PACKAGES[@]} including runtime prerequisites"
+        elif [[ "$PLAN_USABLE" == true && "$TEST_SCOPE" == "packages" ]]; then
+          echo "::notice::Cargo-Rail: testing ${#TEST_PACKAGES[@]} packages, building the full workspace"
         else
-          echo "::notice::Full workspace build (no DAG filter available)"
+          echo "::notice::Full workspace build and test"
         fi
 
         source <(cargo llvm-cov show-env --export-prefix)
@@ -325,33 +260,30 @@ runs:
         fi
 
         bins_start=$(date +%s)
-        if [[ -n "$PACKAGE_FLAGS" ]]; then
-          cargo build --locked $PACKAGE_FLAGS
-        else
-          cargo build --locked
-        fi
+        cargo build --locked "${BUILD_ARGS[@]}"
         bins_end=$(date +%s)
         bins_duration=$((bins_end - bins_start))
         echo "::notice::Binaries and libraries built in ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
 
         compile_start=$(date +%s)
-        if [[ -n "$PACKAGE_FLAGS" ]]; then
-          cargo test --locked --no-run $PACKAGE_FLAGS
-        else
-          cargo test --locked --no-run
-        fi
+        cargo test --locked --no-run "${TEST_CARGO_ARGS[@]}" "${TEST_TARGET_ARGS[@]}"
         compile_end=$(date +%s)
         compile_duration=$((compile_end - compile_start))
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
 
         # api_handler_tests, version_firewall_tests, and server_e2e_tests need gitignored
-        # wire fixtures. Generate when iggy-gateway-kafka is in the DAG test scope, or (on
+        # wire fixtures. Generate when iggy-gateway-kafka is in the Cargo-Rail test scope, or (on
         # a full-workspace run) when gateways/** changed vs the PR base — avoid building
         # kafka-message-gen / kafka-protocol when the gateway was not touched.
         NEEDS_KAFKA_FIXTURES=false
-        if grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
-          NEEDS_KAFKA_FIXTURES=true
-        elif [[ -z "$NEXTEST_FILTER" ]]; then
+        if [[ "$TEST_SCOPE" == "packages" ]]; then
+          for package in "${TEST_PACKAGES[@]}"; do
+            if [[ "$package" == "iggy-gateway-kafka" ]]; then
+              NEEDS_KAFKA_FIXTURES=true
+              break
+            fi
+          done
+        else
           # HEAD on a pull_request run is the synthetic merge commit; its first parent is
           # the base tip GitHub merged against. The depth-1 checkout holds that parent only
           # as a shallow boundary: `HEAD^1` does not resolve and `origin/master...HEAD` has
@@ -408,27 +340,22 @@ runs:
 
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
-          if [[ -n "$NEXTEST_FILTER" ]]; then
+          if [[ "$TEST_SCOPE" == "packages" ]]; then
             # Every test target in the `bdd` crate is `required-features =
             # ["bdd"]`, so the `cargo test --no-run` above builds no binaries
             # for it. A PR touching only that crate then produces a valid
-            # filter that matches zero tests, and nextest's default
+            # package scope that matches zero tests, and nextest's default
             # `--no-tests=fail` turns that into exit 4 on a green PR.
-            cargo nextest run --locked --no-fail-fast --no-tests=warn --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
+            cargo nextest run --locked --no-fail-fast --no-tests=warn --profile ci \
+              "${PARTITION_ARGS[@]}" "${TEST_CARGO_ARGS[@]}" "${TEST_TARGET_ARGS[@]}"
           else
-            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
+            cargo nextest run --locked --no-fail-fast --profile ci "${PARTITION_ARGS[@]}"
           fi
         else
-          if [[ -n "$PARTITION_FLAG" ]]; then
+          if [[ ${#PARTITION_ARGS[@]} -gt 0 ]]; then
             echo "::error::cargo-nextest not found, falling back to cargo test without partitioning (all tests will run on every partition)"
           fi
-          # Use TEST_PACKAGE_FLAGS (affected crates only), not PACKAGE_FLAGS
-          # (which includes binary packages whose tests should NOT run).
-          if [[ -n "$TEST_PACKAGE_FLAGS" ]]; then
-            cargo test --locked --no-fail-fast $TEST_PACKAGE_FLAGS
-          else
-            cargo test --locked --no-fail-fast
-          fi
+          cargo test --locked --no-fail-fast "${TEST_CARGO_ARGS[@]}" "${TEST_TARGET_ARGS[@]}"
         fi
         test_end=$(date +%s)
         test_duration=$((test_end - test_start))
@@ -438,13 +365,14 @@ runs:
         total_duration=$((build_duration + test_duration))
         echo ""
         echo "========================================="
-        if [[ -n "$PACKAGE_FLAGS" ]]; then
-          TEST_CRATE_COUNT=$(( $(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l) - PLUGIN_SUITES ))
-          BUILD_CRATE_COUNT=$(echo "$PACKAGE_FLAGS" | grep -o '\-p ' | wc -l)
-          echo "DAG scope (test):              ${TEST_CRATE_COUNT}/${TOTAL_CRATES} crates + ${PLUGIN_SUITES} connector suites"
-          echo "DAG scope (build):             ${BUILD_CRATE_COUNT}/${TOTAL_CRATES} crates"
+        if [[ "$BUILD_SCOPE" == "packages" ]]; then
+          echo "Cargo-Rail scope (test):       ${#TEST_PACKAGES[@]} packages"
+          echo "Cargo-Rail scope (build):      ${#BUILD_PACKAGES[@]} packages"
+        elif [[ "$PLAN_USABLE" == true && "$TEST_SCOPE" == "packages" ]]; then
+          echo "Cargo-Rail scope (test):       ${#TEST_PACKAGES[@]} packages"
+          echo "Cargo-Rail scope (build):      full workspace"
         else
-          echo "DAG scope:                     full workspace (${TOTAL_CRATES} crates)"
+          echo "Cargo-Rail scope:              full workspace"
         fi
         echo "All targets build:             ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
         echo "Tests compile:                 ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
