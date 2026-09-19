@@ -31,9 +31,10 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
+use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    BrokerAdvertise, DEFAULT_KAFKA_PORT, HandleOutcome, handle_request_bounded,
+    BrokerAdvertise, DEFAULT_KAFKA_PORT, GatewayState, HandleOutcome, handle_request_bounded,
 };
 use crate::protocol::header::{request_header_version, response_header_version};
 use std::io;
@@ -162,6 +163,7 @@ pub fn bind_listener(addr: &str) -> Result<TcpListener> {
 
 pub struct KafkaGateway {
     config: Arc<GatewayConfig>,
+    bridge: Option<Arc<IggyBridge>>,
 }
 
 impl KafkaGateway {
@@ -169,7 +171,17 @@ impl KafkaGateway {
     pub fn new(config: GatewayConfig) -> Self {
         Self {
             config: Arc::new(config),
+            bridge: None,
         }
+    }
+
+    /// Serve requests against `bridge` instead of the stub answers.
+    ///
+    /// `None` is the default and keeps every handler on its stub.
+    #[must_use]
+    pub fn with_bridge(mut self, bridge: Option<Arc<IggyBridge>>) -> Self {
+        self.bridge = bridge;
+        self
     }
 
     /// Accept Kafka wire connections until `shutdown` fires, then drain in-flight tasks.
@@ -186,14 +198,16 @@ impl KafkaGateway {
         mut shutdown: broadcast::Receiver<()>,
     ) -> Result<()> {
         let local_addr = listener.local_addr()?;
-        let broker = Arc::new(BrokerAdvertise::from_server_config(
-            &self.config,
-            local_addr,
-        )?);
+        let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
         info!(
             "kafka listener bound on {} (advertised as {}:{})",
             local_addr, broker.host, broker.port
         );
+        let state = Arc::new(GatewayState::new(
+            broker,
+            self.bridge.clone(),
+            self.config.max_frame_size,
+        ));
 
         let tracker = TaskTracker::new();
         let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
@@ -238,12 +252,12 @@ impl KafkaGateway {
                                 warn!(%peer, "TCP_KEEPALIVE failed: {e}");
                             }
                             let cfg = Arc::clone(&self.config);
-                            let broker = Arc::clone(&broker);
+                            let state = Arc::clone(&state);
                             let conn_cancel = cancel.child_token();
                             tracker.spawn(async move {
                                 let _permit = permit;
                                 if let Err(err) =
-                                    handle_connection(stream, cfg, peer, broker, conn_cancel).await
+                                    handle_connection(stream, cfg, peer, state, conn_cancel).await
                                 {
                                     // debug!, not warn!: every `KafkaProtocolError` that can
                                     // reach here is either a malformed/oversized frame from the
@@ -311,7 +325,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<GatewayConfig>,
     peer: SocketAddr,
-    broker: Arc<BrokerAdvertise>,
+    state: Arc<GatewayState>,
     cancel: CancellationToken,
 ) -> Result<()> {
     debug!(%peer, "connection accepted");
@@ -350,13 +364,9 @@ async fn handle_connection(
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
-        let outcome = handle_request_bounded(
-            req.request_api_key,
-            req.request_api_version,
-            body,
-            &broker,
-            config.max_frame_size,
-        );
+        let outcome =
+            handle_request_bounded(&state, req.request_api_key, req.request_api_version, body)
+                .await;
         if dispatch_outcome(&mut stream, &peer, &config, &req, resp_hdr_ver, outcome).await? {
             return Ok(());
         }
