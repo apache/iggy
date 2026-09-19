@@ -12,7 +12,7 @@ By default, runtime will look for the configuration file, to decide which connec
 
 Set the broker credentials and connector configuration directory before starting the runtime. The embedded default has an empty connector directory and cannot start unchanged. Follow the [connector quick start](../README.md#quick-start) for a complete setup.
 
-The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect:edge`.
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available via `docker pull apache/iggy-connect`. It ships in two flavors: a default image with every connector plugin bundled, and a `-slim` runtime-only image.
 
 The runtime opens two Iggy TCP clients, one for producers and one for consumers. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
 
