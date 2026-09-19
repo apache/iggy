@@ -56,7 +56,12 @@ test-group = "elasticsearch"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)'
+# `gateway_bridge_e2e_tests` shares this group too: it spawns real `iggy-server` processes
+# through the identical `tests/common/iggy_server.rs` harness (same PortGuard band, same
+# cpu_allocation override), so it carries the same contention risk against unrelated packages'
+# tests as `bridge_iggy_integration_tests` - and against that binary's own real-server tests, if
+# nextest scheduled both binaries' server-spawning tests concurrently instead.
+filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests) or binary_id(iggy-gateway-kafka::gateway_bridge_e2e_tests)'
 test-group = "kafka_bridge"
 
 [profile.default]

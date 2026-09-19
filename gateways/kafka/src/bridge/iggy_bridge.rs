@@ -71,11 +71,13 @@ const RECONNECTION_RETRIES: u32 = 3;
 /// so no finite value here can guarantee catching it. That same unboundedness is why this timeout
 /// cannot simply be dropped for post-connect calls either: [`IggyBridge`] holds one `IggyClient`
 /// with no pooling, so an unbounded reconnect dial with nothing here to stop it would wedge every
-/// later call on this bridge, not just the one that triggered it. Tolerable only because nothing
-/// calls this bridge from a live Kafka handler yet - closing it needs either a cooperatively
+/// later call on this bridge, not just the one that triggered it. Live today, not a future
+/// concern: `Metadata`, `CreateTopics` and `ListOffsets` (`protocol::api`) already call this
+/// bridge from real Kafka connections, and a slow-to-reconnect Iggy backend can already wedge
+/// every one of them behind a single stuck call - closing it needs either a cooperatively
 /// cancellable SDK call or a deadline on the SDK's own reconnect dial, neither of which this
-/// bridge can add from the outside. Must be resolved before #3535/#3536 share this client across
-/// concurrent connections.
+/// bridge can add from the outside. Gets worse, not better, once #3535/#3536 add Produce/Fetch to
+/// the same shared client.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`]. See that constant's doc for why every
@@ -223,8 +225,12 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
-    /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
-    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] for connectivity/auth failures. Returns
+    /// topic-naming rules. Returns [`BridgeError::InvalidPartitionCount`] if `partition_count`
+    /// is `0` - enforced here, not left to a caller, since this method is reachable directly
+    /// through the public [`TopicCatalog`](crate::bridge::TopicCatalog) trait, not only through
+    /// the `CreateTopics` wire-validation layer that happens to check this today. Returns
+    /// [`BridgeError::Timeout`] if a call takes longer than `REQUEST_TIMEOUT`. Returns
+    /// [`BridgeError::Iggy`] for connectivity/auth failures. Returns
     /// [`BridgeError::PartitionCountMismatch`] if the topic already exists with a different
     /// partition count than `partition_count`.
     pub async fn ensure_stream_and_topic(
@@ -233,6 +239,11 @@ impl IggyBridge {
         partition_count: u32,
     ) -> Result<(), BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        if partition_count == 0 {
+            return Err(BridgeError::InvalidPartitionCount {
+                kafka_topic: kafka_topic.to_string(),
+            });
+        }
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = self.ensure_stream(stream_name).await?;
         self.ensure_topic(&stream_id, topic_name, kafka_topic, partition_count)
@@ -282,9 +293,11 @@ impl IggyBridge {
     /// `Identifier::named`, not `Identifier::try_from` - the same numeric-name ambiguity
     /// [`Self::ensure_stream`]'s doc comment describes for stream names applies to topic names.
     ///
-    /// `partition_count == 0` is accepted here as defense in depth, not the primary guard: the
-    /// server allows it by design (`rewrite.rs`), and the `CreateTopics` stub already rejects it
-    /// at the wire level (`protocol/responses.rs`) before any bridge call would be reachable.
+    /// `partition_count == 0` never reaches here in practice - `ensure_stream_and_topic` (this
+    /// method's only caller) rejects it up front with [`BridgeError::InvalidPartitionCount`],
+    /// and the `CreateTopics` wire-validation layer (`protocol/responses.rs`) rejects it earlier
+    /// still. Not re-checked here: this is a private helper with one call site, so the
+    /// invariant only needs enforcing once, at the public entry point.
     async fn ensure_topic(
         &self,
         stream_id: &Identifier,

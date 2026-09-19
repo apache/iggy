@@ -29,12 +29,27 @@ use async_trait::async_trait;
 use iggy::prelude::IggyError;
 use iggy_gateway_kafka::bridge::{BridgeError, KafkaTopicMetadata, TopicCatalog};
 
+/// One topic's fake state: partition count, plus a single watermark applied to every partition
+/// (real `IggyBridge` tracks watermarks per-partition, but no test in this suite needs more than
+/// one distinguishable value per topic to tell LATEST from EARLIEST).
+#[derive(Clone, Copy)]
+struct TopicState {
+    partitions_count: u32,
+    /// What `high_watermarks` reports for every partition of this topic. Distinct from `0` by
+    /// default specifically so a test seeding a nonzero watermark can tell "the handler read the
+    /// real watermark" apart from "the handler (or this fake) always answers 0 regardless" - a
+    /// fake that only ever returns `Ok(0)` (this type's original shape) makes every EARLIEST/
+    /// LATEST assertion pass identically whether the underlying logic is correct or not.
+    watermark: i64,
+}
+
 /// Topics this fake already knows about, keyed by Kafka topic name. Seeded via
-/// [`FakeBridge::with_topic`]; `ensure_stream_and_topic` also inserts into it, mirroring
-/// `IggyBridge`'s own create-if-missing contract closely enough for wire-level assertions.
+/// [`FakeBridge::with_topic`]/[`FakeBridge::with_topic_and_watermark`]; `ensure_stream_and_topic`
+/// also inserts into it (watermark `0`), mirroring `IggyBridge`'s own create-if-missing contract
+/// closely enough for wire-level assertions.
 #[derive(Default)]
 pub struct FakeBridge {
-    topics: Mutex<HashMap<String, u32>>,
+    topics: Mutex<HashMap<String, TopicState>>,
 }
 
 impl FakeBridge {
@@ -42,12 +57,31 @@ impl FakeBridge {
         Self::default()
     }
 
+    /// Seeds a topic with watermark `0` for every partition - equivalent to
+    /// `with_topic_and_watermark(kafka_topic, partitions_count, 0)`. Kept as its own method: most
+    /// callers only care about partition count/existence, not a specific watermark value.
     #[must_use]
     pub fn with_topic(self, kafka_topic: &str, partitions_count: u32) -> Self {
+        self.with_topic_and_watermark(kafka_topic, partitions_count, 0)
+    }
+
+    #[must_use]
+    pub fn with_topic_and_watermark(
+        self,
+        kafka_topic: &str,
+        partitions_count: u32,
+        watermark: i64,
+    ) -> Self {
         self.topics
             .lock()
             .expect("fake bridge mutex poisoned")
-            .insert(kafka_topic.to_string(), partitions_count);
+            .insert(
+                kafka_topic.to_string(),
+                TopicState {
+                    partitions_count,
+                    watermark,
+                },
+            );
         self
     }
 }
@@ -61,9 +95,15 @@ impl TopicCatalog for FakeBridge {
     ) -> Result<(), BridgeError> {
         let existing = {
             let mut topics = self.topics.lock().expect("fake bridge mutex poisoned");
-            let existing = topics.get(kafka_topic).copied();
+            let existing = topics.get(kafka_topic).map(|state| state.partitions_count);
             if existing.is_none() {
-                topics.insert(kafka_topic.to_string(), partition_count);
+                topics.insert(
+                    kafka_topic.to_string(),
+                    TopicState {
+                        partitions_count: partition_count,
+                        watermark: 0,
+                    },
+                );
             }
             existing
         };
@@ -84,11 +124,11 @@ impl TopicCatalog for FakeBridge {
         kafka_topic: &str,
         partitions: &[u32],
     ) -> Result<Vec<(u32, Result<i64, BridgeError>)>, BridgeError> {
-        let partitions_count = {
+        let state = {
             let topics = self.topics.lock().expect("fake bridge mutex poisoned");
             topics.get(kafka_topic).copied()
         };
-        let Some(partitions_count) = partitions_count else {
+        let Some(state) = state else {
             return Err(BridgeError::Iggy(IggyError::TopicNameNotFound(
                 kafka_topic.to_string(),
                 "kafka".to_string(),
@@ -97,13 +137,13 @@ impl TopicCatalog for FakeBridge {
         Ok(partitions
             .iter()
             .map(|&partition| {
-                let result = if partition < partitions_count {
-                    Ok(0)
+                let result = if partition < state.partitions_count {
+                    Ok(state.watermark)
                 } else {
                     Err(BridgeError::PartitionOutOfRange {
                         topic: kafka_topic.to_string(),
                         partition,
-                        partitions_count,
+                        partitions_count: state.partitions_count,
                     })
                 };
                 (partition, result)
@@ -117,7 +157,7 @@ impl TopicCatalog for FakeBridge {
     ) -> Result<Option<KafkaTopicMetadata>, BridgeError> {
         let partitions_count = {
             let topics = self.topics.lock().expect("fake bridge mutex poisoned");
-            topics.get(kafka_topic).copied()
+            topics.get(kafka_topic).map(|state| state.partitions_count)
         };
         Ok(partitions_count.map(|partitions_count| KafkaTopicMetadata {
             kafka_topic: kafka_topic.to_string(),
@@ -130,7 +170,7 @@ impl TopicCatalog for FakeBridge {
             let topics = self.topics.lock().expect("fake bridge mutex poisoned");
             topics
                 .iter()
-                .map(|(kafka_topic, &partitions_count)| (kafka_topic.clone(), partitions_count))
+                .map(|(kafka_topic, state)| (kafka_topic.clone(), state.partitions_count))
                 .collect()
         };
         Ok(snapshot

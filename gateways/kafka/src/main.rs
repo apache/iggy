@@ -45,26 +45,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bridge = IggyBridge::connect(bridge_config)
         .await
         .map_err(|e| format!("failed to connect to Iggy: {e}"))?;
-    let bridge: Arc<dyn iggy_gateway_kafka::bridge::TopicCatalog> = Arc::new(bridge);
+    // Kept as a concrete `Arc<IggyBridge>`, not only the `Arc<dyn TopicCatalog>` the server
+    // needs: `close()` takes `IggyBridge` by value, so tearing it down at shutdown needs this
+    // binding's own `Arc::try_unwrap` once every clone the server handed out is done with it -
+    // a bare `Arc<dyn TopicCatalog>` has no path back to the concrete type to call it on.
+    let bridge = Arc::new(bridge);
+    let server_bridge: Arc<dyn iggy_gateway_kafka::bridge::TopicCatalog> = bridge.clone();
 
     let listener = bind_listener(&config.bind_addr)
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
-    let server = KafkaGateway::new(config, bridge);
+    let server = KafkaGateway::new(config, server_bridge);
 
     let (tx, rx) = broadcast::channel(1);
     let mut server_task = tokio::spawn(async move { server.run(listener, rx).await });
 
-    tokio::select! {
-        result = &mut server_task => {
-            return Ok(result??);
-        }
+    let server_result = tokio::select! {
+        result = &mut server_task => result,
         () = shutdown_signal() => {
             let _ = tx.send(());
+            server_task.await
+        }
+    };
+
+    close_bridge(bridge).await;
+    Ok(server_result??)
+}
+
+/// Tears down the Iggy connection this gateway opened at startup, including its background
+/// heartbeat task - best-effort, not a hard requirement for shutdown to complete.
+///
+/// `close(self)` needs sole ownership: a connection task that missed `run()`'s drain deadline
+/// (a known gap - `drain`'s own doc) is abandoned, not joined, and can still hold its own clone
+/// of this `Arc` past this point. That case is left to the process exit to reclaim the socket
+/// and heartbeat task via `Drop`, not treated as a bug here - a fully graceful close was already
+/// not possible once a connection task didn't finish in time.
+async fn close_bridge(bridge: Arc<IggyBridge>) {
+    match Arc::try_unwrap(bridge) {
+        Ok(bridge) => {
+            if let Err(error) = bridge.close().await {
+                tracing::warn!(%error, "failed to cleanly close the Iggy bridge connection");
+            }
+        }
+        Err(_still_shared) => {
+            tracing::debug!(
+                "Iggy bridge still has live references at shutdown (a connection task likely \
+                 missed the drain deadline); skipping explicit close, Drop will still tear down \
+                 the underlying connection"
+            );
         }
     }
-
-    server_task.await??;
-    Ok(())
 }
 
 /// The `IGGY_KAFKA_*` vars `load_config` itself reads. `IGGY_KAFKA_` is a

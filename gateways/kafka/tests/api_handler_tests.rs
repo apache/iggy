@@ -33,8 +33,8 @@ use bytes::Bytes;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
-    handle_request, is_supported_version, supported_api_ranges,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_TOPIC_ALREADY_EXISTS, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSUPPORTED_VERSION, handle_request, is_supported_version, supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -552,7 +552,10 @@ async fn list_offsets_unknown_topic_returns_unknown_topic_or_partition() {
 /// against topics the bridge has never heard of; this exercises the success path with a
 /// hand-built request against a topic seeded into the fake bridge, independent of any `.bin`
 /// fixture. Timestamp `-2` (earliest) always resolves to offset 0 in this bridge (see
-/// `IggyBridge::list_kafka_topics`' own doc on why), regardless of how many partitions exist.
+/// `IggyBridge::list_kafka_topics`' own doc on why), regardless of how many partitions exist -
+/// seeded with a nonzero fake watermark specifically so this assertion can't pass by accident:
+/// a `FakeBridge` that always answered `0` (its original shape) would make "the handler ignores
+/// the real watermark for -2" indistinguishable from "the fake always says 0 anyway."
 #[tokio::test]
 async fn list_offsets_decodes_request_with_real_topic_and_partition() {
     let body = wire::build_list_offsets_branch_request(6, "orders", 2);
@@ -561,7 +564,7 @@ async fn list_offsets_decodes_request_with_real_topic_and_partition() {
         6,
         body,
         &default_broker(),
-        &FakeBridge::new().with_topic("orders", 3),
+        &FakeBridge::new().with_topic_and_watermark("orders", 3, 42),
     )
     .await
     .expect_response("test request has acks != 0 and expects a response");
@@ -584,6 +587,41 @@ async fn list_offsets_decodes_request_with_real_topic_and_partition() {
     assert_eq!(d.read_i16().unwrap(), ERROR_NONE, "partition 2 of 3 exists");
     assert_eq!(d.read_i64().unwrap(), -1, "earliest sentinel: timestamp");
     assert_eq!(d.read_i64().unwrap(), 0, "earliest sentinel: offset");
+}
+
+/// LATEST's counterpart to the EARLIEST test above: the real (fake, but nonzero) watermark must
+/// come through unchanged, proving the handler actually reads it for `-1` rather than also
+/// hardcoding a constant the way it deliberately does for `-2`.
+#[tokio::test]
+async fn list_offsets_latest_returns_the_real_watermark() {
+    let body = wire::build_list_offsets_request(6, "orders", 2);
+    let resp = handle_request(
+        API_KEY_LIST_OFFSETS,
+        6,
+        body,
+        &default_broker(),
+        &FakeBridge::new().with_topic_and_watermark("orders", 3, 42),
+    )
+    .await
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(resp);
+    let _throttle = d.read_i32().unwrap();
+    let topics_plus_one = d.read_varint().unwrap();
+    assert_eq!(topics_plus_one, 2, "one topic");
+    assert_eq!(
+        d.read_compact_nullable_string().unwrap(),
+        Some("orders".to_string())
+    );
+    let parts_plus_one = d.read_varint().unwrap();
+    assert_eq!(parts_plus_one, 2, "one partition");
+    assert_eq!(d.read_i32().unwrap(), 2, "partition_index must echo");
+    assert_eq!(d.read_i16().unwrap(), ERROR_NONE);
+    assert_eq!(d.read_i64().unwrap(), -1, "latest sentinel: timestamp");
+    assert_eq!(
+        d.read_i64().unwrap(),
+        42,
+        "latest must echo the real watermark, not a constant"
+    );
 }
 
 // ── Metadata regression - all supported versions, broker advertise, topic counts ──
@@ -858,6 +896,49 @@ async fn create_topics_succeeds_against_a_fresh_bridge() {
         }
         assert_eq!(d.read_i16().unwrap(), ERROR_NONE, "CreateTopics v{version}");
     }
+}
+
+/// `CreateTopics` is not an upsert: `ensure_stream_and_topic`'s own idempotency (matching-spec
+/// re-call is `Ok`) is right for an internal get-or-create helper, but `AdminClient.createTopics`
+/// never reports success for a topic it didn't create, spec match or not. Re-sending the exact
+/// same create request the first call already satisfied must return `TOPIC_ALREADY_EXISTS` (36),
+/// not silently succeed a second time.
+#[tokio::test]
+async fn create_topics_recreate_with_matching_spec_returns_topic_already_exists() {
+    let fake = FakeBridge::new();
+    let body = wire::build_create_topics_simple_request(5, "orders", 3, 1, false);
+
+    let first = handle_request(
+        API_KEY_CREATE_TOPICS,
+        5,
+        body.clone(),
+        &default_broker(),
+        &fake,
+    )
+    .await
+    .expect_response("first create must respond");
+    let mut d = Decoder::new(first);
+    let _throttle = d.read_i32().unwrap();
+    let _topics = d.read_varint().unwrap();
+    let _topic = d.read_compact_nullable_string().unwrap();
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_NONE,
+        "first create must succeed"
+    );
+
+    let second = handle_request(API_KEY_CREATE_TOPICS, 5, body, &default_broker(), &fake)
+        .await
+        .expect_response("recreate must respond");
+    let mut d = Decoder::new(second);
+    let _throttle = d.read_i32().unwrap();
+    let _topics = d.read_varint().unwrap();
+    let _topic = d.read_compact_nullable_string().unwrap();
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_TOPIC_ALREADY_EXISTS,
+        "recreating an existing topic must not silently succeed a second time"
+    );
 }
 
 /// Real topic, replica assignment, and (at v5+) a `cleanup.policy` config entry - assignments are

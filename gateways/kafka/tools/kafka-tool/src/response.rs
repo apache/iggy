@@ -45,8 +45,11 @@ impl ResponseSummary {
     /// Reasons `verify` should count this response as a failure.
     ///
     /// Fails on correlation mismatch, schema decode failure, and unexpected non-zero
-    /// error codes. Stub APIs may return documented non-zero codes (Produce 6,
-    /// Metadata 3, CreateTopics 41).
+    /// error codes. Produce/Fetch are still stubs (documented non-zero code 6). Metadata,
+    /// ListOffsets and CreateTopics call through to a real Iggy backend: 3
+    /// (UNKNOWN_TOPIC_OR_PARTITION) for a topic that doesn't exist yet is expected from
+    /// Metadata/ListOffsets, and 36 (TOPIC_ALREADY_EXISTS) is expected from CreateTopics on a
+    /// topic `verify` already created in an earlier run.
     #[must_use]
     pub fn verify_failure_reason(&self, api_key: i16) -> Option<String> {
         if !self.correlation_match {
@@ -104,9 +107,13 @@ fn is_acceptable_verify_error(api_key: i16, error_code: i16) -> bool {
         return true;
     }
     match api_key {
-        0..=2 => error_code == 6, // Produce/Fetch/ListOffsets stub: NOT_LEADER_OR_FOLLOWER
-        3 => error_code == 3,     // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
-        19 => error_code == 41,   // CreateTopics stub: NOT_CONTROLLER
+        0..=1 => error_code == 6, // Produce/Fetch stub: NOT_LEADER_OR_FOLLOWER
+        // ListOffsets/Metadata: real lookup via IggyBridge, UNKNOWN_TOPIC_OR_PARTITION for a
+        // topic that doesn't exist yet on the connected Iggy backend.
+        2 | 3 => error_code == 3,
+        // CreateTopics: real provisioning via IggyBridge - TOPIC_ALREADY_EXISTS on a re-run
+        // against a topic an earlier `verify` call already created.
+        19 => error_code == 36,
         _ => false,
     }
 }

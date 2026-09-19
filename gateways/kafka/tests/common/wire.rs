@@ -445,3 +445,105 @@ pub fn build_create_topics_request_with_sections(version: i16, topic: &str) -> B
 
     enc.freeze()
 }
+
+/// `CreateTopics` single-topic request with no manual assignments and no per-topic configs -
+/// the shape `NewTopic(name, numPartitions, replicationFactor)` (the common-case Java
+/// `AdminClient` constructor) actually sends, unlike
+/// [`build_create_topics_request_with_sections`]'s always-present assignment/config sections.
+pub fn build_create_topics_simple_request(
+    version: i16,
+    topic: &str,
+    num_partitions: i32,
+    replication_factor: i16,
+    validate_only: bool,
+) -> Bytes {
+    let flexible = version >= 5;
+    let mut enc = Encoder::with_capacity(128);
+
+    if flexible {
+        enc.write_varint(2); // one topic
+        enc.write_compact_nullable_string(Some(topic));
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(topic)).expect("topic fits");
+    }
+    enc.write_i32(num_partitions);
+    enc.write_i16(replication_factor);
+
+    if flexible {
+        enc.write_varint(1); // empty assignments compact array
+        enc.write_varint(1); // empty configs compact array
+        enc.write_empty_tagged_fields(); // topic tagged fields
+    } else {
+        enc.write_i32(0); // empty assignments array
+        enc.write_i32(0); // empty configs array
+    }
+
+    enc.write_i32(5_000); // timeout_ms
+    if version >= 1 {
+        enc.write_bool(validate_only);
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
+/// `CreateTopics` single-topic request using manual partition assignment - the shape
+/// `NewTopic(name, replicasAssignments)` sends: `num_partitions`/`replication_factor` both `-1`
+/// (KIP-464), one assignment entry per intended partition, no configs. `partition_count` intended
+/// partitions, each assigned to broker id `1` (the only broker this gateway ever reports).
+pub fn build_create_topics_with_assignments_request(
+    version: i16,
+    topic: &str,
+    partition_count: u32,
+) -> Bytes {
+    let flexible = version >= 5;
+    let mut enc = Encoder::with_capacity(128);
+
+    if flexible {
+        enc.write_varint(2); // one topic
+        enc.write_compact_nullable_string(Some(topic));
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(topic)).expect("topic fits");
+    }
+    enc.write_i32(-1); // num_partitions: broker default sentinel (manual assignment)
+    enc.write_i16(-1); // replication_factor: broker default sentinel
+
+    if flexible {
+        enc.write_varint(u64::from(partition_count) + 1);
+    } else {
+        enc.write_i32(i32::try_from(partition_count).expect("test partition_count fits i32"));
+    }
+    for partition_index in 0..partition_count {
+        enc.write_i32(i32::try_from(partition_index).expect("test partition_index fits i32"));
+        if flexible {
+            enc.write_varint(2); // one replica
+        } else {
+            enc.write_i32(1);
+        }
+        enc.write_i32(1); // broker_id
+        if flexible {
+            enc.write_empty_tagged_fields(); // assignment tagged fields
+        }
+    }
+
+    if flexible {
+        enc.write_varint(1); // empty configs compact array
+        enc.write_empty_tagged_fields(); // topic tagged fields
+    } else {
+        enc.write_i32(0); // empty configs array
+    }
+
+    enc.write_i32(5_000); // timeout_ms
+    if version >= 1 {
+        enc.write_bool(false); // validate_only
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}

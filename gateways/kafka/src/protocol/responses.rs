@@ -38,8 +38,8 @@ use kafka_protocol::protocol::Encodable;
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_NONE,
-    ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR,
+    ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
 };
 
 /// Encode a `kafka_protocol` message, mapping its `anyhow::Error` (the crate has no stable
@@ -375,7 +375,19 @@ pub fn validate_create_topic_shape(
             u32::try_from(topic.assignments.len()).map_err(|_| ERROR_INVALID_PARTITIONS)?
         }
     } else if topic.num_partitions > 0 {
-        u32::try_from(topic.num_partitions).map_err(|_| ERROR_INVALID_PARTITIONS)?
+        let count = u32::try_from(topic.num_partitions).map_err(|_| ERROR_INVALID_PARTITIONS)?;
+        // An explicit count alongside a non-empty manual assignment is not the normal shape a
+        // conforming client sends (the Java `NewTopic` constructors are mutually exclusive on
+        // this), but nothing on the wire forbids it, and the two can disagree - the assignment
+        // implies a different partition count than `num_partitions` states outright. Neither is
+        // silently preferred: real Kafka's own analogue for a malformed assignment is
+        // `INVALID_REPLICA_ASSIGNMENT` (39).
+        let assignment_count_matches = topic.assignments.is_empty()
+            || u64::try_from(topic.assignments.len()).is_ok_and(|len| len == u64::from(count));
+        if !assignment_count_matches {
+            return Err(ERROR_INVALID_REPLICA_ASSIGNMENT);
+        }
+        count
     } else {
         return Err(ERROR_INVALID_PARTITIONS);
     };

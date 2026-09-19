@@ -104,9 +104,11 @@ shared client's connection lock for up to another 30s (the SDK's own reply deadl
 every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
 Concurrency ceiling below), so this only matters once concurrent Kafka connections share a bridge
 
-- tolerable today only because nothing calls this bridge from a live handler yet; must be resolved
-before `#3535`/`#3536`. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't
-a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
+- live today, not a future concern: `Metadata`, `CreateTopics` and `ListOffsets` already call this
+bridge from real Kafka connections, so a slow-to-reconnect Iggy backend can already wedge every one
+of them behind a single stuck call. Gets worse, not better, once `#3535`/`#3536` add Produce/Fetch
+to the same shared client. See `IggyBridge`'s own doc comment (its rustdoc is private, so this
+isn't a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
 
 ### Topic mapping
 
@@ -159,15 +161,38 @@ messages or 1 MiB of unflushed data, whichever comes first). Kafka's own default
 posture, so this isn't a wrong choice, but on a single node both can lose an acked write to a power
 cut before that threshold is reached - worth knowing rather than discovering later.
 
+### `CreateTopics` replication factor
+
+`replication_factor` is accepted on the wire but not applied: Iggy's replication is cluster-wide
+(Raft over the whole stream), not a per-topic knob this bridge can set. A `CreateTopics` response
+always echoes `replication_factor = 1` regardless of what was requested - a client that asked for
+`RF=3` expecting per-topic replica placement gets a response that silently normalizes it rather
+than honoring or rejecting the request. `num_partitions` is honored exactly (including deriving
+the count from a manual `assignments` list's length); only replication factor is echoed, not
+enforced.
+
+### `ListOffsets` timestamp support
+
+Only the `-1` (latest) and `-2` (earliest) sentinels are supported. A real timestamp value (a
+client seeking to a specific point in time, e.g. Java's `OffsetSpec.forTimestamp`) answers
+`INVALID_REQUEST` (42) for that partition - not a statement that the request is malformed, but
+that this bridge has no timestamp-to-offset lookup to serve it with. `-2` (earliest) always
+resolves to offset `0`: every topic this bridge creates has message expiry left at Iggy's
+never-expire default (see Provisioning above) and nothing in this gateway trims a partition yet,
+so `0` is correct for any topic this bridge actually manages - but it is not derived from a real
+low-watermark lookup, so a topic that later gains retention or trimming outside this bridge's
+knowledge would make this answer stale.
+
 ### Concurrency ceiling
 
 One `IggyBridge` (one `IggyClient`) is meant to serve every Kafka connection this gateway handles,
 and the Iggy SDK's TCP transport is lockstep - one request in flight per client, its stream mutex
 held across write, flush, and read. Every concurrent Kafka connection ends up serialized behind
 whichever single Iggy request is in flight; the Kafka side's own connection limit
-(`IGGY_KAFKA_MAX_CONNECTIONS`) does nothing to relieve this. No connection pooling exists yet - it
-is a known gap to address before `#3535`/`#3536` put this on a hot path, not a design decision to
-rely on.
+(`IGGY_KAFKA_MAX_CONNECTIONS`) does nothing to relieve this. Already true today for `Metadata`,
+`CreateTopics` and `ListOffsets` - not only a future concern for Produce/Fetch. No connection
+pooling exists yet - it is a known gap to close, not a design decision to rely on, and `#3535`/
+`#3536` will only add more request volume behind the same single connection.
 
 ### Error mapping
 

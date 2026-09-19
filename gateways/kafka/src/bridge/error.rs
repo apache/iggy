@@ -19,9 +19,9 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -85,6 +85,13 @@ pub enum BridgeError {
     /// raw or non-conformant client, not an expected path.
     #[error("invalid Kafka topic name '{kafka_topic}': {reason}")]
     InvalidKafkaTopicName { kafka_topic: String, reason: String },
+    /// `ensure_stream_and_topic` was asked for `partition_count == 0`. Enforced here, not only
+    /// at the `CreateTopics` wire-validation layer that's this bridge's only caller today - the
+    /// method is `pub` on a public trait, so a future caller (a test, or a later Produce
+    /// auto-create path) bypassing that layer must not be able to provision a topic nothing can
+    /// produce to.
+    #[error("partition count must be at least 1, got 0 for topic '{kafka_topic}'")]
+    InvalidPartitionCount { kafka_topic: String },
 }
 
 impl BridgeError {
@@ -106,6 +113,10 @@ impl BridgeError {
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,
             Self::InvalidKafkaTopicName { .. } => ERROR_INVALID_TOPIC_EXCEPTION,
+            // Same code the wire-validation layer already uses for this exact condition
+            // (`protocol/responses.rs`'s `validate_create_topic_shape`) - this is the same
+            // failure reached through a different door, not a new kind of error.
+            Self::InvalidPartitionCount { .. } => ERROR_INVALID_PARTITIONS,
             // Not a wire-response case in practice: an invalid bridge config is caught at
             // `IggyBridge::connect` before any handler exists to answer a Kafka request, so this
             // is reachable only if a future caller starts constructing configs at request time.
@@ -163,7 +174,13 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
         IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
-        IggyError::TooManyPartitions => ERROR_INVALID_PARTITIONS,
+        // Not `ERROR_INVALID_PARTITIONS` (37): that code's own text, per `kafka-protocol`'s
+        // table, is "Number of partitions is below 1" - the opposite condition from "too many"
+        // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
+        // client-visible error message that contradicts the actual request it sent.
+        // `ERROR_INVALID_REQUEST` (42) has no such text mismatch and matches this bridge's own
+        // convention elsewhere for a request-shape problem with no exact Kafka analogue.
+        IggyError::TooManyPartitions => ERROR_INVALID_REQUEST,
         _ => ERROR_UNKNOWN_SERVER_ERROR,
     }
 }
@@ -211,8 +228,19 @@ mod tests {
     }
 
     #[test]
-    fn too_many_partitions_maps_to_invalid_partitions() {
+    fn too_many_partitions_maps_to_invalid_request_not_invalid_partitions() {
+        // INVALID_PARTITIONS (37) means "count is below 1" (kafka-protocol's own error table) -
+        // the opposite condition from "too many": reusing it here would send a client-visible
+        // message that contradicts the request it just sent.
         let err = BridgeError::Iggy(IggyError::TooManyPartitions);
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn invalid_partition_count_maps_to_invalid_partitions() {
+        let err = BridgeError::InvalidPartitionCount {
+            kafka_topic: "orders".to_string(),
+        };
         assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PARTITIONS);
     }
 
@@ -382,6 +410,7 @@ mod tests {
                 ERROR_TOPIC_ALREADY_EXISTS,
                 ResponseError::TopicAlreadyExists,
             ),
+            (ERROR_INVALID_REQUEST, ResponseError::InvalidRequest),
             (ERROR_INVALID_PARTITIONS, ResponseError::InvalidPartitions),
         ] {
             assert_eq!(

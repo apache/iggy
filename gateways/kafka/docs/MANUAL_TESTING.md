@@ -1,6 +1,6 @@
 # Kafka gateway — manual testing procedure
 
-Manual validation for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421) foundation: TCP listener, wire decode, version firewall, stub responses. **No Iggy backend** — success means correct Kafka wire behavior, not message persistence.
+Manual validation for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421) foundation: TCP listener, wire decode, version firewall, stub responses. **A running `iggy-server` is required** — the gateway connects to it at startup (`IggyBridge::connect`, before it even binds the Kafka listener) and Metadata/CreateTopics/ListOffsets now answer from it for real; only Produce/Fetch remain stub responses with no message persistence.
 
 See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.md) (automated coverage).
 
@@ -21,11 +21,15 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 ### Build and start gateway
 
 ```bash
-# From iggy workspace root (or iggy-gateway-kafka subdir)
-cargo build -p iggy-gateway-kafka
+# From iggy workspace root
+cargo build -p iggy-server -p iggy-gateway-kafka
 
-# Terminal 1 — start listener (default 127.0.0.1:9093)
-RUST_LOG=info cargo run -p iggy-gateway-kafka
+# Terminal 1 — start a real Iggy backend (default gateway target: 127.0.0.1:8090)
+cargo run --bin iggy-server
+
+# Terminal 2 — start the gateway (default 127.0.0.1:9093); IGGY_KAFKA_IGGY_PASSWORD is
+# required, no default - connect fails fast and loud without it
+IGGY_KAFKA_IGGY_PASSWORD=iggy RUST_LOG=info cargo run -p iggy-gateway-kafka
 ```
 
 Expected log:
@@ -75,11 +79,11 @@ connection-refuses before any assertion runs.
 | A1 | Gateway starts | Run `iggy-gateway-kafka` | Binds to `:9093`, no panic | Log shows bind address |
 | A2 | ApiVersions v1 | `cargo run -p kafka-message-gen -- send --host 127.0.0.1:9093 --api-key 18 --version 1` | Response received | `ec=0`, non-zero byte count |
 | A3 | ApiVersions v3 (flexible) | Same with `--version 3` | Response received | `ec=0` |
-| A4 | Metadata v0 | `send --host 127.0.0.1:9093 --api-key 3 --version 0` | Stub broker in response | Topic entries show `ec=3` (UNKNOWN_TOPIC_OR_PARTITION, stub) |
+| A4 | Metadata v0 | `send --host 127.0.0.1:9093 --api-key 3 --version 0` | Real lookup via `IggyBridge` | Topic entries show `ec=3` (UNKNOWN_TOPIC_OR_PARTITION) for a topic that doesn't exist yet on the connected Iggy backend |
 | A5 | Produce v3 | `send --host 127.0.0.1:9093 --api-key 0 --version 3` | Decode + stub retriable error | `ec=6` (NOT_LEADER_OR_FOLLOWER) per partition |
 | A6 | Fetch v4 | `send --host 127.0.0.1:9093 --api-key 1 --version 4` | Decode + stub response | Top-level `ec=0`; per-partition `ec=6` (NOT_LEADER_OR_FOLLOWER) |
-| A7 | ListOffsets v1 | `send --host 127.0.0.1:9093 --api-key 2 --version 1` | Decode + stub offsets | Per-partition `ec=6` (NOT_LEADER_OR_FOLLOWER) - no top-level error field on this response |
-| A8 | CreateTopics v2 | `send --host 127.0.0.1:9093 --api-key 19 --version 2` | Decode + stub non-creation ack | `ec=41` (NOT_CONTROLLER) per topic |
+| A7 | ListOffsets v1 | `send --host 127.0.0.1:9093 --api-key 2 --version 1` | Real lookup via `IggyBridge` | Per-partition `ec=3` (UNKNOWN_TOPIC_OR_PARTITION) for a topic that doesn't exist yet - no top-level error field on this response |
+| A8 | CreateTopics v2 | `send --host 127.0.0.1:9093 --api-key 19 --version 2` | Real provisioning via `IggyBridge` | `ec=0` and the topic exists on the Iggy backend afterward; re-running the same request returns `ec=36` (TOPIC_ALREADY_EXISTS) |
 | A9 | Verify all scoped keys | `cargo run -p kafka-message-gen -- verify --host 127.0.0.1:9093 --api-key 0 --api-key 1 --api-key 2 --api-key 3 --api-key 18 --api-key 19` | Exit code 0 | No timeouts or I/O errors (`verify` already knows each stub's expected non-zero code - see `is_acceptable_verify_error` in `kafka-tool/src/response.rs`) |
 
 ### Category B — Version firewall (boundary validation)
@@ -131,9 +135,10 @@ that one connection) is still serving other clients.
 ### Category D — Flexible vs legacy wire encoding
 
 Run every `send` below with `--host 127.0.0.1:9093`. This category validates that the wire
-encoding round-trips at the legacy/flexible boundary - not the stub error code, which is
-per-API and constant across both rows (see Category A: `ec=6` for Produce, `ec=41` for
-CreateTopics, and so on).
+encoding round-trips at the legacy/flexible boundary, not any specific error code - Produce's
+stays a constant `ec=6` stub across both rows (see Category A), while Metadata/ListOffsets/
+CreateTopics now answer from the real Iggy backend, so their `ec` here depends on whatever state
+that backend is already in from earlier steps.
 
 | ID | API key | Version | Encoding | Validation |
 | ---- | --------- | --------- | ---------- | ------------ |
@@ -196,13 +201,15 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 
 | Code | Name | When returned |
 | ------ | ------ | --------------- |
-| 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub, per partition (retriable; payload not persisted) |
-| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic |
+| 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6). Also a genuine success from Metadata/ListOffsets/CreateTopics now that they call through to a real Iggy backend |
+| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata/ListOffsets, per topic/partition, for a topic that doesn't exist yet on the connected Iggy backend |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch stub, per partition (retriable; payload not persisted) |
 | 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception). Every other API key's out-of-range version closes the connection instead - see Category B |
+| 36 | TOPIC_ALREADY_EXISTS | CreateTopics: the topic already exists - including a spec-matching re-create, which is not treated as a silent success |
 | 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
 | 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
-| 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
+| 39 | INVALID_REPLICA_ASSIGNMENT | CreateTopics: an explicit `num_partitions` disagrees with a non-empty manual `assignments` list's own length |
+| 40 | INVALID_CONFIG | CreateTopics: the request carried one or more per-topic Kafka configs (none map onto an Iggy topic option this bridge applies) |
 | 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. **Not** Produce - a Produce decode failure always stays silent (`NoResponse`), never `ec=42` - see H1 |
 
 A malformed request header (before any API-specific body is even reached) has no parsed header to

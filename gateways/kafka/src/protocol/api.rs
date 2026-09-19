@@ -27,6 +27,7 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::{Decodable, StrBytes};
 
+use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{BridgeError, TopicCatalog};
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::bounds_guard::{
@@ -88,11 +89,11 @@ pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
-/// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
+/// `CreateTopics`: an explicit `num_partitions` disagrees with a non-empty `assignments` list's
+/// own length.
 ///
-/// Not sent once `#3538` wires real provisioning in - kept for the closed set of paths that can
-/// still fail before any bridge call is attempted (decode failure, unsupported version).
-pub const ERROR_NOT_CONTROLLER: i16 = 41;
+/// The wire carries no rule for which one wins, so neither is silently preferred over the other.
+pub const ERROR_INVALID_REPLICA_ASSIGNMENT: i16 = 39;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// `CreateTopics`: a requested topic carried one or more per-topic Kafka configs.
 ///
@@ -255,13 +256,37 @@ pub async fn handle_request_bounded(
 /// `kafka_protocol`'s `Decodable` stops once it has read the fields its schema defines; it does
 /// not know (or care) whether the caller handed it an exact-length body, so the trailing-bytes
 /// check has to live here.
+/// A wire trace captured against a real `kcat -L` (librdkafka 2.14.2) showed a `Metadata` v9
+/// request - null `topics` array, otherwise fully and correctly consumed by
+/// `MetadataRequest::decode` - followed by one extra `0x00` byte past the schema's own end.
+/// Tolerated as benign encoder padding up to this many trailing bytes, all of which must be
+/// zero (see [`decode_exhaustive`]'s check) - generous above the one byte actually observed,
+/// without being unbounded. Safe regardless of the bound chosen: `bounds_guard`'s
+/// allocation-size checks run against the wire-declared array/string lengths *before*
+/// `decode_exhaustive` is ever reached, so tolerating a few extra zero bytes here cannot change
+/// what gets allocated - it only widens what counts as "fully consumed" after decoding already
+/// succeeded.
+const MAX_TOLERATED_TRAILING_PADDING_BYTES: usize = 8;
+
 fn decode_exhaustive<T: Decodable>(version: i16, mut body: Bytes) -> Result<T> {
     let value =
         T::decode(&mut body, version).map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
     if body.has_remaining() {
-        return Err(KafkaProtocolError::Malformed(
-            "unexpected trailing bytes in request body".to_string(),
-        ));
+        let remaining = body.chunk();
+        if remaining.len() > MAX_TOLERATED_TRAILING_PADDING_BYTES
+            || remaining.iter().any(|&byte| byte != 0)
+        {
+            return Err(KafkaProtocolError::Malformed(
+                "unexpected trailing bytes in request body".to_string(),
+            ));
+        }
+        // debug!, not warn!: every other decode-failure log site in this module treats the
+        // request body as attacker-controlled input, not an operator-actionable event - this is
+        // the same call site, just a tolerated case of it rather than a rejected one.
+        tracing::debug!(
+            trailing_bytes = remaining.len(),
+            "tolerated trailing zero-byte padding after a fully-decoded request body"
+        );
     }
     Ok(value)
 }
@@ -454,13 +479,15 @@ async fn handle_metadata(
         }
     };
 
-    // Empty means "all topics" (decode_metadata_topics collapses the legacy null-array sentinel
-    // to this - see its own doc). Listing is one bridge call per stream this gateway's topic
-    // mapping can resolve to; looking up N specific topics is N bridge calls, one per name,
-    // since Metadata's per-topic error_code needs to distinguish "doesn't exist" from a real
-    // bridge failure for each name independently.
-    let resolved: Vec<(String, i16, Option<u32>)> = if requested.is_empty() {
-        match bridge.list_kafka_topics().await {
+    // `None` (null array) means "all topics"; `Some(&[])` (explicit empty array) means "no
+    // topics - brokers/cluster metadata only" (KIP-4's `describeCluster()` shape); `Some(names)`
+    // means "look up exactly these" - the three must stay distinguishable (see
+    // `decode_metadata_topics`'s own doc). Listing is one bridge call per stream this gateway's
+    // topic mapping can resolve to; looking up N specific topics is N bridge calls, one per
+    // name, since Metadata's per-topic error_code needs to distinguish "doesn't exist" from a
+    // real bridge failure for each name independently.
+    let resolved: Vec<(String, i16, Option<u32>)> = match requested {
+        None => match bridge.list_kafka_topics().await {
             Ok(topics) => topics
                 .into_iter()
                 .map(|topic| (topic.kafka_topic, ERROR_NONE, Some(topic.partitions_count)))
@@ -473,27 +500,29 @@ async fn handle_metadata(
                 tracing::warn!(%error, "failed to list Kafka topics from Iggy bridge; closing connection");
                 return HandleOutcome::Close;
             }
-        }
-    } else {
-        let mut out = Vec::with_capacity(requested.len());
-        for name in &requested {
-            let kafka_topic = name.as_str();
-            match bridge.get_kafka_topic(kafka_topic).await {
-                Ok(Some(topic)) => {
-                    out.push((topic.kafka_topic, ERROR_NONE, Some(topic.partitions_count)));
-                }
-                Ok(None) => out.push((
-                    kafka_topic.to_string(),
-                    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-                    None,
-                )),
-                Err(error) => {
-                    tracing::warn!(%error, kafka_topic, "failed to look up Kafka topic from Iggy bridge");
-                    out.push((kafka_topic.to_string(), error.to_kafka_error_code(), None));
+        },
+        Some(names) if names.is_empty() => Vec::new(),
+        Some(names) => {
+            let mut out = Vec::with_capacity(names.len());
+            for name in &names {
+                let kafka_topic = name.as_str();
+                match bridge.get_kafka_topic(kafka_topic).await {
+                    Ok(Some(topic)) => {
+                        out.push((topic.kafka_topic, ERROR_NONE, Some(topic.partitions_count)));
+                    }
+                    Ok(None) => out.push((
+                        kafka_topic.to_string(),
+                        ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                        None,
+                    )),
+                    Err(error) => {
+                        tracing::warn!(%error, kafka_topic, "failed to look up Kafka topic from Iggy bridge");
+                        out.push((kafka_topic.to_string(), error.to_kafka_error_code(), None));
+                    }
                 }
             }
+            out
         }
-        out
     };
 
     respond_or_close(
@@ -581,6 +610,13 @@ async fn create_one_topic(
     if !topic.configs.is_empty() {
         return Err(ERROR_INVALID_CONFIG);
     }
+    // Checked here, not left to `ensure_stream_and_topic`'s own call: that call is skipped
+    // entirely below for `validate_only`, and name validation is part of "can this topic be
+    // created as specified," the exact thing `validate_only` promises to check - skipping it
+    // would report success for a name (empty, padded, over Kafka's 249-byte cap) that the real
+    // call always rejects.
+    validate_kafka_topic_name("kafka_topic", topic.name.0.as_str())
+        .map_err(|error| error.to_kafka_error_code())?;
     let partition_count = validate_create_topic_shape(topic, api_version)?;
 
     if validate_only {
@@ -592,8 +628,23 @@ async fn create_one_topic(
         return Ok(partition_count);
     }
 
+    let kafka_topic = topic.name.0.as_str();
+    // `ensure_stream_and_topic`'s own contract is intentionally idempotent (get-or-create,
+    // matching-spec re-call is Ok) - correct for an internal "make sure this exists" helper, but
+    // `CreateTopics` is not an upsert: the real `AdminClient.createTopics` contract is
+    // `TOPIC_ALREADY_EXISTS` (36) for a topic that's already there even when the requested spec
+    // matches exactly. Checked up front with the same read-only lookup `handle_metadata` uses,
+    // so the common "genuinely new topic" path still goes straight through
+    // `ensure_stream_and_topic`'s own create-race handling unchanged; only "it's already there"
+    // short-circuits before ever calling it.
+    match bridge.get_kafka_topic(kafka_topic).await {
+        Ok(Some(_existing)) => return Err(ERROR_TOPIC_ALREADY_EXISTS),
+        Ok(None) => {}
+        Err(error) => return Err(error.to_kafka_error_code()),
+    }
+
     bridge
-        .ensure_stream_and_topic(topic.name.0.as_str(), partition_count)
+        .ensure_stream_and_topic(kafka_topic, partition_count)
         .await
         .map(|()| partition_count)
         .map_err(|error| error.to_kafka_error_code())
@@ -822,27 +873,37 @@ fn encode_metadata_response(
 
 /// Decodes a Metadata request body so the response can echo topic names.
 ///
-/// A null topics array (`-1` legacy / `varint=0` compact) means "all topics" and decodes to an
-/// empty list for this stub. A null per-topic `name` (v10+ allows topic-id-only lookups) has no
-/// name to echo, so it errors rather than silently dropping the topic from the response.
+/// A null topics array (`-1` legacy / `varint=0` compact) means "all topics": `Ok(None)`. A
+/// non-null array - including an explicitly *empty* one, which real Kafka clients (e.g.
+/// `AdminClient.describeCluster()`, KIP-4) send specifically to ask for broker/cluster metadata
+/// with no topic listing at all - decodes to `Ok(Some(names))`, `names` empty or not. The two
+/// must stay distinguishable: collapsing both to "treat as all topics" (as an earlier version of
+/// this function did) answers a `describeCluster()`-style request with the entire topic catalog
+/// instead of the empty list it asked for.
+///
+/// A null per-topic `name` (v10+ allows topic-id-only lookups) has no name to echo, so it errors
+/// rather than silently dropping the topic from the response.
 fn decode_metadata_topics(
     api_version: i16,
     body: Bytes,
     max_frame_size: usize,
-) -> Result<Vec<StrBytes>> {
+) -> Result<Option<Vec<StrBytes>>> {
     let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
         validate_metadata_shape(v, b, max_frame_size)
     })?;
     req.topics
-        .unwrap_or_default()
-        .into_iter()
-        .map(|topic| {
-            topic
-                .name
-                .map(|name| name.0)
-                .ok_or(KafkaProtocolError::NullTopicName)
+        .map(|topics| {
+            topics
+                .into_iter()
+                .map(|topic| {
+                    topic
+                        .name
+                        .map(|name| name.0)
+                        .ok_or(KafkaProtocolError::NullTopicName)
+                })
+                .collect()
         })
-        .collect()
+        .transpose()
 }
 
 #[cfg(test)]
@@ -850,6 +911,61 @@ mod tests {
     use super::*;
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
+    /// Every `ERROR_*` constant defined in this module, checked against `kafka-protocol`'s own
+    /// `ResponseError` table - mirrors `bridge::error`'s identical self-check, which covers only
+    /// the constants `IggyError` mappings emit. These are the rest: hand-typed integer literals
+    /// used directly by `protocol::api`/`protocol::responses`, verified against nothing
+    /// automated before this test (the earlier state of affairs Krishna's #4043 review already
+    /// flagged once for the `bridge::error` half - "I checked all twelve constants... nothing in
+    /// the crate holds them there" - restated here for the half that check didn't cover).
+    #[test]
+    fn every_protocol_error_code_matches_kafka_protocols_own_table() {
+        use kafka_protocol::error::ResponseError;
+
+        for (ours, theirs) in [
+            (
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                ResponseError::UnknownTopicOrPartition,
+            ),
+            (
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+                ResponseError::NotLeaderOrFollower,
+            ),
+            (ERROR_REQUEST_TIMED_OUT, ResponseError::RequestTimedOut),
+            (
+                ERROR_INVALID_TOPIC_EXCEPTION,
+                ResponseError::InvalidTopicException,
+            ),
+            (
+                ERROR_TOPIC_AUTHORIZATION_FAILED,
+                ResponseError::TopicAuthorizationFailed,
+            ),
+            (ERROR_UNSUPPORTED_VERSION, ResponseError::UnsupportedVersion),
+            (
+                ERROR_TOPIC_ALREADY_EXISTS,
+                ResponseError::TopicAlreadyExists,
+            ),
+            (ERROR_INVALID_PARTITIONS, ResponseError::InvalidPartitions),
+            (
+                ERROR_INVALID_REPLICATION_FACTOR,
+                ResponseError::InvalidReplicationFactor,
+            ),
+            (
+                ERROR_INVALID_REPLICA_ASSIGNMENT,
+                ResponseError::InvalidReplicaAssignment,
+            ),
+            (ERROR_INVALID_CONFIG, ResponseError::InvalidConfig),
+            (ERROR_INVALID_REQUEST, ResponseError::InvalidRequest),
+        ] {
+            assert_eq!(
+                ours,
+                theirs.code(),
+                "{theirs:?} is {} in kafka-protocol, not {ours}",
+                theirs.code()
+            );
+        }
+    }
 
     #[test]
     fn decode_metadata_topics_legacy_null_topic_name_fails() {
@@ -864,10 +980,72 @@ mod tests {
     #[test]
     fn decode_metadata_topics_legacy_null_array_means_all_topics() {
         // -1 is the spec-defined "all topics" sentinel for the legacy i32 array count, not a
-        // malformed request - must decode to an empty list.
+        // malformed request - must decode to None, distinct from an explicit empty array.
         let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
         let topics = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert!(topics.is_empty());
+        assert_eq!(topics, None);
+    }
+
+    #[test]
+    fn decode_metadata_topics_legacy_empty_array_means_no_topics_not_all_topics() {
+        // 0, not -1: an explicit zero-length array - real Kafka clients (describeCluster())
+        // send this to mean "brokers only, no topic listing," distinct from the null sentinel.
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00]); // 0 topics
+        let topics = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(topics, Some(Vec::new()));
+    }
+
+    #[test]
+    fn decode_metadata_topics_flexible_empty_array_means_no_topics_not_all_topics() {
+        // Compact array: varint 1 = zero elements (not null, which would be varint 0).
+        let body = Bytes::from_static(&[
+            0x01, // topics: empty compact array, not null
+            0x00, // allow_auto_topic_creation
+            0x00, // include_cluster_authorized_operations
+            0x00, // include_topic_authorized_operations
+            0x00, // tagged fields
+        ]);
+        let topics = decode_metadata_topics(9, body, TEST_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(topics, Some(Vec::new()));
+    }
+
+    #[test]
+    fn decode_metadata_topics_tolerates_librdkafkas_trailing_padding_byte() {
+        // Captured verbatim from a real `kcat -L` (librdkafka 2.14.2) against this gateway: a
+        // Metadata v9 request with topics=null, all three v8/v9 flags false, one empty tagged
+        // field (id=0, len=0), then one extra 0x00 byte past what the schema consumes. Without
+        // MAX_TOLERATED_TRAILING_PADDING_BYTES this rejects with "unexpected trailing bytes" and
+        // the gateway closes the connection - reproduced against this exact payload before the
+        // fix.
+        let body = Bytes::from_static(&[
+            0x00, // topics: null (all topics)
+            0x00, // allow_auto_topic_creation
+            0x00, // include_cluster_authorized_operations
+            0x00, // include_topic_authorized_operations
+            0x01, // tagged field count = 1
+            0x00, // tag id = 0
+            0x00, // tag data length = 0
+            0x00, // trailing padding byte past the schema's end
+        ]);
+        let topics = decode_metadata_topics(9, body, TEST_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(topics, None, "topics=null must still mean all topics");
+    }
+
+    #[test]
+    fn decode_metadata_topics_rejects_trailing_bytes_beyond_the_tolerated_padding() {
+        let mut bytes = vec![0x00, 0x00, 0x00, 0x00, 0x00]; // valid v9 body, no tagged fields
+        bytes.extend(std::iter::repeat_n(
+            0u8,
+            MAX_TOLERATED_TRAILING_PADDING_BYTES + 1,
+        ));
+        let body = Bytes::from(bytes);
+        assert!(decode_metadata_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn decode_metadata_topics_rejects_nonzero_trailing_bytes() {
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]); // valid + 1 nonzero
+        assert!(decode_metadata_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]

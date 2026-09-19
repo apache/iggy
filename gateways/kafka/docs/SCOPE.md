@@ -2,7 +2,7 @@
 
 ## Issue #3421 — in scope (this iteration)
 
-Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. **No Iggy backend integration.**
+Foundation layer: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and validates request wire formats. **Produce and Fetch remain stub responses with no Iggy backend integration** - Metadata, CreateTopics and ListOffsets have since been wired to a real Iggy backend (below), so "no backend integration" no longer describes this gateway as a whole.
 
 **Stub semantics (important):** Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6); Fetch is likewise still a stub. Both land with [#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536).
 
