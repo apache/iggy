@@ -31,6 +31,7 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
+      - ./scenarios/stream_topic_purge.feature:/app/features/stream_topic_purge.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
     command:
@@ -41,6 +42,7 @@ services:
           basic_messaging)    cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test basic_messaging ;;
           leader_redirection) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection ;;
           raw_command)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test raw_command ;;
+          stream_topic_purge) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_topic_purge ;;
           stream_crud)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_crud ;;
           *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
         esac
