@@ -353,11 +353,6 @@ pub(crate) async fn consume_messages(
         let messages = std::mem::take(&mut batch);
         let messages_count = messages.len();
         metrics.inc_messages_consumed_with_labels(&labels.counter, messages_count as u64);
-        let messages_metadata = MessagesMetadata {
-            partition_id,
-            current_offset,
-            schema: decoder.schema(),
-        };
         if verbose {
             info!(
                 "Processing {messages_count} messages for sink connector with ID: {}",
@@ -372,7 +367,8 @@ pub(crate) async fn consume_messages(
         let start = Instant::now();
         let result = process_messages(
             plugin_id,
-            messages_metadata,
+            partition_id,
+            current_offset,
             &topic_metadata,
             messages,
             &consume,
@@ -549,7 +545,8 @@ pub(crate) async fn setup_sink_consumers(
 #[allow(clippy::too_many_arguments)]
 async fn process_messages(
     plugin_id: u32,
-    messages_metadata: MessagesMetadata,
+    partition_id: u32,
+    current_offset: u64,
     topic_metadata: &TopicMetadata,
     messages: Vec<IggyMessage>,
     consume: &ConsumeCallback,
@@ -599,8 +596,17 @@ async fn process_messages(
     }
     let decode_elapsed = decode_start.elapsed();
 
-    let mut messages = Vec::with_capacity(decoded.len());
+    // One `Schema` tag covers a whole FFI call, so messages are grouped into
+    // contiguous runs of the same payload variant and each run is sent on its
+    // own. No decoder mixes variants within one configured instance, but a
+    // transform can: `ProtoConvert` returns `Payload::Raw` when it can encode a
+    // message against its descriptor and `Payload::Proto` when it cannot, which
+    // turns on the message rather than the config. A uniform batch stays one run
+    // and one call.
+    let mut runs: Vec<(Schema, Vec<RawMessage>)> = Vec::with_capacity(1);
+    let mut remaining = decoded.len();
     for message in decoded {
+        remaining -= 1;
         let mut current_message = Some(message);
         let mut transform_failed = false;
         for transform in transforms.iter() {
@@ -674,6 +680,10 @@ async fn process_messages(
             continue;
         };
 
+        // Read the tag off the payload before `try_into_vec` consumes it. The
+        // decoder's own schema names the format it reads, not the variant it
+        // returned, and a transform may have changed the variant since.
+        let schema = message.payload.schema();
         let Ok(payload) = message.payload.try_into_vec() else {
             error!(
                 "Failed to get message payload for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
@@ -696,7 +706,7 @@ async fn process_messages(
             None => vec![],
         };
 
-        messages.push(RawMessage {
+        let raw_message = RawMessage {
             id,
             offset,
             checksum,
@@ -704,7 +714,23 @@ async fn process_messages(
             origin_timestamp,
             headers,
             payload,
-        });
+        };
+        match runs.last_mut() {
+            Some((run_schema, run)) if *run_schema == schema => run.push(raw_message),
+            _ => {
+                // Only the first run is sized to the batch. Reserving what is
+                // left for every run would cost O(n^2) slots on a batch that
+                // alternates variants, and any run after the first is rare
+                // enough to be worth growing on demand.
+                let mut run = if runs.is_empty() {
+                    Vec::with_capacity(remaining + 1)
+                } else {
+                    Vec::new()
+                };
+                run.push(raw_message);
+                runs.push((schema, run));
+            }
+        }
     }
 
     metrics.inc_errors_by_with_labels(&labels.counter, error_count);
@@ -712,7 +738,17 @@ async fn process_messages(
         metrics.inc_messages_filtered_with_labels(&labels.counter, filtered_count);
     }
 
-    let processed_count = messages.len();
+    // A batch that lost every message still reaches the sink, as it always has.
+    // There is no payload to read a tag from, so it carries the stream's
+    // configured schema. That is the decoder's wire format rather than a payload
+    // variant, which is safe only because the run is empty: a tag is read back
+    // once per message, so an empty run never has it interpreted. Anything that
+    // starts branching on the tag for whole-batch behaviour has to revisit this.
+    if runs.is_empty() {
+        runs.push((decoder.schema(), Vec::new()));
+    }
+
+    let mut processed_count: usize = runs.iter().map(|(_, run)| run.len()).sum();
 
     let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
         error!(
@@ -721,43 +757,50 @@ async fn process_messages(
         RuntimeError::FailedToSerializeTopicMetadata
     })?;
 
-    let messages_meta = postcard::to_allocvec(&messages_metadata).map_err(|error| {
-        error!(
-            "Failed to serialize messages metadata for sink connector with ID: {plugin_id}. {error}"
-        );
-        RuntimeError::FailedToSerializeMessagesMetadata
-    })?;
+    let mut ffi_elapsed = Duration::ZERO;
+    for (schema, run) in runs {
+        let messages_metadata = MessagesMetadata {
+            partition_id,
+            current_offset,
+            schema,
+        };
+        let messages_meta = postcard::to_allocvec(&messages_metadata).map_err(|error| {
+            error!(
+                "Failed to serialize messages metadata for sink connector with ID: {plugin_id}. {error}"
+            );
+            RuntimeError::FailedToSerializeMessagesMetadata
+        })?;
 
-    let messages = postcard::to_allocvec(&RawMessages {
-        schema: decoder.schema(),
-        messages,
-    })
-    .map_err(|error| {
-        error!("Failed to serialize messages for sink connector with ID: {plugin_id}. {error}");
-        RuntimeError::FailedToSerializeRawMessages
-    })?;
+        let run_len = run.len();
+        let messages = postcard::to_allocvec(&RawMessages {
+            schema,
+            messages: run,
+        })
+        .map_err(|error| {
+            error!("Failed to serialize messages for sink connector with ID: {plugin_id}. {error}");
+            RuntimeError::FailedToSerializeRawMessages
+        })?;
 
-    let ffi_start = Instant::now();
-    let result = (consume)(
-        plugin_id,
-        topic_meta.as_ptr(),
-        topic_meta.len(),
-        messages_meta.as_ptr(),
-        messages_meta.len(),
-        messages.as_ptr(),
-        messages.len(),
-    );
-    let ffi_elapsed = ffi_start.elapsed();
-    let processed_count = if result == 0 {
-        processed_count
-    } else {
-        error!(
-            "Failed to consume {processed_count} messages for sink connector with ID: {plugin_id}, stream: {}, topic: {}, status: {result}",
-            topic_metadata.stream, topic_metadata.topic
+        let ffi_start = Instant::now();
+        let result = (consume)(
+            plugin_id,
+            topic_meta.as_ptr(),
+            topic_meta.len(),
+            messages_meta.as_ptr(),
+            messages_meta.len(),
+            messages.as_ptr(),
+            messages.len(),
         );
-        metrics.inc_errors_with_labels(&labels.counter);
-        0
-    };
+        ffi_elapsed += ffi_start.elapsed();
+        if result != 0 {
+            error!(
+                "Failed to consume {run_len} messages for sink connector with ID: {plugin_id}, stream: {}, topic: {}, schema: {schema}, status: {result}",
+                topic_metadata.stream, topic_metadata.topic
+            );
+            metrics.inc_errors_with_labels(&labels.counter);
+            processed_count -= run_len;
+        }
+    }
 
     Ok(SinkBatchTiming {
         processed_count,
@@ -770,4 +813,317 @@ struct SinkBatchTiming {
     processed_count: usize,
     decode_elapsed: Duration,
     ffi_elapsed: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dashmap::DashMap;
+    use iggy::prelude::IggyMessageHeader;
+    use iggy_connector_sdk::transforms::TransformType;
+    use iggy_connector_sdk::transforms::{ProtoConvert, ProtoConvertConfig};
+    use iggy_connector_sdk::{Error, Payload};
+    use prost::Message as _;
+    use std::sync::LazyLock;
+    use std::sync::atomic::AtomicU32;
+
+    /// One entry per FFI call the stub sink received, keyed by plugin id so
+    /// tests sharing the binary do not read each other's batches.
+    static CONSUMED: LazyLock<DashMap<u32, Vec<ConsumedBatch>>> = LazyLock::new(DashMap::new);
+
+    static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
+
+    struct ConsumedBatch {
+        metadata_schema: Schema,
+        messages_schema: Schema,
+        payloads: Vec<Vec<u8>>,
+        offsets: Vec<u64>,
+    }
+
+    extern "C" fn capturing_consume(
+        plugin_id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        messages_meta_ptr: *const u8,
+        messages_meta_len: usize,
+        messages_ptr: *const u8,
+        messages_len: usize,
+    ) -> i32 {
+        let messages_meta =
+            unsafe { std::slice::from_raw_parts(messages_meta_ptr, messages_meta_len) };
+        let messages = unsafe { std::slice::from_raw_parts(messages_ptr, messages_len) };
+        let metadata = postcard::from_bytes::<MessagesMetadata>(messages_meta)
+            .expect("failed to deserialize messages metadata");
+        let raw = postcard::from_bytes::<RawMessages>(messages).expect("failed to deserialize");
+
+        CONSUMED.entry(plugin_id).or_default().push(ConsumedBatch {
+            metadata_schema: metadata.schema,
+            messages_schema: raw.schema,
+            offsets: raw.messages.iter().map(|message| message.offset).collect(),
+            payloads: raw
+                .messages
+                .into_iter()
+                .map(|message| message.payload)
+                .collect(),
+        });
+        0
+    }
+
+    /// Rewrites every payload to the configured variant, standing in for a
+    /// third-party transform that changes the payload type.
+    struct RetaggingTransform {
+        payloads: Vec<Payload>,
+        next: std::sync::Mutex<usize>,
+    }
+
+    impl Transform for RetaggingTransform {
+        fn r#type(&self) -> TransformType {
+            TransformType::AvroConvert
+        }
+
+        fn transform(
+            &self,
+            _metadata: &TopicMetadata,
+            mut message: DecodedMessage,
+        ) -> Result<Option<DecodedMessage>, Error> {
+            let mut next = self.next.lock().expect("transform counter was poisoned");
+            message.payload = self.payloads[*next % self.payloads.len()].clone();
+            *next += 1;
+            Ok(Some(message))
+        }
+    }
+
+    fn next_plugin_id() -> u32 {
+        TEST_PLUGIN_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn test_message(offset: u64, payload: Vec<u8>) -> IggyMessage {
+        IggyMessage {
+            header: IggyMessageHeader {
+                checksum: 0,
+                id: u128::from(offset) + 1,
+                offset,
+                timestamp: 0,
+                origin_timestamp: 0,
+                user_headers_length: 0,
+                payload_length: payload.len() as u32,
+                reserved: 0,
+            },
+            payload: payload.into(),
+            user_headers: None,
+        }
+    }
+
+    fn avro_schema() -> apache_avro::Schema {
+        apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"Event","fields":[{"name":"id","type":"long"}]}"#,
+        )
+        .expect("failed to parse Avro schema")
+    }
+
+    fn avro_datum(schema: &apache_avro::Schema, id: i64) -> Vec<u8> {
+        let record = apache_avro::types::Value::Record(vec![(
+            "id".to_owned(),
+            apache_avro::types::Value::Long(id),
+        )]);
+        apache_avro::writer::datum::GenericDatumWriter::builder(schema)
+            .build()
+            .expect("failed to build Avro writer")
+            .write_value_to_vec(record)
+            .expect("failed to encode Avro datum")
+    }
+
+    async fn run(
+        plugin_id: u32,
+        decoder: Arc<dyn StreamDecoder>,
+        transforms: Vec<Arc<dyn Transform>>,
+        messages: Vec<IggyMessage>,
+    ) -> SinkBatchTiming {
+        let metrics = Arc::new(Metrics::init());
+        let labels = SinkLabels::new("test_sink");
+        let topic_metadata = TopicMetadata {
+            stream: "test_stream".to_owned(),
+            topic: "test_topic".to_owned(),
+        };
+
+        process_messages(
+            plugin_id,
+            0,
+            messages.last().map_or(0, |message| message.header.offset),
+            &topic_metadata,
+            messages,
+            &(capturing_consume as ConsumeCallback),
+            &transforms,
+            &decoder,
+            &metrics,
+            &labels,
+        )
+        .await
+        .expect("processing the batch should succeed")
+    }
+
+    fn captured(plugin_id: u32) -> Vec<ConsumedBatch> {
+        CONSUMED
+            .remove(&plugin_id)
+            .map(|(_, batches)| batches)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn given_an_avro_stream_when_batch_is_tagged_should_use_the_decoded_payload_schema() {
+        let plugin_id = next_plugin_id();
+        let schema = avro_schema();
+        let decoder = Arc::new(
+            AvroStreamDecoder::try_new(AvroConfig {
+                schema_json: Some(schema.canonical_form()),
+                ..AvroConfig::default()
+            })
+            .expect("failed to build the Avro decoder"),
+        );
+        let messages = vec![
+            test_message(0, avro_datum(&schema, 1)),
+            test_message(1, avro_datum(&schema, 2)),
+        ];
+
+        let timing = run(plugin_id, decoder, Vec::new(), messages).await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(timing.processed_count, 2);
+        assert_eq!(batches.len(), 1, "a uniform batch is one FFI call");
+        // The decoder reads Avro but returns JSON, so JSON is what the sink is
+        // told it has.
+        assert_eq!(batches[0].metadata_schema, Schema::Json);
+        assert_eq!(batches[0].messages_schema, Schema::Json);
+        for payload in &batches[0].payloads {
+            serde_json::from_slice::<serde_json::Value>(payload).expect("payload should be JSON");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_transform_changing_the_variant_when_batch_is_tagged_should_follow_the_transform()
+     {
+        let plugin_id = next_plugin_id();
+        let transform = Arc::new(RetaggingTransform {
+            payloads: vec![Payload::Avro(vec![1, 2, 3])],
+            next: std::sync::Mutex::new(0),
+        });
+        let messages = vec![test_message(0, br#"{"id":1}"#.to_vec())];
+
+        run(plugin_id, Schema::Json.decoder(), vec![transform], messages).await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].metadata_schema, Schema::Avro);
+        assert_eq!(batches[0].messages_schema, Schema::Avro);
+    }
+
+    #[tokio::test]
+    async fn given_mixed_payload_variants_when_batch_is_processed_should_split_into_runs() {
+        let plugin_id = next_plugin_id();
+        let transform = Arc::new(RetaggingTransform {
+            payloads: vec![
+                Payload::Text("first".to_owned()),
+                Payload::Text("second".to_owned()),
+                Payload::Raw(vec![9]),
+                Payload::Text("fourth".to_owned()),
+            ],
+            next: std::sync::Mutex::new(0),
+        });
+        let messages = (0..4)
+            .map(|offset| test_message(offset, br#"{"id":1}"#.to_vec()))
+            .collect();
+
+        let timing = run(plugin_id, Schema::Json.decoder(), vec![transform], messages).await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(timing.processed_count, 4, "no message may be lost");
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].metadata_schema, Schema::Text);
+        assert_eq!(batches[0].offsets, vec![0, 1]);
+        assert_eq!(batches[1].metadata_schema, Schema::Raw);
+        assert_eq!(batches[1].offsets, vec![2]);
+        assert_eq!(batches[2].metadata_schema, Schema::Text);
+        assert_eq!(batches[2].offsets, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn given_no_surviving_messages_when_batch_is_processed_should_still_call_the_sink_once() {
+        let plugin_id = next_plugin_id();
+        // An Avro decoder, so the fallback tag cannot be confused with
+        // `Schema::default()`.
+        let decoder = Arc::new(
+            AvroStreamDecoder::try_new(AvroConfig {
+                schema_json: Some(avro_schema().canonical_form()),
+                ..AvroConfig::default()
+            })
+            .expect("failed to build the Avro decoder"),
+        );
+        let messages = vec![test_message(0, b"not an avro datum".to_vec())];
+
+        let timing = run(plugin_id, decoder, Vec::new(), messages).await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(timing.processed_count, 0);
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].offsets.is_empty());
+        // Nothing survived to read a tag from, so the stream's configured
+        // schema stands in.
+        assert_eq!(batches[0].metadata_schema, Schema::Avro);
+    }
+
+    #[tokio::test]
+    async fn given_a_proto_convert_transform_when_a_batch_mixes_variants_should_split_into_runs() {
+        // `ProtoConvert` encodes a top-level object against its descriptor and
+        // falls back to proto text for anything else, so one configured
+        // instance returns `Raw` for one message and `Proto` for the next.
+        let plugin_id = next_plugin_id();
+        let descriptor = protox_parse::parse(
+            "record.proto",
+            r#"syntax = "proto3";
+            message StringRecord {
+                string first = 1;
+            }"#,
+        )
+        .expect("test schema must parse");
+        let transform = Arc::new(ProtoConvert::new(ProtoConvertConfig {
+            source_format: Schema::Json,
+            target_format: Schema::Proto,
+            message_type: Some("StringRecord".to_owned()),
+            descriptor_set: Some(
+                prost_types::FileDescriptorSet {
+                    file: vec![descriptor],
+                }
+                .encode_to_vec(),
+            ),
+            ..ProtoConvertConfig::default()
+        }));
+        let messages = vec![
+            test_message(0, br#"{"first":"encoded"}"#.to_vec()),
+            test_message(1, br#"[1,2,3]"#.to_vec()),
+            test_message(2, br#"{"first":"encoded"}"#.to_vec()),
+        ];
+
+        let timing = run(plugin_id, Schema::Json.decoder(), vec![transform], messages).await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(timing.processed_count, 3, "no message may be lost");
+        assert_eq!(
+            batches.len(),
+            3,
+            "each variant change starts a new FFI call"
+        );
+        assert_eq!(batches[0].metadata_schema, Schema::Raw);
+        assert_eq!(batches[0].offsets, vec![0]);
+        assert_eq!(batches[1].metadata_schema, Schema::Proto);
+        assert_eq!(batches[1].offsets, vec![1]);
+        assert_eq!(batches[2].metadata_schema, Schema::Raw);
+        assert_eq!(batches[2].offsets, vec![2]);
+
+        // The tag has to survive the trip back, or the sink sees a variant the
+        // transform never produced.
+        let rebuilt =
+            Payload::try_from_schema(batches[1].messages_schema, batches[1].payloads[0].clone())
+                .expect("the proto run must rebuild");
+        assert_eq!(rebuilt.schema(), Schema::Proto);
+    }
 }

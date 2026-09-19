@@ -381,7 +381,9 @@ impl Sink for ElasticsearchSink {
                         }
                     }
                 }
-                Payload::Text(text) => simd_json::json!({
+                // `Payload::Proto` holds proto text, so it indexes the
+                // same way `Payload::Text` does.
+                Payload::Text(text) | Payload::Proto(text) => simd_json::json!({
                     "text": text,
                     "data_type": "text"
                 }),

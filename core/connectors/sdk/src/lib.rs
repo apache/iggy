@@ -157,6 +157,50 @@ pub enum Payload {
 }
 
 impl Payload {
+    /// The `Schema` describing this payload's variant.
+    ///
+    /// Not the same thing as `StreamDecoder::schema`, which names the wire
+    /// format a decoder reads rather than the variant it hands back: the Avro
+    /// and FlatBuffer decoders return `Payload::Json` whenever `extract_as_json`
+    /// is set, and the Proto decoder returns `Payload::Json` or `Payload::Raw`
+    /// depending on the path it takes. A transform may change the variant again
+    /// after that. Anything tagging a payload for transport has to read the tag
+    /// off the payload it actually holds.
+    pub const fn schema(&self) -> Schema {
+        match self {
+            Payload::Json(_) => Schema::Json,
+            Payload::Raw(_) => Schema::Raw,
+            Payload::Text(_) => Schema::Text,
+            Payload::Proto(_) => Schema::Proto,
+            Payload::FlatBuffer(_) => Schema::FlatBuffer,
+            Payload::Avro(_) => Schema::Avro,
+        }
+    }
+
+    /// Rebuilds a payload from a tag produced by `Payload::schema`.
+    ///
+    /// The variant-preserving inverse of `Payload::schema`, and not the same
+    /// thing as `Schema::try_into_payload`, which reads a tag naming the wire
+    /// format a source plugin sent. The two disagree on `Schema::Proto`: it
+    /// means protobuf wire bytes to a source and a `Payload::Proto` string
+    /// here, so the sink path needs its own inverse to get its variant back.
+    pub fn try_from_schema(schema: Schema, mut value: Vec<u8>) -> Result<Self, Error> {
+        match schema {
+            Schema::Json => Ok(Payload::Json(
+                simd_json::to_owned_value(&mut value).map_err(|_| Error::InvalidJsonPayload)?,
+            )),
+            Schema::Raw => Ok(Payload::Raw(value)),
+            Schema::Text => Ok(Payload::Text(
+                String::from_utf8(value).map_err(|_| Error::InvalidTextPayload)?,
+            )),
+            Schema::Proto => Ok(Payload::Proto(
+                String::from_utf8(value).map_err(|_| Error::InvalidProtobufPayload)?,
+            )),
+            Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
+            Schema::Avro => Ok(Payload::Avro(value)),
+        }
+    }
+
     /// Consuming conversion — transfers ownership of inner buffers.
     pub fn try_into_vec(self) -> Result<Vec<u8>, Error> {
         match self {
@@ -240,6 +284,13 @@ pub enum Schema {
 }
 
 impl Schema {
+    /// Rebuilds a payload from a tag naming the wire format its bytes are in.
+    ///
+    /// Carries the source path, where a plugin sets `ProducedMessages::schema`
+    /// to describe the bytes it produced. `Schema::Proto` therefore means
+    /// protobuf wire bytes and is read as a `prost_types::Any`. Use
+    /// `Payload::try_from_schema` to invert a tag that came from
+    /// `Payload::schema` instead.
     pub fn try_into_payload(self, mut value: Vec<u8>) -> Result<Payload, Error> {
         match self {
             Schema::Json => Ok(Payload::Json(
@@ -470,4 +521,104 @@ pub enum Error {
     /// retried.
     #[error("State provider latched after a permanent state error")]
     StateLatched,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_payloads() -> Vec<(Payload, Schema)> {
+        vec![
+            (Payload::Json(simd_json::json!({"id": 1})), Schema::Json),
+            (Payload::Json(simd_json::json!([1, 2, 3])), Schema::Json),
+            (Payload::Json(simd_json::json!("scalar")), Schema::Json),
+            (Payload::Json(simd_json::json!(null)), Schema::Json),
+            (Payload::Raw(vec![1, 2, 3]), Schema::Raw),
+            (Payload::Raw(Vec::new()), Schema::Raw),
+            (Payload::Text("hello".to_owned()), Schema::Text),
+            (Payload::Text(String::new()), Schema::Text),
+            (Payload::Proto("proto text".to_owned()), Schema::Proto),
+            (Payload::Proto(String::new()), Schema::Proto),
+            (Payload::FlatBuffer(vec![4, 5, 6]), Schema::FlatBuffer),
+            (Payload::FlatBuffer(Vec::new()), Schema::FlatBuffer),
+            (Payload::Avro(vec![7, 8, 9]), Schema::Avro),
+            (Payload::Avro(Vec::new()), Schema::Avro),
+        ]
+    }
+
+    #[test]
+    fn given_every_payload_variant_when_schema_is_read_should_name_that_variant() {
+        for (payload, expected) in all_payloads() {
+            assert_eq!(
+                payload.schema(),
+                expected,
+                "wrong schema for {payload}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_payload_when_round_tripped_through_its_own_schema_should_keep_the_variant() {
+        for (payload, schema) in all_payloads() {
+            let bytes = payload
+                .try_into_vec()
+                .unwrap_or_else(|error| panic!("failed to serialize {schema} payload: {error}"));
+            let rebuilt = Payload::try_from_schema(schema, bytes)
+                .unwrap_or_else(|error| panic!("failed to rebuild {schema} payload: {error}"));
+
+            assert_eq!(
+                rebuilt.schema(),
+                schema,
+                "round trip through {schema} produced {rebuilt}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_proto_text_when_rebuilt_from_a_variant_tag_should_return_the_proto_payload() {
+        let payload = Payload::Proto(r#"{"id":1}"#.to_owned());
+        let bytes = payload.try_into_vec().expect("failed to serialize");
+        let rebuilt = Payload::try_from_schema(Schema::Proto, bytes).expect("failed to rebuild");
+
+        let Payload::Proto(text) = rebuilt else {
+            panic!("expected a proto payload, got {rebuilt}");
+        };
+        assert_eq!(text, r#"{"id":1}"#);
+    }
+
+    #[test]
+    fn given_non_utf8_bytes_when_rebuilt_as_proto_from_a_variant_tag_should_fail() {
+        let error = Payload::try_from_schema(Schema::Proto, vec![0xff, 0xfe])
+            .expect_err("non UTF-8 bytes cannot be a proto text payload");
+
+        assert_eq!(error, Error::InvalidProtobufPayload);
+    }
+
+    #[test]
+    fn given_protobuf_wire_bytes_when_rebuilt_from_a_wire_tag_should_stay_an_any_document() {
+        // The source path keeps its own inverse: a plugin tagging
+        // `Schema::Proto` really does send protobuf, so those bytes are read as
+        // a `prost_types::Any` rather than as text.
+        let any = prost_types::Any {
+            type_url: "type.googleapis.com/test.Event".to_owned(),
+            value: vec![1, 2, 3],
+        };
+        let rebuilt = Schema::Proto
+            .try_into_payload(any.encode_to_vec())
+            .expect("failed to rebuild");
+
+        assert_eq!(rebuilt.schema(), Schema::Json);
+    }
+
+    #[test]
+    fn given_bytes_that_are_not_an_any_when_rebuilt_from_a_wire_tag_should_fall_back_to_raw() {
+        // The other half of the source arm. A plugin can tag `Schema::Proto`
+        // and send something that is not an `Any`, and those bytes still have
+        // to reach the sink rather than being dropped.
+        let rebuilt = Schema::Proto
+            .try_into_payload(b"not protobuf wire bytes".to_vec())
+            .expect("failed to rebuild");
+
+        assert_eq!(rebuilt.schema(), Schema::Raw);
+    }
 }
