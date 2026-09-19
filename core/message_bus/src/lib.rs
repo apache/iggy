@@ -432,6 +432,58 @@ pub type AcceptedWssClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, Shared
 /// clear the replica mapping and re-dial.
 pub type ConnectionLostFn = std::rc::Rc<dyn Fn(u8)>;
 
+/// Socket-read accounting for one plaintext replica link.
+///
+/// The link shard reads every inbound consensus frame off one socket, so
+/// the ratio of decoded frames to completed socket reads is the batching
+/// factor the read-ahead buffer exists to raise. Only link shards read
+/// replica sockets, so a nonzero value also identifies the link shard.
+///
+/// `Cell` rather than atomics: the reader task that bumps these and the
+/// shard sweep that drains them run on the same compio thread. Shared
+/// with the reader task through an `Rc`, on the precedent of
+/// `installer::replica`'s `install_aborted`.
+#[derive(Debug, Default)]
+pub struct ReplicaReadStats {
+    reads: Cell<u64>,
+    frames: Cell<u64>,
+}
+
+impl ReplicaReadStats {
+    /// One completed socket read on the replica read half.
+    pub fn record_read(&self) {
+        self.reads.set(self.reads.get() + 1);
+    }
+
+    /// One frame decoded out of the replica read half.
+    pub fn record_frame(&self) {
+        self.frames.set(self.frames.get() + 1);
+    }
+
+    /// Drain both counts, resetting them to zero.
+    ///
+    /// Take semantics because the caller feeds the result to a cumulative
+    /// Prometheus counter's `inc_by`: handing back running totals would
+    /// double count every sweep.
+    pub const fn take(&self) -> ReplicaReadMetrics {
+        ReplicaReadMetrics {
+            reads: self.reads.replace(0),
+            frames: self.frames.replace(0),
+        }
+    }
+}
+
+/// Deltas since the previous [`ReplicaReadStats::take`].
+///
+/// `frames >= reads` is not an invariant: a body that arrives in two
+/// segments, or one that straddles the end of the read-ahead buffer,
+/// costs two reads for one frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaReadMetrics {
+    pub reads: u64,
+    pub frames: u64,
+}
+
 /// Point-to-point message delivery between consensus participants.
 ///
 /// `Ok(())` means "accepted for delivery" - NOT "delivered to peer".
@@ -627,6 +679,16 @@ pub trait MessageBus {
     fn realtime_micros(&self) -> u64 {
         iggy_common::IggyTimestamp::now().as_micros()
     }
+
+    /// Drain this bus's plaintext replica socket-read counters.
+    ///
+    /// The provided default returns zeros so the simulator bus and the
+    /// test buses need no override: they own no replica socket. The
+    /// production bus takes from its own [`ReplicaReadStats`], which the
+    /// reader task of every plaintext replica link shares.
+    fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
+        ReplicaReadMetrics::default()
+    }
 }
 
 /// Production message bus backed by real TCP connections.
@@ -707,6 +769,11 @@ pub struct IggyMessageBus {
     /// pending; entries expire lazily inside [`Self::check_dial_pending`].
     /// Only shard 0's bus ever populates this.
     pending_dials: RefCell<ahash::AHashMap<u8, Instant>>,
+    /// Socket-read counters shared by the reader task of every plaintext
+    /// replica link this shard owns. Drained through
+    /// [`MessageBus::take_replica_read_stats`] by the shard's tick;
+    /// stays at zero on a shard that owns no such link.
+    replica_read_stats: Rc<ReplicaReadStats>,
 }
 
 impl IggyMessageBus {
@@ -819,6 +886,7 @@ impl IggyMessageBus {
             replica_handshake_slots: RefCell::new(ahash::AHashMap::new()),
             replica_slot_seq: Cell::new(0),
             pending_dials: RefCell::new(ahash::AHashMap::new()),
+            replica_read_stats: Rc::new(ReplicaReadStats::default()),
         }
     }
 
@@ -1109,6 +1177,12 @@ impl IggyMessageBus {
         &self.config
     }
 
+    /// Handle every plaintext replica reader task on this shard bumps.
+    #[must_use]
+    pub fn replica_read_stats(&self) -> Rc<ReplicaReadStats> {
+        Rc::clone(&self.replica_read_stats)
+    }
+
     /// Cheap clone of the root shutdown token.
     ///
     /// Handed to accept loops, read tasks, writer tasks, and periodic tasks
@@ -1296,6 +1370,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn realtime_micros(&self) -> u64 {
         (**self).realtime_micros()
     }
+
+    fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
+        (**self).take_replica_read_stats()
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -1393,6 +1471,10 @@ impl MessageBus for IggyMessageBus {
 
     fn track_background(&self, handle: JoinHandle<()>) {
         Self::track_background(self, handle);
+    }
+
+    fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
+        self.replica_read_stats.take()
     }
 }
 

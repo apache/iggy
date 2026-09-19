@@ -1057,6 +1057,19 @@ max_batch = 256
 # also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
 
+# Read-ahead buffer per plaintext replica link. The framing layer decodes every
+# complete frame a fill delivered, and a fill takes what the socket holds rather
+# than waiting for a full buffer. A body at least this size is read straight into
+# its frame. 0 keeps the unbuffered path (one read per header, one per body).
+# No-op under cluster.tls.
+#
+# 256 KiB holds 64 average Prepares or 1024 PrepareOks of one burst, and is
+# twice the kernel's default receive buffer (tcp_rmem[1], 128 KiB). Kernel
+# autotuning grows the receive queue past that default once the reader falls
+# behind, so under a CPU-bound reader this value alone sets the batching
+# factor. Boot rejects a nonzero value below 4 KiB.
+replica_read_buffer_size = "256 KiB"
+
 # Bound on each replica peer's mpsc queue. The writer task drains; the
 # send_to_* path enqueues.
 peer_queue_capacity = 4096
