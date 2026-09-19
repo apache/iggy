@@ -1,0 +1,150 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use chrono::{DateTime, Utc};
+use iggy_connector_sdk::Error;
+
+use crate::OutputFormat;
+
+pub(crate) struct PathContext<'a> {
+    pub(crate) stream: &'a str,
+    pub(crate) topic: &'a str,
+    pub(crate) partition_id: u32,
+    pub(crate) first_timestamp_micros: u64,
+}
+
+pub(crate) fn object_path(
+    path_prefix: &str,
+    path_template: &str,
+    context: &PathContext<'_>,
+    offset_start: u64,
+    offset_end: u64,
+    format: OutputFormat,
+) -> Result<String, Error> {
+    let rendered = render_template(path_template, context)?;
+
+    // Partition ID is always embedded in the filename to prevent cross-partition
+    // key collisions because partitions have independent offset spaces starting at
+    // 0.
+    let filename = format!(
+        "{:05}-{:020}-{:020}.{}",
+        context.partition_id,
+        offset_start,
+        offset_end,
+        format.file_extension()
+    );
+
+    if path_prefix.is_empty() {
+        Ok(format!("{rendered}/{filename}"))
+    } else {
+        Ok(format!("{path_prefix}/{rendered}/{filename}"))
+    }
+}
+
+fn render_template(template: &str, context: &PathContext<'_>) -> Result<String, Error> {
+    let timestamp = timestamp_to_datetime(context.first_timestamp_micros)?;
+    let date = timestamp.format("%Y-%m-%d").to_string();
+    let hour = timestamp.format("%H").to_string();
+    let timestamp_millis = (context.first_timestamp_micros / 1_000).to_string();
+
+    Ok(template
+        .replace("{stream}", &sanitize_path_segment(context.stream))
+        .replace("{topic}", &sanitize_path_segment(context.topic))
+        .replace("{partition}", &context.partition_id.to_string())
+        .replace("{date}", &date)
+        .replace("{hour}", &hour)
+        .replace("{timestamp}", &timestamp_millis))
+}
+
+fn sanitize_path_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || character == '.'
+                || character == '_'
+                || character == '-'
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn timestamp_to_datetime(micros: u64) -> Result<DateTime<Utc>, Error> {
+    let seconds = (micros / 1_000_000) as i64;
+    let nanoseconds = ((micros % 1_000_000) * 1_000) as u32;
+    DateTime::<Utc>::from_timestamp(seconds, nanoseconds).ok_or_else(|| {
+        Error::InvalidRecordValue(format!(
+            "Invalid message timestamp: {micros} micros is out of range"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_custom_template_when_building_path_should_render_and_sanitize_segments() {
+        let context = PathContext {
+            stream: "event stream",
+            topic: "orders/eu",
+            partition_id: 7,
+            first_timestamp_micros: 1_710_597_600_000_000,
+        };
+
+        let path = object_path(
+            "archive",
+            "{stream}/{topic}/{partition}/{date}/{hour}/{timestamp}",
+            &context,
+            42,
+            84,
+            OutputFormat::JsonLines,
+        )
+        .expect("path should be rendered");
+
+        assert_eq!(
+            path,
+            "archive/event_stream/orders_eu/7/2024-03-16/14/1710597600000/\
+             00007-00000000000000000042-00000000000000000084.jsonl"
+        );
+    }
+    #[test]
+    fn given_out_of_range_timestamp_when_building_path_should_return_error() {
+        let context = PathContext {
+            stream: "events",
+            topic: "orders",
+            partition_id: 7,
+            first_timestamp_micros: u64::MAX,
+        };
+
+        let error = object_path(
+            "",
+            "{stream}/{topic}/{date}/{hour}",
+            &context,
+            42,
+            84,
+            OutputFormat::JsonLines,
+        )
+        .expect_err("timestamp should be rejected");
+
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
+    }
+}
