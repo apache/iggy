@@ -95,8 +95,12 @@ A record takes the fallback when any of these hold:
 - the key is longer than 255 bytes
 - a header name, prefixed with `kafka.h.`, is longer than 255 bytes
 - a header value is null, empty, or longer than 255 bytes
-- two headers share a name
 - the headers together would exceed the 100 KB user-header budget
+
+A repeated header name belonged on that list and is not reachable. Kafka allows one, but
+`kafka_protocol` decodes headers into an `IndexMap` and inserts each in turn (`records.rs:919`),
+so a repeat overwrites its earlier entry before any gateway code runs. The last value wins and
+the record takes the native path. Catching the case needs a decoder this gateway does not have.
 
 Such a record is stored with a `kafka.envelope` header whose value is one byte, the format
 version, currently `1`. The payload holds the key, the value and the headers in the layout
@@ -161,9 +165,16 @@ therefore still admit 4096 times that much output.
 
 Produce keeps a single decompression budget for the whole request, set to `max_frame_size`, so a
 compressed request can never yield more than the same client could have sent uncompressed. A
-batch that exhausts the budget is rejected with `MESSAGE_TOO_LARGE` (10) before the output is
-allocated. Each decompressed record value has to clear Iggy's own `MAX_PAYLOAD_SIZE` (64 MB,
-`iggy_message.rs:44`) separately, since one record becomes one message.
+batch that exhausts the budget is rejected with `MESSAGE_TOO_LARGE` (10). Each decompressed
+record value has to clear Iggy's own `MAX_PAYLOAD_SIZE` (64 MB, `iggy_message.rs:44`) separately,
+since one record becomes one message.
+
+The budget bounds what a request accumulates, not what one batch allocates. `kafka_protocol`'s
+decompressors write the whole stream out before they hand it over (`compression/gzip.rs:46` and
+its three siblings), so a single batch reaches its full decompressed size in memory and the
+budget rejects it one step later. Bounding the peak needs a size-limited reader per codec, which
+means owning Kafka's snappy and lz4 framing rather than borrowing it. That is worth doing and it
+is not done here.
 
 Nothing decompresses today. The record batch stays an opaque `Bytes` on both paths, so the bound
 above is a requirement on [#3535](https://github.com/apache/iggy/issues/3535) rather than a
