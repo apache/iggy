@@ -165,6 +165,8 @@ jobs:
     with:
       component: ${{ matrix.component }}
       task: ${{ matrix.task }}
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Other components
   test-other:
