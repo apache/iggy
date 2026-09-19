@@ -107,6 +107,23 @@ const client = new Client({
 const stats = await client.system.getStats();
 ```
 
+### Connection events
+
+`Client` provides Node.js-style `on` and `once` methods for observing its
+connection lifecycle. Both methods return the client, so registrations can be
+chained.
+
+```ts
+client
+  .on("connecting", () => console.log("Connecting to Iggy"))
+  .once("connected", () => console.log("Connected to Iggy"))
+  .on("error", (error) => console.error("Iggy connection error", error));
+```
+
+`connecting` is emitted for each TCP or TLS connection attempt. `connected` is
+emitted once the TCP connection or TLS handshake is ready. `error` receives the
+transport error; a command affected by the same error is still rejected.
+
 ### Connection strings
 
 Every client constructor (except `SimpleClient` see note) also accepts a
