@@ -248,7 +248,7 @@ runs:
       if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
       run: |
         ./scripts/ci/apt-install.sh musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
-        rm -f $HOME/.local/share/keyrings/*
+        rm -f "$HOME"/.local/share/keyrings/*
       shell: bash
 
     - name: Install cargo-llvm-cov
