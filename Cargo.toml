@@ -214,7 +214,13 @@ ipnet = "2.12.2"
 journal = { path = "core/journal" }
 js-sys = "0.3"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
-kafka-protocol = { version = "0.18.0", default-features = false, features = ["broker"] }
+kafka-protocol = { version = "0.18.0", default-features = false, features = [
+    "broker",
+    "gzip",
+    "lz4",
+    "snappy",
+    "zstd",
+] }
 keyring-core = "1.0.0"
 lapin = "2.5.1"
 lazy_static = "1.5.0"
