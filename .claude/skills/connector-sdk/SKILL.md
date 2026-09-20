@@ -63,6 +63,7 @@ sdk/src/
 5. **`simd_json::OwnedValue`** for JSON payloads, not `serde_json::Value`. Use `convert::owned_value_to_serde_json` as a bridge when interop is required.
 6. **`BTreeMap`** for headers - deterministic ordering. Never `HashMap` on the wire.
 7. **No breaking changes** to `Sink`/`Source`/`StreamDecoder`/`StreamEncoder`/`Transform` trait signatures without coordinating with all in-tree plugins in the same PR.
+8. **A `Schema` variant that changes meaning is as breaking as a new variant.** The discriminant crosses FFI unchanged, so a plugin built against the old SDK keeps decoding it the old way and misreads every batch with no error anywhere. Same process as a trait change: bump the SDK minor version, update every in-tree plugin in the same PR, and state in the PR description that plugins built against the previous SDK must be rebuilt.
 
 ## Adding a new `Schema` variant
 
@@ -79,7 +80,7 @@ The `Schema` enum (in `lib.rs`) is `#[repr(C)]` - it crosses FFI. Touch points t
 9. `Schema::decoder()` - factory returning `Arc<dyn StreamDecoder>`.
 10. `Schema::encoder()` - factory returning `Arc<dyn StreamEncoder>`.
 11. New `decoders/<name>.rs` and `encoders/<name>.rs`.
-12. Update `sdk/README.md` and `core/connectors/README.md` schema list.
+12. Update the schema list in `sdk/README.md`.
 13. Tests: round-trip encode/decode, error paths. `Payload::schema()` must round-trip through `Payload::try_from_schema`, with no exceptions: every variant survives that trip and the test is table-driven over all of them.
 
 Miss any of these → silent failures at runtime (typically `Error::InvalidPayloadType` or surprising decoder behavior in plugin code).

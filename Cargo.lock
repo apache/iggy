@@ -7147,6 +7147,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "simd-json",
  "tokio",
  "tracing",
  "url",
@@ -7500,7 +7501,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "apache-avro 0.22.0",
