@@ -159,10 +159,13 @@ impl PurgeStorageHarness {
         )
         .await
         .unwrap();
-        let mut parent = 0;
+        let mut parent_checksum = 0;
         for offset in 0..FRESH_MESSAGE_COUNT {
-            let prepare = owned_prepare(offset + 1, parent, offset);
-            parent = prepare.header().checksum;
+            let operation_number = offset + 1;
+            // The helper fills the payload with the operation number, allowing
+            // polls to verify message contents as well as their offsets.
+            let prepare = owned_prepare(operation_number, parent_checksum, offset);
+            parent_checksum = prepare.header().checksum;
             journal.append(prepare.into_frozen()).await.unwrap();
         }
         journal.sync().await.unwrap();
@@ -227,7 +230,11 @@ impl PurgeStorageHarness {
     /// Poll `Next` for the consumer and group, checking actual offsets and payloads.
     /// This executes and completes real polls with automatic offset commits disabled;
     /// it consumes the partition because completing polls can update live tracking.
-    async fn assert_next_messages(&self, partition: TestPartition, expected_offsets: &[u64]) {
+    async fn poll_next_and_assert_messages(
+        &self,
+        partition: TestPartition,
+        expected_offsets: &[u64],
+    ) {
         let partitions = IggyPartitions::new(ShardId::new(0), partition_config());
         partitions.insert(self.namespace, partition);
         for consumer in consumers() {
@@ -235,7 +242,11 @@ impl PurgeStorageHarness {
                 .build_poll_snapshot(
                     &self.namespace,
                     consumer,
-                    &PollingArgs::new(PollingStrategy::next(), 10, false),
+                    &PollingArgs {
+                        strategy: PollingStrategy::next(),
+                        count: 10,
+                        auto_commit: false,
+                    },
                 )
                 .unwrap();
             assert!(!plan.needs_off_pump_io());
@@ -327,8 +338,9 @@ fn partition_config() -> PartitionsConfig {
     }
 }
 
-/// Prove the fixture really restores saved progress and `Next` honors it.
-/// A recovery helper that always returned empty maps would fail this control.
+/// After power loss, a new partition must load the consumer and group
+/// bookmarks from storage. Both saved bookmarks are 2, so Next must
+/// return messages 3 and 4.
 #[test]
 fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmarks() {
     block_on(async {
@@ -344,28 +356,39 @@ fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmar
                 assert_eq!(recovered.get_consumer_offset(consumer), Some(STORED_OFFSET));
             }
             // Bookmark 2 means the first three messages were already consumed.
-            harness.assert_next_messages(recovered, &[3, 4]).await;
+            harness
+                .poll_next_and_assert_messages(recovered, &[3, 4])
+                .await;
         }
     });
 }
 
-/// Prove successful purge cleanup survives power loss without skipping fresh data.
-/// Reusing offsets 0 through 4 makes an old bookmark valid in range but wrong in
-/// meaning: retaining bookmark 2 would silently hide messages 0 through 2.
+/// Purge must remove the consumer and group bookmarks before fresh messages arrive.
+/// After power loss, a new partition must find no saved bookmarks, so Next returns
+/// all fresh messages, 0 through 4. Restoring either old bookmark of 2 would skip
+/// messages 0 through 2 even though that bookmark is still within the new history.
 #[test]
 fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
     block_on(async {
         for policy in [Durability::Replicated, Durability::Persisted] {
+            // Start at the completion phase: message history has been reset,
+            // but the old consumer and group bookmarks still need to be cleared.
             let harness = PurgeStorageHarness::with_stored_progress(policy).await;
             let mut partition = harness.empty_partition();
-            // Enter the completion phase with message history already reset,
-            // but with the old bookmarks still loaded, as in a real purge.
             harness
                 .recover_progress(&mut partition, STORED_OFFSET)
                 .await;
-            assert_eq!(partition.applied_purge_generation(), OLD_GENERATION);
+            assert_eq!(
+                partition.applied_purge_generation(),
+                OLD_GENERATION,
+                "{policy:?}: setup must load the earlier purge marker"
+            );
             for consumer in consumers() {
-                assert_eq!(partition.get_consumer_offset(consumer), Some(STORED_OFFSET));
+                assert_eq!(
+                    partition.get_consumer_offset(consumer),
+                    Some(STORED_OFFSET),
+                    "{policy:?}, {consumer:?}: setup must load the old bookmark"
+                );
             }
 
             // These files arrive after recovery, so only the production directory
@@ -373,39 +396,73 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
             for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
                 harness.persist_bookmark(kind, STRAY_ID).await;
             }
+
+            // Check the purge's effects on the live partition before discarding it.
             partition
                 .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
                 .await
                 .expect("complete purge cleanup");
-            assert_eq!(partition.applied_purge_generation(), NEW_GENERATION);
+            assert_eq!(
+                partition.applied_purge_generation(),
+                NEW_GENERATION,
+                "{policy:?}: purge must advance the applied generation"
+            );
+            for consumer in consumers() {
+                assert_eq!(
+                    partition.get_consumer_offset(consumer),
+                    None,
+                    "{policy:?}, {consumer:?}: purge must clear the live bookmark"
+                );
+            }
             for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-                assert_eq!(partition.durable_consumer_offset_count(kind), 0);
+                assert_eq!(
+                    partition.durable_consumer_offset_count(kind),
+                    0,
+                    "{policy:?}, {kind:?}: purge must clear durability tracking"
+                );
+                let directory = harness.offset_directory(kind);
+                let remaining_paths: Vec<_> = harness
+                    .storage
+                    .entries(&directory)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| directory.join(entry.name))
+                    .collect();
                 assert!(
-                    harness
-                        .storage
-                        .entries(&harness.offset_directory(kind))
-                        .await
-                        .unwrap()
-                        .is_empty()
+                    remaining_paths.is_empty(),
+                    "{policy:?}, {kind:?}: purge left bookmark files: {remaining_paths:?}"
                 );
             }
             drop(partition);
 
-            // Add durable replacement messages, then lose volatile filesystem
-            // changes. Recovery must reconstruct progress from files alone.
+            // Save messages 0 through 4 after purge, then simulate power loss.
+            // The new partition must load its messages and bookmarks from storage.
             harness.persist_fresh_history().await;
             harness.storage.crash(Crash::PowerLoss);
             let recovered = harness.recover_partition().await;
 
-            assert_eq!(recovered.applied_purge_generation(), NEW_GENERATION);
+            assert_eq!(
+                recovered.applied_purge_generation(),
+                NEW_GENERATION,
+                "{policy:?}: the completed purge marker must survive power loss"
+            );
             for consumer in consumers() {
-                assert_eq!(recovered.get_consumer_offset(consumer), None);
+                assert_eq!(
+                    recovered.get_consumer_offset(consumer),
+                    None,
+                    "{policy:?}, {consumer:?}: a deleted bookmark must not return after power loss"
+                );
             }
             for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-                assert_eq!(recovered.durable_consumer_offset_count(kind), 0);
+                assert_eq!(
+                    recovered.durable_consumer_offset_count(kind),
+                    0,
+                    "{policy:?}, {kind:?}: recovery must find no durable bookmarks"
+                );
             }
             harness
-                .assert_next_messages(recovered, &[0, 1, 2, 3, 4])
+                .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
                 .await;
         }
     });
