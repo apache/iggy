@@ -24,8 +24,9 @@ use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
-    PURGE_GENERATION_FILE, delete_persisted_offset, persist_offset, persist_offset_max,
-    persist_purge_generation, read_purge_generation,
+    PURGE_GENERATION_FILE, delete_persisted_offset, delete_persisted_offset_with_storage,
+    persist_offset, persist_offset_max, persist_purge_generation_with_storage,
+    read_purge_generation_with_storage,
 };
 use crate::persistence::{PartitionPersistence, PersistenceCompletion, PersistenceNotifier};
 use crate::poll_plan::{
@@ -50,6 +51,7 @@ use consensus::{
     replicate_frozen_to_next_in_chain, replicate_preflight, report_uncommittable_head,
     restamp_prepare_view, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
+use futures::StreamExt;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -67,6 +69,7 @@ use iggy_common::{
     TopicRuntimeOptions,
 };
 use journal::Journal as _;
+use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::local_gate::LocalGate;
 use journal::superblock::{
     PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
@@ -88,6 +91,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -687,7 +691,7 @@ where
     /// reconciler re-applies the purge; a crash AFTER a purge's durable
     /// generation write correctly skips the re-wipe, keeping messages
     /// appended since. A record left by a PREVIOUS incarnation of this
-    /// namespace reads 0 as well (see [`read_purge_generation`]). No-op
+    /// namespace reads 0 as well (see [`read_purge_generation_with_storage`]). No-op
     /// without a partition dir (in-memory storage).
     ///
     /// # Errors
@@ -695,10 +699,26 @@ where
     /// sentinel 0 instead would make the reconciler silently re-purge and
     /// destroy post-purge messages, so the boot fails loud.
     pub async fn hydrate_applied_purge_generation(&mut self) -> Result<(), IggyError> {
+        self.hydrate_applied_purge_generation_with_storage(&DiskStorage)
+            .await
+    }
+
+    /// Restore the applied generation from the filesystem used for purge cleanup.
+    ///
+    /// Set the partition directory and its creation revision before calling this.
+    /// A simulator must call this on a new partition after discarding its volatile
+    /// state, so completion is recovered from storage instead of retained in memory.
+    ///
+    /// # Errors
+    /// Propagates failures reading the marker, as the disk recovery entry point does.
+    pub async fn hydrate_applied_purge_generation_with_storage<S: DurableStorage>(
+        &mut self,
+        storage: &S,
+    ) -> Result<(), IggyError> {
         if let Some(dir) = self.partition_dir() {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
             self.applied_purge_generation =
-                read_purge_generation(&path, self.created_revision).await?;
+                read_purge_generation_with_storage(storage, &path, self.created_revision).await?;
         }
         Ok(())
     }
@@ -7814,6 +7834,34 @@ where
         self.installed_frontier = None;
         self.segment_checksum_cache.borrow_mut().clear();
 
+        self.complete_purge_with_storage(&DiskStorage, generation)
+            .await
+    }
+
+    /// Clear consumer progress and record completion after resetting message history.
+    ///
+    /// Message history must already be reset, as [`Self::purge`] does before
+    /// entering this phase. The caller must exclude concurrent writes throughout.
+    /// Retry behavior remains in [`Self::purge`], including its deferral and
+    /// message reset decisions. Storage controls the offset files and completion
+    /// marker; journal and superblock operations still use the implementations
+    /// attached to this partition.
+    ///
+    /// Offset deletion and directory sync failures are logged and completion
+    /// continues. Keeping that decision here makes a storage harness exercise the
+    /// same failure behavior as the server.
+    ///
+    /// # Errors
+    /// Returns [`PurgeError::GenerationNotRecorded`] if the completion marker
+    /// cannot be persisted. The applied generation then remains unchanged.
+    #[allow(clippy::too_many_lines)]
+    pub async fn complete_purge_with_storage<S: DurableStorage>(
+        &mut self,
+        storage: &S,
+        generation: u64,
+    ) -> Result<(), PurgeError> {
+        let namespace = self.namespace();
+
         // Clear consumer + consumer-group offsets (memory + disk). Collect the
         // file paths before deleting so the map guard is not held across an
         // await.
@@ -7849,28 +7897,25 @@ where
         // full reset, and an offset file the live map never held -- a pre-purge
         // op re-persisted by journal repair on a restarted replica -- would
         // otherwise survive for boot to hydrate back.
-        let strayed_consumers =
-            crate::state_transfer::strayed_offset_files(self.consumer_offsets_path.as_deref())
-                .into_iter()
-                .filter_map(|path| {
-                    crate::state_transfer::numeric_offset_id(&path)
-                        .map(|id| (ConsumerKind::Consumer, id, path))
-                });
-        let strayed_groups = crate::state_transfer::strayed_offset_files(
-            self.consumer_group_offsets_path.as_deref(),
+        let strayed_consumers = purge_offset_files(
+            storage,
+            self.consumer_offsets_path.as_deref(),
+            ConsumerKind::Consumer,
         )
-        .into_iter()
-        .filter_map(|path| {
-            crate::state_transfer::numeric_offset_id(&path)
-                .map(|id| (ConsumerKind::ConsumerGroup, id, path))
-        });
+        .await;
+        let strayed_groups = purge_offset_files(
+            storage,
+            self.consumer_group_offsets_path.as_deref(),
+            ConsumerKind::ConsumerGroup,
+        )
+        .await;
         for (kind, consumer_id, path) in consumer_paths
             .into_iter()
             .chain(group_paths)
             .chain(strayed_consumers)
             .chain(strayed_groups)
         {
-            if let Err(error) = delete_persisted_offset(&path).await {
+            if let Err(error) = delete_persisted_offset_with_storage(storage, &path).await {
                 self.consumer_offset_capacity_for(kind)
                     .record_stranded(consumer_id);
                 warn!(
@@ -7904,7 +7949,7 @@ where
             .into_iter()
             .chain(self.consumer_group_offsets_path.clone())
         {
-            if let Err(error) = crate::state_transfer::fsync_dir(&dir).await {
+            if let Err(error) = storage.sync_directory(Path::new(&dir)).await {
                 warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
@@ -7980,8 +8025,13 @@ where
         // recorded the generation keep it.
         if let Some(dir) = self.partition_dir() {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
-            if let Err(error) =
-                persist_purge_generation(&path, generation, self.created_revision).await
+            if let Err(error) = persist_purge_generation_with_storage(
+                storage,
+                &path,
+                generation,
+                self.created_revision,
+            )
+            .await
             {
                 self.purge_deferred = true;
                 warn!(
@@ -8414,6 +8464,37 @@ where
         // put O(journal) on every ack; the call-order invariant stands in.)
         send_prepare_ok_common(self.consensus(), header, true).await
     }
+}
+
+async fn purge_offset_files<S: DurableStorage>(
+    storage: &S,
+    directory: Option<&str>,
+    kind: ConsumerKind,
+) -> Vec<(ConsumerKind, u32, String)> {
+    let Some(directory) = directory else {
+        return Vec::new();
+    };
+    let Ok(entries) = storage.regular_files(Path::new(directory)).await else {
+        return Vec::new();
+    };
+    futures::pin_mut!(entries);
+    let mut offsets = Vec::new();
+    while let Some(entry) = entries.next().await {
+        let Ok(path) = entry else {
+            continue;
+        };
+        let Some(consumer_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some(path) = path.to_str() {
+            offsets.push((kind, consumer_id, path.to_owned()));
+        }
+    }
+    offsets
 }
 
 /// Automatic commits remain monotone because an earlier poll can commit after

@@ -22,16 +22,29 @@ use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use futures::channel::oneshot;
 use futures::lock::Mutex;
+use futures::{Stream, stream};
 use server_common::iobuf::{Frozen, Owned};
 use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use tokio::sync::{Semaphore, mpsc};
+use tracing::warn;
+
+const FILE_DIRECTORY_BUFFER: usize = 64;
+static FILE_DIRECTORY_READERS: Semaphore = Semaphore::const_new(4);
+
+/// Paths to regular files from one directory scan, followed by any scan error.
+/// Dropping the stream may cancel enumeration without waiting for its worker.
+pub type RegularFiles = Pin<Box<dyn Stream<Item = io::Result<PathBuf>>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMode {
     Read,
     ReadWrite,
     Create,
+    /// Create or truncate a file without requiring read permission.
+    CreateWriteOnly,
     /// Create a file if absent, preserving the inode and bytes if it exists.
     CreateOrOpen,
 }
@@ -75,9 +88,38 @@ pub trait DurableStorage {
     /// # Errors
     /// Returns the underlying filesystem error.
     fn exists(&self, path: &Path) -> impl Future<Output = io::Result<bool>>;
+    /// Check whether a path resolves to an existing target, following symbolic links.
+    /// Backends without symbolic links can use the default existence check.
+    ///
+    /// # Errors
+    /// Returns the underlying filesystem error. Missing targets return `false`.
+    fn exists_following_links(&self, path: &Path) -> impl Future<Output = io::Result<bool>> {
+        self.exists(path)
+    }
     /// # Errors
     /// Returns an error for unreadable directories or unsupported file types.
     fn entries(&self, path: &Path) -> impl Future<Output = io::Result<Vec<StorageEntry>>>;
+    /// Enumerate regular files without including directories.
+    ///
+    /// Disk scans skip unreadable entries and unsupported file types, and bound
+    /// both worker concurrency and buffered paths. Other backends may use their
+    /// existing directory enumeration through the default implementation.
+    ///
+    /// # Errors
+    /// Returns an error, or yields one in the stream, if the directory cannot be
+    /// enumerated. Dropping a stream does not make any filesystem changes durable.
+    fn regular_files(&self, path: &Path) -> impl Future<Output = io::Result<RegularFiles>> {
+        async move {
+            let entries = self.entries(path).await?;
+            let path = path.to_path_buf();
+            Ok(Box::pin(stream::iter(
+                entries
+                    .into_iter()
+                    .filter(|entry| !entry.directory)
+                    .map(move |entry| Ok(path.join(entry.name))),
+            )) as RegularFiles)
+        }
+    }
     /// # Errors
     /// Returns the underlying filesystem error. Missing paths are accepted.
     fn remove_tree(&self, path: &Path) -> impl Future<Output = io::Result<()>>;
@@ -191,9 +233,16 @@ impl DurableStorage for DiskStorage {
 
     async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<File> {
         let mut options = OpenOptions::new();
-        options.read(true).write(mode != OpenMode::Read);
-        if matches!(mode, OpenMode::Create | OpenMode::CreateOrOpen) {
-            options.create(true).truncate(mode == OpenMode::Create);
+        options
+            .read(mode != OpenMode::CreateWriteOnly)
+            .write(mode != OpenMode::Read);
+        if matches!(
+            mode,
+            OpenMode::Create | OpenMode::CreateWriteOnly | OpenMode::CreateOrOpen
+        ) {
+            options
+                .create(true)
+                .truncate(matches!(mode, OpenMode::Create | OpenMode::CreateWriteOnly));
         }
         options.open(path).await
     }
@@ -226,10 +275,74 @@ impl DurableStorage for DiskStorage {
         }
     }
 
+    async fn exists_following_links(&self, path: &Path) -> io::Result<bool> {
+        match compio::fs::metadata(path).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn entries(&self, path: &Path) -> io::Result<Vec<StorageEntry>> {
         // getdents has no io_uring operation, and shard fallback pools are disabled.
         let path = path.to_path_buf();
         run_blocking("iggy-directory-scan", move || directory_entries(&path)).await
+    }
+
+    async fn regular_files(&self, path: &Path) -> io::Result<RegularFiles> {
+        // Compio has no asynchronous directory iterator and the shard's blocking
+        // pool is disabled. The worker owns the permit so cancellation cannot
+        // exceed the concurrency bound.
+        let permit = FILE_DIRECTORY_READERS
+            .acquire()
+            .await
+            .map_err(io::Error::other)?;
+        let (sender, receiver) = mpsc::channel(FILE_DIRECTORY_BUFFER);
+        let directory = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("iggy-offset-recovery".to_owned())
+            .spawn(move || {
+                let _permit = permit;
+                let result = (|| {
+                    // A single bad entry must not keep offset recovery from
+                    // booting a partition. Only opening the directory is fatal.
+                    for entry in std::fs::read_dir(&directory)? {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                warn!(path = %directory.display(), %error, "failed to read directory entry");
+                                continue;
+                            }
+                        };
+                        let is_file = match entry.file_type() {
+                            Ok(file_type) => file_type.is_file(),
+                            Err(error) => {
+                                warn!(path = %directory.display(), %error, "failed to read entry type");
+                                continue;
+                            }
+                        };
+                        if is_file && sender.blocking_send(Ok(Some(entry.path()))).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                })();
+                // Explicit completion distinguishes an empty directory from an
+                // interrupted worker. Closed receivers abandon enumeration.
+                let _ = sender.blocking_send(result.map(|()| None));
+            })?;
+        Ok(Box::pin(stream::unfold(
+            Some(receiver),
+            |receiver| async move {
+                let mut receiver = receiver?;
+                match receiver.recv().await {
+                    Some(Ok(Some(path))) => Some((Ok(path), Some(receiver))),
+                    Some(Ok(None)) => None,
+                    Some(Err(error)) => Some((Err(error), None)),
+                    None => Some((Err(io::Error::other("directory reader stopped")), None)),
+                }
+            },
+        )))
     }
 
     async fn remove_tree(&self, path: &Path) -> io::Result<()> {
@@ -378,7 +491,10 @@ fn directory_entries(path: &Path) -> io::Result<Vec<StorageEntry>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskStorage, DurableFile, DurableStorage, OpenMode, run_blocking};
+    use super::{
+        DiskStorage, DurableFile, DurableStorage, FILE_DIRECTORY_BUFFER, OpenMode, run_blocking,
+    };
+    use futures::TryStreamExt;
     use futures::channel::oneshot;
     use futures::future::{Either, select};
     use std::io;
@@ -386,6 +502,67 @@ mod tests {
     use std::time::Duration;
 
     const WORKER_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[compio::test]
+    async fn given_symlink_when_target_disappears_should_report_target_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::fs::write(&target, []).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(DiskStorage.exists_following_links(&target).await.unwrap());
+        assert!(DiskStorage.exists_following_links(&link).await.unwrap());
+
+        std::fs::remove_file(&target).unwrap();
+
+        assert!(DiskStorage.exists(&link).await.unwrap());
+        assert!(!DiskStorage.exists_following_links(&link).await.unwrap());
+    }
+
+    #[compio::test]
+    async fn given_buffered_file_scan_when_cancelled_should_release_worker_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry_count = FILE_DIRECTORY_BUFFER * 2;
+        for consumer_id in 0..entry_count {
+            std::fs::write(directory.path().join(consumer_id.to_string()), []).unwrap();
+        }
+
+        // More cancellations than available workers expose permits retained by
+        // a worker whose receiver has gone away.
+        for _ in 0..8 {
+            let entries = DiskStorage.regular_files(directory.path()).await.unwrap();
+            drop(entries);
+        }
+
+        let paths: Vec<_> = DiskStorage
+            .regular_files(directory.path())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), entry_count);
+    }
+
+    #[compio::test]
+    async fn given_non_regular_entries_when_scanning_files_should_skip_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let regular_file = directory.path().join("1");
+        std::fs::write(&regular_file, []).unwrap();
+        std::fs::create_dir(directory.path().join("2")).unwrap();
+        std::os::unix::fs::symlink(&regular_file, directory.path().join("3")).unwrap();
+
+        let paths: Vec<_> = DiskStorage
+            .regular_files(directory.path())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(paths, [regular_file]);
+    }
 
     #[compio::test]
     async fn cancelled_blocking_operation_keeps_its_permit_until_completion() {
