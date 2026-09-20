@@ -80,6 +80,7 @@ use metadata::permissioner::Permissioner;
 use server_common::Message;
 use shard::{PartitionRead, PartitionReadReply};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
@@ -410,10 +411,25 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         GET_ME_CODE => {
             // Self-scoped, so no permissioner rule -- but the consumer-group
             // list it carries is read off the streams STM, so it is gated like
-            // any other metadata read.
+            // any other metadata read. External auth sessions with no stream
+            // grants are denied: an all-false inline grant should not learn
+            // transport details or consumer-group memberships.
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
+                return;
+            }
+            if session_perms
+                .as_deref()
+                .is_some_and(|p| p.streams.as_ref().is_none_or(BTreeMap::is_empty))
+            {
+                send_non_replicated_deny(
+                    shard,
+                    &request,
+                    transport_client_id,
+                    IggyError::Unauthorized.as_code(),
+                )
+                .await;
                 return;
             }
             handle_get_me(shard, sessions, transport_client_id, &request).await;
@@ -610,9 +626,24 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             // Self-scoped: serves the caller's own assignment keyed by the
             // header client id, so it carries no permissioner rule. The
             // assignment itself is metadata-STM state, hence the gate.
+            // External auth sessions with no stream grants are denied (same
+            // rationale as GET_ME above).
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
+                return;
+            }
+            if session_perms
+                .as_deref()
+                .is_some_and(|p| p.streams.as_ref().is_none_or(BTreeMap::is_empty))
+            {
+                send_non_replicated_deny(
+                    shard,
+                    &request,
+                    transport_client_id,
+                    IggyError::Unauthorized.as_code(),
+                )
+                .await;
                 return;
             }
             handle_sync_consumer_group(shard, transport_client_id, &request).await;
