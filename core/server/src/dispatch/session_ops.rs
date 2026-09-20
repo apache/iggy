@@ -1455,6 +1455,12 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     return;
                 }
                 let reserved_uid = external_auth.user_id;
+                tracing::debug!(
+                    transport_client_id,
+                    principal,
+                    expires_at,
+                    "external auth inline grant accepted"
+                );
                 // Set permissions BEFORE binding the session so that any
                 // request arriving immediately after bind already sees the
                 // grants. On bind failure we roll back.
