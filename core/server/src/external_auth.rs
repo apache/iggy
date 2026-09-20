@@ -161,6 +161,16 @@ impl fmt::Display for ExternalAuthError {
 
 impl std::error::Error for ExternalAuthError {}
 
+fn redact_url_userinfo(url: &str) -> std::borrow::Cow<'_, str> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return std::borrow::Cow::Borrowed(url);
+    };
+    match rest.split_once('@') {
+        Some((_, after_at)) => std::borrow::Cow::Owned(format!("{scheme}://{after_at}")),
+        None => std::borrow::Cow::Borrowed(url),
+    }
+}
+
 /// # Errors
 ///
 /// Returns [`ServerError::InvalidExternalAuthConfig`](crate::server_error::ServerError::InvalidExternalAuthConfig)
@@ -184,7 +194,7 @@ pub fn validate_config(
             crate::server_error::ServerError::InvalidExternalAuthConfig {
                 reason: format!(
                     "external_auth.url must start with http:// or https://, got: {}",
-                    config.url
+                    redact_url_userinfo(&config.url)
                 ),
             },
         );
@@ -196,7 +206,10 @@ pub fn validate_config(
     if after_scheme.is_empty() || after_scheme.starts_with('/') {
         return Err(
             crate::server_error::ServerError::InvalidExternalAuthConfig {
-                reason: format!("external_auth.url has no host: {}", config.url),
+                reason: format!(
+                    "external_auth.url has no host: {}",
+                    redact_url_userinfo(&config.url)
+                ),
             },
         );
     }
@@ -240,7 +253,7 @@ pub fn validate_config(
 pub fn warn_insecure_url(config: &ExternalAuthConfig) {
     if config.enabled && config.url.starts_with("http://") {
         tracing::warn!(
-            url = config.url,
+            url = %redact_url_userinfo(&config.url),
             "external auth URL uses plain HTTP; credentials will be sent in cleartext"
         );
     }
