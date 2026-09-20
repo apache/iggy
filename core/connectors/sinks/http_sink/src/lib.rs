@@ -1194,8 +1194,10 @@ impl Sink for HttpSink {
     ///
     /// **Runtime note**: The FFI boundary in `sdk/src/sink.rs` maps `consume()`'s `Result` to
     /// `i32` (0=ok, 1=err), but the runtime's `process_messages()` in `runtime/src/sink.rs`
-    /// logs and counts a nonzero code, records no processed messages for that batch,
-    /// and continues polling. Returning `Err` does not trigger a runtime retry.
+    /// logs and counts a nonzero code, records no processed messages for the run that
+    /// returned it, and continues polling. A batch that mixes payload variants is split
+    /// into one `consume()` call per run, so the other runs of that poll still count as
+    /// processed. Returning `Err` does not trigger a runtime retry.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,

@@ -164,6 +164,8 @@ The two `[[streams]]` shapes differ: a source produces to a single `topic` and c
 
 Transforms are keyed by type, so one connector configures at most one `proto_convert`.
 
+The order of a transform chain is not defined. The runtime builds the chain from a map keyed by transform type, so two transforms on one connector can run in either order from one process to the next. Do not configure a chain whose result depends on which transform runs first.
+
 ### Key Configuration Options
 
 #### Programmatic Encoder and Decoder Configuration
@@ -177,7 +179,7 @@ These are SDK configuration fields, not Random or Stdout `plugin_config` keys. T
 #### Transform Options
 
 - **`proto_convert`**: Transform for converting between protobuf and other formats
-- **`source_format`** / **`target_format`**: Formats to convert between - any schema value (`json`, `raw`, `text`, `proto`, `flat_buffer`, `avro`). `source_format` must match the variant the decoder or a preceding transform actually produced, or the message is rejected
+- **`source_format`** / **`target_format`**: Formats to convert between - any schema value (`json`, `raw`, `text`, `proto`, `flat_buffer`, `avro`). Only `flatbuffer_convert` checks `source_format` against the payload it was handed and rejects a mismatch. `proto_convert` and `avro_convert` dispatch on the format pair with no up-front guard, which is why the `schema = "raw"` plus `source_format = "proto"` example above works
 - **`preserve_unknown_fields`**: Accepted by `proto_convert`, but currently has no effect
 - **`include_paths`**: Additional directories searched for imported `.proto` files
 - **`field_mappings`**: Renames fields in a JSON input object before conversion (e.g., `"old_field" = "new_field"`)

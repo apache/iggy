@@ -251,6 +251,12 @@ While the schema of messages (that will be consumed from the Iggy stream), canno
 
 `messages_metadata.schema` names the variant each `Payload` in the batch actually holds, which is not always the stream's `schema` setting. A decoder may return a different form than the wire format it reads: with `schema = "avro"` the Avro decoder extracts to JSON by default, so the batch arrives as `Payload::Json`. A configured transform can change the variant again. Match on the `Payload` itself and treat `messages_metadata.schema` as a description of what arrived, not of how the stream was configured.
 
+One poll can reach the plugin as more than one `consume()` call. The runtime groups a batch into contiguous runs of one payload variant and sends each run on its own, so a batch whose variant changes partway through arrives as several calls.
+
+Every call in that poll repeats the same `messages_metadata.current_offset`, which is the partition's high-water offset from the poll and not the offset of the last message in the call. A sink that keys a commit, a file name or a table version on `current_offset` has to tolerate the repeat.
+
+A batch whose messages were all dropped by the decoder or by a transform still reaches the plugin as one empty call. Nothing is left to read a variant from, so that call carries the stream's configured `schema` instead: an `avro` stream tags its empty batches `avro` and its non-empty ones `json`.
+
 Keep in mind, that it might be sometimes difficult/impossible e.g. to transform one format to another e.g. JSON to SBE or so, and in such a case, the consumed messages will be ignored.
 
 Eventually, compile the source code and create a separate connector configuration file in the connectors directory (as specified in the main runtime `config.toml`).  Make sure that `path` points to the existing plugin.
