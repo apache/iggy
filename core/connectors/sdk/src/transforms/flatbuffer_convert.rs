@@ -157,7 +157,14 @@ impl Transform for FlatBufferConvert {
                 encoder.convert_format(message.payload, Schema::Raw)?
             }
             (source, target) if source == target => message.payload,
-            _ => unreachable!("conversion pair was validated during construction"),
+            // `validate_conversion` rejects every other pair at construction.
+            // Transforms run inside the runtime's consume task, so a panic
+            // here would take the whole connector down rather than one message.
+            (source, target) => {
+                return Err(Error::InvalidConfigValue(format!(
+                    "unsupported FlatBuffer conversion: {source} -> {target}"
+                )));
+            }
         };
 
         Ok(Some(message))
