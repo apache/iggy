@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -313,7 +314,14 @@ impl QuickwitSink {
     fn extract_json_payloads(&self, messages: Vec<ConsumedMessage>) -> Vec<OwnedValue> {
         let mut json_payloads = Vec::with_capacity(messages.len());
         for message in messages {
-            let val = match message.payload {
+            // The descriptor-less `proto_convert` fallback puts a JSON document
+            // in `Payload::Proto`. It is indexed as that document, and the text
+            // arm below is kept for proto text that is not JSON.
+            let payload = match message.payload.json_document() {
+                Some(Cow::Owned(document)) => Payload::Json(document),
+                _ => message.payload,
+            };
+            let val = match payload {
                 Payload::Json(value @ OwnedValue::Object(_)) => value,
                 Payload::Json(value) => simd_json::json!({
                     "data": value,
@@ -659,6 +667,25 @@ mod tests {
         );
         let text = simd_json::json!({"text": "hello quickwit", "data_type": "text"});
         assert_eq!(&extracted[4..], &[text.clone(), text]);
+    }
+
+    #[test]
+    fn given_proto_text_holding_json_when_extracted_should_preserve_the_document() {
+        let sink = QuickwitSink::new(1, test_config());
+        let messages = vec![
+            test_message(Payload::Proto(r#"{"key": "value"}"#.to_string())),
+            test_message(Payload::Proto("[1, 2]".to_string())),
+        ];
+
+        let extracted = sink.extract_json_payloads(messages);
+
+        assert_eq!(
+            extracted,
+            vec![
+                simd_json::json!({"key": "value"}),
+                simd_json::json!({"data": [1, 2], "data_type": "json"}),
+            ]
+        );
     }
 
     #[test]
