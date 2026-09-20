@@ -330,3 +330,141 @@ macro_rules! sink_connector {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::sink::SinkContainer;
+    use crate::{
+        ConsumedMessage, Error, MessagesMetadata, Payload, RawMessage, RawMessages, Schema, Sink,
+        TopicMetadata,
+    };
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    /// Keeps the payloads the container rebuilt, which is the only observable
+    /// the FFI entry point produces.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        consumed: Arc<Mutex<Vec<Payload>>>,
+    }
+
+    #[async_trait]
+    impl Sink for RecordingSink {
+        async fn open(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn consume(
+            &self,
+            _topic_metadata: &TopicMetadata,
+            _messages_metadata: MessagesMetadata,
+            messages: Vec<ConsumedMessage>,
+        ) -> Result<(), Error> {
+            let mut consumed = self.consumed.lock().expect("recorder was poisoned");
+            consumed.extend(messages.into_iter().map(|message| message.payload));
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Drives one run through the container the way the runtime does: postcard
+    /// bytes in, and the payloads the sink was handed out.
+    fn consume_one(schema: Schema, payload: Vec<u8>) -> Vec<Payload> {
+        let consumed = Arc::new(Mutex::new(Vec::new()));
+        let container = SinkContainer {
+            id: 1,
+            sink: Some(RecordingSink {
+                consumed: Arc::clone(&consumed),
+            }),
+            shutdown: None,
+        };
+
+        let topic_meta = postcard::to_allocvec(&TopicMetadata {
+            stream: "test_stream".to_owned(),
+            topic: "test_topic".to_owned(),
+        })
+        .expect("failed to serialize topic metadata");
+        let messages_meta = postcard::to_allocvec(&MessagesMetadata {
+            partition_id: 0,
+            current_offset: 10_000,
+            schema,
+        })
+        .expect("failed to serialize messages metadata");
+        let messages = postcard::to_allocvec(&RawMessages {
+            schema,
+            messages: vec![RawMessage {
+                id: 1,
+                offset: 0,
+                checksum: 0,
+                timestamp: 0,
+                origin_timestamp: 0,
+                headers: Vec::new(),
+                payload,
+            }],
+        })
+        .expect("failed to serialize messages");
+
+        // `consume` blocks on the SDK runtime, so this stays a plain test.
+        let status = unsafe {
+            container.consume(
+                topic_meta.as_ptr(),
+                topic_meta.len(),
+                messages_meta.as_ptr(),
+                messages_meta.len(),
+                messages.as_ptr(),
+                messages.len(),
+            )
+        };
+        assert_eq!(status, 0, "the container must accept the run");
+
+        consumed.lock().expect("recorder was poisoned").clone()
+    }
+
+    #[test]
+    fn given_a_proto_tagged_run_when_the_container_consumes_should_hand_the_sink_a_proto_payload() {
+        let recorded = consume_one(Schema::Proto, br#"{"first":"encoded"}"#.to_vec());
+
+        assert_eq!(recorded.len(), 1);
+        let Payload::Proto(text) = &recorded[0] else {
+            panic!("expected a proto payload, got {}", recorded[0]);
+        };
+        assert_eq!(text, r#"{"first":"encoded"}"#);
+    }
+
+    #[test]
+    fn given_a_json_tagged_run_when_the_container_consumes_should_hand_the_sink_a_json_payload() {
+        let recorded = consume_one(Schema::Json, br#"{"first":"encoded"}"#.to_vec());
+
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            matches!(recorded[0], Payload::Json(_)),
+            "got {}",
+            recorded[0]
+        );
+    }
+
+    #[test]
+    fn given_a_text_tagged_run_when_the_container_consumes_should_hand_the_sink_a_text_payload() {
+        let recorded = consume_one(Schema::Text, b"plain text".to_vec());
+
+        assert_eq!(recorded.len(), 1);
+        let Payload::Text(text) = &recorded[0] else {
+            panic!("expected a text payload, got {}", recorded[0]);
+        };
+        assert_eq!(text, "plain text");
+    }
+
+    #[test]
+    fn given_a_raw_tagged_run_when_the_container_consumes_should_hand_the_sink_a_raw_payload() {
+        let recorded = consume_one(Schema::Raw, vec![0xff, 0x00, 0x01]);
+
+        assert_eq!(recorded.len(), 1);
+        let Payload::Raw(bytes) = &recorded[0] else {
+            panic!("expected a raw payload, got {}", recorded[0]);
+        };
+        assert_eq!(bytes, &[0xff, 0x00, 0x01]);
+    }
+}

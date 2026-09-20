@@ -1144,8 +1144,18 @@ mod tests {
         if let Ok(Some(transformed_message)) = result {
             if let Payload::Json(json_value) = transformed_message.payload {
                 if let simd_json::OwnedValue::Object(map) = json_value {
-                    assert!(map.contains_key("type_url"));
-                    assert!(map.contains_key("value"));
+                    assert_eq!(
+                        map.get("type_url").and_then(|value| value.as_str()),
+                        Some("type.googleapis.com/google.protobuf.StringValue")
+                    );
+                    assert_eq!(
+                        map.get("value").and_then(|value| value.as_str()),
+                        Some(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(b"Hello, World!")
+                                .as_str()
+                        )
+                    );
                 } else {
                     panic!("Expected JSON object");
                 }
