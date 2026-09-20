@@ -30,6 +30,7 @@ use reqwest_retry::{
 };
 use reqwest_tracing::TracingMiddleware;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -372,29 +373,30 @@ impl HttpSink {
     }
 
     /// Convert a `Payload` to a JSON value for metadata wrapping.
-    /// Non-JSON payloads are base64-encoded with a `iggy_payload_encoding` marker.
+    /// Text payloads, and proto text that is not JSON, are sent as strings; binary
+    /// payloads are base64-encoded with a `iggy_payload_encoding` marker.
     ///
     /// Note: All current `Payload` variants produce infallible conversions.
     /// The `Result` return type exists as a safety net for future variants.
     fn payload_to_json(&self, payload: Payload) -> Result<serde_json::Value, Error> {
+        // Proto text holding JSON is the descriptor-less `proto_convert`
+        // fallback and is sent as the document it holds, the way the same
+        // bytes were sent when the batch was tagged `json`. Proto text that is
+        // not JSON is text, and is sent the way `Payload::Text` is.
+        let payload = match payload.json_document() {
+            Some(Cow::Owned(document)) => Payload::Json(document),
+            _ => payload,
+        };
         match payload {
             Payload::Json(value) => {
                 // Direct structural conversion (not serialization roundtrip).
                 // Follows the Elasticsearch sink pattern. NaN/Infinity f64 → null.
                 Ok(owned_value_to_serde_json(&value))
             }
-            Payload::Text(text) => Ok(serde_json::Value::String(text)),
+            Payload::Text(text) | Payload::Proto(text) => Ok(serde_json::Value::String(text)),
             Payload::Raw(bytes) | Payload::FlatBuffer(bytes) => {
                 let encoded = EncodedPayload {
                     data: general_purpose::STANDARD.encode(&bytes),
-                    iggy_payload_encoding: ENCODING_BASE64,
-                };
-                serde_json::to_value(encoded)
-                    .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
-            }
-            Payload::Proto(proto_str) => {
-                let encoded = EncodedPayload {
-                    data: general_purpose::STANDARD.encode(proto_str.as_bytes()),
                     iggy_payload_encoding: ENCODING_BASE64,
                 };
                 serde_json::to_value(encoded)
@@ -1554,16 +1556,21 @@ mod tests {
     }
 
     #[test]
-    fn given_proto_payload_should_base64_encode_string_bytes() {
+    fn given_proto_payload_holding_json_should_send_the_document() {
+        let sink = given_sink_with_defaults();
+        let result = sink
+            .payload_to_json(Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_string()))
+            .unwrap();
+        assert_eq!(result, serde_json::json!({"id": 1, "name": "row-1"}));
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_should_send_it_as_a_string() {
         let sink = given_sink_with_defaults();
         let result = sink
             .payload_to_json(Payload::Proto("proto_data".to_string()))
             .unwrap();
-        assert_eq!(result[FIELD_PAYLOAD_ENCODING], "base64");
-        assert_eq!(
-            result[FIELD_DATA],
-            general_purpose::STANDARD.encode(b"proto_data")
-        );
+        assert_eq!(result, serde_json::Value::String("proto_data".to_string()));
     }
 
     #[test]

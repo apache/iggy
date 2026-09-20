@@ -136,7 +136,9 @@ then partition, offset and the 32-digit hexadecimal message ID. Payload and
 transform changes do not alter that identity.
 
 `payload_format = "auto"` stores decoded JSON payloads as queryable SurrealDB
-values, text/Proto variants as strings, and raw/Avro/FlatBuffer bytes as base64
+values, text variants as strings, Proto variants as the JSON document they
+hold when the text parses as JSON or as strings otherwise, and
+raw/Avro/FlatBuffer bytes as base64
 strings, even when raw bytes contain valid JSON. Explicit `json` parses other
 payload variants as JSON, `text` requires UTF-8, and `base64`/`binary` encodes the
 payload bytes. Invalid conversions reject that record. Destination schema,

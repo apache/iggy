@@ -28,6 +28,7 @@ use reqwest::{Body, Client as HttpClient, RequestBuilder, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -893,6 +894,14 @@ fn build_insert_query(table: &str, records: &[Value]) -> Result<Bytes, Error> {
 }
 
 fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
+    // Proto text holding JSON is the descriptor-less `proto_convert` fallback
+    // and is stored as the document it holds, the way the same bytes were
+    // stored when the batch was tagged `json`. Proto text that is not JSON
+    // stays text.
+    let payload = match payload.json_document() {
+        Some(Cow::Owned(document)) => Payload::Json(document),
+        _ => payload,
+    };
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
             value: owned_value_to_serde_json(&value),
@@ -1609,6 +1618,22 @@ mod tests {
 
         assert_eq!(document.encoding, ENCODING_JSON);
         assert_eq!(document.value, json!({"name": "Alice", "active": true}));
+    }
+
+    #[test]
+    fn given_auto_payload_proto_holding_json_should_store_queryable_json() {
+        let payload = Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_string());
+        let document = build_auto_payload_document(payload).expect("Failed to build payload");
+        assert_eq!(document.value, json!({"id": 1, "name": "row-1"}));
+        assert_eq!(document.encoding, ENCODING_JSON);
+    }
+
+    #[test]
+    fn given_auto_payload_proto_text_should_store_text() {
+        let payload = Payload::Proto("name: \"row-1\"".to_string());
+        let document = build_auto_payload_document(payload).expect("Failed to build payload");
+        assert_eq!(document.value, Value::String("name: \"row-1\"".to_string()));
+        assert_eq!(document.encoding, ENCODING_TEXT);
     }
 
     #[test]
