@@ -25,11 +25,12 @@ use elasticsearch::{
 use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::retry::{RetryPolicy, parse_duration};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Schema, Sink, TopicMetadata, sink_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use simd_json::{OwnedValue, prelude::*};
+use std::borrow::Cow;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -312,6 +313,39 @@ impl ElasticsearchSink {
     }
 }
 
+/// The document a payload indexes as. `None` skips the message.
+fn document_from_payload(payload: Payload, schema: Schema) -> Option<OwnedValue> {
+    // The descriptor-less `proto_convert` fallback puts a JSON document in
+    // `Payload::Proto`. It indexes field by field, the way the same bytes did
+    // when the batch was tagged `json`, and the text arm below is kept for
+    // proto text that is not JSON.
+    let payload = match payload.json_document() {
+        Some(Cow::Owned(document)) => Payload::Json(document),
+        _ => payload,
+    };
+    match payload {
+        Payload::Json(value) => Some(value),
+        Payload::Raw(bytes) => {
+            let mut bytes_copy = bytes.clone();
+            match simd_json::from_slice::<OwnedValue>(&mut bytes_copy) {
+                Ok(value) => Some(value),
+                Err(_) => Some(simd_json::json!({
+                    "data": general_purpose::STANDARD.encode(&bytes),
+                    "data_type": "raw"
+                })),
+            }
+        }
+        Payload::Text(text) | Payload::Proto(text) => Some(simd_json::json!({
+            "text": text,
+            "data_type": "text"
+        })),
+        _ => {
+            warn!("Unsupported payload format: {schema}");
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl Sink for ElasticsearchSink {
     async fn open(&mut self) -> Result<(), Error> {
@@ -367,30 +401,9 @@ impl Sink for ElasticsearchSink {
         let messages_count = messages.len();
         let mut documents = Vec::with_capacity(messages_count);
         for message in messages {
-            let mut doc = match message.payload {
-                Payload::Json(value) => value,
-                Payload::Raw(bytes) => {
-                    let mut bytes_copy = bytes.clone();
-                    match simd_json::from_slice::<OwnedValue>(&mut bytes_copy) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            simd_json::json!({
-                                "data": general_purpose::STANDARD.encode(&bytes),
-                                "data_type": "raw"
-                            })
-                        }
-                    }
-                }
-                // `Payload::Proto` holds proto text, so it indexes the
-                // same way `Payload::Text` does.
-                Payload::Text(text) | Payload::Proto(text) => simd_json::json!({
-                    "text": text,
-                    "data_type": "text"
-                }),
-                _ => {
-                    warn!("Unsupported payload format: {}", messages_metadata.schema);
-                    continue;
-                }
+            let Some(mut doc) = document_from_payload(message.payload, messages_metadata.schema)
+            else {
+                continue;
             };
 
             // Add metadata fields
@@ -492,6 +505,33 @@ mod tests {
         assert_eq!(sink.retry_policy.max_attempts, 3);
         assert_eq!(sink.retry_policy.base_delay, Duration::from_secs(1));
         assert_eq!(sink.retry_policy.max_delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn given_proto_text_holding_json_when_building_a_document_should_keep_the_original_fields() {
+        let payload = Payload::Proto(r#"{"name":"user_1","amount":2.5}"#.to_owned());
+
+        let document = document_from_payload(payload, Schema::Proto)
+            .expect("proto text holding JSON is a document");
+
+        assert_eq!(
+            document,
+            simd_json::json!({"name": "user_1", "amount": 2.5}),
+            "the document must keep its fields rather than become a text blob"
+        );
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_when_building_a_document_should_index_it_as_text() {
+        let payload = Payload::Proto("name: \"user_1\"".to_owned());
+
+        let document =
+            document_from_payload(payload, Schema::Proto).expect("proto text still indexes");
+
+        assert_eq!(
+            document,
+            simd_json::json!({"text": "name: \"user_1\"", "data_type": "text"})
+        );
     }
 
     #[test]

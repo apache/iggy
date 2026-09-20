@@ -7,7 +7,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 - The target Doris **database and table must be pre-created** before enabling the sink. The connector never issues DDL.
 - `database` and `table` config values must match `[A-Za-z0-9_]+`. Anything else is rejected at startup with `Error::InvalidConfigValue` — this also prevents path traversal in the constructed `/api/{db}/{table}/_stream_load` URL.
 - Messages must arrive with `Payload::Json` (i.e. the configured stream schema is `json`). If a non-JSON payload reaches the connector it logs at `error!` and aborts the whole poll; since the consumer offset is already committed at poll time the batch is not replayed - data loss despite the error log - so the upstream schema must be guaranteed JSON. (Under `schema = "json"` the SDK drops non-JSON before the connector sees it, so this abort is a defensive guard.)
-- That guard is reachable in one case: a format-converting transform such as `avro_convert` runs after the decoder and can hand the connector a non-JSON variant even under `schema = "json"`.
+- That guard is reachable in one case: a format-converting transform runs after the decoder and can hand the connector a non-JSON variant even under `schema = "json"`. `Payload::Proto` is the exception: a `proto_convert` transform with no descriptor hands over the JSON it was given as proto text, and the connector loads that as the document it holds. Proto text that is not JSON still aborts the poll.
 - The Iggy message JSON shape must match the target table columns. JSON fields map by name. Use the optional `columns` plugin setting for field mappings or derived expressions.
 
 ## How it works
@@ -106,7 +106,7 @@ timeout = "30s"
 - **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
 - **Multi-chunk batches are best-effort for operational failures.** A poll larger than `batch_size` is split into chunks, each loaded as its own labelled Stream Load (with its own in-request retry budget for transient failures). If a chunk still fails after its retries (serialize, HTTP, or status-classification error), the connector keeps the first error, attempts the remaining chunks, and returns that error at the end — it does **not** stop at the first such failure.
   The runtime commits the consumer offset for the whole poll before `consume()` runs, so a chunk that exhausts its in-request retries is not replayed across polls; pushing the other chunks through maximizes delivered data, and the first error is surfaced at the end (logged at `error!` for observability; the runtime counts the error and continues polling, with no automatic replay of the failed poll or DLQ).
-  The one deliberate exception is a **non-JSON payload**, which is treated as a schema-contract violation and aborts the whole poll immediately (see the Requirements note above). Under `schema = "json"` with no transforms configured this is unreachable, so it is a defensive guard rather than a normal path.
+  The one deliberate exception is a **non-JSON payload**, which is treated as a schema-contract violation and aborts the whole poll immediately (see the Requirements note above). Under `schema = "json"` with no transforms configured this is unreachable, so it is a defensive guard rather than a normal path. Proto text holding a JSON document does not trigger it.
 
 ## Limitations
 

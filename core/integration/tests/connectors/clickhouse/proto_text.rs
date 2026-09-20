@@ -17,7 +17,7 @@
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::create_test_messages;
-use crate::connectors::fixtures::ElasticsearchSinkFixture;
+use crate::connectors::fixtures::ClickHouseSinkFixture;
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
@@ -26,18 +26,18 @@ use integration::harness::seeds;
 use integration::iggy_harness;
 
 /// A `proto_convert` transform with no descriptor falls back to proto text, so
-/// the batch is tagged `Schema::Proto` and the sink is handed `Payload::Proto`
-/// holding the JSON it was given. The sink indexes that as the document it
-/// holds, field by field, the same way the bytes indexed when the batch was
-/// tagged `json`. Indexing it as one opaque `text` field would pass while
-/// losing every original field, so the assertions read the fields back.
+/// every message reaches the sink as `Payload::Proto` holding the JSON it was
+/// given. The default JSONEachRow builder reads that as the document it holds.
+/// A builder that only accepts `Payload::Json` skips every row, sends nothing,
+/// and returns success, so the offset is committed and the rows are gone; this
+/// test times out on that with zero rows and zero errors counted.
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/elasticsearch/proto_text.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/clickhouse/proto_text.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_a_proto_convert_transform_when_the_sink_consumes_should_index_the_document(
+async fn given_a_proto_convert_transform_when_the_sink_consumes_should_store_the_rows(
     harness: &TestHarness,
-    fixture: ElasticsearchSinkFixture,
+    fixture: ClickHouseSinkFixture,
 ) {
     let client = harness.root_client().await.unwrap();
 
@@ -69,58 +69,45 @@ async fn given_a_proto_convert_transform_when_the_sink_consumes_should_index_the
         .expect("Failed to send messages");
 
     fixture
-        .wait_for_documents(TEST_MESSAGE_COUNT)
+        .wait_for_rows(TEST_MESSAGE_COUNT)
         .await
-        .expect("the proto text batch must be indexed, not dropped");
+        .expect("the proto text batch must be inserted, not skipped");
 
-    fixture
-        .refresh_index()
+    let rows = fixture
+        .fetch_rows()
         .await
-        .expect("Failed to refresh index");
-
-    let search_result = fixture
-        .search_documents()
-        .await
-        .expect("Failed to search documents");
+        .expect("Failed to fetch rows from ClickHouse");
 
     assert_eq!(
-        search_result.hits.total.value, TEST_MESSAGE_COUNT,
-        "Expected {TEST_MESSAGE_COUNT} documents in Elasticsearch"
+        rows.len(),
+        TEST_MESSAGE_COUNT,
+        "Expected {TEST_MESSAGE_COUNT} rows in ClickHouse"
     );
 
-    for (i, hit) in search_result.hits.hits.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
+        let expected = &messages_data[i];
+
+        let id = row["id"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| row["id"].as_u64())
+            .unwrap_or_else(|| panic!("Missing 'id' at row {i}"));
+        assert_eq!(id, expected.id, "id mismatch at row {i}");
+
+        let name = row["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Missing 'name' at row {i}"));
+        assert_eq!(name, expected.name, "name mismatch at row {i}");
+
+        let amount = row["amount"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| row["amount"].as_f64())
+            .unwrap_or_else(|| panic!("Missing 'amount' at row {i}"));
         assert!(
-            hit.source.get("data_type").is_none(),
-            "a proto payload holding JSON must index as a document, not a text blob: {}",
-            hit.source
-        );
-        let name = hit
-            .source
-            .get("name")
-            .and_then(|value| value.as_str())
-            .unwrap_or_else(|| {
-                panic!(
-                    "the original fields must survive the transform: {}",
-                    hit.source
-                )
-            });
-        assert!(
-            name.starts_with("user_"),
-            "unexpected name at hit {i}: {}",
-            hit.source
-        );
-        assert!(
-            hit.source
-                .get("amount")
-                .and_then(|value| value.as_f64())
-                .is_some(),
-            "amount must be indexed as a number, got {}",
-            hit.source
-        );
-        assert!(
-            hit.source.get("_iggy_offset").is_some(),
-            "metadata must still be injected into the document, got {}",
-            hit.source
+            (amount - expected.amount).abs() < 1e-6,
+            "amount mismatch at row {i}: got {amount}, expected {}",
+            expected.amount
         );
     }
 }

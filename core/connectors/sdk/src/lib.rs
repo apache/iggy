@@ -28,6 +28,7 @@ use encoders::{
 use iggy::prelude::{HeaderKey, HeaderValue};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use strum_macros::{Display, IntoStaticStr};
@@ -198,6 +199,28 @@ impl Payload {
             )),
             Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
             Schema::Avro => Ok(Payload::Avro(value)),
+        }
+    }
+
+    /// The JSON document this payload holds, when it holds one.
+    ///
+    /// A `Payload::Json` is borrowed as it is. A `Payload::Proto` is parsed,
+    /// because `proto_convert` puts the JSON text it was handed there whenever
+    /// it has no descriptor or the encode fails, and puts arbitrary text there
+    /// on its text and raw paths. The parse can therefore fail by design, and
+    /// `None` means the text has to be treated as text. Every other variant is
+    /// `None`.
+    ///
+    /// Proto text is parsed from a copy: simd_json mutates its buffer even when
+    /// the parse fails, and the text has to survive for the fallback.
+    pub fn json_document(&self) -> Option<Cow<'_, simd_json::OwnedValue>> {
+        match self {
+            Payload::Json(value) => Some(Cow::Borrowed(value)),
+            Payload::Proto(text) => {
+                let mut bytes = text.as_bytes().to_vec();
+                simd_json::to_owned_value(&mut bytes).ok().map(Cow::Owned)
+            }
+            _ => None,
         }
     }
 
@@ -547,6 +570,59 @@ mod tests {
     }
 
     #[test]
+    fn given_a_json_payload_when_the_document_is_read_should_borrow_it() {
+        let payload = Payload::Json(simd_json::json!({"id": 1}));
+
+        let document = payload
+            .json_document()
+            .expect("a JSON payload is a document");
+
+        assert!(matches!(document, Cow::Borrowed(_)));
+        assert_eq!(*document, simd_json::json!({"id": 1}));
+    }
+
+    #[test]
+    fn given_proto_text_holding_json_when_the_document_is_read_should_parse_it() {
+        let payload = Payload::Proto(r#"{"id": 1, "name": "row-1"}"#.to_owned());
+
+        let document = payload
+            .json_document()
+            .expect("proto text holding JSON is a document");
+
+        assert!(matches!(document, Cow::Owned(_)));
+        assert_eq!(*document, simd_json::json!({"id": 1, "name": "row-1"}));
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_when_the_document_is_read_should_leave_the_text_intact() {
+        let text = r#"binary_data: "AQID""#;
+        let payload = Payload::Proto(text.to_owned());
+
+        assert!(payload.json_document().is_none());
+        // simd_json overwrites its input buffer on a failed parse, so this
+        // only holds because the parse ran on a copy.
+        let Payload::Proto(kept) = &payload else {
+            panic!("the variant must not change");
+        };
+        assert_eq!(kept, text);
+    }
+
+    #[test]
+    fn given_a_payload_that_is_not_json_or_proto_when_the_document_is_read_should_return_none() {
+        for payload in [
+            Payload::Text(r#"{"id": 1}"#.to_owned()),
+            Payload::Raw(br#"{"id": 1}"#.to_vec()),
+            Payload::FlatBuffer(vec![1, 2, 3]),
+            Payload::Avro(vec![1, 2, 3]),
+        ] {
+            assert!(
+                payload.json_document().is_none(),
+                "{payload} must not be read as a document"
+            );
+        }
+    }
+
+    #[test]
     fn given_every_payload_variant_when_schema_is_read_should_name_that_variant() {
         for (payload, expected) in all_payloads() {
             assert_eq!(
@@ -558,18 +634,30 @@ mod tests {
     }
 
     #[test]
-    fn given_a_payload_when_round_tripped_through_its_own_schema_should_keep_the_variant() {
+    fn given_a_payload_when_round_tripped_through_its_own_schema_should_keep_the_variant_and_the_bytes()
+     {
+        // The JSON rows are small objects, arrays and scalars, so their
+        // serialised bytes are stable. A row with many keys would need a value
+        // comparison instead, because simd_json objects do not keep key order
+        // past their small-map threshold.
         for (payload, schema) in all_payloads() {
             let bytes = payload
-                .try_into_vec()
+                .try_to_bytes()
                 .unwrap_or_else(|error| panic!("failed to serialize {schema} payload: {error}"));
-            let rebuilt = Payload::try_from_schema(schema, bytes)
+            let rebuilt = Payload::try_from_schema(schema, bytes.clone())
                 .unwrap_or_else(|error| panic!("failed to rebuild {schema} payload: {error}"));
 
             assert_eq!(
                 rebuilt.schema(),
                 schema,
                 "round trip through {schema} produced {rebuilt}"
+            );
+            assert_eq!(
+                rebuilt
+                    .try_to_bytes()
+                    .unwrap_or_else(|error| panic!("failed to serialize {rebuilt}: {error}")),
+                bytes,
+                "round trip through {schema} changed the payload bytes"
             );
         }
     }

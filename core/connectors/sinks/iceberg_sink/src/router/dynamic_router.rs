@@ -83,17 +83,23 @@ impl DynamicRouter {
     }
 
     fn extract_route_field(&self, message: &ConsumedMessage) -> Option<String> {
-        match &message.payload {
-            Payload::Json(payload) => payload
-                .as_object()
-                .and_then(|obj| obj.get(&self.route_field))
-                .map(|val| val.to_string()),
-            _ => {
-                warn!("Unsupported format for iceberg connector");
-                None
-            }
-        }
+        route_value(&message.payload, &self.route_field)
     }
+}
+
+/// The routing value a payload carries under `route_field`, read from the JSON
+/// document it holds. Proto text holding JSON is the descriptor-less
+/// `proto_convert` fallback and routes like the document it holds; a payload
+/// with no document does not route.
+fn route_value(payload: &Payload, route_field: &str) -> Option<String> {
+    let Some(document) = payload.json_document() else {
+        warn!("Unsupported format for iceberg connector");
+        return None;
+    };
+    document
+        .as_object()
+        .and_then(|obj| obj.get(route_field))
+        .map(|val| val.to_string())
 }
 
 #[async_trait]
@@ -163,5 +169,32 @@ impl Router for DynamicRouter {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_value;
+    use iggy_connector_sdk::Payload;
+
+    #[test]
+    fn given_proto_text_holding_json_should_route_by_the_route_field() {
+        let payload = Payload::Proto(r#"{"id": 1, "region": "eu"}"#.to_owned());
+
+        assert_eq!(route_value(&payload, "region").as_deref(), Some("eu"));
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_should_not_route() {
+        let payload = Payload::Proto("region: \"eu\"".to_owned());
+
+        assert_eq!(route_value(&payload, "region"), None);
+    }
+
+    #[test]
+    fn given_a_json_payload_without_the_route_field_should_not_route() {
+        let payload = Payload::Json(simd_json::json!({ "id": 1 }));
+
+        assert_eq!(route_value(&payload, "region"), None);
     }
 }
