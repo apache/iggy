@@ -588,6 +588,27 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_trusted_issuer_mapping_to_external_auth_user() {
+        let jwt = HttpJwtConfig {
+            trusted_issuers: Some(vec![TrustedIssuerConfig {
+                issuer: "https://external.example".to_string(),
+                audience: "iggy".to_string(),
+                jwks_url: "https://external.example/.well-known/jwks.json".to_string(),
+                user_id: u32::MAX,
+            }]),
+            ..HttpJwtConfig::default()
+        };
+        match JwtManager::build(&jwt, None, Some(u32::MAX)) {
+            Err(IggyError::InvalidConfiguration) => {}
+            Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
+            Ok(_) => panic!(
+                "build must reject a trusted issuer whose user_id \
+                 collides with external_auth.user_id"
+            ),
+        }
+    }
+
+    #[test]
     fn build_rejects_trusted_issuer_with_empty_issuer() {
         let jwt = HttpJwtConfig {
             trusted_issuers: Some(vec![TrustedIssuerConfig {
