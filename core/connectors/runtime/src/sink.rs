@@ -382,7 +382,7 @@ pub(crate) async fn consume_messages(
         // Total always records; sub-stages only on success (no 0-sample skew).
         metrics.observe_stage_with_labels(&labels.stage_total, elapsed);
 
-        let (processed_count, decode_us, prepare_us, ffi_us) = match &result {
+        let (processed_count, runs, decode_us, prepare_us, ffi_us) = match &result {
             Ok(timing) => {
                 let prepare_elapsed = elapsed
                     .saturating_sub(timing.ffi_elapsed)
@@ -392,12 +392,13 @@ pub(crate) async fn consume_messages(
                 metrics.observe_stage_with_labels(&labels.stage_ffi, timing.ffi_elapsed);
                 (
                     timing.processed_count,
+                    timing.runs,
                     benchmark::as_micros(timing.decode_elapsed),
                     benchmark::as_micros(prepare_elapsed),
                     benchmark::as_micros(timing.ffi_elapsed),
                 )
             }
-            Err(_) => (0, 0, 0, 0),
+            Err(_) => (0, 0, 0, 0, 0),
         };
 
         if benchmark {
@@ -409,6 +410,7 @@ pub(crate) async fn consume_messages(
                 current_offset,
                 messages_count,
                 processed_count,
+                runs,
                 decode_us,
                 prepare_us,
                 ffi_us,
@@ -748,7 +750,9 @@ async fn process_messages(
         runs.push((decoder.schema(), Vec::new()));
     }
 
-    let mut processed_count: usize = runs.iter().map(|(_, run)| run.len()).sum();
+    // An empty batch is still one FFI call, so it is still one run.
+    let run_count = runs.len();
+    let mut processed_count = 0usize;
 
     let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
         error!(
@@ -792,18 +796,24 @@ async fn process_messages(
             messages.len(),
         );
         ffi_elapsed += ffi_start.elapsed();
-        if result != 0 {
+        if result == 0 {
+            processed_count += run_len;
+        } else {
             error!(
                 "Failed to consume {run_len} messages for sink connector with ID: {plugin_id}, stream: {}, topic: {}, schema: {schema}, status: {result}",
                 topic_metadata.stream, topic_metadata.topic
             );
             metrics.inc_errors_with_labels(&labels.counter);
-            processed_count -= run_len;
         }
     }
 
+    // Counted once every call has been made, so a serialisation failure above
+    // cannot leave calls on the counter that never happened.
+    metrics.inc_sink_runs_with_labels(&labels.counter, run_count as u64);
+
     Ok(SinkBatchTiming {
         processed_count,
+        runs: run_count,
         decode_elapsed,
         ffi_elapsed,
     })
@@ -811,7 +821,11 @@ async fn process_messages(
 
 struct SinkBatchTiming {
     processed_count: usize,
+    /// FFI calls the batch was split into, one per contiguous payload variant.
+    runs: usize,
     decode_elapsed: Duration,
+    /// Summed over every run, so one batch is one `stage_ffi` sample however
+    /// many calls it took.
     ffi_elapsed: Duration,
 }
 
@@ -840,15 +854,25 @@ mod tests {
         offsets: Vec<u64>,
     }
 
-    extern "C" fn capturing_consume(
+    /// Runs the stub sink fails, keyed by plugin id and matched on the run's
+    /// schema, so a test reads the failure off the run split rather than off
+    /// a call counter.
+    static FAILING_SCHEMAS: LazyLock<DashMap<u32, Schema>> = LazyLock::new(DashMap::new);
+
+    /// High-water offset deliberately unrelated to any message offset in a
+    /// batch: `current_offset` is the partition's head from the poll, and a
+    /// helper that made it equal the last message's offset would let a test
+    /// assert the wrong contract without failing.
+    const TEST_CURRENT_OFFSET: u64 = 10_000;
+
+    /// Records the batch the FFI call carried and returns its run schema.
+    fn capture_batch(
         plugin_id: u32,
-        _topic_meta_ptr: *const u8,
-        _topic_meta_len: usize,
         messages_meta_ptr: *const u8,
         messages_meta_len: usize,
         messages_ptr: *const u8,
         messages_len: usize,
-    ) -> i32 {
+    ) -> Schema {
         let messages_meta =
             unsafe { std::slice::from_raw_parts(messages_meta_ptr, messages_meta_len) };
         let messages = unsafe { std::slice::from_raw_parts(messages_ptr, messages_len) };
@@ -866,7 +890,69 @@ mod tests {
                 .map(|message| message.payload)
                 .collect(),
         });
+        metadata.schema
+    }
+
+    extern "C" fn capturing_consume(
+        plugin_id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        messages_meta_ptr: *const u8,
+        messages_meta_len: usize,
+        messages_ptr: *const u8,
+        messages_len: usize,
+    ) -> i32 {
+        capture_batch(
+            plugin_id,
+            messages_meta_ptr,
+            messages_meta_len,
+            messages_ptr,
+            messages_len,
+        );
         0
+    }
+
+    /// Captures like `capturing_consume`, then fails the run whose schema the
+    /// test registered in `FAILING_SCHEMAS`.
+    extern "C" fn selectively_failing_consume(
+        plugin_id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        messages_meta_ptr: *const u8,
+        messages_meta_len: usize,
+        messages_ptr: *const u8,
+        messages_len: usize,
+    ) -> i32 {
+        let schema = capture_batch(
+            plugin_id,
+            messages_meta_ptr,
+            messages_meta_len,
+            messages_ptr,
+            messages_len,
+        );
+        match FAILING_SCHEMAS.get(&plugin_id) {
+            Some(failing) if *failing == schema => 1,
+            _ => 0,
+        }
+    }
+
+    extern "C" fn always_failing_consume(
+        plugin_id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        messages_meta_ptr: *const u8,
+        messages_meta_len: usize,
+        messages_ptr: *const u8,
+        messages_len: usize,
+    ) -> i32 {
+        capture_batch(
+            plugin_id,
+            messages_meta_ptr,
+            messages_meta_len,
+            messages_ptr,
+            messages_len,
+        );
+        1
     }
 
     /// Rewrites every payload to the configured variant, standing in for a
@@ -939,6 +1025,20 @@ mod tests {
         transforms: Vec<Arc<dyn Transform>>,
         messages: Vec<IggyMessage>,
     ) -> SinkBatchTiming {
+        run_with(plugin_id, capturing_consume, decoder, transforms, messages)
+            .await
+            .0
+    }
+
+    /// Drives one batch through `process_messages` with the given stub sink
+    /// and hands back the metrics it wrote, so a test can read counters.
+    async fn run_with(
+        plugin_id: u32,
+        consume: ConsumeCallback,
+        decoder: Arc<dyn StreamDecoder>,
+        transforms: Vec<Arc<dyn Transform>>,
+        messages: Vec<IggyMessage>,
+    ) -> (SinkBatchTiming, Arc<Metrics>) {
         let metrics = Arc::new(Metrics::init());
         let labels = SinkLabels::new("test_sink");
         let topic_metadata = TopicMetadata {
@@ -946,20 +1046,39 @@ mod tests {
             topic: "test_topic".to_owned(),
         };
 
-        process_messages(
+        let timing = process_messages(
             plugin_id,
             0,
-            messages.last().map_or(0, |message| message.header.offset),
+            TEST_CURRENT_OFFSET,
             &topic_metadata,
             messages,
-            &(capturing_consume as ConsumeCallback),
+            &consume,
             &transforms,
             &decoder,
             &metrics,
             &labels,
         )
         .await
-        .expect("processing the batch should succeed")
+        .expect("processing the batch should succeed");
+        (timing, metrics)
+    }
+
+    /// Four messages retagged `Text, Text, Raw, Text`, which the runtime
+    /// splits into three runs.
+    fn split_batch() -> (Arc<RetaggingTransform>, Vec<IggyMessage>) {
+        let transform = Arc::new(RetaggingTransform {
+            payloads: vec![
+                Payload::Text("first".to_owned()),
+                Payload::Text("second".to_owned()),
+                Payload::Raw(vec![9]),
+                Payload::Text("fourth".to_owned()),
+            ],
+            next: std::sync::Mutex::new(0),
+        });
+        let messages = (0..4)
+            .map(|offset| test_message(offset, br#"{"id":1}"#.to_vec()))
+            .collect();
+        (transform, messages)
     }
 
     fn captured(plugin_id: u32) -> Vec<ConsumedBatch> {
@@ -1044,6 +1163,74 @@ mod tests {
         assert_eq!(batches[1].offsets, vec![2]);
         assert_eq!(batches[2].metadata_schema, Schema::Text);
         assert_eq!(batches[2].offsets, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn given_a_failing_run_when_a_batch_is_split_should_debit_only_that_run() {
+        let plugin_id = next_plugin_id();
+        FAILING_SCHEMAS.insert(plugin_id, Schema::Raw);
+        let (transform, messages) = split_batch();
+
+        let (timing, metrics) = run_with(
+            plugin_id,
+            selectively_failing_consume,
+            Schema::Json.decoder(),
+            vec![transform],
+            messages,
+        )
+        .await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(timing.processed_count, 3, "only the failing run is lost");
+        assert_eq!(timing.runs, 3);
+        assert_eq!(batches.len(), 3, "a failing run does not stop later runs");
+        assert_eq!(batches[2].offsets, vec![3]);
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 1);
+        assert_eq!(metrics.get_sink_runs("test_sink"), 3);
+    }
+
+    #[tokio::test]
+    async fn given_every_run_failing_when_a_batch_is_split_should_report_no_processed_messages() {
+        let plugin_id = next_plugin_id();
+        let (transform, messages) = split_batch();
+
+        let (timing, metrics) = run_with(
+            plugin_id,
+            always_failing_consume,
+            Schema::Json.decoder(),
+            vec![transform],
+            messages,
+        )
+        .await;
+
+        assert_eq!(timing.processed_count, 0);
+        assert_eq!(captured(plugin_id).len(), 3, "every run is still attempted");
+        assert_eq!(
+            metrics.get_errors("test_sink", ConnectorType::Sink),
+            3,
+            "one error per failed run"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_uniform_batch_when_batch_is_processed_should_count_one_run() {
+        let plugin_id = next_plugin_id();
+        let messages = (0..3)
+            .map(|offset| test_message(offset, br#"{"id":1}"#.to_vec()))
+            .collect();
+
+        let (timing, metrics) = run_with(
+            plugin_id,
+            capturing_consume,
+            Schema::Json.decoder(),
+            Vec::new(),
+            messages,
+        )
+        .await;
+
+        assert_eq!(timing.runs, 1);
+        assert_eq!(metrics.get_sink_runs("test_sink"), 1);
+        assert_eq!(captured(plugin_id).len(), 1);
     }
 
     #[tokio::test]
