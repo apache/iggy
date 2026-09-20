@@ -56,6 +56,11 @@ pub struct StorageEntry {
 
 /// Filesystem operations whose completion and persistence order affect recovery.
 /// Implementations must preserve open file identity across rename and unlink.
+///
+/// Completing a write or filesystem mutation does not by itself guarantee
+/// survival across a crash. File sync makes file contents durable; directory
+/// sync makes changes to that directory's entries durable. Syncing a parent
+/// directory does not sync changes inside its child directories.
 pub trait DurableStorage {
     type File: DurableFile;
 

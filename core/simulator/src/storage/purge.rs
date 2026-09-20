@@ -15,10 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Focused purge completion and boot recovery over the simulated filesystem.
-//! The fixture enters after the message reset, with old consumer progress still
-//! present. Fresh messages use a durable journal so power loss tests offset
-//! recovery without assuming that the old partition's memory survived.
+//! Exercise purge completion and consumer recovery across simulated power loss.
+//!
+//! A consumer offset is a bookmark: storing 2 means `Next` starts at message 3.
+//! Purge must remove those bookmarks as well as the old messages, so consumers
+//! can read a replacement history from offset 0. The purge generation marker
+//! records which purge was applied; it is separate from consumer progress.
+//!
+//! The two controls make that distinction observable. Without a purge, recovery
+//! must preserve bookmark 2 and return messages 3 and 4. After a completed purge,
+//! recovery must find no bookmarks and return all five messages, 0 through 4.
+//! Both controls cover individual consumers and groups under both offset policies.
+//!
+//! The harness enters after message history has been reset. It uses production
+//! purge completion and consumer recovery with `SimStorage`, then polls through
+//! the real `Next` path. Message recovery is narrower than server boot: a helper
+//! replays a durable journal into a new partition. No partition memory survives
+//! recovery. These controls do not inject sync failures or exercise purge retries.
 
 use super::tests::owned_prepare;
 use super::{Crash, SimStorage};
@@ -56,13 +69,20 @@ const FRESH_MESSAGE_COUNT: u64 = 5;
 
 type TestPartition = IggyPartition<Rc<IggyMessageBus>>;
 
+/// Own the simulated filesystem and configuration, but no live partition state.
+///
+/// Offset files and the purge marker use the server's directory layout. The
+/// separate message journal supplies history for rebuilding each new partition.
 struct PurgeStorageHarness {
     storage: SimStorage,
     config: ServerConfig,
     namespace: IggyNamespace,
+    /// Policy for consumer offsets; message durability is established by the fixture.
     policy: Durability,
 }
 
+/// Prove the fixture really restores saved progress and `Next` honors it.
+/// A recovery helper that always returned empty maps would fail this control.
 #[test]
 fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmarks() {
     block_on(async {
@@ -77,17 +97,23 @@ fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmar
             for consumer in consumers() {
                 assert_eq!(recovered.get_consumer_offset(consumer), Some(STORED_OFFSET));
             }
+            // Bookmark 2 means the first three messages were already consumed.
             harness.assert_next_messages(recovered, &[3, 4]).await;
         }
     });
 }
 
+/// Prove successful purge cleanup survives power loss without skipping fresh data.
+/// Reusing offsets 0 through 4 makes an old bookmark valid in range but wrong in
+/// meaning: retaining bookmark 2 would silently hide messages 0 through 2.
 #[test]
 fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
     block_on(async {
         for policy in [Durability::Replicated, Durability::Persisted] {
             let harness = PurgeStorageHarness::with_stored_progress(policy).await;
             let mut partition = harness.empty_partition();
+            // Enter the completion phase with message history already reset,
+            // but with the old bookmarks still loaded, as in a real purge.
             harness
                 .recover_progress(&mut partition, STORED_OFFSET)
                 .await;
@@ -119,8 +145,8 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
             }
             drop(partition);
 
-            // The old offset 2 is inside the new history. A stale recovered
-            // bookmark would silently skip its first three messages.
+            // Add durable replacement messages, then lose volatile filesystem
+            // changes. Recovery must reconstruct progress from files alone.
             harness.persist_fresh_history().await;
             harness.storage.crash(Crash::PowerLoss);
             let recovered = harness.recover_partition().await;
@@ -140,6 +166,9 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
 }
 
 impl PurgeStorageHarness {
+    /// Store bookmark 2 for a consumer and a group, plus the earlier purge marker.
+    /// All files and their directory entries are durable before the test starts,
+    /// including when the selected offset policy does not require an immediate sync.
     async fn with_stored_progress(policy: Durability) -> Self {
         let harness = Self {
             storage: SimStorage::default(),
@@ -178,6 +207,8 @@ impl PurgeStorageHarness {
         harness
     }
 
+    /// Persist bookmark 2 without adding it to any partition's live offset maps.
+    /// This also creates stray files that the purge must discover by scanning.
     async fn persist_bookmark(&self, kind: ConsumerKind, consumer_id: usize) {
         let directory = self.offset_directory(kind);
         let path = directory.join(consumer_id.to_string());
@@ -201,6 +232,8 @@ impl PurgeStorageHarness {
         self.storage.sync_directory(&directory).await.unwrap();
     }
 
+    /// Journal five messages at offsets 0 through 4 without touching offset directories.
+    /// Syncing the message journal must not accidentally make bookmark cleanup durable.
     async fn persist_fresh_history(&self) {
         let mut journal = PartitionPrepareJournal::open_with_storage(
             &self.journal_directory(),
@@ -225,6 +258,11 @@ impl PurgeStorageHarness {
             .unwrap();
     }
 
+    /// Rebuild messages, the applied purge marker, and consumer progress from storage.
+    ///
+    /// Journal entries are appended and committed into a fresh in-memory partition
+    /// before the shared server offset loader runs. This supplies real readable
+    /// messages for `Next` without claiming to exercise the full server boot path.
     async fn recover_partition(&self) -> TestPartition {
         let journal = PartitionPrepareJournal::open_with_storage(
             &self.journal_directory(),
@@ -252,6 +290,8 @@ impl PurgeStorageHarness {
         partition
     }
 
+    /// Use the shared marker and offset loaders, including the server's offset clamping.
+    /// `current_offset` is the message bound against which saved progress is checked.
     async fn recover_progress(&self, partition: &mut TestPartition, current_offset: u64) {
         partition
             .hydrate_applied_purge_generation_with_storage(&self.storage)
@@ -268,6 +308,9 @@ impl PurgeStorageHarness {
         .unwrap();
     }
 
+    /// Poll `Next` for the consumer and group, checking actual offsets and payloads.
+    /// This executes and completes real polls with automatic offset commits disabled;
+    /// it consumes the partition because completing polls can update live tracking.
     async fn assert_next_messages(&self, partition: TestPartition, expected_offsets: &[u64]) {
         let partitions = IggyPartitions::new(ShardId::new(0), partition_config());
         partitions.insert(self.namespace, partition);
@@ -304,6 +347,8 @@ impl PurgeStorageHarness {
         }
     }
 
+    /// Create a partition with no recovered messages or consumer progress.
+    /// Its identity matches the durable records so recovery can accept those records.
     fn empty_partition(&self) -> TestPartition {
         let consensus = VsrConsensus::new(
             1,

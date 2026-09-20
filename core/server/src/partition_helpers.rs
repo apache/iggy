@@ -171,11 +171,17 @@ pub async fn configure_consumer_offsets(
 
 /// Recover consumer and group offsets from `storage` into a new partition.
 ///
+/// Restore the partition's message offset and reservation frontier before
+/// calling this, and pass its restored offset counter as `current_offset`.
+/// These values bound which saved consumer positions are plausible.
+///
 /// Missing directories produce empty maps. Valid records seed the visible
 /// offsets and their persistence state. Unreadable records and invalid records
 /// whose removal cannot be made durable retain their admission capacity slots.
 /// Offsets beyond the space reserved by the partition are clamped to
-/// `current_offset`, as during server boot.
+/// `current_offset`, as during server boot. Clamping changes the visible position
+/// without rewriting its file; persistence tracking retains the original value
+/// read from storage.
 ///
 /// # Errors
 /// Returns [`ServerError::ConsumerOffsetsLoad`] if an existing offset directory

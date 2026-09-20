@@ -15,6 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Store consumer bookmarks and the partition's applied purge generation.
+//!
+//! A bookmark records the last consumed offset. The purge marker instead records
+//! which reset was applied to this incarnation of the partition. Recovery uses
+//! them to restore progress and decide whether a purge must be repeated.
+//!
+//! Functions ending in `_with_storage` share the persistence sequence between
+//! real disk and simulated storage. File sync makes record contents durable;
+//! directory sync makes creation, replacement, or deletion durable. Offset callers
+//! own that directory sync, while purge marker writes include it before returning.
+
 use std::{io, path::Path};
 
 use compio::{

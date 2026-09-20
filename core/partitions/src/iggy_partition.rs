@@ -7840,6 +7840,14 @@ where
 
     /// Clear consumer progress and record completion after resetting message history.
     ///
+    /// Completion proceeds through three stages:
+    /// 1. Clear live consumer and group bookmarks, delete their files, and sync
+    ///    each offset directory so the deletions can survive power loss.
+    /// 2. Reset offset bookkeeping and prevent old journal entries from being
+    ///    applied or served as messages again.
+    /// 3. Persist the purge generation before advancing the live generation,
+    ///    then invalidate cached state transfer offers and restamp the frontier.
+    ///
     /// Message history must already be reset, as [`Self::purge`] does before
     /// entering this phase. The caller must exclude concurrent writes throughout.
     /// Retry behavior remains in [`Self::purge`], including its deferral and
@@ -7849,11 +7857,15 @@ where
     ///
     /// Offset deletion and directory sync failures are logged and completion
     /// continues. Keeping that decision here makes a storage harness exercise the
-    /// same failure behavior as the server.
+    /// same failure behavior as the server. Consequently, success does not prove
+    /// that all bookmark deletions are durable: syncing the generation marker's
+    /// parent does not sync the separate consumer and group directories.
     ///
     /// # Errors
     /// Returns [`PurgeError::GenerationNotRecorded`] if the completion marker
-    /// cannot be persisted. The applied generation then remains unchanged.
+    /// cannot be persisted. Cleanup is not rolled back, the applied generation
+    /// remains unchanged, and the flag that defers prepare acknowledgements is
+    /// set. The normal purge path manages that flag when retrying.
     #[allow(clippy::too_many_lines)]
     pub async fn complete_purge_with_storage<S: DurableStorage>(
         &mut self,
