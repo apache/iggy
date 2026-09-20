@@ -218,8 +218,10 @@ pooling exists yet - it is a known gap to close, not a design decision to rely o
   `INVALID_TOPIC_EXCEPTION` (17), checked before any Iggy call is made
 - `PartitionCountMismatch` → `TOPIC_ALREADY_EXISTS` (36, not `INVALID_PARTITIONS` - that code's
   own text is "below 1", a different condition)
-- Too many partitions requested (`TooManyPartitions`) → `INVALID_PARTITIONS` (37), reachable
-  through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
+- Too many partitions requested (`TooManyPartitions`) → `INVALID_REQUEST` (42), reachable through
+  `ensure_topic`'s `partition_count` argument once it exceeds the server's cap - not
+  `INVALID_PARTITIONS` (37): that code's own text is "below 1", the opposite condition from "too
+  many"
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
 
 ## Wire fixture tool

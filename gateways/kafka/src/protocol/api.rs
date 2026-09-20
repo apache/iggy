@@ -619,28 +619,34 @@ async fn create_one_topic(
         .map_err(|error| error.to_kafka_error_code())?;
     let partition_count = validate_create_topic_shape(topic, api_version)?;
 
-    if validate_only {
-        // KIP-4: "check that the topics can be created as specified, but don't create
-        // anything." Format is already checked above; going further (does ensure_topic's
-        // eventual PartitionCountMismatch also apply here) would mean calling the bridge with
-        // create-on-miss semantics anyway, defeating the "don't create anything" contract - so
-        // this reports success on format alone rather than fully simulating the real call.
-        return Ok(partition_count);
-    }
-
     let kafka_topic = topic.name.0.as_str();
+    // Checked before the `validate_only` branch, not after: "can this topic be created as
+    // specified" includes "does it already exist" - real Kafka's own `validateOnly` still
+    // flags an existing topic, it doesn't only check format. `get_kafka_topic` is read-only
+    // (the same lookup `handle_metadata` uses), so running it here doesn't violate KIP-4's
+    // "don't create anything" promise even when `validate_only` is set.
+    //
     // `ensure_stream_and_topic`'s own contract is intentionally idempotent (get-or-create,
     // matching-spec re-call is Ok) - correct for an internal "make sure this exists" helper, but
     // `CreateTopics` is not an upsert: the real `AdminClient.createTopics` contract is
     // `TOPIC_ALREADY_EXISTS` (36) for a topic that's already there even when the requested spec
-    // matches exactly. Checked up front with the same read-only lookup `handle_metadata` uses,
-    // so the common "genuinely new topic" path still goes straight through
-    // `ensure_stream_and_topic`'s own create-race handling unchanged; only "it's already there"
-    // short-circuits before ever calling it.
+    // matches exactly. The common "genuinely new topic" path still goes straight through
+    // `ensure_stream_and_topic`'s own create-race handling unchanged below; only "it's already
+    // there" short-circuits before ever reaching it.
     match bridge.get_kafka_topic(kafka_topic).await {
         Ok(Some(_existing)) => return Err(ERROR_TOPIC_ALREADY_EXISTS),
         Ok(None) => {}
         Err(error) => return Err(error.to_kafka_error_code()),
+    }
+
+    if validate_only {
+        // KIP-4: "check that the topics can be created as specified, but don't create
+        // anything." Format and existence are already checked above; going further (does
+        // ensure_topic's eventual PartitionCountMismatch also apply here) would mean calling
+        // the bridge with create-on-miss semantics anyway, defeating the "don't create
+        // anything" contract - so this reports success on format+existence alone rather than
+        // fully simulating the real call.
+        return Ok(partition_count);
     }
 
     bridge

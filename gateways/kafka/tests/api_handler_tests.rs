@@ -941,6 +941,77 @@ async fn create_topics_recreate_with_matching_spec_returns_topic_already_exists(
     );
 }
 
+/// `validate_only` must still see the topic-already-exists conflict, not only format checks -
+/// real Kafka's own `validateOnly` flags an existing topic too, it doesn't just check shape.
+/// `get_kafka_topic` is read-only, so checking existence here doesn't violate KIP-4's "don't
+/// create anything" promise for a dry run.
+#[tokio::test]
+async fn create_topics_validate_only_against_an_existing_topic_returns_topic_already_exists() {
+    let fake = FakeBridge::new().with_topic("orders", 3);
+    let body = wire::build_create_topics_simple_request(5, "orders", 3, 1, true);
+
+    let resp = handle_request(API_KEY_CREATE_TOPICS, 5, body, &default_broker(), &fake)
+        .await
+        .expect_response("validate_only request must still respond");
+    let mut d = Decoder::new(resp);
+    let _throttle = d.read_i32().unwrap();
+    let _topics = d.read_varint().unwrap();
+    let _topic = d.read_compact_nullable_string().unwrap();
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_TOPIC_ALREADY_EXISTS,
+        "validate_only against an existing topic must not report a clean dry-run success"
+    );
+}
+
+/// The other half of the same contract: `validate_only` against a genuinely new topic still
+/// succeeds, and - the actual KIP-4 promise - does not create it. The existence check added
+/// above must not turn into an accidental create.
+#[tokio::test]
+async fn create_topics_validate_only_against_a_new_topic_succeeds_without_creating_it() {
+    let fake = FakeBridge::new();
+    let body = wire::build_create_topics_simple_request(5, "orders", 3, 1, true);
+
+    let resp = handle_request(API_KEY_CREATE_TOPICS, 5, body, &default_broker(), &fake)
+        .await
+        .expect_response("validate_only request must still respond");
+    let mut d = Decoder::new(resp);
+    let _throttle = d.read_i32().unwrap();
+    let _topics = d.read_varint().unwrap();
+    let _topic = d.read_compact_nullable_string().unwrap();
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_NONE,
+        "validate_only against a new topic must succeed"
+    );
+
+    let exists = handle_request(
+        API_KEY_METADATA,
+        9,
+        wire::build_metadata_flexible_request(&["orders"]),
+        &default_broker(),
+        &fake,
+    )
+    .await
+    .expect_response("Metadata must respond");
+    let mut d = Decoder::new(exists);
+    let _throttle = d.read_i32().unwrap();
+    let _brokers = d.read_varint().unwrap();
+    let _node_id = d.read_i32().unwrap();
+    let _host = d.read_compact_nullable_string().unwrap();
+    let _port = d.read_i32().unwrap();
+    let _rack = d.read_compact_nullable_string().unwrap();
+    d.read_tagged_fields().unwrap();
+    let _cluster_id = d.read_compact_nullable_string().unwrap();
+    let _controller_id = d.read_i32().unwrap();
+    let _topics = d.read_varint().unwrap();
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        "validate_only must not have actually created the topic"
+    );
+}
+
 /// Real topic, replica assignment, and (at v5+) a `cleanup.policy` config entry - assignments are
 /// accepted (Iggy has no per-partition assignment concept to apply them to, so they're simply
 /// ignored), but a non-empty `configs` list is rejected outright (see `ERROR_INVALID_CONFIG`'s own
