@@ -118,6 +118,7 @@ pub fn prepare(
     addr: SocketAddr,
     http_config: &HttpConfig,
     cluster: &ClusterConfig,
+    external_auth_user_id: Option<u32>,
 ) -> Result<PreparedHttp, ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
     // from the cluster PSK, so a bearer minted on any node verifies on every
@@ -125,7 +126,7 @@ pub fn prepare(
     let cluster_psk =
         (cluster.enabled && cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
             .then_some(cluster.auth.shared_secret.as_str());
-    let jwt = JwtManager::build(&http_config.jwt, cluster_psk)?;
+    let jwt = JwtManager::build(&http_config.jwt, cluster_psk, external_auth_user_id)?;
     // Forwarding needs a bearer every node can verify; without key material it
     // degrades to off (followers answer the transient 503) instead of failing
     // the boot, so keyless clusters still serve HTTP node-locally.

@@ -78,7 +78,13 @@ pub(in crate::boot) async fn start_tcp_runtime(
     // sole caller of this function.
     let http = topology
         .http_listen_addr
-        .map(|addr| http::prepare(addr, &config.http, &config.cluster))
+        .map(|addr| {
+            let ext_auth_uid = config
+                .external_auth
+                .enabled
+                .then_some(config.external_auth.user_id);
+            http::prepare(addr, &config.http, &config.cluster, ext_auth_uid)
+        })
         .transpose()?;
 
     let mut bound = if config.tcp.enabled && !config.tcp.tls.enabled {
