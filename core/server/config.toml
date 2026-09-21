@@ -1059,17 +1059,21 @@ max_message_size = "64 MiB"
 
 # Read-ahead buffer per plaintext replica link. The framing layer decodes every
 # complete frame a fill delivered, and a fill takes what the socket holds rather
-# than waiting for a full buffer. A read at least this size goes straight to the
-# socket, so a body larger than the buffer crosses it only for the part the
-# header's fill already pulled in. 0 keeps the unbuffered path (one read per
-# header, one per body). No-op under cluster.tls.
+# than waiting for a full buffer. 0 selects the unbuffered path (one read per
+# header, one per body), and so do unlimited and none, which the byte-size parser
+# reads as 0. No-op under cluster.tls.
 #
-# 32 KiB holds 128 PrepareOks or 8 average Prepares of one burst, and caps the
-# copy a larger body pays at 32 KiB. It sits below the kernel's default receive
-# buffer (tcp_rmem[1], 128 KiB), which autotuning grows further once the reader
-# falls behind: a backlog then costs several reads rather than one. That is the
-# trade this value sets, fewer bytes copied per Prepare against a lower batching
-# factor under backlog. Boot rejects a nonzero value outside 4 KiB..16 MiB.
+# A read at least this size that starts on an empty buffer goes straight to the
+# socket. The bypass needs an empty buffer, so a body between one and two buffers
+# crosses the buffer whole, and a body of two buffers or more crosses it for about
+# one buffer.
+#
+# 32 KiB holds 128 PrepareOks or 8 average Prepares of one burst. It sits below the
+# kernel's default receive buffer (tcp_rmem[1], 128 KiB), which autotuning grows
+# further once the reader falls behind: a backlog then costs several reads rather
+# than one. That is the trade this value sets, fewer bytes copied per Prepare
+# against a lower batching factor under backlog. Boot rejects a nonzero value
+# outside 4 KiB..16 MiB.
 replica_read_buffer_size = "32 KiB"
 
 # Bound on each replica peer's mpsc queue. The writer task drains; the

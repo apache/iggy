@@ -130,9 +130,10 @@ pub async fn read_message<S: AsyncReadExt>(
     // Stage 2: grow the same `Owned` in place and fill the tail via a
     // slice read. Total allocations for a body frame: ONE
     // (`Owned::with_capacity(HEADER_SIZE)` plus one in-place realloc of
-    // the backing AVec). The body lands in this `Owned` in one pass; a
-    // buffered read half copies only what it read ahead (at most its
-    // buffer size) before the rest goes straight in.
+    // the backing AVec). The body lands in this `Owned` in one pass. A
+    // buffered read half skips the buffer only on an empty buffer and a
+    // caller slice of at least one buffer, so a body of one to two buffers
+    // crosses the buffer whole.
     let mut owned = owned;
     // The `.map_err` arm is unreachable today: `Owned<MESSAGE_ALIGN>` is
     // the only `IoBufMut` ever fed here, and its `reserve_exact` impl

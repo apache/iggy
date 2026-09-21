@@ -352,7 +352,7 @@ impl<R: AsyncRead> AsyncRead for ReadAhead<R> {
 /// when the bus token fires; the in-flight read returns `Ok(0)` and
 /// `framing::read_message` surfaces it as an EOF error on the next
 /// iteration. Frames already complete in the read-ahead buffer are still
-/// decoded and delivered before that happens.
+/// decoded and handed to the dispatcher before that happens.
 #[allow(clippy::future_not_send)]
 async fn reader_loop<R: AsyncRead>(
     mut read_half: R,
