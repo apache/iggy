@@ -31,11 +31,7 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
     ERROR_NOT_CONTROLLER, ERROR_UNSUPPORTED_VERSION,
 };
-use iggy_gateway_kafka::protocol::responses::{
-    encode_create_topics_error_response, encode_create_topics_response,
-    encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
-    encode_produce_error_response,
-};
+use iggy_gateway_kafka::protocol::handlers::{create_topics, fetch, list_offsets, produce};
 
 use codec::Decoder;
 
@@ -53,7 +49,7 @@ fn creatable_topic(name: &str, num_partitions: i32, replication_factor: i16) -> 
 #[test]
 fn create_topics_response_flags_non_positive_partition_count_v2() {
     let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic("bad-topic", 0, 1)]);
-    let body = encode_create_topics_response(2, &req).unwrap();
+    let body = create_topics::encode_response(2, &req).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_i32().unwrap(), 1); // topics len
@@ -70,7 +66,7 @@ fn create_topics_v5_broker_default_partitions_is_not_invalid_partitions() {
     let req = CreateTopicsRequest::default()
         .with_topics(vec![creatable_topic("default-parts", -1, 2)])
         .with_validate_only(true);
-    let body = encode_create_topics_response(5, &req).unwrap();
+    let body = create_topics::encode_response(5, &req).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_varint().unwrap(), 2); // one topic
@@ -92,7 +88,7 @@ fn create_topics_v5_flags_zero_and_below_minus_one_partition_count() {
             num_partitions,
             1,
         )]);
-        let body = encode_create_topics_response(5, &req).unwrap();
+        let body = create_topics::encode_response(5, &req).unwrap();
         let mut d = Decoder::new(body);
         assert_eq!(d.read_i32().unwrap(), 0);
         assert_eq!(d.read_varint().unwrap(), 2);
@@ -116,7 +112,7 @@ fn create_topics_v5_flags_invalid_replication_factor() {
             1,
             replication_factor,
         )]);
-        let body = encode_create_topics_response(5, &req).unwrap();
+        let body = create_topics::encode_response(5, &req).unwrap();
         let mut d = Decoder::new(body);
         assert_eq!(d.read_i32().unwrap(), 0);
         assert_eq!(d.read_varint().unwrap(), 2);
@@ -136,7 +132,7 @@ fn create_topics_v5_flags_invalid_replication_factor() {
 fn create_topics_v2_rejects_broker_default_sentinel() {
     // KIP-464 defaults apply from v4; on v2 without assignments, -1 is INVALID_PARTITIONS.
     let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic("legacy", -1, 1)]);
-    let body = encode_create_topics_response(2, &req).unwrap();
+    let body = create_topics::encode_response(2, &req).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_i32().unwrap(), 1);
@@ -158,7 +154,7 @@ fn create_topics_v2_with_assignments_allows_broker_default_sentinels() {
     let req = CreateTopicsRequest::default().with_topics(vec![
         creatable_topic("assigned", -1, -1).with_assignments(vec![assignment]),
     ]);
-    let body = encode_create_topics_response(2, &req).unwrap();
+    let body = create_topics::encode_response(2, &req).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_i32().unwrap(), 1);
@@ -171,7 +167,7 @@ fn create_topics_v2_with_assignments_allows_broker_default_sentinels() {
 
 #[test]
 fn create_topics_error_response_carries_explicit_error_code() {
-    let body = encode_create_topics_error_response(5, ERROR_UNSUPPORTED_VERSION).unwrap();
+    let body = create_topics::encode_error_response(5, ERROR_UNSUPPORTED_VERSION).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_varint().unwrap(), 2);
@@ -184,7 +180,7 @@ fn create_topics_error_response_carries_explicit_error_code() {
 
 #[test]
 fn fetch_error_response_v7_uses_top_level_error_and_no_topics() {
-    let body = encode_fetch_error_response(7, ERROR_INVALID_REQUEST).unwrap();
+    let body = fetch::encode_error_response(7, ERROR_INVALID_REQUEST).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
@@ -195,7 +191,7 @@ fn fetch_error_response_v7_uses_top_level_error_and_no_topics() {
 
 #[test]
 fn fetch_error_response_v12_uses_flexible_empty_topics() {
-    let body = encode_fetch_error_response(12, ERROR_UNSUPPORTED_VERSION).unwrap();
+    let body = fetch::encode_error_response(12, ERROR_UNSUPPORTED_VERSION).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
@@ -208,9 +204,9 @@ fn fetch_error_response_v12_uses_flexible_empty_topics() {
 #[test]
 fn list_offsets_error_response_v6_uses_flexible_shape() {
     // v0's legacy `old_style_offsets` shape has no `kafka_protocol` encoder - see
-    // `responses::encode_list_offsets_error_response` and the version-firewall e2e coverage for
+    // `list_offsets::encode_error_response` and the version-firewall e2e coverage for
     // that behavior. This exercises the lowest version the crate can actually encode.
-    let body = encode_list_offsets_error_response(6, ERROR_UNSUPPORTED_VERSION).unwrap();
+    let body = list_offsets::encode_error_response(6, ERROR_UNSUPPORTED_VERSION).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_varint().unwrap(), 2); // one topic
@@ -229,7 +225,7 @@ fn list_offsets_error_response_v6_uses_flexible_shape() {
 
 #[test]
 fn produce_error_response_v9_uses_flexible_record_errors_shape() {
-    let body = encode_produce_error_response(9, ERROR_INVALID_REQUEST).unwrap();
+    let body = produce::encode_error_response(9, ERROR_INVALID_REQUEST).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_varint().unwrap(), 2); // one topic
     assert_eq!(
@@ -252,25 +248,21 @@ fn success_responses_can_still_encode_empty_request_vectors() {
         .with_acks(1)
         .with_timeout_ms(1_000)
         .with_topic_data(Vec::<TopicProduceData>::new());
-    assert!(
-        !iggy_gateway_kafka::protocol::responses::encode_produce_response(3, &produce)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(!produce::encode_response(3, &produce).unwrap().is_empty());
 
     let fetch = FetchRequest::default().with_topics(Vec::<FetchTopic>::new());
-    assert!(!encode_fetch_response(4, &fetch).unwrap().is_empty());
+    assert!(!fetch::encode_response(4, &fetch).unwrap().is_empty());
 
     let list_offsets = ListOffsetsRequest::default().with_topics(Vec::<ListOffsetsTopic>::new());
     assert!(
-        !iggy_gateway_kafka::protocol::responses::encode_list_offsets_response(1, &list_offsets)
+        !list_offsets::encode_response(1, &list_offsets)
             .unwrap()
             .is_empty()
     );
 
     let create_topics = CreateTopicsRequest::default().with_topics(Vec::<CreatableTopic>::new());
     assert!(
-        !encode_create_topics_response(2, &create_topics)
+        !create_topics::encode_response(2, &create_topics)
             .unwrap()
             .is_empty()
     );
