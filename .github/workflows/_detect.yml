@@ -97,7 +97,7 @@ jobs:
             chmod +x /tmp/yq
             sudo mv /tmp/yq /usr/local/bin/yq
           fi
-          echo "components=$(yq -o=json -I=0 '.' .github/config/components.yml | jq -c)" >> $GITHUB_OUTPUT
+          echo "components=$(yq -o=json -I=0 '.' .github/config/components.yml | jq -c)" >> "$GITHUB_OUTPUT"
 
       - name: Build matrices
         id: mk
