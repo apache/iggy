@@ -59,10 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The `IGGY_KAFKA_*` vars `load_config` itself reads. `IGGY_KAFKA_` is a
-/// `DELEGATED_ENV_VAR_PREFIXES` entry in `core/configs` (see that file's comment), which trades
-/// away the central provider's typo-detection for this whole namespace - a misspelled key here
-/// would otherwise silently no-op instead of surfacing anywhere. `reject_unknown_kafka_env_vars`
-/// is this crate's own replacement for that lost check.
+/// `SERVER_ALLOWED_ENV_PREFIXES` entry in `core/configs`, which trades away the server's
+/// unknown-variable check for this whole namespace - a misspelled key here would otherwise
+/// silently no-op instead of surfacing anywhere. `reject_unknown_kafka_env_vars` is this crate's
+/// own replacement for that lost check.
 ///
 /// Deliberately excludes `IggyBridgeConfig::KNOWN_ENV_VARS`: `reject_unknown_kafka_env_vars`
 /// checks both lists rather than one merged copy, so a bridge var rename can't silently desync
@@ -82,7 +82,7 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
 
 /// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] or
 /// [`IggyBridgeConfig::KNOWN_ENV_VARS`] - a typo (e.g. `IGGY_KAFKA_BIN_ADDR`) would otherwise be
-/// silently ignored: `core/configs`' central provider skips the whole `IGGY_KAFKA_` prefix, and
+/// silently ignored: the server's check in `core/configs` skips the whole `IGGY_KAFKA_` prefix, and
 /// this crate's own `env_var()` only ever looks up exact known names, so nothing reads the
 /// misspelled var and nothing warns either. Checking both lists is deliberate: a user who
 /// exports a bridge var while `IGGY_KAFKA_BRIDGE_ENABLED` is off must not see a spurious
