@@ -144,6 +144,10 @@ impl IggyIndexWriter {
         self.index_size_bytes.fetch_add(bytes, Ordering::Release);
     }
 
+    pub(crate) fn path(&self) -> &str {
+        &self.file_path
+    }
+
     /// Flushes buffered index file contents to disk.
     ///
     /// Uses `fdatasync` (data only): index files are append-only and the
