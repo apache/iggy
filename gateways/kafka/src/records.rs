@@ -18,13 +18,13 @@
 //! One Kafka record to and from one Iggy message.
 //!
 //! `docs/BRIDGE_MAPPING.md` is the specification. This module implements it and nothing else:
-//! no batch framing, no Iggy calls, no handler wiring.
+//! no Iggy calls, no handler wiring.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use iggy::prelude::{HeaderKey, HeaderValue, IggyError, IggyMessage};
+use iggy::prelude::{HeaderKey, HeaderValue, IggyError, IggyMessage, MAX_PAYLOAD_SIZE};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
@@ -37,6 +37,8 @@ use thiserror::Error;
 pub const KEY_HEADER: &str = "kafka.key";
 /// Iggy header naming which of null or empty a placeholder payload stands for.
 pub const VALUE_MARKER_HEADER: &str = "kafka.value";
+/// Iggy header marking a record stamped at the Unix epoch.
+pub const TIMESTAMP_MARKER_HEADER: &str = "kafka.ts";
 /// Prefix every Kafka record header name is stored under.
 pub const HEADER_PREFIX: &str = "kafka.h.";
 /// Iggy header whose one-byte value is the envelope format version.
@@ -46,6 +48,8 @@ pub const ENVELOPE_VERSION: u8 = 1;
 
 /// Kafka sends this for a record with no timestamp.
 const NO_TIMESTAMP: i64 = -1;
+/// The one Kafka timestamp an `origin_timestamp` of zero cannot be told apart from.
+const EPOCH_TIMESTAMP: i64 = 0;
 /// Stored in place of a null or empty value, discarded on the way back.
 const PLACEHOLDER: &[u8] = &[0x00];
 /// Iggy caps one header name and one header value at this many bytes.
@@ -53,21 +57,35 @@ const MAX_FIELD: usize = 255;
 
 const MARKER_NULL: &[u8] = b"null";
 const MARKER_EMPTY: &[u8] = b"empty";
+const MARKER_EPOCH: &[u8] = b"epoch";
 
 const FLAG_KEY: u8 = 0b01;
 const FLAG_VALUE: u8 = 0b10;
 
+/// Flags byte, key length, value length and header count, per `BRIDGE_MAPPING.md`.
+const ENVELOPE_OVERHEAD: usize = 13;
+/// Name length, value-present byte and value length, before either field's own bytes.
+const ENVELOPE_HEADER_OVERHEAD: usize = 9;
+
 /// Record batch version this gateway writes. v2 is the only shape `kafka_protocol` encodes.
 const BATCH_VERSION: i8 = 2;
 
+/// Why a record could not cross.
+///
+/// The `Envelope*` variants never leave the module. `from_iggy` reads an envelope it cannot
+/// parse as a message the gateway did not write, and these name the reason it ruled that way.
 #[derive(Debug, Error)]
 pub enum RecordCodecError {
     #[error("Iggy rejected the message: {0}")]
     Iggy(#[from] IggyError),
     #[error("record timestamp {0} ms does not fit Iggy's microsecond field")]
     TimestampOutOfRange(i64),
+    #[error("envelope for this record is {size} bytes, over Iggy's {MAX_PAYLOAD_SIZE} byte limit")]
+    EnvelopeTooLarge { size: usize },
     #[error("envelope is truncated: needed {needed} bytes, {remaining} remain")]
     EnvelopeTruncated { needed: usize, remaining: usize },
+    #[error("envelope has {0} bytes left after its last header")]
+    EnvelopeTrailingBytes(usize),
     #[error("envelope format version {0} is not {ENVELOPE_VERSION}")]
     EnvelopeVersion(u8),
     #[error("envelope header name is not UTF-8")]
@@ -87,8 +105,8 @@ type Result<T> = std::result::Result<T, RecordCodecError>;
 ///
 /// # Errors
 ///
-/// Returns an error when the timestamp does not fit, or when Iggy rejects the message for a
-/// reason the envelope does not fix, such as a payload over `MAX_PAYLOAD_SIZE`.
+/// Returns an error when the timestamp does not fit, when the envelope would exceed
+/// `MAX_PAYLOAD_SIZE`, or when Iggy rejects the message for a reason the envelope does not fix.
 pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
     if needs_envelope(record) {
         return envelope_message(record);
@@ -98,6 +116,7 @@ pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
     if let Some(marker) = marker {
         headers.insert(header_key(VALUE_MARKER_HEADER), header_value(marker));
     }
+    mark_epoch(&mut headers, record.timestamp);
     if let Some(key) = record.key.as_ref() {
         headers.insert(header_key(KEY_HEADER), header_value(key));
     }
@@ -122,18 +141,28 @@ pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
 /// A message with no `kafka.` headers was written by an Iggy client, not through this gateway.
 /// It gets a null key and its own user headers.
 ///
+/// An envelope that does not parse falls back to the same reading. `kafka.` is reserved by
+/// `BRIDGE_MAPPING.md` and by nothing the server enforces, so any Iggy producer can set
+/// `kafka.envelope` on a message this gateway never wrote. The gateway only ever writes an
+/// envelope that parses, so one that does not came from such a producer, and reading it as a
+/// plain Iggy message is the honest answer. It also keeps one message from failing a whole Fetch.
+///
 /// # Errors
 ///
-/// Returns an error when the message carries a malformed envelope.
+/// Returns an error when the stored user-header block itself cannot be decoded.
 pub fn from_iggy(message: &IggyMessage, offset: i64) -> Result<Record> {
     let stored = message.user_headers_map()?.unwrap_or_default();
-    let envelope = stored.get(&header_key(ENVELOPE_HEADER));
-    let (key, value, headers) = if let Some(version) = envelope {
-        decode_envelope(version.value().as_ref(), &message.payload)?
-    } else {
-        native_fields(&stored, message)
-    };
-    Ok(record(key, value, headers, offset, timestamp_out(message)))
+    let (key, value, headers) = stored
+        .get(&header_key(ENVELOPE_HEADER))
+        .and_then(|version| decode_envelope(version.as_bytes(), &message.payload).ok())
+        .unwrap_or_else(|| native_fields(&stored, message));
+    Ok(record(
+        key,
+        value,
+        headers,
+        offset,
+        timestamp_out(message, &stored),
+    ))
 }
 
 /// Kafka counts milliseconds, Iggy counts microseconds, and `-1` means the broker assigns one.
@@ -147,8 +176,15 @@ fn timestamp_in(millis: i64) -> Result<u64> {
         .ok_or(RecordCodecError::TimestampOutOfRange(millis))
 }
 
-/// Zero means the producer sent no timestamp, so the server-assigned one stands in.
-fn timestamp_out(message: &IggyMessage) -> i64 {
+/// Zero means the producer sent no timestamp, so the server-assigned one stands in. A record
+/// stamped at the epoch stores that same zero and carries a marker to say it meant it.
+fn timestamp_out(message: &IggyMessage, stored: &BTreeMap<HeaderKey, HeaderValue>) -> i64 {
+    let epoch = stored
+        .get(&header_key(TIMESTAMP_MARKER_HEADER))
+        .is_some_and(|marker| marker.as_bytes() == MARKER_EPOCH);
+    if epoch {
+        return EPOCH_TIMESTAMP;
+    }
     let micros = if message.header.origin_timestamp == 0 {
         message.header.timestamp
     } else {
@@ -187,6 +223,17 @@ fn split_value(value: Option<&Bytes>) -> (Bytes, Option<&'static [u8]>) {
     }
 }
 
+/// Iggy reads an `origin_timestamp` of zero as no timestamp at all, so a record that really was
+/// stamped at the epoch needs a header to hold the difference.
+fn mark_epoch(headers: &mut BTreeMap<HeaderKey, HeaderValue>, timestamp: i64) {
+    if timestamp == EPOCH_TIMESTAMP {
+        headers.insert(
+            header_key(TIMESTAMP_MARKER_HEADER),
+            header_value(MARKER_EPOCH),
+        );
+    }
+}
+
 /// `Ok(None)` when the headers together pass Iggy's budget, which the envelope then carries.
 fn build(
     payload: Bytes,
@@ -207,18 +254,42 @@ fn build(
 }
 
 fn envelope_message(record: &Record) -> Result<IggyMessage> {
+    // The envelope moves the key and the headers into the payload, so a record whose value alone
+    // clears `MAX_PAYLOAD_SIZE` can be one the fallback cannot hold. Say so before spending the
+    // allocation, since the native path has already been ruled out and nothing else is left.
+    let size = envelope_size(record);
+    if size > MAX_PAYLOAD_SIZE as usize {
+        return Err(RecordCodecError::EnvelopeTooLarge { size });
+    }
+
     let mut headers = BTreeMap::new();
     headers.insert(
         header_key(ENVELOPE_HEADER),
         header_value(&[ENVELOPE_VERSION]),
     );
-    build(encode_envelope(record), headers, record.timestamp)?
+    mark_epoch(&mut headers, record.timestamp);
+    build(encode_envelope(record, size), headers, record.timestamp)?
         .ok_or(IggyError::TooBigUserHeaders)
         .map_err(Into::into)
 }
 
+/// Exactly what `encode_envelope` writes for `record`.
+fn envelope_size(record: &Record) -> usize {
+    let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
+    ENVELOPE_OVERHEAD
+        + field(record.key.as_ref())
+        + field(record.value.as_ref())
+        + record
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                ENVELOPE_HEADER_OVERHEAD + name.as_str().len() + field(value.as_ref())
+            })
+            .sum::<usize>()
+}
+
 /// 13 bytes of fixed overhead plus 9 per header, little-endian throughout.
-fn encode_envelope(record: &Record) -> Bytes {
+fn encode_envelope(record: &Record, size: usize) -> Bytes {
     let mut flags = 0u8;
     if record.key.is_some() {
         flags |= FLAG_KEY;
@@ -227,7 +298,7 @@ fn encode_envelope(record: &Record) -> Bytes {
         flags |= FLAG_VALUE;
     }
 
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(size);
     buf.put_u8(flags);
     put_field(&mut buf, record.key.as_ref());
     put_field(&mut buf, record.value.as_ref());
@@ -259,9 +330,21 @@ fn decode_envelope(version: &[u8], payload: &Bytes) -> Result<EnvelopeFields> {
     let flags = take(&mut buf, 1)?[0];
     let key = take_field(&mut buf)?;
     let value = take_field(&mut buf)?;
-    let count = u32::from_le_bytes(take(&mut buf, 4)?.as_ref().try_into().unwrap_or_default());
+    let count =
+        u32::from_le_bytes(take(&mut buf, 4)?.as_ref().try_into().unwrap_or_default()) as usize;
 
-    let mut headers = IndexMap::with_capacity(count as usize);
+    // The count is four bytes of a payload anyone can write and every header costs at least nine,
+    // so reserving before reading lets a 13-byte message ask for four billion entries. Charge the
+    // floor against what is left and the reserve below is bounded by the input.
+    let needed = count.saturating_mul(ENVELOPE_HEADER_OVERHEAD);
+    if buf.remaining() < needed {
+        return Err(RecordCodecError::EnvelopeTruncated {
+            needed,
+            remaining: buf.remaining(),
+        });
+    }
+
+    let mut headers = IndexMap::with_capacity(count);
     for _ in 0..count {
         let name = take_field(&mut buf)?;
         let name =
@@ -271,6 +354,12 @@ fn decode_envelope(version: &[u8], payload: &Bytes) -> Result<EnvelopeFields> {
         headers.insert(StrBytes::from_string(name), present.then_some(value));
     }
 
+    // Every byte of an envelope is accounted for above, so a leftover means this payload is not
+    // one. Accepting it would turn a stray `kafka.envelope` header plus junk into a null record.
+    if buf.has_remaining() {
+        return Err(RecordCodecError::EnvelopeTrailingBytes(buf.remaining()));
+    }
+
     Ok((
         (flags & FLAG_KEY != 0).then_some(key),
         (flags & FLAG_VALUE != 0).then_some(value),
@@ -278,6 +367,7 @@ fn decode_envelope(version: &[u8], payload: &Bytes) -> Result<EnvelopeFields> {
     ))
 }
 
+/// The reading for a message this gateway did not write, and for one whose envelope is not one.
 fn native_fields(
     stored: &BTreeMap<HeaderKey, HeaderValue>,
     message: &IggyMessage,
@@ -288,11 +378,13 @@ fn native_fields(
     let key = stored.get(&header_key(KEY_HEADER)).map(HeaderValue::value);
     let value = match stored
         .get(&header_key(VALUE_MARKER_HEADER))
-        .map(HeaderValue::value)
+        .map(HeaderValue::as_bytes)
     {
-        Some(marker) if marker.as_ref() == MARKER_NULL => None,
-        Some(_) => Some(Bytes::new()),
-        None => Some(message.payload.clone()),
+        Some(MARKER_NULL) => None,
+        Some(MARKER_EMPTY) => Some(Bytes::new()),
+        // A marker this build never writes, so the header belongs to whoever did. The payload is
+        // the value, rather than an empty value guessed from a name that was not understood.
+        Some(_) | None => Some(message.payload.clone()),
     };
 
     let mut headers = IndexMap::new();
@@ -507,6 +599,38 @@ mod tests {
         )
     }
 
+    fn record_at(timestamp: i64) -> Record {
+        record(
+            Some(Bytes::from_static(b"k")),
+            Some(Bytes::from_static(b"v")),
+            IndexMap::new(),
+            0,
+            timestamp,
+        )
+    }
+
+    fn message_with(payload: &'static [u8], headers: &[(&str, &[u8])]) -> IggyMessage {
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (header_key(name), header_value(value)))
+            .collect();
+        IggyMessage::builder()
+            .payload(Bytes::from_static(payload))
+            .user_headers(headers)
+            .build()
+            .unwrap()
+    }
+
+    fn envelope_bytes(count: u32, trailing: &[u8]) -> Bytes {
+        let mut payload = BytesMut::new();
+        payload.put_u8(0);
+        payload.put_u32_le(0);
+        payload.put_u32_le(0);
+        payload.put_u32_le(count);
+        payload.put_slice(trailing);
+        payload.freeze()
+    }
+
     fn is_enveloped(message: &IggyMessage) -> bool {
         message
             .user_headers_map()
@@ -645,13 +769,98 @@ mod tests {
     #[test]
     fn given_a_truncated_envelope_when_decoded_should_fail() {
         let message = to_iggy(&record_with(Some(b""), Some(b"v"), &[])).unwrap();
-        let mut truncated = message;
-        truncated.payload = truncated.payload.slice(0..3);
         assert!(matches!(
-            from_iggy(&truncated, 0),
+            decode_envelope(&[ENVELOPE_VERSION], &message.payload.slice(0..3)),
             Err(RecordCodecError::EnvelopeTruncated { .. })
         ));
     }
+
+    #[test]
+    fn given_more_headers_than_the_payload_holds_when_decoded_should_fail() {
+        // Thirteen bytes claiming four billion headers. Reserving for them is the whole risk.
+        assert!(matches!(
+            decode_envelope(&[ENVELOPE_VERSION], &envelope_bytes(u32::MAX, b"")),
+            Err(RecordCodecError::EnvelopeTruncated { .. })
+        ));
+    }
+
+    #[test]
+    fn given_bytes_after_the_last_header_when_decoded_should_fail() {
+        assert!(matches!(
+            decode_envelope(&[ENVELOPE_VERSION], &envelope_bytes(0, b"junk")),
+            Err(RecordCodecError::EnvelopeTrailingBytes(4))
+        ));
+    }
+
+    #[test]
+    fn given_an_envelope_that_does_not_parse_when_read_should_fall_back_to_the_native_form() {
+        let message = message_with(
+            b"not an envelope",
+            &[(ENVELOPE_HEADER, &[ENVELOPE_VERSION])],
+        );
+
+        let record = from_iggy(&message, 0).unwrap();
+        assert_eq!(record.key, None, "no Kafka producer wrote this");
+        assert_eq!(record.value.as_deref(), Some(&b"not an envelope"[..]));
+    }
+
+    #[test]
+    fn given_an_unknown_value_marker_when_read_should_keep_the_payload() {
+        let message = message_with(b"v", &[(VALUE_MARKER_HEADER, b"neither")]);
+        assert_eq!(
+            from_iggy(&message, 0).unwrap().value.as_deref(),
+            Some(&b"v"[..]),
+            "a marker this build does not write cannot stand for an empty value"
+        );
+    }
+
+    #[test]
+    fn given_an_epoch_timestamp_when_round_tripped_should_stay_at_the_epoch() {
+        let mut message = to_iggy(&record_at(EPOCH_TIMESTAMP)).unwrap();
+        message.header.timestamp = 5_000_000;
+        assert_eq!(from_iggy(&message, 0).unwrap().timestamp, EPOCH_TIMESTAMP);
+    }
+
+    #[test]
+    fn given_an_epoch_timestamp_in_an_envelope_when_read_should_stay_at_the_epoch() {
+        let original = record(
+            Some(Bytes::new()),
+            Some(Bytes::from_static(b"v")),
+            IndexMap::new(),
+            0,
+            EPOCH_TIMESTAMP,
+        );
+        let mut message = to_iggy(&original).unwrap();
+        assert!(is_enveloped(&message));
+        message.header.timestamp = 5_000_000;
+        assert_eq!(from_iggy(&message, 0).unwrap().timestamp, EPOCH_TIMESTAMP);
+    }
+
+    #[test]
+    fn given_no_timestamp_when_read_should_use_the_server_timestamp() {
+        let mut message = to_iggy(&record_at(NO_TIMESTAMP)).unwrap();
+        message.header.timestamp = 5_000_000;
+        assert_eq!(from_iggy(&message, 0).unwrap().timestamp, 5_000);
+    }
+
+    #[test]
+    fn given_a_value_filling_the_payload_when_the_envelope_is_needed_should_fail() {
+        // An empty key is the cheapest field Iggy cannot hold, so this record has to take the
+        // envelope, and the envelope has to carry the key alongside a value already at the cap.
+        let oversized = record(
+            Some(Bytes::new()),
+            Some(Bytes::from(vec![b'x'; MAX_PAYLOAD_SIZE as usize])),
+            IndexMap::new(),
+            0,
+            1_700_000_000_000,
+        );
+        assert!(matches!(
+            to_iggy(&oversized),
+            Err(RecordCodecError::EnvelopeTooLarge { size })
+                if size == MAX_PAYLOAD_SIZE as usize + ENVELOPE_OVERHEAD
+        ));
+    }
+
     fn encode_with(records: &[Record], compression: Compression) -> Bytes {
         let mut buf = BytesMut::new();
         let options = RecordEncodeOptions {

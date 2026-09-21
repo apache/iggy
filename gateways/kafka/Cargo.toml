@@ -37,10 +37,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 bytes = { workspace = true }
 iggy = { workspace = true }
-# Broker-role plus the four compression codecs, which `records::decode_batches` needs to read a
-# compressed Produce batch. Client-role codec paths stay off: this gateway answers requests, it
-# does not send them.
-kafka-protocol = { workspace = true }
+kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

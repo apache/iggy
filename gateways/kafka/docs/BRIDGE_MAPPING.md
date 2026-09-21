@@ -63,6 +63,11 @@ Kafka sends `-1` for a record with no timestamp. That is stored as `0`, and Fetc
 a zero origin timestamp as an instruction to use the server-assigned timestamp instead. A real
 broker does the same thing under `LogAppendTime`, so the two agree.
 
+A record stamped at exactly `0` ms, the Unix epoch, is a different record that stores the same
+`0`. It carries a `kafka.ts` header holding `epoch` to say so, and Fetch reads that header before
+it reads the origin timestamp. Without it a producer that stamps a record `0` gets the server's
+clock back instead, and never learns that the value changed.
+
 ## Records Iggy cannot hold natively
 
 Iggy rejects an empty payload (`core/common/src/types/message/iggy_message.rs:169`), caps a
@@ -133,6 +138,12 @@ The cost is that these messages are opaque to Iggy consumers and connectors. Tha
 of confining the fallback to record shapes that are rare in practice, rather than making it the
 default storage form.
 
+The envelope moves the key and the headers into the payload, so it cannot hold every record the
+native path cannot. A value close enough to `MAX_PAYLOAD_SIZE`, on a record whose key is empty or
+over 255 bytes, comes to more than `MAX_PAYLOAD_SIZE` once the envelope wraps it, and Produce
+rejects the record with `MESSAGE_TOO_LARGE` (10). The gateway measures the envelope before it
+builds one, so the answer does not depend on allocating a payload already known to be too big.
+
 ## Batch-level fields
 
 Per-record storage drops what the Kafka record batch header carries: producer id, producer
@@ -152,9 +163,9 @@ Whether producer id `-1` is what Fetch actually sends depends on the InitProduce
 [`IDEMPOTENCE.md`](IDEMPOTENCE.md). Allocating producer ids does not change what is stored, only
 what Produce accepts, so this section holds under either answer.
 
-Produce decompresses gzip, snappy, lz4 and zstd batches, which means turning those features back
-on for the `kafka-protocol` dependency (`Cargo.toml:217` currently builds it with
-`default-features = false, features = ["broker"]`). Fetch emits uncompressed batches.
+Produce decompresses gzip, snappy, lz4 and zstd batches. `gateways/kafka/Cargo.toml` turns those
+four features on for `kafka-protocol` and the workspace entry stays on `broker` alone, so the
+codecs are declared by the crate that needs them. Fetch emits uncompressed batches.
 
 Decompression needs its own bound, and the bound is per request rather than per batch.
 `max_frame_size` bounds the frame a client sent, which is the compressed size, and zstd reaches
@@ -176,9 +187,10 @@ budget rejects it one step later. Bounding the peak needs a size-limited reader 
 means owning Kafka's snappy and lz4 framing rather than borrowing it. That is worth doing and it
 is not done here.
 
-Nothing decompresses today. The record batch stays an opaque `Bytes` on both paths, so the bound
-above is a requirement on [#3535](https://github.com/apache/iggy/issues/3535) rather than a
-description of current behavior.
+`records::decode_batches` decompresses, and `records::DecompressionBudget` is the bound. The
+budget is a parameter, so setting it to `max_frame_size` for the whole request belongs to the
+Produce handler in [#3535](https://github.com/apache/iggy/issues/3535). Until that lands, nothing
+calls either one in a server path.
 
 ## Offsets
 
@@ -226,6 +238,18 @@ Iggy's group registry is used as an offset key and for nothing else, which
 `kafka.` is reserved on messages the gateway writes and reads. An Iggy producer that sets a
 header in that namespace on a topic a Kafka consumer reads will have it interpreted as gateway
 metadata.
+
+The reservation is a convention. Nothing in the server enforces it, so Fetch has to hold for a
+message that sets `kafka.envelope`, `kafka.value` or `kafka.ts` to something the gateway would
+never write. Fetch reads such a message as the plain Iggy message it is: an envelope that does
+not parse, or a marker this build does not know, falls back to the payload as the record value
+rather than failing. One message an Iggy producer wrote therefore cannot fail a Fetch for the
+records around it, and nothing is discarded on a guess.
+
+The envelope decoder treats its whole payload as untrusted for the same reason. A header count
+is four bytes anyone can write, so the decoder charges the nine bytes each header needs against
+the payload before it reserves for one, and it rejects a payload with bytes left over after the
+last header.
 
 ## Open questions
 
