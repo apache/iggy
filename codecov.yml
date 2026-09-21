@@ -71,6 +71,9 @@ flag_management:
     - name: go
       paths:
         - foreign/go/
+    - name: cpp
+      paths:
+        - foreign/cpp/
 
 component_management:
   individual_components:
@@ -102,6 +105,10 @@ component_management:
       name: "Go SDK"
       paths:
         - foreign/go/
+    - component_id: cpp
+      name: "C++ SDK"
+      paths:
+        - foreign/cpp/
 
 comment:
   layout: "header, diff, components, files"

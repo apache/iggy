@@ -231,6 +231,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload C++ coverage to Codecov
+        if: inputs.component == 'sdk-cpp' && inputs.task == 'test'
+        uses: codecov/codecov-action@v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/cpp-coverage.lcov
+          disable_search: true
+          flags: cpp
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       - name: Upload Java coverage to Codecov
         if: inputs.component == 'sdk-java' && inputs.task == 'test'
         uses: codecov/codecov-action@v7.0.0
