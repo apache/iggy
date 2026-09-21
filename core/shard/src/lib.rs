@@ -5701,17 +5701,18 @@ where
                 } else {
                     let commit_min = partition.consensus().commit_min();
                     let next = partition.repair.as_ref().and_then(|live| {
-                        (commit_min > before).then_some((live.peer, live.nonce, live.fetch_to_op))
+                        partition_repair_next_chunk(before, commit_min, live.fetch_to_op)
+                            .map(|from_op| (live.peer, live.nonce, from_op, live.fetch_to_op))
                     });
                     let cluster = partition.consensus().cluster();
                     let self_id = partition.consensus().replica();
-                    if let Some((peer, nonce, to_op)) = next {
+                    if let Some((peer, nonce, from_op, to_op)) = next {
                         self.send_request_prepares(
                             cluster,
                             self_id,
                             peer,
                             nonce,
-                            commit_min + 1,
+                            from_op,
                             to_op,
                             header.group,
                         )
@@ -11059,6 +11060,18 @@ fn partition_repair_fetch_to_op(
         .then(|| missing_suffix.unwrap_or(commit_max))
 }
 
+/// Start of the next chunk to pull after a `RepairDone`, or `None` when the
+/// walk made no progress (the stall retry owns the remainder) or already
+/// stands at the session's fetch ceiling. The sweep closes such a session,
+/// because `fetch_to_op` never sits below `commit_to_op`.
+///
+/// A session can outlive its last fetchable op until that close, and
+/// `from_op > to_op` fails `RequestPreparesHeader::validate` on the serving
+/// peer, which drops the frame as unparsable.
+fn partition_repair_next_chunk(before: u64, commit_min: u64, fetch_to_op: u64) -> Option<u64> {
+    (commit_min > before && commit_min < fetch_to_op).then_some(commit_min + 1)
+}
+
 /// Highest adopted suffix op whose bodies are not all present above `commit_max`.
 ///
 /// The shape `maybe_request_partition_repair` widens its window for, read here
@@ -12063,6 +12076,17 @@ mod repair_scope_tests {
         let mut missing = pending;
         missing.headers.retain(|header| header.op != 99);
         assert_eq!(adopted_suffix_head(&missing, 98, 101), None);
+    }
+
+    #[test]
+    fn given_a_walk_at_the_fetch_ceiling_when_repair_done_lands_should_not_request_a_chunk() {
+        assert_eq!(super::partition_repair_next_chunk(4, 7, 8), Some(8));
+        // No progress leaves the remainder to the stall retry.
+        assert_eq!(super::partition_repair_next_chunk(7, 7, 8), None);
+        // Progress that reached the ceiling has nothing left to ask for: the
+        // sweep closes the session, and `9..=8` is not a range.
+        assert_eq!(super::partition_repair_next_chunk(7, 8, 8), None);
+        assert_eq!(super::partition_repair_next_chunk(7, 9, 8), None);
     }
 
     #[test]
