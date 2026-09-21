@@ -126,7 +126,8 @@ pub enum HandleOutcome {
 }
 
 impl HandleOutcome {
-    /// Return the response body, or panic with `msg` if the outcome is not [`Self::Respond`].
+    /// Return the response body of a [`Self::Respond`] or [`Self::RespondThenClose`], or panic
+    /// with `msg`.
     ///
     /// # Panics
     ///
@@ -148,15 +149,6 @@ impl HandleOutcome {
     #[must_use]
     pub const fn is_close(&self) -> bool {
         matches!(self, Self::Close)
-    }
-
-    /// Whether applying this outcome ends the connection, whether or not it writes first.
-    ///
-    /// Distinct from [`Self::is_close`], which asks only whether the connection ends *without* a
-    /// response. Callers deciding whether to keep reading want this one.
-    #[must_use]
-    pub const fn closes_connection(&self) -> bool {
-        matches!(self, Self::Close | Self::RespondThenClose(_))
     }
 }
 

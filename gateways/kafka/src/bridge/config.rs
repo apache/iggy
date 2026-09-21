@@ -23,7 +23,11 @@ use tracing::warn;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::{TopicMapping, validate_identifier_name};
 
-const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
+/// Iggy address used when `IGGY_KAFKA_IGGY_ADDR` is unset.
+///
+/// `pub(crate)` because `auth` falls back to it too: both read the same variable for the same
+/// purpose, and a second copy is a second thing to forget when this one moves.
+pub(crate) const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
 /// Matches `DEFAULT_ROOT_USERNAME` (`core/server/src/boot/credentials.rs`) - the root user's
 /// username is always `iggy` regardless of how its password was provisioned, so defaulting this
 /// one field is safe. The password is a different story - see why there is no

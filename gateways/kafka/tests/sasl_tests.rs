@@ -31,7 +31,7 @@ use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::auth::{AuthError, SaslAuthenticator};
-use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
+use iggy_gateway_kafka::protocol::sasl::{MAX_PRE_AUTH_API_VERSIONS, PlainCredentials};
 
 #[path = "common/codec.rs"]
 mod codec;
@@ -386,6 +386,37 @@ async fn given_a_second_handshake_after_authenticating_should_be_refused_without
 }
 
 #[tokio::test]
+async fn given_a_handshake_above_the_version_ceiling_after_authenticating_should_close() {
+    // The keep-open promise stops where the schemas do. SaslHandshake has no v2, so there is no
+    // body this client could parse and one shaped for v1 would be misparsed; the version is
+    // checked before the encoder rather than left to fail inside it.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut stream).await;
+
+    let token = plain_token("alice", "s3cret");
+    let authenticated = send(
+        &mut stream,
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        &authenticate_body(&token),
+    )
+    .await;
+    assert_eq!(error_code(&authenticated), ERROR_NONE);
+
+    let frame = build_request_frame(
+        API_KEY_SASL_HANDSHAKE,
+        HANDSHAKE_VERSION + 1,
+        3,
+        Some("sasl-test"),
+        &handshake_body("PLAIN"),
+    );
+    stream.write_all(&frame).await.expect("write request");
+    assert_closed(&mut stream).await;
+}
+
+#[tokio::test]
 async fn given_sasl_disabled_when_a_client_connects_should_serve_without_authenticating() {
     // The default configuration, which is what every existing deployment runs.
     let (addr, shutdown) = server::spawn_test_server().await;
@@ -661,20 +692,27 @@ async fn given_iggy_is_unreachable_when_authenticating_should_not_send_a_termina
 }
 
 #[tokio::test]
-async fn given_a_second_pre_auth_api_versions_should_be_refused_and_close() {
+async fn given_pre_auth_api_versions_past_the_allowance_should_be_refused_and_close() {
     // Without this the pre-auth read budget resets on every frame, so a client that never
     // authenticates holds a connection permit indefinitely by sending ApiVersions on a timer.
     let addr = spawn_sasl_gateway().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    let first = send(&mut stream, API_KEY_API_VERSIONS, 1, 1, &[]).await;
-    assert!(!first.is_empty(), "the first ApiVersions is answered");
+    for correlation_id in 1..=i32::from(MAX_PRE_AUTH_API_VERSIONS) {
+        let answered = send(&mut stream, API_KEY_API_VERSIONS, 1, correlation_id, &[]).await;
+        assert_eq!(
+            error_code(&answered),
+            ERROR_NONE,
+            "ApiVersions {correlation_id} is inside the allowance"
+        );
+    }
 
-    let second = send(&mut stream, API_KEY_API_VERSIONS, 1, 2, &[]).await;
+    let refused = send(&mut stream, API_KEY_API_VERSIONS, 1, 99, &[]).await;
     assert_eq!(
-        error_code(&second),
+        error_code(&refused),
         ERROR_ILLEGAL_SASL_STATE,
-        "a real broker allows exactly one ApiVersions before the handshake"
+        "a real broker allows one ApiVersions before the handshake, and the allowance adds only \
+         the KIP-511 downgrade retry"
     );
     assert_closed(&mut stream).await;
 }
@@ -888,9 +926,9 @@ async fn given_a_pre_auth_request_above_the_firewall_should_close_rather_than_an
 }
 
 #[tokio::test]
-async fn given_a_refused_first_api_versions_should_not_spend_the_single_allowance() {
+async fn given_a_refused_api_versions_when_retried_lower_should_still_be_answered() {
     // A client refused at one version is entitled to retry lower, which is what the KIP-511
-    // downgrade does. Spending the allowance on the refusal strands it on the retry.
+    // downgrade does. An allowance that did not cover the retry would strand it.
     let addr = spawn_sasl_gateway().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -909,4 +947,28 @@ async fn given_a_refused_first_api_versions_should_not_spend_the_single_allowanc
         ERROR_NONE,
         "the downgrade retry must not be refused for having spent the allowance"
     );
+}
+
+#[tokio::test]
+async fn given_a_repeated_refused_api_versions_should_run_the_allowance_out() {
+    // The half a success-only allowance misses: a version this gateway refuses is one the peer
+    // can repeat, and every frame resets the pre-authentication read budget, so refusals that
+    // cost nothing hold a `max_connections` permit for as long as the client keeps typing.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    for correlation_id in 1..=i32::from(MAX_PRE_AUTH_API_VERSIONS) {
+        let refused = send(&mut stream, API_KEY_API_VERSIONS, 99, correlation_id, &[]).await;
+        assert_ne!(
+            error_code(&refused),
+            ERROR_NONE,
+            "v99 is out of range at every attempt"
+        );
+    }
+
+    // Past the allowance there is nothing left to answer with: ILLEGAL_SASL_STATE has no shape at
+    // a version outside the firewall, so this closes without a body.
+    let frame = build_request_frame(API_KEY_API_VERSIONS, 99, 99, Some("sasl-test"), &[]);
+    stream.write_all(&frame).await.expect("write request");
+    assert_closed(&mut stream).await;
 }

@@ -147,9 +147,11 @@ Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 
 - [x] SASL/PLAIN (17, 36), opt-in via `IGGY_KAFKA_SASL_ENABLED`, credentials verified against Iggy.
       Kept out of `SUPPORTED_RANGES` on purpose: the connection loop routes both keys through the
-      SASL state machine before dispatch, so a gateway with the feature off refuses them like any
-      other unlisted key and enabling it later cannot silently widen what an unauthenticated client
-      may send. SCRAM is ruled out by Iggy's credential storage, not deferred
+      SASL state machine before dispatch, so a gateway with the feature off advertises neither key
+      and answers either one with `ILLEGAL_SASL_STATE` (34) and an empty mechanism list, keeping the
+      connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
+      silently widen what an unauthenticated client may send. SCRAM is ruled out by Iggy's
+      credential storage, not deferred
 - [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys

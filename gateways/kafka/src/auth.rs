@@ -27,6 +27,8 @@ use async_trait::async_trait;
 use iggy::prelude::{AutoLogin, Client, Credentials, IggyClientBuilder, IggyError};
 use tracing::{debug, warn};
 
+use crate::bridge::config::DEFAULT_IGGY_ADDR;
+use crate::env::parse_bool;
 use crate::protocol::sasl::PlainCredentials;
 
 /// Bound on one credential verification.
@@ -121,12 +123,6 @@ pub struct IggyAuthenticator {
     tls: IggyTls,
 }
 
-/// Iggy address used when `IGGY_KAFKA_IGGY_ADDR` is unset.
-///
-/// Matches `bridge::config`'s own default. The two read the same variable for the same purpose, so
-/// they must not disagree about what it falls back to.
-const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
-
 impl IggyAuthenticator {
     /// The complete set of `IGGY_KAFKA_*` vars this type reads, for `main`'s unknown-var guard.
     ///
@@ -177,14 +173,11 @@ impl IggyAuthenticator {
     pub fn from_env() -> Result<Self, String> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
-        let enabled = match std::env::var("IGGY_KAFKA_IGGY_TLS_ENABLED").as_deref() {
-            Ok("true") => true,
-            Ok("false") | Err(_) => false,
-            Ok(other) => {
-                return Err(format!(
-                    "invalid IGGY_KAFKA_IGGY_TLS_ENABLED `{other}`: expected `true` or `false`"
-                ));
-            }
+        // Unset reads as off; only a value that is set and unrecognised is an error, which is
+        // what `parse_bool` decides for every switch in this gateway.
+        let enabled = match std::env::var("IGGY_KAFKA_IGGY_TLS_ENABLED") {
+            Ok(raw) => parse_bool("IGGY_KAFKA_IGGY_TLS_ENABLED", &raw)?,
+            Err(_) => false,
         };
         let domain = std::env::var("IGGY_KAFKA_IGGY_TLS_DOMAIN").unwrap_or_default();
         let ca_file = std::env::var("IGGY_KAFKA_IGGY_TLS_CA_FILE").ok();
@@ -294,8 +287,21 @@ fn classify(error: &IggyError) -> AuthError {
 #[cfg(test)]
 mod tests {
     use secrecy::SecretString;
+    use serial_test::serial;
 
     use super::*;
+
+    /// Leaves every variable [`IggyAuthenticator::from_env`] reads unset, so one case's value
+    /// cannot decide another's result.
+    fn clear_authenticator_env() {
+        for key in IggyAuthenticator::KNOWN_ENV_VARS {
+            // SAFETY: every test that calls this is `#[serial]`, which is what makes an env
+            // mutation sound under edition 2024 - see the note on the tests below.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
 
     fn credentials() -> PlainCredentials {
         PlainCredentials {
@@ -336,6 +342,75 @@ mod tests {
             classify(&IggyError::TransientNotCommitted),
             AuthError::Unavailable
         ));
+    }
+
+    /// `#[serial]`, unkeyed: this crate's lib test binary shares one default group, and
+    /// `bridge::config`'s and `server`'s env-touching tests are in it too. Edition 2024's
+    /// `env::set_var`/`remove_var` are unsound against *any* concurrent env read on another
+    /// thread, whichever key either side happens to touch.
+    #[test]
+    #[serial]
+    fn given_an_empty_environment_when_read_should_reach_the_shared_default_in_the_clear() {
+        clear_authenticator_env();
+        let authenticator = IggyAuthenticator::from_env().expect("an empty environment is valid");
+        assert!(!authenticator.is_tls_enabled());
+        assert_eq!(
+            authenticator.to_string(),
+            format!("{DEFAULT_IGGY_ADDR} in the clear"),
+            "the address falls back to the same constant the bridge defaults to"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_a_mistyped_tls_switch_when_read_should_refuse_to_start() {
+        clear_authenticator_env();
+        // SAFETY: `#[serial]` excludes every other env-touching test in this binary.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_ENABLED", "TRUE");
+        }
+        let result = IggyAuthenticator::from_env();
+        clear_authenticator_env();
+        assert!(
+            result.is_err(),
+            "defaulting a mistyped security switch to off is how a deployment sends passwords in \
+             the clear while believing it does not"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_tls_material_without_the_switch_when_read_should_refuse_to_start() {
+        clear_authenticator_env();
+        // SAFETY: `#[serial]` excludes every other env-touching test in this binary.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_CA_FILE", "/etc/iggy/ca.pem");
+        }
+        let result = IggyAuthenticator::from_env();
+        clear_authenticator_env();
+        assert!(
+            result.is_err(),
+            "configured TLS material with the switch unset is the same mistake reached through \
+             the unset path instead of a typo"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_a_complete_tls_configuration_when_read_should_carry_it_through() {
+        clear_authenticator_env();
+        // SAFETY: `#[serial]` excludes every other env-touching test in this binary.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_ADDR", "iggy.internal:8090");
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_ENABLED", "true");
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_DOMAIN", "iggy.internal");
+        }
+        let result = IggyAuthenticator::from_env();
+        clear_authenticator_env();
+
+        let authenticator = result.expect("a complete TLS configuration is valid");
+        assert!(authenticator.is_tls_enabled());
+        assert_eq!(authenticator.to_string(), "iggy.internal:8090 over TLS");
     }
 
     #[tokio::test]

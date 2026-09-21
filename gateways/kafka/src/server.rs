@@ -41,7 +41,9 @@ use crate::protocol::api::{
     sasl_authenticate_outcome, sasl_handshake_outcome,
 };
 use crate::protocol::header::{request_header_version, response_header_version};
-use crate::protocol::sasl::{SASL_HANDSHAKE_VERSION, SaslAction, SaslState, parse_plain};
+use crate::protocol::sasl::{
+    SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState, parse_plain,
+};
 use std::io;
 
 const READ_CHUNK: usize = 65536;
@@ -118,6 +120,10 @@ pub struct GatewayConfig {
     /// shape-valid tokens. `max_connections` alone is not a bound on that: it caps sockets, not
     /// the work each one can ask Iggy to do. Verifications beyond this queue rather than fail,
     /// since a rejected login is indistinguishable from a wrong password to the client.
+    ///
+    /// Four by default, which stays under the shard count of any node with 16 or fewer physical
+    /// cores. A default above that is no bound at all on the deployments most likely to run one
+    /// gateway in front of one node; a larger node raises it deliberately.
     pub max_concurrent_authentications: usize,
 }
 
@@ -135,7 +141,7 @@ impl Default for GatewayConfig {
             shutdown_drain_timeout: Duration::from_secs(25),
             sasl_enabled: false,
             pre_auth_timeout: Duration::from_secs(15),
-            max_concurrent_authentications: 16,
+            max_concurrent_authentications: 4,
         }
     }
 }
@@ -278,8 +284,8 @@ impl KafkaGateway {
         if self.config.sasl_enabled && self.authenticator.is_none() {
             return Err(KafkaProtocolError::InvalidConfig(
                 "SASL is enabled but no authenticator is configured; every client would be \
-                 rejected. Set IGGY_KAFKA_IGGY_ADDR and the Iggy credentials, or unset \
-                 IGGY_KAFKA_SASL_ENABLED"
+                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
+                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
                     .into(),
             ));
         }
@@ -459,24 +465,21 @@ async fn route_frame(
             ctx.config.max_frame_size,
             ctx.config.sasl_enabled,
         ),
-        SaslAction::DispatchFirstApiVersions => {
-            let outcome = handle_request_bounded(
+        SaslAction::DispatchPreAuthApiVersions => {
+            // Counted whatever the answer says. A refusal the client is entitled to retry at a
+            // lower version, which is what the KIP-511 downgrade path does, is covered by the
+            // allowance rather than exempt from it: spending it only on a usable answer lets a
+            // peer repeat a rejected version forever, resetting the pre-authentication read budget
+            // on every frame and holding a `max_connections` permit with it.
+            sasl_state.count_api_versions_answer();
+            handle_request_bounded(
                 req.request_api_key,
                 req.request_api_version,
                 body,
                 ctx.broker,
                 ctx.config.max_frame_size,
                 ctx.config.sasl_enabled,
-            );
-            // Spend the allowance only on an answer the client can use. A refusal it is entitled
-            // to retry at a lower version, which is what the KIP-511 downgrade path does, must not
-            // consume the single attempt and strand a conformant client on the retry.
-            if answered_successfully(&outcome) {
-                *sasl_state = SaslState::AwaitHandshake {
-                    api_versions_seen: true,
-                };
-            }
-            outcome
+            )
         }
         SaslAction::AcceptHandshake(mechanism) => {
             debug!(%peer, %mechanism, "SASL mechanism negotiated");
@@ -507,15 +510,7 @@ async fn route_frame(
             HandleOutcome::Close
         }
         SaslAction::Authenticate => {
-            let outcome = authenticate_token(
-                ctx.authenticator,
-                ctx.auth_slots,
-                ctx.config.pre_auth_timeout,
-                req.request_api_version,
-                body,
-                peer,
-            )
-            .await;
+            let outcome = authenticate_token(ctx, req.request_api_version, body).await;
             // Only a plain `Respond` is success: every refusal path answers with
             // `RespondThenClose`, so the state advances on exactly the accepting branch.
             if matches!(outcome, HandleOutcome::Respond(_)) {
@@ -618,16 +613,14 @@ async fn handle_connection(
 /// user, a wrong password and an unreachable Iggy are indistinguishable to the client on purpose;
 /// the gateway's own log carries the difference.
 async fn authenticate_token(
-    authenticator: Option<&dyn SaslAuthenticator>,
-    auth_slots: &Semaphore,
-    budget: Duration,
+    ctx: &ConnectionContext<'_>,
     api_version: i16,
     body: Bytes,
-    peer: &SocketAddr,
 ) -> HandleOutcome {
+    let peer = ctx.peer;
     let failed = || sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true);
 
-    let Some(authenticator) = authenticator else {
+    let Some(authenticator) = ctx.authenticator else {
         // Unreachable: `run` refuses to start in this combination. Fail closed anyway, since the
         // alternative is admitting an unauthenticated connection.
         error!(%peer, "SASL is enabled but no authenticator is configured");
@@ -647,9 +640,9 @@ async fn authenticate_token(
     // bound: an unauthenticated connection would sit in `acquire()` for as long as the backlog
     // takes to drain, holding a `max_connections` permit the whole time, which is precisely the
     // invariant `pre_auth_timeout` is documented to enforce.
-    let verified = tokio::time::timeout(budget, async {
+    let verified = tokio::time::timeout(ctx.config.pre_auth_timeout, async {
         // Acquire fails only once the semaphore is closed, which this gateway never does.
-        let Ok(_slot) = auth_slots.acquire().await else {
+        let Ok(_slot) = ctx.auth_slots.acquire().await else {
             error!(%peer, "authentication slots unavailable");
             return None;
         };
@@ -687,20 +680,15 @@ async fn authenticate_token(
     }
 }
 
-/// Whether an `ApiVersions` outcome carries `error_code` 0, meaning the client got a usable
-/// answer rather than one it is expected to retry at a lower version.
-fn answered_successfully(outcome: &HandleOutcome) -> bool {
-    let (HandleOutcome::Respond(body) | HandleOutcome::RespondThenClose(body)) = outcome else {
-        return false;
-    };
-    // `ApiVersions` puts its error code in the first two bytes of the body at every version.
-    body.len() >= 2 && i16::from_be_bytes([body[0], body[1]]) == ERROR_NONE
-}
-
 /// Answers a request that is well-formed but not legal in this connection's SASL state.
 ///
 /// `keep_open` marks the one case a real broker does not treat as fatal: a SASL request arriving
 /// on a connection that already authenticated.
+///
+/// The version is checked ahead of the encoders rather than left to fail inside one. A SASL key
+/// asked for above the version this gateway accepts has no response schema to answer in, so
+/// `keep_open` cannot hold there: a body shaped for another version would be misparsed, the same
+/// reason [`SaslAction::RejectHandshakeVersion`] closes rather than clamping.
 fn illegal_state_outcome(
     api_key: i16,
     api_version: i16,
@@ -708,12 +696,13 @@ fn illegal_state_outcome(
     sasl_enabled: bool,
 ) -> HandleOutcome {
     match api_key {
-        API_KEY_SASL_HANDSHAKE => {
+        API_KEY_SASL_HANDSHAKE if (0..=SASL_HANDSHAKE_VERSION).contains(&api_version) => {
             sasl_handshake_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
-        API_KEY_SASL_AUTHENTICATE => {
+        API_KEY_SASL_AUTHENTICATE if (0..=SASL_AUTHENTICATE_MAX_VERSION).contains(&api_version) => {
             sasl_authenticate_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
+        API_KEY_SASL_HANDSHAKE | API_KEY_SASL_AUTHENTICATE => HandleOutcome::Close,
         _ => encode_error_for_key(api_key, api_version, ERROR_ILLEGAL_SASL_STATE, sasl_enabled),
     }
 }
@@ -1302,11 +1291,11 @@ mod tests {
     /// `bridge::config` compile into the same lib unit-test binary. `main.rs`'s own `#[serial]`
     /// test does NOT share this group: `main.rs` is the separate `iggy-gateway-kafka` bin's own
     /// test harness, a different process, and `serial_test`'s mutex is process-local - see that
-    /// test's own doc comment for the mirror-image note): `init_tracing` reads `RUST_LOG` via
-    /// `EnvFilter::try_from_default_env`, and edition 2024's `env::set_var`/`remove_var` are
-    /// unsound against *any* concurrent env read in another thread, not just a write to the same
-    /// key - a set/remove elsewhere in this binary racing this read is exactly the hazard,
-    /// regardless of which var either side touches.
+    /// test's own doc comment for the mirror-image note): `init_tracing` reads `RUST_LOG` with
+    /// `std::env::var`, and edition 2024's `env::set_var`/`remove_var` are unsound against *any*
+    /// concurrent env read in another thread, not just a write to the same key - a set/remove
+    /// elsewhere in this binary racing this read is exactly the hazard, regardless of which var
+    /// either side touches.
     #[test]
     #[serial]
     fn init_tracing_is_idempotent() {

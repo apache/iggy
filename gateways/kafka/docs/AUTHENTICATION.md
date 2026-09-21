@@ -1,8 +1,9 @@
 # Kafka authentication and Iggy identity
 
-Status: proposed. Answers [#3549](https://github.com/apache/iggy/issues/3549) and needs a TLS listener
-first (see [Transport security](#transport-security)). The mechanism choice below is forced by how Iggy
-stores credentials, not preferred.
+Status: implemented. Answers [#3549](https://github.com/apache/iggy/issues/3549). The gateway listener
+still has no TLS, so PLAIN stays confined to a trusted network until that lands (see
+[Transport security](#transport-security)). The mechanism choice below is forced by how Iggy stores
+credentials, not preferred.
 
 ## Decision
 
@@ -124,8 +125,8 @@ never retrievable, so a restarted gateway cannot recover what it minted and must
 again, handling `PersonalAccessTokenAlreadyExists` (51). Names have to be instance-scoped or two gateways
 fight over one token. A user holds at most `max_tokens_per_user` tokens, 100 by default
 (`core/server/config.toml:305`), and tokens leaked by instances that never cleaned up count against that.
-Token expiry has to outlive the cache TTL with margin. The gateway would also be holding bearer credentials
-carrying the full rights of their users with no scope narrowing, in memory, for every principal it has seen.
+The gateway would also be holding bearer credentials carrying the full rights of their users with no scope
+narrowing, in memory, for every principal it has seen.
 
 Measure the login rate before taking any of that on.
 
@@ -144,7 +145,7 @@ Per connection, with SASL enabled. Only ApiVersions and SaslHandshake are legal 
 | | SaslAuthenticate (36), credentials rejected | answer 58 with a generic message, then close |
 | | anything else | answer 34, then close |
 | `Authenticated` | any supported API, including ApiVersions again | serve |
-| `AwaitHandshake` | a second ApiVersions | answer 34, then close (one is allowed, as on a real broker) |
+| `AwaitHandshake` | ApiVersions past the allowance | answer 34, then close (two are allowed: the one a real broker allows, plus the KIP-511 downgrade retry) |
 | `AwaitToken` | SaslAuthenticate above the advertised ceiling | close, no schema exists at that version |
 | any | Metadata or Produce while unauthenticated | close with no body (no error field, and acks=0 forbids one) |
 | | SaslHandshake or SaslAuthenticate | answer 34, keep the connection |
@@ -158,6 +159,9 @@ Notes that decide the implementation.
   out of scope. That matters beyond convenience, see the re-authentication note below.
 - **ApiVersions is answered twice.** The Java client sends it once before the handshake and again after
   authenticating, so it must stay legal in both states.
+- **The pre-authentication allowance counts answers, not successes.** A refusal a client may retry at a
+  lower version is one it may also repeat, and every frame resets the pre-authentication deadline, so
+  spending the allowance only on a usable answer leaves the connection unbounded.
 - **Produce with `acks=0` stays silent.** Answering an unauthenticated fire-and-forget produce desyncs the
   client's correlation stream, so that case closes without writing. The existing rationale in
   `protocol/api.rs` applies unchanged.
@@ -181,9 +185,8 @@ After authentication, Iggy reports exactly one permission-denied code, `IggyErro
 error, because the Iggy error cannot tell them apart.
 
 Iggy's data-plane permission checks read the local shard's view, so a permission revocation is visible on
-the control plane immediately and on the data plane only after that shard applies it. Combined with the
-principal cache TTL above, revocation is eventually consistent by two mechanisms rather than one. Say so
-in the README rather than leaving an operator to discover it.
+the control plane immediately and on the data plane only after that shard applies it. Say so in the README
+rather than leaving an operator to discover it.
 
 ## Transport security
 
@@ -234,9 +237,7 @@ has to resolve it first.
    Auto-provisioning also cannot work here: the gateway only ever sees a password it cannot validate
    against anything until a user already exists, so provisioning would accept any credential as a new
    account. Default: an operator creates the accounts, and the gateway only consumes them.
-2. **What is the principal cache TTL?** It bounds how long a revoked Iggy user keeps working through the
-   gateway. Default: 5 minutes.
-3. **What happens when SASL is enabled on a gateway that already serves unauthenticated clients?** Enabling
+2. **What happens when SASL is enabled on a gateway that already serves unauthenticated clients?** Enabling
    it breaks every existing client at once, since the version advertisement changes. Default: SASL is
    off unless configured, and the two SASL keys are not advertised when it is off.
 

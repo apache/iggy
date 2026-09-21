@@ -26,6 +26,7 @@ use tracing::{info, warn};
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::IggyBridgeConfig;
+use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::server::{bind_listener, init_tracing};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -156,7 +157,7 @@ fn warn_on_unused_bridge_env_vars(sasl_enabled: bool) {
 
 /// Build [`GatewayConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
 /// break the listener (a zero connection cap serves nothing, a zero timeout drops every
-/// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
+/// connection, a semaphore cap above `Semaphore::MAX_PERMITS` panics at startup).
 fn load_config() -> Result<GatewayConfig, String> {
     reject_unknown_kafka_env_vars()?;
     let mut config = GatewayConfig::default();
@@ -205,8 +206,18 @@ fn load_config() -> Result<GatewayConfig, String> {
     if let Some(raw) = env_var("IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS") {
         // Rejecting zero matters more here than elsewhere: a zero-permit semaphore never yields,
         // so every authentication would wait out its budget and no client could ever log in.
-        config.max_concurrent_authentications =
+        let max_concurrent_authentications: usize =
             parse_positive("IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS", &raw)?;
+        // Both caps build a `Semaphore`, so both need the same ceiling: above `MAX_PERMITS`,
+        // `Semaphore::new` panics and the gateway dies on a startup value instead of rejecting it.
+        if max_concurrent_authentications > Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS {max_concurrent_authentications} \
+                 exceeds maximum {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
+        config.max_concurrent_authentications = max_concurrent_authentications;
     }
     // Drain of 0 is valid: abandon in-flight connections immediately on shutdown.
     if let Some(raw) = env_var("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
@@ -222,21 +233,6 @@ fn load_config() -> Result<GatewayConfig, String> {
 
 fn env_var(key: &str) -> Option<String> {
     std::env::var(key).ok()
-}
-
-/// Parses a boolean switch, accepting only the two spellings an operator can check by eye.
-///
-/// Not `str::parse::<bool>` alone, because the failure mode matters here: a typo in the value of
-/// the one variable that turns authentication on must stop the process, never quietly leave it
-/// serving unauthenticated traffic.
-fn parse_bool(key: &str, raw: &str) -> Result<bool, String> {
-    match raw {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(format!(
-            "invalid {key} `{other}`: expected `true` or `false`"
-        )),
-    }
 }
 
 /// Parse a strictly-positive value, rejecting `0` (which for connection caps and timeouts would
@@ -284,14 +280,15 @@ async fn shutdown_signal() {
 mod tests {
     use serial_test::serial;
 
-    use super::{parse_bool, parse_positive, reject_unknown_kafka_env_vars};
+    use super::{parse_positive, reject_unknown_kafka_env_vars};
 
     /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - this binary's
     /// default group). This is the only `#[serial]` test compiled into *this* binary
-    /// (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `bridge::config`'s and
-    /// `server`'s env-touching tests compile into the separate lib test binary, and
-    /// `serial_test`'s mutex is process-local, so it does not (and does not need to) coordinate
-    /// with either of those; `server.rs`'s own `#[serial]` test makes the mirror-image note.
+    /// (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `auth`'s,
+    /// `bridge::config`'s and `server`'s env-touching tests compile into the separate lib test
+    /// binary, and `serial_test`'s mutex is process-local, so it does not (and does not need to)
+    /// coordinate with any of those; `server.rs`'s own `#[serial]` test makes the mirror-image
+    /// note.
     ///
     /// # Safety
     /// Edition 2024's `env::set_var`/`remove_var` are unsound against *any* concurrent env read
@@ -340,22 +337,6 @@ mod tests {
             bridge_var_result.is_ok(),
             "known bridge IGGY_KAFKA_ var must be accepted"
         );
-    }
-
-    /// The one variable that turns authentication on must fail loudly on a typo, never default to
-    /// off. Every spelling a person might reach for is rejected except the two documented ones.
-    #[test]
-    fn parse_bool_accepts_only_the_two_documented_spellings() {
-        assert_eq!(parse_bool("KEY", "true"), Ok(true));
-        assert_eq!(parse_bool("KEY", "false"), Ok(false));
-        for typo in [
-            "1", "0", "TRUE", "False", "yes", "no", "on", "off", "", " true",
-        ] {
-            assert!(
-                parse_bool("KEY", typo).is_err(),
-                "{typo:?} must not be silently treated as a boolean"
-            );
-        }
     }
 
     #[test]

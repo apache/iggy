@@ -32,11 +32,6 @@ use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 /// Bind an ephemeral port, start `KafkaGateway`, return address + shutdown sender.
 pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
     spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: 8 * 1024 * 1024,
-        max_connections: 1024,
         idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
