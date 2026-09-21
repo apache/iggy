@@ -437,7 +437,7 @@ pub async fn persist_purge_generation_with_storage<S: DurableStorage>(
 ///
 /// # Errors
 /// Propagates an open or read failure after the existence probe, except a short read.
-pub async fn read_purge_generation_with_storage<S: DurableStorage>(
+pub async fn read_purge_generation<S: DurableStorage>(
     storage: &S,
     path: &str,
     created_revision: u64,
@@ -755,7 +755,7 @@ mod tests {
             .into_owned();
 
         assert_eq!(
-            read_purge_generation_with_storage(&DiskStorage, &path, 11)
+            read_purge_generation(&DiskStorage, &path, 11)
                 .await
                 .expect("absent file"),
             0,
@@ -766,7 +766,7 @@ mod tests {
             .await
             .expect("persist generation");
         assert_eq!(
-            read_purge_generation_with_storage(&DiskStorage, &path, 11)
+            read_purge_generation(&DiskStorage, &path, 11)
                 .await
                 .expect("valid file"),
             3,
@@ -775,7 +775,7 @@ mod tests {
 
         std::fs::write(&path, [0xAB, 0xCD]).expect("write torn file");
         assert_eq!(
-            read_purge_generation_with_storage(&DiskStorage, &path, 11)
+            read_purge_generation(&DiskStorage, &path, 11)
                 .await
                 .expect("torn file"),
             0,
@@ -785,8 +785,7 @@ mod tests {
         // A directory path is a real I/O error, not a short read: it must
         // surface, not collapse to the re-purge sentinel (a silent re-purge
         // would destroy post-purge messages).
-        let result =
-            read_purge_generation_with_storage(&DiskStorage, &dir.to_string_lossy(), 11).await;
+        let result = read_purge_generation(&DiskStorage, &dir.to_string_lossy(), 11).await;
         assert!(
             matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
             "real I/O error must propagate, got {result:?}",
@@ -813,14 +812,14 @@ mod tests {
             .expect("persist generation");
 
         assert_eq!(
-            read_purge_generation_with_storage(&DiskStorage, &path, 41)
+            read_purge_generation(&DiskStorage, &path, 41)
                 .await
                 .expect("same dir"),
             9,
             "the incarnation that wrote it still hydrates it"
         );
         assert_eq!(
-            read_purge_generation_with_storage(&DiskStorage, &path, 42)
+            read_purge_generation(&DiskStorage, &path, 42)
                 .await
                 .expect("stale file"),
             0,
@@ -832,13 +831,13 @@ mod tests {
             .await
             .expect("persist generation");
         assert_eq!(
-            read_purge_generation_with_storage(&DiskStorage, &path, 42)
+            read_purge_generation(&DiskStorage, &path, 42)
                 .await
                 .expect("rekeyed"),
             1
         );
         assert_eq!(
-            read_purge_generation_with_storage(&DiskStorage, &path, 41)
+            read_purge_generation(&DiskStorage, &path, 41)
                 .await
                 .expect("now stale"),
             0

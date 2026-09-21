@@ -26,7 +26,7 @@ use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
     PURGE_GENERATION_FILE, delete_persisted_offset, delete_persisted_offset_with_storage,
     persist_offset, persist_offset_max, persist_purge_generation_with_storage,
-    read_purge_generation_with_storage,
+    read_purge_generation,
 };
 use crate::persistence::{PartitionPersistence, PersistenceCompletion, PersistenceNotifier};
 use crate::poll_plan::{
@@ -691,7 +691,7 @@ where
     /// reconciler re-applies the purge; a crash AFTER a purge's durable
     /// generation write correctly skips the re-wipe, keeping messages
     /// appended since. A record left by a PREVIOUS incarnation of this
-    /// namespace reads 0 as well (see [`read_purge_generation_with_storage`]). No-op
+    /// namespace reads 0 as well (see [`read_purge_generation`]). No-op
     /// without a partition dir (in-memory storage).
     ///
     /// # Errors
@@ -718,7 +718,7 @@ where
         if let Some(dir) = self.partition_dir() {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
             self.applied_purge_generation =
-                read_purge_generation_with_storage(storage, &path, self.created_revision).await?;
+                read_purge_generation(storage, &path, self.created_revision).await?;
         }
         Ok(())
     }
