@@ -143,9 +143,8 @@ use crate::http::wire::{
     consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
     poll_wire_request, resync_required_polled_messages, store_offset_wire_request,
 };
-use crate::responses::{
-    build_polled_messages_body, build_raw_pat_reply, connected_client_to_response,
-};
+use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
+use crate::responses::connected_client_to_response;
 use crate::rewrite::{
     validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
     warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
