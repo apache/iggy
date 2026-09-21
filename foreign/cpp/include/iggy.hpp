@@ -1626,7 +1626,8 @@ class IggyBlockingClient final {
      * - `tls=<bool>`
      * - `tls_domain=<string>`
      * - `tls_ca_file=<path>`
-     * - `reconnection_retries=<uint32|unlimited>`
+     * - `tls_validate_certificate=<bool>` (defaults to true)
+     * - `reconnection_max_retries=<uint32|unlimited>`
      * - `reconnection_interval=<duration>`
      * - `reestablish_after=<duration>`
      * - `heartbeat_interval=<duration>`
@@ -1642,11 +1643,11 @@ class IggyBlockingClient final {
      * - `receive_window=<uint64>`
      * - `keep_alive_interval=<uint64>`
      * - `max_idle_timeout=<uint64>`
-     * - `validate_certificate=<bool>`
+     * - `tls_validate_certificate=<bool>`
      * - `heartbeat_interval=<duration>`
      * - `reconnection_max_retries=<uint32|unlimited>`
      * - `reconnection_interval=<duration>`
-     * - `reconnection_reestablish_after=<duration>`
+     * - `reestablish_after=<duration>`
      *
      * HTTP accepts these query parameters:
      *
@@ -1656,7 +1657,7 @@ class IggyBlockingClient final {
      * WebSocket accepts these query parameters:
      *
      * - `heartbeat_interval=<duration>`
-     * - `reconnection_retries=<uint32|unlimited>`
+     * - `reconnection_max_retries=<uint32|unlimited>`
      * - `reconnection_interval=<duration>`
      * - `reestablish_after=<duration>`
      * - `read_buffer_size=<unsigned integer>`
@@ -1671,6 +1672,8 @@ class IggyBlockingClient final {
      * - `tls_validate_certificate=<bool>`
      *
      * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
+     * Deprecated aliases:
+     * When an option is repeated, including through a (deprecated) alias, the last occurrence takes effect.
      * Boolean values are `true` or `false`.
      *
      * Credentials embedded in the connection string configure automatic login
