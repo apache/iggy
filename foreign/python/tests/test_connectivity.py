@@ -35,11 +35,11 @@ class TestConnectivity:
         [
             "iggy://iggy:iggy@127.0.0.1:8090",
             "iggy+tcp://iggy:iggy@127.0.0.1:8090",
-            "iggy+tcp://iggy:iggy@127.0.0.1:8090?reconnection_retries=3&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=5s&nodelay=true&tls_domain=localhost&tls_ca_file=unused.pem&tls=false",
+            "iggy+tcp://iggy:iggy@127.0.0.1:8090?reconnection_max_retries=3&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=5s&nodelay=true&tls_domain=localhost&tls_ca_file=unused.pem&tls=false",
             "iggy+http://iggy:iggy@127.0.0.1:3000",
             "iggy+http://iggy:iggy@127.0.0.1:3000?heartbeat_interval=5s&retries=3",
             "iggy+ws://iggy:iggy@127.0.0.1:8092",
-            "iggy+ws://iggy:iggy@127.0.0.1:8092?heartbeat_interval=5s&reconnection_retries=3&reconnection_interval=1s&reestablish_after=5s&read_buffer_size=4096&write_buffer_size=4096&max_write_buffer_size=8192&max_message_size=16384&max_frame_size=16384&accept_unmasked_frames=false&tls_domain=localhost&tls_ca_file=unused.pem&tls_validate_certificate=false&tls=false",
+            "iggy+ws://iggy:iggy@127.0.0.1:8092?heartbeat_interval=5s&reconnection_max_retries=3&reconnection_interval=1s&reestablish_after=5s&read_buffer_size=4096&write_buffer_size=4096&max_write_buffer_size=8192&max_message_size=16384&max_frame_size=16384&accept_unmasked_frames=false&tls_domain=localhost&tls_ca_file=unused.pem&tls_validate_certificate=false&tls=false",
             "iggy+quic://iggy:iggy@127.0.0.1:8080?reconnection_max_retries=0",
         ],
     )
