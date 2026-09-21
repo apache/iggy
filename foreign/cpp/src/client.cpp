@@ -307,30 +307,45 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
                                              const Identifier &stream,
                                              const Identifier &topic,
                                              const std::uint64_t offset,
-                                             const std::uint32_t partition_id) {
+                                             const std::optional<std::uint32_t> partition_id) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, offset, partition_id] {
-        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
-                                        consumer.Id().ToFfi(), offset);
+        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == unspecified_partition_id) {
+            throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
+        }
+        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
+                                        std::string(consumer.KindName()), consumer.Id().ToFfi(), offset);
     });
 }
 
 ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consumer,
                                                          const Identifier &stream,
                                                          const Identifier &topic,
-                                                         const std::uint32_t partition_id) {
+                                                         const std::optional<std::uint32_t> partition_id) {
     return RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id] {
+        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == unspecified_partition_id) {
+            throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
+        }
+        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
         return ConsumerOffsetInfo::FromFfi(Handle()->get_consumer_offset(
-            stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi()));
+            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi()));
     });
 }
 
 void IggyBlockingClient::DeleteConsumerOffset(const Consumer &consumer,
                                               const Identifier &stream,
                                               const Identifier &topic,
-                                              const std::uint32_t partition_id) {
+                                              const std::optional<std::uint32_t> partition_id) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id] {
-        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
-                                         consumer.Id().ToFfi());
+        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == unspecified_partition_id) {
+            throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
+        }
+        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
+                                         std::string(consumer.KindName()), consumer.Id().ToFfi());
     });
 }
 

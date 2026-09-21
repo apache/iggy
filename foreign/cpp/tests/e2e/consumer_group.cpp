@@ -1156,7 +1156,7 @@ TEST_F(E2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucceeds) {
 }
 
 TEST_F(E2E_ConsumerGroup, StoreGetAndDeleteConsumerOffsetSucceeds) {
-    RecordProperty("description", "Stores, retrieves, and deletes an individual consumer offset.");
+    RecordProperty("description", "Retrieves a partition-0 offset with no partition specified.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
@@ -1177,17 +1177,17 @@ TEST_F(E2E_ConsumerGroup, StoreGetAndDeleteConsumerOffsetSucceeds) {
     ASSERT_NO_THROW(client.StoreConsumerOffset(consumer, iggy::Identifier::String(stream_name),
                                                iggy::Identifier::String(topic_name), 0, 0));
 
-    const auto offset = client.GetConsumerOffset(consumer, iggy::Identifier::String(stream_name),
-                                                 iggy::Identifier::String(topic_name), 0);
+    const auto offset =
+        client.GetConsumerOffset(consumer, iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
     EXPECT_EQ(offset.PartitionId(), 0u);
     EXPECT_EQ(offset.CurrentOffset(), 0u);
     EXPECT_EQ(offset.StoredOffset(), 0u);
 
     ASSERT_NO_THROW(client.DeleteConsumerOffset(consumer, iggy::Identifier::String(stream_name),
                                                 iggy::Identifier::String(topic_name), 0));
-    ASSERT_THROW(client.GetConsumerOffset(consumer, iggy::Identifier::String(stream_name),
-                                          iggy::Identifier::String(topic_name), 0),
-                 iggy::IggyException);
+    ASSERT_THROW(
+        client.GetConsumerOffset(consumer, iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
+        iggy::IggyException);
 }
 
 TEST_F(E2E_ConsumerGroup, StoreConsumerOffsetOnEmptyPartitionThrows) {

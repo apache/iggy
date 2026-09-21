@@ -1137,8 +1137,8 @@ class ConsumerGroupMember final {
     [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
 
     /**
-     * @brief Returns the number of partitions assigned to this member.
-     * @return Number of entries in Partitions().
+     * @brief Returns the server-reported number of partitions assigned to this member.
+     * @return Partition count reported by the server.
      */
     [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
 
@@ -1237,8 +1237,8 @@ class ConsumerGroupDetails final {
     [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
 
     /**
-     * @brief Returns the number of members in the group.
-     * @return Number of entries in Members().
+     * @brief Returns the server-reported number of members in the group.
+     * @return Member count reported by the server.
      */
     [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
 
@@ -2549,7 +2549,10 @@ class IggyBlockingClient final {
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
      * @param offset Message offset to store.
-     * @param partition_id Partition whose offset is stored.
+     * @param partition_id Partition whose offset is stored, or `std::nullopt`
+     *        to omit the partition from the request. The maximum
+     *        `std::uint32_t` value is rejected because it is reserved by the
+     *        FFI representation.
      * @throws IggyException if an identifier, partition, or offset is invalid;
      *         the resource does not exist; the client is unauthenticated; the
      *         caller lacks permission; or the request fails.
@@ -2558,7 +2561,7 @@ class IggyBlockingClient final {
                              const Identifier &stream,
                              const Identifier &topic,
                              std::uint64_t offset,
-                             std::uint32_t partition_id);
+                             std::optional<std::uint32_t> partition_id = std::nullopt);
 
     /**
      * @brief Retrieves the stored offset for a consumer or consumer group.
@@ -2574,7 +2577,10 @@ class IggyBlockingClient final {
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition whose offset is retrieved.
+     * @param partition_id Partition whose offset is retrieved, or
+     *        `std::nullopt` to omit the partition from the request. The
+     *        maximum `std::uint32_t` value is rejected because it is reserved
+     *        by the FFI representation.
      * @return Partition state and the stored consumer offset.
      * @throws IggyException if an identifier or partition is invalid; the
      *         resource or stored offset does not exist; the client is
@@ -2584,7 +2590,7 @@ class IggyBlockingClient final {
     ConsumerOffsetInfo GetConsumerOffset(const Consumer &consumer,
                                          const Identifier &stream,
                                          const Identifier &topic,
-                                         std::uint32_t partition_id);
+                                         std::optional<std::uint32_t> partition_id = std::nullopt);
 
     /**
      * @brief Deletes the stored offset for a consumer or consumer group.
@@ -2601,7 +2607,10 @@ class IggyBlockingClient final {
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition whose offset is deleted.
+     * @param partition_id Partition whose offset is deleted, or `std::nullopt`
+     *        to omit the partition from the request. The maximum
+     *        `std::uint32_t` value is rejected because it is reserved by the
+     *        FFI representation.
      * @throws IggyException if an identifier or partition is invalid; the
      *         resource or stored offset does not exist; the client is
      *         unauthenticated; the caller lacks permission; or the request
@@ -2610,7 +2619,7 @@ class IggyBlockingClient final {
     void DeleteConsumerOffset(const Consumer &consumer,
                               const Identifier &stream,
                               const Identifier &topic,
-                              std::uint32_t partition_id);
+                              std::optional<std::uint32_t> partition_id = std::nullopt);
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);
