@@ -19,9 +19,8 @@
 # Companion to stale-prs.yml which runs with remove-stale-when-updated:false
 # to stop the stale bot from unmarking its own label on the next cron run.
 #
-# Comment- and review-driven unmark is handled separately by
-# stale-prs-unmark-on-activity.yml because issue_comment and
-# pull_request_review on cross-fork PRs deliver a read-only GITHUB_TOKEN.
+# Comment- and review-driven unmark lives in pr-triage-apply.yml, which
+# already resolves the PR for every comment and review.
 
 name: Unmark Stale PRs
 

@@ -20,14 +20,15 @@ name: PR Triage Apply
 # Comment-driven PR triage and lifecycle labels. Inspired by
 # rust-lang/triagebot UX.
 #
-# Two-stage design to defeat the fork-PR token restriction:
-#   pr-triage-collect.yml runs on issue_comment / pull_request_review with
-#   a read-only GITHUB_TOKEN (forced for cross-fork events) and uploads
-#   the raw event payload as artifact `triage-event`. This workflow then
-#   fires via workflow_run on the base ref, where the GITHUB_TOKEN has
-#   write perms, downloads the artifact, and applies the labels.
-#   pull_request_target lifecycle is handled directly here without going
-#   through the collector — it already gets a write token by design.
+# Triggers:
+#   issue_comment        runs the default-branch workflow with the write
+#                        token declared below, on fork PRs too.
+#   pull_request_target  lifecycle, same token, base-repo workflow.
+#   workflow_run         pull_request_review handoff. That event runs the
+#                        PR's own copy of pr-triage-collect.yml with a
+#                        read-only token on cross-fork PRs, so the collector
+#                        only completes and this run does the work on the
+#                        base ref. See SECURITY below.
 #
 # Comment commands (parsed line-by-line in PR comments and review bodies):
 #   /request-review @u [@u2 ...]   — request review from one or more
@@ -67,21 +68,31 @@ name: PR Triage Apply
 #   converted_to_draft     -> remove both S-* labels
 #   closed (merged or not) -> remove both S-* labels
 #
+# Stale bot:
+#   Any comment or review removes S-stale; the bot never clears its own
+#   label (remove-stale-when-updated: false in stale-prs.yml). Push,
+#   reopen and ready_for_review are handled by stale-prs-unmark.yml.
+#
 # SECURITY:
-# - workflow_run, pull_request_target are the ONLY triggers here.
+# - issue_comment, pull_request_target and workflow_run are the ONLY
+#   triggers. All three run this file from the base ref.
 # - No actions/checkout of any ref. PR-controlled code is never executed.
 # - The default GITHUB_TOKEN is never written to outputs, env files, or
 #   passed to user-supplied programs. The workflow only calls the GitHub
 #   REST API via actions/github-script.
-# - pull_request_target runs the base-repo workflow with a write token so
-#   fork-PR lifecycle labels can be applied. workflow_run also runs against
-#   base ref. Both are safe because we never run fork code: no checkout,
-#   no exec of PR contents, no token export. The review/comment body
-#   reaches us via the artifact uploaded by pr-triage-collect.yml; it is
-#   treated as untrusted text, parsed only by the command regex. See
+# - Nothing produced by the collector run is consumed: no artifact, no
+#   output, no env file. A fork can rewrite its copy of the collector, so
+#   the only facts taken from that run are the ones GitHub sets on the
+#   workflow_run payload (event, conclusion, actor, head_sha, created_at).
+#   The review itself, its author association and its body are fetched
+#   from the API.
+#   Comment and review bodies are untrusted text parsed only by the
+#   command regex. See
 #   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
 
 on:
+  issue_comment:
+    types: [created]
   pull_request_target:
     types: [opened, ready_for_review, converted_to_draft, closed]
   workflow_run:
@@ -92,99 +103,42 @@ permissions:
   pull-requests: write
   issues: write
   contents: read
-  # Required for actions/download-artifact@v8 to fetch the triage-event
-  # artifact uploaded by the upstream PR Triage Collect run via run-id.
-  actions: read
 
 concurrency:
-  # cancel-in-progress: false keeps the active run, but GH still replaces
-  # any pending run with the latest arrival on burst commands. Net effect
-  # under N rapid commands: the active run plus the latest arrival land,
-  # everything queued in between is dropped. Acceptable because /ready
-  # and /author are idempotent (state is reflected in the final label)
-  # and /request-review is the only non-idempotent command; a 3-command
-  # /request-review burst in <1s lands at most 2 reviewers, larger bursts
-  # lose proportionally more. Pending-queue retention key (queue:) is not
-  # yet in the GH Actions schema; revisit when available.
-  #
-  # workflow_run leg cannot key on PR number until after artifact parse,
-  # so it falls back to the upstream run id. Each collect run is unique,
-  # so this widens the group to one-run-per-upstream-collect and same-PR
-  # bursts on this leg do NOT serialize. Correctness does not depend on
+  # Only the lifecycle leg keys on the PR number, so only lifecycle runs
+  # ever queue (GH keeps one pending run per group and cancels it when
+  # another arrives; cancel-in-progress: false lets the active one
+  # finish). The comment leg keys on the comment id and the workflow_run
+  # leg on the upstream run id, both unique, so command runs never evict
+  # a pending lifecycle run nor each other: every comment and review
+  # runs, in parallel when they burst. Correctness does not depend on
   # serialization: the setLabels helper performs an atomic replace-all
   # (list current labels, drop the S-* sibling, push target, single
   # setLabels call), so two interleaved label flips converge on the
   # last-finishing run's target instead of fabricating a both-labels
-  # state. Per-PR serialization on this leg is a noise/cost
-  # optimization, blocked on GH adding job-level concurrency so the
-  # parsed PR number can re-key.
-  group: pr-triage-apply-${{ github.event.pull_request.number || github.event.workflow_run.id }}
+  # state. Per-PR serialization of command runs would only save noise
+  # and is blocked on GH adding job-level concurrency (the PR number is
+  # known only after resolution) or a pending-queue retention key
+  # (queue:), neither of which is in the schema yet.
+  group: pr-triage-apply-${{ github.event.pull_request.number || github.event.comment.id || github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
   apply:
+    # The workflow_run gate on the upstream event is not a formality: a
+    # fork can change what its copy of the collector triggers on.
     if: |
       github.event_name == 'pull_request_target'
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null)
       || (github.event_name == 'workflow_run'
-          && github.event.workflow_run.conclusion == 'success')
+          && github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'pull_request_review')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
-      - name: Download triage event artifact
-        if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v8
-        with:
-          name: triage-event
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: payload/
-
-      - name: Parse triage event payload
-        if: github.event_name == 'workflow_run'
-        env:
-          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          # The artifact contains exactly one file: the JSON event payload
-          # uploaded as `${{ github.event_path }}`. Its on-disk name is
-          # whatever the runner used (e.g. event.json); resolve it dynamically.
-          payload=( payload/*.json payload/event.json )
-          f=""
-          for candidate in "${payload[@]}"; do
-            [[ -f "$candidate" ]] && f="$candidate" && break
-          done
-          if [[ -z "$f" ]]; then
-            echo "triage payload not found under payload/" >&2
-            ls -la payload/ >&2 || true
-            exit 1
-          fi
-          # Body is attacker-controlled. Route it via a file rather than
-          # $GITHUB_ENV: heredoc terminators can be forged inside the body
-          # to close the block early and inject arbitrary env vars (e.g.
-          # NODE_OPTIONS, GITHUB_PATH) into the subsequent github-script
-          # step, which holds a write GITHUB_TOKEN. The other fields below
-          # are constrained single-line values (numeric ids, enum states,
-          # GH login charset) and can stay in $GITHUB_ENV.
-          jq -r '.comment.body // .review.body // ""' "$f" > payload/body.txt
-          {
-            echo "COMMENT_AUTHOR=$(jq -r '.comment.user.login // .review.user.login // ""' "$f")"
-            echo "COMMENT_ASSOC=$(jq -r '.comment.author_association // .review.author_association // ""' "$f")"
-            echo "COMMENT_ID=$(jq -r '.comment.id // ""' "$f")"
-            echo "PR_NUMBER=$(jq -r '.pull_request.number // .issue.number // ""' "$f")"
-            echo "REVIEW_STATE=$(jq -r '.review.state // ""' "$f")"
-            echo "TRIAGE_EVENT_NAME=${UPSTREAM_EVENT}"
-          } >> "$GITHUB_ENV"
-
       - name: Dispatch
         uses: actions/github-script@v9
-        env:
-          COMMENT_AUTHOR: ${{ env.COMMENT_AUTHOR }}
-          COMMENT_ASSOC: ${{ env.COMMENT_ASSOC }}
-          COMMENT_ID: ${{ env.COMMENT_ID }}
-          PR_NUMBER: ${{ env.PR_NUMBER || github.event.pull_request.number }}
-          REVIEW_STATE: ${{ env.REVIEW_STATE }}
-          TRIAGE_EVENT_NAME: ${{ env.TRIAGE_EVENT_NAME || github.event_name }}
         with:
           script: |
             const LABEL_REVIEW = 'S-waiting-on-review';
@@ -193,6 +147,8 @@ jobs:
             // is the only label stale-prs.yml exempts, so it is added and
             // removed on its own and never goes through replaceStateLabel.
             const LABEL_PINNED = 'pinned';
+            // Must match stale-pr-label in stale-prs.yml.
+            const LABEL_STALE = 'S-stale';
             const COMMITTER_ASSOCS = new Set(['MEMBER', 'COLLABORATOR', 'OWNER']);
             // Wider gate for the implicit changes_requested -> author
             // flip: a formal "Request changes" review is a deliberate,
@@ -200,24 +156,16 @@ jobs:
             // it, not just committers. Derived from COMMITTER_ASSOCS so
             // the two cannot drift. Bots are excluded separately.
             const REVIEW_AUTHOR_ASSOCS = new Set(['CONTRIBUTOR', ...COMMITTER_ASSOCS]);
-            const prNumber = Number(process.env.PR_NUMBER);
-            // Number('') === 0 and an unknown jq path also yields ''.
-            // Without this gate the run would silently issue API calls
-            // against issue_number: 0, get a 404 swallowed by the
-            // pulls.get catch below, and complete green with no labels
-            // applied. Fail loudly instead so the misconfiguration shows
-            // up as a red Actions run.
-            if (!Number.isInteger(prNumber) || prNumber <= 0) {
-              core.setFailed(`invalid PR_NUMBER: ${process.env.PR_NUMBER}`);
-              return;
-            }
-
-            // Effective event name. On the workflow_run leg the artifact
-            // payload was produced by issue_comment / pull_request_review,
-            // and the upstream event name was preserved into the env in
-            // the parse step. On the pull_request_target leg we read the
-            // GH-provided context.eventName directly.
-            const eventName = process.env.TRIAGE_EVENT_NAME || context.eventName;
+            // The triage subject, resolved per event once the helpers below
+            // exist. prNumber is set on every leg, the rest only on the
+            // comment/review leg.
+            let prNumber;
+            let commentAuthor = '';
+            let commentAssoc = '';
+            let isBot = false;
+            let commentId = null;
+            let reviewState = '';
+            let body = '';
 
             // Welcome comment posted once when a non-draft PR is opened.
             // The leading HTML marker is invisible in rendered Markdown
@@ -343,31 +291,38 @@ jobs:
               }
             };
 
-            // Add-only / remove-only, so unlike replaceStateLabel there is no
-            // list-then-PUT window an unrelated label change can be lost in.
-            const setPinned = async (on) => {
-              if (on) {
-                if (!await ensurePinnedLabel()) return false;
-                await withRetry(() => github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNumber,
-                  labels: [LABEL_PINNED],
-                }), `addLabels ${LABEL_PINNED}`);
-                return true;
-              }
+            // Remove-only, so unlike replaceStateLabel there is no list-then-PUT
+            // window an unrelated label change can be lost in. 404 is the PR
+            // not carrying the label, or the label not existing at all; both
+            // mean it is already absent.
+            const removeLabelIfPresent = async (name) => {
               try {
                 await withRetry(() => github.rest.issues.removeLabel({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: prNumber,
-                  name: LABEL_PINNED,
-                }), `removeLabel ${LABEL_PINNED}`);
+                  name,
+                }), `removeLabel ${name}`);
+                return true;
               } catch (e) {
-                // 404 is the PR not carrying the label, or the label not existing
-                // at all. Both mean it is already in the state /unpin asks for.
                 if (e.status !== 404) throw e;
+                return false;
               }
+            };
+
+            // Add-only for the same reason.
+            const setPinned = async (on) => {
+              if (!on) {
+                await removeLabelIfPresent(LABEL_PINNED);
+                return true;
+              }
+              if (!await ensurePinnedLabel()) return false;
+              await withRetry(() => github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [LABEL_PINNED],
+              }), `addLabels ${LABEL_PINNED}`);
               return true;
             };
 
@@ -376,7 +331,6 @@ jobs:
             // Reactions exist only for issue comments — review-triggered
             // commands have no comment to react to, so commentId is null
             // and react() is a no-op.
-            const commentId = Number(process.env.COMMENT_ID) || null;
             const react = async (content) => {
               if (!commentId) return;
               try {
@@ -461,8 +415,97 @@ jobs:
               }
             };
 
+            // ----- resolve the triage subject -----
+            const isBotUser = (user) => !!user
+              && (user.type === 'Bot' || /\[bot\]$/.test(user.login || ''));
+
+            if (context.eventName === 'pull_request_target') {
+              prNumber = context.payload.pull_request.number;
+            } else if (context.eventName === 'issue_comment') {
+              const comment = context.payload.comment;
+              prNumber = context.payload.issue.number;
+              commentAuthor = comment.user.login;
+              commentAssoc = comment.author_association;
+              isBot = isBotUser(comment.user);
+              commentId = comment.id;
+              body = comment.body || '';
+            } else {
+              // workflow_run from pr-triage-collect.yml. On a cross-fork PR
+              // the collector ran the PR's own copy of its workflow, so
+              // nothing it uploaded or printed is trusted; it is not even
+              // downloaded. GitHub sets actor (the review submitter, kept
+              // on re-run), head_sha and created_at on the run, and the
+              // review itself comes from the API. The PR is the open one
+              // at the reviewed head commit, nothing looser: a branch-name
+              // fallback for a push that lands inside the handoff window
+              // would let a closed PR resolve to another fork's identically
+              // named branch and replay the reviewer's older review there.
+              // Such a push costs one automatic flip, which the log shows.
+              const run = context.payload.workflow_run;
+              const reviewer = run.actor && run.actor.login;
+              if (!reviewer) {
+                core.info('review: run has no actor, skipping');
+                return;
+              }
+              const open = await withRetry(() => github.paginate(
+                github.rest.pulls.list,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  per_page: 100,
+                },
+              ), 'pulls.list');
+              // Usually one open PR sits at the reviewed head. Two can,
+              // when someone opens a PR from another PR's exact head
+              // commit; the reviewer's review then tells them apart.
+              const candidates = open.filter(pr => pr.head.sha === run.head_sha);
+              // The review that fired the collector: the reviewer's last
+              // one submitted before the collector run was created. A
+              // plain "latest by reviewer" would miss a changes_requested
+              // when a single inline comment, which GitHub stores as a
+              // COMMENTED review, follows it within the handoff window.
+              // Across candidates the most recent such review wins: the
+              // firing one is seconds old, an older one on a duplicate-head
+              // PR is not.
+              const firedAt = Date.parse(run.created_at);
+              let found = null;
+              for (const candidate of candidates) {
+                const reviews = await withRetry(() => github.paginate(
+                  github.rest.pulls.listReviews,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: candidate.number,
+                    per_page: 100,
+                  },
+                ), `pulls.listReviews #${candidate.number}`);
+                const review = reviews
+                  .filter(r => r.user && r.user.login === reviewer
+                    && Date.parse(r.submitted_at) <= firedAt)
+                  .pop();
+                if (review && (!found
+                    || Date.parse(review.submitted_at) > Date.parse(found.review.submitted_at))) {
+                  found = { number: candidate.number, review };
+                }
+              }
+              if (!found) {
+                core.info(`review: no review by ${reviewer} on the ` +
+                          `${candidates.length} open PRs at head ${run.head_sha}, skipping`);
+                return;
+              }
+              prNumber = found.number;
+              const review = found.review;
+              commentAuthor = reviewer;
+              commentAssoc = review.author_association;
+              isBot = isBotUser(review.user);
+              // REST reports CHANGES_REQUESTED, the webhook changes_requested.
+              reviewState = (review.state || '').toLowerCase();
+              body = review.body || '';
+            }
+
             // ----- pull_request_target lifecycle -----
-            if (eventName === 'pull_request_target') {
+            if (context.eventName === 'pull_request_target') {
               const action = context.payload.action;
               const pr = context.payload.pull_request;
 
@@ -546,25 +589,19 @@ jobs:
             }
 
             // ----- issue_comment / pull_request_review commands -----
-            // Both event types feed the same path: COMMENT_AUTHOR/_ASSOC/
-            // _ID, PR_NUMBER and REVIEW_STATE resolve from the artifact
-            // uploaded by pr-triage-collect.yml via the parse step above.
-            // body is routed through a file (payload/body.txt) rather
-            // than $GITHUB_ENV -- see the parse step's comment for the
-            // injection rationale. The file is absent on the
-            // pull_request_target leg (no parse step), and lifecycle
-            // returned above, so falling back to '' is safe.
-            const fs = require('fs');
-            const body = fs.existsSync('payload/body.txt')
-              ? fs.readFileSync('payload/body.txt', 'utf8')
-              : '';
+
+            // Any comment or review is activity for the stale bot, which
+            // never clears its own label (see stale-prs.yml). Runs before
+            // the command gate so drive-by comments count too.
+            if (await removeLabelIfPresent(LABEL_STALE)) {
+              core.info(`activity: removed ${LABEL_STALE}`);
+            }
 
             // A changes_requested review is an implicit /author: the ball
             // is back with the author. Gated by REVIEW_AUTHOR_ASSOCS
             // (checked below) -- wider than the /author command. An
             // explicit command in the review body still takes precedence.
-            // REVIEW_STATE is empty for issue_comment.
-            const reviewState = process.env.REVIEW_STATE || '';
+            // reviewState is empty for issue_comment.
             const reviewWantsAuthor = reviewState === 'changes_requested';
 
             // Skip everything if there is neither a command line nor an
@@ -581,20 +618,15 @@ jobs:
               return;
             }
 
-            const commentAuthor = process.env.COMMENT_AUTHOR;
-            const commentAssoc = process.env.COMMENT_ASSOC;
-            // Bot-suffixed accounts (e.g. dependabot[bot]) cannot drive
-            // commands as committer or PR author — would let bots
-            // self-flip review state.
-            const isBot = /\[bot\]$/.test(commentAuthor);
+            // Bots (dependabot[bot], ...) cannot drive commands as committer
+            // or PR author -- would let bots self-flip review state.
             const isCommitter = COMMITTER_ASSOCS.has(commentAssoc) && !isBot;
             // Permitted to drive the implicit changes_requested flip;
             // see REVIEW_AUTHOR_ASSOCS.
             const isReviewFlipper = REVIEW_AUTHOR_ASSOCS.has(commentAssoc) && !isBot;
 
-            // Live state read. The artifact carries the webhook-frozen
-            // payload at delivery time, plus we now have ~30s of
-            // artifact-handoff latency on top; comment-while-open +
+            // Live state read. The event payload is frozen at delivery time
+            // and the workflow_run leg adds ~30s on top; comment-while-open +
             // close-arriving-later would otherwise re-label a now-closed
             // PR. Run on both committer and non-committer paths --
             // correctness over the single API call saved on the
@@ -621,8 +653,8 @@ jobs:
             // Reject command runs against a PR that turned draft after
             // the comment was posted. The pull_request_target lifecycle
             // clears S-* on converted_to_draft; without this gate the
-            // ~30-90s artifact-handoff window lets a stale command
-            // re-add S-waiting-on-review onto a now-draft PR.
+            // ~30-90s of event latency lets a stale command re-add
+            // S-waiting-on-review onto a now-draft PR.
             if (prData.data.draft) {
               core.info('PR is draft, skipping');
               return;
