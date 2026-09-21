@@ -85,14 +85,6 @@ impl IggyStreamConfig {
     pub fn producer_config(&self) -> &IggyProducerConfig {
         &self.producer_config
     }
-
-    pub fn stream_name(&self) -> &str {
-        self.producer_config.stream_name()
-    }
-
-    pub fn topic_name(&self) -> &str {
-        self.producer_config.topic_name()
-    }
 }
 
 #[cfg(test)]
@@ -118,8 +110,8 @@ mod tests {
         )
         .unwrap();
         let config = IggyStreamConfig::new(consumer_config, producer_config);
-        assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(config.topic_name(), "test_topic");
+        assert_eq!(config.consumer_config().stream_name(), "test_stream");
+        assert_eq!(config.producer_config().topic_name(), "test_topic");
         assert_eq!(config.consumer_config().batch_length(), 100);
         assert_eq!(config.producer_config().batch_length(), 100);
         assert_eq!(
@@ -135,8 +127,8 @@ mod tests {
     #[test]
     fn should_be_default() {
         let config = IggyStreamConfig::default();
-        assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(config.topic_name(), "test_topic");
+        assert_eq!(config.consumer_config().stream_name(), "test_stream");
+        assert_eq!(config.producer_config().topic_name(), "test_topic");
         assert_eq!(config.consumer_config().batch_length(), 100);
         assert_eq!(config.producer_config().batch_length(), 100);
         assert_eq!(
@@ -162,8 +154,8 @@ mod tests {
         assert!(res.is_ok());
         let config = res.unwrap();
 
-        assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(config.topic_name(), "test_topic");
+        assert_eq!(config.consumer_config().stream_name(), "test_stream");
+        assert_eq!(config.producer_config().topic_name(), "test_topic");
         assert_eq!(config.consumer_config().batch_length(), 100);
         assert_eq!(config.producer_config().batch_length(), 100);
         assert_eq!(

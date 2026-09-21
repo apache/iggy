@@ -61,7 +61,7 @@ async fn main() -> Result<(), IggyError> {
 
     println!("Stop the message stream and shutdown iggy client");
     sender.send(()).expect("Failed to send shutdown signal");
-    let stream_id = Identifier::named(stream_config.stream_name())?;
+    let stream_id = Identifier::named(stream_config.producer_config().stream_name())?;
     client.delete_stream(&stream_id).await?;
     client.shutdown().await?;
 
