@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod api;
-pub mod bounds_guard;
-pub mod handlers;
-pub mod header;
+//! Fetch-side bridge calls.
+//!
+//! Empty until the Fetch handler lands. Separate from `produce.rs` so the two never edit one
+//! file.
