@@ -23,7 +23,8 @@ use elasticsearch::{
 };
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -47,11 +48,11 @@ struct State {
     last_poll_timestamp: Option<DateTime<Utc>>,
     total_documents_fetched: usize,
     poll_count: usize,
-    /// Last document ID processed (for cursor-based pagination)
+    /// Retained in snapshots; not used for pagination.
     last_document_id: Option<String>,
-    /// Last scroll ID (for scroll-based pagination)
+    /// Retained in snapshots; the connector does not use scroll.
     last_scroll_id: Option<String>,
-    /// Last processed offset
+    /// Retained in snapshots; not used as a polling cursor.
     last_offset: Option<u64>,
     /// Error count and last error
     error_count: usize,
@@ -62,31 +63,47 @@ struct State {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProcessingStats {
-    /// Total bytes processed
+    /// Serialized source payload bytes fetched, including retries.
     total_bytes_processed: u64,
-    /// Average processing time per batch
+    /// Mean successful-poll elapsed milliseconds, including the polling delay.
     avg_batch_processing_time_ms: f64,
     /// Last successful processing timestamp
     last_successful_poll: Option<DateTime<Utc>>,
     /// Number of empty polls
     empty_polls_count: usize,
-    /// Number of successful polls
+    /// Number of successful polls, including empty polls.
     successful_polls_count: usize,
+}
+
+impl ProcessingStats {
+    fn record_success(&mut self, elapsed: Duration, empty: bool) {
+        self.successful_polls_count += 1;
+        self.last_successful_poll = Some(Utc::now());
+
+        let total_polls = self.successful_polls_count;
+        self.avg_batch_processing_time_ms = (self.avg_batch_processing_time_ms
+            * (total_polls - 1) as f64
+            + elapsed.as_millis() as f64)
+            / total_polls as f64;
+        if empty {
+            self.empty_polls_count += 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
     /// Enable state persistence
     pub enabled: bool,
-    /// State storage type: "file", "elasticsearch", "redis", etc.
+    /// Only "file" is implemented; other values fall back to the default file directory.
     pub storage_type: Option<String>,
     /// State storage configuration (depends on storage_type)
     pub storage_config: Option<Value>,
     /// State ID for this connector instance
     pub state_id: Option<String>,
-    /// Auto-save state interval (e.g., "30s", "5m")
+    /// Interval for manually started StateManager tasks; unused by the runtime plugin.
     pub auto_save_interval: Option<String>,
-    /// Fields to track in state (e.g., ["last_timestamp", "last_document_id"])
+    /// Reserved; does not filter the saved state.
     pub tracked_fields: Option<Vec<String>>,
 }
 
@@ -101,6 +118,7 @@ pub struct ElasticsearchSourceConfig {
     pub polling_interval: Option<String>,
     pub batch_size: Option<usize>,
     pub timestamp_field: Option<String>,
+    /// Reserved; the connector does not use the scroll API.
     pub scroll_timeout: Option<String>,
     pub state: Option<StateConfig>,
 }
@@ -112,6 +130,7 @@ pub struct ElasticsearchSource {
     client: Option<Elasticsearch>,
     polling_interval: Duration,
     state: Mutex<State>,
+    pending_timestamp: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl ElasticsearchSource {
@@ -139,6 +158,7 @@ impl ElasticsearchSource {
             config,
             client: None,
             polling_interval,
+            pending_timestamp: Mutex::new(None),
             state: Mutex::new(restored_state.unwrap_or(State {
                 last_poll_timestamp: None,
                 total_documents_fetched: 0,
@@ -319,7 +339,7 @@ impl ElasticsearchSource {
     async fn search_documents(
         &self,
         client: &Elasticsearch,
-    ) -> Result<Vec<ProducedMessage>, Error> {
+    ) -> Result<(Vec<ProducedMessage>, Option<DateTime<Utc>>), Error> {
         let state = self.state.lock().await;
         let batch_size = self.config.batch_size.unwrap_or(100);
 
@@ -387,8 +407,23 @@ impl ElasticsearchSource {
             .await
             .map_err(|e| Error::Storage(format!("Failed to parse search response: {}", e)))?;
 
+        if response_body.get("timed_out").and_then(Value::as_bool) == Some(true) {
+            return Err(Error::Storage("Elasticsearch search timed out".to_string()));
+        }
+        if let Some(failed_shards) = response_body
+            .get("_shards")
+            .and_then(|shards| shards.get("failed"))
+            .and_then(Value::as_u64)
+            .filter(|failed| *failed > 0)
+        {
+            return Err(Error::Storage(format!(
+                "Elasticsearch search failed on {failed_shards} shards"
+            )));
+        }
+
         let mut messages = Vec::new();
         let mut latest_timestamp = None;
+        let mut payload_bytes = 0;
 
         if let Some(hits) = response_body
             .get("hits")
@@ -414,6 +449,7 @@ impl ElasticsearchSource {
                         Error::Serialization(format!("Failed to serialize document: {}", e))
                     })?;
 
+                    payload_bytes += payload.len() as u64;
                     let message = ProducedMessage {
                         id: None,
                         headers: None,
@@ -430,12 +466,9 @@ impl ElasticsearchSource {
         // Update state
         let mut state = self.state.lock().await;
         state.total_documents_fetched += messages.len();
+        state.processing_stats.total_bytes_processed += payload_bytes;
         state.poll_count += 1;
-        if let Some(timestamp) = latest_timestamp {
-            state.last_poll_timestamp = Some(timestamp);
-        }
-
-        Ok(messages)
+        Ok((messages, latest_timestamp))
     }
 }
 
@@ -500,28 +533,15 @@ impl Source for ElasticsearchSource {
             .as_ref()
             .ok_or_else(|| Error::Storage("Elasticsearch client not initialized".to_string()))?;
 
-        let messages = match self.search_documents(client).await {
-            Ok(msgs) => {
-                // Update success statistics
+        let (messages, latest_timestamp) = match self.search_documents(client).await {
+            Ok((msgs, latest_timestamp)) => {
                 let mut state = self.state.lock().await;
-                state.processing_stats.successful_polls_count += 1;
-                state.processing_stats.last_successful_poll = Some(Utc::now());
-
-                let processing_time = start_time.elapsed().as_millis() as f64;
-                let total_polls = state.processing_stats.successful_polls_count
-                    + state.processing_stats.empty_polls_count;
-                state.processing_stats.avg_batch_processing_time_ms =
-                    (state.processing_stats.avg_batch_processing_time_ms
-                        * (total_polls - 1) as f64
-                        + processing_time)
-                        / total_polls as f64;
-
-                if msgs.is_empty() {
-                    state.processing_stats.empty_polls_count += 1;
-                }
+                state
+                    .processing_stats
+                    .record_success(start_time.elapsed(), msgs.is_empty());
 
                 drop(state);
-                msgs
+                (msgs, latest_timestamp)
             }
             Err(e) => {
                 // Update error statistics
@@ -533,15 +553,31 @@ impl Source for ElasticsearchSource {
             }
         };
         let persisted_state = {
-            let state = self.state.lock().await;
-            self.serialize_state(&state)
+            let mut candidate_state = self.state.lock().await.clone();
+            if let Some(timestamp) = latest_timestamp {
+                candidate_state.last_poll_timestamp = Some(timestamp);
+            }
+            self.serialize_state(&candidate_state).ok_or_else(|| {
+                Error::Serialization("Failed to serialize Elasticsearch source state".to_string())
+            })?
         };
+        *self.pending_timestamp.lock().await = latest_timestamp;
 
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: persisted_state,
+            state: Some(persisted_state),
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let pending_timestamp = self.pending_timestamp.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(timestamp) = pending_timestamp
+        {
+            self.state.lock().await.last_poll_timestamp = Some(timestamp);
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -573,5 +609,230 @@ impl Source for ElasticsearchSource {
             self.id
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONNECTOR_NAME, ElasticsearchSource, ElasticsearchSourceConfig, State};
+    use iggy_connector_sdk::{ConnectorState, Source, source::SourceBatchResult};
+    use serde_json::json;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_config(url: &str) -> ElasticsearchSourceConfig {
+        serde_json::from_value(json!({
+            "url": url,
+            "index": "logs",
+            "polling_interval": "0s",
+            "timestamp_field": "timestamp"
+        }))
+        .unwrap()
+    }
+
+    async fn source_backend() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs/_search"))
+            .and(body_partial_json(json!({"query": {"match_all": {}}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hits": {"hits": [{"_source": {"timestamp": "2026-01-01T00:00:00Z", "value": 1}}]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs/_search"))
+            .and(body_partial_json(json!({"query": {"bool": {"must": [
+                {"match_all": {}}, {"range": {"timestamp": {"gt": "2026-01-01T00:00:00+00:00"}}}
+            ]}}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"hits": {"hits": []}})))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn given_nack_should_retry_documents_before_advancing_cursor() {
+        let server = source_backend().await;
+        let mut source = ElasticsearchSource::new(1, test_config(&server.uri()), None);
+        source.open().await.unwrap();
+        let first = source.poll().await.unwrap();
+        assert_eq!(first.messages.len(), 1);
+
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .unwrap();
+        let retry = source.poll().await.unwrap();
+        assert_eq!(
+            retry.messages.len(),
+            1,
+            "Nack must leave the document eligible for the next poll"
+        );
+        assert_eq!(retry.messages[0].payload, first.messages[0].payload);
+
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .unwrap();
+        assert!(source.poll().await.unwrap().messages.is_empty());
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_no_state_should_start_fresh() {
+        let source = ElasticsearchSource::new(1, test_config("http://localhost:9200"), None);
+        let state = source.state.lock().await;
+        assert!(state.last_poll_timestamp.is_none());
+        assert_eq!(state.total_documents_fetched, 0);
+    }
+
+    #[tokio::test]
+    async fn given_invalid_state_should_start_fresh() {
+        let source = ElasticsearchSource::new(
+            1,
+            test_config("http://localhost:9200"),
+            Some(ConnectorState(b"invalid state".to_vec())),
+        );
+        let state = source.state.lock().await;
+        assert!(state.last_poll_timestamp.is_none());
+        assert_eq!(state.total_documents_fetched, 0);
+    }
+
+    #[tokio::test]
+    async fn given_persisted_state_should_restore_cursor() {
+        let source = ElasticsearchSource::new(1, test_config("http://localhost:9200"), None);
+        let mut state = source.state.lock().await.clone();
+        state.last_poll_timestamp = Some("2026-01-01T00:00:00Z".parse().unwrap());
+        state.total_documents_fetched = 12;
+        let restored = ElasticsearchSource::new(
+            1,
+            test_config("http://localhost:9200"),
+            source.serialize_state(&state),
+        );
+        let restored = restored.state.lock().await;
+        assert_eq!(restored.last_poll_timestamp, state.last_poll_timestamp);
+        assert_eq!(restored.total_documents_fetched, 12);
+    }
+
+    #[tokio::test]
+    async fn state_should_be_serializable_and_deserializable() {
+        let source = ElasticsearchSource::new(1, test_config("http://localhost:9200"), None);
+        let mut state = source.state.lock().await.clone();
+        state.poll_count = 7;
+        state.last_document_id = Some("record_1".to_string());
+        state.error_count = 2;
+        state.last_error = Some("backend unavailable".to_string());
+        state.processing_stats.successful_polls_count = 5;
+        let restored = source
+            .serialize_state(&state)
+            .unwrap()
+            .deserialize::<State>(CONNECTOR_NAME, 1)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(state).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn given_empty_and_nonempty_polls_should_average_each_poll_once() {
+        let source = ElasticsearchSource::new(1, test_config("http://localhost:9200"), None);
+        let mut state = source.state.lock().await;
+        let stats = &mut state.processing_stats;
+        for (milliseconds, empty) in [(100, false), (200, true), (300, false), (400, true)] {
+            stats.record_success(std::time::Duration::from_millis(milliseconds), empty);
+        }
+        assert_eq!(stats.successful_polls_count, 4);
+        assert_eq!(stats.empty_polls_count, 2);
+        assert_eq!(stats.avg_batch_processing_time_ms, 250.0);
+    }
+
+    #[tokio::test]
+    async fn given_fetched_documents_should_count_payload_bytes_including_retries() {
+        let server = source_backend().await;
+        let mut source = ElasticsearchSource::new(1, test_config(&server.uri()), None);
+        source.open().await.unwrap();
+        let first = source.poll().await.unwrap();
+        assert_eq!(first.messages.len(), 1);
+        let payload_bytes = first.messages[0].payload.len() as u64;
+        assert_eq!(
+            source
+                .state
+                .lock()
+                .await
+                .processing_stats
+                .total_bytes_processed,
+            payload_bytes
+        );
+
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .unwrap();
+        let retry = source.poll().await.unwrap();
+        assert_eq!(retry.messages.len(), 1);
+        assert_eq!(
+            source
+                .state
+                .lock()
+                .await
+                .processing_stats
+                .total_bytes_processed,
+            payload_bytes * 2
+        );
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_incomplete_search_should_preserve_cursor_and_retry() {
+        for mut response in [
+            json!({"timed_out": true}),
+            json!({"_shards": {"failed": 1}}),
+        ] {
+            let server = source_backend().await;
+            response["hits"] =
+                json!({"hits": [{"_source": {"timestamp": "2026-01-01T00:00:00Z", "value": 1}}]});
+            Mock::given(method("POST"))
+                .and(path("/logs/_search"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+                .with_priority(1)
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            let mut source = ElasticsearchSource::new(1, test_config(&server.uri()), None);
+            source.open().await.unwrap();
+
+            assert!(
+                source.poll().await.is_err(),
+                "Incomplete response must fail: {response}"
+            );
+            let state = source.state.lock().await;
+            assert!(state.last_poll_timestamp.is_none());
+            assert_eq!(state.total_documents_fetched, 0);
+            assert_eq!(state.error_count, 1);
+            drop(state);
+
+            let retry = source.poll().await.unwrap();
+            assert_eq!(retry.messages.len(), 1);
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .unwrap();
+            source.close().await.unwrap();
+        }
     }
 }

@@ -28,7 +28,15 @@
 use crate::server::scenarios::create_client;
 use bytes::Bytes;
 use iggy::prelude::*;
+use iggy_binary_protocol::WireEncode;
+use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::dispatch::COMMAND_TABLE;
+use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
+use iggy_common::wire_conversions::{
+    consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
+};
 use integration::harness::{TestHarness, login_root};
 
 const STREAM_NAME: &str = "auth-test-stream";
@@ -105,8 +113,6 @@ pub async fn run(harness: &TestHarness) {
 /// New entries in `COMMAND_TABLE` will hit the wildcard arm and panic,
 /// forcing an explicit decision about each new command.
 async fn test_all_commands_require_auth(client: &IggyClient) {
-    use iggy_binary_protocol::codes::*;
-
     let ctx = TestContext::new();
 
     for entry in COMMAND_TABLE {
@@ -157,6 +163,18 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
             DESCRIBE_OPTIONS_CODE => client
                 .describe_options(OptionsScope::Topic)
+                .await
+                .map(|_| ()),
+            ATTACH_CONSUMER_SESSION_CODE => client
+                .send_binary_request(
+                    code,
+                    AttachConsumerSessionRequest {
+                        client_id: 0,
+                        session: 0,
+                        metadata_watermark: 0,
+                    }
+                    .to_bytes(),
+                )
                 .await
                 .map(|_| ()),
 
@@ -271,6 +289,22 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 )
                 .await
                 .map(|_| ()),
+            GET_POLL_ROUTING_CODE | POLL_MESSAGES_ON_PRIMARY_CODE => client
+                .send_binary_request(
+                    code,
+                    PollMessagesRequest {
+                        consumer: consumer_to_wire(&ctx.consumer).unwrap(),
+                        stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
+                        topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
+                        partition_id: Some(0),
+                        strategy: polling_strategy_to_wire(&PollingStrategy::offset(0)),
+                        count: 1,
+                        auto_commit: true,
+                    }
+                    .to_bytes(),
+                )
+                .await
+                .map(|_| ()),
             FLUSH_UNSAVED_BUFFER_CODE => {
                 client
                     .flush_unsaved_buffer(&ctx.stream_id, &ctx.topic_id, 0, false)
@@ -278,6 +312,19 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             }
 
             // Consumer Offsets
+            GET_CONSUMER_OFFSET_ROUTING_CODE => client
+                .send_binary_request(
+                    code,
+                    GetConsumerOffsetRequest {
+                        consumer: consumer_to_wire(&ctx.consumer).unwrap(),
+                        stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
+                        topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
+                        partition_id: Some(0),
+                    }
+                    .to_bytes(),
+                )
+                .await
+                .map(|_| ()),
             GET_CONSUMER_OFFSET_CODE => client
                 .get_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
                 .await

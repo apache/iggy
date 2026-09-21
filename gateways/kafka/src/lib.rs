@@ -17,6 +17,7 @@
 
 //! Kafka wire protocol gateway foundation for Apache Iggy.
 
+pub mod bridge;
 pub mod error;
 pub mod protocol;
 pub mod server;

@@ -352,8 +352,8 @@ jobs:
       - name: Check status
         run: |
           set -euxo pipefail
-          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## CI Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
           # Helper function to format status with appropriate emoji
           format_status() {
@@ -384,16 +384,16 @@ jobs:
           }
 
           # Language test results with timing
-          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Status | Duration |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|--------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Status | Duration |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|--------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
           # Detection and Common checks always run
           detect_status=$(format_status "${{ needs.detect.result }}" "${{ steps.times.outputs.detect_time }}")
           common_status=$(format_status "${{ needs.common.result }}" "${{ steps.times.outputs.common_time }}")
-          echo "| 🔍 Detection | $detect_status | ${{ steps.times.outputs.detect_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📋 Common Checks | $common_status | ${{ steps.times.outputs.common_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔍 Detection | $detect_status | ${{ steps.times.outputs.detect_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 📋 Common Checks | $common_status | ${{ steps.times.outputs.common_time }} |" >> "$GITHUB_STEP_SUMMARY"
 
           # Language/component tests
           rust_status=$(format_status "${{ needs.test-rust.result }}" "${{ steps.times.outputs.rust_time }}")
@@ -408,19 +408,19 @@ jobs:
           examples_status=$(format_status "${{ needs.test-examples.result }}" "${{ steps.times.outputs.examples_time }}")
           other_status=$(format_status "${{ needs.test-other.result }}" "${{ steps.times.outputs.other_time }}")
 
-          echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🐍 Python | $python_status | ${{ steps.times.outputs.python_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🐘 PHP | $php_status | ${{ steps.times.outputs.php_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🟢 Node | $node_status | ${{ steps.times.outputs.node_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🐹 Go | $go_status | ${{ steps.times.outputs.go_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| ☕ Java | $java_status | ${{ steps.times.outputs.java_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🔷 C# | $csharp_status | ${{ steps.times.outputs.csharp_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🔶 C++ | $cpp_status | ${{ steps.times.outputs.cpp_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🧪 BDD | $bdd_status | ${{ steps.times.outputs.bdd_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📚 Examples | $examples_status | ${{ steps.times.outputs.examples_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📦 Other | $other_status | ${{ steps.times.outputs.other_time }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Total workflow time:** ${{ steps.times.outputs.total_time }}" >> $GITHUB_STEP_SUMMARY
+          echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🐍 Python | $python_status | ${{ steps.times.outputs.python_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🐘 PHP | $php_status | ${{ steps.times.outputs.php_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🟢 Node | $node_status | ${{ steps.times.outputs.node_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🐹 Go | $go_status | ${{ steps.times.outputs.go_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ☕ Java | $java_status | ${{ steps.times.outputs.java_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔷 C# | $csharp_status | ${{ steps.times.outputs.csharp_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔶 C++ | $cpp_status | ${{ steps.times.outputs.cpp_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🧪 BDD | $bdd_status | ${{ steps.times.outputs.bdd_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 📚 Examples | $examples_status | ${{ steps.times.outputs.examples_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 📦 Other | $other_status | ${{ steps.times.outputs.other_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total workflow time:** ${{ steps.times.outputs.total_time }}" >> "$GITHUB_STEP_SUMMARY"
 
           # Check for failures
           if [[ "${{ needs.common.result }}" == "failure" ]] || \
@@ -436,8 +436,8 @@ jobs:
              [[ "${{ needs.test-bdd.result }}" == "failure" ]] || \
              [[ "${{ needs.test-examples.result }}" == "failure" ]] || \
              [[ "${{ needs.test-other.result }}" == "failure" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "❌ **CI Failed** - Please check the logs for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ **CI Failed** - Please check the logs for details." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           elif [[ "${{ needs.common.result }}" == "cancelled" ]] || \
                [[ "${{ needs.detect.result }}" == "cancelled" ]] || \
@@ -452,10 +452,10 @@ jobs:
                [[ "${{ needs.test-bdd.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-examples.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-other.result }}" == "cancelled" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ **CI Cancelled** - The workflow was cancelled." >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ **CI Cancelled** - The workflow was cancelled." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           else
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ **CI Passed** - All checks completed successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ **CI Passed** - All checks completed successfully!" >> "$GITHUB_STEP_SUMMARY"
           fi

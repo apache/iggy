@@ -25,6 +25,7 @@ use iggy_binary_protocol::consensus::{
     RequestHeader, read_size_field, result_code, result_section_len,
 };
 use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
@@ -201,6 +202,23 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
         }
         _ => Err(IggyError::InvalidCommand),
     }
+}
+
+/// Track metadata acknowledgments without adding coordinator traffic to warm polls.
+pub(crate) fn observe_metadata_reply(watermark: &AtomicU64, header: &[u8; HEADER_SIZE]) {
+    if peek_command(header) != Command::Reply {
+        return;
+    }
+    let Ok(operation) = read_operation(header) else {
+        return;
+    };
+    if operation == Operation::NonReplicated || operation.is_partition() {
+        return;
+    }
+    const COMMIT_OFFSET: usize = std::mem::offset_of!(ReplyHeader, commit);
+    let mut commit = [0; size_of::<u64>()];
+    commit.copy_from_slice(&header[COMMIT_OFFSET..COMMIT_OFFSET + size_of::<u64>()]);
+    watermark.fetch_max(u64::from_le_bytes(commit), Ordering::Release);
 }
 
 /// Decode a reply when the header and body have been read into separate

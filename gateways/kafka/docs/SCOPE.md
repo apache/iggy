@@ -89,7 +89,7 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
 | **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
-| **3 — Iggy bridge** | Out of scope | Produce/Fetch → Iggy SDK; deferred to a follow-on issue |
+| **3 — Iggy bridge** | Landed, not wired in | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed; Produce/Fetch handler wiring itself is a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
 
@@ -97,14 +97,22 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 
 Items from the [hybrid architecture review](https://github.com/apache/iggy/discussions/3252) and maintainer feedback. **Not part of #3421.**
 
-### Phase 2 — Iggy bridge (new issue)
+### Phase 2 — Iggy bridge
 
-- [ ] Add `bridge/` module (`iggy_bridge`): Produce → `send_messages`, Fetch → `poll_messages`
-- [ ] Document partition mapping in `docs/BRIDGE_MAPPING.md`:
+[#3533](https://github.com/apache/iggy/issues/3533) landed the bridge module itself; the items
+below it are still open for the issues that build on top of it.
+
+- [x] Add `bridge/` module (`iggy_bridge`) - connection lifecycle, topic mapping, provisioning,
+      high watermark, error mapping. See [README.md](../README.md#iggy-bridge-3533). Produce →
+      `send_messages` / Fetch → `poll_messages` handler wiring itself is
+      [#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536),
+      not part of `bridge/`'s own scope.
+- [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
+      exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
+- [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
-  - Iggy **consumer groups exist** — map Kafka group APIs to Iggy consumer group APIs
-  - Use `Partitioning::balanced()` only when Kafka sends `partition == -1`; otherwise use request partition ID
-- [ ] Idempotent `ensure_stream_and_topic()` (create-if-not-exists)
+  - Kafka consumer groups do **not** map onto Iggy consumer groups. Assignment stays client-side, and Iggy's group registry is used as an offset key only ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md))
+  - `Partitioning::partition_id(index)` on every Produce. A Kafka producer resolves the partition before it builds the request, so `Partitioning::balanced()` has no trigger there. The `-1` default-partition-count case belongs to CreateTopics
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
 ### `kafka-protocol` crate adoption — superseded, done differently
@@ -122,11 +130,17 @@ above).
 
 ### Phase 3 — Consumer groups (~7 API keys)
 
+Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
+[`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
+
 - [ ] OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
 - [ ] JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning
+
+InitProducerId and idempotent producers
+([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 - [ ] SASL (17, 36) if required by deployment
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)

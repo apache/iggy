@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::leader_aware::read_transport_endpoints;
 use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
     check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
 };
+use crate::poll_routing::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::prelude::AutoLogin;
 use crate::session::ConsensusSession;
 use crate::vsr::replay_after_session_reset_is_safe;
@@ -47,6 +49,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -79,6 +82,7 @@ const TRANSIENT_FAILOVER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// QUIC client for interacting with the Iggy API.
 #[derive(Debug)]
 pub struct QuicClient {
+    poll_router: PollRouter<Self>,
     pub(crate) endpoint: Endpoint,
     pub(crate) connection: Arc<Mutex<Option<Connection>>>,
     pub(crate) config: Arc<QuicClientConfig>,
@@ -95,6 +99,7 @@ pub struct QuicClient {
     /// as walk candidates for a request the current node keeps refusing to
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
+    roster_learned: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent QUIC streams cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -132,6 +137,20 @@ impl Client for QuicClient {
 
 #[async_trait]
 impl BinaryTransport for QuicClient {
+    async fn send_offset_write_with_response(
+        &self,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        self.poll_router.write_offset(self, code, payload).await
+    }
+
+    async fn send_poll_with_response(
+        &self,
+        request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+    ) -> Result<Bytes, IggyError> {
+        self.poll_router.poll(self, request).await
+    }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
     }
@@ -147,6 +166,9 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if is_poll_routing_code(code) {
+            return self.send_poll_request(code, payload).await;
+        }
         let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
         let mut result = self.send_raw(code, payload.clone()).await;
 
@@ -416,6 +438,7 @@ impl iggy_common::VsrSessionControl for QuicClient {
         // mid-request can leave the old session in place until this sign-in
         // re-mints it.
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
     }
 
@@ -425,7 +448,42 @@ impl iggy_common::VsrSessionControl for QuicClient {
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
+        self.poll_router.clear_session();
         Ok(())
+    }
+
+    async fn remember_session_credentials(&self, credentials: Credentials, user_id: u32) {
+        self.poll_router.remember_credentials(credentials, user_id);
+        if self.auto_login_configured()
+            || self.get_state().await != ClientState::Authenticated
+            || self.roster_learned.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let read = read_transport_endpoints(self, TransportProtocol::Quic);
+        let Ok((node_count, endpoints)) = tokio::time::timeout(ROSTER_READ_TIMEOUT, read).await
+        else {
+            warn!("Reading the cluster roster took longer than {ROSTER_READ_TIMEOUT:?}");
+            return;
+        };
+        if !endpoints.is_empty() {
+            self.poll_router
+                .roster_size
+                .store(node_count, Ordering::Release);
+            *self.roster_endpoints.lock().await = endpoints;
+        }
+    }
+
+    async fn forget_session_credentials(&self) {
+        self.poll_router.forget_credentials();
+    }
+
+    async fn refresh_session_password(&self, user: &iggy_common::Identifier, new_password: &str) {
+        self.poll_router.refresh_password(user, new_password);
+    }
+
+    async fn refresh_session_username(&self, user: &iggy_common::Identifier, new_username: &str) {
+        self.poll_router.refresh_username(user, new_username);
     }
 
     fn sdk_version(&self) -> &'static str {
@@ -434,6 +492,35 @@ impl iggy_common::VsrSessionControl for QuicClient {
 }
 
 impl BinaryClient for QuicClient {}
+
+#[async_trait]
+impl PollTransport for QuicClient {
+    const PROTOCOL: TransportProtocol = TransportProtocol::Quic;
+
+    async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
+        let mut config = (*self.config).clone();
+        config.server_address = endpoint.to_owned();
+        config.auto_login = AutoLogin::Enabled(
+            self.poll_router
+                .credentials()
+                .ok_or(IggyError::Unauthenticated)?,
+        );
+        config.reconnection.enabled = false;
+        let mut client_address = config
+            .client_address
+            .parse::<SocketAddr>()
+            .map_err(|_| IggyError::InvalidClientAddress)?;
+        client_address.set_port(0);
+        config.client_address = client_address.to_string();
+        let client = Self::create(Arc::new(config))?;
+        client.connect_off_leader().await?;
+        Ok(client)
+    }
+
+    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, false).await
+    }
+}
 
 impl QuicClient {
     /// Whether an `AutoLogin` is configured on this client, which makes the
@@ -495,6 +582,7 @@ impl QuicClient {
 
         let server_address = config.server_address.clone();
         Ok(Self {
+            poll_router: PollRouter::default(),
             config,
             endpoint,
             connection: Arc::new(Mutex::new(None)),
@@ -506,6 +594,7 @@ impl QuicClient {
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
+            roster_learned: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -527,6 +616,7 @@ impl QuicClient {
         recv: &mut RecvStream,
         response_buffer_size: usize,
         read_timeout: Duration,
+        metadata_watermark: &std::sync::atomic::AtomicU64,
     ) -> Result<Bytes, IggyError> {
         let buffer = tokio::time::timeout(read_timeout, recv.read_to_end(response_buffer_size))
             .await
@@ -542,6 +632,12 @@ impl QuicClient {
             return Err(IggyError::EmptyResponse);
         }
 
+        if let Some(header) = buffer
+            .get(..iggy_binary_protocol::HEADER_SIZE)
+            .and_then(|header| header.try_into().ok())
+        {
+            crate::vsr::observe_metadata_reply(metadata_watermark, header);
+        }
         crate::vsr::decode_response(Bytes::from(buffer))
     }
 
@@ -800,6 +896,9 @@ impl QuicClient {
         // persistently refused request runs, not for dead-node redial (which
         // remains TCP-only).
         if !leader_check.endpoints.is_empty() {
+            self.poll_router
+                .roster_size
+                .store(leader_check.node_count, Ordering::Release);
             *self.roster_endpoints.lock().await = leader_check.endpoints;
         }
         let leader_address = leader_check.redirect;
@@ -890,6 +989,15 @@ impl QuicClient {
     }
 
     async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, true).await
+    }
+
+    async fn send_raw_request(
+        &self,
+        code: u32,
+        payload: Bytes,
+        retry_transient: bool,
+    ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
                 trace!("Cannot send data. Client is shutdown.");
@@ -915,6 +1023,7 @@ impl QuicClient {
         let connection = self.connection.clone();
         let response_buffer_size = self.config.response_buffer_size;
         let consensus_session = self.consensus_session.clone();
+        let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let connection = connection.lock().await;
@@ -983,10 +1092,12 @@ impl QuicClient {
                         &mut recv,
                         response_buffer_size as usize,
                         remaining,
+                        &metadata_watermark,
                     )
                     .await
                     {
                         Ok(reply) => return Ok(reply),
+                        Err(error) if !retry_transient => return Err(error),
                         // `TransientNotCommitted` = the server replied with an
                         // explicit retry frame with an outcome that may still
                         // be resolving (not-caught-up / in-flight /

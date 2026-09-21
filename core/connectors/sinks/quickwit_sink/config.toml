@@ -39,7 +39,7 @@ verbose_logging = true
 max_retries = 2
 retry_delay = "250ms"
 retry_max_delay = "2s"
-# Total readiness probes including the first; 1 disables retries.
+# One initial probe per readiness check; share up to max_open_retries - 1 retries.
 max_open_retries = 8
 open_retry_max_delay = "10s"
 timeout = "10s"

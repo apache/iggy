@@ -583,7 +583,14 @@ impl SurrealDbSink {
             return request;
         };
 
-        request.basic_auth(username, Some(password.expose_secret()))
+        let mut request = request.basic_auth(username, Some(password.expose_secret()));
+        if matches!(self.auth_scope, AuthScope::Namespace | AuthScope::Database) {
+            request = request.header("Surreal-Auth-NS", &self.namespace);
+        }
+        if self.auth_scope == AuthScope::Database {
+            request = request.header("Surreal-Auth-DB", &self.database);
+        }
+        request
     }
 
     async fn process_messages(

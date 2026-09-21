@@ -21,12 +21,19 @@ capabilities.
 Install the NuGet package:
 
 ```bash
-dotnet add package Apache.Iggy --version 0.9.0-edge.9
+dotnet add package Apache.Iggy --version 0.9.0
 ```
 
 The examples target server 0.9.0. For source builds, use the server and SDK from the same checkout.
-The SDK targets .NET 8 and .NET 10; repository examples require .NET 10. `0.9.0-edge.9`
+The SDK targets .NET 8 and .NET 10; repository examples require .NET 10. `0.9.0`
 includes the independent message and consumer-offset durability options.
+
+Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
+and uses separate connections to partition primaries. It requires server support
+for binary commands 14, 103 and 104. Pause binary auto-commit consumers for the
+whole upgrade: upgrade every server first, then the SDKs, and restart consumers
+so they rejoin their groups. Older SDKs can lose membership when a backup refuses
+an offset commit; the new SDK does not fall back to legacy polling.
 
 ### Supported Protocols
 

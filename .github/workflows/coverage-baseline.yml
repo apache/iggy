@@ -90,7 +90,7 @@ jobs:
       - name: Install system dependencies
         run: |
           ./scripts/ci/apt-install.sh gnome-keyring keyutils dbus-x11 libsecret-tools
-          rm -f $HOME/.local/share/keyrings/*
+          rm -f "$HOME"/.local/share/keyrings/*
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -104,7 +104,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.3
+        uses: taiki-e/install-action@v2.87.8
         with:
           tool: cargo-llvm-cov
 
@@ -299,7 +299,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.3
+        uses: taiki-e/install-action@v2.87.8
         with:
           tool: cargo-llvm-cov
 
@@ -318,7 +318,7 @@ jobs:
           export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
 
           # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
-          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> "$GITHUB_ENV"
 
           cargo llvm-cov clean --workspace
           echo "Building Python wheel with coverage instrumentation..."
@@ -436,7 +436,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7
         with:
           node-version: "23"
           cache: "npm"

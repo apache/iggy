@@ -11,7 +11,7 @@
 
 <div align="center">
 
-[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/apache-iggy) | [Crates](https://crates.io/crates/iggy)
+[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/quickstart/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/apache-iggy) | [Crates](https://crates.io/crates/iggy) | [Mailing list](https://iggy.apache.org/community/mailing-lists/)
 
 </div>
 <p align="center">
@@ -38,6 +38,27 @@
 <p align="center">
   <a title="Discord" target="_blank" href="https://discord.gg/apache-iggy"><img alt="Chat with Apache Iggy community on Discord" src="https://img.shields.io/discord/1144142576266530928?label=Discord&logo=Discord&style=social"></a>
 </p>
+
+**Contents:** [What is Apache Iggy?](#what-is-apache-iggy) ·
+[Features](#features) ·
+[Architecture](#architecture) ·
+[Clustering](#clustering) ·
+[Version](#version) ·
+[Supported languages SDK](#supported-languages-sdk) ·
+[CLI](#cli) ·
+[Web UI](#web-ui) ·
+[Connectors](#connectors) ·
+[Kafka gateway](#kafka-gateway) ·
+[Model Context Protocol](#model-context-protocol) ·
+[Docker](#docker) ·
+[Kubernetes](#kubernetes) ·
+[Configuration](#configuration) ·
+[Run the server](#run-the-server) ·
+[Try the CLI](#try-the-cli) ·
+[Examples](#examples) ·
+[SDK](#sdk) ·
+[Benchmarks](#benchmarks) ·
+[Contributing](#contributing)
 
 ---
 
@@ -109,11 +130,21 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ---
 
+## Clustering
+
+Clustering is built into the standard `iggy-server` binary, with no separate build or feature flag. The same server runs as a single node or as a cluster, and `cluster.enabled` in the configuration chooses which. Clustering is disabled by default.
+
+Replicas stay consistent using [Viewstamped Replication (VSR)](https://github.com/apache/iggy/blob/master/assets/vsr.pdf), which commits on a quorum and elects a new primary when the current one fails. See the [clustering documentation](https://iggy.apache.org/docs/clustering/vsr) for configuration and deployment.
+
+---
+
 ## Version
 
-The official releases follow the regular semver (`0.7.0`) or have `latest` tag applied (`apache/iggy:latest`).
+The official releases follow semver (for example `server-0.9.0`), and the Docker images also carry the `latest` tag (`apache/iggy:latest`).
 
-We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
+The server, SDKs and CLI are versioned independently. For example, server 0.9.0 ships with Rust SDK 0.11.0 and CLI 0.14.0. The [server compatibility table](https://iggy.apache.org/docs/sdk/introduction#server-compatibility) lists the SDK version for each server release.
+
+We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
 
 ---
 
@@ -186,6 +217,12 @@ fields = ["email", "created_at"]
 
 ---
 
+## Kafka gateway
+
+The [Kafka gateway](https://github.com/apache/iggy/tree/master/gateways/kafka) is a Kafka wire protocol listener in front of Iggy, intended to let existing Kafka clients use Iggy. It is in development and not yet part of a release. See its [README](gateways/kafka/README.md) for the current status and how to run it.
+
+---
+
 ## Model Context Protocol
 
 The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open protocol that standardizes how applications provide context to LLMs. The **[Iggy MCP Server](https://github.com/apache/iggy/tree/master/core/ai/mcp)** is an implementation of the MCP protocol for the message streaming infrastructure. It can be used to provide context to LLMs in real-time, allowing for more accurate and relevant responses.
@@ -196,30 +233,44 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 ## Docker
 
-The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+The official images are on [Docker Hub](https://hub.docker.com/r/apache/iggy). Images tagged `latest` are built from stable releases, and `edge` images are built from the latest `master` branch. Images for the other tools, such as the connectors runtime and the MCP server, are also on [Docker Hub](https://hub.docker.com/u/apache?page=1&search=iggy).
 
-You can also find the images for all the different tooling such as Connectors, MCP Server etc. at [Docker Hub](https://hub.docker.com/u/apache?page=1&search=iggy).
+The published image listens on `127.0.0.1` inside the container, so the host can't reach it by default. This command makes it reachable and sets the root credentials:
 
-Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
-
-You can find the `Dockerfile` and `docker-compose` in the root of the repository. To build and start the server, run: `docker compose up`.
-
-Additionally, you can run the `CLI` which is available in the running container, by executing: `docker exec -it iggy-server /iggy`.
-
-Keep in mind that running the container on the OS other than Linux, where the Docker is running in the VM, might result in the performance degradation.
-
-Also, when running the container, **make sure to include the additional capabilities**, as you can find in [docker-compose](https://github.com/apache/iggy/blob/master/docker-compose.yml) file:
-
-```yml
-cap_add:
-  - SYS_NICE
-security_opt:
-  - seccomp:unconfined
-ulimits:
-  memlock:
-    soft: -1
-    hard: -1
+```bash
+docker run -d --name iggy \
+  --cap-add=SYS_NICE --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=iggy \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 -e IGGY_HTTP_ADDRESS=0.0.0.0:3000 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
+  -p 8090:8090 -p 3000:3000 \
+  -v iggy:/app/local_data \
+  apache/iggy
 ```
+
+The CLI is on the image's `PATH`:
+
+```bash
+docker exec -it iggy iggy -u iggy -p iggy stream list
+```
+
+The `SYS_NICE` capability, the seccomp setting and the unlimited locked memory are required. The [Docker & Helm](https://iggy.apache.org/docs/server/docker) page explains why, and has a `docker-compose.yml` example and the Helm chart.
+
+On operating systems other than Linux, Docker runs in a VM, so the container might run slower.
+
+To build the image from source instead, run `docker compose up` from the root of the repository. That image listens on all interfaces and keeps its data in `/local_data`. The container is named `iggy-server`, and the CLI is at `/iggy`. Set `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` in `docker-compose.yml`. Otherwise the server generates a root password and prints it once in the container log.
+
+---
+
+## Kubernetes
+
+A Helm chart for the server and the Web UI is in [helm/charts/iggy](helm/charts/iggy):
+
+```bash
+helm install iggy ./helm/charts/iggy --set server.image.tag=0.9.0
+```
+
+See the chart [README](helm/charts/iggy/README.md) and the [Docker & Helm](https://iggy.apache.org/docs/server/docker) page for its settings.
 
 ---
 
@@ -247,7 +298,7 @@ For the detailed documentation of the configuration file, please refer to the [c
 
 ---
 
-## Quick start
+## Run the server
 
 Build the project (the longer compilation time is due to [LTO](https://doc.rust-lang.org/rustc/linker-plugin-lto.html) enabled in release [profile](https://github.com/apache/iggy/blob/master/Cargo.toml#L2):
 
@@ -276,8 +327,7 @@ $env:IGGY_ROOT_USERNAME = "iggy"
 $env:IGGY_ROOT_PASSWORD = "iggy"
 ```
 
-By default, `iggy-server` will generate a randomized root user password and print it to `stdout`, when there's
-NO users created.
+If no root credentials are set and no users exist yet, `iggy-server` generates a random root user password and prints it once in the server log.
 
 Start the server:
 
@@ -315,7 +365,11 @@ To quickly generate the sample data:
 
 `cargo run --bin data-seeder-tool`
 
-*Please note that all commands below are using `iggy` binary, which is part of release (`cli` sub-crate).*
+---
+
+## Try the CLI
+
+The commands below use the `iggy` CLI from the `core/cli` crate, run against the server started above.
 
 Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `websocket`, `tcp`, `http`, default `tcp`):
 
@@ -357,7 +411,7 @@ Finally, restart the server to see it is able to load the persisted data.
 
 The HTTP API endpoints can be found in [server.http](https://github.com/apache/iggy/blob/master/core/server/server.http) file, which can be used with [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension for VS Code.
 
-To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` environment variable. See images below:
+To see the detailed logs from the CLI/server, run it with the `RUST_LOG=trace` environment variable.
 
 ---
 
@@ -366,6 +420,8 @@ To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` envir
 You can find comprehensive sample applications under the `examples/rust` directory. These examples showcase various usage patterns of the Iggy client SDK, from basic operations to advanced multi-tenant scenarios.
 
 For detailed information about available examples and how to run them, please see the [Examples README](examples/rust/README.md).
+
+There are also examples for [C#](examples/csharp/README.md), [Go](examples/go/README.md), [Java](examples/java/README.md), [Node.js](examples/node/README.md), [PHP](examples/php/README.md) and [Python](examples/python/README.md).
 
 ---
 

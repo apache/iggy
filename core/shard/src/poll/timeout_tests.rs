@@ -101,7 +101,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     let late_reply = reply.clone();
     let completion = owner
         .poll_completions
-        .try_reserve(requested_namespace, reply)
+        .try_reserve(requested_namespace, reply, None)
         .expect("reserve the read before the requester times out");
     let read_plan = partitions
         .build_poll_snapshot(&requested_namespace, requested_consumer, &args)
@@ -239,7 +239,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
     let (held_reply, _held_replies) = channel(1);
     let reservation = owner
         .poll_completions
-        .try_reserve(namespace, held_reply)
+        .try_reserve(namespace, held_reply, None)
         .expect("reserve the only slot");
     assert_eq!(owner.poll_completion_inbox_len(), 0);
     let (reply, replies) = channel(1);

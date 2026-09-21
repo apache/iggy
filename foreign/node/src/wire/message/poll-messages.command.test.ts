@@ -276,6 +276,20 @@ describe('VSR consumer-group polling', () => {
     );
   });
 
+  it('does not replay an ambiguous auto-commit poll when its coordinator also resets', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, [4]),
+      new ResponseError(COMMAND_CODE.PollMessages, 57)
+    ], (command, emitter) => {
+      if (command === COMMAND_CODE.PollMessages)
+        emitter.emit('sessionReset');
+    });
+    await assert.rejects(pollMessages(async () => client)({ ...groupRequest, autocommit: true }),
+      (error: unknown) => error instanceof ResponseError && error.errorCode === 57);
+    assert.deepEqual(commands.map(({ command }) => command),
+      [COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages]);
+  });
+
   it('resynchronizes twice before returning an empty result', async () => {
     const resyncPartition = 0xFFFF_FFFF;
     const { client, commands } = stubClient([

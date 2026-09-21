@@ -10,7 +10,7 @@
 
 Apache Iggy Node.js client written in typescript, it currently only supports tcp & tls transports.
 
-diclaimer: although all iggy commands & basic client/stream are implemented this is still a WIP, provided as is, and has still a long way to go to be considered "battle tested".
+Disclaimer: although all iggy commands & basic client/stream are implemented this is still a WIP, provided as is, and has still a long way to go to be considered "battle tested".
 
 note: This lib started as _iggy-bin_ ( [github](https://github.com/T1B0/iggy-bin) / [npm](https://www.npmjs.com/package/iggy-bin)) before migrating under iggy-rs org. package iggy-bin@v1.3.4 is equivalent to @iggy.rs/sdk@v1.0.3 and migrating again under apache iggy monorepo ( [github](https://github.com/apache/iggy/tree/master/foreign/node) and is now published on npmjs as apache-iggy
 
@@ -145,6 +145,13 @@ Durations accept the same expressions as the Rust SDK, for example `500ms`,
 `5` are rejected.
 
 ## use sources
+
+Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
+and uses separate connections to partition primaries. It requires server support
+for binary commands 14, 103 and 104. Pause binary auto-commit consumers for the
+whole upgrade: upgrade every server first, then the SDKs, and restart consumers
+so they rejoin their groups. Older SDKs can lose membership when a backup refuses
+an offset commit; the new SDK does not fall back to legacy polling.
 
 ### Install
 

@@ -1017,7 +1017,10 @@ impl StreamsInner {
         self.pending_revocations_count = count;
     }
 
-    pub(crate) fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    /// Resolve a wire stream identifier to its committed slab id, `None` when
+    /// the stream does not exist.
+    #[must_use]
+    pub fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;
@@ -1031,11 +1034,11 @@ impl StreamsInner {
         }
     }
 
-    pub(crate) fn resolve_topic_id(
-        &self,
-        stream_id: usize,
-        identifier: &WireIdentifier,
-    ) -> Option<usize> {
+    /// Resolve a wire topic identifier within the stream already resolved to
+    /// slab id `stream_id` to its committed slab id, `None` when the stream or
+    /// topic does not exist.
+    #[must_use]
+    pub fn resolve_topic_id(&self, stream_id: usize, identifier: &WireIdentifier) -> Option<usize> {
         let stream = self.items.get(stream_id)?;
         match identifier {
             WireIdentifier::Numeric(id) => {
@@ -1064,7 +1067,99 @@ impl StreamsInner {
     }
 }
 
+/// Metadata identity for a consumer operation, independent of unrelated groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollMetadata {
+    created_revision: u64,
+    purge_generation: u64,
+    group: Option<(u64, u64)>,
+    client_id: u128,
+}
+
+impl PollMetadata {
+    #[must_use]
+    pub fn matches_partition(&self, created_revision: Option<u64>, purge_generation: u64) -> bool {
+        created_revision == Some(self.created_revision) && purge_generation == self.purge_generation
+    }
+
+    #[must_use]
+    pub fn is_valid(&self, streams: &Streams, namespace: IggyNamespace) -> bool {
+        streams
+            .poll_metadata(namespace, self.group.map(|(id, _)| id), self.client_id)
+            .as_ref()
+            == Some(self)
+    }
+
+    #[must_use]
+    pub fn is_valid_for_offset(&self, streams: &Streams, namespace: IggyNamespace) -> bool {
+        streams
+            .consumer_offset_metadata(namespace, self.group.map(|(id, _)| id), self.client_id)
+            .as_ref()
+            == Some(self)
+    }
+}
+
 impl Streams {
+    #[must_use]
+    pub fn poll_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+    ) -> Option<PollMetadata> {
+        self.consumer_metadata(namespace, group_id, client_id, true)
+    }
+
+    /// Offset commits can drain partitions awaiting cooperative revocation.
+    #[must_use]
+    pub fn consumer_offset_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+    ) -> Option<PollMetadata> {
+        self.consumer_metadata(namespace, group_id, client_id, false)
+    }
+
+    fn consumer_metadata(
+        &self,
+        namespace: IggyNamespace,
+        group_id: Option<u64>,
+        client_id: u128,
+        require_pollable: bool,
+    ) -> Option<PollMetadata> {
+        self.read(|inner| {
+            let topic = inner
+                .items
+                .get(namespace.stream_id())?
+                .topics
+                .get(namespace.topic_id())?;
+            let partition = find_partition(&topic.partitions, namespace.partition_id())?;
+            let group = if let Some(group_id) = group_id {
+                let group = topic.consumer_groups.get(&group_id)?;
+                if !group.members.iter().any(|(_, member)| {
+                    member.client_id == client_id
+                        && if require_pollable {
+                            member.is_pollable(namespace.partition_id())
+                        } else {
+                            member.partitions.contains(&namespace.partition_id())
+                        }
+                }) {
+                    return None;
+                }
+                Some((group.id, group.generation))
+            } else {
+                None
+            };
+            Some(PollMetadata {
+                created_revision: partition.created_revision,
+                purge_generation: partition.purge_generation,
+                group,
+                client_id,
+            })
+        })
+    }
+
     #[must_use]
     pub fn read<F, R>(&self, f: F) -> R
     where
@@ -1586,11 +1681,8 @@ impl Streams {
             let stream = inner.items.get(stream_id)?;
             let topic = stream.topics.get(topic_id)?;
             let partition_id = usize::try_from(partition_id).ok()?;
-            topic
-                .partitions
-                .iter()
-                .any(|partition| partition.id == partition_id)
-                .then(|| IggyNamespace::new(stream_id, topic_id, partition_id))
+            find_partition(&topic.partitions, partition_id)
+                .map(|_| IggyNamespace::new(stream_id, topic_id, partition_id))
         })
     }
 
@@ -1632,17 +1724,7 @@ impl Streams {
         self.inner.read(|inner| {
             let stream = inner.items.get(namespace.stream_id())?;
             let topic = stream.topics.get(namespace.topic_id())?;
-            let partition_id = namespace.partition_id();
-            if let Some(partition) = topic.partitions.get(partition_id)
-                && partition.id == partition_id
-            {
-                return Some(read(partition));
-            }
-            topic
-                .partitions
-                .iter()
-                .find(|partition| partition.id == partition_id)
-                .map(read)
+            find_partition(&topic.partitions, namespace.partition_id()).map(read)
         })
     }
 
@@ -1838,6 +1920,22 @@ impl Streams {
 /// replicas disagree about their TOML.
 const fn admits_slab_key(vacant_key: usize, ceiling: usize) -> bool {
     vacant_key < ceiling
+}
+
+/// The partition carrying `partition_id`, or `None` when the topic has none.
+///
+/// A primary mints dense 0-based ids, so the vector index IS the id and the
+/// direct hit answers every ordinary topic. The scan exists only for a vector
+/// left sparse by a partition delete, where an index no longer names its id.
+fn find_partition(partitions: &[Partition], partition_id: usize) -> Option<&Partition> {
+    if let Some(partition) = partitions.get(partition_id)
+        && partition.id == partition_id
+    {
+        return Some(partition);
+    }
+    partitions
+        .iter()
+        .find(|partition| partition.id == partition_id)
 }
 
 /// Range and distinctness for the ABSOLUTE partition ids on a topic create,
@@ -4226,6 +4324,37 @@ mod tests {
             .find(|partition| partition.id == partition_id)
             .expect("committed partition")
             .clone()
+    }
+
+    /// A delete leaves every surviving id above the hole naming an index that
+    /// is no longer its own, so the direct hit has to fall through to the scan
+    /// or the survivor resolves to nothing and its namespace stops routing.
+    #[test]
+    fn given_sparse_partition_ids_when_resolving_should_fall_back_to_the_scan() {
+        let inner = inner_with_registered_partition();
+        let template = committed_partition(&inner, 0, 0, 0);
+        let partition = |id| Partition {
+            id,
+            ..template.clone()
+        };
+        let dense = vec![partition(0), partition(1)];
+        let sparse = vec![partition(3), partition(7)];
+
+        assert_eq!(
+            find_partition(&dense, 1).map(|partition| partition.id),
+            1.into()
+        );
+        assert_eq!(
+            find_partition(&sparse, 3).map(|partition| partition.id),
+            3.into()
+        );
+        assert_eq!(
+            find_partition(&sparse, 7).map(|partition| partition.id),
+            7.into()
+        );
+        assert!(find_partition(&sparse, 0).is_none());
+        assert!(find_partition(&sparse, 1).is_none());
+        assert!(find_partition(&dense, 2).is_none());
     }
 
     /// A checkpoint reads a stream's total and each of its topics' as separate
