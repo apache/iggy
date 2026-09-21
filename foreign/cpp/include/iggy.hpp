@@ -2548,11 +2548,11 @@ class IggyBlockingClient final {
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param offset Message offset to store.
      * @param partition_id Partition whose offset is stored, or `std::nullopt`
      *        to omit the partition from the request. The maximum
      *        `std::uint32_t` value is rejected because it is reserved by the
      *        FFI representation.
+     * @param offset Message offset to store.
      * @throws IggyException if an identifier, partition, or offset is invalid;
      *         the resource does not exist; the client is unauthenticated; the
      *         caller lacks permission; or the request fails.
@@ -2560,8 +2560,8 @@ class IggyBlockingClient final {
     void StoreConsumerOffset(const Consumer &consumer,
                              const Identifier &stream,
                              const Identifier &topic,
-                             std::uint64_t offset,
-                             std::optional<std::uint32_t> partition_id = std::nullopt);
+                             std::optional<std::uint32_t> partition_id,
+                             std::uint64_t offset);
 
     /**
      * @brief Retrieves the stored offset for a consumer or consumer group.

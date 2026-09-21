@@ -402,7 +402,7 @@ TEST(IggyBlockingClientTest, ConsumerOffsetOperationsRejectMaximumPartitionId) {
         }
     };
 
-    expect_rejection([&] { client.StoreConsumerOffset(consumer, stream, topic, 0, maximum_partition); });
+    expect_rejection([&] { client.StoreConsumerOffset(consumer, stream, topic, maximum_partition, 0); });
     expect_rejection([&] { (void)client.GetConsumerOffset(consumer, stream, topic, maximum_partition); });
     expect_rejection([&] { client.DeleteConsumerOffset(consumer, stream, topic, maximum_partition); });
 }

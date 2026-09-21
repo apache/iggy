@@ -306,8 +306,8 @@ void IggyBlockingClient::LeaveConsumerGroup(const Identifier &stream,
 void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
                                              const Identifier &stream,
                                              const Identifier &topic,
-                                             const std::uint64_t offset,
-                                             const std::optional<std::uint32_t> partition_id) {
+                                             const std::optional<std::uint32_t> partition_id,
+                                             const std::uint64_t offset) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, offset, partition_id] {
         constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
         if (partition_id == unspecified_partition_id) {
