@@ -2235,7 +2235,7 @@ async fn assert_owned_segments(
     );
 }
 
-fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
+pub(super) fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
     let payload = vec![
         u8::try_from(op).unwrap();
         OWNED_BATCH_BYTES - BATCH_HEADER_SIZE - BATCH_MESSAGE_HEADER_SIZE
