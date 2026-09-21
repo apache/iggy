@@ -7015,12 +7015,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "crc32c",
+ "flate2",
  "iggy",
  "kafka-protocol",
  "libc",
+ "lz4",
  "secrecy",
  "serde",
  "serial_test",
+ "snap",
  "socket2 0.6.5",
  "tempfile",
  "thiserror 2.0.20",
@@ -7030,6 +7034,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zstd 0.13.3",
 ]
 
 [[package]]
