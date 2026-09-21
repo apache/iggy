@@ -96,13 +96,6 @@ enum Inode {
     },
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-struct DirectorySyncFailure {
-    path: std::path::PathBuf,
-    entries_at_failure: Rc<Cell<Option<usize>>>,
-}
-
 #[derive(Clone)]
 struct State {
     id: u64,
@@ -112,8 +105,6 @@ struct State {
     written_bytes: BTreeMap<usize, usize>,
     write_errors: BTreeMap<usize, u64>,
     fault: Option<(usize, FaultMode)>,
-    #[cfg(test)]
-    directory_sync_failure: Option<DirectorySyncFailure>,
     paused: Option<StorageOperation>,
     waiters: Vec<std::task::Waker>,
 }
@@ -128,20 +119,12 @@ impl SimStorage {
         let mut state = self.state.borrow_mut();
         state.trace.clear();
         state.fault = None;
-        #[cfg(test)]
-        {
-            state.directory_sync_failure = None;
-        }
     }
 
     pub fn fail_at(&self, operation: usize, mode: FaultMode) {
         let mut state = self.state.borrow_mut();
         state.trace.clear();
         state.fault = Some((operation, mode));
-        #[cfg(test)]
-        {
-            state.directory_sync_failure = None;
-        }
     }
 
     /// A process restart preserves the OS cache. Power loss discards it.
@@ -159,10 +142,6 @@ impl SimStorage {
         }
         state.trace.clear();
         state.fault = None;
-        #[cfg(test)]
-        {
-            state.directory_sync_failure = None;
-        }
     }
 
     /// Model background writeback without attributing a durability barrier to it.
@@ -233,20 +212,6 @@ impl SimStorage {
         for waiter in waiters {
             waiter.wake();
         }
-    }
-
-    /// Fail the next sync of this directory before its changes become durable.
-    /// The returned cell records the directory entry count at the failed sync;
-    /// `None` means the selected sync has not been reached.
-    #[cfg(test)]
-    fn fail_next_directory_sync(&self, path: &Path) -> Rc<Cell<Option<usize>>> {
-        self.clear_trace();
-        let entries_at_failure = Rc::new(Cell::new(None));
-        self.state.borrow_mut().directory_sync_failure = Some(DirectorySyncFailure {
-            path: path.to_path_buf(),
-            entries_at_failure: Rc::clone(&entries_at_failure),
-        });
-        entries_at_failure
     }
 
     async fn wait_for(&self, operation: StorageOperation) {
@@ -381,16 +346,6 @@ impl DurableStorage for SimStorage {
     async fn sync_directory(&self, path: &Path) -> io::Result<()> {
         self.perform(StorageOperation::DirectorySync, |state, _| {
             let inode = state.lookup(path)?;
-            #[cfg(test)]
-            if let Some(failure) = state
-                .directory_sync_failure
-                .take_if(|failure| failure.path == path)
-            {
-                failure
-                    .entries_at_failure
-                    .set(Some(state.directory(inode)?.len()));
-                return Err(io::Error::other("injected directory sync failure"));
-            }
             match &mut state.inodes[inode] {
                 Inode::Directory { entries, stable } => stable.clone_from(entries),
                 Inode::File { .. } => return Err(invalid("directory sync on a file")),
@@ -628,8 +583,6 @@ impl Default for State {
             written_bytes: BTreeMap::new(),
             write_errors: BTreeMap::new(),
             fault: None,
-            #[cfg(test)]
-            directory_sync_failure: None,
             paused: None,
             waiters: Vec::new(),
         }
