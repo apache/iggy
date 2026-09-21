@@ -136,14 +136,19 @@ func TestConnect_SuppressedSignInSendsNothing(t *testing.T) {
 
 	client := newDialingClient(t, server.address(),
 		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
-	// The state a replayed login leaves behind before its reconnect.
-	client.skipAutoLoginOnce = true
 
-	require.NoError(t, client.Connect(context.Background()))
+	// The context a replayed login drives its reconnect with.
+	require.NoError(t, client.Connect(suppressAutoLogin(context.Background())))
 
 	assert.Empty(t, server.recorded(),
 		"the replayed login owns the sign-in; Connect must not preempt it")
-	assert.False(t, client.skipAutoLoginOnce, "the suppression is consumed exactly once")
+
+	// And it is that context, not the client, that carries the suppression:
+	// a Connect without it signs in.
+	require.NoError(t, client.disconnect())
+	require.NoError(t, client.Connect(context.Background()))
+	assert.NotEmpty(t, server.recorded(),
+		"the suppression outlived the call that meant it")
 }
 
 func TestClose_InterruptsAnInFlightReplayWait(t *testing.T) {

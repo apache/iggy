@@ -17,18 +17,28 @@
 
 //! Adversarial specs against the VSR client table's at-most-once guarantees.
 //!
-//! Both assert the dedup contract a retrying client needs at the table's two
-//! resource edges. The capacity one now passes; the reply-ring one is still a
-//! RED SPEC, expected to FAIL.
+//! Each asserts the dedup contract a retrying client needs: the first two at
+//! the table's resource edges, the third across the request-id gaps a client
+//! that also produces leaves behind.
 //!
 //! 1. Capacity: a full table evicts the entry with the oldest commit. Eviction
 //!    keeps that client's request watermark (and the watermark's reply when the
 //!    ring still held it), so a client that was merely quiet re-registers and
 //!    its retry of an already-committed request id is answered, not re-executed.
-//! 2. Reply ring: each entry retains only its `REPLY_RING_CAPACITY` most
-//!    recent committed replies. A retry of a request whose reply aged out is
-//!    refused with the terminal `RequestAlreadyApplied` and no result payload,
-//!    indistinguishable from a rejection to the caller.
+//! 2. Reply retention: an entry keeps `REPLY_RING_CAPACITY` replies whatever
+//!    they weigh and older ones for as long as they fit
+//!    `REPLY_RING_RETENTION_BYTES`, so a retry arriving more commits late than
+//!    the floor alone would hold still replays its original bytes. The depth is
+//!    bounded, not unlimited: a retry that outlives the byte budget is still
+//!    answered with the terminal `RequestAlreadyApplied` and no result payload,
+//!    which the caller cannot tell apart from a rejection. That edge, and the
+//!    fact that neither a state transfer nor a restart carries the deeper
+//!    history, are pinned by the consensus crate's unit tests; this file pins
+//!    the depth the budget buys on a live server.
+//! 3. Sequence gaps: partition sends spend request ids on a plane that keeps no
+//!    client table, so the next metadata request arrives with a gap under it.
+//!    The entry stores a watermark, not a contiguous sequence, so the gapped
+//!    request must execute once and its retry must replay that reply.
 //!
 //! The frames are hand-crafted on raw TCP sockets, same technique and frame
 //! builders as the clients-table restart tests, because the churn needs
@@ -36,7 +46,7 @@
 //! expose. The builders here are parameterized by client id, which is why the
 //! restart tests' fixed-identity helpers are not reused directly.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use consensus::client_table::REPLY_RING_CAPACITY;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
@@ -44,11 +54,13 @@ use iggy_binary_protocol::consensus::{
     Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
 };
+use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
-    ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName, WireOptions,
+    ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireIdentifier, WireName, WireOptions,
+    WirePartitioning,
 };
 use integration::harness::TestHarness;
 use integration::iggy_harness;
@@ -66,6 +78,13 @@ const CLIENT_A: u128 = 0xA11CE0001;
 /// Churn identities that overflow the capacity-2 table and force the
 /// eviction of `CLIENT_A`'s entry.
 const CHURN_CLIENTS: [u128; 3] = [0xB0B0001, 0xB0B0002, 0xB0B0003];
+
+/// The topic the gap spec produces into, and how many batches it sends before
+/// its next metadata request. One batch already gaps the sequence; four makes
+/// the distance the table has to tolerate unmistakable.
+const GAP_STREAM: &str = "adv-m-gap";
+const GAP_TOPIC: &str = "adv-m-gap-topic";
+const GAP_BATCHES: u64 = 4;
 
 /// Budget for one committed round-trip (covers transient replays while the
 /// single node elects itself after boot).
@@ -145,19 +164,21 @@ async fn given_a_low_client_table_cap_when_connects_churn_should_keep_a_live_ded
     }
 }
 
-/// RED SPEC, expected to FAIL: a retry that falls off the reply ring must not
-/// be terminally rejected without a result.
+/// A retry that arrives after more commits than the unconditional floor holds
+/// must still replay its original result while the byte budget covers it.
 ///
-/// Request 1 commits, then later requests on the same session push its reply
-/// out of the ring. The retry of request 1 is then answered with the terminal
-/// `RequestAlreadyApplied` code and no result payload. The
-/// caller cannot distinguish "your operation succeeded, the reply aged out"
-/// from "your operation was rejected", so a slow retrier is forced to treat a
-/// success as a failure.
-// TODO(hubcio): fix this test
-#[ignore = "replay past the reply ring draws terminal RequestAlreadyApplied, no result payload"]
+/// Request 1 commits, then more requests than `REPLY_RING_CAPACITY` commit on
+/// the same session. Retention past the floor is budgeted in bytes and these
+/// replies are small, so request 1's is still cached and its retry answers with
+/// the original bytes. Answering `RequestAlreadyApplied` instead tells the
+/// caller its operation succeeded while handing back no result, which a slow
+/// retrier cannot tell apart from a rejection.
+///
+/// Scoped to what the budget covers. A retry late enough to outlive it, and one
+/// that lands on a replica rebuilt by transfer or restart, still draw the
+/// terminal code; the consensus crate's unit tests own those cases.
 #[iggy_harness(cluster_nodes = 1)]
-async fn given_replays_past_the_reply_ring_when_a_request_id_falls_off_should_not_terminally_reject(
+async fn given_a_retry_past_the_reply_floor_when_the_retention_budget_still_holds_it_should_replay_from_cache(
     harness: &mut TestHarness,
 ) {
     let addr = tcp_addr(harness);
@@ -165,8 +186,8 @@ async fn given_replays_past_the_reply_ring_when_a_request_id_falls_off_should_no
     let aged_payload = create_stream_payload("adv-l-aged");
     let committed = commit_request(&mut stream, CLIENT_A, session, 1, &aged_payload).await;
 
-    // One more commit than the ring holds, so request 1's reply is evicted
-    // even though the register reply seeded a slot of its own.
+    // More commits than the unconditional floor holds, so passing depends on
+    // the byte-budgeted retention rather than on the floor alone.
     let later_requests = REPLY_RING_CAPACITY as u64 + 1;
     for index in 0..later_requests {
         let payload = create_stream_payload(&format!("adv-l-filler-{index}"));
@@ -180,12 +201,70 @@ async fn given_replays_past_the_reply_ring_when_a_request_id_falls_off_should_no
             assert_replayed_from_cache(&committed, &replayed, 1);
         }
         other => panic!(
-            "a committed request replayed past the reply ring is terminally rejected: \
-             request 1 was applied and confirmed, but after {later_requests} newer commits \
-             its reply aged out of the {REPLY_RING_CAPACITY}-deep ring and the server \
-             answered the terminal RequestAlreadyApplied code with no result payload, which the \
-             client cannot distinguish from a rejection of an operation that in fact \
-             succeeded; got {other:?}"
+            "a committed request replayed past the reply floor lost its result: request 1 \
+             was applied and confirmed, and {later_requests} newer commits of this size fit \
+             the retention budget, so its reply must still replay; a terminal \
+             RequestAlreadyApplied tells the client its operation succeeded while handing \
+             back no result, which it cannot tell apart from a rejection; got {other:?}"
+        ),
+    }
+}
+
+/// A metadata request that lands above a gap the partition plane opened must
+/// still deduplicate.
+///
+/// Every replicated request on a session spends an id, but only the metadata
+/// plane keeps a client table, so a session that produces reaches its next
+/// metadata request several ids above the watermark. The entry records the
+/// highest committed request rather than a contiguous run, so the gapped
+/// request executes once and the retry of its exact frame is answered from the
+/// cache. A committed duplicate-name rejection is the proof of re-execution.
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_partition_batches_spent_request_ids_when_a_metadata_request_is_retried_should_replay_from_cache(
+    harness: &mut TestHarness,
+) {
+    // The topic the batches target is set up over the SDK on its own session,
+    // so the raw session below spends ids only on what this spec is about.
+    let setup = harness.tcp_root_client().await.unwrap();
+    setup
+        .create_stream(GAP_STREAM)
+        .await
+        .expect("create stream");
+    setup
+        .create_topic(
+            &Identifier::named(GAP_STREAM).unwrap(),
+            GAP_TOPIC,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic");
+    drop(setup);
+
+    let addr = tcp_addr(harness);
+    let (mut stream, session) = register(addr, CLIENT_A).await;
+
+    for request in 1..=GAP_BATCHES {
+        let batch = send_messages_payload(u128::from(request));
+        commit_batch(&mut stream, CLIENT_A, session, request, &batch).await;
+    }
+
+    let payload = create_stream_payload("adv-m-after-gap");
+    let gapped_request = GAP_BATCHES + 1;
+    let committed = commit_request(&mut stream, CLIENT_A, session, gapped_request, &payload).await;
+    let replay = replay_request(&mut stream, CLIENT_A, session, gapped_request, &payload).await;
+
+    match replay {
+        Verdict::Success(replayed) => {
+            assert_replayed_from_cache(&committed, &replayed, gapped_request);
+        }
+        other => panic!(
+            "a metadata request above a partition-plane gap lost its dedup: request \
+             {gapped_request} committed after {GAP_BATCHES} batches spent the ids below it, \
+             so its retry must be answered from the cache rather than re-executed; the \
+             watermark is a high-water mark, not a contiguity check; got {other:?}"
         ),
     }
 }
@@ -203,6 +282,31 @@ fn create_stream_payload(name: &str) -> Bytes {
         options: WireOptions::empty(),
     }
     .to_bytes()
+}
+
+/// One canonical batch for the gap spec's partition, in the shape
+/// `SendMessagesEncoder` writes and admission verifies. `message_id` keeps
+/// successive batches distinct on the wire.
+fn send_messages_payload(message_id: u128) -> Bytes {
+    let stream_id = WireIdentifier::named(GAP_STREAM).unwrap();
+    let topic_id = WireIdentifier::named(GAP_TOPIC).unwrap();
+    let partitioning = WirePartitioning::PartitionId(0);
+    let messages = [RawMessage {
+        id: message_id,
+        origin_timestamp: 0,
+        headers: None,
+        payload: b"adv-m-gap-batch",
+    }];
+
+    let mut buf = BytesMut::with_capacity(SendMessagesEncoder::encoded_size(
+        &stream_id,
+        &topic_id,
+        &partitioning,
+        &messages,
+    ));
+    SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &messages)
+        .expect("send batch encodes");
+    buf.freeze()
 }
 
 fn request_header(client: u128, session: u64, request: u64, body_len: usize) -> RequestHeader {
@@ -290,6 +394,40 @@ async fn commit_request(
                 sleep(RETRY_PAUSE).await;
             }
             other => panic!("request {request} did not commit: {other:?}"),
+        }
+    }
+}
+
+/// Send one batch on the partition plane and require it committed. The reply
+/// is not result-framed and carries no body, so a zero status is the whole
+/// verdict; what this spec needs from it is only the request id it spends.
+async fn commit_batch(
+    stream: &mut TcpStream,
+    client: u128,
+    session: u64,
+    request: u64,
+    body: &Bytes,
+) {
+    let header = RequestHeader {
+        command: Command::Request,
+        operation: Operation::SendMessages,
+        size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
+        client,
+        session,
+        request,
+        ..Default::default()
+    };
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        match exchange(stream, &header, body).await {
+            Exchange::Reply { status: 0, .. } => return,
+            Exchange::Reply { status, .. } if is_transient(status) && Instant::now() < deadline => {
+                sleep(RETRY_PAUSE).await;
+            }
+            other => panic!(
+                "batch at request {request} did not commit: {:?}",
+                other.verdict()
+            ),
         }
     }
 }

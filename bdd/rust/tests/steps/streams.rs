@@ -123,9 +123,18 @@ pub async fn when_delete_stream_by_numeric_id(world: &mut GlobalContext) {
 
 #[then("getting the stream by its numeric ID should return no stream")]
 pub async fn then_get_stream_returns_no_stream(world: &mut GlobalContext) {
+    // Read before the get overwrites it. The assertion is "not the stream we
+    // deleted", not "nothing at this id": `IdSlab::insert` hands out the lowest
+    // free key and these scenarios share one server, so a concurrent create can
+    // legitimately occupy the deleted stream's id.
+    let deleted = world
+        .last_stream_name
+        .clone()
+        .expect("Stream should have been created");
     get_stream_by_numeric_id(world).await;
-    assert!(
-        world.last_stream_name.is_none(),
+    assert_ne!(
+        world.last_stream_name.as_ref(),
+        Some(&deleted),
         "Deleted stream should not be returned"
     );
 }

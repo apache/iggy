@@ -38,6 +38,10 @@ pub struct CreateTopicWithAssignmentsRequest {
     pub request: CreateTopicRequest,
     pub derived_options: WireOptions,
     pub partitions: Vec<CreatedPartitionAssignment>,
+    /// View the admitting primary minted this create in. Rides the body, which
+    /// `checksum_body` seals, so unlike the header's `view` it is never restamped
+    /// by a post-view-change retransmit: every replica decodes the same value.
+    pub created_view: u32,
 }
 
 impl WireEncode for CreateTopicWithAssignmentsRequest {
@@ -51,6 +55,7 @@ impl WireEncode for CreateTopicWithAssignmentsRequest {
                 .iter()
                 .map(WireEncode::encoded_size)
                 .sum::<usize>()
+            + 4
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -71,6 +76,7 @@ impl WireEncode for CreateTopicWithAssignmentsRequest {
         for partition in &self.partitions {
             partition.encode(buf);
         }
+        buf.put_u32_le(self.created_view);
     }
 }
 
@@ -116,11 +122,23 @@ impl WireDecode for CreateTopicWithAssignmentsRequest {
             partitions.push(partition);
         }
 
+        // Trailing field: entries journaled before it existed end here and read
+        // 0, the view every plane starts in. 1-3 leftover bytes are corruption,
+        // not an old shape, so they still error.
+        let created_view = if offset < buf.len() {
+            let view = read_u32_le(buf, offset)?;
+            offset += 4;
+            view
+        } else {
+            0
+        };
+
         Ok((
             Self {
                 request,
                 derived_options,
                 partitions,
+                created_view,
             },
             offset,
         ))
@@ -165,11 +183,38 @@ mod tests {
                     consensus_group_id: 2,
                 },
             ],
+            created_view: 7,
         };
         let bytes = request.to_bytes();
         let (decoded, consumed) = CreateTopicWithAssignmentsRequest::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn decode_without_trailing_view_reads_zero() {
+        let request = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(1),
+                partitions_count: 1,
+                name: WireName::new("events").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+            created_view: 7,
+        };
+        // Bytes journaled before the field existed: same shape, no trailing u32.
+        let bytes = request.to_bytes();
+        let old_bytes = &bytes[..bytes.len() - 4];
+        let (decoded, consumed) = CreateTopicWithAssignmentsRequest::decode(old_bytes).unwrap();
+        assert_eq!(consumed, old_bytes.len());
+        assert_eq!(decoded.created_view, 0);
+        assert_eq!(decoded.partitions, request.partitions);
+        assert_eq!(decoded.request, request.request);
     }
 
     #[test]
@@ -183,6 +228,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![],
+            created_view: 0,
         };
         let bytes = request.to_bytes();
         let (decoded, consumed) = CreateTopicWithAssignmentsRequest::decode(&bytes).unwrap();

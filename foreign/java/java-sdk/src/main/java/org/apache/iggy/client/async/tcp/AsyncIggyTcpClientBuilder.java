@@ -19,6 +19,10 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.channel.IoEventLoop;
+import io.netty.channel.IoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandle;
+import io.netty.util.concurrent.EventExecutor;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
@@ -61,6 +65,13 @@ import java.util.function.Function;
  *     .credentials("admin", "secret")
  *     .buildAndLogin()
  *     .join();
+ *
+ * // Many clients on one caller-owned event loop group
+ * var group = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
+ * var producer = AsyncIggyTcpClient.builder().eventLoopGroup(group).build();
+ * var consumer = AsyncIggyTcpClient.builder().eventLoopGroup(group).build();
+ * // ... close both clients, then:
+ * group.shutdownGracefully();
  * }</pre>
  *
  * @see AsyncIggyTcpClient#builder()
@@ -78,6 +89,8 @@ public final class AsyncIggyTcpClientBuilder {
     private Duration acquireTimeout;
     private Duration heartbeatInterval = Duration.ofSeconds(5);
     private long maxVsrFrameSize = VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE;
+    private int ioThreads = AsyncTcpConnection.DEFAULT_IO_THREADS;
+    private IoEventLoopGroup eventLoopGroup;
 
     public AsyncIggyTcpClientBuilder() {}
 
@@ -228,6 +241,42 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
+     * Sets the number of event loop threads in the group that the client creates for itself.
+     *
+     * <p>The client drives a single channel, so the default of 1 is enough. If
+     * {@link #eventLoopGroup(IoEventLoopGroup)} is set, the client ignores this value.
+     *
+     * @param ioThreads the event loop thread count, at least 1
+     * @return this builder
+     */
+    public AsyncIggyTcpClientBuilder ioThreads(int ioThreads) {
+        this.ioThreads = ioThreads;
+        return this;
+    }
+
+    /**
+     * Sets a caller-owned event loop group shared across clients.
+     *
+     * <p>The client pins its channel to one loop of the group and never shuts the group down.
+     * After every client on the group is closed, the caller shuts the group down. The group
+     * must drive NIO channels, for example
+     * {@code new MultiThreadIoEventLoopGroup(threads, NioIoHandler.newFactory())}.
+     * Do not block in a completion callback. Callbacks run on the group's loops, so a
+     * blocked callback stalls every client that shares the group.
+     *
+     * @param eventLoopGroup the group to register the client's channel on
+     * @return this builder
+     * @throws IggyInvalidArgumentException if the group is null
+     */
+    public AsyncIggyTcpClientBuilder eventLoopGroup(IoEventLoopGroup eventLoopGroup) {
+        if (eventLoopGroup == null) {
+            throw new IggyInvalidArgumentException("EventLoopGroup cannot be null");
+        }
+        this.eventLoopGroup = eventLoopGroup;
+        return this;
+    }
+
+    /**
      * Builds and returns a configured AsyncIggyTcpClient instance.
      * Note: You still need to call {@link AsyncIggyTcpClient#connect()} on the returned client.
      *
@@ -242,6 +291,8 @@ public final class AsyncIggyTcpClientBuilder {
         validateRequestTimeout();
         validateHeartbeatInterval();
         validateMaxVsrFrameSize();
+        validateIoThreads();
+        validateEventLoopGroup();
 
         return new AsyncIggyTcpClient(
                 host,
@@ -255,7 +306,9 @@ public final class AsyncIggyTcpClientBuilder {
                 (int) maxVsrFrameSize,
                 retryPolicy,
                 enableTls,
-                Optional.ofNullable(tlsCertificate));
+                Optional.ofNullable(tlsCertificate),
+                Optional.ofNullable(eventLoopGroup),
+                ioThreads);
     }
 
     private void validateHost() {
@@ -305,6 +358,30 @@ public final class AsyncIggyTcpClientBuilder {
         if (maxVsrFrameSize < VsrHeaders.HEADER_SIZE || maxVsrFrameSize > Integer.MAX_VALUE) {
             throw new IggyInvalidArgumentException("MaxVsrFrameSize must be between " + VsrHeaders.HEADER_SIZE + " and "
                     + Integer.MAX_VALUE + " bytes");
+        }
+    }
+
+    private void validateIoThreads() {
+        if (eventLoopGroup != null) {
+            return;
+        }
+        if (ioThreads < 1) {
+            throw new IggyInvalidArgumentException("IoThreads must be at least 1");
+        }
+    }
+
+    private void validateEventLoopGroup() {
+        if (eventLoopGroup == null) {
+            return;
+        }
+        for (EventExecutor executor : eventLoopGroup) {
+            if (!(executor instanceof IoEventLoop loop) || !loop.isCompatible(NioIoHandle.class)) {
+                throw new IggyInvalidArgumentException(
+                        "EventLoopGroup must drive NIO channels, for example MultiThreadIoEventLoopGroup with NioIoHandler");
+            }
+        }
+        if (eventLoopGroup.isShuttingDown()) {
+            throw new IggyInvalidArgumentException("EventLoopGroup shutdown already started");
         }
     }
 

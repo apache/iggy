@@ -17,10 +17,8 @@
 
 //! Query-response parsers for InfluxDB V2 (annotated CSV) and V3 (JSONL).
 //!
-//! Both parsers produce `Vec<Row>` — a list of field-name → string-value maps.
-//! The cursor-tracking and payload-building logic in the source connector
-//! operates on this common representation so it runs unchanged regardless of
-//! which InfluxDB version is in use.
+//! Both parsers produce `Vec<Row>` for the version-specific cursor and payload
+//! logic. V2 retains CSV strings; V3 preserves typed JSON values.
 
 use ahash::AHashMap;
 use csv::StringRecord;
@@ -30,11 +28,9 @@ use std::sync::Arc;
 
 /// A single row returned by a query, field name → typed JSON value.
 ///
-/// V2 (annotated CSV) stores all values as `Value::String` since CSV has no
-/// type information; `parse_scalar` in `build_payload` converts them to typed
-/// values when building the message payload. V3 (JSONL) stores typed values
-/// directly — numbers, booleans, and nulls arrive pre-typed from SQL, so no
-/// string-round-trip parse is needed.
+/// V2 stores cells as `Value::String`, ignoring annotation datatype/default values.
+/// `parse_scalar` infers scalars when building whole-row payloads. V3 preserves
+/// the typed JSON values returned by SQL.
 ///
 /// Column names are interned as `Arc<str>` so they are allocated once per
 /// unique name and cloned cheaply (pointer bump) for every data row.
@@ -42,29 +38,21 @@ pub(crate) type Row = AHashMap<Arc<str>, serde_json::Value>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
-/// Return `true` if `record` is a CSV header row.
-///
-/// Checks for any of the standard InfluxDB temporal column names:
-/// `_time`, `_start`, or `_stop`. Regular time-series queries include `_time`;
-/// Flux window-aggregate queries (`count()`, `mean()`, `distinct()`) produce
-/// result tables with `_start` and `_stop` but no `_time`. Requiring only
-/// `_time` would cause those header rows to be missed, silently dropping all
-/// subsequent data rows until the next recognised header.
-///
-/// InfluxDB annotation rows (`#group`, `#datatype`, `#default`) are already
-/// filtered out earlier in [`parse_csv_rows`] by the leading-`#` check, so
-/// they will never reach this function.
-fn is_header_record(record: &StringRecord) -> bool {
-    record
-        .iter()
-        .any(|v| v == "_time" || v == "_start" || v == "_stop")
+/// Recognize temporal headers when annotation rows are absent.
+/// Existing column positions keep payload strings from replacing the header.
+fn is_header_record(record: &StringRecord, headers: Option<&StringRecord>) -> bool {
+    record.iter().enumerate().any(|(index, value)| {
+        matches!(value, "_time" | "_start" | "_stop")
+            && headers.is_none_or(|headers| headers.get(index) == Some(value))
+    })
 }
 
 /// Parse an InfluxDB V2 annotated-CSV response body into a list of rows.
 ///
 /// - Annotation rows (first field starts with `#`) are skipped.
 /// - Blank lines are skipped.
-/// - The first non-annotation row containing `_time`, `_start`, or `_stop` becomes the header.
+/// - The row after annotations supplies the header, including custom cursor names.
+/// - Without annotations, temporal labels identify the header.
 /// - Repeated identical header rows (multi-table result format) are skipped.
 /// - Each subsequent data row is mapped `header[i] → row[i]`.
 pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
@@ -74,6 +62,7 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
         .from_reader(csv_text.as_bytes());
 
     let mut headers: Option<StringRecord> = None;
+    let mut expect_header = false;
     // Interned column names: allocated once per unique name when a header row is
     // seen, then cheap-cloned (pointer bump) for every data row below.
     let mut header_keys: Vec<Arc<str>> = Vec::new();
@@ -90,12 +79,14 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
         if let Some(first) = record.get(0)
             && first.starts_with('#')
         {
+            expect_header = true;
             continue;
         }
 
-        if is_header_record(&record) {
+        if expect_header || is_header_record(&record, headers.as_ref()) {
             header_keys = record.iter().map(Arc::<str>::from).collect();
             headers = Some(record.clone());
+            expect_header = false;
             continue;
         }
 
@@ -221,6 +212,73 @@ mod tests {
     #[test]
     fn csv_empty_string_returns_empty() {
         assert!(parse_csv_rows("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn csv_temporal_labels_in_payload_are_not_headers() {
+        for annotations in ["", "#datatype,dateTime:RFC3339,string\n"] {
+            let csv = format!(
+                "{annotations},_time,_value\n\
+                 ,2026-01-01T00:00:00Z,_time\n\
+                 ,2026-01-01T00:00:01Z,_start\n\
+                 ,2026-01-01T00:00:02Z,_stop\n"
+            );
+            let rows = parse_csv_rows(&csv).unwrap();
+            let values: Vec<_> = rows
+                .iter()
+                .map(|row| row.get("_value").and_then(|value| value.as_str()))
+                .collect();
+            assert_eq!(
+                values,
+                vec![Some("_time"), Some("_start"), Some("_stop")],
+                "valid string values must not replace the active header"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_annotated_tables_can_reorder_columns() {
+        let csv = "#datatype,dateTime:RFC3339,string\n\
+                   ,_time,_value\n\
+                   ,2026-01-01T00:00:00Z,_stop\n\
+                   #datatype,string,dateTime:RFC3339\n\
+                   ,_value,_time\n\
+                   ,_start,2026-01-01T00:00:01Z\n";
+        let rows = parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get("_value").and_then(|value| value.as_str()),
+            Some("_stop")
+        );
+        assert_eq!(
+            rows[1].get("_value").and_then(|value| value.as_str()),
+            Some("_start")
+        );
+        assert_eq!(
+            rows[1].get("_time").and_then(|value| value.as_str()),
+            Some("2026-01-01T00:00:01Z")
+        );
+    }
+
+    #[test]
+    fn csv_annotated_header_supports_custom_cursor_names() {
+        let csv = "#datatype,dateTime:RFC3339,string\n\
+                   ,event_time,payload\n\
+                   ,2026-01-01T00:00:00Z,example\n";
+        let rows = parse_csv_rows(csv).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "annotations identify a table header without reserved column names"
+        );
+        assert_eq!(
+            rows[0].get("event_time").and_then(|value| value.as_str()),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            rows[0].get("payload").and_then(|value| value.as_str()),
+            Some("example")
+        );
     }
 
     #[test]

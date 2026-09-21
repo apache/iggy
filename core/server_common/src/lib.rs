@@ -26,6 +26,7 @@ pub mod fs_utils;
 pub mod iobuf;
 pub mod log;
 mod memory_pool;
+pub mod poll;
 mod reactor_yield;
 mod segment_storage;
 pub mod send_messages;
@@ -38,6 +39,7 @@ pub use certificates::generate_self_signed_certificate;
 pub use consensus_message::{
     ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
+    ResponseFragments,
 };
 pub use executor::create_shard_executor;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};

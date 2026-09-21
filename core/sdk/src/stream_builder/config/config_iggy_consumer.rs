@@ -24,6 +24,8 @@ use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
 
+const DEFAULT_PARTITION_ID: u32 = 0;
+
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
 pub struct IggyConsumerConfig {
@@ -37,20 +39,22 @@ pub struct IggyConsumerConfig {
     topic_name: String,
     /// The auto-commit configuration for storing the message offset on the server. See  `AutoCommit` for details.
     auto_commit: AutoCommit,
-    /// The max number of messages to send in a batch. The greater the batch length, the higher the throughput for bulk data.
+    /// The max number of messages to poll in a batch. The greater the batch length, the higher the throughput for bulk data.
     /// Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
     batch_length: u32,
     /// Create the stream if it doesn't exist.
     create_stream_if_not_exists: bool,
     /// Create the topic if it doesn't exist.
     create_topic_if_not_exists: bool,
-    /// The name of the consumer. Must be unique
+    /// Members of the same consumer group use the same name.
     consumer_name: String,
     /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`. ConsumerGroup is default.
     consumer_kind: ConsumerKind,
-    /// Sets the number of partitions for ConsumerKind `Consumer`. Does not apply to `ConsumerGroup`.
+    /// Partition count when creating a topic.
     partitions_count: u32,
-    /// Sets the replication factor for the consumed topic.
+    /// Partition ID for an ordinary consumer. Defaults to 0 and is ignored by consumer groups.
+    #[builder(default = DEFAULT_PARTITION_ID)]
+    partition_id: u32,
     /// The polling interval for messages.
     polling_interval: IggyDuration,
     /// `PollingStrategy` specifies from where to start polling messages. See `PollingStrategy` for details.
@@ -61,7 +65,7 @@ pub struct IggyConsumerConfig {
     /// Might be useful when the stream or topic is created dynamically by the producer.
     init_retries: Option<u32>,
     init_interval: NonZeroIggyDuration,
-    /// Sets a optional client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
+    /// Sets client-side payload and user-header decryption. Currently only Aes256Gcm is supported.
     /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
     encryptor: Option<Arc<EncryptorKind>>,
 }
@@ -85,6 +89,7 @@ impl Default for IggyConsumerConfig {
             polling_interval: IggyDuration::from_str("5ms").unwrap(),
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
+            partition_id: DEFAULT_PARTITION_ID,
             encryptor: None,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: Some(5),
@@ -103,14 +108,14 @@ impl IggyConsumerConfig {
     /// * `topic_id` - The topic id.
     /// * `topic_name` - The topic name.
     /// * `auto_commit` - The auto commit config.
-    /// * `batch_length` - The max number of messages to send in a batch.
+    /// * `batch_length` - The max number of messages to poll in a batch.
     /// * `create_stream_if_not_exists` - Whether to create the stream if it does not exists.
     /// * `create_topic_if_not_exists` - Whether to create the topic if it does not exists.
     /// * `consumer_name` - The consumer name.
     /// * `consumer_kind` - The consumer kind.
     /// * `polling_interval` - The interval between polling for new messages.
     /// * `polling_strategy` - The polling strategy.
-    /// * `partitions_count` - The number of partitions.
+    /// * `partitions_count` - Topic creation count.
     /// * `encryptor` - The encryptor.
     /// * `polling_retry_interval` - The polling retry interval.
     /// * `init_retries` - The number of init retries.
@@ -119,6 +124,8 @@ impl IggyConsumerConfig {
     ///
     /// Returns:
     /// A new `IggyConsumerConfig`.
+    ///
+    /// Ordinary consumers use partition 0. Use [`Self::with_partition_id`] to select another partition.
     ///
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -154,6 +161,7 @@ impl IggyConsumerConfig {
             polling_interval,
             polling_strategy,
             partitions_count,
+            partition_id: DEFAULT_PARTITION_ID,
             encryptor,
             polling_retry_interval,
             init_retries,
@@ -167,7 +175,7 @@ impl IggyConsumerConfig {
     ///
     /// * `stream` - The stream name.
     /// * `topic` - The topic name.
-    /// * `batch_length` - The max number of messages to send in a batch.
+    /// * `batch_length` - The max number of messages to poll in a batch.
     /// * `polling_interval` - The interval between polling for new messages.
     ///
     /// Returns:
@@ -196,6 +204,7 @@ impl IggyConsumerConfig {
             polling_interval,
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
+            partition_id: DEFAULT_PARTITION_ID,
             encryptor: None,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: Some(5),
@@ -205,6 +214,12 @@ impl IggyConsumerConfig {
 }
 
 impl IggyConsumerConfig {
+    /// Selects the partition for an ordinary consumer. Consumer groups ignore this setting.
+    pub fn with_partition_id(mut self, partition_id: u32) -> Self {
+        self.partition_id = partition_id;
+        self
+    }
+
     pub fn stream_id(&self) -> &Identifier {
         &self.stream_id
     }
@@ -254,6 +269,10 @@ impl IggyConsumerConfig {
 
     pub fn partitions_count(&self) -> u32 {
         self.partitions_count
+    }
+
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
     }
 
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {

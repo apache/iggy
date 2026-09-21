@@ -39,3 +39,8 @@ mod verify_cluster_replica_data_identical;
 // Auto-commit offset replication is inherently a multi-node (VSR) property: the
 // backup only holds the offset if the poll's auto-commit rode consensus.
 mod verify_auto_commit_offset_replicates;
+
+// On-disk format compatibility across a binary swap. `#[ignore]`d: it needs a
+// baseline `iggy-server` built from the merge base, which only
+// `scripts/ci/storage-compat.sh` provides.
+mod storage_compat;

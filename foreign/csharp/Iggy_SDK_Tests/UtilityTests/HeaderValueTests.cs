@@ -35,6 +35,13 @@ public sealed class HeaderValueTests
     }
 
     [Fact]
+    public void Raw_ThrowsArgumentExceptionForInvalidValue()
+    {
+        Assert.Throws<ArgumentException>(() => HeaderValue.FromBytes([]));
+        Assert.Throws<ArgumentException>(() => HeaderValue.FromBytes(new byte[256]));
+    }
+
+    [Fact]
     public void String_ThrowsArgumentExceptionForInvalidValue()
     {
         Assert.Throws<ArgumentException>(() => HeaderValue.FromString(""));

@@ -26,6 +26,7 @@ pub const GET_STATS_CODE: u32 = 10;
 pub const GET_SNAPSHOT_FILE_CODE: u32 = 11;
 pub const GET_CLUSTER_METADATA_CODE: u32 = 12;
 pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
+pub const ATTACH_CONSUMER_SESSION_CODE: u32 = 14;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;
@@ -53,11 +54,16 @@ pub const LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE: u32 = 44;
 pub const POLL_MESSAGES_CODE: u32 = 100;
 pub const SEND_MESSAGES_CODE: u32 = 101;
 pub const FLUSH_UNSAVED_BUFFER_CODE: u32 = 102;
+pub const GET_POLL_ROUTING_CODE: u32 = 103;
+pub const POLL_MESSAGES_ON_PRIMARY_CODE: u32 = 104;
 
 // -- Consumer Offsets --
 pub const GET_CONSUMER_OFFSET_CODE: u32 = 120;
 pub const STORE_CONSUMER_OFFSET_CODE: u32 = 121;
 pub const DELETE_CONSUMER_OFFSET_CODE: u32 = 122;
+/// Primary and parent session for offset writes; uses `GetConsumerOffsetRequest`
+/// and `PollRoutingResponse`, with the offset ownership fence (revocations may drain).
+pub const GET_CONSUMER_OFFSET_ROUTING_CODE: u32 = 123;
 
 // -- Streams --
 pub const GET_STREAM_CODE: u32 = 200;
@@ -111,6 +117,8 @@ mod tests {
         GET_STATS_CODE,
         GET_SNAPSHOT_FILE_CODE,
         GET_CLUSTER_METADATA_CODE,
+        DESCRIBE_OPTIONS_CODE,
+        ATTACH_CONSUMER_SESSION_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
         GET_CLIENTS_CODE,
@@ -130,11 +138,14 @@ mod tests {
         DELETE_PERSONAL_ACCESS_TOKEN_CODE,
         LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
         POLL_MESSAGES_CODE,
+        GET_POLL_ROUTING_CODE,
+        POLL_MESSAGES_ON_PRIMARY_CODE,
         SEND_MESSAGES_CODE,
         FLUSH_UNSAVED_BUFFER_CODE,
         GET_CONSUMER_OFFSET_CODE,
         STORE_CONSUMER_OFFSET_CODE,
         DELETE_CONSUMER_OFFSET_CODE,
+        GET_CONSUMER_OFFSET_ROUTING_CODE,
         GET_STREAM_CODE,
         GET_STREAMS_CODE,
         CREATE_STREAM_CODE,
@@ -161,6 +172,11 @@ mod tests {
 
     #[test]
     fn every_code_has_a_name() {
+        assert_eq!(
+            ALL_CODES.len(),
+            crate::dispatch::COMMAND_TABLE.len(),
+            "command-code tests must cover the complete dispatch registry"
+        );
         for &code in ALL_CODES {
             assert!(
                 command_name(code).is_ok(),

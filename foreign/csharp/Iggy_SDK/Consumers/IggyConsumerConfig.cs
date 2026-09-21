@@ -50,7 +50,7 @@ public class IggyConsumerConfig
     public bool CreateIggyClient { get; set; }
 
     /// <summary>
-    ///     The protocol to use for communication (TCP, QUIC, HTTP)
+    ///     The protocol to use for communication (TCP or HTTP)
     /// </summary>
     public Protocol Protocol { get; set; }
 
@@ -76,14 +76,18 @@ public class IggyConsumerConfig
     public string PersonalAccessToken { get; set; } = string.Empty;
 
     /// <summary>
-    ///     The size of the receive buffer in bytes. Default is 4096.
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
 
     /// <summary>
-    ///     The size of the send buffer in bytes. Default is 4096.
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     The identifier of the stream to consume from
@@ -96,7 +100,7 @@ public class IggyConsumerConfig
     public Identifier TopicId { get; set; }
 
     /// <summary>
-    ///     Optional partition ID to consume from. If null, consumes from all partitions.
+    ///     Optional partition ID to consume from. If null, selects partition 0.
     ///     Note: This is ignored when using consumer groups.
     /// </summary>
     public uint? PartitionId { get; set; }

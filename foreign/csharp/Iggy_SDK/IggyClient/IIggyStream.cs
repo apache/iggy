@@ -29,7 +29,7 @@ public interface IIggyStream
     ///     Creates a new stream with the specified name.
     /// </summary>
     /// <remarks>
-    ///     The stream name must be unique within the Iggy instance and has a maximum length of 255 characters.
+    ///     The stream name must be unique within the Iggy instance and has a maximum length of 255 UTF-8 bytes.
     /// </remarks>
     /// <param name="name">The unique name of the stream to create.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>

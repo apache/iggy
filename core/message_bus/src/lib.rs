@@ -53,13 +53,14 @@
 //!   `Ready` on first poll. Consensus code relies on this for
 //!   reentrancy reasoning; any `.await` in the body breaks it.
 //! - The TCP transport's writer task coalesces up to
-//!   `MessageBusConfig::max_batch` (default 256) `Frozen<MESSAGE_ALIGN>`
-//!   into one `write_vectored_all`. Don't introduce per-message
+//!   `MessageBusConfig::max_batch` (default 256) [`BusMessage`] frames
+//!   (their `Frozen<MESSAGE_ALIGN>` fragments flattened, chunked at
+//!   `IOV_MAX`) into `write_vectored_all`. Don't introduce per-message
 //!   syscalls or per-message encryption on the plaintext TCP plane.
-//! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
-//!   connections have no dupable plaintext fd, so shard 0 terminates
-//!   and forwards `Frozen<MESSAGE_ALIGN>` over the existing
-//!   inter-shard crossfire channel.
+//! - fd-delegation ([`fd_transfer`]) transfers raw TCP sockets for TCP,
+//!   WS, TCP-TLS and WSS before handshakes. The destination shard owns
+//!   handshake state and I/O. QUIC client callbacks install on shard 0
+//!   through its shared UDP endpoint.
 //! - 0-RTT stays disabled by default on any future QUIC path. Per-
 //!   command opt-in requires a checked-in idempotence audit.
 //!
@@ -279,7 +280,7 @@ pub type ReplicaForwardFn = Box<dyn Fn(u8, u16, Frozen<MESSAGE_ALIGN>) -> Result
 /// shift. `client_id` is carried so the receiver can rebuild the
 /// `ShardFrame::Lifecycle`'s `ForwardClientSend { client_id, msg }`
 /// payload.
-pub type ClientForwardFn = Box<dyn Fn(u128, u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
+pub type ClientForwardFn = Box<dyn Fn(u128, u16, BusMessage) -> Result<(), SendError>>;
 
 /// Callback invoked when a client connection metadata entry is removed.
 pub type ClientConnectionLostFn = std::rc::Rc<dyn Fn(u128)>;
@@ -402,42 +403,26 @@ pub type AcceptedQuicClientFn = std::rc::Rc<dyn Fn(AcceptedQuicConn)>;
 /// requires a dupable plaintext fd) stays well-defined.
 pub type AcceptedWsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
 
+/// Listener TLS configuration shared with the shard owning each connection.
+/// Per-connection TLS state is created only on the destination runtime.
+pub type SharedTlsServerConfig = std::sync::Arc<rustls::ServerConfig>;
+
 /// Callback invoked on every accepted SDK TCP-TLS client connection.
 ///
 /// Fires after shard 0's TCP-TLS listener accepts a raw TCP socket.
-/// Neither the rustls handshake nor any application-layer work has run
-/// yet — the listener stays cheap so a slow handshake on one peer cannot
-/// block subsequent accepts. The callback receives the raw stream plus
-/// a clone of the shared [`std::sync::Arc<rustls::ServerConfig>`] built
-/// at bind time, mints a `client_id`, and calls
-/// [`installer::install_client_tcp_tls`]; the install path drives the
-/// rustls handshake on its own task before forwarding the connection to
-/// [`installer::install_client_conn`].
-///
-/// TCP-TLS stays shard-0 terminal: rustls's connection state machine
-/// is tied to the local task and not serialisable, and the
-/// pre-handshake fd would have to re-handshake on the receiving shard,
-/// losing the point of fd-delegation.
-pub type AcceptedTlsClientFn =
-    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+/// The callback delegates the socket and its listener's configuration
+/// before any TLS bytes are consumed. The destination shard runs
+/// [`installer::install_client_tcp_tls`], owning the handshake and all I/O.
+pub type AcceptedTlsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, SharedTlsServerConfig)>;
 
 /// Callback invoked on every accepted SDK WSS (WebSocket-over-TLS)
 /// client connection.
 ///
-/// Fires after shard 0's WSS listener accepts a raw TCP socket. Neither
-/// the rustls handshake nor the WebSocket HTTP-Upgrade has run yet — the
-/// listener stays cheap so neither handshake on one peer can block
-/// subsequent accepts. The callback receives the raw stream plus a clone
-/// of the shared [`std::sync::Arc<rustls::ServerConfig>`] built at bind
-/// time, mints a `client_id`, and calls
-/// [`installer::install_client_wss`]; the install path drives
-/// both handshakes on its own task before forwarding the connection to
-/// [`installer::install_client_conn`].
-///
-/// No subprotocol negotiation is performed. WSS stays shard-0 terminal
-/// for the same reasons as the TCP-TLS plane.
-pub type AcceptedWssClientFn =
-    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+/// Fires before either the TLS handshake or WebSocket upgrade. The callback
+/// delegates the raw socket and its listener's configuration to the owning
+/// shard, where [`installer::install_client_wss`] runs both handshakes and
+/// subsequent I/O. No subprotocol negotiation is performed.
+pub type AcceptedWssClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, SharedTlsServerConfig)>;
 
 /// Notifier fired when a delegated replica connection dies.
 ///
@@ -496,10 +481,13 @@ pub type ConnectionLostFn = std::rc::Rc<dyn Fn(u8)>;
 ///
 /// A bus impl must preserve this divergence - see each method.
 pub trait MessageBus {
+    /// Queue one frame for `client_id`. Takes anything that converts into a
+    /// [`BusMessage`]: a single `Frozen<MESSAGE_ALIGN>` buffer or an
+    /// already fragmented frame.
     fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> impl Future<Output = Result<(), SendError>>;
 
     fn send_to_replica(
@@ -793,7 +781,7 @@ impl IggyMessageBus {
     }
 
     /// Construct a bus with explicit runtime tunables and a pre-allocated
-    /// owner table. Server-ng bootstrap uses this so every shard's bus
+    /// owner table. Server bootstrap uses this so every shard's bus
     /// shares the same atomic slots; tests use [`Self::with_tunables`]
     /// which allocates a fresh table per bus.
     ///
@@ -1220,6 +1208,8 @@ impl IggyMessageBus {
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let clients_outcome = self.clients.drain(remaining).await;
+        // Connection tasks skip per-client cleanup during bus shutdown.
+        self.client_meta.borrow_mut().clear();
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let replicas_outcome = self.replicas.drain(remaining).await;
 
@@ -1261,7 +1251,7 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> impl Future<Output = Result<(), SendError>> {
         (**self).send_to_client(client_id, data)
     }
@@ -1313,11 +1303,12 @@ impl MessageBus for IggyMessageBus {
     async fn send_to_client(
         &self,
         client_id: u128,
-        message: Frozen<MESSAGE_ALIGN>,
+        message: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         if self.is_shutting_down() {
             return Err(SendError::BusShuttingDown);
         }
+        let message = message.into();
         // Owning shard is encoded in the top 16 bits of client_id.
         let owning_shard = client_id_owning_shard(client_id);
         if owning_shard == self.shard_id {
@@ -1357,9 +1348,9 @@ impl MessageBus for IggyMessageBus {
         // Fast path: this shard owns a connection to the replica. On no-slot
         // the registry returns the message unchanged so the slow path can
         // forward it via the inter-shard channel without a wasted clone.
-        let message = match self.replicas.try_send_or_return(replica, message) {
+        let message = match self.replicas.try_send_or_return(replica, message.into()) {
             Ok(send_result) => return send_result.map_err(map_try_send_err),
-            Err(message) => message,
+            Err(message) => message.into_contiguous(),
         };
         // Slow path: route via the inter-shard channel to the owning shard.
         // The shard-shared `owner_table` is the authoritative routing
@@ -1438,7 +1429,7 @@ pub const fn is_auto_commit_client(client_id: u128) -> bool {
 /// Shape-matches `Result::map_err` (takes the error by value) so it can be
 /// used directly as a function reference rather than a closure.
 #[allow(clippy::needless_pass_by_value)] // signature required by map_err
-fn map_try_send_err(e: async_channel::TrySendError<Frozen<MESSAGE_ALIGN>>) -> SendError {
+fn map_try_send_err(e: async_channel::TrySendError<BusMessage>) -> SendError {
     match e {
         async_channel::TrySendError::Full(_) => SendError::Backpressure,
         async_channel::TrySendError::Closed(_) => SendError::ConnectionClosed,
@@ -1448,9 +1439,10 @@ fn map_try_send_err(e: async_channel::TrySendError<Frozen<MESSAGE_ALIGN>>) -> Se
 /// Peek `ReplyHeader.request` (the originating request id) from a reply
 /// buffer at its fixed header offset. Only the in-process reply path calls
 /// this; the socket path never decodes.
-fn reply_request_id(reply: &Frozen<MESSAGE_ALIGN>) -> u64 {
+fn reply_request_id(reply: &BusMessage) -> u64 {
     const OFFSET: usize = std::mem::offset_of!(ReplyHeader, request);
     reply
+        .first()
         .as_slice()
         .get(OFFSET..OFFSET + std::mem::size_of::<u64>())
         .and_then(|bytes| bytes.try_into().ok())

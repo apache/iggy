@@ -56,7 +56,7 @@ public class HeartbeatTests
 
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(1);
+        me.ConsumerGroupsCount.ShouldBe(1u);
     }
 
     [Test]
@@ -78,7 +78,7 @@ public class HeartbeatTests
         // fresh, auto-logged-in session.
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0);
+        me.ConsumerGroupsCount.ShouldBe(0u);
     }
 
     [Test]
@@ -101,31 +101,34 @@ public class HeartbeatTests
 
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0);
+        me.ConsumerGroupsCount.ShouldBe(0u);
     }
 
+    /// <summary>
+    ///     An eviction is the server's heartbeat verifier reacting to silence, not caller intent, so a client
+    ///     that signed in by hand recovers from it exactly like one whose credentials were configured: the
+    ///     sign-in it remembered re-establishes the session. Only an explicit sign-out or Dispose ends it.
+    /// </summary>
     [Test]
-    public async Task EvictedClient_WithoutAutoLogin_Should_FailFast_And_NotReconnect()
+    public async Task EvictedClient_WithoutAutoLogin_Should_ReestablishItsSession()
     {
         using var client = await CreateClient(TimeSpan.FromHours(1), false);
         await client.LoginUserAsync("iggy", "iggy");
         var (streamName, _) = await JoinFreshGroup(client);
 
-        var reconnected = false;
-        client.SubscribeConnectionEvents(args =>
-        {
-            reconnected |= args.CurrentState == ConnectionState.Connecting;
-            return Task.CompletedTask;
-        });
-
         await Task.Delay(IdleFor);
 
-        // A reconnect could not bring the session back, so the request surfaces the loss instead of coming back
-        // over an unauthenticated connection.
-        await Should.ThrowAsync<Exception>(() => client.GetMeAsync());
-        reconnected.ShouldBeFalse();
-        await Should.ThrowAsync<NotConnectedException>(() =>
-            client.GetStreamByIdAsync(Identifier.String(streamName)));
+        // A read is replay-safe, so the eviction is absorbed: the reconnect signs in again with the
+        // credentials the hand-run login remembered, and the request completes over the session it
+        // re-established.
+        var stream = await client.GetStreamByIdAsync(Identifier.String(streamName));
+        stream.ShouldNotBeNull();
+
+        // The session is a new one, though: what the server evicted stays evicted, so the group membership
+        // that belonged to it is gone.
+        var me = await client.GetMeAsync();
+        me.ShouldNotBeNull();
+        me.ConsumerGroupsCount.ShouldBe(0u);
     }
 
     private Task<IIggyClient> CreateClient(TimeSpan heartbeatInterval, bool autoLogin = true)

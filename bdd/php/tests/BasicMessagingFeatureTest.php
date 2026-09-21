@@ -19,6 +19,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/SharedFeatureParser.php';
+require_once __DIR__ . '/TestEnvironment.php';
 
 use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
@@ -71,7 +72,7 @@ final class BasicMessagingFeatureTest extends TestCase
     private function runStep(string $step): void
     {
         if ($step === 'I have a running Iggy server') {
-            $this->client = new IggyClient(server_host() . ':' . server_port());
+            $this->client = new IggyClient(TestEnvironment::serverAddress());
             $this->client->connect();
             $this->client->ping();
 
@@ -79,7 +80,7 @@ final class BasicMessagingFeatureTest extends TestCase
         }
 
         if ($step === 'I am authenticated as the root user') {
-            $this->requireClient()->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+            $this->requireClient()->loginUser(TestEnvironment::rootUsername(), TestEnvironment::rootPassword());
 
             return;
         }

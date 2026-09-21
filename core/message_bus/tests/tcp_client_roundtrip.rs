@@ -49,7 +49,7 @@ async fn request_reply_round_trip() {
         .detach();
     });
 
-    let (listener, addr) = bind(loopback()).await.expect("bind");
+    let (listener, addr) = bind(loopback()).expect("bind");
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);
     let accept_handle = compio::runtime::spawn(async move {
@@ -88,7 +88,7 @@ async fn unexpected_command_is_ignored() {
         let _ = tx.try_send(());
     });
 
-    let (listener, addr) = bind(loopback()).await.unwrap();
+    let (listener, addr) = bind(loopback()).unwrap();
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);
     let accept_handle = compio::runtime::spawn(async move {

@@ -84,14 +84,19 @@ function env_or_default(string $name, string $default): string
     return $value === false || $value === '' ? $default : $value;
 }
 
+function server_address(): string
+{
+    return env_or_default('IGGY_TCP_ADDRESS', '127.0.0.1:8090');
+}
+
 function server_host(): string
 {
-    return env_or_default('IGGY_HOST', '127.0.0.1');
+    return explode(':', server_address(), 2)[0];
 }
 
 function server_port(): int
 {
-    return (int) env_or_default('IGGY_PORT', '8090');
+    return (int) (explode(':', server_address(), 2)[1] ?? '8090');
 }
 
 function wait_for_server(string $host, int $port, int $timeoutSeconds = 30): void
@@ -116,9 +121,9 @@ function wait_for_server(string $host, int $port, int $timeoutSeconds = 30): voi
 
 function new_client(): IggyClient
 {
-    $client = new IggyClient(server_host() . ':' . server_port());
+    $client = new IggyClient(server_address());
     $client->connect();
-    $client->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+    $client->loginUser(env_or_default('IGGY_ROOT_USERNAME', 'iggy'), env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
 
     return $client;
 }
@@ -127,8 +132,8 @@ function new_connection_string_client(): IggyClient
 {
     $host = server_host();
     $port = server_port();
-    $username = rawurlencode(env_or_default('IGGY_USERNAME', 'iggy'));
-    $password = rawurlencode(env_or_default('IGGY_PASSWORD', 'iggy'));
+    $username = rawurlencode(env_or_default('IGGY_ROOT_USERNAME', 'iggy'));
+    $password = rawurlencode(env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
 
     $client = IggyClient::fromConnectionString("iggy+tcp://{$username}:{$password}@{$host}:{$port}");
     $client->connect();

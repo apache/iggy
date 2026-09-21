@@ -22,10 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 
 	"github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/batch"
-	"github.com/google/uuid"
 	"github.com/klauspost/compress/s2"
 	"github.com/zeebo/xxh3"
 )
@@ -96,11 +96,8 @@ func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
 		// The id sits under the frame checksum, so it must exist before the
 		// frame is hashed; the server never mints ids.
 		if message.Header.Id == (iggcon.MessageID{}) {
-			id, err := uuid.NewRandom()
-			if err != nil {
-				return b, err
-			}
-			message.Header.Id = iggcon.MessageID(id)
+			binary.LittleEndian.PutUint64(message.Header.Id[0:8], rand.Uint64())
+			binary.LittleEndian.PutUint64(message.Header.Id[8:16], rand.Uint64())
 		}
 		// The header lengths and the appended slices must agree, or every
 		// message boundary after a mismatch mis-frames; deriving both from

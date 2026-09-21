@@ -252,7 +252,6 @@ const operationModule = await import(
 );
 const internalStart = rustOperations.get('CreateTopicWithAssignments');
 const metadataStart = rustOperations.get('CreateStream');
-const partitionStart = rustOperations.get('SendMessages');
 const rustMetadataNames = new Set(
   [...(rustOperation.match(
     /fn is_metadata[\s\S]*?matches!\(\s*self,([\s\S]*?)\)\s*\n\s*\}/
@@ -275,11 +274,6 @@ for (const [name, value] of rustOperations) {
     operationModule.isMetadata(value),
     metadata,
     `Node isMetadata(${name}) differs from Rust is_metadata`
-  );
-  assert.equal(
-    operationModule.isPartition(value),
-    value >= partitionStart,
-    `Node isPartition(${name}) differs from Rust is_partition`
   );
   assert.equal(
     operationModule.isResultFramed(value),

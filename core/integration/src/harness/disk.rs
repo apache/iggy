@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use consensus::VsrState;
-use iggy::prelude::{ClusterClient, ClusterNodeRole};
+use iggy::prelude::{ClusterClient, ClusterNodeRole, ConsumerKind};
 use journal::superblock::{SLOT_FILE_NAMES, SuperblockContents, decode_slots};
 use tokio::time::sleep;
 
@@ -39,14 +39,50 @@ const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(20);
 const CONVERGENCE_STABLE_POLLS: u32 = 3;
 
+/// Numeric regular offset files in one partition's selected kind directory.
+pub fn consumer_offset_file_ids(
+    data_path: &Path,
+    stream_id: u32,
+    topic_id: u32,
+    partition_id: u32,
+    kind: ConsumerKind,
+) -> std::io::Result<BTreeSet<u32>> {
+    let kind_dir = match kind {
+        ConsumerKind::Consumer => "consumers",
+        ConsumerKind::ConsumerGroup => "groups",
+    };
+    let dir = data_path.join(format!(
+        "streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/offsets/{kind_dir}"
+    ));
+    let entries = fs::read_dir(dir)?;
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+        {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
 /// A partition segment `.log`, named for its 20-digit zero-padded base offset
 /// (see `partitions::state_transfer`'s path builders).
 ///
 /// Matches the segment file NAME shape, not the `.log` extension alone and not
 /// a `streams/` path prefix: the server's own text log sits under the same data
-/// root, so an extension-only match would count tracing output as segment data.
+/// root. The parent must be a partition ID so quarantined copies are excluded.
 pub fn is_segment_log(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| extension == "log")
+    // Quarantine directories and private WAL links are not live partition data.
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.parse::<u32>().is_ok())
+        && path.extension().is_some_and(|extension| extension == "log")
         && path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -146,7 +182,7 @@ pub fn installed_payloads_complete(data_path: &Path, expected: &[String]) -> Res
 /// commit cadence, which differs between primary (one flush per op) and backup
 /// (one flush per committed heartbeat range).
 fn is_comparable(rel: &str, include_wal: bool) -> bool {
-    let is_segment = rel.starts_with("streams/") && rel.ends_with(".log");
+    let is_segment = rel.starts_with("streams/") && is_segment_log(Path::new(rel));
     let is_metadata_wal = rel == "metadata/journal.wal";
     is_segment || (include_wal && is_metadata_wal)
 }
@@ -325,7 +361,7 @@ fn total_log_bytes(root: &Path) -> u64 {
                 && let Ok(rel) = path.strip_prefix(root)
             {
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                if rel.starts_with("streams/") && rel.ends_with(".log") {
+                if is_comparable(&rel, false) {
                     total += fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
                 }
             }
@@ -448,14 +484,29 @@ pub fn find_partition_superblock_dir(root: &Path) -> Option<PathBuf> {
 /// Index of the node the metadata roster marks as leader, resolved by matching
 /// the roster's TCP port against each node's bound address.
 ///
+/// Reads through node 0. Use [`leader_node_index_via`] where node 0 may be
+/// down or where the roster must be read from a named node.
+///
 /// # Panics
 /// If no root client connects, the roster query fails, no node is marked
 /// leader, or the leader's port matches no harness node.
 pub async fn leader_node_index(harness: &TestHarness) -> usize {
+    leader_node_index_via(harness, 0).await
+}
+
+/// [`leader_node_index`] reading the roster through node `via`.
+///
+/// Named separately because which node answers matters once node 0 may be
+/// down: the roster read is auth-gated, so it needs a node that can complete a
+/// login, and a client built against a dead node cannot.
+///
+/// # Panics
+/// As [`leader_node_index`].
+pub async fn leader_node_index_via(harness: &TestHarness, via: usize) -> usize {
     let client = harness
-        .root_client_for_node(0)
+        .root_client_for_node(via)
         .await
-        .expect("a root client (redirecting to the leader if node 0 is not it)");
+        .expect("a root client (redirecting to the leader if the dialed node is not it)");
     let metadata = client
         .get_cluster_metadata()
         .await

@@ -18,6 +18,7 @@
 use super::{
     config::map_connector_config,
     error::ApiError,
+    key::KeyPath,
     models::{SourceDetailsResponse, SourceInfoResponse, TransformResponse},
 };
 use crate::api::models::SourceConfigResponse;
@@ -72,10 +73,10 @@ async fn get_sources(
 
 async fn get_source(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<SourceDetailsResponse>, ApiError> {
     let Some(source) = context.sources.get(&key).await else {
-        return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
+        return Err(ApiError::Error(RuntimeError::SourceNotFound(key.into())));
     };
     let source = source.lock().await;
     Ok(Json(SourceDetailsResponse {
@@ -86,11 +87,11 @@ async fn get_source(
 
 async fn get_source_plugin_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
     Query(query): Query<GetSourceConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Some(source) = context.sources.get(&key).await else {
-        return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
+        return Err(ApiError::Error(RuntimeError::SourceNotFound(key.into())));
     };
     let source = source.lock().await;
     let Some(config) = source.config.plugin_config.as_ref() else {
@@ -113,10 +114,10 @@ struct GetSourceConfig {
 
 async fn get_source_transforms(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<Vec<TransformResponse>>, ApiError> {
     let Some(source) = context.sources.get(&key).await else {
-        return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
+        return Err(ApiError::Error(RuntimeError::SourceNotFound(key.into())));
     };
     let source = source.lock().await;
     let Some(transforms) = source.config.transforms.as_ref() else {
@@ -137,13 +138,13 @@ async fn get_source_transforms(
 
 async fn get_source_configs(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<Vec<SourceConfigResponse>>, ApiError> {
     let active_config = context
         .sources
         .get_config(&key)
         .await
-        .ok_or(ApiError::Error(RuntimeError::SourceNotFound(key.clone())))?;
+        .ok_or_else(|| ApiError::Error(RuntimeError::SourceNotFound(key.to_string())))?;
     let configs = context.config_provider.get_source_configs(&key).await?;
     let configs = configs
         .into_iter()
@@ -157,12 +158,12 @@ async fn get_source_configs(
 
 async fn create_source_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
     Json(config): Json<CreateSourceConfig>,
 ) -> Result<Json<SourceConfigResponse>, ApiError> {
     let created_config = context
         .config_provider
-        .create_source_config(&key, config.clone())
+        .create_source_config(&key, config)
         .await?;
 
     Ok(Json(SourceConfigResponse {
@@ -171,15 +172,21 @@ async fn create_source_config(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct ConfigVersion {
+    version: u64,
+}
+
 async fn get_source_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key, version)): Path<(String, u64)>,
+    KeyPath(key): KeyPath,
+    Path(ConfigVersion { version }): Path<ConfigVersion>,
 ) -> Result<Json<SourceConfigResponse>, ApiError> {
     let active_config = context
         .sources
         .get_config(&key)
         .await
-        .ok_or(ApiError::Error(RuntimeError::SourceNotFound(key.clone())))?;
+        .ok_or_else(|| ApiError::Error(RuntimeError::SourceNotFound(key.to_string())))?;
 
     let config = context
         .config_provider
@@ -195,20 +202,21 @@ async fn get_source_config(
             }))
         }
         None => Err(ApiError::Error(RuntimeError::SourceConfigNotFound(
-            key, version,
+            key.into(),
+            version,
         ))),
     }
 }
 
 async fn get_source_active_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<SourceConfigResponse>, ApiError> {
     let config = context
         .sources
         .get_config(&key)
         .await
-        .ok_or(ApiError::Error(RuntimeError::SourceNotFound(key)))?;
+        .ok_or(ApiError::Error(RuntimeError::SourceNotFound(key.into())))?;
     Ok(Json(SourceConfigResponse {
         config,
         active: true,
@@ -222,7 +230,7 @@ struct UpdateSourceActiveConfig {
 
 async fn update_source_active_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
     Json(update): Json<UpdateSourceActiveConfig>,
 ) -> Result<StatusCode, ApiError> {
     context
@@ -239,7 +247,7 @@ struct DeleteSourceConfig {
 
 async fn delete_source_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
     Query(query): Query<DeleteSourceConfig>,
 ) -> Result<StatusCode, ApiError> {
     context
@@ -251,7 +259,7 @@ async fn delete_source_config(
 
 async fn restart_source(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
 ) -> Result<StatusCode, ApiError> {
     context
         .sources

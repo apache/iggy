@@ -134,6 +134,8 @@ fn get_command(
                 args.message_expiry.clone().into(),
                 args.max_topic_size,
                 args.set.iter().cloned().collect(),
+                args.durability,
+                args.consumer_offset_durability,
             )),
             TopicAction::Delete(args) => Box::new(DeleteTopicCmd::new(
                 args.stream_id.clone(),

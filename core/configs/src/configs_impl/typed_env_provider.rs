@@ -64,7 +64,18 @@ const IGNORED_ENV_VARS: &[&str] = &[
 
 /// Prefixes for env vars handled by separate providers with runtime prefixes.
 /// The main config provider skips these; each sub-provider validates its own vars.
-const DELEGATED_ENV_VAR_PREFIXES: &[&str] = &["IGGY_CONNECTORS_SINK_", "IGGY_CONNECTORS_SOURCE_"];
+///
+/// `IGGY_KAFKA_` (`gateways/kafka/src/main.rs`) parses its own nine vars by hand rather than via
+/// `#[derive(ConfigEnv)]`, so it needs an entry here the same way the connector prefixes do -
+/// without it, `iggy-server` (and `cargo test -p integration`, which forwards `IGGY_*` to spawned
+/// servers) `debug_assert!`s on the first `IGGY_KAFKA_*` var it sees. This trades away the
+/// typo-detection this provider gives derived configs: an `IGGY_KAFKA_` typo now silently no-ops
+/// instead of surfacing here.
+const DELEGATED_ENV_VAR_PREFIXES: &[&str] = &[
+    "IGGY_CONNECTORS_SINK_",
+    "IGGY_CONNECTORS_SOURCE_",
+    "IGGY_KAFKA_",
+];
 
 type ProfileMap = FigmentMap<Profile, Dict>;
 
@@ -75,7 +86,7 @@ type ProfileMap = FigmentMap<Profile, Dict>;
 ///
 /// # Example
 /// ```ignore
-/// let provider = TypedEnvProvider::<ServerConfig>::new("IGGY_", &["IGGY_SYSTEM_ENCRYPTION_KEY"]);
+/// let provider = TypedEnvProvider::<ServerConfig>::new("IGGY_", &["IGGY_ENCRYPTION_KEY"]);
 /// ```
 #[derive(Debug, Clone)]
 pub struct TypedEnvProvider<T: ConfigEnvMappings> {
@@ -573,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn typed_provider_deserializes_env_vars() {
         unsafe {
             env::set_var("TEST_ENABLED", "true");

@@ -26,7 +26,7 @@
 //! with reads. This mirrors the legacy server's `MessagesCleaner` ->
 //! message-pump `CleanTopicMessages` path.
 
-use crate::bootstrap::ServerShard;
+use crate::shell::ServerShard;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::{IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;

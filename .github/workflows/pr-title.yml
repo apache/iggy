@@ -85,6 +85,7 @@ jobs:
             security
             server
             shard
+            swift
             test
             web
             consensus
@@ -94,3 +95,4 @@ jobs:
             storage
             simulator
             configs
+            gateways

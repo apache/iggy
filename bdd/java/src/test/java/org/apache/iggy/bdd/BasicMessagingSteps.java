@@ -54,7 +54,7 @@ public class BasicMessagingSteps {
 
     @Given("I have a running Iggy server")
     public void runningServer() {
-        context.serverAddr = getenvOrDefault("IGGY_TCP_ADDRESS", "127.0.0.1:8090");
+        context.serverAddr = TestEnvironment.serverAddress();
         HostPort hostPort = HostPort.parse(context.serverAddr);
 
         IggyTcpClient client =
@@ -67,9 +67,7 @@ public class BasicMessagingSteps {
 
     @Given("I am authenticated as the root user")
     public void authenticatedRootUser() {
-        String username = getenvOrDefault("IGGY_ROOT_USERNAME", "iggy");
-        String password = getenvOrDefault("IGGY_ROOT_PASSWORD", "iggy");
-        getClient().users().login(username, password);
+        getClient().users().login(TestEnvironment.rootUsername(), TestEnvironment.rootPassword());
     }
 
     @Given("I have no streams in the system")
@@ -144,8 +142,16 @@ public class BasicMessagingSteps {
 
     @Then("getting the stream by its numeric ID should return no stream")
     public void getStreamReturnsNoStream() {
+        // The assertion is "not the stream we deleted", not "nothing at this id":
+        // the server hands out the lowest free stream id, so once these scenarios
+        // run concurrently against one server a fresh create can legitimately
+        // occupy the deleted stream's id. Named, so a missing pre-value fails
+        // here instead of making the comparison below vacuously true.
+        assertNotNull(context.lastStreamName, "Stream should have been created");
         Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
-        assertTrue(stream.isEmpty(), "Deleted stream should not be returned");
+        assertTrue(
+                stream.isEmpty() || !stream.get().name().equals(context.lastStreamName),
+                "Deleted stream should not be returned");
     }
 
     @When("I create a topic with name {string} in stream {int} with {int} partitions")
@@ -299,11 +305,6 @@ public class BasicMessagingSteps {
             throw new IllegalStateException("Iggy client not initialized");
         }
         return context.client;
-    }
-
-    private static String getenvOrDefault(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return value == null || value.isBlank() ? defaultValue : value;
     }
 
     private static final class HostPort {

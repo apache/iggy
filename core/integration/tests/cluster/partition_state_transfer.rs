@@ -88,7 +88,7 @@ const MARKER_POLL: Duration = Duration::from_millis(200);
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         partition.evicted_ring_capacity = "64"
     )
 )]
@@ -192,7 +192,7 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         partition.evicted_ring_capacity = "64"
     )
 )]
@@ -243,7 +243,7 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         partition.evicted_ring_capacity = "64"
     )
 )]

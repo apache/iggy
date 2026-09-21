@@ -22,7 +22,7 @@ import { COMMAND_CODE } from '../command.code.js';
 import { dedupeOptions, serializeOptions, type OptionEntry } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
 import {
-  isValidCompressionAlgorithm, CompressionAlgorithm,
+  isValidCompressionAlgorithm, CompressionAlgorithm, Durability,
   compressionAlgorithmName,
   deserializeTopic,
   type Topic,
@@ -56,8 +56,9 @@ export type CreateTopic = {
   maxTopicSize?: bigint,
   /** Segment size in bytes: 512-byte multiple between 1 MiB and 1 GiB */
   segmentSize?: bigint,
-  /** Fsync every write instead of leaving it to the page cache */
-  enforceFsync?: boolean,
+  /** Message completion policy. Defaults to replicated, independently of offsets. */
+  durability?: Durability,
+  consumerOffsetDurability?: Durability,
   /** Message count that triggers a save (must be non-zero) */
   messagesRequiredToSave?: number,
   /** Accumulated message bytes that trigger a save */
@@ -90,7 +91,8 @@ export const CREATE_TOPIC = {
     messageExpiry = 0n,
     maxTopicSize = 0n,
     segmentSize,
-    enforceFsync,
+    durability = Durability.Replicated,
+    consumerOffsetDurability = Durability.Replicated,
     messagesRequiredToSave,
     sizeOfMessagesRequiredToSave,
     preallocateSegments,
@@ -130,10 +132,19 @@ export const CREATE_TOPIC = {
       options.push({
         key: 'segment_size', value: HeaderValue.Uint64(segmentSize)
       });
-    if (enforceFsync !== undefined)
-      options.push({
-        key: 'enforce_fsync', value: HeaderValue.Bool(enforceFsync)
-      });
+    for (const [key, policy] of [
+      ['durability', durability],
+      ['consumer_offset_durability', consumerOffsetDurability]
+    ] as const) {
+      if (policy !== Durability.Replicated && policy !== Durability.Persisted)
+        throw new Error(`Invalid ${key}: ${policy}`);
+      const expected = HeaderValue.String(policy);
+      for (const entry of extraOptions) {
+        if (entry.key === key && (entry.value.kind !== expected.kind || entry.value.value !== expected.value))
+          throw new Error(`Conflicting ${key}`);
+      }
+      options.push({ key, value: expected });
+    }
     if (messagesRequiredToSave !== undefined)
       options.push({
         key: 'messages_required_to_save',

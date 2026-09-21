@@ -29,9 +29,7 @@ use bytes::BytesMut;
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
-use iggy_binary_protocol::codes::{
-    FLUSH_UNSAVED_BUFFER_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
-};
+use iggy_binary_protocol::codes::{FLUSH_UNSAVED_BUFFER_CODE, SEND_MESSAGES_CODE};
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
     FlushUnsavedBufferRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
@@ -127,8 +125,7 @@ async fn topic_partition_count<B: BinaryClient>(
     Ok(details.partitions_count)
 }
 
-/// Resolve `Balanced` / `MessagesKey` to an explicit `PartitionId` client-side
-/// (the VSR broker only routes explicit partitions, matching Kafka).
+/// Resolve `Balanced` / `MessagesKey` locally using the SDK's partition cache and cursor.
 async fn resolve_partitioning<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -166,14 +163,15 @@ async fn resolve_partitioning<B: BinaryClient>(
 }
 
 /// Poll a consumer group: select one of the member's assigned partitions
-/// (round-robin) and send an explicit-partition poll. A coordinator fence
-/// rejection (stale assignment after a rebalance) triggers one re-sync + retry.
+/// (round-robin), ask `strategy_for` where to read it from and send an
+/// explicit-partition poll. A coordinator fence rejection (stale assignment
+/// after a rebalance) triggers one re-sync + retry.
 async fn poll_group_messages<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
     consumer: &Consumer,
-    strategy: &PollingStrategy,
+    strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
     count: u32,
     auto_commit: bool,
 ) -> Result<PolledMessages, IggyError> {
@@ -195,21 +193,23 @@ async fn poll_group_messages<B: BinaryClient>(
                     topic_id.clone(),
                 ));
             }
-            return Ok(PolledMessages::empty());
+            return Ok(PolledMessages {
+                partition_id: crate::NO_ASSIGNED_PARTITION,
+                ..PolledMessages::empty()
+            });
         };
+        // Resolved per attempt: a fence retry can land on another partition.
+        let strategy = strategy_for(partition_id);
         let request = PollMessagesRequest {
             consumer: consumer_to_wire(consumer)?,
             stream_id: identifier_to_wire(stream_id)?,
             topic_id: identifier_to_wire(topic_id)?,
             partition_id: Some(partition_id),
-            strategy: polling_strategy_to_wire(strategy),
+            strategy: polling_strategy_to_wire(&strategy),
             count,
             auto_commit,
         };
-        match client
-            .send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
-            .await
-        {
+        match client.send_poll_with_response(&request).await {
             Ok(response) => {
                 let polled = PolledMessages::from_bytes(response)?;
                 // The coordinator can't yet signal a generation fence as a typed
@@ -262,10 +262,9 @@ pub fn decode_send_confirmations(response: &[u8]) -> Result<SendMessagesResponse
 ///
 /// An unreadable body degrades to no confirmations instead of an error. The
 /// producer retry loop filters nothing and resends on any `Err`, so failing
-/// here would turn one committed write into as many copies as the retry budget
-/// allows, on a plane that keeps no reply cache to deduplicate them. Reporting
-/// a zeroed entry instead would be no better: the caller cannot tell it from a
-/// genuine commit at offset 0 and would checkpoint the shape mismatch.
+/// here would resend a committed write under a new request id, outside the
+/// partition's retry deduplication. A zeroed entry would be indistinguishable
+/// from a genuine commit at offset 0 and would checkpoint the shape mismatch.
 fn committed_send_confirmations(response: &[u8]) -> SendMessagesResponse {
     decode_send_confirmations(response).unwrap_or_else(|_| SendMessagesResponse {
         confirmations: Vec::new(),
@@ -284,6 +283,28 @@ impl<B: BinaryClient> MessageClient for B {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_strategy_for(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            &|_: u32| *strategy,
+            count,
+            auto_commit,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_strategy_for(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+    ) -> Result<PolledMessages, IggyError> {
         fail_if_not_authenticated(self).await?;
         // VSR: a consumer-group poll without an explicit partition is resolved
         // client-side from the member's cached assignment (the broker routes
@@ -294,24 +315,23 @@ impl<B: BinaryClient> MessageClient for B {
                 stream_id,
                 topic_id,
                 consumer,
-                strategy,
+                strategy_for,
                 count,
                 auto_commit,
             )
             .await;
         }
+        let strategy = strategy_for(partition_id.unwrap_or(0));
         let req = PollMessagesRequest {
             consumer: consumer_to_wire(consumer)?,
             stream_id: identifier_to_wire(stream_id)?,
             topic_id: identifier_to_wire(topic_id)?,
             partition_id,
-            strategy: polling_strategy_to_wire(strategy),
+            strategy: polling_strategy_to_wire(&strategy),
             count,
             auto_commit,
         };
-        let response = self
-            .send_raw_with_response(POLL_MESSAGES_CODE, req.to_bytes())
-            .await?;
+        let response = self.send_poll_with_response(&req).await?;
         PolledMessages::from_bytes(response)
     }
 
