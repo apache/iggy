@@ -32,6 +32,122 @@ LoginInfo LoginInfo::FromFfi(ffi::LoginInfo login_info) {
     return LoginInfo(login_info.user_id, std::move(access_token), access_token_expiry);
 }
 
+ffi::GlobalPermissions GlobalPermissions::ToFfi() const {
+    ffi::GlobalPermissions permissions{};
+    permissions.manage_servers = manage_servers_;
+    permissions.read_servers   = read_servers_;
+    permissions.manage_users   = manage_users_;
+    permissions.read_users     = read_users_;
+    permissions.manage_streams = manage_streams_;
+    permissions.read_streams   = read_streams_;
+    permissions.manage_topics  = manage_topics_;
+    permissions.read_topics    = read_topics_;
+    permissions.poll_messages  = poll_messages_;
+    permissions.send_messages  = send_messages_;
+    return permissions;
+}
+
+GlobalPermissions GlobalPermissions::FromFfi(ffi::GlobalPermissions permissions) {
+    GlobalPermissions result;
+    result.manage_servers_ = permissions.manage_servers;
+    result.read_servers_   = permissions.read_servers;
+    result.manage_users_   = permissions.manage_users;
+    result.read_users_     = permissions.read_users;
+    result.manage_streams_ = permissions.manage_streams;
+    result.read_streams_   = permissions.read_streams;
+    result.manage_topics_  = permissions.manage_topics;
+    result.read_topics_    = permissions.read_topics;
+    result.poll_messages_  = permissions.poll_messages;
+    result.send_messages_  = permissions.send_messages;
+    return result;
+}
+
+ffi::TopicPermissions TopicPermissions::ToFfi() const {
+    ffi::TopicPermissions permissions{};
+    permissions.manage_topic  = manage_topic_;
+    permissions.read_topic    = read_topic_;
+    permissions.poll_messages = poll_messages_;
+    permissions.send_messages = send_messages_;
+    return permissions;
+}
+
+TopicPermissions TopicPermissions::FromFfi(ffi::TopicPermissions permissions) {
+    TopicPermissions result;
+    result.manage_topic_  = permissions.manage_topic;
+    result.read_topic_    = permissions.read_topic;
+    result.poll_messages_ = permissions.poll_messages;
+    result.send_messages_ = permissions.send_messages;
+    return result;
+}
+
+ffi::StreamPermissions StreamPermissions::ToFfi() const {
+    ffi::StreamPermissions permissions{};
+    permissions.manage_stream = manage_stream_;
+    permissions.read_stream   = read_stream_;
+    permissions.manage_topics = manage_topics_;
+    permissions.read_topics   = read_topics_;
+    permissions.poll_messages = poll_messages_;
+    permissions.send_messages = send_messages_;
+    permissions.topics.reserve(topics_.size());
+    for (const auto &[topic_id, topic_permissions] : topics_) {
+        ffi::TopicPermissionEntry entry{};
+        entry.topic_id    = topic_id;
+        entry.permissions = topic_permissions.ToFfi();
+        permissions.topics.push_back(entry);
+    }
+    return permissions;
+}
+
+StreamPermissions StreamPermissions::FromFfi(ffi::StreamPermissions permissions) {
+    StreamPermissions result;
+    result.manage_stream_ = permissions.manage_stream;
+    result.read_stream_   = permissions.read_stream;
+    result.manage_topics_ = permissions.manage_topics;
+    result.read_topics_   = permissions.read_topics;
+    result.poll_messages_ = permissions.poll_messages;
+    result.send_messages_ = permissions.send_messages;
+    for (auto &entry : permissions.topics) {
+        result.topics_.emplace(entry.topic_id, TopicPermissions::FromFfi(entry.permissions));
+    }
+    return result;
+}
+
+ffi::Permissions Permissions::ToFfi() const {
+    ffi::Permissions permissions{};
+    permissions.global = global_.ToFfi();
+    permissions.streams.reserve(streams_.size());
+    for (const auto &[stream_id, stream_permissions] : streams_) {
+        ffi::StreamPermissionEntry entry{};
+        entry.stream_id   = stream_id;
+        entry.permissions = stream_permissions.ToFfi();
+        permissions.streams.push_back(std::move(entry));
+    }
+    return permissions;
+}
+
+Permissions Permissions::FromFfi(ffi::Permissions permissions) {
+    Permissions result;
+    result.global_ = GlobalPermissions::FromFfi(permissions.global);
+    for (auto &entry : permissions.streams) {
+        result.streams_.emplace(entry.stream_id, StreamPermissions::FromFfi(std::move(entry.permissions)));
+    }
+    return result;
+}
+
+UserInfo UserInfo::FromFfi(ffi::UserInfo user) {
+    return UserInfo(user.id, user.created_at, static_cast<UserStatus>(user.status),
+                    std::string(user.username.c_str(), user.username.size()));
+}
+
+UserInfoDetails UserInfoDetails::FromFfi(ffi::UserInfoDetails user) {
+    std::optional<::iggy::Permissions> permissions;
+    if (user.has_permissions) {
+        permissions = ::iggy::Permissions::FromFfi(std::move(user.permissions));
+    }
+    return UserInfoDetails(user.id, user.created_at, static_cast<UserStatus>(user.status),
+                           std::string(user.username.c_str(), user.username.size()), std::move(permissions));
+}
+
 ffi::Identifier Identifier::ToFfi() const {
     ffi::Identifier identifier{};
     if (kind_ == Kind::Numeric) {
@@ -179,6 +295,34 @@ ConsumerGroupDetails ConsumerGroupDetails::FromFfi(ffi::ConsumerGroupDetails gro
 
     return ConsumerGroupDetails(group.id, std::string(group.name.c_str(), group.name.size()), group.partitions_count,
                                 group.members_count, std::move(members));
+}
+
+ConsumerGroupInfo ConsumerGroupInfo::FromFfi(ffi::ConsumerGroupInfo info) {
+    return ConsumerGroupInfo(info.stream_id, info.topic_id, info.group_id);
+}
+
+ClientInfo ClientInfo::FromFfi(ffi::ClientInfo info) {
+    std::optional<std::uint32_t> user_id;
+    if (info.has_user_id) {
+        user_id = info.user_id;
+    }
+    return ClientInfo(info.client_id, user_id, std::string(info.address.c_str(), info.address.size()),
+                      std::string(info.transport.c_str(), info.transport.size()), info.consumer_groups_count);
+}
+
+ClientInfoDetails ClientInfoDetails::FromFfi(ffi::ClientInfoDetails info) {
+    std::optional<std::uint32_t> user_id;
+    if (info.has_user_id) {
+        user_id = info.user_id;
+    }
+    std::vector<ConsumerGroupInfo> consumer_groups;
+    consumer_groups.reserve(info.consumer_groups.size());
+    for (auto &group : info.consumer_groups) {
+        consumer_groups.push_back(ConsumerGroupInfo::FromFfi(group));
+    }
+    return ClientInfoDetails(info.client_id, user_id, std::string(info.address.c_str(), info.address.size()),
+                             std::string(info.transport.c_str(), info.transport.size()), info.consumer_groups_count,
+                             std::move(consumer_groups));
 }
 
 }  // namespace iggy
