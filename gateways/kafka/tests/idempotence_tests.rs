@@ -34,15 +34,16 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_NONE,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, handle_request, handle_request_bounded,
-    is_supported_version,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNSUPPORTED_VERSION, GatewayState, handle_request,
+    handle_request_bounded, is_supported_version,
 };
 
 use codec::Decoder;
 use scope::default_broker;
-use server::spawn_test_server;
+use server::{spawn_test_server, spawn_test_server_with_config};
 use tcp::{ByteRead, build_request_frame, read_byte_with_timeout, round_trip};
 use wire::{build_api_versions_flexible_request, build_init_producer_id_request};
 
@@ -180,6 +181,14 @@ async fn given_a_transactional_id_when_init_producer_id_should_answer_unsupporte
             response.error_code, ERROR_UNSUPPORTED_VERSION,
             "v{version} must refuse a transactional producer"
         );
+        // A real broker's error path leaves both at their schema defaults, and -1 is the
+        // "no producer id" sentinel the whole bit-63-clear layout exists to keep distinct
+        // from a real allocation.
+        assert_eq!(
+            response.producer_id, -1,
+            "v{version} a refusal must not hand back an allocated id"
+        );
+        assert_eq!(response.producer_epoch, 0, "v{version} producer_epoch");
     }
 }
 
@@ -220,10 +229,10 @@ async fn given_no_transactional_id_when_producing_should_keep_the_retriable_stub
     )
     .await
     .expect_response("acks=1 expects a response");
-    assert_ne!(
+    assert_eq!(
         first_produce_partition_error(&body),
-        ERROR_UNSUPPORTED_VERSION,
-        "a non-transactional produce must not inherit the transactional refusal"
+        ERROR_NOT_LEADER_OR_FOLLOWER,
+        "a non-transactional produce keeps the retriable stub error, not the transactional refusal"
     );
 }
 
@@ -349,6 +358,62 @@ async fn given_a_live_server_when_a_transactional_request_is_refused_should_keep
             "key {api_key} must refuse the transaction without dropping the connection"
         );
     }
+}
+
+/// Config value has to reach the allocator, not just the struct. Nothing else pins that hop:
+/// one test pins env to config, another pins `GatewayState::new` to the high bits, and the
+/// server's own `config.instance_id` argument sat between them uncovered.
+#[tokio::test]
+async fn given_a_server_configured_with_an_instance_id_when_init_producer_id_should_reflect_it() {
+    let instance_id = 0x0042u16;
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
+        bind_addr: String::new(),
+        advertised_host: None,
+        advertised_port: None,
+        max_frame_size: MAX_FRAME_SIZE,
+        max_connections: 1024,
+        idle_timeout: Duration::from_secs(5),
+        read_timeout: Duration::from_secs(5),
+        write_timeout: Duration::from_secs(5),
+        shutdown_drain_timeout: Duration::from_secs(5),
+        instance_id,
+    })
+    .await;
+
+    let request = build_init_producer_id_request(4, None);
+    let (_correlation_id, body) =
+        round_trip(addr, API_KEY_INIT_PRODUCER_ID, 4, 7_200, &request).await;
+    let response = decode_init_producer_id_response(4, &body);
+    assert_eq!(response.error_code, ERROR_NONE);
+    assert_eq!(
+        response.producer_id >> COUNTER_BITS,
+        i64::from(instance_id),
+        "the configured instance number must reach the allocator, not stop at the config struct"
+    );
+}
+
+/// One allocator per process, shared across connections. Building a `GatewayState` per accepted
+/// connection instead would restart every counter at 0 and put duplicate producer ids on the
+/// wire, which Kafka requires to be unique; the in-process test above cannot see that because it
+/// never opens a second connection.
+#[tokio::test]
+async fn given_one_server_when_two_connections_init_should_receive_distinct_ids() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let request = build_init_producer_id_request(4, None);
+
+    let (_first_id, first_body) =
+        round_trip(addr, API_KEY_INIT_PRODUCER_ID, 4, 7_300, &request).await;
+    let (_second_id, second_body) =
+        round_trip(addr, API_KEY_INIT_PRODUCER_ID, 4, 7_301, &request).await;
+
+    let first = decode_init_producer_id_response(4, &first_body);
+    let second = decode_init_producer_id_response(4, &second_body);
+    assert_eq!(first.error_code, ERROR_NONE);
+    assert_eq!(second.error_code, ERROR_NONE);
+    assert_ne!(
+        first.producer_id, second.producer_id,
+        "separate connections must draw from one allocator"
+    );
 }
 
 #[tokio::test]

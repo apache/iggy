@@ -38,13 +38,14 @@ kafka listener bound on 127.0.0.1:9093
 
 ```bash
 # Terminal 2
-# Keys 0/1/2/19 match ci-wire-fixtures.sh: the only keys any test actually loads a .bin
-# fixture for. Metadata (3) and ApiVersions (18) requests are built synthetically in-test
-# instead, so fixtures for those keys are generated but unused - `generate` still accepts
-# them if you want them for manual `send`/`verify` below.
+# Keys 0/1/2/19/22 match ci-wire-fixtures.sh's FIXTURE_API_KEYS: the only keys any test
+# actually loads a .bin fixture for. Omit key 22 and the six InitProducerId cases skip
+# silently, which reads as a pass. Metadata (3) and ApiVersions (18) requests are built
+# synthetically in-test instead, so fixtures for those keys are generated but unused -
+# `generate` still accepts them if you want them for manual `send`/`verify` below.
 cargo run -p kafka-message-gen -- generate \
   --output gateways/kafka/tools/kafka-tool/kafka_messages \
-  --api-key 0 --api-key 1 --api-key 2 --api-key 19
+  --api-key 0 --api-key 1 --api-key 2 --api-key 19 --api-key 22
 ```
 
 ---
@@ -269,14 +270,14 @@ Tester: ___________
 Gateway commit: ___________
 kcat version (if used): ___________
 
-[ ] A1–A9  Smoke tests
-[ ] B1–B4  Version firewall (all 6 keys × 4 boundary versions)
+[ ] A1–A10 Smoke tests
+[ ] B1–B4  Version firewall (all 7 keys × 4 boundary versions)
 [ ] C1–C4  Unsupported API keys
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
 [ ] F1–F6  TCP / connection behavior
 [ ] G1–G3  kcat client (record errors for G2/G3)
-[ ] H1–H3  Adversarial input
+[ ] H1–H6  Adversarial input
 
 Automated regression:
 [ ] cargo test -p iggy-gateway-kafka — all passed (see `TEST_SUITE.md` for why this checklist

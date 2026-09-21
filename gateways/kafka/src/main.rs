@@ -341,6 +341,35 @@ mod tests {
         );
     }
 
+    /// A bad instance id must fail startup loudly. Silently defaulting to 0 would let two
+    /// gateways mint colliding producer ids, which Kafka requires to be unique cluster-wide,
+    /// and the message has to name the variable and the offending value or an operator cannot
+    /// act on it.
+    #[test]
+    #[serial]
+    fn given_an_unparseable_instance_id_when_loading_config_should_reject_and_name_it() {
+        for raw in ["abc", "-1", "", " 7", "7.0"] {
+            unsafe {
+                std::env::set_var("IGGY_KAFKA_INSTANCE_ID", raw);
+            }
+            let loaded = load_config();
+            unsafe {
+                std::env::remove_var("IGGY_KAFKA_INSTANCE_ID");
+            }
+            let error = loaded.err().unwrap_or_else(|| {
+                panic!("instance id `{raw}` must be rejected, not silently defaulted to 0")
+            });
+            assert!(
+                error.contains("IGGY_KAFKA_INSTANCE_ID"),
+                "`{raw}` rejection must name the variable, got: {error}"
+            );
+            assert!(
+                error.contains(raw),
+                "`{raw}` rejection must quote the offending value, got: {error}"
+            );
+        }
+    }
+
     #[test]
     fn parse_positive_rejects_zero() {
         assert!(parse_positive::<usize>("KEY", "0").is_err());

@@ -780,6 +780,36 @@ mod tests {
         assert!(validate_metadata_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
+    /// Every sibling guard carries a rejection POC; without one, short-circuiting this guard to
+    /// `Ok(())` leaves the whole suite green, so nothing proved it rejected a hostile frame.
+    #[test]
+    fn init_producer_id_v5_huge_compact_string_rejected() {
+        // Compact string length varint far past the frame: nothing follows it to read.
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_init_producer_id_shape(5, &body).is_err());
+    }
+
+    #[test]
+    fn init_producer_id_v0_truncated_legacy_string_rejected() {
+        // Declares 32767 bytes of transactional id, supplies none.
+        let body = Bytes::from_static(&[0x7F, 0xFF]);
+        assert!(validate_init_producer_id_shape(0, &body).is_err());
+    }
+
+    #[test]
+    fn init_producer_id_v5_null_transactional_id_accepted() {
+        // Null compact string, transaction_timeout_ms, then the v3+ producer id/epoch pair
+        // (both -1, "no producer id"), then tagged fields.
+        let body = Bytes::from_static(&[
+            0x00, // transactional_id: null compact string
+            0x00, 0x00, 0x75, 0x30, // transaction_timeout_ms: 30000
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // producer_id: -1
+            0xFF, 0xFF, // producer_epoch: -1
+            0x00, // tagged fields
+        ]);
+        assert!(validate_init_producer_id_shape(5, &body).is_ok());
+    }
+
     #[test]
     fn metadata_v0_null_array_all_topics_accepted() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]); // -1: all topics

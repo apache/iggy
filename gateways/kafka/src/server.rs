@@ -205,9 +205,12 @@ impl KafkaGateway {
     ) -> Result<()> {
         let local_addr = listener.local_addr()?;
         let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
+        // instance_id is logged because it is the only way to tell from a running process which
+        // half of the producer-id space this gateway owns. Two gateways left on the default
+        // collide silently, and a config file cannot be diffed against a live deployment.
         info!(
-            "kafka listener bound on {} (advertised as {}:{})",
-            local_addr, broker.host, broker.port
+            "kafka listener bound on {} (advertised as {}:{}, instance id {})",
+            local_addr, broker.host, broker.port, self.config.instance_id
         );
         let state = Arc::new(GatewayState::new(
             broker,

@@ -124,7 +124,11 @@ a birthday collision, not a remote one.
 The id is a pool key, not a dedup identity. Under the design above, the dedup identity is the
 session's own random client id, minted at register. The producer id only decides which connection
 serves a producer. Kafka still requires it to be unique across the cluster, which is what the
-instance number buys. It does not have to survive a restart.
+instance number buys. It does not have to survive a restart while nothing keys state on it,
+which is true of allocate-only: the gateway hands an id out and forgets it. That stops being true
+the moment the pool lands or Produce persists, because a restarted allocator replays ids a live
+producer still holds, and `producer_epoch` is always 0 so the pair cannot tell the generations
+apart. Treat generation reuse as a pool blocker, not a detail.
 
 An empty `transactional_id` reads as absent. A wire null decodes to `None`, but
 `kafka-protocol`'s own `Default` is `Some("")`, and a producer that is idempotent-only names no
@@ -179,7 +183,9 @@ to every consumer.
 
 ## Invariants this design rests on
 
-Both are absences, so nothing fails loudly if they are lost.
+Both are absences. Losing either is caught: `golden_wire_fixtures_tests.rs` pins the ApiVersions
+v1 and v3 bodies byte-exactly, so adding a finalized feature or any advertised key fails both
+goldens.
 
 **Never advertise `transaction.version >= 2` in the ApiVersions `finalized_features`.**
 `TransactionManager.maybeUpdateTransactionV2Enabled` reads it, and under TV2 `maybeAddPartition`

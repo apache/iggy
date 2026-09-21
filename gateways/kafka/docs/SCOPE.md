@@ -12,7 +12,7 @@ Foundation layer only: a TCP listener on the Kafka wire port that decodes reques
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
 | Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
 | Version negotiation firewall (`SUPPORTED_RANGES`) | Done | `src/protocol/api.rs` |
-| Request decode + stub encode for 6 API keys | Done | `src/protocol/api.rs`, `responses.rs` (via the `kafka_protocol` crate) |
+| Request decode + stub encode for 7 API keys | Done | `src/protocol/api.rs`, `src/protocol/handlers/` (via the `kafka_protocol` crate) |
 | Produce hot path: RecordBatch as opaque `Bytes` | Done | `src/protocol/responses.rs` |
 | Pre-decode bounds guard against unbounded allocation | Done | `src/protocol/bounds_guard.rs` |
 | Graceful errors (corrupt decode, invalid header) | Done | `src/protocol/api.rs`, `src/server.rs` |
@@ -101,7 +101,10 @@ Three things enforce that, in the order a client meets them:
    throws and `NetworkClient.doSend` keeps the request off the wire; librdkafka's four request
    builders return `__UNSUPPORTED_FEATURE`, which is fatal there.
 2. **InitProducerId (22) with a `transactional_id`** answers `UNSUPPORTED_VERSION` (35), so a
-   producer that got past step 1 fails before it can open a transaction.
+   producer that got past step 1 fails before it can open a transaction. Terminal on the Java
+   client, whose `InitProducerIdHandler` treats any unrecognised code as fatal. Not terminal on
+   librdkafka, which retries 35 here indefinitely; librdkafka is stopped by step 1 instead, and
+   [`IDEMPOTENCE.md`](IDEMPOTENCE.md) records why that matters when FindCoordinator is advertised.
 3. **Produce with a non-empty `transactional_id`** answers `UNSUPPORTED_VERSION` (35) per
    partition, so a raw client that skipped both earlier gates still cannot write transactional
    records. `acks=0` stays silent, and no case closes the connection.

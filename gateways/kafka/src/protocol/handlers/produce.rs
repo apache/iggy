@@ -147,6 +147,12 @@ pub fn encode_response(version: i16, req: &ProduceRequest) -> Result<Bytes> {
 /// A transactional batch must never be answered as if it were ordinary records: nothing here
 /// tracks a last stable offset or writes an abort marker, so an aborted transaction's records
 /// would reach every consumer. 35 is fatal for the producer; 42 and 43 are only abortable.
+///
+/// This reads the request-level `transactional_id` only. A record batch carries its own
+/// transactional bit in attributes, and the records stay opaque bytes here, so a hand-built
+/// frame setting the bit without the request field still gets the retriable stub error. Java
+/// and librdkafka both set the request field whenever they set the batch bit, so no real client
+/// reaches that gap; it has to close before records are ever persisted.
 fn partition_error_code(req: &ProduceRequest) -> i16 {
     if is_transactional(req.transactional_id.as_ref()) {
         ERROR_UNSUPPORTED_VERSION
