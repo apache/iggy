@@ -15,19 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake};
 
-use consensus::PartitionsHandle;
-use iggy_common::{IggyError, PollingStrategy};
+use consensus::{
+    ClientTable, MetadataHandle, PartitionsHandle, Sequencer, SessionEnd, build_reply_message_with,
+};
+use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, PurgeTopicRequest};
+use iggy_binary_protocol::{AckLevel, ReplyHeader, RoutedRequestHeader, WireConsumer};
+use iggy_binary_protocol::{Command, Operation, PrepareHeader, WireEncode, WireIdentifier};
+use iggy_common::{IggyError, IggyTimestamp, PollingStrategy};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::IggyMessageBus;
 use metadata::IggyMetadata;
-use metadata::impls::metadata::IggySnapshot;
+use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
+use metadata::stm::StateMachine;
+use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
+use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
+use metadata::stm::user::Users;
 use partitions::{IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer};
+use server_common::Message;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
@@ -35,9 +47,470 @@ use super::test_support::{PollTestMetadata, partition_with_messages};
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    IggyShard, LifecycleFrame, PartitionConsensusConfig, PartitionRead, PartitionReadReply,
-    Receiver, ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
+    ConsumerAttachment, IggyShard, LifecycleFrame, PartitionConsensusConfig, PartitionRead,
+    PartitionReadReply, Receiver, ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender,
+    channel, shard_channel,
 };
+
+#[compio::test]
+#[allow(clippy::too_many_lines)]
+async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_affected_reads() {
+    const CLIENT: u128 = 41;
+    const OTHER_CLIENT: u128 = 42;
+    const USER: u32 = 7;
+    const GROUP: u64 = 7;
+    #[derive(Debug, Clone, Copy)]
+    enum Change {
+        Logout,
+        Leave,
+        OtherLeave,
+        MissingLeave,
+        Rejoin,
+        Purge,
+        Delete,
+    }
+    for change in [
+        Change::Logout,
+        Change::Leave,
+        Change::OtherLeave,
+        Change::MissingLeave,
+        Change::Rejoin,
+        Change::Purge,
+        Change::Delete,
+    ] {
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+        let mut inner = StreamsInner::default();
+        let mut stream = Stream::default();
+        let mut topic = Topic::default();
+        topic.partitions.push(Partition::new(
+            0,
+            namespace.inner(),
+            IggyTimestamp::default(),
+            1,
+            0,
+        ));
+        for (group_id, client_id) in [(GROUP, CLIENT), (GROUP + 1, OTHER_CLIENT)] {
+            let mut group = ConsumerGroup::new(group_id, Arc::from(format!("group-{group_id}")));
+            group.members.insert(ConsumerGroupMember::new(0, client_id));
+            group.rebalance_members(&[0]);
+            topic.consumer_groups.insert(group_id, group);
+        }
+        stream.topics.insert(topic);
+        inner.items.insert(stream);
+        let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
+        let (owner, _owner_sender) = owner_with_metadata(&bus, config, namespace, metadata);
+        owner
+            .shards_table
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 1));
+        let partitions = owner.plane.partitions();
+        partitions.insert(namespace, partition);
+        let mut table = ClientTable::new(1);
+        let header = PrepareHeader {
+            client: CLIENT,
+            user_id: USER,
+            operation: Operation::Register,
+            op: 1,
+            ..Default::default()
+        };
+        table.commit_register(CLIENT, USER, build_reply_message_with(&header, 0, |_| {}));
+        let (_stop, stop) = channel(1);
+        let pump = owner.run_message_pump(stop, Arc::new(AtomicBool::new(false)));
+        futures::pin_mut!(pump);
+
+        let session = table.attach_session(CLIENT, header.op, USER).unwrap();
+        let streams = owner.plane.metadata().mux_stm.streams();
+        if matches!(change, Change::Purge) {
+            let (reply, replies) = channel(1);
+            owner
+                .on_partition_read(
+                    namespace,
+                    PartitionRead::PollOnPrimary {
+                        consumer: PollingConsumer::Consumer(USER as usize, 0),
+                        args: PollingArgs {
+                            strategy: PollingStrategy::first(),
+                            count: 1,
+                            auto_commit: false,
+                        },
+                        attachment: ConsumerAttachment {
+                            session: session.clone(),
+                            metadata: streams.poll_metadata(namespace, None, CLIENT).unwrap(),
+                        },
+                    },
+                    reply,
+                )
+                .await;
+            assert_single_message_reply(&replies);
+        }
+        let mut completions = Vec::new();
+        for group in [None, Some(GROUP)] {
+            let attachment = ConsumerAttachment {
+                session: session.clone(),
+                metadata: streams.poll_metadata(namespace, group, CLIENT).unwrap(),
+            };
+            let (reply, replies) = channel(1);
+            let completion = owner
+                .poll_completions
+                .try_reserve(namespace, reply, Some(attachment))
+                .expect("reserve the attached read");
+            let plan = partitions
+                .build_poll_snapshot(
+                    &namespace,
+                    group.map_or(PollingConsumer::Consumer(USER as usize, 0), |group| {
+                        PollingConsumer::ConsumerGroup(usize::try_from(group).unwrap(), 0)
+                    }),
+                    &PollingArgs {
+                        strategy: PollingStrategy::first(),
+                        count: 1,
+                        auto_commit: true,
+                    },
+                )
+                .expect("the group has an unread message");
+            let result = plan.execute_resident();
+            completions.push((group, completion, replies, result));
+        }
+        match change {
+            Change::Logout => {
+                table.remove_client(CLIENT, USER, SessionEnd::Explicit);
+            }
+            Change::Leave => streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default()),
+            Change::OtherLeave => {
+                streams.remove_consumer_group_member(OTHER_CLIENT, IggyTimestamp::default());
+            }
+            Change::MissingLeave => {
+                streams.remove_consumer_group_member(OTHER_CLIENT + 1, IggyTimestamp::default());
+            }
+            Change::Rejoin => apply_poll_metadata(
+                &owner,
+                Operation::JoinConsumerGroup,
+                JoinConsumerGroupRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    group_id: WireIdentifier::numeric(u32::try_from(GROUP).unwrap()),
+                    client_id: CLIENT,
+                    in_flight: Vec::new(),
+                }
+                .to_bytes(),
+            ),
+            Change::Purge => apply_poll_metadata(
+                &owner,
+                Operation::PurgeTopic,
+                PurgeTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                }
+                .to_bytes(),
+            ),
+            Change::Delete => apply_poll_metadata(
+                &owner,
+                Operation::DeleteTopic,
+                DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                }
+                .to_bytes(),
+            ),
+        }
+        for (group, completion, replies, result) in completions {
+            let stale = matches!(change, Change::Logout | Change::Purge | Change::Delete)
+                || (matches!(change, Change::Leave) && group.is_some());
+            completion.complete(result);
+            assert!(futures::poll!(pump.as_mut()).is_pending());
+            let reply = replies
+                .try_recv()
+                .expect("the owner must validate the completion");
+            if stale {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    ),
+                    "{change:?}, group {group:?}: stale authorization must reject, got {reply:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Poll {
+                            current_offset: 0,
+                            ..
+                        }
+                    ),
+                    "fresh authorization must accept, got {reply:?}"
+                );
+            }
+            if group.is_some() {
+                let expected = if stale {
+                    (None, None)
+                } else {
+                    (Some(0), Some(0))
+                };
+                assert_eq!(
+                    partitions.group_offset_state(&namespace, GROUP).unwrap(),
+                    expected,
+                    "{change:?}: completion must preserve group progress"
+                );
+            }
+        }
+        if matches!(change, Change::Purge) {
+            let (reply, replies) = channel(1);
+            owner
+                .on_partition_read(
+                    namespace,
+                    PartitionRead::PollOnPrimary {
+                        consumer: PollingConsumer::Consumer(USER as usize, 0),
+                        args: PollingArgs {
+                            strategy: PollingStrategy::first(),
+                            count: 1,
+                            auto_commit: true,
+                        },
+                        attachment: ConsumerAttachment {
+                            session: session.clone(),
+                            metadata: streams.poll_metadata(namespace, None, CLIENT).unwrap(),
+                        },
+                    },
+                    reply,
+                )
+                .await;
+            assert!(
+                matches!(
+                    replies.try_recv().unwrap(),
+                    PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                ),
+                "new polls must wait until the committed purge is materialized"
+            );
+        }
+    }
+}
+
+fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: impl AsRef<[u8]>) {
+    let body = body.as_ref();
+    let size = size_of::<PrepareHeader>() + body.len();
+    let mut message = Message::<PrepareHeader>::new(size);
+    let header = PrepareHeader {
+        command: Command::Prepare,
+        operation,
+        size: u32::try_from(size).unwrap(),
+        ..Default::default()
+    };
+    message.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(body);
+    let message = message.transmute_header::<PrepareHeader>(|_, target| *target = header);
+    assert_eq!(
+        owner.plane.metadata().mux_stm.update(message).unwrap().code,
+        0
+    );
+}
+
+#[compio::test]
+#[allow(clippy::too_many_lines)]
+async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_admission() {
+    const PARENT: u128 = 41;
+    const DATA_CLIENT: u128 = 51;
+    const USER: u32 = 7;
+    const GROUP: u64 = 7;
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        None,
+        PendingRevocation,
+        Logout,
+        Reregister,
+        Leave,
+        Purge,
+        Delete,
+        Replaced,
+        Unmaterialized,
+    }
+    for change in [
+        Change::None,
+        Change::PendingRevocation,
+        Change::Logout,
+        Change::Reregister,
+        Change::Leave,
+        Change::Purge,
+        Change::Delete,
+        Change::Replaced,
+        Change::Unmaterialized,
+    ] {
+        let namespace = IggyNamespace::new(0, 0, 1);
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+        let mut inner = StreamsInner::default();
+        let mut stream = Stream::default();
+        let mut topic = Topic::default();
+        for partition_id in [0, 1] {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            topic.partitions.push(Partition::new(
+                partition_id,
+                namespace.inner(),
+                IggyTimestamp::default(),
+                1,
+                0,
+            ));
+        }
+        let mut group = ConsumerGroup::new(GROUP, Arc::from("offset-group"));
+        group.members.insert(ConsumerGroupMember::new(0, PARENT));
+        group.rebalance_members(&[0, 1]);
+        if matches!(change, Change::PendingRevocation) {
+            group
+                .members
+                .insert(ConsumerGroupMember::new(1, PARENT + 1));
+            group.rebalance_cooperative(&[0, 1], &HashSet::from([1]), 1);
+            assert_eq!(group.pending_revocations().len(), 1);
+        }
+        topic.consumer_groups.insert(GROUP, group);
+        stream.topics.insert(topic);
+        inner.items.insert(stream);
+        let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
+        let (owner, _sender) = owner_with_metadata(&bus, config.clone(), namespace, metadata);
+        owner
+            .shards_table
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 1));
+        let partitions = owner.plane.partitions();
+        partitions.insert(namespace, partition);
+        let mut table = ClientTable::new(1);
+        let mut registration = PrepareHeader {
+            client: PARENT,
+            user_id: USER,
+            operation: Operation::Register,
+            op: 1,
+            ..Default::default()
+        };
+        table.commit_register(
+            PARENT,
+            USER,
+            build_reply_message_with(&registration, 0, |_| {}),
+        );
+        let streams = owner.plane.metadata().mux_stm.streams();
+        if matches!(change, Change::PendingRevocation) {
+            assert!(
+                streams
+                    .poll_metadata(namespace, Some(GROUP), PARENT)
+                    .is_none()
+            );
+        }
+        let attachment = ConsumerAttachment {
+            session: table.attach_session(PARENT, registration.op, USER).unwrap(),
+            metadata: streams
+                .consumer_offset_metadata(namespace, Some(GROUP), PARENT)
+                .unwrap(),
+        };
+        let body = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer_group(WireIdentifier::numeric(
+                u32::try_from(GROUP).unwrap(),
+            )),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(1),
+            offset: 0,
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        let size = size_of::<RoutedRequestHeader>() + body.len();
+        let mut request = Message::<RoutedRequestHeader>::new(size);
+        request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        let request = request.transmute_header::<RoutedRequestHeader>(|_, header| {
+            *header = RoutedRequestHeader {
+                command: Command::Request,
+                operation: Operation::StoreConsumerOffset,
+                size: u32::try_from(size).unwrap(),
+                cluster: 1,
+                group: namespace.inner(),
+                client: DATA_CLIENT,
+                user_id: USER,
+                session: 1,
+                request: 1,
+                ..Default::default()
+            }
+        });
+        let ticket = owner
+            .partition_submit_attached(namespace, request, Some(attachment))
+            .unwrap();
+        match change {
+            Change::None | Change::PendingRevocation => {}
+            Change::Logout => {
+                table.remove_client(PARENT, USER, SessionEnd::Explicit);
+            }
+            Change::Reregister => {
+                registration.op += 1;
+                table.commit_register(
+                    PARENT,
+                    USER,
+                    build_reply_message_with(&registration, 0, |_| {}),
+                );
+            }
+            Change::Leave => streams.remove_consumer_group_member(PARENT, IggyTimestamp::default()),
+            Change::Purge => apply_poll_metadata(
+                &owner,
+                Operation::PurgeTopic,
+                PurgeTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                }
+                .to_bytes(),
+            ),
+            Change::Delete => apply_poll_metadata(
+                &owner,
+                Operation::DeleteTopic,
+                DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                }
+                .to_bytes(),
+            ),
+            Change::Replaced => {
+                owner
+                    .shards_table
+                    .insert(namespace, PartitionLocation::new(ShardId::new(0), 2));
+            }
+            Change::Unmaterialized => {
+                partitions.remove(&namespace);
+            }
+        }
+        let (_stop, stop) = channel(1);
+        let pump = owner.run_message_pump(stop, Arc::new(AtomicBool::new(false)));
+        futures::pin_mut!(pump);
+        assert!(futures::poll!(pump.as_mut()).is_pending());
+        let admitted = matches!(change, Change::None | Change::PendingRevocation);
+        if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+            assert_eq!(
+                partition.consensus().sequencer().current_sequence(),
+                if admitted { 2 } else { 1 },
+                "{change:?}"
+            );
+            if admitted {
+                partition.consensus().advance_commit_max(2);
+                partition.commit_journal(&config).await;
+            }
+        }
+        let reply = owner
+            .await_partition_submit(ticket)
+            .await
+            .unwrap()
+            .try_into_typed::<ReplyHeader>()
+            .unwrap();
+        let header = reply.header();
+        let status = if admitted {
+            0
+        } else if matches!(change, Change::Logout | Change::Reregister) {
+            IggyError::StaleClient.as_code()
+        } else {
+            IggyError::TransientNotAccepted.as_code()
+        };
+        assert_eq!(header.status, status, "{change:?}");
+        assert_eq!(
+            header.client, DATA_CLIENT,
+            "the parent must not replace the write's deduplication identity"
+        );
+        if !matches!(change, Change::Unmaterialized) {
+            assert_eq!(
+                partitions.group_offset_state(&namespace, GROUP).unwrap().1,
+                admitted.then_some(0),
+                "{change:?}"
+            );
+        }
+    }
+}
 
 /// Replacement can reuse every message offset from the old history. The pump
 /// must reject the old completion by history, then accept a fresh completion
@@ -69,7 +542,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let (stale_reply_sender, stale_replies) = channel(1);
     let old_completion = owner
         .poll_completions
-        .try_reserve(namespace, stale_reply_sender)
+        .try_reserve(namespace, stale_reply_sender, None)
         .expect("reserve the old read before executing it");
     let old_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
@@ -139,7 +612,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let (fresh_reply_sender, fresh_replies) = channel(1);
     let fresh_completion = owner
         .poll_completions
-        .try_reserve(namespace, fresh_reply_sender)
+        .try_reserve(namespace, fresh_reply_sender, None)
         .expect("reserve the fresh read before executing it");
     let fresh_plan = partitions
         .build_poll_snapshot(&namespace, consumer, &poll_args)
@@ -218,7 +691,7 @@ async fn given_full_owner_inbox_when_reserved_reads_complete_should_interleave_b
         let (reply_sender, replies) = channel(1);
         let completion = owner
             .poll_completions
-            .try_reserve(namespace, reply_sender)
+            .try_reserve(namespace, reply_sender, None)
             .expect("reserve completion capacity before reading");
         let plan = partitions
             .build_poll_snapshot(
@@ -404,9 +877,18 @@ fn owner_with_inbox(
     config: PartitionsConfig,
     namespace: IggyNamespace,
 ) -> (CompletionTestShard, TaggedSender) {
+    owner_with_metadata(bus, config, namespace, PollTestMetadata::default())
+}
+
+fn owner_with_metadata(
+    bus: &Rc<IggyMessageBus>,
+    config: PartitionsConfig,
+    namespace: IggyNamespace,
+    metadata: PollTestMetadata,
+) -> (CompletionTestShard, TaggedSender) {
     let shard_id = ShardId::new(0);
     let partitions = IggyPartitions::new(shard_id, config);
-    let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None);
+    let metadata = IggyMetadata::new(None, None, None, None, metadata, None);
     let (sender, inbox, replies) = shard_channel(0, 2, 1);
     let routes = PapayaShardsTable::new();
     routes.insert(namespace, PartitionLocation::new(shard_id, 0));
@@ -453,7 +935,7 @@ fn queue_resident_poll(
     let (reply_sender, replies) = channel(1);
     owner
         .poll_completions
-        .try_reserve(namespace, reply_sender)
+        .try_reserve(namespace, reply_sender, None)
         .expect("reserve capacity before completing the read")
         .complete(plan.execute_resident());
     assert_eq!(

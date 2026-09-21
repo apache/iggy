@@ -80,10 +80,13 @@ pub use mongodb::{
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
 pub use postgres::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceDeleteFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceOps,
+    POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
+    PostgresSinkJsonFixture, PostgresSinkLargeBatchFixture, PostgresSourceByteaFixture,
+    PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture, PostgresSourceDeleteFixture,
+    PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture, PostgresSourceJsonbFixture,
+    PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
+    PostgresSourceNonUniqueTrackingFixture, PostgresSourceNumericTrackingFixture,
+    PostgresSourceOps, PostgresSourceTextKeyFixture,
 };
 pub use quickwit::{
     QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,
@@ -100,7 +103,7 @@ pub use redshift::{
 };
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 pub use surrealdb::{
-    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
-    SurrealDbSinkRawFixture,
+    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkDatabaseFixture, SurrealDbSinkFixture,
+    SurrealDbSinkJsonFixture, SurrealDbSinkNamespaceFixture, SurrealDbSinkRawFixture,
 };
 pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};

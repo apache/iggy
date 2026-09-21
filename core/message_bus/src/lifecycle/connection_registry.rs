@@ -90,12 +90,11 @@ pub type BusReceiver = async_channel::Receiver<BusMessage>;
 ///
 /// Exposes the writer and reader [`JoinHandle`]s plus the per-connection
 /// [`Shutdown`] so the loser can explicitly drain (or force-cancel on
-/// deadline) the orphan tasks rather than relying on them to self-exit via
-/// `install_aborted`. `compio::runtime::JoinHandle::drop` detaches; without
-/// this the loser would leak the handles and a reader looping on
-/// `framing::read_message` could outlive the race indefinitely on a
-/// half-open socket. Triggering the [`Shutdown`] wakes the reader off its
-/// `io_uring` read SQE without waiting for peer EOF.
+/// deadline) the orphan tasks. `install_aborted` prevents them from
+/// dispatching frames or cleaning up the winning entry. Dropping a
+/// [`JoinHandle`] cancels its task; explicitly draining allows cooperative
+/// shutdown before the deadline. Triggering [`Shutdown`] wakes the reader
+/// without waiting for peer EOF.
 ///
 /// [`Shutdown`]: crate::lifecycle::Shutdown
 #[derive(Debug)]

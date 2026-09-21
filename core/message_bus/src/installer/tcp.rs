@@ -61,6 +61,8 @@ pub fn install_client_tcp(
 /// Install a pre-wrapped client connection on the bus. Generic over
 /// [`TransportConn`]; plane-symmetric with
 /// [`super::replica::install_replica_conn`].
+///
+/// Connections arriving after shutdown starts are dropped before registration.
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub fn install_client_conn<C: TransportConn>(
     bus: &Rc<IggyMessageBus>,
@@ -68,10 +70,13 @@ pub fn install_client_conn<C: TransportConn>(
     conn: C,
     on_request: RequestHandler,
 ) {
+    if bus.is_shutting_down() {
+        return;
+    }
     let client_id = meta.client_id;
-    let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
+    let (tx, rx) = async_channel::bounded(bus.config().client_queue_capacity);
     let (in_tx, in_rx) =
-        async_channel::bounded::<Message<GenericHeader>>(bus.peer_queue_capacity());
+        async_channel::bounded::<Message<GenericHeader>>(bus.config().client_queue_capacity);
 
     // If the registry insert below loses a race for `client_id`, the
     // losing reader must NOT invoke `on_request` (it would route

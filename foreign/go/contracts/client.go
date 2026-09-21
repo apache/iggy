@@ -123,6 +123,13 @@ type Client interface {
 	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
 	//
+	// Clustered auto-commit polls use persistent partition-primary connections
+	// while the coordinator retains group membership. Only explicit refusal
+	// before admission is retried. ErrTransientNotCommitted, or cancellation
+	// after sending a poll, can mean the offset advanced without a reply.
+	// These polls are never replayed automatically after an unknown outcome.
+	// Servers must support primary routing and consumer-session attachment.
+	//
 	// A group poll that names no partition is orchestrated client-side and
 	// has three outcomes:
 	//   - err == nil with PartitionId == NoAssignedPartition and an empty

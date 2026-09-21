@@ -34,11 +34,14 @@ path = "src/main.rs"
 
 [dependencies]
 bytes = { workspace = true }
+iggy = { workspace = true }
 # Broker-role only: decodes requests and encodes responses. Default features also pull in
 # client-role codec paths and compression codecs (gzip/lz4/snappy/zstd) this gateway never
 # uses, since RecordBatch payloads stay opaque `Bytes` here.
 kafka-protocol = { workspace = true }
 libc = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
@@ -51,11 +54,14 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tokio-util = { workspace = true, features = ["rt"] }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+serial_test = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 
 [lints.clippy]

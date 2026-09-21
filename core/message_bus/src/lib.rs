@@ -57,10 +57,10 @@
 //!   (their `Frozen<MESSAGE_ALIGN>` fragments flattened, chunked at
 //!   `IOV_MAX`) into `write_vectored_all`. Don't introduce per-message
 //!   syscalls or per-message encryption on the plaintext TCP plane.
-//! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
-//!   connections have no dupable plaintext fd, so shard 0 terminates
-//!   and forwards `Frozen<MESSAGE_ALIGN>` over the existing
-//!   inter-shard crossfire channel.
+//! - fd-delegation ([`fd_transfer`]) transfers raw TCP sockets for TCP,
+//!   WS, TCP-TLS and WSS before handshakes. The destination shard owns
+//!   handshake state and I/O. QUIC client callbacks install on shard 0
+//!   through its shared UDP endpoint.
 //! - 0-RTT stays disabled by default on any future QUIC path. Per-
 //!   command opt-in requires a checked-in idempotence audit.
 //!
@@ -403,42 +403,26 @@ pub type AcceptedQuicClientFn = std::rc::Rc<dyn Fn(AcceptedQuicConn)>;
 /// requires a dupable plaintext fd) stays well-defined.
 pub type AcceptedWsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
 
+/// Listener TLS configuration shared with the shard owning each connection.
+/// Per-connection TLS state is created only on the destination runtime.
+pub type SharedTlsServerConfig = std::sync::Arc<rustls::ServerConfig>;
+
 /// Callback invoked on every accepted SDK TCP-TLS client connection.
 ///
 /// Fires after shard 0's TCP-TLS listener accepts a raw TCP socket.
-/// Neither the rustls handshake nor any application-layer work has run
-/// yet — the listener stays cheap so a slow handshake on one peer cannot
-/// block subsequent accepts. The callback receives the raw stream plus
-/// a clone of the shared [`std::sync::Arc<rustls::ServerConfig>`] built
-/// at bind time, mints a `client_id`, and calls
-/// [`installer::install_client_tcp_tls`]; the install path drives the
-/// rustls handshake on its own task before forwarding the connection to
-/// [`installer::install_client_conn`].
-///
-/// TCP-TLS stays shard-0 terminal: rustls's connection state machine
-/// is tied to the local task and not serialisable, and the
-/// pre-handshake fd would have to re-handshake on the receiving shard,
-/// losing the point of fd-delegation.
-pub type AcceptedTlsClientFn =
-    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+/// The callback delegates the socket and its listener's configuration
+/// before any TLS bytes are consumed. The destination shard runs
+/// [`installer::install_client_tcp_tls`], owning the handshake and all I/O.
+pub type AcceptedTlsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, SharedTlsServerConfig)>;
 
 /// Callback invoked on every accepted SDK WSS (WebSocket-over-TLS)
 /// client connection.
 ///
-/// Fires after shard 0's WSS listener accepts a raw TCP socket. Neither
-/// the rustls handshake nor the WebSocket HTTP-Upgrade has run yet — the
-/// listener stays cheap so neither handshake on one peer can block
-/// subsequent accepts. The callback receives the raw stream plus a clone
-/// of the shared [`std::sync::Arc<rustls::ServerConfig>`] built at bind
-/// time, mints a `client_id`, and calls
-/// [`installer::install_client_wss`]; the install path drives
-/// both handshakes on its own task before forwarding the connection to
-/// [`installer::install_client_conn`].
-///
-/// No subprotocol negotiation is performed. WSS stays shard-0 terminal
-/// for the same reasons as the TCP-TLS plane.
-pub type AcceptedWssClientFn =
-    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+/// Fires before either the TLS handshake or WebSocket upgrade. The callback
+/// delegates the raw socket and its listener's configuration to the owning
+/// shard, where [`installer::install_client_wss`] runs both handshakes and
+/// subsequent I/O. No subprotocol negotiation is performed.
+pub type AcceptedWssClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, SharedTlsServerConfig)>;
 
 /// Notifier fired when a delegated replica connection dies.
 ///
@@ -1224,6 +1208,8 @@ impl IggyMessageBus {
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let clients_outcome = self.clients.drain(remaining).await;
+        // Connection tasks skip per-client cleanup during bus shutdown.
+        self.client_meta.borrow_mut().clear();
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let replicas_outcome = self.replicas.drain(remaining).await;
 

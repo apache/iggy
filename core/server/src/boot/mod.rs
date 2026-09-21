@@ -256,7 +256,7 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
-    crate::responses::init_stats_data_path(config.get_system_path().into());
+    crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
     let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 
@@ -910,10 +910,9 @@ async fn shard_main(
     }
 
     // Listeners (replica + every client transport) bind on shard 0 only.
-    // Shard 0's coordinator round-robins inbound TCP/WS connections to
-    // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
-    // locally on shard 0 (their per-connection state is non-portable -
-    // see `LifecycleFrame::ClientWsConnectionSetup` rustdoc).
+    // The coordinator delegates TCP/WS/TCP-TLS/WSS before any handshake;
+    // the destination shard owns all connection state and I/O.
+    // QUIC terminates locally on shard 0 through its shared UDP endpoint.
     if shard_id == 0 {
         let coord = shard
             .coordinator()

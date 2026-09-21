@@ -48,7 +48,6 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
 
-use crate::responses::{resolve_stream_id, resolve_topic_id};
 use crate::shell::{ShellBus, ShellShard};
 
 /// Authorize a partition-plane op on its resolved (stream, topic) for the
@@ -389,7 +388,7 @@ where
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| resolve_stream_id(inner, stream_id))
+        .read(|inner| inner.resolve_stream_id(stream_id))
 }
 
 /// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
@@ -407,8 +406,8 @@ where
     SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let stream_id = resolve_stream_id(inner, stream_id)?;
-        let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
+        let stream_id = inner.resolve_stream_id(stream_id)?;
+        let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
         Some((stream_id, topic_id))
     })
 }
@@ -419,10 +418,12 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE,
-        GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
-        LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE,
-        POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+        ATTACH_CONSUMER_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
+        GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE,
+        GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
+        LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+        LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+        SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
@@ -491,6 +492,22 @@ mod tests {
                 invalid_command,
             ),
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
+            (
+                ATTACH_CONSUMER_SESSION_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (GET_POLL_ROUTING_CODE, invalid_command, invalid_command),
+            (
+                POLL_MESSAGES_ON_PRIMARY_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (
+                GET_CONSUMER_OFFSET_ROUTING_CODE,
+                invalid_command,
+                invalid_command,
+            ),
             (
                 FLUSH_UNSAVED_BUFFER_CODE,
                 feature_unavailable,

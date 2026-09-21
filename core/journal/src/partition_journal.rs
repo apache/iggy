@@ -474,6 +474,30 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.retained_bytes
     }
 
+    /// Physical write lengths an append occupies in the current storage mode.
+    ///
+    /// The first return value is the padded number of bytes written to the WAL.
+    /// The second return value is the unpadded message-body bytes written to
+    /// segment storage, or zero when the prepare remains inline in the WAL.
+    ///
+    /// # Errors
+    /// Returns an error when `prepare_length` falls outside the supported bounds.
+    pub fn append_lengths(
+        &self,
+        operation: Operation,
+        prepare_length: usize,
+    ) -> io::Result<(usize, usize)> {
+        let inline_length = record_length(prepare_length)?;
+        if self.state.segment_storage.is_some() && operation == Operation::SendMessages {
+            Ok((
+                record_length(REFERENCED_PREPARE_BYTES)?,
+                prepare_length - size_of::<PrepareHeader>(),
+            ))
+        } else {
+            Ok((inline_length, 0))
+        }
+    }
+
     #[must_use]
     pub fn contains(&self, header: &PrepareHeader) -> bool {
         if header.op > self.durable_head {
@@ -750,7 +774,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         references: Option<&[Option<SegmentReference>]>,
     ) -> io::Result<()> {
         self.ensure_healthy()?;
-        self.cleanup_obsolete().await;
         self.recovered_prepares.clear();
         let mut state = self.state;
         let mut retained_bytes = self.retained_bytes;
@@ -864,7 +887,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     }
 
     async fn retain_segment_inodes(
-        &self,
+        &mut self,
         records: &[(u64, StoredPrepare, usize)],
     ) -> io::Result<()> {
         if self.state.segment_storage.is_some() {
@@ -877,6 +900,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 && retained_segments.insert((reference.generation, reference.start_offset))
             {
                 let retained = reference.path(&self.directory);
+                // A failed unlink leaves its path queued for a retry. This
+                // append is adopting that very link, so the retry would delete
+                // a segment the new generation references. Claiming it back is
+                // what makes reusing the existing inode safe.
+                self.obsolete.retain(|queued| queued != &retained);
                 if !self.storage.exists(&retained).await? {
                     let parent = self
                         .directory
@@ -1039,18 +1067,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    /// Drop every file the recovered history does not retain, repeating while
-    /// the queue shrinks: `cleanup_obsolete` removes a bounded batch per call
-    /// and re-queues what it could not remove.
+    /// Drop every file the recovered history does not retain.
     async fn remove_obsolete_history(&mut self) -> io::Result<()> {
         self.discover_obsolete().await?;
-        loop {
-            let remaining = self.obsolete.len();
-            self.cleanup_obsolete().await;
-            if self.obsolete.is_empty() || self.obsolete.len() == remaining {
-                return Ok(());
-            }
-        }
+        self.cleanup_obsolete().await;
+        Ok(())
     }
 
     async fn discover_obsolete(&mut self) -> io::Result<()> {
@@ -1075,8 +1096,18 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    async fn cleanup_obsolete(&mut self) {
-        let count = self.obsolete.len().min(16);
+    /// Attempt every queued obsolete file once, and retry a directory barrier
+    /// a previous pass could not complete. Failed unlinks stay queued.
+    /// Does nothing when the queue is empty and no barrier is owed.
+    ///
+    /// Off the append path, so the unlinks and the barrier do not sit inside a
+    /// group's durability. A generation reaches the queue from the boot scan,
+    /// or from the rewrite behind a checkpoint, a truncate, or a reset, and
+    /// always after the publication that stops naming it, so nothing here is
+    /// still reachable by a reader or a recovery. The writer owns the journal,
+    /// so this runs between mutations and never beside one.
+    pub async fn cleanup_obsolete(&mut self) {
+        let count = self.obsolete.len();
         for _ in 0..count {
             let Some(path) = self.obsolete.pop_front() else {
                 break;
@@ -1334,10 +1365,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("WAL generation exhausted"))?;
-        let mut file = self
-            .storage
-            .open(&data_path(&self.directory, generation), OpenMode::Create)
-            .await?;
+        let path = data_path(&self.directory, generation);
+        // A failed boot unlink may still name the generation this rewrite
+        // adopts. It must no longer be eligible for deferred reclamation.
+        self.obsolete.retain(|queued| queued != &path);
+        let mut file = self.storage.open(&path, OpenMode::Create).await?;
         let mut entries = BTreeMap::new();
         let mut state = JournalState {
             generation,
@@ -1508,7 +1540,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.retain_active_segment_file();
         self.poisoned = false;
         self.obsolete.push_back(obsolete);
-        self.cleanup_obsolete().await;
         Ok(())
     }
 }
@@ -1826,6 +1857,140 @@ mod tests {
         }
     }
 
+    /// Reclamation used to run at the head of every append, so an unlink and a
+    /// directory barrier for a generation the append does not touch landed
+    /// inside the acknowledgement it was waiting on. The append must leave the
+    /// queue alone and the writer must drain it between mutations instead.
+    #[compio::test]
+    async fn append_leaves_obsolete_files_for_the_writer_to_reclaim() {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+
+        let stale = directory.join("prepares-6.wal");
+        std::fs::write(&stale, b"a generation a checkpoint replaced").unwrap();
+        journal.obsolete.push_back(stale.clone());
+
+        let prepare = prepare(1, 0);
+        journal
+            .append_batch_buffered(&[prepare.into_frozen()])
+            .await
+            .unwrap();
+        journal.sync().await.unwrap();
+
+        assert!(
+            stale.exists(),
+            "the acknowledgement must not have waited on the unlink"
+        );
+
+        journal.cleanup_obsolete().await;
+
+        assert!(!stale.exists());
+    }
+
+    #[compio::test]
+    async fn cleanup_reclaims_all_generations_queued_between_writer_passes() {
+        const GENERATIONS: u64 = 64;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let mut parent = 0;
+        for op in 1..=GENERATIONS {
+            let entry = prepare(op, parent);
+            parent = entry.header().checksum;
+            journal.append(entry.into_frozen()).await.unwrap();
+            journal.checkpoint(op).await.unwrap();
+        }
+        let retired: Vec<_> = journal.obsolete.iter().cloned().collect();
+        assert_eq!(retired.len(), usize::try_from(GENERATIONS).unwrap());
+        journal.cleanup_obsolete().await;
+        assert!(
+            journal.obsolete.is_empty(),
+            "one reclaim pass must keep up with a writer's accumulated generations"
+        );
+        assert!(retired.iter().all(|path| !path.exists()));
+        drop(journal);
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.checkpoint_op(), GENERATIONS);
+        assert_eq!(journal.head(), GENERATIONS);
+    }
+
+    #[compio::test]
+    async fn a_rewrite_reclaims_the_wal_path_it_reuses() {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+
+        // A crash before publishing the frontier can leave the next generation
+        // on disk; a failed boot unlink leaves that path queued for retry.
+        let reused = data_path(&directory, journal.state.generation + 1);
+        std::fs::write(&reused, b"unpublished generation").unwrap();
+        journal.obsolete.push_back(reused.clone());
+        journal.checkpoint(1).await.unwrap();
+        let second = prepare(2, first.header().checksum);
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        journal.cleanup_obsolete().await;
+        assert!(reused.exists(), "cleanup must retain the published WAL");
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), second.as_slice());
+    }
+
+    /// A failed unlink leaves its path queued for a retry. When a later append
+    /// references that same segment again it adopts the link already on disk,
+    /// so the retry would delete an inode the live generation depends on.
+    #[compio::test]
+    async fn an_append_reclaims_the_retained_link_it_adopts() {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+
+        let prepare = sized_prepare(1, 0, size_of::<PrepareHeader>() + 4096);
+        let parent = prepare.header().checksum;
+        let reference = write_segment(partition.path(), 0, 0, &prepare).await;
+        let retained = reference.path(&directory);
+        journal
+            .append_batch_referenced_buffered(&[prepare.into_frozen()], &[Some(reference)])
+            .await
+            .unwrap();
+        journal.sync().await.unwrap();
+        assert!(retained.exists(), "the body link must exist to be adopted");
+
+        // Stand in for a removal that failed and was queued again.
+        journal.obsolete.push_back(retained.clone());
+
+        let second = sized_prepare(2, parent, size_of::<PrepareHeader>() + 4096);
+        journal
+            .append_batch_referenced_buffered(&[second.into_frozen()], &[Some(reference)])
+            .await
+            .unwrap();
+        journal.sync().await.unwrap();
+        journal.cleanup_obsolete().await;
+
+        assert!(
+            retained.exists(),
+            "reclamation must not delete a link the newest generation references"
+        );
+    }
+
     #[compio::test]
     async fn referenced_bodies_survive_retention_and_checkpoint_without_wal_copies() {
         let partition = tempdir().unwrap();
@@ -1868,6 +2033,7 @@ mod tests {
         assert_eq!(recovered[1].as_slice(), second.as_slice());
         journal.checkpoint(2).await.unwrap();
         assert_eq!(journal.size_bytes(), PARTITION_WAL_BLOCK_SIZE as u64);
+        journal.cleanup_obsolete().await;
         assert!(!first_reference.path(&directory).exists());
         assert!(second_reference.path(&directory).exists());
         drop(journal);
@@ -2026,6 +2192,7 @@ mod tests {
         assert_eq!(journal.purge_marker(), (1, 2));
         journal.truncate_from(3).await.unwrap();
         assert!(first_reference.path(&directory).exists());
+        journal.cleanup_obsolete().await;
         assert!(!second_reference.path(&directory).exists());
         drop(journal);
         let journal = PartitionPrepareJournal::open(&directory, 42, 7)
@@ -2600,6 +2767,7 @@ mod tests {
             "purge must not fabricate a committed frontier"
         );
         assert_eq!(journal.retained_bytes(), retained_bytes);
+        journal.cleanup_obsolete().await;
         for reference in references {
             assert!(!reference.path(&directory).exists());
             std::fs::remove_file(
@@ -3224,6 +3392,7 @@ mod tests {
                 journal.prepares().await.unwrap()[0].as_slice(),
                 next.as_slice()
             );
+            journal.cleanup_obsolete().await;
             assert_eq!(checkpoint_reference.path(&directory).exists(), materialized);
             let expected = SegmentPosition {
                 length: initial.length + BODY_BYTES as u64,

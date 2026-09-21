@@ -47,6 +47,8 @@ IGGY_CONNECTORS_CONFIG_PATH=connectors.toml cargo run --bin iggy-connectors
 
 Supported scalar fields and indexed list entries use environment variables with nested keys joined by underscores, for example `IGGY_CONNECTORS_IGGY_USERNAME`. Header and URL-template maps are configured in TOML. The runtime loads the first `.env` file found in the working directory or its parents, or the file specified by `IGGY_CONNECTORS_ENV_PATH`.
 
+Source destination topics must persist every acknowledged batch before the runtime checkpoints the source or invokes its Ack hook. Missing topics are therefore created with `durability = "persisted"` and `messages_required_to_save = 1`. An existing topic must use `durability = "persisted"`; its save threshold may differ because persisted acknowledgments already wait for durable storage.
+
 ## State storage
 
 Source plugins can supply optional checkpoint bytes. The runtime stores these opaque bytes using the backend selected by `state.storage`:

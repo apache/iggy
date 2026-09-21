@@ -20,7 +20,7 @@ key = "influxdb"
 enabled = true
 version = 0
 name = "InfluxDB source"
-path = "../../target/release/libiggy_connector_influxdb_source"
+path = "target/release/libiggy_connector_influxdb_source"
 verbose = false
 
 [[streams]]
@@ -36,10 +36,10 @@ org = "iggy"
 token = "replace-with-token"
 query = '''
 from(bucket: "events")
-  |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "iggy_messages")
-  |> filter(fn: (r) => r._time > time(v: "$cursor"))
-  |> sort(columns: ["_time"])
+  |> range(start: time(v: "$cursor"))
+  |> filter(fn: (r) => r._measurement == "iggy_messages" and r._field == "payload_json")
+  |> group(columns: [])
+  |> sort(columns: ["_time", "message_id"])
   |> limit(n: $limit)
 '''
 poll_interval = "5s"

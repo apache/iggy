@@ -478,7 +478,7 @@ mod tests {
 
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
-        assert_eq!(cfg.message_bus.peer_queue_capacity, 256);
+        assert_eq!(cfg.message_bus.peer_queue_capacity, 4096);
     }
 
     #[test]

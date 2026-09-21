@@ -285,7 +285,7 @@ And before starting the runtime, do not forget to create the specified stream an
 ```bash
 iggy --username iggy --password iggy stream create example_stream
 
-iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
+iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d --durability persisted
 ```
 
 And that's all, enjoy using the source connector!

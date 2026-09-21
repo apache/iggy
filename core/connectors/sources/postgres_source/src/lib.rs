@@ -15,21 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use humantime::Duration as HumanDuration;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::postgres::types::{Oid, PgInterval, PgTimeTz};
-use sqlx::{Column, Pool, Postgres, Row, TypeInfo, ValueRef};
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::time::Duration;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgValueFormat, PgValueRef};
+use sqlx::types::BigDecimal;
+use sqlx::{Column, Pool, Postgres, Row, Transaction, TypeInfo, ValueRef};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -38,6 +42,16 @@ source_connector!(PostgresSource);
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
+const ACK_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
+const ACK_STATEMENT_TIMEOUT: Duration = Duration::from_secs(9);
+const _: () = assert!(ACK_STATEMENT_TIMEOUT.as_nanos() < ACK_BATCH_TIMEOUT.as_nanos());
+const MAX_CONSECUTIVE_PROCESS_FAILURES: u32 = 3;
+const MAX_CONSECUTIVE_ADVANCE_FAILURES: u32 = 3;
+const MIN_CDC_POSTGRES_VERSION_NUM: i32 = 110_000;
+const NUMERIC_NAN_SIGN: u16 = 0xC000;
+const NUMERIC_POSITIVE_INFINITY_SIGN: u16 = 0xD000;
+const NUMERIC_NEGATIVE_INFINITY_SIGN: u16 = 0xF000;
+const ROW_VERSION_COLUMN: &str = "__iggy_row_version";
 
 #[derive(Debug)]
 pub struct PostgresSource {
@@ -45,6 +59,9 @@ pub struct PostgresSource {
     pool: Option<Pool<Postgres>>,
     config: PostgresSourceConfig,
     state: Mutex<State>,
+    pending_batch: Mutex<Option<PendingBatch>>,
+    consecutive_process_failures: AtomicU32,
+    consecutive_advance_failures: AtomicU32,
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
@@ -97,11 +114,56 @@ impl PayloadFormat {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     last_poll_time: DateTime<Utc>,
     tracking_offsets: HashMap<String, String>,
     processed_rows: u64,
+    #[serde(default)]
+    pending_operations: Vec<PendingOperation>,
+}
+
+#[derive(Debug)]
+struct PolledBatch {
+    messages: Vec<ProducedMessage>,
+    pending: Option<PendingBatch>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBatch {
+    state: State,
+    acknowledged: bool,
+    retiring_operations: bool,
+    operations_checkpointed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum PendingOperation {
+    ProcessRows {
+        table: String,
+        ids: Vec<String>,
+        tracking_boundary: Option<String>,
+        #[serde(default)]
+        target: Option<CleanupTarget>,
+        #[serde(default)]
+        row_versions: Vec<String>,
+    },
+    AdvanceReplicationSlot {
+        lsn: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CleanupTarget {
+    key_column: String,
+    tracking_column: String,
+    action: CleanupAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum CleanupAction {
+    Delete,
+    MarkProcessed { column: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,6 +190,7 @@ struct ProcessedRow {
     message: ProducedMessage,
     max_offset: Option<String>,
     row_pk: Option<String>,
+    row_version: Option<String>,
 }
 
 const CONNECTOR_NAME: &str = "PostgreSQL source";
@@ -144,6 +207,18 @@ impl PostgresSource {
                     s.tracking_offsets, s.processed_rows
                 );
             });
+        let state = restored_state.unwrap_or(State {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::new(),
+            processed_rows: 0,
+            pending_operations: Vec::new(),
+        });
+        let pending_batch = (!state.pending_operations.is_empty()).then(|| PendingBatch {
+            state: state.clone(),
+            acknowledged: true,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
 
         let delay_str = config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY);
         let retry_delay = HumanDuration::from_str(delay_str)
@@ -157,11 +232,10 @@ impl PostgresSource {
             id,
             pool: None,
             config,
-            state: Mutex::new(restored_state.unwrap_or(State {
-                last_poll_time: Utc::now(),
-                tracking_offsets: HashMap::new(),
-                processed_rows: 0,
-            })),
+            state: Mutex::new(state),
+            pending_batch: Mutex::new(pending_batch),
+            consecutive_process_failures: AtomicU32::new(0),
+            consecutive_advance_failures: AtomicU32::new(0),
             verbose,
             retry_delay,
             poll_interval,
@@ -181,12 +255,21 @@ impl Source for PostgresSource {
             self.id, self.config.mode, self.config.tables
         );
 
+        if self.config.delete_after_read.unwrap_or(false) && self.config.processed_column.is_some()
+        {
+            warn!(
+                "PostgreSQL source connector ID: {} has both delete_after_read and \
+                 processed_column configured; delete_after_read takes precedence",
+                self.id
+            );
+        }
         self.connect().await?;
 
         validate_payload_format(self.config.payload_format.as_deref())?;
 
         match self.config.mode.as_str() {
             "cdc" => {
+                self.validate_cdc_server_version().await?;
                 let backend = validate_cdc_backend(self.config.cdc_backend.as_deref())?;
                 validate_capture_operations(self.config.capture_operations.as_deref())?;
                 self.setup_cdc().await?;
@@ -196,6 +279,8 @@ impl Source for PostgresSource {
                 );
             }
             "polling" => {
+                self.validate_pending_cleanup()?;
+                self.validate_polling_keys().await?;
                 info!(
                     "PostgreSQL polling mode enabled for connector ID: {}",
                     self.id
@@ -218,10 +303,58 @@ impl Source for PostgresSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        let poll_interval = self.poll_interval;
-        tokio::time::sleep(poll_interval).await;
+        let schema = match self.payload_format() {
+            PayloadFormat::Bytea => Schema::Raw,
+            PayloadFormat::Text => Schema::Text,
+            PayloadFormat::JsonDirect | PayloadFormat::Json => Schema::Json,
+        };
 
-        let messages = match self.config.mode.as_str() {
+        {
+            let pending = self.pending_batch.lock().await;
+            if let Some(pending) = pending
+                .as_ref()
+                .filter(|pending| pending.retiring_operations)
+            {
+                let state = self.serialize_state(&pending.state).ok_or_else(|| {
+                    Error::Serialization("failed to serialize PostgreSQL source state".to_string())
+                })?;
+                return Ok(ProducedMessages {
+                    schema,
+                    messages: Vec::new(),
+                    state: Some(state),
+                });
+            }
+        }
+
+        tokio::time::sleep(self.poll_interval).await;
+
+        {
+            let pending = self.pending_batch.lock().await;
+            if let Some(pending) = pending.as_ref() {
+                let state = if pending.retiring_operations {
+                    Some(self.serialize_state(&pending.state).ok_or_else(|| {
+                        Error::Serialization(
+                            "failed to serialize PostgreSQL source state".to_string(),
+                        )
+                    })?)
+                } else if pending.acknowledged {
+                    None
+                } else {
+                    error!(
+                        "PostgreSQL source connector ID: {} was polled while a batch was still in flight",
+                        self.id
+                    );
+                    return Err(Error::InvalidState);
+                };
+                return Ok(ProducedMessages {
+                    schema,
+                    messages: Vec::new(),
+                    state,
+                });
+            }
+        }
+
+        let polled = match self.config.mode.as_str() {
             "polling" => self.poll_tables().await?,
             "cdc" => self.poll_cdc().await?,
             _ => {
@@ -230,36 +363,92 @@ impl Source for PostgresSource {
             }
         };
 
-        let state = self.state.lock().await;
+        let processed_rows = self.state.lock().await.processed_rows;
         if self.verbose {
             info!(
                 "PostgreSQL source connector ID: {} produced {} messages. Total processed: {}",
                 self.id,
-                messages.len(),
-                state.processed_rows
+                polled.messages.len(),
+                processed_rows
             );
         } else {
             debug!(
                 "PostgreSQL source connector ID: {} produced {} messages. Total processed: {}",
                 self.id,
-                messages.len(),
-                state.processed_rows
+                polled.messages.len(),
+                processed_rows
             );
         }
 
-        let schema = match self.payload_format() {
-            PayloadFormat::Bytea => Schema::Raw,
-            PayloadFormat::Text => Schema::Text,
-            PayloadFormat::JsonDirect | PayloadFormat::Json => Schema::Json,
-        };
-
-        let persisted_state = self.serialize_state(&state);
+        let persisted_state = polled
+            .pending
+            .as_ref()
+            .filter(|pending| pending.operations_checkpointed)
+            .map(|pending| {
+                self.serialize_state(&pending.state).ok_or_else(|| {
+                    Error::Serialization("failed to serialize PostgreSQL source state".to_string())
+                })
+            })
+            .transpose()?;
+        *self.pending_batch.lock().await = polled.pending;
 
         Ok(ProducedMessages {
             schema,
-            messages,
+            messages: polled.messages,
             state: persisted_state,
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        if result == SourceBatchResult::Nack {
+            let mut pending = self.pending_batch.lock().await;
+            if pending
+                .as_ref()
+                .is_some_and(|pending| !pending.acknowledged && !pending.retiring_operations)
+            {
+                pending.take();
+            }
+            return Ok(());
+        }
+
+        let Some(pending) = self.pending_batch.lock().await.as_ref().cloned() else {
+            return Ok(());
+        };
+
+        let PendingBatch {
+            mut state,
+            operations_checkpointed,
+            ..
+        } = pending;
+        let had_operations = !state.pending_operations.is_empty();
+        let operations = std::mem::take(&mut state.pending_operations);
+        let deadline = tokio::time::Instant::now() + ACK_BATCH_TIMEOUT;
+        let failed_operations = self.apply_pending_operations(operations, deadline).await?;
+
+        if failed_operations.is_empty() {
+            *self.state.lock().await = state.clone();
+            let mut pending = self.pending_batch.lock().await;
+            if had_operations && operations_checkpointed {
+                *pending = Some(PendingBatch {
+                    state,
+                    acknowledged: false,
+                    retiring_operations: true,
+                    operations_checkpointed: false,
+                });
+            } else {
+                pending.take();
+            }
+        } else {
+            state.pending_operations = failed_operations;
+            *self.pending_batch.lock().await = Some(PendingBatch {
+                state,
+                acknowledged: true,
+                retiring_operations: false,
+                operations_checkpointed,
+            });
+        }
+
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -284,12 +473,16 @@ impl PostgresSource {
     async fn connect(&mut self) -> Result<(), Error> {
         let max_connections = self.config.max_connections.unwrap_or(10);
         let redacted = redact_connection_string(self.config.connection_string.expose_secret());
+        let connect_options = PgConnectOptions::from_str(
+            self.config.connection_string.expose_secret(),
+        )
+        .map_err(|e| Error::InitError(format!("Invalid PostgreSQL connection string: {e}")))?;
 
         info!("Connecting to PostgreSQL with max {max_connections} connections: {redacted}");
 
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .connect(self.config.connection_string.expose_secret())
+            .connect_with(connect_options)
             .await
             .map_err(|e| Error::InitError(format!("Failed to connect to PostgreSQL: {e}")))?;
 
@@ -300,6 +493,100 @@ impl PostgresSource {
 
         self.pool = Some(pool);
         info!("Connected to PostgreSQL database with {max_connections} max connections");
+        Ok(())
+    }
+
+    async fn validate_polling_keys(&self) -> Result<(), Error> {
+        let tracking_column = self.tracking_column();
+        if self.uses_tracking_cursor() {
+            self.validate_unique_key("Tracking column", tracking_column)
+                .await?;
+        }
+
+        if self.should_process_rows() {
+            let cleanup_key = self.cleanup_key_column();
+            if cleanup_key != tracking_column || !self.uses_tracking_cursor() {
+                self.validate_unique_key("Cleanup key", cleanup_key).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_pending_cleanup(&mut self) -> Result<(), Error> {
+        let configured_target = self.cleanup_target();
+        for operation in &self.state.get_mut().pending_operations {
+            let PendingOperation::ProcessRows {
+                ids,
+                target,
+                row_versions,
+                ..
+            } = operation
+            else {
+                continue;
+            };
+
+            if ids.is_empty() {
+                continue;
+            }
+            let Some(target) = target else {
+                return Err(Error::InitError(
+                    "the restored PostgreSQL cleanup operation predates row-version safety; \
+                     clear the connector state only after verifying the rows manually"
+                        .to_string(),
+                ));
+            };
+            if row_versions.len() != ids.len() {
+                return Err(Error::InitError(
+                    "the restored PostgreSQL cleanup operation has incomplete row-version data"
+                        .to_string(),
+                ));
+            }
+            if configured_target.as_ref() != Some(target) {
+                return Err(Error::InitError(format!(
+                    "the PostgreSQL cleanup configuration changed while acknowledged cleanup is \
+                     pending; restore key '{}', tracking column '{}', and action {:?}",
+                    target.key_column, target.tracking_column, target.action
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_unique_key(&self, key_kind: &str, column: &str) -> Result<(), Error> {
+        let pool = self.get_pool()?;
+        for table in &self.config.tables {
+            let relation = quote_qualified_identifier(table)?;
+            let is_unique: bool = sqlx::query_scalar(
+                "SELECT EXISTS (\
+                    SELECT 1 FROM pg_catalog.pg_index AS idx \
+                    JOIN pg_catalog.pg_attribute AS attr \
+                      ON attr.attrelid = idx.indrelid AND attr.attnum = idx.indkey[0] \
+                    WHERE idx.indrelid = pg_catalog.to_regclass($1) \
+                      AND idx.indisunique AND idx.indisvalid \
+                      AND idx.indpred IS NULL AND idx.indexprs IS NULL \
+                      AND idx.indnkeyatts = 1 \
+                      AND attr.attname = $2 AND attr.attnotnull\
+                )",
+            )
+            .bind(&relation)
+            .bind(column)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| {
+                Error::InitError(format!(
+                    "Failed to validate {key_kind} '{column}' for table '{table}': {e}"
+                ))
+            })?;
+
+            if !is_unique {
+                return Err(Error::InitError(format!(
+                    "{key_kind} '{column}' for table '{table}' must be a non-null column \
+                     backed by a valid single-column unique index"
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -347,11 +634,7 @@ impl PostgresSource {
             }
         }
 
-        let slot_name = self
-            .config
-            .replication_slot
-            .as_deref()
-            .unwrap_or("iggy_slot");
+        let slot_name = self.replication_slot();
 
         let existing_plugin: Option<String> =
             sqlx::query_scalar("SELECT plugin FROM pg_replication_slots WHERE slot_name = $1")
@@ -389,7 +672,19 @@ impl PostgresSource {
         Ok(())
     }
 
-    async fn poll_cdc(&self) -> Result<Vec<ProducedMessage>, Error> {
+    async fn validate_cdc_server_version(&self) -> Result<(), Error> {
+        let pool = self.get_pool()?;
+        let server_version_num: i32 =
+            sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    Error::InitError(format!("Failed to read PostgreSQL server version: {e}"))
+                })?;
+        validate_cdc_server_version_num(server_version_num)
+    }
+
+    async fn poll_cdc(&self) -> Result<PolledBatch, Error> {
         match self.config.cdc_backend.as_deref().unwrap_or("builtin") {
             "builtin" => self.poll_cdc_builtin().await,
             "pg_replicate" => Err(Error::InitError(
@@ -399,14 +694,10 @@ impl PostgresSource {
         }
     }
 
-    async fn poll_cdc_builtin(&self) -> Result<Vec<ProducedMessage>, Error> {
+    async fn poll_cdc_builtin(&self) -> Result<PolledBatch, Error> {
         let pool = self.get_pool()?;
 
-        let slot_name = self
-            .config
-            .replication_slot
-            .as_deref()
-            .unwrap_or("iggy_slot");
+        let slot_name = self.replication_slot();
         let capture_ops = self
             .config
             .capture_operations
@@ -417,43 +708,65 @@ impl PostgresSource {
             (!self.config.tables.is_empty()).then_some(self.config.tables.as_slice());
         let batch_size = self.config.batch_size.unwrap_or(1000) as i32;
 
+        let pre_peek_lsn = with_retry(
+            || {
+                sqlx::query_scalar(
+                    "SELECT CASE WHEN pg_is_in_recovery() \
+                     THEN pg_last_wal_replay_lsn() \
+                     ELSE pg_current_wal_flush_lsn() END::text",
+                )
+                .fetch_one(pool)
+            },
+            self.get_max_retries(),
+            self.retry_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| Error::Connection(format!("failed to read current WAL position: {e}")))?;
+
         // Database I/O without holding the lock. upto_nchanges is only
         // checked at transaction-commit boundaries (a single huge transaction
         // can still exceed it), so this isn't a hard per-call cap - but it
         // stops the backlog from growing unbounded across many transactions
         // the way NULL (no limit at all) did.
-        let rows =
-            sqlx::query("SELECT lsn, xid, data FROM pg_logical_slot_get_changes($1, NULL, $2)")
+        let rows = with_retry(
+            || {
+                sqlx::query(
+                    "SELECT lsn::text AS lsn, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
+                )
                 .bind(slot_name)
                 .bind(batch_size)
                 .fetch_all(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to fetch CDC changes: {e}");
-                    Error::InvalidRecord
-                })?;
+            },
+            self.get_max_retries(),
+            self.retry_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| Error::Connection(format!("failed to fetch CDC changes: {e}")))?;
 
+        let last_lsn: Option<String> = rows
+            .last()
+            .map(|row| {
+                row.try_get("lsn").map_err(|e| {
+                    error!("Failed to read CDC row LSN: {e}");
+                    Error::InvalidRecord
+                })
+            })
+            .transpose()?;
         let mut messages = Vec::new();
 
         for row in rows {
-            let data: String = match row.try_get("data") {
-                Ok(data) => data,
-                Err(e) => {
-                    error!("Skipping CDC row with unreadable data column: {e}");
-                    continue;
-                }
-            };
+            let data: String = row.try_get("data").map_err(|e| {
+                error!("Failed to read CDC row data: {e}");
+                Error::InvalidRecord
+            })?;
 
             if let Some(change_record) =
                 self.parse_logical_replication_message(&data, &capture_ops, captured_tables)
             {
-                let payload = match simd_json::to_vec(&change_record) {
-                    Ok(payload) => payload,
-                    Err(e) => {
-                        error!("Skipping CDC row that failed to serialize: {e}");
-                        continue;
-                    }
-                };
+                let payload = simd_json::to_vec(&change_record).map_err(|e| {
+                    error!("Failed to serialize CDC row: {e}");
+                    Error::InvalidRecord
+                })?;
 
                 let message = ProducedMessage {
                     id: Some(Uuid::new_v4().as_u128()),
@@ -468,31 +781,37 @@ impl PostgresSource {
             }
         }
 
-        // Update state with minimal lock time
-        if !messages.is_empty() {
-            let mut state = self.state.lock().await;
-            state.processed_rows += messages.len() as u64;
-        }
-
         if self.verbose {
             info!("CDC: Fetched {} change records", messages.len());
         } else {
             debug!("CDC: Fetched {} change records", messages.len());
         }
-        Ok(messages)
+        let lsn = last_lsn.unwrap_or(pre_peek_lsn);
+        let mut state = self.state.lock().await.clone();
+        if !messages.is_empty() {
+            state.processed_rows += messages.len() as u64;
+            state.last_poll_time = Utc::now();
+        }
+        state.pending_operations = vec![PendingOperation::AdvanceReplicationSlot { lsn }];
+        let pending = Some(PendingBatch {
+            state,
+            acknowledged: false,
+            retiring_operations: false,
+            operations_checkpointed: !messages.is_empty(),
+        });
+
+        Ok(PolledBatch { messages, pending })
     }
 
-    async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
+    async fn poll_tables(&self) -> Result<PolledBatch, Error> {
         let pool = self.get_pool()?;
         let mut messages = Vec::new();
+        let mut operations = Vec::new();
+        let mut candidate_state = self.state.lock().await.clone();
 
         let batch_size = self.config.batch_size.unwrap_or(1000);
-        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
-        let pk_column = self
-            .config
-            .primary_key_column
-            .as_deref()
-            .unwrap_or(tracking_column);
+        let tracking_column = self.tracking_column();
+        let pk_column = self.cleanup_key_column();
 
         let row_config = RowProcessingConfig {
             table: "",
@@ -504,8 +823,6 @@ impl PostgresSource {
             include_metadata: self.config.include_metadata.unwrap_or(true),
         };
 
-        // Collect state updates to apply after processing
-        let mut state_updates: Vec<(String, String)> = Vec::new();
         let mut total_processed: u64 = 0;
 
         for table in &self.config.tables {
@@ -514,11 +831,7 @@ impl PostgresSource {
                 ..row_config
             };
 
-            // Get last offset with minimal lock time
-            let last_offset = {
-                let state = self.state.lock().await;
-                state.tracking_offsets.get(table).cloned()
-            };
+            let last_offset = candidate_state.tracking_offsets.get(table).cloned();
 
             let query = if let Some(custom_query) = &self.config.custom_query {
                 self.validate_custom_query(custom_query)?;
@@ -526,23 +839,38 @@ impl PostgresSource {
             } else {
                 self.build_polling_query(table, tracking_column, &last_offset, batch_size)?
             };
+            let query = if self.should_process_rows() {
+                self.attach_row_versions(&query, table, pk_column, tracking_column)?
+            } else {
+                query
+            };
 
             // Database I/O without holding the lock
             let rows = with_retry(
-                || sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(pool),
+                || {
+                    sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+                        .persistent(false)
+                        .fetch_all(pool)
+                },
                 self.get_max_retries(),
                 self.retry_delay.as_millis() as u64,
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                Error::Connection(format!("failed to poll PostgreSQL table '{table}': {e}"))
+            })?;
 
             let mut max_offset: Option<String> = None;
-            let mut processed_ids: Vec<String> = Vec::new();
+            let mut processed_ids = Vec::with_capacity(rows.len());
+            let mut row_versions = Vec::with_capacity(rows.len());
+            let mut table_processed = 0;
 
             for row in rows {
                 let processed = self.process_row(&row, &table_config)?;
 
-                if let Some(pk) = processed.row_pk {
+                if let (Some(pk), Some(row_version)) = (processed.row_pk, processed.row_version) {
                     processed_ids.push(pk);
+                    row_versions.push(row_version);
                 }
                 if let Some(offset) = processed.max_offset {
                     max_offset = Some(offset);
@@ -550,68 +878,253 @@ impl PostgresSource {
 
                 messages.push(processed.message);
                 total_processed += 1;
+                table_processed += 1;
             }
 
-            // Database I/O without holding the lock
-            if !processed_ids.is_empty() {
-                self.mark_or_delete_processed_rows(pool, table, pk_column, &processed_ids)
-                    .await?;
+            let cleanup_boundary = self.cleanup_boundary(max_offset.clone());
+            let tracking_cursor = self.tracking_cursor(max_offset);
+
+            if self.should_process_rows() && !processed_ids.is_empty() {
+                operations.push(PendingOperation::ProcessRows {
+                    table: table.clone(),
+                    ids: processed_ids,
+                    tracking_boundary: cleanup_boundary,
+                    target: self.cleanup_target(),
+                    row_versions,
+                });
             }
 
-            // Collect offset update for later
-            if let Some(offset) = max_offset {
-                state_updates.push((table.clone(), offset));
+            if let Some(offset) = tracking_cursor {
+                candidate_state
+                    .tracking_offsets
+                    .insert(table.clone(), offset);
             }
 
             if self.verbose {
-                info!("Fetched {} rows from table '{table}'", messages.len());
+                info!("Fetched {table_processed} rows from table '{table}'");
             } else {
-                debug!("Fetched {} rows from table '{table}'", messages.len());
+                debug!("Fetched {table_processed} rows from table '{table}'");
             }
         }
 
-        // Apply all state updates with a single lock acquisition
-        {
-            let mut state = self.state.lock().await;
-            state.processed_rows += total_processed;
-            for (table, offset) in state_updates {
-                state.tracking_offsets.insert(table, offset);
-            }
-            state.last_poll_time = Utc::now();
-        }
+        let pending = if total_processed > 0 {
+            candidate_state.processed_rows += total_processed;
+            candidate_state.last_poll_time = Utc::now();
+            candidate_state.pending_operations = operations;
+            Some(PendingBatch {
+                state: candidate_state,
+                acknowledged: false,
+                retiring_operations: false,
+                operations_checkpointed: true,
+            })
+        } else {
+            None
+        };
 
-        Ok(messages)
+        Ok(PolledBatch { messages, pending })
+    }
+
+    async fn advance_replication_slot(&self, lsn: &str) -> Result<(), Error> {
+        let slot_name = self.replication_slot();
+        let pool = self.get_pool()?;
+        with_retry(
+            || async {
+                let mut transaction = begin_ack_transaction(pool).await?;
+                let result = sqlx::query("SELECT pg_replication_slot_advance($1, $2::pg_lsn)")
+                    .bind(slot_name)
+                    .bind(lsn)
+                    .execute(&mut *transaction)
+                    .await
+                    .map(|_| ());
+                let result = finish_ack_transaction(transaction, result).await;
+
+                if let Err(error) = result {
+                    match replication_slot_reached_target(pool, slot_name, lsn).await {
+                        Ok(true) => {
+                            warn!(
+                                "PostgreSQL source connector ID: {} confirmed replication slot \
+                                 '{slot_name}' is already at or beyond {lsn} after advance failed: \
+                                 {error}",
+                                self.id
+                            );
+                            return Ok(());
+                        }
+                        Ok(false) => {}
+                        Err(read_error) => warn!(
+                            "PostgreSQL source connector ID: {} failed to read replication slot \
+                             '{slot_name}' after advance failed: {read_error}",
+                            self.id
+                        ),
+                    }
+                    return Err(error);
+                }
+
+                Ok(())
+            },
+            self.get_max_retries(),
+            self.retry_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| {
+            Error::Connection(format!(
+                "failed to advance replication slot '{slot_name}' to {lsn}: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    async fn apply_pending_operations(
+        &self,
+        operations: Vec<PendingOperation>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<PendingOperation>, Error> {
+        let mut failed_operations = Vec::new();
+        let mut operations = operations.into_iter();
+        while let Some(operation) = operations.next() {
+            if tokio::time::Instant::now() >= deadline {
+                failed_operations.push(operation);
+                failed_operations.extend(operations);
+                break;
+            }
+            if !self.apply_pending_operation(&operation, deadline).await? {
+                failed_operations.push(operation);
+            }
+        }
+        Ok(failed_operations)
+    }
+
+    async fn apply_pending_operation(
+        &self,
+        operation: &PendingOperation,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, Error> {
+        let result = tokio::time::timeout_at(deadline, async {
+            match operation {
+                PendingOperation::ProcessRows {
+                    table,
+                    ids,
+                    tracking_boundary,
+                    target,
+                    row_versions,
+                } => {
+                    if ids.is_empty() {
+                        return Ok(());
+                    }
+                    let target = target.as_ref().ok_or(Error::InvalidState)?;
+                    let pool = self.get_pool()?;
+                    self.mark_or_delete_processed_rows(
+                        pool,
+                        table,
+                        ids,
+                        row_versions,
+                        target,
+                        tracking_boundary.as_deref(),
+                    )
+                    .await
+                }
+                PendingOperation::AdvanceReplicationSlot { lsn } => {
+                    self.advance_replication_slot(lsn).await
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                match operation {
+                    PendingOperation::ProcessRows { .. } => {
+                        self.consecutive_process_failures
+                            .store(0, Ordering::Relaxed);
+                    }
+                    PendingOperation::AdvanceReplicationSlot { .. } => {
+                        self.consecutive_advance_failures
+                            .store(0, Ordering::Relaxed);
+                    }
+                }
+                Ok(true)
+            }
+            Ok(Err(error)) => {
+                self.record_pending_operation_failure(operation, &error)?;
+                Ok(false)
+            }
+            Err(_) => {
+                self.record_pending_operation_failure(
+                    operation,
+                    "operation exceeded the shared 10s ACK batch budget",
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn record_pending_operation_failure(
+        &self,
+        operation: &PendingOperation,
+        error: impl std::fmt::Display,
+    ) -> Result<(), Error> {
+        match operation {
+            PendingOperation::ProcessRows { .. } => {
+                let consecutive_failures = self
+                    .consecutive_process_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                error!(
+                    "Failed to process rows for PostgreSQL source connector ID: {}. \
+                     Consecutive row processing failures: {consecutive_failures}. {error}",
+                    self.id,
+                );
+                if consecutive_failures >= MAX_CONSECUTIVE_PROCESS_FAILURES {
+                    return Err(Error::Connection(format!(
+                        "stopping PostgreSQL source connector ID {} after {consecutive_failures} \
+                         consecutive row processing failures",
+                        self.id
+                    )));
+                }
+            }
+            PendingOperation::AdvanceReplicationSlot { .. } => {
+                let consecutive_failures = self
+                    .consecutive_advance_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                error!(
+                    "Failed to advance replication slot for PostgreSQL source connector ID: {}. \
+                     Consecutive replication slot advance failures: {consecutive_failures}. \
+                     {error}",
+                    self.id
+                );
+                if consecutive_failures >= MAX_CONSECUTIVE_ADVANCE_FAILURES {
+                    return Err(Error::Connection(format!(
+                        "stopping PostgreSQL source connector ID {} after {consecutive_failures} \
+                         consecutive replication slot advance failures",
+                        self.id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn mark_or_delete_processed_rows(
         &self,
         pool: &Pool<Postgres>,
         table: &str,
-        pk_column: &str,
         ids: &[String],
+        row_versions: &[String],
+        target: &CleanupTarget,
+        tracking_boundary: Option<&str>,
     ) -> Result<(), Error> {
         if ids.is_empty() {
             return Ok(());
         }
 
         let quoted_table = quote_qualified_identifier(table)?;
-        let quoted_pk = quote_identifier(pk_column)?;
+        let row_condition = build_row_version_condition(&target.key_column, ids, row_versions)?;
+        let tracking_condition =
+            build_tracking_condition(&target.tracking_column, tracking_boundary)?;
 
-        let ids_list = ids
-            .iter()
-            .map(|id| {
-                if id.parse::<i64>().is_ok() {
-                    id.clone()
-                } else {
-                    format!("'{}'", id.replace('\'', "''"))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if self.config.delete_after_read.unwrap_or(false) {
+        if target.action == CleanupAction::Delete {
             let delete_query =
-                format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list})");
+                format!("DELETE FROM {quoted_table} WHERE ({row_condition}){tracking_condition}");
 
             if self.verbose {
                 info!("Deleting {} processed rows from '{table}'", ids.len());
@@ -619,17 +1132,18 @@ impl PostgresSource {
                 debug!("Deleting {} processed rows from '{table}'", ids.len());
             }
 
-            sqlx::query(sqlx::AssertSqlSafe(delete_query))
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to delete processed rows: {e}");
-                    Error::InvalidRecord
-                })?;
-        } else if let Some(processed_col) = &self.config.processed_column {
-            let quoted_processed = quote_identifier(processed_col)?;
+            with_retry(
+                || execute_ack_statement(pool, delete_query.as_str()),
+                self.get_max_retries(),
+                self.retry_delay.as_millis() as u64,
+            )
+            .await
+            .map_err(|e| Error::Connection(format!("failed to delete processed rows: {e}")))?;
+        } else if let CleanupAction::MarkProcessed { column } = &target.action {
+            let quoted_processed = quote_identifier(column)?;
             let update_query = format!(
-                "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({ids_list})"
+                "UPDATE {quoted_table} SET {quoted_processed} = TRUE \
+                 WHERE ({row_condition}){tracking_condition}"
             );
 
             if self.verbose {
@@ -638,13 +1152,13 @@ impl PostgresSource {
                 debug!("Marking {} rows as processed in '{table}'", ids.len());
             }
 
-            sqlx::query(sqlx::AssertSqlSafe(update_query))
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to mark rows as processed: {e}");
-                    Error::InvalidRecord
-                })?;
+            with_retry(
+                || execute_ack_statement(pool, update_query.as_str()),
+                self.get_max_retries(),
+                self.retry_delay.as_millis() as u64,
+            )
+            .await
+            .map_err(|e| Error::Connection(format!("failed to mark rows as processed: {e}")))?;
         }
 
         Ok(())
@@ -667,6 +1181,66 @@ impl PostgresSource {
 
     fn get_max_retries(&self) -> u32 {
         self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
+    }
+
+    fn should_process_rows(&self) -> bool {
+        self.config.delete_after_read.unwrap_or(false) || self.config.processed_column.is_some()
+    }
+
+    fn cleanup_target(&self) -> Option<CleanupTarget> {
+        let action = if self.config.delete_after_read.unwrap_or(false) {
+            CleanupAction::Delete
+        } else {
+            CleanupAction::MarkProcessed {
+                column: self.config.processed_column.clone()?,
+            }
+        };
+        Some(CleanupTarget {
+            key_column: self.cleanup_key_column().to_string(),
+            tracking_column: self.tracking_column().to_string(),
+            action,
+        })
+    }
+
+    fn cleanup_boundary(&self, max_offset: Option<String>) -> Option<String> {
+        if self.config.custom_query.is_some() {
+            None
+        } else {
+            max_offset
+        }
+    }
+
+    fn tracking_cursor(&self, max_offset: Option<String>) -> Option<String> {
+        if self.uses_tracking_cursor() {
+            max_offset
+        } else {
+            None
+        }
+    }
+
+    fn uses_tracking_cursor(&self) -> bool {
+        self.config
+            .custom_query
+            .as_ref()
+            .is_none_or(|query| query.contains("$offset"))
+    }
+
+    fn tracking_column(&self) -> &str {
+        self.config.tracking_column.as_deref().unwrap_or("id")
+    }
+
+    fn cleanup_key_column(&self) -> &str {
+        self.config
+            .primary_key_column
+            .as_deref()
+            .unwrap_or_else(|| self.tracking_column())
+    }
+
+    fn replication_slot(&self) -> &str {
+        self.config
+            .replication_slot
+            .as_deref()
+            .unwrap_or("iggy_slot")
     }
 
     fn build_polling_query(
@@ -714,6 +1288,31 @@ impl PostgresSource {
         ))
     }
 
+    fn attach_row_versions(
+        &self,
+        query: &str,
+        table: &str,
+        key_column: &str,
+        tracking_column: &str,
+    ) -> Result<String, Error> {
+        let quoted_table = quote_qualified_identifier(table)?;
+        let quoted_key = quote_identifier(key_column)?;
+        let quoted_tracking = quote_identifier(tracking_column)?;
+        let query = query.trim().trim_end_matches(';');
+        let order_clause = if self.uses_tracking_cursor() {
+            format!(" ORDER BY __iggy_rows.{quoted_tracking} ASC")
+        } else {
+            String::new()
+        };
+
+        Ok(format!(
+            "SELECT __iggy_rows.*, __iggy_source.xmin::text AS \"{ROW_VERSION_COLUMN}\" \
+             FROM ({query}) AS __iggy_rows \
+             JOIN {quoted_table} AS __iggy_source \
+               ON __iggy_source.{quoted_key} = __iggy_rows.{quoted_key}{order_clause}"
+        ))
+    }
+
     fn validate_custom_query(&self, query: &str) -> Result<(), Error> {
         let query_upper = query.to_uppercase();
         if !query_upper.contains("SELECT") {
@@ -733,18 +1332,25 @@ impl PostgresSource {
         batch_size: u32,
     ) -> String {
         let offset_value = last_offset
-            .clone()
-            .or_else(|| self.config.initial_offset.clone())
+            .as_deref()
+            .or(self.config.initial_offset.as_deref())
             .unwrap_or_default();
+        let formatted_offset = format_offset_value(offset_value);
 
         let now = Utc::now();
+        let batch_size = batch_size.to_string();
+        let now_unix = now.timestamp().to_string();
+        let now = now.to_rfc3339();
+        let replacements = [
+            ("$table", table),
+            ("'$offset'", formatted_offset.as_str()),
+            ("$offset", formatted_offset.as_str()),
+            ("$limit", batch_size.as_str()),
+            ("$now_unix", now_unix.as_str()),
+            ("$now", now.as_str()),
+        ];
 
-        query
-            .replace("$table", table)
-            .replace("$offset", &offset_value)
-            .replace("$limit", &batch_size.to_string())
-            .replace("$now", &now.to_rfc3339())
-            .replace("$now_unix", &now.timestamp().to_string())
+        substitute_query_tokens(query, &replacements)
     }
 
     fn parse_logical_replication_message(
@@ -816,11 +1422,21 @@ impl PostgresSource {
         config: &RowProcessingConfig,
     ) -> Result<ProcessedRow, Error> {
         let mut row_pk: Option<String> = None;
+        let mut row_version: Option<String> = None;
         let mut max_offset: Option<String> = None;
         let mut extracted_payload: Option<Vec<u8>> = None;
         let mut data = serde_json::Map::new();
 
         for (i, column) in row.columns().iter().enumerate() {
+            if column.name() == ROW_VERSION_COLUMN {
+                row_version = Some(row.try_get(i).map_err(|error| {
+                    Error::InvalidRecordValue(format!(
+                        "failed to decode PostgreSQL row version: {error}"
+                    ))
+                })?);
+                continue;
+            }
+
             let column_name = if config.snake_case_columns {
                 to_snake_case(column.name())
             } else {
@@ -830,27 +1446,29 @@ impl PostgresSource {
             if !config.payload_col.is_empty() && column.name() == config.payload_col {
                 extracted_payload =
                     Some(self.extract_payload_column(row, i, config.payload_format)?);
-                continue;
+                if column.name() != config.tracking_column && column.name() != config.pk_column {
+                    continue;
+                }
             }
 
             let value = extract_column_value(row, i)?;
-            data.insert(column_name.clone(), value.clone());
-
             if column.name() == config.tracking_column {
-                if let serde_json::Value::String(ref s) = value {
-                    max_offset = Some(s.clone());
-                } else if let serde_json::Value::Number(ref n) = value {
-                    max_offset = Some(n.to_string());
-                }
+                max_offset = extract_tracking_value(&value);
             }
 
             if column.name() == config.pk_column {
-                if let serde_json::Value::String(ref s) = value {
-                    row_pk = Some(s.clone());
-                } else if let serde_json::Value::Number(ref n) = value {
-                    row_pk = Some(n.to_string());
-                }
+                row_pk = extract_tracking_value(&value);
             }
+
+            data.insert(column_name, value);
+        }
+
+        if self.should_process_rows() && (row_pk.is_none() || row_version.is_none()) {
+            return Err(Error::InvalidRecordValue(format!(
+                "polling cleanup requires query results to include key column '{}' and the \
+                 source row version",
+                config.pk_column
+            )));
         }
 
         let payload = if let Some(bytes) = extracted_payload {
@@ -891,6 +1509,7 @@ impl PostgresSource {
             message,
             max_offset,
             row_pk,
+            row_version,
         })
     }
 
@@ -994,15 +1613,7 @@ fn extract_column_value(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null))
         }
-        "NUMERIC" => {
-            let value: Option<String> = row
-                .try_get(column_index)
-                .map_err(|_| Error::InvalidRecord)?;
-            Ok(value
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(serde_json::Value::from)
-                .unwrap_or(serde_json::Value::Null))
-        }
+        "NUMERIC" => extract_numeric_value(row, column_index),
         "VARCHAR" | "TEXT" | "CHAR" | "NAME" | "BPCHAR" => {
             let value: Option<String> = row
                 .try_get(column_index)
@@ -1375,6 +1986,49 @@ fn extract_column_value(
     }
 }
 
+fn extract_numeric_value(
+    row: &sqlx::postgres::PgRow,
+    column_index: usize,
+) -> Result<serde_json::Value, Error> {
+    let raw = row
+        .try_get_raw(column_index)
+        .map_err(|_| Error::InvalidRecord)?;
+    if raw.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Some(value) = extract_special_numeric_value(raw)? {
+        return Ok(serde_json::Value::String(value.to_string()));
+    }
+
+    let value: BigDecimal = row
+        .try_get(column_index)
+        .map_err(|_| Error::InvalidRecord)?;
+    Ok(serde_json::Value::String(value.normalized().to_string()))
+}
+
+fn extract_special_numeric_value(raw: PgValueRef<'_>) -> Result<Option<&'static str>, Error> {
+    match raw.format() {
+        PgValueFormat::Text => match raw.as_str().map_err(|_| Error::InvalidRecord)? {
+            "NaN" => Ok(Some("NaN")),
+            "Infinity" => Ok(Some("Infinity")),
+            "-Infinity" => Ok(Some("-Infinity")),
+            _ => Ok(None),
+        },
+        PgValueFormat::Binary => {
+            let bytes = raw.as_bytes().map_err(|_| Error::InvalidRecord)?;
+            if bytes.len() < 6 {
+                return Ok(None);
+            }
+            match u16::from_be_bytes([bytes[4], bytes[5]]) {
+                NUMERIC_NAN_SIGN => Ok(Some("NaN")),
+                NUMERIC_POSITIVE_INFINITY_SIGN => Ok(Some("Infinity")),
+                NUMERIC_NEGATIVE_INFINITY_SIGN => Ok(Some("-Infinity")),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
 fn format_pg_interval(interval: &PgInterval) -> String {
     let mut parts = Vec::new();
 
@@ -1453,10 +2107,138 @@ fn quote_qualified_identifier(name: &str) -> Result<String, Error> {
 }
 
 fn format_offset_value(value: &str) -> String {
-    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "''"))
+    // Let PostgreSQL infer the literal type from the compared column.
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn build_row_version_condition(
+    key_column: &str,
+    ids: &[String],
+    row_versions: &[String],
+) -> Result<String, Error> {
+    if ids.len() != row_versions.len() {
+        return Err(Error::InvalidState);
+    }
+    let quoted_key = quote_identifier(key_column)?;
+    Ok(ids
+        .iter()
+        .zip(row_versions)
+        .map(|(id, row_version)| {
+            format!(
+                "({quoted_key} = {} AND xmin = {}::xid)",
+                format_offset_value(id),
+                format_offset_value(row_version)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR "))
+}
+
+fn substitute_query_tokens(query: &str, replacements: &[(&str, &str)]) -> String {
+    let mut result = String::with_capacity(query.len());
+    let mut remaining = query;
+
+    loop {
+        let mut next_replacement: Option<(usize, &str, &str)> = None;
+        for &(token, replacement) in replacements {
+            let Some(index) = remaining.find(token) else {
+                continue;
+            };
+            let should_replace = match next_replacement {
+                Some((next_index, next_token, _)) => {
+                    index < next_index || (index == next_index && token.len() > next_token.len())
+                }
+                None => true,
+            };
+            if should_replace {
+                next_replacement = Some((index, token, replacement));
+            }
+        }
+
+        let Some((index, token, replacement)) = next_replacement else {
+            result.push_str(remaining);
+            return result;
+        };
+        result.push_str(&remaining[..index]);
+        result.push_str(replacement);
+        remaining = &remaining[index + token.len()..];
+    }
+}
+
+fn build_tracking_condition(
+    tracking_column: &str,
+    tracking_boundary: Option<&str>,
+) -> Result<String, Error> {
+    let Some(boundary) = tracking_boundary else {
+        return Ok(String::new());
+    };
+    let quoted_tracking = quote_identifier(tracking_column)?;
+    Ok(format!(
+        " AND ({quoted_tracking} <= {} OR {quoted_tracking} IS NULL)",
+        format_offset_value(boundary)
+    ))
+}
+
+async fn replication_slot_reached_target(
+    pool: &Pool<Postgres>,
+    slot_name: &str,
+    target_lsn: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut transaction = begin_ack_transaction(pool).await?;
+    let result = sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(confirmed_flush_lsn >= $2::pg_lsn, FALSE) \
+         FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(slot_name)
+    .bind(target_lsn)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map(|reached| reached.unwrap_or(false));
+    finish_ack_transaction(transaction, result).await
+}
+
+async fn begin_ack_transaction(
+    pool: &Pool<Postgres>,
+) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(format!("{}ms", ACK_STATEMENT_TIMEOUT.as_millis()))
+        .execute(&mut *transaction)
+        .await?;
+    Ok(transaction)
+}
+
+async fn finish_ack_transaction<T>(
+    transaction: Transaction<'_, Postgres>,
+    result: Result<T, sqlx::Error>,
+) -> Result<T, sqlx::Error> {
+    match result {
+        Ok(value) => {
+            transaction.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+async fn execute_ack_statement(pool: &Pool<Postgres>, statement: &str) -> Result<(), sqlx::Error> {
+    let mut transaction = begin_ack_transaction(pool).await?;
+    let result = sqlx::query(sqlx::AssertSqlSafe(statement))
+        .persistent(false)
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ());
+    finish_ack_transaction(transaction, result).await
+}
+
+fn extract_tracking_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -1504,6 +2286,16 @@ fn validate_cdc_backend(cdc_backend: Option<&str>) -> Result<&str, Error> {
             "Unsupported cdc_backend '{other}'. Use 'builtin' or 'pg_replicate'"
         ))),
     }
+}
+
+fn validate_cdc_server_version_num(server_version_num: i32) -> Result<(), Error> {
+    if server_version_num < MIN_CDC_POSTGRES_VERSION_NUM {
+        return Err(Error::InitError(format!(
+            "PostgreSQL CDC requires PostgreSQL 11 or newer; server_version_num is \
+             {server_version_num}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_capture_operations(capture_operations: Option<&[String]>) -> Result<(), Error> {
@@ -1647,7 +2439,11 @@ fn parse_bare_scalar(token: &str) -> serde_json::Value {
     }
 }
 
-async fn with_retry<T, F, Fut>(operation: F, max_retries: u32, delay_ms: u64) -> Result<T, Error>
+async fn with_retry<T, F, Fut>(
+    operation: F,
+    max_retries: u32,
+    delay_ms: u64,
+) -> Result<T, sqlx::Error>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
@@ -1660,7 +2456,7 @@ where
                 attempts += 1;
                 if attempts >= max_retries || !is_transient_error(&e) {
                     error!("Database operation failed after {attempts} attempts: {e}");
-                    return Err(Error::InvalidRecord);
+                    return Err(e);
                 }
                 warn!(
                     "Transient database error (attempt {attempts}/{max_retries}): {e}. Retrying in {delay_ms}ms..."
@@ -1677,14 +2473,18 @@ fn is_transient_error(e: &sqlx::Error) -> bool {
         sqlx::Error::PoolTimedOut => true,
         sqlx::Error::PoolClosed => false,
         sqlx::Error::Protocol(_) => false,
-        sqlx::Error::Database(db_err) => db_err.code().is_some_and(|code| {
-            matches!(
-                code.as_ref(),
-                "40001" | "40P01" | "57P01" | "57P02" | "57P03" | "08000" | "08003" | "08006"
-            )
-        }),
+        sqlx::Error::Database(db_err) => db_err
+            .code()
+            .is_some_and(|code| is_transient_sqlstate(code.as_ref())),
         _ => false,
     }
+}
+
+fn is_transient_sqlstate(code: &str) -> bool {
+    matches!(
+        code,
+        "40001" | "40P01" | "55006" | "57P01" | "57P02" | "57P03" | "08000" | "08003" | "08006"
+    )
 }
 
 fn redact_connection_string(conn_str: &str) -> String {
@@ -1704,6 +2504,8 @@ mod cdc_fixtures;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
 
     fn test_config() -> PostgresSourceConfig {
@@ -1756,7 +2558,7 @@ mod tests {
             .expect("Failed to build query");
         assert_eq!(
             query,
-            "SELECT * FROM \"users\" WHERE \"id\" > 100 ORDER BY \"id\" ASC LIMIT 1000"
+            "SELECT * FROM \"users\" WHERE \"id\" > '100' ORDER BY \"id\" ASC LIMIT 1000"
         );
     }
 
@@ -1772,13 +2574,129 @@ mod tests {
     }
 
     #[test]
-    fn given_numeric_offset_should_not_quote_value() {
+    fn given_delete_and_processed_column_should_include_processed_filter() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        config.processed_column = Some("is_processed".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        let query = src
+            .build_polling_query("events", "id", &None, 100)
+            .expect("Failed to build query");
+
+        assert!(query.contains("\"is_processed\" = FALSE"));
+    }
+
+    #[test]
+    fn given_numeric_offset_should_allow_database_type_inference() {
         let src = PostgresSource::new(1, test_config(), None);
         let query = src
             .build_polling_query("users", "id", &Some("42".to_string()), 100)
             .expect("Failed to build query");
-        assert!(query.contains("\"id\" > 42"));
-        assert!(!query.contains("'42'"));
+        assert!(query.contains("\"id\" > '42'"));
+    }
+
+    #[test]
+    fn given_exact_numeric_boundary_should_preserve_text_and_include_null_rows() {
+        let condition = build_tracking_condition("offset", Some("9007199254740993.25"))
+            .expect("Failed to build tracking condition");
+
+        assert_eq!(
+            condition,
+            " AND (\"offset\" <= '9007199254740993.25' OR \"offset\" IS NULL)"
+        );
+    }
+
+    #[test]
+    fn given_non_finite_offsets_should_quote_values() {
+        for value in ["NaN", "inf", "-infinity"] {
+            assert_eq!(format_offset_value(value), format!("'{value}'"));
+        }
+    }
+
+    #[test]
+    fn given_cleanup_receipts_should_match_keys_and_row_versions() {
+        let ids = vec!["100".to_string(), "O'Reilly".to_string()];
+        let row_versions = vec!["42".to_string(), "43".to_string()];
+
+        assert_eq!(
+            build_row_version_condition("id", &ids, &row_versions)
+                .expect("Failed to build row-version condition"),
+            "(\"id\" = '100' AND xmin = '42'::xid) OR \
+             (\"id\" = 'O''Reilly' AND xmin = '43'::xid)"
+        );
+    }
+
+    #[test]
+    fn given_cleanup_query_should_capture_row_versions_in_the_same_snapshot() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        config.primary_key_column = Some("id".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        let query = src
+            .attach_row_versions(
+                "SELECT * FROM \"users\" ORDER BY \"updated_at\" ASC LIMIT 500",
+                "users",
+                "id",
+                "updated_at",
+            )
+            .expect("Failed to attach row versions");
+
+        assert!(query.contains("__iggy_source.xmin::text AS \"__iggy_row_version\""));
+        assert!(query.contains(
+            "ON __iggy_source.\"id\" = __iggy_rows.\"id\" ORDER BY \
+             __iggy_rows.\"updated_at\" ASC"
+        ));
+    }
+
+    #[test]
+    fn given_no_tracking_boundary_should_not_add_tracking_condition() {
+        let condition =
+            build_tracking_condition("offset", None).expect("Failed to build tracking condition");
+
+        assert!(condition.is_empty());
+    }
+
+    #[test]
+    fn given_custom_query_should_not_apply_last_row_as_cleanup_boundary() {
+        let mut config = test_config();
+        config.custom_query = Some("SELECT id FROM users".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        assert_eq!(src.cleanup_boundary(Some("42".to_string())), None);
+    }
+
+    #[test]
+    fn given_generated_query_should_use_last_row_as_cleanup_boundary() {
+        let src = PostgresSource::new(1, test_config(), None);
+
+        assert_eq!(
+            src.cleanup_boundary(Some("42".to_string())),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn given_custom_query_with_offset_should_advance_tracking_cursor() {
+        let mut config = test_config();
+        config.custom_query =
+            Some("SELECT * FROM users WHERE id > $offset ORDER BY id ASC LIMIT $limit".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        assert_eq!(
+            src.tracking_cursor(Some("42".to_string())),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn given_custom_query_without_offset_should_not_advance_tracking_cursor() {
+        let mut config = test_config();
+        config.custom_query = Some("SELECT * FROM users ORDER BY id ASC".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        assert_eq!(src.tracking_cursor(Some("42".to_string())), None);
     }
 
     #[test]
@@ -1977,6 +2895,19 @@ mod tests {
         let ops = vec!["INSERT".to_string(), "DELETE".to_string()];
         assert!(validate_capture_operations(Some(&ops)).is_ok());
         assert!(validate_capture_operations(None).is_ok());
+    }
+
+    #[test]
+    fn given_postgres_10_should_fail_cdc_version_validation() {
+        let error = validate_cdc_server_version_num(100_000).unwrap_err();
+
+        assert!(matches!(error, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_postgres_11_or_newer_should_pass_cdc_version_validation() {
+        assert!(validate_cdc_server_version_num(110_000).is_ok());
+        assert!(validate_cdc_server_version_num(170_000).is_ok());
     }
 
     #[test]
@@ -2433,19 +3364,68 @@ mod tests {
         let result = src.substitute_query_params(query, "events", &Some("100".to_string()), 50);
 
         assert!(result.contains("FROM events"));
-        assert!(result.contains("id > 100"));
+        assert!(result.contains("id > '100'"));
         assert!(result.contains("LIMIT 50"));
+    }
+
+    #[test]
+    fn given_text_offset_should_escape_it_as_a_sql_literal() {
+        let src = PostgresSource::new(1, test_config(), None);
+
+        let query = "SELECT * FROM events WHERE name > $offset";
+        let result =
+            src.substitute_query_params(query, "events", &Some("O'Reilly".to_string()), 50);
+
+        assert_eq!(result, "SELECT * FROM events WHERE name > 'O''Reilly'");
+    }
+
+    #[test]
+    fn given_quoted_text_offset_should_not_double_quote_the_literal() {
+        let src = PostgresSource::new(1, test_config(), None);
+
+        let query = "SELECT * FROM events WHERE name > '$offset'";
+        let result =
+            src.substitute_query_params(query, "events", &Some("O'Reilly".to_string()), 50);
+
+        assert_eq!(result, "SELECT * FROM events WHERE name > 'O''Reilly'");
+    }
+
+    #[test]
+    fn given_offset_containing_placeholder_should_substitute_original_token_once() {
+        let src = PostgresSource::new(1, test_config(), None);
+
+        let query = "SELECT * FROM events WHERE name > '$offset'";
+        let result = src.substitute_query_params(
+            query,
+            "events",
+            &Some("$offset' OR TRUE --".to_string()),
+            50,
+        );
+
+        assert_eq!(
+            result,
+            "SELECT * FROM events WHERE name > '$offset'' OR TRUE --'"
+        );
     }
 
     #[test]
     fn given_custom_query_with_time_params_should_substitute_correctly() {
         let src = PostgresSource::new(1, test_config(), None);
 
-        let query = "SELECT * FROM $table WHERE created_at < '$now'";
+        let query = "SELECT '$now', $now_unix FROM $table";
         let result = src.substitute_query_params(query, "logs", &None, 100);
+        let values = result
+            .strip_prefix("SELECT '")
+            .and_then(|value| value.strip_suffix(" FROM logs"))
+            .expect("query structure and table placeholder must be preserved");
+        let (timestamp, unix_seconds) = values.split_once("', ").unwrap();
+        let timestamp = DateTime::parse_from_rfc3339(timestamp)
+            .expect("$now must expand to an RFC3339 timestamp");
+        let unix_seconds: i64 = unix_seconds
+            .parse()
+            .expect("$now_unix must expand to integer seconds");
 
-        assert!(result.contains("FROM logs"));
-        assert!(!result.contains("$now"));
+        assert_eq!(unix_seconds, timestamp.timestamp());
     }
 
     #[test]
@@ -2457,7 +3437,7 @@ mod tests {
         let query = "SELECT * FROM $table WHERE id > $offset";
         let result = src.substitute_query_params(query, "data", &None, 100);
 
-        assert!(result.contains("id > 500"));
+        assert!(result.contains("id > '500'"));
     }
 
     #[test]
@@ -2481,8 +3461,8 @@ mod tests {
         assert_eq!(redacted, "postgresql://adm***");
     }
 
-    #[test]
-    fn given_persisted_state_should_restore_tracking_offsets() {
+    #[tokio::test]
+    async fn given_persisted_state_should_restore_tracking_offsets() {
         let state = State {
             last_poll_time: Utc::now(),
             tracking_offsets: HashMap::from([
@@ -2490,6 +3470,7 @@ mod tests {
                 ("orders".to_string(), "2024-01-15T10:30:00Z".to_string()),
             ]),
             processed_rows: 500,
+            pending_operations: Vec::new(),
         };
 
         let connector_state =
@@ -2497,44 +3478,538 @@ mod tests {
 
         let src = PostgresSource::new(1, test_config(), Some(connector_state));
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let restored = src.state.lock().await;
-            assert_eq!(
-                restored.tracking_offsets.get("users"),
-                Some(&"100".to_string())
+        let restored = src.state.lock().await;
+        assert_eq!(
+            restored.tracking_offsets.get("users"),
+            Some(&"100".to_string())
+        );
+        assert_eq!(
+            restored.tracking_offsets.get("orders"),
+            Some(&"2024-01-15T10:30:00Z".to_string())
+        );
+        assert_eq!(restored.processed_rows, 500);
+    }
+
+    #[tokio::test]
+    async fn given_legacy_checkpoint_when_source_restarts_should_restore_without_pending_operations()
+     {
+        #[derive(Serialize)]
+        struct LegacyState {
+            last_poll_time: DateTime<Utc>,
+            tracking_offsets: HashMap<String, String>,
+            processed_rows: u64,
+        }
+
+        let legacy_state = LegacyState {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::from([("users".to_string(), "100".to_string())]),
+            processed_rows: 500,
+        };
+        let connector_state = ConnectorState(
+            rmp_serde::to_vec(&legacy_state).expect("Failed to serialize legacy state"),
+        );
+
+        let src = PostgresSource::new(1, test_config(), Some(connector_state));
+
+        let restored = src.state.lock().await;
+        assert_eq!(
+            restored.tracking_offsets.get("users").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(restored.processed_rows, 500);
+        assert!(restored.pending_operations.is_empty());
+        drop(restored);
+        assert!(src.pending_batch.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_checkpoint_with_cleanup_when_source_restarts_should_replay_and_retire_operation()
+    {
+        let mut config = test_config();
+        config.poll_interval = Some("0s".to_string());
+        let state = State {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::from([("users".to_string(), "3".to_string())]),
+            processed_rows: 3,
+            pending_operations: vec![PendingOperation::ProcessRows {
+                table: "users".to_string(),
+                ids: Vec::new(),
+                tracking_boundary: Some("3".to_string()),
+                target: None,
+                row_versions: Vec::new(),
+            }],
+        };
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+        let mut src = PostgresSource::new(1, config, Some(connector_state));
+        src.pool = Some(
+            PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:postgres@localhost/postgres")
+                .expect("lazy PostgreSQL pool should be created"),
+        );
+
+        {
+            let pending = src.pending_batch.lock().await;
+            let pending = pending
+                .as_ref()
+                .expect("restored cleanup should be staged for replay");
+            assert!(pending.acknowledged);
+            assert_eq!(pending.state.pending_operations, state.pending_operations);
+        }
+
+        src.on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("restored cleanup should replay successfully");
+        {
+            let pending = src.pending_batch.lock().await;
+            assert!(
+                pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.retiring_operations)
             );
-            assert_eq!(
-                restored.tracking_offsets.get("orders"),
-                Some(&"2024-01-15T10:30:00Z".to_string())
-            );
-            assert_eq!(restored.processed_rows, 500);
-        });
+        }
+
+        src.on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("failed retirement checkpoint should remain retryable");
+        assert!(src.pending_batch.lock().await.is_some());
+
+        let retirement = src
+            .poll()
+            .await
+            .expect("retirement checkpoint should be produced");
+        assert!(retirement.messages.is_empty());
+        let retired_state = retirement
+            .state
+            .expect("retirement should include cleared state")
+            .deserialize::<State>("test", 1)
+            .expect("retirement state should deserialize");
+        assert!(retired_state.pending_operations.is_empty());
+
+        src.on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("retirement checkpoint should complete");
+        assert!(src.pending_batch.lock().await.is_none());
     }
 
     #[test]
-    fn given_no_state_should_start_fresh() {
+    fn given_pending_cleanup_when_cleanup_target_changes_should_reject_restart() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        config.primary_key_column = Some("id".to_string());
+        let state = State {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::new(),
+            processed_rows: 1,
+            pending_operations: vec![PendingOperation::ProcessRows {
+                table: "users".to_string(),
+                ids: vec!["1".to_string()],
+                tracking_boundary: None,
+                target: Some(CleanupTarget {
+                    key_column: "legacy_id".to_string(),
+                    tracking_column: "updated_at".to_string(),
+                    action: CleanupAction::Delete,
+                }),
+                row_versions: vec!["42".to_string()],
+            }],
+        };
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+        let mut src = PostgresSource::new(1, config, Some(connector_state));
+
+        assert!(matches!(
+            src.validate_pending_cleanup(),
+            Err(Error::InitError(_))
+        ));
+    }
+
+    #[test]
+    fn given_legacy_pending_cleanup_without_row_versions_should_reject_restart() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        let state = State {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::new(),
+            processed_rows: 1,
+            pending_operations: vec![PendingOperation::ProcessRows {
+                table: "users".to_string(),
+                ids: vec!["1".to_string()],
+                tracking_boundary: None,
+                target: None,
+                row_versions: Vec::new(),
+            }],
+        };
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+        let mut src = PostgresSource::new(1, config, Some(connector_state));
+
+        assert!(matches!(
+            src.validate_pending_cleanup(),
+            Err(Error::InitError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_no_state_should_start_fresh() {
         let src = PostgresSource::new(1, test_config(), None);
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
+        let state = src.state.lock().await;
+        assert!(state.tracking_offsets.is_empty());
+        assert_eq!(state.processed_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn given_transient_database_errors_when_retrying_should_eventually_succeed() {
+        let attempts = AtomicU32::new(0);
+
+        let result = with_retry(
+            || async {
+                if attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                    Err(sqlx::Error::PoolTimedOut)
+                } else {
+                    Ok(())
+                }
+            },
+            3,
+            0,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn given_zero_max_retries_should_attempt_operation_once() {
+        let attempts = AtomicU32::new(0);
+
+        let result: Result<(), sqlx::Error> = with_retry(
+            || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(sqlx::Error::PoolTimedOut)
+            },
+            0,
+            0,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_active_replication_slot_sqlstate_should_be_transient() {
+        assert!(is_transient_sqlstate("55006"));
+    }
+
+    #[tokio::test]
+    async fn given_nack_when_batch_is_staged_should_keep_committed_state() {
+        let src = PostgresSource::new(1, test_config(), None);
+        let mut candidate_state = src.state.lock().await.clone();
+        candidate_state
+            .tracking_offsets
+            .insert("users".to_string(), "3".to_string());
+        candidate_state.processed_rows = 3;
+        candidate_state.pending_operations = vec![
+            PendingOperation::ProcessRows {
+                table: "users".to_string(),
+                ids: vec!["3".to_string()],
+                tracking_boundary: Some("3".to_string()),
+                target: None,
+                row_versions: Vec::new(),
+            },
+            PendingOperation::AdvanceReplicationSlot {
+                lsn: "0/16D32A0".to_string(),
+            },
+        ];
+        *src.pending_batch.lock().await = Some(PendingBatch {
+            state: candidate_state,
+            acknowledged: false,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
+
+        src.on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("NACK should discard the candidate state");
+
+        {
             let state = src.state.lock().await;
             assert!(state.tracking_offsets.is_empty());
             assert_eq!(state.processed_rows, 0);
-        });
+        }
+        assert!(src.pending_batch.lock().await.is_none());
     }
 
-    #[test]
-    fn given_invalid_state_should_start_fresh() {
+    #[tokio::test]
+    async fn given_nack_when_ack_retry_is_staged_should_keep_pending_operation() {
+        let src = PostgresSource::new(1, test_config(), None);
+        let mut candidate_state = src.state.lock().await.clone();
+        candidate_state.pending_operations = vec![PendingOperation::AdvanceReplicationSlot {
+            lsn: "0/16D32A0".to_string(),
+        }];
+        *src.pending_batch.lock().await = Some(PendingBatch {
+            state: candidate_state,
+            acknowledged: true,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
+
+        src.on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("NACK should not discard an operation from an acknowledged batch");
+
+        assert!(src.pending_batch.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn given_ack_when_staged_operation_fails_should_keep_candidate_state_staged() {
+        let mut src = PostgresSource::new(1, test_config(), None);
+        src.pool = Some(
+            PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:postgres@localhost/postgres")
+                .expect("lazy PostgreSQL pool should be created"),
+        );
+        let mut candidate_state = src.state.lock().await.clone();
+        candidate_state
+            .tracking_offsets
+            .insert("users".to_string(), "3".to_string());
+        candidate_state.processed_rows = 3;
+        candidate_state.pending_operations = vec![PendingOperation::ProcessRows {
+            table: "public.".to_string(),
+            ids: vec!["3".to_string()],
+            tracking_boundary: Some("3".to_string()),
+            target: Some(CleanupTarget {
+                key_column: "updated_at".to_string(),
+                tracking_column: "updated_at".to_string(),
+                action: CleanupAction::Delete,
+            }),
+            row_versions: vec!["1".to_string()],
+        }];
+        *src.pending_batch.lock().await = Some(PendingBatch {
+            state: candidate_state,
+            acknowledged: false,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
+
+        src.on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ACK callback should keep the failed operation staged");
+
+        {
+            let state = src.state.lock().await;
+            assert!(state.tracking_offsets.is_empty());
+            assert_eq!(state.processed_rows, 0);
+        }
+        let pending = src.pending_batch.lock().await;
+        let pending = pending
+            .as_ref()
+            .expect("failed operation should remain staged");
+        assert_eq!(
+            pending
+                .state
+                .tracking_offsets
+                .get("users")
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(pending.state.processed_rows, 3);
+        assert_eq!(pending.state.pending_operations.len(), 1);
+        assert!(pending.acknowledged);
+        assert_eq!(src.consecutive_process_failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn given_ack_operation_when_row_processing_repeatedly_fails_should_stop_and_keep_work() {
+        let mut src = PostgresSource::new(1, test_config(), None);
+        src.pool = Some(
+            PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:postgres@localhost/postgres")
+                .expect("lazy PostgreSQL pool should be created"),
+        );
+        let mut candidate_state = src.state.lock().await.clone();
+        candidate_state.pending_operations = vec![PendingOperation::ProcessRows {
+            table: "public.".to_string(),
+            ids: vec!["3".to_string()],
+            tracking_boundary: Some("3".to_string()),
+            target: Some(CleanupTarget {
+                key_column: "updated_at".to_string(),
+                tracking_column: "updated_at".to_string(),
+                action: CleanupAction::Delete,
+            }),
+            row_versions: vec!["1".to_string()],
+        }];
+        *src.pending_batch.lock().await = Some(PendingBatch {
+            state: candidate_state,
+            acknowledged: false,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
+
+        for _ in 1..MAX_CONSECUTIVE_PROCESS_FAILURES {
+            src.on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("row processing should remain retryable below the failure threshold");
+        }
+        let error = src
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect_err("row processing should stop the source at the failure threshold");
+
+        assert!(matches!(error, Error::Connection(_)));
+        assert_eq!(
+            src.consecutive_process_failures.load(Ordering::Relaxed),
+            MAX_CONSECUTIVE_PROCESS_FAILURES
+        );
+        assert!(src.pending_batch.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn given_prior_failure_when_row_processing_succeeds_should_reset_failure_count() {
+        let mut src = PostgresSource::new(1, test_config(), None);
+        src.pool = Some(
+            PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:postgres@localhost/postgres")
+                .expect("lazy PostgreSQL pool should be created"),
+        );
+        src.consecutive_process_failures.store(1, Ordering::Relaxed);
+        let operation = PendingOperation::ProcessRows {
+            table: "users".to_string(),
+            ids: Vec::new(),
+            tracking_boundary: None,
+            target: None,
+            row_versions: Vec::new(),
+        };
+
+        assert!(
+            src.apply_pending_operation(
+                &operation,
+                tokio::time::Instant::now() + ACK_BATCH_TIMEOUT,
+            )
+            .await
+            .expect("empty row processing should succeed")
+        );
+        assert_eq!(src.consecutive_process_failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn given_staged_operation_when_retry_succeeds_should_commit_candidate_state() {
+        let mut src = PostgresSource::new(1, test_config(), None);
+        src.pool = Some(
+            PgPoolOptions::new()
+                .connect_lazy("postgres://postgres:postgres@localhost/postgres")
+                .expect("lazy PostgreSQL pool should be created"),
+        );
+        let mut candidate_state = src.state.lock().await.clone();
+        candidate_state
+            .tracking_offsets
+            .insert("users".to_string(), "3".to_string());
+        candidate_state.processed_rows = 3;
+        candidate_state.pending_operations = vec![PendingOperation::ProcessRows {
+            table: "users".to_string(),
+            ids: Vec::new(),
+            tracking_boundary: None,
+            target: None,
+            row_versions: Vec::new(),
+        }];
+        *src.pending_batch.lock().await = Some(PendingBatch {
+            state: candidate_state,
+            acknowledged: true,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
+
+        src.on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("staged operation should be retried successfully");
+
+        {
+            let state = src.state.lock().await;
+            assert_eq!(
+                state.tracking_offsets.get("users").map(String::as_str),
+                Some("3")
+            );
+            assert_eq!(state.processed_rows, 3);
+        }
+        {
+            let pending = src.pending_batch.lock().await;
+            let pending = pending
+                .as_ref()
+                .expect("successful cleanup should stage operation retirement");
+            assert!(pending.retiring_operations);
+            assert!(pending.state.pending_operations.is_empty());
+        }
+
+        src.on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("retirement checkpoint ACK should clear the pending batch");
+        assert!(src.pending_batch.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_failed_slot_advance_should_increment_consecutive_failures() {
+        let src = PostgresSource::new(1, test_config(), None);
+        let mut candidate_state = src.state.lock().await.clone();
+        candidate_state.pending_operations = vec![PendingOperation::AdvanceReplicationSlot {
+            lsn: "0/16D32A0".to_string(),
+        }];
+        *src.pending_batch.lock().await = Some(PendingBatch {
+            state: candidate_state,
+            acknowledged: false,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
+
+        src.on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ACK should record the failed slot advance");
+
+        assert_eq!(src.consecutive_advance_failures.load(Ordering::Relaxed), 1);
+        let pending = src.pending_batch.lock().await;
+        assert!(pending.as_ref().is_some_and(|pending| pending.acknowledged));
+    }
+
+    #[tokio::test]
+    async fn given_repeated_slot_advance_failures_should_stop_source() {
+        let src = PostgresSource::new(1, test_config(), None);
+        let mut candidate_state = src.state.lock().await.clone();
+        candidate_state.pending_operations = vec![PendingOperation::AdvanceReplicationSlot {
+            lsn: "0/16D32A0".to_string(),
+        }];
+        *src.pending_batch.lock().await = Some(PendingBatch {
+            state: candidate_state,
+            acknowledged: false,
+            retiring_operations: false,
+            operations_checkpointed: true,
+        });
+
+        for _ in 1..MAX_CONSECUTIVE_ADVANCE_FAILURES {
+            src.on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("slot advance should remain retryable below the failure threshold");
+        }
+        let error = src
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect_err("slot advance should stop the source at the failure threshold");
+
+        assert!(matches!(error, Error::Connection(_)));
+        assert_eq!(
+            src.consecutive_advance_failures.load(Ordering::Relaxed),
+            MAX_CONSECUTIVE_ADVANCE_FAILURES
+        );
+        assert!(src.pending_batch.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn given_invalid_state_should_start_fresh() {
         let invalid_state = ConnectorState(b"not valid json".to_vec());
         let src = PostgresSource::new(1, test_config(), Some(invalid_state));
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let state = src.state.lock().await;
-            assert!(state.tracking_offsets.is_empty());
-            assert_eq!(state.processed_rows, 0);
-        });
+        let state = src.state.lock().await;
+        assert!(state.tracking_offsets.is_empty());
+        assert_eq!(state.processed_rows, 0);
     }
 
     #[test]
@@ -2545,6 +4020,7 @@ mod tests {
                 .with_timezone(&Utc),
             tracking_offsets: HashMap::from([("table1".to_string(), "42".to_string())]),
             processed_rows: 1000,
+            pending_operations: Vec::new(),
         };
 
         let connector_state =
@@ -2556,6 +4032,7 @@ mod tests {
         assert_eq!(original.last_poll_time, deserialized.last_poll_time);
         assert_eq!(original.tracking_offsets, deserialized.tracking_offsets);
         assert_eq!(original.processed_rows, deserialized.processed_rows);
+        assert_eq!(original.pending_operations, deserialized.pending_operations);
     }
 
     #[test]

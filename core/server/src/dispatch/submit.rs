@@ -29,10 +29,11 @@ use crate::dispatch::session_ops::{
     submit_register_local_or_forward,
 };
 use crate::dispatch::upgrade_shard_handle;
-use crate::responses::committed_reply_header;
+use crate::reply_frame::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use consensus::MetadataHandle;
 use iggy_binary_protocol::{GenericHeader, PrepareHeader, RoutedRequestHeader};
+use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use server_common::Message;
@@ -45,6 +46,7 @@ use tracing::warn;
 /// proposal. Spawns a task so the awaiting peer is woken once the op
 /// commits. Submit failures are returned verbatim so the peer can preserve
 /// unknown-outcome retry semantics.
+#[allow(clippy::too_many_lines)]
 pub fn make_metadata_submit_handler<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> shard::MetadataSubmitHandler
@@ -63,6 +65,21 @@ where
         let bus = shard.bus.clone();
         bus.spawn(async move {
             match submit {
+                shard::MetadataSubmit::AttachConsumerSession {
+                    vsr_client_id,
+                    session,
+                    user_id,
+                    reply,
+                } => {
+                    let attached = shard
+                        .plane
+                        .metadata()
+                        .client_table
+                        .borrow_mut()
+                        .attach_session(vsr_client_id, session, user_id)
+                        .ok_or(IggyError::StaleClient);
+                    let _ = reply.try_send(attached);
+                }
                 shard::MetadataSubmit::Register {
                     vsr_client_id,
                     user_id,
@@ -229,7 +246,7 @@ pub fn committed_reply_commit(reply: &Message<GenericHeader>) -> Option<u64> {
 mod tests {
     use super::committed_reply_commit;
     use crate::dispatch::test_support::request_message;
-    use crate::responses::{build_deny_reply, build_reply_from_bytes};
+    use crate::reply_frame::{build_deny_reply, build_reply_from_bytes};
     use bytes::Bytes;
     use iggy_binary_protocol::Operation;
     use iggy_common::IggyError;

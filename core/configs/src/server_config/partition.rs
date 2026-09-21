@@ -115,7 +115,7 @@ fn default_offset_reservation_lease() -> NonZeroU32 {
 }
 
 /// Mirrors `partitions::EVICTED_RING_CAPACITY`.
-pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 4096;
+pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Upper bound on `evicted_ring_capacity`. The ring exists per multi-replica
 /// partition and each retained entry pins a full committed batch, so
@@ -124,7 +124,7 @@ pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 4096;
 pub const MAX_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Mirrors `partitions::EVICTED_RING_BYTES_MAX`.
-pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 64 * 1024 * 1024;
 
 /// Upper bound on `evicted_ring_bytes_max`, per partition. Whichever ring cap
 /// trips first evicts; this byte ceiling is the second typo guard.

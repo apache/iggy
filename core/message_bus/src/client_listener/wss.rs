@@ -26,14 +26,9 @@
 //! [`crate::transports::wss::WssTransportConn`]'s `run` method) so a
 //! slow or malicious peer cannot block subsequent accepts.
 //!
-//! WSS is shard-0 terminal. The plain TCP fd that exists pre-handshake
-//! could in principle be dup'd to another shard, but the receiving
-//! shard would then have to perform both the TLS handshake and the WS
-//! upgrade against state that lives on shard 0 — losing the point of
-//! the cross-shard handover. Post-upgrade the rustls + tungstenite
-//! state machines hold per-record sequence numbers, key schedule,
-//! masking state, and write buffers tied to the local task, with no
-//! dupable plaintext fd.
+//! The coordinator delegates the raw fd and shared configuration before
+//! either handshake. The destination shard creates all TLS and WebSocket
+//! state and owns subsequent encrypted I/O.
 //!
 //! Like the TCP-TLS plane, WSS structurally cannot preserve
 //! `Frozen<MESSAGE_ALIGN>` ownership: rustls's encrypt step copies
@@ -90,9 +85,8 @@ pub fn bind(
 /// Each accepted [`compio::net::TcpStream`] is handed to `on_accepted`
 /// together with a clone of the shared [`Arc<rustls::ServerConfig>`].
 /// The callback owns the stream from that point on; production wiring
-/// routes through shard 0's coordinator (mints a `client_id`, builds
-/// the install context, calls
-/// [`crate::installer::install_client_wss`]).
+/// delegates the raw fd and configuration through shard 0's coordinator.
+/// The destination shard calls [`crate::installer::install_client_wss`].
 #[allow(clippy::future_not_send)]
 pub async fn run(
     listener: TcpListener,
