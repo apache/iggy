@@ -42,7 +42,7 @@ jobs:
     # Select runner based on build target
     runs-on: ${{
       (inputs.task == 'build-aarch64-gnu' || inputs.task == 'build-aarch64-musl') && 'ubuntu-24.04-arm' ||
-      inputs.task == 'build-macos-aarch64' && 'macos-14' ||
+      (inputs.task == 'build-macos-aarch64' || inputs.task == 'clippy-macos-aarch64') && 'macos-14' ||
       inputs.task == 'build-windows-sdk' && 'windows-latest' ||
       'ubuntu-latest'
       }}
