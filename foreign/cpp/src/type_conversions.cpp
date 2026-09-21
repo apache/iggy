@@ -325,4 +325,31 @@ ClientInfoDetails ClientInfoDetails::FromFfi(ffi::ClientInfoDetails info) {
                              std::move(consumer_groups));
 }
 
+CacheMetricEntry CacheMetricEntry::FromFfi(ffi::CacheMetricEntry entry) {
+    return CacheMetricEntry(entry.stream_id, entry.topic_id, entry.partition_id, entry.hits, entry.misses,
+                            entry.hit_ratio);
+}
+
+Stats Stats::FromFfi(ffi::Stats stats) {
+    std::optional<std::uint32_t> server_semver;
+    if (stats.has_server_semver) {
+        server_semver = stats.iggy_server_semver;
+    }
+    std::vector<CacheMetricEntry> cache_metrics;
+    cache_metrics.reserve(stats.cache_metrics.size());
+    for (auto &entry : stats.cache_metrics) {
+        cache_metrics.push_back(CacheMetricEntry::FromFfi(std::move(entry)));
+    }
+    return Stats(stats.process_id, stats.cpu_usage, stats.total_cpu_usage, stats.memory_usage, stats.total_memory,
+                 stats.available_memory, stats.run_time_micros, stats.start_time_epoch_micros, stats.read_bytes,
+                 stats.written_bytes, stats.messages_size_bytes, stats.streams_count, stats.topics_count,
+                 stats.partitions_count, stats.segments_count, stats.messages_count, stats.clients_count,
+                 stats.consumer_groups_count, std::string(stats.hostname.c_str(), stats.hostname.size()),
+                 std::string(stats.os_name.c_str(), stats.os_name.size()),
+                 std::string(stats.os_version.c_str(), stats.os_version.size()),
+                 std::string(stats.kernel_version.c_str(), stats.kernel_version.size()),
+                 std::string(stats.iggy_server_version.c_str(), stats.iggy_server_version.size()), server_semver,
+                 std::move(cache_metrics), stats.threads_count, stats.free_disk_space, stats.total_disk_space);
+}
+
 }  // namespace iggy
