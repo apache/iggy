@@ -23,6 +23,7 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
+| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
 
 ## Test
 
@@ -57,6 +58,23 @@ Before check-in, run the procedure in [docs/MANUAL_TESTING.md](docs/MANUAL_TESTI
 ## Scoped APIs
 
 See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/issues/3421) deliverables, supported API key/version table, and post-foundation TODO backlog.
+
+## Design decisions
+
+- [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
+- [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
+- [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
+
+### Delivery guarantees
+
+Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
+restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
+a producer id so that it starts, but its retries are not deduplicated: a retry after a network
+timeout writes the record twice, and both copies reach the stream with their own offsets.
+
+Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
+guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
+[docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
 
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 
@@ -187,6 +205,28 @@ rely on.
 - Too many partitions requested (`TooManyPartitions`) → `INVALID_PARTITIONS` (37), reachable
   through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
+
+### Server limits the gateway inherits
+
+These are Iggy server limits, not gateway settings. A Kafka client cannot act on any of them, so
+an operator has to.
+
+| Limit | Default | Where |
+| ------- | --------- | ------- |
+| Consumer offset keys per partition, per consumer kind | 4096, ceiling 262144 | `partition.consumer_offsets_max` |
+| One user header name, and one header value | 255 bytes | fixed, `user_headers.rs` |
+| All user headers of one message | 100 KB | fixed, `MAX_USER_HEADERS_SIZE` |
+| Message payload | 64 MB | fixed, `MAX_PAYLOAD_SIZE` |
+
+Only the first is configurable. A Kafka consumer group commits one offset key per partition it
+holds, so `partition.consumer_offsets_max` is what bounds the number of groups that can commit
+against one partition. Passing it returns `TooManyConsumerOffsets` (3024), which reaches the
+client as `UNKNOWN_SERVER_ERROR` because Kafka has no code for the condition. The gateway logs
+the real Iggy error, so the server log is where an operator diagnoses it.
+
+The other three decide when a Kafka record goes into the envelope instead of being stored
+natively. See [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) and
+[docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md).
 
 ## Wire fixture tool
 

@@ -11,7 +11,7 @@
 
 <div align="center">
 
-[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/quickstart/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/apache-iggy) | [Crates](https://crates.io/crates/iggy)
+[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/quickstart/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/apache-iggy) | [Crates](https://crates.io/crates/iggy) | [Mailing list](https://iggy.apache.org/community/mailing-lists/)
 
 </div>
 <p align="center">

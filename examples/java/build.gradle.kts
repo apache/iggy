@@ -19,7 +19,7 @@
 
 plugins {
     java
-    id("com.diffplug.spotless") version "8.10.1"
+    id("com.diffplug.spotless") version "8.10.2"
 }
 
 repositories {
@@ -28,7 +28,7 @@ repositories {
 
 dependencies {
     implementation("org.apache.iggy:iggy:local-dev")
-    implementation("org.slf4j:slf4j-simple:2.0.18")
+    implementation("org.slf4j:slf4j-simple:2.0.19")
     implementation("tools.jackson.core:jackson-databind:3.2.2")
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
