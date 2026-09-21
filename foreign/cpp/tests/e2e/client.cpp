@@ -1931,346 +1931,343 @@ TEST_F(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
     iggy::ffi::delete_client(client);
 }
 
-TEST_F(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
+TEST_F(E2E_Client, GetStatsBeforeLoginThrows) {
     RecordProperty("description",
-                   "Rejects get_stats before connect, after connect but before login, and after disconnect.");
-    iggy::ffi::Client *client = GetLoggedOutClient();
+                   "Rejects GetStats before connect, after connect but before login, and after disconnect.");
+    auto client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(client->get_stats(), std::exception);
-    ASSERT_NO_THROW(client->connect());
-    ASSERT_THROW(client->get_stats(), std::exception);
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(client->disconnect());
-    ASSERT_THROW(client->get_stats(), std::exception);
+    ASSERT_THROW((void)client.GetStats(), iggy::IggyException);
+    ASSERT_NO_THROW(client.Connect());
+    ASSERT_THROW((void)client.GetStats(), iggy::IggyException);
+    ASSERT_NO_THROW(client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(client.Disconnect());
+    ASSERT_THROW((void)client.GetStats(), iggy::IggyException);
 }
 
 // The VSR server has no unsaved-buffer primitive (writes are journaled at
 // commit); FLUSH_UNSAVED_BUFFER denies typed with FeatureUnavailable even for
 // resolvable targets.
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferThrowsForExistingPartition) {
+TEST_F(E2E_Client, FlushUnsavedBufferThrowsForExistingPartition) {
     RecordProperty("description",
-                   "Rejects flush_unsaved_buffer with the feature-unavailable error for an existing partition.");
+                   "Rejects FlushUnsavedBuffer with the feature-unavailable error for an existing partition.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    const auto topic_details  = client.CreateTopic(iggy::Identifier::Numeric(stream_details.Id()), topic_name,
+                                                   iggy::TopicCreateOptions().SetPartitionsCount(1));
 
+    iggy::ffi::Client *sender = GetLoggedInClient();
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     messages.push_back(iggy::ffi::make_message(to_payload("flush-me"), rust::Vec<iggy::ffi::HeaderEntry>()));
 
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
-    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
-                 std::exception);
+    ASSERT_NO_THROW(sender->send_messages(make_numeric_identifier(stream_details.Id()),
+                                          make_numeric_identifier(topic_details.Id()), "partition_id",
+                                          partition_id_bytes(0), std::move(messages)));
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(stream_details.Id()),
+                                           iggy::Identifier::Numeric(topic_details.Id()), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferThrowsForExistingEmptyPartition) {
+TEST_F(E2E_Client, FlushUnsavedBufferThrowsForExistingEmptyPartition) {
     RecordProperty(
         "description",
-        "Rejects flush_unsaved_buffer with the feature-unavailable error for a partition with no unsaved messages.");
+        "Rejects FlushUnsavedBuffer with the feature-unavailable error for a partition with no unsaved messages.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    const auto topic_details  = client.CreateTopic(iggy::Identifier::Numeric(stream_details.Id()), topic_name,
+                                                   iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
-                 std::exception);
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(stream_details.Id()),
+                                           iggy::Identifier::Numeric(topic_details.Id()), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferBeforeLoginThrows) {
+TEST_F(E2E_Client, FlushUnsavedBufferBeforeLoginThrows) {
     RecordProperty("description",
-                   "Throws when flush_unsaved_buffer is called before connect, after connect but before login, and "
+                   "Throws when FlushUnsavedBuffer is called before connect, after connect but before login, and "
                    "after disconnect.");
-    iggy::ffi::Client *client = GetLoggedOutClient();
+    auto client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(1), make_numeric_identifier(1), 0, true),
-                 std::exception);
-    ASSERT_NO_THROW(client->connect());
-    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(1), make_numeric_identifier(1), 0, true),
-                 std::exception);
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(client->disconnect());
-    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(1), make_numeric_identifier(1), 0, true),
-                 std::exception);
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(1), iggy::Identifier::Numeric(1), 0, true),
+                 iggy::IggyException);
+    ASSERT_NO_THROW(client.Connect());
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(1), iggy::Identifier::Numeric(1), 0, true),
+                 iggy::IggyException);
+    ASSERT_NO_THROW(client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(client.Disconnect());
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(1), iggy::Identifier::Numeric(1), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferOnNonExistentStreamThrows) {
-    RecordProperty("description", "Throws when flush_unsaved_buffer is called for a stream that does not exist.");
+TEST_F(E2E_Client, FlushUnsavedBufferOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when FlushUnsavedBuffer is called for a stream that does not exist.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    const auto topic_details = client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                                  iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    ASSERT_THROW(
-        client->flush_unsaved_buffer(make_string_identifier(GetRandomName()), make_numeric_identifier(0), 0, true),
-        std::exception);
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::String(GetRandomName()),
+                                           iggy::Identifier::Numeric(topic_details.Id()), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferOnNonExistentTopicThrows) {
-    RecordProperty("description", "Throws when flush_unsaved_buffer is called for a topic that does not exist.");
+TEST_F(E2E_Client, FlushUnsavedBufferOnNonExistentTopicThrows) {
+    RecordProperty("description", "Throws when FlushUnsavedBuffer is called for a topic that does not exist.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    ASSERT_THROW(client->flush_unsaved_buffer(make_string_identifier(stream_name),
-                                              make_string_identifier(GetRandomName()), 0, true),
-                 std::exception);
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::String(stream_name),
+                                           iggy::Identifier::String(GetRandomName()), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferAfterStreamDeletedThrows) {
-    RecordProperty("description", "Throws when flush_unsaved_buffer is called after the stream has been deleted.");
+TEST_F(E2E_Client, FlushUnsavedBufferAfterStreamDeletedThrows) {
+    RecordProperty("description", "Throws when FlushUnsavedBuffer is called after the stream has been deleted.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    const auto topic_details  = client.CreateTopic(iggy::Identifier::Numeric(stream_details.Id()), topic_name,
+                                                   iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    const std::uint32_t saved_stream_id = stream.id;
-    ASSERT_NO_THROW(client->delete_stream(make_numeric_identifier(saved_stream_id)));
-    ForgetTrackedStream(saved_stream_id);
+    const std::uint32_t saved_stream_id = stream_details.Id();
+    const std::uint32_t saved_topic_id  = topic_details.Id();
+    ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::Numeric(saved_stream_id)));
+    ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(saved_stream_id), make_numeric_identifier(0), 0, true),
-        std::exception);
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(saved_stream_id),
+                                           iggy::Identifier::Numeric(saved_topic_id), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferAfterTopicDeletedThrows) {
-    RecordProperty("description", "Throws when flush_unsaved_buffer is called after the topic has been deleted.");
+TEST_F(E2E_Client, FlushUnsavedBufferAfterTopicDeletedThrows) {
+    RecordProperty("description", "Throws when FlushUnsavedBuffer is called after the topic has been deleted.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
-    ASSERT_NO_THROW(client->delete_topic(make_numeric_identifier(stream.id), make_string_identifier(topic_name)));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    const auto topic_details  = client.CreateTopic(iggy::Identifier::Numeric(stream_details.Id()), topic_name,
+                                                   iggy::TopicCreateOptions().SetPartitionsCount(1));
+    ASSERT_NO_THROW(
+        client.DeleteTopic(iggy::Identifier::Numeric(stream_details.Id()), iggy::Identifier::String(topic_name)));
 
-    ASSERT_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_string_identifier(topic_name), 0, true),
-        std::exception);
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(stream_details.Id()),
+                                           iggy::Identifier::Numeric(topic_details.Id()), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceThrows) {
+TEST_F(E2E_Client, FlushUnsavedBufferTwiceThrows) {
     RecordProperty("description",
-                   "Rejects flush_unsaved_buffer with the feature-unavailable error consistently across repeat calls.");
+                   "Rejects FlushUnsavedBuffer with the feature-unavailable error consistently across repeat calls.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    const auto topic_details  = client.CreateTopic(iggy::Identifier::Numeric(stream_details.Id()), topic_name,
+                                                   iggy::TopicCreateOptions().SetPartitionsCount(1));
 
+    iggy::ffi::Client *sender = GetLoggedInClient();
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     messages.push_back(iggy::ffi::make_message(to_payload("flush-twice"), rust::Vec<iggy::ffi::HeaderEntry>()));
 
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
-    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
-                 std::exception);
-    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
-                 std::exception);
+    ASSERT_NO_THROW(sender->send_messages(make_numeric_identifier(stream_details.Id()),
+                                          make_numeric_identifier(topic_details.Id()), "partition_id",
+                                          partition_id_bytes(0), std::move(messages)));
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(stream_details.Id()),
+                                           iggy::Identifier::Numeric(topic_details.Id()), 0, true),
+                 iggy::IggyException);
+    ASSERT_THROW(client.FlushUnsavedBuffer(iggy::Identifier::Numeric(stream_details.Id()),
+                                           iggy::Identifier::Numeric(topic_details.Id()), 0, true),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferWithInvalidPartitionIdsThrows) {
-    RecordProperty("description", "Throws when flush_unsaved_buffer is called for non-existent partition ids.");
+TEST_F(E2E_Client, FlushUnsavedBufferWithInvalidPartitionIdsThrows) {
+    RecordProperty("description", "Throws when FlushUnsavedBuffer is called for non-existent partition ids.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    const auto topic_details  = client.CreateTopic(iggy::Identifier::Numeric(stream_details.Id()), topic_name,
+                                                   iggy::TopicCreateOptions().SetPartitionsCount(1));
 
     const std::uint32_t invalid_partition_ids[] = {1u, 9999u, static_cast<std::uint32_t>(-1)};
     for (const std::uint32_t invalid_partition_id : invalid_partition_ids) {
         SCOPED_TRACE(invalid_partition_id);
-        ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                                  invalid_partition_id, true),
-                     std::exception);
+        ASSERT_THROW(
+            client.FlushUnsavedBuffer(iggy::Identifier::Numeric(stream_details.Id()),
+                                      iggy::Identifier::Numeric(topic_details.Id()), invalid_partition_id, true),
+            iggy::IggyException);
     }
 }
 
-TEST_F(LowLevelE2E_Client, DeleteSegmentsBeforeLoginThrows) {
+TEST_F(E2E_Client, DeleteSegmentsBeforeLoginThrows) {
     RecordProperty("description",
-                   "Rejects delete_segments before connect, after connect but before login, and after disconnect.");
-    const std::string stream_name   = GetRandomName();
-    const std::string topic_name    = GetRandomName();
-    iggy::ffi::Client *setup_client = GetLoggedInClient();
+                   "Rejects DeleteSegments before connect, after connect but before login, and after disconnect.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    auto setup_client             = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(setup_client->create_stream(stream_name));
+    ASSERT_NO_THROW(setup_client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(
-        setup_client->create_topic(make_string_identifier(stream_name), topic_name,
-                                   make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(setup_client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                             iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
-    ASSERT_THROW(unauthenticated_client->delete_segments(make_string_identifier(stream_name),
-                                                         make_string_identifier(topic_name), 0, 1),
-                 std::exception);
-    ASSERT_NO_THROW(unauthenticated_client->connect());
-    ASSERT_THROW(unauthenticated_client->delete_segments(make_string_identifier(stream_name),
-                                                         make_string_identifier(topic_name), 0, 1),
-                 std::exception);
-    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(unauthenticated_client->disconnect());
-    ASSERT_THROW(unauthenticated_client->delete_segments(make_string_identifier(stream_name),
-                                                         make_string_identifier(topic_name), 0, 1),
-                 std::exception);
+    auto unauthenticated_client = GetLoggedOutHighLevelClient();
+    ASSERT_THROW(unauthenticated_client.DeleteSegments(iggy::Identifier::String(stream_name),
+                                                       iggy::Identifier::String(topic_name), 0, 1),
+                 iggy::IggyException);
+    ASSERT_NO_THROW(unauthenticated_client.Connect());
+    ASSERT_THROW(unauthenticated_client.DeleteSegments(iggy::Identifier::String(stream_name),
+                                                       iggy::Identifier::String(topic_name), 0, 1),
+                 iggy::IggyException);
+    ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client.Disconnect());
+    ASSERT_THROW(unauthenticated_client.DeleteSegments(iggy::Identifier::String(stream_name),
+                                                       iggy::Identifier::String(topic_name), 0, 1),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentStreamThrows) {
+TEST_F(E2E_Client, DeleteSegmentsOnNonExistentStreamThrows) {
     RecordProperty("description", "Throws when deleting segments from a stream that does not exist.");
     const std::string stream_name         = GetRandomName();
     const std::string topic_name          = GetRandomName();
     const std::string missing_stream_name = GetRandomName();
-    iggy::ffi::Client *client             = GetLoggedInClient();
+    auto client                           = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    ASSERT_THROW(
-        client->delete_segments(make_string_identifier(missing_stream_name), make_string_identifier(topic_name), 0, 1),
-        std::exception);
+    ASSERT_THROW(client.DeleteSegments(iggy::Identifier::String(missing_stream_name),
+                                       iggy::Identifier::String(topic_name), 0, 1),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentTopicThrows) {
+TEST_F(E2E_Client, DeleteSegmentsOnNonExistentTopicThrows) {
     RecordProperty("description", "Throws when deleting segments from a topic that does not exist.");
     const std::string stream_name        = GetRandomName();
     const std::string topic_name         = GetRandomName();
     const std::string missing_topic_name = GetRandomName();
-    iggy::ffi::Client *client            = GetLoggedInClient();
+    auto client                          = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    ASSERT_THROW(
-        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(missing_topic_name), 0, 1),
-        std::exception);
+    ASSERT_THROW(client.DeleteSegments(iggy::Identifier::String(stream_name),
+                                       iggy::Identifier::String(missing_topic_name), 0, 1),
+                 iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentPartitionThrows) {
+TEST_F(E2E_Client, DeleteSegmentsOnNonExistentPartitionThrows) {
     RecordProperty("description", "Throws when deleting segments from a partition that does not exist.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     ASSERT_THROW(
-        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(topic_name), 999, 1),
-        std::exception);
+        client.DeleteSegments(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 999, 1),
+        iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
-    RecordProperty("description", "Treats delete_segments with count 0 as a no-op.");
+TEST_F(E2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
+    RecordProperty("description", "Treats DeleteSegments with count 0 as a no-op.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    std::uint32_t stream_id = 0;
-    std::uint32_t topic_id  = 0;
-    ASSERT_NO_THROW({
-        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
-        ASSERT_EQ(stream_details.topics.size(), 1u);
-        stream_id = stream_details.id;
-        topic_id  = stream_details.topics.front().id;
-    });
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    ASSERT_EQ(stream_details.Topics().size(), 1u);
+    const std::uint32_t stream_id = stream_details.Id();
+    const std::uint32_t topic_id  = stream_details.Topics().front().Id();
 
+    iggy::ffi::Client *sender = GetLoggedInClient();
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; ++i) {
         messages.push_back(iggy::ffi::make_message(to_payload("zero-count-" + std::to_string(i)),
                                                    rust::Vec<iggy::ffi::HeaderEntry>()));
     }
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
+    ASSERT_NO_THROW(sender->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
 
-    iggy::ffi::Partition partition_before_delete{};
-    ASSERT_NO_THROW({
+    const auto find_partition = [&client, stream_id, topic_id](std::uint32_t partition_id) {
         const auto topic_details =
-            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
-        for (const auto &partition : topic_details.partitions) {
-            if (partition.id == 0) {
-                partition_before_delete = partition;
-                break;
+            client.GetTopic(iggy::Identifier::Numeric(stream_id), iggy::Identifier::Numeric(topic_id));
+        for (const auto &partition : topic_details.Partitions()) {
+            if (partition.Id() == partition_id) {
+                return partition;
             }
         }
-    });
+        throw iggy::IggyException("Partition was not found");
+    };
+
+    const auto partition_before_delete = find_partition(0);
 
     iggy::ffi::PolledMessages polled_before_delete{};
     ASSERT_NO_THROW({
         polled_before_delete =
-            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
                                   make_numeric_identifier(1005), "offset", 0, 1000, false);
     });
 
     ASSERT_NO_THROW(
-        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(topic_name), 0, 0));
+        client.DeleteSegments(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 0, 0));
 
-    iggy::ffi::Partition partition_after_delete{};
-    ASSERT_NO_THROW({
-        const auto topic_details =
-            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
-        for (const auto &partition : topic_details.partitions) {
-            if (partition.id == 0) {
-                partition_after_delete = partition;
-                break;
-            }
-        }
-    });
+    const auto partition_after_delete = find_partition(0);
 
     iggy::ffi::PolledMessages polled_after_delete{};
     ASSERT_NO_THROW({
         polled_after_delete =
-            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
                                   make_numeric_identifier(1006), "offset", 0, 1000, false);
     });
 
-    EXPECT_EQ(partition_after_delete.segments_count, partition_before_delete.segments_count);
-    EXPECT_EQ(partition_after_delete.current_offset, partition_before_delete.current_offset);
-    EXPECT_EQ(partition_after_delete.messages_count, partition_before_delete.messages_count);
-    EXPECT_EQ(partition_after_delete.size_bytes, partition_before_delete.size_bytes);
+    EXPECT_EQ(partition_after_delete.SegmentsCount(), partition_before_delete.SegmentsCount());
+    EXPECT_EQ(partition_after_delete.CurrentOffset(), partition_before_delete.CurrentOffset());
+    EXPECT_EQ(partition_after_delete.MessagesCount(), partition_before_delete.MessagesCount());
+    EXPECT_EQ(partition_after_delete.SizeBytes(), partition_before_delete.SizeBytes());
     EXPECT_EQ(polled_after_delete.count, polled_before_delete.count);
     ASSERT_EQ(polled_after_delete.messages.size(), polled_before_delete.messages.size());
     for (std::size_t i = 0; i < polled_before_delete.messages.size(); ++i) {
@@ -2278,81 +2275,69 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
     }
 }
 
-TEST_F(LowLevelE2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
+TEST_F(E2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
     RecordProperty("description",
-                   "Keeps the partition unchanged when delete_segments is called with only the active segment.");
+                   "Keeps the partition unchanged when DeleteSegments is called with only the active segment.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name,
-                                         make_topic_create_options(1, "none", "never_expire", 0, "server_default")));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    std::uint32_t stream_id = 0;
-    std::uint32_t topic_id  = 0;
-    ASSERT_NO_THROW({
-        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
-        ASSERT_EQ(stream_details.topics.size(), 1u);
-        stream_id = stream_details.id;
-        topic_id  = stream_details.topics.front().id;
-    });
+    const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
+    ASSERT_EQ(stream_details.Topics().size(), 1u);
+    const std::uint32_t stream_id = stream_details.Id();
+    const std::uint32_t topic_id  = stream_details.Topics().front().Id();
 
+    iggy::ffi::Client *sender = GetLoggedInClient();
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; ++i) {
         messages.push_back(iggy::ffi::make_message(to_payload("active-only-" + std::to_string(i)),
                                                    rust::Vec<iggy::ffi::HeaderEntry>()));
     }
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
+    ASSERT_NO_THROW(sender->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
 
-    iggy::ffi::Partition partition_before_delete{};
-    ASSERT_NO_THROW({
+    const auto find_partition = [&client, stream_id, topic_id](std::uint32_t partition_id) {
         const auto topic_details =
-            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
-        for (const auto &partition : topic_details.partitions) {
-            if (partition.id == 0) {
-                partition_before_delete = partition;
-                break;
+            client.GetTopic(iggy::Identifier::Numeric(stream_id), iggy::Identifier::Numeric(topic_id));
+        for (const auto &partition : topic_details.Partitions()) {
+            if (partition.Id() == partition_id) {
+                return partition;
             }
         }
-    });
-    ASSERT_EQ(partition_before_delete.segments_count, 1u);
+        throw iggy::IggyException("Partition was not found");
+    };
+
+    const auto partition_before_delete = find_partition(0);
+    ASSERT_EQ(partition_before_delete.SegmentsCount(), 1u);
 
     iggy::ffi::PolledMessages polled_before_delete{};
     ASSERT_NO_THROW({
         polled_before_delete =
-            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
                                   make_numeric_identifier(1007), "offset", 0, 1000, false);
     });
 
     ASSERT_NO_THROW(
-        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(topic_name), 0, 1));
+        client.DeleteSegments(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 0, 1));
 
-    iggy::ffi::Partition partition_after_delete{};
-    ASSERT_NO_THROW({
-        const auto topic_details =
-            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
-        for (const auto &partition : topic_details.partitions) {
-            if (partition.id == 0) {
-                partition_after_delete = partition;
-                break;
-            }
-        }
-    });
+    const auto partition_after_delete = find_partition(0);
 
     iggy::ffi::PolledMessages polled_after_delete{};
     ASSERT_NO_THROW({
         polled_after_delete =
-            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
                                   make_numeric_identifier(1008), "offset", 0, 1000, false);
     });
 
-    EXPECT_EQ(partition_after_delete.segments_count, partition_before_delete.segments_count);
-    EXPECT_EQ(partition_after_delete.current_offset, partition_before_delete.current_offset);
-    EXPECT_EQ(partition_after_delete.messages_count, partition_before_delete.messages_count);
-    EXPECT_EQ(partition_after_delete.size_bytes, partition_before_delete.size_bytes);
+    EXPECT_EQ(partition_after_delete.SegmentsCount(), partition_before_delete.SegmentsCount());
+    EXPECT_EQ(partition_after_delete.CurrentOffset(), partition_before_delete.CurrentOffset());
+    EXPECT_EQ(partition_after_delete.MessagesCount(), partition_before_delete.MessagesCount());
+    EXPECT_EQ(partition_after_delete.SizeBytes(), partition_before_delete.SizeBytes());
     EXPECT_EQ(polled_after_delete.count, polled_before_delete.count);
     ASSERT_EQ(polled_after_delete.messages.size(), polled_before_delete.messages.size());
     for (std::size_t i = 0; i < polled_before_delete.messages.size(); ++i) {
@@ -2362,7 +2347,7 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
 
 // TODO(slbotbm): add a test to create some streams, topics, partitions, and segments, send messages, and create
 // consumer groups and verify it.
-TEST_F(LowLevelE2E_Client, GetStatsReturnsServerStats) {
+TEST_F(E2E_Client, GetStatsReturnsServerStats) {
     RecordProperty("description",
                    "Returns empty resource counts first, then reflects aggregated streams, topics, partitions, "
                    "consumer groups, and clients.");
@@ -2375,145 +2360,125 @@ TEST_F(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     const std::string second_group_name                 = GetRandomName();
     const std::string third_group_name                  = GetRandomName();
     constexpr std::uint32_t additional_partitions_count = 2;
-    iggy::ffi::Client *client                           = GetLoggedInClient();
+    auto client                                         = GetLoggedInHighLevelClient();
 
-    iggy::ffi::Client *second_client = nullptr;
-    iggy::ffi::Client *third_client  = nullptr;
+    const auto empty_stats = client.GetStats();
+    EXPECT_NE(empty_stats.ProcessId(), 0u);
+    EXPECT_GT(empty_stats.ThreadsCount(), 0u);
+    EXPECT_GT(empty_stats.TotalMemory(), 0u);
+    EXPECT_LE(empty_stats.AvailableMemory(), empty_stats.TotalMemory());
+    EXPECT_GE(empty_stats.TotalDiskSpace(), empty_stats.FreeDiskSpace());
+    EXPECT_FALSE(empty_stats.Hostname().empty());
+    EXPECT_FALSE(empty_stats.OsName().empty());
+    EXPECT_FALSE(empty_stats.OsVersion().empty());
+    EXPECT_FALSE(empty_stats.KernelVersion().empty());
+    EXPECT_FALSE(empty_stats.IggyServerVersion().empty());
 
-    iggy::ffi::Stats empty_stats{};
-    iggy::ffi::Stats stats_after_create{};
-    ASSERT_NO_THROW({
-        empty_stats = client->get_stats();
-        EXPECT_NE(empty_stats.process_id, 0u);
-        EXPECT_GT(empty_stats.threads_count, 0u);
-        EXPECT_GT(empty_stats.total_memory, 0u);
-        EXPECT_LE(empty_stats.available_memory, empty_stats.total_memory);
-        EXPECT_GE(empty_stats.total_disk_space, empty_stats.free_disk_space);
-        EXPECT_FALSE(static_cast<std::string>(empty_stats.hostname).empty());
-        EXPECT_FALSE(static_cast<std::string>(empty_stats.os_name).empty());
-        EXPECT_FALSE(static_cast<std::string>(empty_stats.os_version).empty());
-        EXPECT_FALSE(static_cast<std::string>(empty_stats.kernel_version).empty());
-        EXPECT_FALSE(static_cast<std::string>(empty_stats.iggy_server_version).empty());
-    });
-
-    ASSERT_NO_THROW(client->create_stream(first_stream_name));
+    ASSERT_NO_THROW(client.CreateStream(first_stream_name));
     TrackStream(first_stream_name);
-    ASSERT_NO_THROW(client->create_stream(second_stream_name));
+    ASSERT_NO_THROW(client.CreateStream(second_stream_name));
     TrackStream(second_stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), first_topic_name,
-                                         make_topic_create_options(1, "none", "server_default", 0, "server_default")));
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), second_topic_name,
-                                         make_topic_create_options(2, "none", "server_default", 0, "server_default")));
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(second_stream_name), third_topic_name,
-                                         make_topic_create_options(3, "none", "server_default", 0, "server_default")));
-    ASSERT_NO_THROW(client->create_partitions(make_string_identifier(first_stream_name),
-                                              make_string_identifier(first_topic_name), additional_partitions_count));
-    const auto first_group  = client->create_consumer_group(make_string_identifier(first_stream_name),
-                                                            make_string_identifier(first_topic_name), first_group_name);
-    const auto second_group = client->create_consumer_group(
-        make_string_identifier(first_stream_name), make_string_identifier(second_topic_name), second_group_name);
-    const auto third_group = client->create_consumer_group(make_string_identifier(second_stream_name),
-                                                           make_string_identifier(third_topic_name), third_group_name);
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(first_stream_name), first_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(first_stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(2)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(second_stream_name), third_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
+    ASSERT_NO_THROW(client.CreatePartitions(iggy::Identifier::String(first_stream_name),
+                                            iggy::Identifier::String(first_topic_name), additional_partitions_count));
+    const auto first_group  = client.CreateConsumerGroup(iggy::Identifier::String(first_stream_name),
+                                                         iggy::Identifier::String(first_topic_name), first_group_name);
+    const auto second_group = client.CreateConsumerGroup(
+        iggy::Identifier::String(first_stream_name), iggy::Identifier::String(second_topic_name), second_group_name);
+    const auto third_group = client.CreateConsumerGroup(iggy::Identifier::String(second_stream_name),
+                                                        iggy::Identifier::String(third_topic_name), third_group_name);
 
-    ASSERT_NO_THROW({ second_client = GetLoggedInClient(); });
-    ASSERT_NE(second_client, nullptr);
-    ASSERT_NO_THROW({ third_client = GetLoggedInClient(); });
-    ASSERT_NE(third_client, nullptr);
+    auto second_client = GetLoggedInHighLevelClient();
+    auto third_client  = GetLoggedInHighLevelClient();
+    (void)second_client;
+    (void)third_client;
 
-    const auto first_stream_details           = client->get_stream(make_string_identifier(first_stream_name));
-    const auto second_stream_details          = client->get_stream(make_string_identifier(second_stream_name));
-    const std::uint32_t expected_topics_count = first_stream_details.topics_count + second_stream_details.topics_count;
-    std::uint32_t first_topic_partitions      = 0;
-    std::uint32_t second_topic_partitions     = 0;
-    std::uint32_t third_topic_partitions      = 0;
-    for (const auto &topic : first_stream_details.topics) {
-        if (topic.name == first_topic_name) {
-            first_topic_partitions = topic.partitions_count;
+    const auto first_stream_details  = client.GetStream(iggy::Identifier::String(first_stream_name));
+    const auto second_stream_details = client.GetStream(iggy::Identifier::String(second_stream_name));
+    const std::uint32_t expected_topics_count =
+        first_stream_details.TopicsCount() + second_stream_details.TopicsCount();
+    std::uint32_t first_topic_partitions  = 0;
+    std::uint32_t second_topic_partitions = 0;
+    std::uint32_t third_topic_partitions  = 0;
+    for (const auto &topic : first_stream_details.Topics()) {
+        if (topic.Name() == first_topic_name) {
+            first_topic_partitions = topic.PartitionsCount();
         }
-        if (topic.name == second_topic_name) {
-            second_topic_partitions = topic.partitions_count;
+        if (topic.Name() == second_topic_name) {
+            second_topic_partitions = topic.PartitionsCount();
         }
     }
-    for (const auto &topic : second_stream_details.topics) {
-        if (topic.name == third_topic_name) {
-            third_topic_partitions = topic.partitions_count;
+    for (const auto &topic : second_stream_details.Topics()) {
+        if (topic.Name() == third_topic_name) {
+            third_topic_partitions = topic.PartitionsCount();
         }
     }
     const std::uint32_t expected_partitions_count =
         first_topic_partitions + second_topic_partitions + third_topic_partitions;
 
-    ASSERT_NO_THROW({
-        stats_after_create = client->get_stats();
-        EXPECT_GE(stats_after_create.streams_count, empty_stats.streams_count + 2u);
-        EXPECT_GE(stats_after_create.topics_count, empty_stats.topics_count + expected_topics_count);
-        EXPECT_GE(stats_after_create.partitions_count, empty_stats.partitions_count + expected_partitions_count);
-        EXPECT_GE(stats_after_create.segments_count, empty_stats.segments_count + expected_partitions_count);
-        EXPECT_GE(stats_after_create.consumer_groups_count, empty_stats.consumer_groups_count + 3u);
-        EXPECT_GE(stats_after_create.clients_count, empty_stats.clients_count + 2u);
-        EXPECT_EQ(first_group.partitions_count, first_topic_partitions);
-        EXPECT_EQ(second_group.partitions_count, second_topic_partitions);
-        EXPECT_EQ(third_group.partitions_count, third_topic_partitions);
-    });
+    const auto stats_after_create = client.GetStats();
+    EXPECT_GE(stats_after_create.StreamsCount(), empty_stats.StreamsCount() + 2u);
+    EXPECT_GE(stats_after_create.TopicsCount(), empty_stats.TopicsCount() + expected_topics_count);
+    EXPECT_GE(stats_after_create.PartitionsCount(), empty_stats.PartitionsCount() + expected_partitions_count);
+    EXPECT_GE(stats_after_create.SegmentsCount(), empty_stats.SegmentsCount() + expected_partitions_count);
+    EXPECT_GE(stats_after_create.ConsumerGroupsCount(), empty_stats.ConsumerGroupsCount() + 3u);
+    EXPECT_GE(stats_after_create.ClientsCount(), empty_stats.ClientsCount() + 2u);
+    EXPECT_EQ(first_group.PartitionsCount(), first_topic_partitions);
+    EXPECT_EQ(second_group.PartitionsCount(), second_topic_partitions);
+    EXPECT_EQ(third_group.PartitionsCount(), third_topic_partitions);
 
-    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(second_stream_name)));
+    ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(second_stream_name)));
     ForgetTrackedStream(second_stream_name);
-    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(first_stream_name)));
+    ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(first_stream_name)));
     ForgetTrackedStream(first_stream_name);
-    DeleteClient(third_client);
-    DeleteClient(second_client);
 
-    ASSERT_NO_THROW({
-        const auto stats = client->get_stats();
-        EXPECT_LE(stats.streams_count, stats_after_create.streams_count);
-        EXPECT_LE(stats.topics_count, stats_after_create.topics_count);
-        EXPECT_LE(stats.partitions_count, stats_after_create.partitions_count);
-        EXPECT_LE(stats.segments_count, stats_after_create.segments_count);
-        EXPECT_LE(stats.consumer_groups_count, stats_after_create.consumer_groups_count);
-        EXPECT_LE(stats.clients_count, stats_after_create.clients_count);
-    });
+    const auto stats = client.GetStats();
+    EXPECT_LE(stats.StreamsCount(), stats_after_create.StreamsCount());
+    EXPECT_LE(stats.TopicsCount(), stats_after_create.TopicsCount());
+    EXPECT_LE(stats.PartitionsCount(), stats_after_create.PartitionsCount());
+    EXPECT_LE(stats.SegmentsCount(), stats_after_create.SegmentsCount());
+    EXPECT_LE(stats.ConsumerGroupsCount(), stats_after_create.ConsumerGroupsCount());
+    EXPECT_LE(stats.ClientsCount(), stats_after_create.ClientsCount());
 }
 
-TEST_F(LowLevelE2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
-    RecordProperty(
-        "description",
-        "Returns sane invariant fields across back-to-back get_stats calls on an idle authenticated client.");
-    iggy::ffi::Client *client = GetLoggedInClient();
+TEST_F(E2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
+    RecordProperty("description",
+                   "Returns sane invariant fields across back-to-back GetStats calls on an idle authenticated client.");
+    auto client = GetLoggedInHighLevelClient();
 
-    iggy::ffi::Stats first_stats{};
-    iggy::ffi::Stats second_stats{};
-    ASSERT_NO_THROW({
-        first_stats  = client->get_stats();
-        second_stats = client->get_stats();
-    });
+    const auto first_stats  = client.GetStats();
+    const auto second_stats = client.GetStats();
 
-    EXPECT_NE(first_stats.process_id, 0u);
-    EXPECT_NE(second_stats.process_id, 0u);
-    EXPECT_EQ(second_stats.process_id, first_stats.process_id);
-    EXPECT_GT(first_stats.threads_count, 0u);
-    EXPECT_GT(second_stats.threads_count, 0u);
-    EXPECT_GT(first_stats.total_memory, 0u);
-    EXPECT_GT(second_stats.total_memory, 0u);
-    EXPECT_FALSE(static_cast<std::string>(first_stats.hostname).empty());
-    EXPECT_FALSE(static_cast<std::string>(second_stats.hostname).empty());
-    EXPECT_FALSE(static_cast<std::string>(first_stats.os_name).empty());
-    EXPECT_FALSE(static_cast<std::string>(second_stats.os_name).empty());
-    EXPECT_FALSE(static_cast<std::string>(first_stats.os_version).empty());
-    EXPECT_FALSE(static_cast<std::string>(second_stats.os_version).empty());
-    EXPECT_FALSE(static_cast<std::string>(first_stats.kernel_version).empty());
-    EXPECT_FALSE(static_cast<std::string>(second_stats.kernel_version).empty());
-    EXPECT_FALSE(static_cast<std::string>(first_stats.iggy_server_version).empty());
-    EXPECT_FALSE(static_cast<std::string>(second_stats.iggy_server_version).empty());
-    EXPECT_EQ(static_cast<std::string>(second_stats.hostname), static_cast<std::string>(first_stats.hostname));
-    EXPECT_EQ(static_cast<std::string>(second_stats.os_name), static_cast<std::string>(first_stats.os_name));
-    EXPECT_EQ(static_cast<std::string>(second_stats.os_version), static_cast<std::string>(first_stats.os_version));
-    EXPECT_EQ(static_cast<std::string>(second_stats.kernel_version),
-              static_cast<std::string>(first_stats.kernel_version));
-    EXPECT_EQ(static_cast<std::string>(second_stats.iggy_server_version),
-              static_cast<std::string>(first_stats.iggy_server_version));
-    EXPECT_EQ(second_stats.has_server_semver, first_stats.has_server_semver);
-    EXPECT_EQ(second_stats.iggy_server_semver, first_stats.iggy_server_semver);
-    EXPECT_GE(first_stats.clients_count, 1u);
-    EXPECT_GE(second_stats.clients_count, 1u);
+    EXPECT_NE(first_stats.ProcessId(), 0u);
+    EXPECT_NE(second_stats.ProcessId(), 0u);
+    EXPECT_EQ(second_stats.ProcessId(), first_stats.ProcessId());
+    EXPECT_GT(first_stats.ThreadsCount(), 0u);
+    EXPECT_GT(second_stats.ThreadsCount(), 0u);
+    EXPECT_GT(first_stats.TotalMemory(), 0u);
+    EXPECT_GT(second_stats.TotalMemory(), 0u);
+    EXPECT_FALSE(first_stats.Hostname().empty());
+    EXPECT_FALSE(second_stats.Hostname().empty());
+    EXPECT_FALSE(first_stats.OsName().empty());
+    EXPECT_FALSE(second_stats.OsName().empty());
+    EXPECT_FALSE(first_stats.OsVersion().empty());
+    EXPECT_FALSE(second_stats.OsVersion().empty());
+    EXPECT_FALSE(first_stats.KernelVersion().empty());
+    EXPECT_FALSE(second_stats.KernelVersion().empty());
+    EXPECT_FALSE(first_stats.IggyServerVersion().empty());
+    EXPECT_FALSE(second_stats.IggyServerVersion().empty());
+    EXPECT_EQ(second_stats.Hostname(), first_stats.Hostname());
+    EXPECT_EQ(second_stats.OsName(), first_stats.OsName());
+    EXPECT_EQ(second_stats.OsVersion(), first_stats.OsVersion());
+    EXPECT_EQ(second_stats.KernelVersion(), first_stats.KernelVersion());
+    EXPECT_EQ(second_stats.IggyServerVersion(), first_stats.IggyServerVersion());
+    EXPECT_EQ(second_stats.ServerSemver(), first_stats.ServerSemver());
+    EXPECT_GE(first_stats.ClientsCount(), 1u);
+    EXPECT_GE(second_stats.ClientsCount(), 1u);
 }
 
 TEST_F(E2E_Client, GetMeBeforeLoginThrows) {

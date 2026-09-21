@@ -292,6 +292,15 @@ void IggyBlockingClient::DeletePartitions(const Identifier &stream,
     });
 }
 
+void IggyBlockingClient::DeleteSegments(const Identifier &stream,
+                                        const Identifier &topic,
+                                        const std::uint32_t partition_id,
+                                        const std::uint32_t segments_count) {
+    RethrowAsIggyException([this, &stream, &topic, partition_id, segments_count] {
+        Handle()->delete_segments(stream.ToFfi(), topic.ToFfi(), partition_id, segments_count);
+    });
+}
+
 ConsumerGroupDetails IggyBlockingClient::CreateConsumerGroup(const Identifier &stream,
                                                              const Identifier &topic,
                                                              std::string name) {
@@ -408,6 +417,19 @@ std::vector<ClientInfo> IggyBlockingClient::GetClients() {
         }
         return clients;
     });
+}
+
+void IggyBlockingClient::FlushUnsavedBuffer(const Identifier &stream,
+                                            const Identifier &topic,
+                                            const std::uint32_t partition_id,
+                                            const bool fsync) {
+    RethrowAsIggyException([this, &stream, &topic, partition_id, fsync] {
+        Handle()->flush_unsaved_buffer(stream.ToFfi(), topic.ToFfi(), partition_id, fsync);
+    });
+}
+
+Stats IggyBlockingClient::GetStats() {
+    return RethrowAsIggyException([this] { return Stats::FromFfi(Handle()->get_stats()); });
 }
 
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {

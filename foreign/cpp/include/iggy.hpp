@@ -54,6 +54,8 @@ class Consumer;
 class ConsumerOffsetInfo;
 class ClientInfo;
 class ClientInfoDetails;
+class CacheMetricEntry;
+class Stats;
 class ConsumerGroupInfo;
 class IggyBlockingClient;
 class LoginInfo;
@@ -1629,6 +1631,164 @@ class ClientInfoDetails final {
     std::vector<ConsumerGroupInfo> consumer_groups_;
 };
 
+class CacheMetricEntry final {
+  public:
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+    [[nodiscard]] std::uint64_t Hits() const noexcept { return hits_; }
+    [[nodiscard]] std::uint64_t Misses() const noexcept { return misses_; }
+    [[nodiscard]] float HitRatio() const noexcept { return hit_ratio_; }
+
+  private:
+    CacheMetricEntry(std::uint32_t stream_id,
+                     std::uint32_t topic_id,
+                     std::uint32_t partition_id,
+                     std::uint64_t hits,
+                     std::uint64_t misses,
+                     float hit_ratio)
+        : stream_id_(stream_id),
+          topic_id_(topic_id),
+          partition_id_(partition_id),
+          hits_(hits),
+          misses_(misses),
+          hit_ratio_(hit_ratio) {}
+
+    static CacheMetricEntry FromFfi(ffi::CacheMetricEntry entry);
+
+    friend class Stats;
+
+    std::uint32_t stream_id_;
+    std::uint32_t topic_id_;
+    std::uint32_t partition_id_;
+    std::uint64_t hits_;
+    std::uint64_t misses_;
+    float hit_ratio_;
+};
+
+class Stats final {
+  public:
+    [[nodiscard]] std::uint32_t ProcessId() const noexcept { return process_id_; }
+    [[nodiscard]] float CpuUsage() const noexcept { return cpu_usage_; }
+    [[nodiscard]] float TotalCpuUsage() const noexcept { return total_cpu_usage_; }
+    [[nodiscard]] std::uint64_t MemoryUsage() const noexcept { return memory_usage_; }
+    [[nodiscard]] std::uint64_t TotalMemory() const noexcept { return total_memory_; }
+    [[nodiscard]] std::uint64_t AvailableMemory() const noexcept { return available_memory_; }
+    [[nodiscard]] std::uint64_t RunTimeMicros() const noexcept { return run_time_micros_; }
+    [[nodiscard]] std::uint64_t StartTimeEpochMicros() const noexcept { return start_time_epoch_micros_; }
+    [[nodiscard]] std::uint64_t ReadBytes() const noexcept { return read_bytes_; }
+    [[nodiscard]] std::uint64_t WrittenBytes() const noexcept { return written_bytes_; }
+    [[nodiscard]] std::uint64_t MessagesSizeBytes() const noexcept { return messages_size_bytes_; }
+    [[nodiscard]] std::uint32_t StreamsCount() const noexcept { return streams_count_; }
+    [[nodiscard]] std::uint32_t TopicsCount() const noexcept { return topics_count_; }
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+    [[nodiscard]] std::uint32_t SegmentsCount() const noexcept { return segments_count_; }
+    [[nodiscard]] std::uint64_t MessagesCount() const noexcept { return messages_count_; }
+    [[nodiscard]] std::uint32_t ClientsCount() const noexcept { return clients_count_; }
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+    [[nodiscard]] const std::string &Hostname() const noexcept { return hostname_; }
+    [[nodiscard]] const std::string &OsName() const noexcept { return os_name_; }
+    [[nodiscard]] const std::string &OsVersion() const noexcept { return os_version_; }
+    [[nodiscard]] const std::string &KernelVersion() const noexcept { return kernel_version_; }
+    [[nodiscard]] const std::string &IggyServerVersion() const noexcept { return iggy_server_version_; }
+    [[nodiscard]] const std::optional<std::uint32_t> &ServerSemver() const noexcept { return server_semver_; }
+    [[nodiscard]] const std::vector<CacheMetricEntry> &CacheMetrics() const noexcept { return cache_metrics_; }
+    [[nodiscard]] std::uint32_t ThreadsCount() const noexcept { return threads_count_; }
+    [[nodiscard]] std::uint64_t FreeDiskSpace() const noexcept { return free_disk_space_; }
+    [[nodiscard]] std::uint64_t TotalDiskSpace() const noexcept { return total_disk_space_; }
+
+  private:
+    Stats(std::uint32_t process_id,
+          float cpu_usage,
+          float total_cpu_usage,
+          std::uint64_t memory_usage,
+          std::uint64_t total_memory,
+          std::uint64_t available_memory,
+          std::uint64_t run_time_micros,
+          std::uint64_t start_time_epoch_micros,
+          std::uint64_t read_bytes,
+          std::uint64_t written_bytes,
+          std::uint64_t messages_size_bytes,
+          std::uint32_t streams_count,
+          std::uint32_t topics_count,
+          std::uint32_t partitions_count,
+          std::uint32_t segments_count,
+          std::uint64_t messages_count,
+          std::uint32_t clients_count,
+          std::uint32_t consumer_groups_count,
+          std::string hostname,
+          std::string os_name,
+          std::string os_version,
+          std::string kernel_version,
+          std::string iggy_server_version,
+          std::optional<std::uint32_t> server_semver,
+          std::vector<CacheMetricEntry> cache_metrics,
+          std::uint32_t threads_count,
+          std::uint64_t free_disk_space,
+          std::uint64_t total_disk_space)
+        : process_id_(process_id),
+          cpu_usage_(cpu_usage),
+          total_cpu_usage_(total_cpu_usage),
+          memory_usage_(memory_usage),
+          total_memory_(total_memory),
+          available_memory_(available_memory),
+          run_time_micros_(run_time_micros),
+          start_time_epoch_micros_(start_time_epoch_micros),
+          read_bytes_(read_bytes),
+          written_bytes_(written_bytes),
+          messages_size_bytes_(messages_size_bytes),
+          streams_count_(streams_count),
+          topics_count_(topics_count),
+          partitions_count_(partitions_count),
+          segments_count_(segments_count),
+          messages_count_(messages_count),
+          clients_count_(clients_count),
+          consumer_groups_count_(consumer_groups_count),
+          hostname_(std::move(hostname)),
+          os_name_(std::move(os_name)),
+          os_version_(std::move(os_version)),
+          kernel_version_(std::move(kernel_version)),
+          iggy_server_version_(std::move(iggy_server_version)),
+          server_semver_(server_semver),
+          cache_metrics_(std::move(cache_metrics)),
+          threads_count_(threads_count),
+          free_disk_space_(free_disk_space),
+          total_disk_space_(total_disk_space) {}
+
+    static Stats FromFfi(ffi::Stats stats);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t process_id_;
+    float cpu_usage_;
+    float total_cpu_usage_;
+    std::uint64_t memory_usage_;
+    std::uint64_t total_memory_;
+    std::uint64_t available_memory_;
+    std::uint64_t run_time_micros_;
+    std::uint64_t start_time_epoch_micros_;
+    std::uint64_t read_bytes_;
+    std::uint64_t written_bytes_;
+    std::uint64_t messages_size_bytes_;
+    std::uint32_t streams_count_;
+    std::uint32_t topics_count_;
+    std::uint32_t partitions_count_;
+    std::uint32_t segments_count_;
+    std::uint64_t messages_count_;
+    std::uint32_t clients_count_;
+    std::uint32_t consumer_groups_count_;
+    std::string hostname_;
+    std::string os_name_;
+    std::string os_version_;
+    std::string kernel_version_;
+    std::string iggy_server_version_;
+    std::optional<std::uint32_t> server_semver_;
+    std::vector<CacheMetricEntry> cache_metrics_;
+    std::uint32_t threads_count_;
+    std::uint64_t free_disk_space_;
+    std::uint64_t total_disk_space_;
+};
+
 /**
  * @brief Compression algorithm used for topic messages.
  *
@@ -2790,6 +2950,10 @@ class IggyBlockingClient final {
      *         request fails.
      */
     void DeletePartitions(const Identifier &stream, const Identifier &topic, std::uint32_t partitions_count);
+    void DeleteSegments(const Identifier &stream,
+                        const Identifier &topic,
+                        std::uint32_t partition_id,
+                        std::uint32_t segments_count);
 
     /**
      * @brief Creates a consumer group for a topic.
@@ -2992,6 +3156,9 @@ class IggyBlockingClient final {
     ClientInfoDetails GetMe();
     ClientInfoDetails GetClient(std::uint32_t client_id);
     std::vector<ClientInfo> GetClients();
+
+    void FlushUnsavedBuffer(const Identifier &stream, const Identifier &topic, std::uint32_t partition_id, bool fsync);
+    Stats GetStats();
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);

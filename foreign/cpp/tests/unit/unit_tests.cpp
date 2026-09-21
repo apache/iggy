@@ -361,6 +361,11 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.Shutdown(), iggy::IggyException);
     EXPECT_THROW(client.Login("iggy", "iggy"), iggy::IggyException);
     EXPECT_THROW(client.Logout(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetUser(stream), iggy::IggyException);
+    EXPECT_THROW((void)client.GetUsers(), iggy::IggyException);
+    EXPECT_THROW((void)client.CreateUser("user", "secret123", iggy::UserStatus::Active), iggy::IggyException);
+    EXPECT_THROW(client.DeleteUser(stream), iggy::IggyException);
+    EXPECT_THROW(client.UpdateUser(stream, "updated-user", iggy::UserStatus::Active), iggy::IggyException);
     EXPECT_THROW(client.CreateStream("stream"), iggy::IggyException);
     EXPECT_THROW(client.UpdateStream(stream, "updated-stream"), iggy::IggyException);
     EXPECT_THROW(client.GetStreams(), iggy::IggyException);
@@ -376,6 +381,7 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.PurgeTopic(stream, topic), iggy::IggyException);
     EXPECT_THROW(client.CreatePartitions(stream, topic, 1), iggy::IggyException);
     EXPECT_THROW(client.DeletePartitions(stream, topic, 1), iggy::IggyException);
+    EXPECT_THROW(client.DeleteSegments(stream, topic, 0, 1), iggy::IggyException);
     EXPECT_THROW(client.CreateConsumerGroup(stream, topic, "group"), iggy::IggyException);
     EXPECT_THROW(client.GetConsumerGroup(stream, topic, group), iggy::IggyException);
     EXPECT_THROW(client.GetConsumerGroups(stream, topic), iggy::IggyException);
@@ -385,6 +391,11 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.StoreConsumerOffset(consumer, stream, topic, 0, 0), iggy::IggyException);
     EXPECT_THROW(client.GetConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
     EXPECT_THROW(client.DeleteConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
+    EXPECT_THROW(client.FlushUnsavedBuffer(stream, topic, 0, true), iggy::IggyException);
+    EXPECT_THROW((void)client.GetStats(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetMe(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetClient(1), iggy::IggyException);
+    EXPECT_THROW((void)client.GetClients(), iggy::IggyException);
 }
 
 TEST(IggyBlockingClientTest, ConsumerOffsetOperationsRejectMaximumPartitionId) {
