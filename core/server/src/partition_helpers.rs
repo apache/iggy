@@ -48,8 +48,8 @@ use iggy_common::{
 };
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::partition_journal::SegmentPosition;
-use journal::superblock::{PingPongSuperblock, SuperblockContents, SuperblockStore};
-use message_bus::{IggyMessageBus, MessageBus};
+use journal::superblock::{PingPongSuperblock, SuperblockContents};
+use message_bus::IggyMessageBus;
 use metadata::stm::stream::Partition;
 use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{
@@ -188,18 +188,13 @@ pub async fn configure_consumer_offsets(
 /// cannot be enumerated. Consumer recovery may already have seeded the partition
 /// when group recovery fails, so callers must discard a failed recovery.
 #[allow(clippy::too_many_lines)]
-pub async fn configure_consumer_offsets_with_storage<S, B, SB>(
+pub async fn configure_consumer_offsets_with_storage<S: DurableStorage>(
     storage: &S,
-    partition: &mut IggyPartition<B, SB>,
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
     namespace: IggyNamespace,
     current_offset: u64,
-) -> Result<(), ServerError>
-where
-    S: DurableStorage,
-    B: MessageBus,
-    SB: SuperblockStore,
-{
+) -> Result<(), ServerError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();

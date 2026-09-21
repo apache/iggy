@@ -420,47 +420,41 @@ pub async fn persist_purge_generation_with_storage<S: DurableStorage>(
 }
 
 /// Read the purge generation this replica applied for the `created_revision`
-/// incarnation of the partition.
+/// incarnation of the partition through the supplied storage backend.
 ///
 /// Absent and torn files map to `Ok(0)`, which makes the reconciler apply any
-/// committed purge again. A failed existence probe is also treated as absence.
+/// committed purge again. A failed existence probe is logged and treated as absence.
 ///
-/// A record written for a DIFFERENT incarnation maps to `Ok(0)` too. A failed
+/// A record written for a different incarnation maps to `Ok(0)` too. A failed
 /// `delete_partitions_from_disk` leaves the directory (and this file) behind;
 /// the recreated topic's generations restart at 0, so hydrating the dead
 /// incarnation's generation would swallow every purge of the new topic until
 /// the committed counter climbed past it.
 ///
-/// An open or read error propagates instead: collapsing it to `0` would purge a
+/// An open or read error propagates. Collapsing it to `0` would purge a
 /// partition whose durable generation is intact but momentarily unreadable,
 /// destroying every message appended after that purge.
 ///
 /// # Errors
 /// Propagates an open or read failure after the existence probe, except a short read.
-pub async fn read_purge_generation(path: &str, created_revision: u64) -> Result<u64, IggyError> {
-    read_purge_generation_with_storage(&DiskStorage, path, created_revision).await
-}
-
-/// Recover a purge marker through the supplied storage backend.
-///
-/// Uses the same absent, torn, and incarnation mismatch handling as
-/// [`read_purge_generation`], including treating a failed existence probe as
-/// absence. Once the file is opened, read failures other than a short record
-/// propagate so an unreadable marker does not trigger another purge.
-///
-/// # Errors
-/// Returns an error if opening or reading a file found by the probe fails.
 pub async fn read_purge_generation_with_storage<S: DurableStorage>(
     storage: &S,
     path: &str,
     created_revision: u64,
 ) -> Result<u64, IggyError> {
-    if !storage
-        .exists_following_links(Path::new(path))
-        .await
-        .unwrap_or(false)
-    {
-        return Ok(0);
+    match storage.exists_following_links(Path::new(path)).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(0),
+        Err(error) => {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                path,
+                %error,
+                "failed to check purge generation file, treating it as absent"
+            );
+            return Ok(0);
+        }
     }
     let file = storage
         .open(Path::new(path), OpenMode::Read)
@@ -761,7 +755,9 @@ mod tests {
             .into_owned();
 
         assert_eq!(
-            read_purge_generation(&path, 11).await.expect("absent file"),
+            read_purge_generation_with_storage(&DiskStorage, &path, 11)
+                .await
+                .expect("absent file"),
             0,
             "absent file is 0"
         );
@@ -770,14 +766,18 @@ mod tests {
             .await
             .expect("persist generation");
         assert_eq!(
-            read_purge_generation(&path, 11).await.expect("valid file"),
+            read_purge_generation_with_storage(&DiskStorage, &path, 11)
+                .await
+                .expect("valid file"),
             3,
             "round-trip"
         );
 
         std::fs::write(&path, [0xAB, 0xCD]).expect("write torn file");
         assert_eq!(
-            read_purge_generation(&path, 11).await.expect("torn file"),
+            read_purge_generation_with_storage(&DiskStorage, &path, 11)
+                .await
+                .expect("torn file"),
             0,
             "torn file degrades to 0 so the reconciler re-applies the purge"
         );
@@ -785,7 +785,8 @@ mod tests {
         // A directory path is a real I/O error, not a short read: it must
         // surface, not collapse to the re-purge sentinel (a silent re-purge
         // would destroy post-purge messages).
-        let result = read_purge_generation(&dir.to_string_lossy(), 11).await;
+        let result =
+            read_purge_generation_with_storage(&DiskStorage, &dir.to_string_lossy(), 11).await;
         assert!(
             matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
             "real I/O error must propagate, got {result:?}",
@@ -812,12 +813,16 @@ mod tests {
             .expect("persist generation");
 
         assert_eq!(
-            read_purge_generation(&path, 41).await.expect("same dir"),
+            read_purge_generation_with_storage(&DiskStorage, &path, 41)
+                .await
+                .expect("same dir"),
             9,
             "the incarnation that wrote it still hydrates it"
         );
         assert_eq!(
-            read_purge_generation(&path, 42).await.expect("stale file"),
+            read_purge_generation_with_storage(&DiskStorage, &path, 42)
+                .await
+                .expect("stale file"),
             0,
             "a record from a dead incarnation must not fence the new one"
         );
@@ -826,9 +831,16 @@ mod tests {
         persist_purge_generation(&path, 1, 42)
             .await
             .expect("persist generation");
-        assert_eq!(read_purge_generation(&path, 42).await.expect("rekeyed"), 1);
         assert_eq!(
-            read_purge_generation(&path, 41).await.expect("now stale"),
+            read_purge_generation_with_storage(&DiskStorage, &path, 42)
+                .await
+                .expect("rekeyed"),
+            1
+        );
+        assert_eq!(
+            read_purge_generation_with_storage(&DiskStorage, &path, 41)
+                .await
+                .expect("now stale"),
             0
         );
 

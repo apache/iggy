@@ -305,12 +305,12 @@ impl DurableStorage for DiskStorage {
         let (sender, receiver) = mpsc::channel(FILE_DIRECTORY_BUFFER);
         let directory = path.to_path_buf();
         std::thread::Builder::new()
-            .name("iggy-offset-recovery".to_owned())
+            .name("iggy-file-scan".to_owned())
             .spawn(move || {
                 let _permit = permit;
                 let result = (|| {
-                    // A single bad entry must not keep offset recovery from
-                    // booting a partition. Only opening the directory is fatal.
+                    // An unreadable entry must not hide the remaining files.
+                    // Only opening the directory fails the scan.
                     for entry in std::fs::read_dir(&directory)? {
                         let entry = match entry {
                             Ok(entry) => entry,

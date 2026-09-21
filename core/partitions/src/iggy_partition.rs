@@ -51,7 +51,7 @@ use consensus::{
     replicate_frozen_to_next_in_chain, replicate_preflight, report_uncommittable_head,
     restamp_prepare_view, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -8486,23 +8486,27 @@ async fn purge_offset_files<S: DurableStorage>(
     let Some(directory) = directory else {
         return Vec::new();
     };
-    let Ok(entries) = storage.regular_files(Path::new(directory)).await else {
-        return Vec::new();
-    };
+    let entries = futures::stream::once(storage.regular_files(Path::new(directory))).try_flatten();
     futures::pin_mut!(entries);
     let mut offsets = Vec::new();
     while let Some(entry) = entries.next().await {
-        let Ok(path) = entry else {
+        let path = match entry {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    path = directory,
+                    %error,
+                    "failed to scan consumer offset directory during purge"
+                );
+                continue;
+            }
+        };
+        let Some(path) = path.to_str() else {
             continue;
         };
-        let Some(consumer_id) = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if let Some(path) = path.to_str() {
+        if let Some(consumer_id) = crate::state_transfer::numeric_offset_id(path) {
             offsets.push((kind, consumer_id, path.to_owned()));
         }
     }
