@@ -3,6 +3,8 @@
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
 > **Stub warning:** no API persists or reads real data yet. Produce, Fetch, and ListOffsets return retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of trusting a fake success. CreateTopics does **not** create topics; valid requests return `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. Persistence lands with the Iggy bridge (see [docs/SCOPE.md](docs/SCOPE.md)).
+>
+> InitProducerId is the one API that does real work: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 
 ## Run
 
@@ -23,6 +25,7 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
+| `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
 
 ## Test
@@ -44,7 +47,7 @@ cargo test -p iggy-gateway-kafka
 Or generate only the keys the tests need:
 
 ```bash
-for key in 0 1 2 19; do
+for key in 0 1 2 19 22; do
   cargo run -p kafka-message-gen -- generate \
     --output gateways/kafka/tools/kafka-tool/kafka_messages \
     --api-key "$key"
@@ -68,13 +71,20 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 ### Delivery guarantees
 
 Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
-restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
-a producer id so that it starts, but its retries are not deduplicated: a retry after a network
-timeout writes the record twice, and both copies reach the stream with their own offsets.
+restart. An idempotent Kafka producer is given a producer id so that it starts, but its retries
+are not deduplicated: a retry after a network timeout writes the record twice, and both copies
+reach the stream with their own offsets.
 
 Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
 guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
 [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
+
+Transactions are **not supported**, and will not be. AddPartitionsToTxn (24), AddOffsetsToTxn
+(25), EndTxn (26) and TxnOffsetCommit (28) are never advertised, so a conforming client never
+sends one; `InitProducerId` with a `transactional_id` answers `UNSUPPORTED_VERSION` (35); and a
+Produce request carrying a `transactional_id` gets `UNSUPPORTED_VERSION` (35) on every partition
+rather than having its records stored as if they were ordinary ones. None of those closes the
+connection. `docs/SCOPE.md`'s Transactions section has the ordering and the reasoning.
 
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 

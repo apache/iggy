@@ -78,6 +78,7 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_WRITE_TIMEOUT_SECS",
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
     "IGGY_KAFKA_BRIDGE_ENABLED",
+    "IGGY_KAFKA_INSTANCE_ID",
 ];
 
 /// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] or
@@ -190,6 +191,12 @@ fn load_config() -> Result<GatewayConfig, String> {
             .map_err(|e| format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{raw}`: {e}"))?;
         config.shutdown_drain_timeout = Duration::from_secs(secs);
     }
+    // Not `parse_positive`: 0 is the default, and the right value for a single gateway.
+    if let Some(raw) = env_var("IGGY_KAFKA_INSTANCE_ID") {
+        config.instance_id = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_INSTANCE_ID `{raw}`: {e}"))?;
+    }
 
     Ok(config)
 }
@@ -243,10 +250,11 @@ async fn shutdown_signal() {
 mod tests {
     use serial_test::serial;
 
-    use super::{parse_positive, reject_unknown_kafka_env_vars};
+    use super::{load_config, parse_positive, reject_unknown_kafka_env_vars};
 
     /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - this binary's
-    /// default group). This is the only `#[serial]` test compiled into *this* binary
+    /// default group), shared with the instance-id test below since both touch the process
+    /// environment. Only this binary's tests are in that group
     /// (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `bridge::config`'s and
     /// `server`'s env-touching tests compile into the separate lib test binary, and
     /// `serial_test`'s mutex is process-local, so it does not (and does not need to) coordinate
@@ -298,6 +306,38 @@ mod tests {
         assert!(
             bridge_var_result.is_ok(),
             "known bridge IGGY_KAFKA_ var must be accepted"
+        );
+    }
+
+    /// `#[serial]` and `# Safety` as on
+    /// `reject_unknown_kafka_env_vars_flags_typo_but_accepts_known_keys` above.
+    ///
+    /// Covers both halves of adding this var: it has to be in `KNOWN_KAFKA_ENV_VARS` (or setting
+    /// it refuses to start the gateway) and it has to keep `0`, which `parse_positive` rejects.
+    #[test]
+    #[serial]
+    fn given_an_instance_id_env_var_when_loading_config_should_accept_and_parse_it() {
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "7");
+        }
+        let seven = load_config();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "0");
+        }
+        let zero = load_config();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "65536");
+        }
+        let overflow = load_config();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_INSTANCE_ID");
+        }
+
+        assert_eq!(seven.expect("instance id 7 must load").instance_id, 7);
+        assert_eq!(zero.expect("instance id 0 must load").instance_id, 0);
+        assert!(
+            overflow.is_err(),
+            "an instance id above u16::MAX must be rejected, not truncated"
         );
     }
 

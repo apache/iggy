@@ -708,6 +708,36 @@ pub fn validate_metadata_shape(version: i16, body: &Bytes, max_frame_size: usize
     Ok(())
 }
 
+/// Mirrors the field order `InitProducerIdRequest::decode` walks.
+///
+/// No response-size guard needed: the response is four fixed-width fields and echoes nothing
+/// from the request, so `usize::MAX` disables that check rather than plumbing `max_frame_size`
+/// through for no effect (same as [`validate_api_versions_shape`]).
+///
+/// # Errors
+///
+/// Returns an error when the declared `transactional_id` length cannot fit in the bytes
+/// remaining in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_init_producer_id_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    let flexible = version >= 2;
+
+    if flexible {
+        c.compact_string(true)?;
+    } else {
+        c.legacy_string(true)?;
+    }
+    let _transaction_timeout_ms = c.read_i32()?;
+    if version >= 3 {
+        let _producer_id = c.read_i64()?;
+        let _producer_epoch = c.read_i16()?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `ApiVersionsRequest::decode` walks. v0-2 have an empty body (no
 /// length-prefixed fields to bound), so this is a no-op below v3.
 ///

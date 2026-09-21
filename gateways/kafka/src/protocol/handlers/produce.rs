@@ -28,7 +28,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, respond_or_close, unsupported_version_response,
+    decode_guarded, encode_message, is_transactional, respond_or_close,
+    unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -123,6 +124,7 @@ pub fn encode_error_response(version: i16, error_code: i16) -> Result<Bytes> {
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
 pub fn encode_response(version: i16, req: &ProduceRequest) -> Result<Bytes> {
+    let error_code = partition_error_code(req);
     let responses = req
         .topic_data
         .iter()
@@ -133,13 +135,24 @@ pub fn encode_response(version: i16, req: &ProduceRequest) -> Result<Bytes> {
                     topic
                         .partition_data
                         .iter()
-                        .map(|p| partition_response(p.index, ERROR_NOT_LEADER_OR_FOLLOWER))
+                        .map(|p| partition_response(p.index, error_code))
                         .collect(),
                 )
         })
         .collect();
     let resp = ProduceResponse::default().with_responses(responses);
     encode_message(&resp, version, 512)
+}
+
+/// A transactional batch must never be answered as if it were ordinary records: nothing here
+/// tracks a last stable offset or writes an abort marker, so an aborted transaction's records
+/// would reach every consumer. 35 is fatal for the producer; 42 and 43 are only abortable.
+fn partition_error_code(req: &ProduceRequest) -> i16 {
+    if is_transactional(req.transactional_id.as_ref()) {
+        ERROR_UNSUPPORTED_VERSION
+    } else {
+        ERROR_NOT_LEADER_OR_FOLLOWER
+    }
 }
 
 fn partition_response(index: i32, error_code: i16) -> PartitionProduceResponse {

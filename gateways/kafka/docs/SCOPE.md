@@ -27,11 +27,12 @@ Source of truth for supported ranges: `SUPPORTED_RANGES` in [`src/protocol/api.r
 Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiVersions advertises exactly what the firewall allows.
 
 **Every unsupported-version case closes the connection, for every listed key** - not just above
-the encoder max. `kafka_protocol`'s schema floor for each of the six supported messages happens
-to equal `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0,
-ApiVersions 0, CreateTopics 2), so there is no version below an API's min that the crate can
-actually encode a response for either - `unsupported_version_response` still tries, but the
-encode attempt fails and the connection closes rather than sending a malformed body.
+the encoder max. `kafka_protocol`'s schema floor for each of the seven supported messages
+happens to equal `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1,
+Metadata 0, ApiVersions 0, CreateTopics 2, InitProducerId 0), so there is no version below an
+API's min that the crate can actually encode a response for either - `unsupported_version_response`
+still tries, but the encode attempt fails and the connection closes rather than sending a
+malformed body.
 **ApiVersions is the sole exception** (KIP-511): out of range still answers with a v0 error body,
 because a client probing an unknown server must be able to parse the discovery response before
 it knows the server supports flexible encoding.
@@ -48,8 +49,11 @@ it knows the server supports flexible encoding.
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
+| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 
-A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above). Any unlisted API key also closes the connection: no api-specific response schema exists for it, so any body this gateway could send would be misparsed by the client against the schema it expected.
+A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
+
+Any unlisted API key also closes the connection. The gateway declines to define a response for a key it does not advertise, and a conforming client never sends one: it reads ApiVersions first and the key's absence is what stops the request. (`kafka-protocol`'s `broker` feature does ship response schemas for keys this gateway leaves unlisted, so the reason is a deliberate refusal, not an encoding limit.)
 
 ### Valid versions reference (by API key)
 
@@ -63,6 +67,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 3 | Metadata | 0–9 | v9 |
 | 18 | ApiVersions | 0–3 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
+| 22 | InitProducerId | 0–5 | v2 |
 
 ---
 
@@ -77,9 +82,32 @@ All API keys not listed above close the connection (see Governance model above) 
 | 10 | FindCoordinator | Consumer group — later issue |
 | 11–16 | JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups | Consumer group — later issue |
 | 17 | SaslHandshake | Auth — later issue |
-| 20+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
+| 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
+| 20, 21, 23, 27, 29+ | DeleteTopics, DeleteRecords, `OffsetForLeaderEpoch`, `WriteTxnMarkers`, ACLs, etc. | Later issues |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
+
+### Transactions
+
+Transactions are not supported and are not planned. There is no last stable offset, no abort
+marker, and nothing that could make `read_committed` mean anything, so accepting a transactional
+write would deliver an aborted transaction's records to every consumer.
+
+Three things enforce that, in the order a client meets them:
+
+1. **AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26) and TxnOffsetCommit (28) stay out
+   of `SUPPORTED_RANGES`**, so ApiVersions never advertises them and a conforming client never
+   sends one. This is the primary gate: the Java client's `NodeApiVersions.latestUsableVersion`
+   throws and `NetworkClient.doSend` keeps the request off the wire; librdkafka's four request
+   builders return `__UNSUPPORTED_FEATURE`, which is fatal there.
+2. **InitProducerId (22) with a `transactional_id`** answers `UNSUPPORTED_VERSION` (35), so a
+   producer that got past step 1 fails before it can open a transaction.
+3. **Produce with a non-empty `transactional_id`** answers `UNSUPPORTED_VERSION` (35) per
+   partition, so a raw client that skipped both earlier gates still cannot write transactional
+   records. `acks=0` stays silent, and no case closes the connection.
+
+An idempotent (non-transactional) producer is unaffected: it gets a producer id and works
+untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 ---
 
@@ -88,7 +116,7 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 7 scoped keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses everywhere but InitProducerId |
 | **3 — Iggy bridge** | Landed, not wired in | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed; Produce/Fetch handler wiring itself is a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
@@ -120,7 +148,7 @@ below it are still open for the issues that build on top of it.
 This TODO originally proposed a selective, feature-gated adoption (`kafka-protocol-cold`)
 alongside the hand-rolled `requests.rs`/`responses.rs` codecs, keeping custom code for the
 Produce/Fetch hot paths. That hybrid approach was not taken: `kafka_protocol` (broker feature
-only) now decodes/encodes all six supported message types wholesale, and the hand-rolled
+only) now decodes/encodes all seven supported message types wholesale, and the hand-rolled
 `codec.rs`/`requests.rs` were deleted. RecordBatch bytes stay opaque (`Option<Bytes>`, never
 decoded) on the Produce/Fetch hot paths, preserving the one property this TODO was protecting.
 `bounds_guard.rs` covers the DoS-bound gap the crate itself leaves open (see Governance model
@@ -142,6 +170,9 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 InitProducerId and idempotent producers
 ([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
+- [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
+      transactional request is refused. The producer-id-keyed connection pool that would make
+      retries deduplicated is deferred - delivery stays at-least-once
 - [ ] SASL (17, 36) if required by deployment
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys

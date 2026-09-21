@@ -27,18 +27,21 @@
 pub mod api_versions;
 pub mod create_topics;
 pub mod fetch;
+pub mod init_producer_id;
 pub mod list_offsets;
 pub mod metadata;
 pub mod produce;
 
 use bytes::{Buf, Bytes, BytesMut};
+use kafka_protocol::messages::TransactionalId;
 use kafka_protocol::protocol::{Decodable, Encodable};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
-    GatewayState, HandleOutcome, is_supported_version, supported_max_version,
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_INIT_PRODUCER_ID,
+    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
+    supported_max_version,
 };
 
 /// Routes one decoded request body to the module that owns its API key.
@@ -58,8 +61,18 @@ pub async fn dispatch(
         API_KEY_METADATA => metadata::handle(state, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(state, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
+        API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
     }
+}
+
+/// Whether a request carries a transactional id, which this gateway never serves.
+///
+/// An empty id reads as absent: `kafka_protocol` decodes a null wire string to `None` but its
+/// own `Default` uses `Some("")`, and a producer that is idempotent-only has no transaction to
+/// name either way.
+pub(crate) fn is_transactional(transactional_id: Option<&TransactionalId>) -> bool {
+    transactional_id.is_some_and(|id| !id.is_empty())
 }
 
 /// Encode a `kafka_protocol` message, mapping its `anyhow::Error` (the crate has no stable

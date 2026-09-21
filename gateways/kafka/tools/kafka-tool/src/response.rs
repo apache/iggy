@@ -19,8 +19,8 @@
 
 use bytes::Bytes;
 use kafka_protocol::messages::{
-    ApiKey, ApiVersionsResponse, CreateTopicsResponse, FetchResponse, ListOffsetsResponse,
-    MetadataResponse, ProduceResponse,
+    ApiKey, ApiVersionsResponse, CreateTopicsResponse, FetchResponse, InitProducerIdResponse,
+    ListOffsetsResponse, MetadataResponse, ProduceResponse,
 };
 use kafka_protocol::protocol::Decodable;
 
@@ -354,6 +354,20 @@ fn decode_body(
                     format_error_code(t.error_code)
                 ));
             }
+        }
+        22 => {
+            let resp = InitProducerIdResponse::decode(&mut buf, api_version)?;
+            codes.push(resp.error_code);
+            details.push(format!("throttle_time_ms={}", resp.throttle_time_ms));
+            details.push(format!(
+                "top_level.error_code={} ({})",
+                resp.error_code,
+                format_error_code(resp.error_code)
+            ));
+            details.push(format!(
+                "producer_id={} producer_epoch={}",
+                resp.producer_id.0, resp.producer_epoch
+            ));
         }
         other => {
             details.push(format!("no schema decoder for api_key={other}"));

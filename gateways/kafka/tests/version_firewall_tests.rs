@@ -37,8 +37,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE,
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_INIT_PRODUCER_ID,
+    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE,
     ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
     supported_api_ranges,
 };
@@ -54,14 +54,14 @@ use tcp::{
 };
 use wire::{
     OUT_OF_SCOPE_API_KEYS, build_api_versions_flexible_request, build_create_topics_empty_request,
-    build_fetch_empty_topics_request, build_list_offsets_request,
+    build_fetch_empty_topics_request, build_init_producer_id_request, build_list_offsets_request,
     build_metadata_all_topics_flexible, build_metadata_all_topics_legacy,
     build_metadata_flexible_request_v10,
 };
 
 #[test]
-fn supported_ranges_table_has_six_entries() {
-    assert_eq!(supported_api_ranges().len(), 6);
+fn supported_ranges_table_has_seven_entries() {
+    assert_eq!(supported_api_ranges().len(), 7);
 }
 
 #[test]
@@ -495,6 +495,7 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
             .flatten()
             .unwrap_or_else(|| build_list_offsets_request(version, "scope-topic", 0)),
         API_KEY_CREATE_TOPICS => build_create_topics_empty_request(version),
+        API_KEY_INIT_PRODUCER_ID => build_init_producer_id_request(version, None),
         _ => Bytes::new(),
     }
 }

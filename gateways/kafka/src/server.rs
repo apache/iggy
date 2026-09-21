@@ -63,6 +63,11 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
+    /// This gateway's number among the gateways fronting one Iggy cluster
+    /// (`IGGY_KAFKA_INSTANCE_ID`). It is the high half of every producer id handed out by
+    /// `InitProducerId`, which Kafka requires to be cluster-unique; two gateways left on the
+    /// same number hand out the same ids.
+    pub instance_id: u16,
 }
 
 impl Default for GatewayConfig {
@@ -77,6 +82,7 @@ impl Default for GatewayConfig {
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(25),
+            instance_id: 0,
         }
     }
 }
@@ -207,6 +213,7 @@ impl KafkaGateway {
             broker,
             self.bridge.clone(),
             self.config.max_frame_size,
+            self.config.instance_id,
         ));
 
         let tracker = TaskTracker::new();

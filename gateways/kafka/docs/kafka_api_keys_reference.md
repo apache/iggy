@@ -15,6 +15,7 @@
 | 🟠 Required Stub | Client state-machine API — must return a well-formed response or clients will stall/crash |
 | 🟡 Optional Stub | Admin/observability — can safely return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` |
 | ❌ Reject | Internal broker / KRaft only — return `INVALID_REQUEST` with a well-formed frame; **do not close the connection** |
+| ❌ Unadvertised | Deliberately absent from `ApiVersions`, so a conforming client never sends one; an arriving request closes the connection |
 
 > This table no longer carries a per-key header-framing status column. `src/protocol/header.rs`
 > has no per-key table of its own to be behind or caught up on: it delegates entirely to
@@ -122,13 +123,19 @@ Key new minimums:
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Gateway Action |
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
-| 22 | **InitProducerId** | 2 | 5 | v2 | 🟡 Optional Stub |
+| 22 | **InitProducerId** | 2 | 5 | v2 | 🟠 Required Stub |
 | 23 | **OffsetForLeaderEpoch** | 1 | 5 | v4 | 🟡 Optional Stub |
-| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | 🟡 Optional Stub |
-| 25 | **AddOffsetsToTxn** | 1 | 4 | v3 | 🟡 Optional Stub |
-| 26 | **EndTxn** | 1 | 4 | v3 | 🟡 Optional Stub |
+| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | ❌ Unadvertised |
+| 25 | **AddOffsetsToTxn** | 1 | 4 | v3 | ❌ Unadvertised |
+| 26 | **EndTxn** | 1 | 4 | v3 | ❌ Unadvertised |
 | 27 | **WriteTxnMarkers** | 0 | 1 | v1 | 🟡 Optional Stub |
-| 28 | **TxnOffsetCommit** | 2 | 5 | v3 | 🟡 Optional Stub |
+| 28 | **TxnOffsetCommit** | 2 | 5 | v3 | ❌ Unadvertised |
+
+> InitProducerId is implemented, not stubbed: it allocates a producer id so a stock idempotent
+> producer starts, and answers `UNSUPPORTED_VERSION` (35) only when the request carries a
+> `transactional_id`. The four keys marked Unadvertised are never listed in `ApiVersions`, which
+> is what stops a conforming client from opening a transaction at all. See
+> [`IDEMPOTENCE.md`](IDEMPOTENCE.md) and `SCOPE.md`'s Transactions section.
 
 ---
 

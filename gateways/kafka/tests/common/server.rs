@@ -38,6 +38,7 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        instance_id: 0,
     })
     .await
 }

@@ -1,8 +1,7 @@
 # InitProducerId and idempotent producers
 
-Status: proposed. Answers the open half of
-[#3545](https://github.com/apache/iggy/issues/3545) and gates the Phase 1 end-to-end test
-([#3539](https://github.com/apache/iggy/issues/3539)), which drives
+Status: implemented, [#3545](https://github.com/apache/iggy/issues/3545). Gates the Phase 1
+end-to-end test ([#3539](https://github.com/apache/iggy/issues/3539)), which drives
 `kafka-console-producer.sh`.
 
 ## The problem
@@ -11,12 +10,10 @@ A stock Java producer sets `enable.idempotence=true` without being asked. That d
 in Kafka 3.0 and took effect from 3.0.1, 3.1.1 and 3.2.0, where a bug that suppressed it was
 fixed. `kafka-console-producer.sh` leaves it on.
 
-An idempotent producer sends InitProducerId (key 22) before its first record. The gateway does
-not list key 22, so ApiVersions does not advertise it, and the producer raises
-`UnsupportedVersionException`. That exception is fatal.
-`TransactionManager.maybeTransitionToErrorState` tests it above the `isTransactional()` branch.
-The producer therefore enters a fatal error state instead of dropping back to weaker semantics.
-It fails at startup, before it sends a record.
+An idempotent producer sends InitProducerId (key 22) before its first record. A gateway that
+does not list key 22 does not advertise it either, and the producer raises
+`UnsupportedVersionException` rather than dropping back to weaker semantics. It fails at
+startup, before it sends a record.
 
 The gateway's stated purpose is that a Kafka user swaps the broker and changes no application
 code. A broker that the default producer cannot start against does not meet it.
@@ -108,9 +105,10 @@ delivery where it already is, and blocks nothing the pool later needs.
 
 ## Behavior
 
-Add key 22 to `SUPPORTED_RANGES` in `src/protocol/api.rs` and advertise it through ApiVersions.
-Without both, the producer never sends the request. `kafka-protocol` 0.18 carries the schemas,
-request v0 to v5 and response v0 to v6, flexible from v2.
+Key 22 is in `SUPPORTED_RANGES` (`src/protocol/api.rs`) and therefore advertised through
+ApiVersions. Without both, the producer never sends the request. `kafka-protocol` 0.18 carries
+the schemas, request v0 to v5 and response v0 to v6, flexible from v2; the gateway serves v0 to
+v5. The handler is `src/protocol/handlers/init_producer_id.rs`.
 
 InitProducerId with no `transactional_id`:
 
@@ -128,26 +126,73 @@ session's own random client id, minted at register. The producer id only decides
 serves a producer. Kafka still requires it to be unique across the cluster, which is what the
 instance number buys. It does not have to survive a restart.
 
+An empty `transactional_id` reads as absent. A wire null decodes to `None`, but
+`kafka-protocol`'s own `Default` is `Some("")`, and a producer that is idempotent-only names no
+transaction either way.
+
 InitProducerId with a `transactional_id`:
 
-- answer `UNSUPPORTED_VERSION` (35), unchanged. Transactions stay out of scope, and so do
+- answer `UNSUPPORTED_VERSION` (35). Transactions stay out of scope, and so do
   AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26) and TxnOffsetCommit (28)
 
-35 rather than `INVALID_REQUEST` (42), because of the same fatal set quoted above.
-`maybeTransitionToErrorState` holds ClusterAuthorization, TransactionalIdAuthorization,
-ProducerFenced, UnsupportedVersion and InvalidPidMapping. `INVALID_REQUEST` is not in it, so a
-transactional producer moves to an abortable error instead. The application is then told to abort
-and retry something that can never succeed. `COORDINATOR_NOT_AVAILABLE` (15) is worse again. It
-is retriable, so the producer never stops trying.
+Not for the reason the Produce path uses. `maybeTransitionToErrorState` governs a failed Produce
+batch and never sees an InitProducerId response; those reach
+`InitProducerIdHandler.handleResponse`, whose trailing `else` is `fatalError(new
+KafkaException("Unexpected error in InitProducerIdResponse; ..."))`. Anything it does not
+recognise is fatal there, so `INVALID_REQUEST` (42) would be equally fatal and the "42 is
+abortable, therefore 35" argument does not apply to this API. 35 is chosen for consistency with
+the Produce guard below, and because it is the one code that also states the truth: the gateway
+does not implement this version of the transactional protocol. What must be avoided is a
+*retriable* code: that same handler re-enqueues `COORDINATOR_LOAD_IN_PROGRESS` (14) and
+`CONCURRENT_TRANSACTIONS` (51), so the producer would never stop trying.
+
+No single response code is terminal on both target clients. 35 is fatal for the Java producer
+and an infinite retry for librdkafka, whose `rd_kafka_idemp_check_error` treats only
+`__UNSUPPORTED_FEATURE`, `INVALID_TRANSACTION_TIMEOUT` (50), 53 and 31 as fatal. 35 stays the
+choice, and librdkafka is stopped at FindCoordinator instead: key 10 is unadvertised today, so
+`rd_kafka_init_transactions()` fails before InitProducerId is reached. Phase 3 advertises key 10
+for consumer groups and has to refuse a `TXN`-type coordinator lookup explicitly.
 
 Produce:
 
 - accept `producer_id`, `producer_epoch` and `base_sequence` on the request and ignore them
 - never answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) or `DUPLICATE_SEQUENCE_NUMBER` (46)
+- reject a non-empty `transactional_id` (v3+) with `UNSUPPORTED_VERSION` (35), at the partition
+  level, keeping the connection open and keeping the `acks=0` silence rule
 
-Those two codes stay unsent even once the pool lands. The watermark accepts any request above it
-without noticing a gap, so a gap cannot be told apart from ordinary traffic. Sending either code
-claims a detection the gateway does not have.
+Those first two codes stay unsent even once the pool lands. The watermark accepts any request
+above it without noticing a gap, so a gap cannot be told apart from ordinary traffic. Sending
+either code claims a detection the gateway does not have.
+
+The third is where `maybeTransitionToErrorState` is exact. `Sender.completeBatch` ->
+`canRetry` false -> `failBatch` -> `handleFailedBatch` -> `maybeTransitionToErrorState`, whose
+explicit fatal set holds ClusterAuthorization, TransactionalIdAuthorization, ProducerFenced,
+UnsupportedVersion and InvalidPidMapping. `INVALID_TXN_STATE` (48) is explicitly rewritten to
+abortable there, and `INVALID_REQUEST` (42) and `UNSUPPORTED_FOR_MESSAGE_FORMAT` (43) fall
+through to abortable, so any of those would tell the application to abort and retry something
+that can never succeed.
+
+Without this guard a transactional batch would land as ordinary records once
+[#3535](https://github.com/apache/iggy/issues/3535) wires the bridge: no last stable offset, no
+abort markers, `read_committed` unimplementable, and an aborted transaction's records delivered
+to every consumer.
+
+## Invariants this design rests on
+
+Both are absences, so nothing fails loudly if they are lost.
+
+**Never advertise `transaction.version >= 2` in the ApiVersions `finalized_features`.**
+`TransactionManager.maybeUpdateTransactionV2Enabled` reads it, and under TV2 `maybeAddPartition`
+adds partitions client-side, so AddPartitionsToTxn and AddOffsetsToTxn are never sent at all.
+That collapses the absence gate this design depends on. `api_versions::encode_response` builds
+an `ApiVersionsResponse` with no finalized features, which is correct and load-bearing.
+
+**The transactional handshake order is fixed**: FindCoordinator(TXN) -> InitProducerId ->
+AddPartitionsToTxn. While FindCoordinator (key 10) stays unadvertised, `initTransactions()`
+already dies before InitProducerId is reached, and the InitProducerId branch is belt and braces.
+Advertising FindCoordinator for consumer groups
+([#3541](https://github.com/apache/iggy/issues/3541)) removes that shield, and is what makes the
+branch load-bearing.
 
 ## What this does not give you
 
@@ -158,15 +203,14 @@ Iggy's own deduplication does not help, because it guards the other hop. Deliver
 gateway is at-least-once until the pool lands, and at-least-once across a gateway restart after
 that.
 
-State that limitation in the README, next to the transaction section, in those words. Do not
-leave a user to infer it from the presence of key 22.
+The README states that limitation under "Delivery guarantees", so a user does not have to infer
+it from the presence of key 22.
 
-## Open question
+## Resolution
 
-Allocate only, as above, or stub and document `enable.idempotence=false`?
-
-If no answer lands by 2026-09-22, allocate only is taken and the work proceeds. This document
-is then updated to record that it was decided by default.
+The open question was allocate only, as above, against stub and document
+`enable.idempotence=false`. Allocate only was taken, which this document named as the default
+outcome, and is what shipped.
 
 ## References
 
@@ -176,4 +220,6 @@ is then updated to record that it was decided by default.
 - Dedup key and window: `core/consensus/src/client_table.rs`
 - Session identity: `core/sdk/src/session.rs`, `core/sdk/src/tcp/tcp_client.rs`
 - Header rewrite: `core/server/src/dispatch/partition.rs`
-- Fatal path: `TransactionManager.maybeTransitionToErrorState`, apache/kafka trunk
+- Produce fatal path: `TransactionManager.maybeTransitionToErrorState`, apache/kafka trunk
+- InitProducerId fatal path: `TransactionManager.InitProducerIdHandler.handleResponse`, same file
+- librdkafka's fatal set: `rd_kafka_idemp_check_error`, `src/rdkafka_idempotence.c`
