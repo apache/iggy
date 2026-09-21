@@ -52,6 +52,9 @@ namespace iggy {
 
 class Consumer;
 class ConsumerOffsetInfo;
+class ClientInfo;
+class ClientInfoDetails;
+class ConsumerGroupInfo;
 class IggyBlockingClient;
 class LoginInfo;
 class Partition;
@@ -59,6 +62,12 @@ class Topic;
 class TopicDetails;
 class Stream;
 class StreamDetails;
+class GlobalPermissions;
+class Permissions;
+class StreamPermissions;
+class TopicPermissions;
+class UserInfo;
+class UserInfoDetails;
 class ConsumerGroup;
 class ConsumerGroupDetails;
 class ConsumerGroupMember;
@@ -194,6 +203,269 @@ class Identifier final {
 
     Kind kind_;
     std::variant<std::uint32_t, std::string> value_;
+};
+
+enum class UserStatus : std::uint8_t {
+    Active   = 1,
+    Inactive = 2,
+};
+
+class GlobalPermissions final {
+  public:
+    [[nodiscard]] bool ManageServers() const noexcept { return manage_servers_; }
+    [[nodiscard]] bool ReadServers() const noexcept { return read_servers_; }
+    [[nodiscard]] bool ManageUsers() const noexcept { return manage_users_; }
+    [[nodiscard]] bool ReadUsers() const noexcept { return read_users_; }
+    [[nodiscard]] bool ManageStreams() const noexcept { return manage_streams_; }
+    [[nodiscard]] bool ReadStreams() const noexcept { return read_streams_; }
+    [[nodiscard]] bool ManageTopics() const noexcept { return manage_topics_; }
+    [[nodiscard]] bool ReadTopics() const noexcept { return read_topics_; }
+    [[nodiscard]] bool PollMessages() const noexcept { return poll_messages_; }
+    [[nodiscard]] bool SendMessages() const noexcept { return send_messages_; }
+
+    GlobalPermissions &SetManageServers(bool enabled) {
+        manage_servers_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetReadServers(bool enabled) {
+        read_servers_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetManageUsers(bool enabled) {
+        manage_users_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetReadUsers(bool enabled) {
+        read_users_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetManageStreams(bool enabled) {
+        manage_streams_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetReadStreams(bool enabled) {
+        read_streams_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetManageTopics(bool enabled) {
+        manage_topics_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetReadTopics(bool enabled) {
+        read_topics_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetPollMessages(bool enabled) {
+        poll_messages_ = enabled;
+        return *this;
+    }
+
+    GlobalPermissions &SetSendMessages(bool enabled) {
+        send_messages_ = enabled;
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::GlobalPermissions ToFfi() const;
+    static GlobalPermissions FromFfi(ffi::GlobalPermissions permissions);
+
+    friend class Permissions;
+
+    bool manage_servers_{};
+    bool read_servers_{};
+    bool manage_users_{};
+    bool read_users_{};
+    bool manage_streams_{};
+    bool read_streams_{};
+    bool manage_topics_{};
+    bool read_topics_{};
+    bool poll_messages_{};
+    bool send_messages_{};
+};
+
+class TopicPermissions final {
+  public:
+    [[nodiscard]] bool ManageTopic() const noexcept { return manage_topic_; }
+    [[nodiscard]] bool ReadTopic() const noexcept { return read_topic_; }
+    [[nodiscard]] bool PollMessages() const noexcept { return poll_messages_; }
+    [[nodiscard]] bool SendMessages() const noexcept { return send_messages_; }
+
+    TopicPermissions &SetManageTopic(bool enabled) {
+        manage_topic_ = enabled;
+        return *this;
+    }
+
+    TopicPermissions &SetReadTopic(bool enabled) {
+        read_topic_ = enabled;
+        return *this;
+    }
+
+    TopicPermissions &SetPollMessages(bool enabled) {
+        poll_messages_ = enabled;
+        return *this;
+    }
+
+    TopicPermissions &SetSendMessages(bool enabled) {
+        send_messages_ = enabled;
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::TopicPermissions ToFfi() const;
+    static TopicPermissions FromFfi(ffi::TopicPermissions permissions);
+
+    friend class StreamPermissions;
+
+    bool manage_topic_{};
+    bool read_topic_{};
+    bool poll_messages_{};
+    bool send_messages_{};
+};
+
+class StreamPermissions final {
+  public:
+    [[nodiscard]] bool ManageStream() const noexcept { return manage_stream_; }
+    [[nodiscard]] bool ReadStream() const noexcept { return read_stream_; }
+    [[nodiscard]] bool ManageTopics() const noexcept { return manage_topics_; }
+    [[nodiscard]] bool ReadTopics() const noexcept { return read_topics_; }
+    [[nodiscard]] bool PollMessages() const noexcept { return poll_messages_; }
+    [[nodiscard]] bool SendMessages() const noexcept { return send_messages_; }
+    [[nodiscard]] const std::map<std::uint32_t, TopicPermissions> &Topics() const noexcept { return topics_; }
+
+    StreamPermissions &SetManageStream(bool enabled) {
+        manage_stream_ = enabled;
+        return *this;
+    }
+
+    StreamPermissions &SetReadStream(bool enabled) {
+        read_stream_ = enabled;
+        return *this;
+    }
+
+    StreamPermissions &SetManageTopics(bool enabled) {
+        manage_topics_ = enabled;
+        return *this;
+    }
+
+    StreamPermissions &SetReadTopics(bool enabled) {
+        read_topics_ = enabled;
+        return *this;
+    }
+
+    StreamPermissions &SetPollMessages(bool enabled) {
+        poll_messages_ = enabled;
+        return *this;
+    }
+
+    StreamPermissions &SetSendMessages(bool enabled) {
+        send_messages_ = enabled;
+        return *this;
+    }
+
+    StreamPermissions &SetTopics(std::map<std::uint32_t, TopicPermissions> topics) {
+        topics_ = std::move(topics);
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::StreamPermissions ToFfi() const;
+    static StreamPermissions FromFfi(ffi::StreamPermissions permissions);
+
+    friend class Permissions;
+
+    bool manage_stream_{};
+    bool read_stream_{};
+    bool manage_topics_{};
+    bool read_topics_{};
+    bool poll_messages_{};
+    bool send_messages_{};
+    std::map<std::uint32_t, TopicPermissions> topics_;
+};
+
+class Permissions final {
+  public:
+    [[nodiscard]] const GlobalPermissions &Global() const noexcept { return global_; }
+    [[nodiscard]] const std::map<std::uint32_t, StreamPermissions> &Streams() const noexcept { return streams_; }
+
+    Permissions &SetGlobal(GlobalPermissions global) {
+        global_ = global;
+        return *this;
+    }
+
+    Permissions &SetStreams(std::map<std::uint32_t, StreamPermissions> streams) {
+        streams_ = std::move(streams);
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::Permissions ToFfi() const;
+    static Permissions FromFfi(ffi::Permissions permissions);
+
+    friend class IggyBlockingClient;
+    friend class UserInfoDetails;
+
+    GlobalPermissions global_;
+    std::map<std::uint32_t, StreamPermissions> streams_;
+};
+
+class UserInfo final {
+  public:
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+    [[nodiscard]] UserStatus Status() const noexcept { return status_; }
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+  private:
+    UserInfo(std::uint32_t id, std::uint64_t created_at, UserStatus status, std::string username)
+        : id_(id), created_at_(created_at), status_(status), username_(std::move(username)) {}
+
+    static UserInfo FromFfi(ffi::UserInfo user);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t id_;
+    std::uint64_t created_at_;
+    UserStatus status_;
+    std::string username_;
+};
+
+class UserInfoDetails final {
+  public:
+    [[nodiscard]] std::uint32_t Id() const noexcept { return id_; }
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+    [[nodiscard]] UserStatus Status() const noexcept { return status_; }
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+    [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
+
+  private:
+    UserInfoDetails(std::uint32_t id,
+                    std::uint64_t created_at,
+                    UserStatus status,
+                    std::string username,
+                    std::optional<::iggy::Permissions> permissions)
+        : id_(id),
+          created_at_(created_at),
+          status_(status),
+          username_(std::move(username)),
+          permissions_(std::move(permissions)) {}
+
+    static UserInfoDetails FromFfi(ffi::UserInfoDetails user);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t id_;
+    std::uint64_t created_at_;
+    UserStatus status_;
+    std::string username_;
+    std::optional<::iggy::Permissions> permissions_;
 };
 
 /**
@@ -1272,6 +1544,91 @@ class ConsumerGroupDetails final {
     std::vector<ConsumerGroupMember> members_;
 };
 
+class ConsumerGroupInfo final {
+  public:
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+  private:
+    ConsumerGroupInfo(std::uint32_t stream_id, std::uint32_t topic_id, std::uint32_t group_id)
+        : stream_id_(stream_id), topic_id_(topic_id), group_id_(group_id) {}
+
+    static ConsumerGroupInfo FromFfi(ffi::ConsumerGroupInfo info);
+
+    friend class ClientInfoDetails;
+
+    std::uint32_t stream_id_;
+    std::uint32_t topic_id_;
+    std::uint32_t group_id_;
+};
+
+class ClientInfo final {
+  public:
+    [[nodiscard]] std::uint32_t ClientId() const noexcept { return client_id_; }
+    [[nodiscard]] const std::optional<std::uint32_t> &UserId() const noexcept { return user_id_; }
+    [[nodiscard]] const std::string &Address() const noexcept { return address_; }
+    [[nodiscard]] const std::string &Transport() const noexcept { return transport_; }
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+
+  private:
+    ClientInfo(std::uint32_t client_id,
+               std::optional<std::uint32_t> user_id,
+               std::string address,
+               std::string transport,
+               std::uint32_t consumer_groups_count)
+        : client_id_(client_id),
+          user_id_(user_id),
+          address_(std::move(address)),
+          transport_(std::move(transport)),
+          consumer_groups_count_(consumer_groups_count) {}
+
+    static ClientInfo FromFfi(ffi::ClientInfo info);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t client_id_;
+    std::optional<std::uint32_t> user_id_;
+    std::string address_;
+    std::string transport_;
+    std::uint32_t consumer_groups_count_;
+};
+
+class ClientInfoDetails final {
+  public:
+    [[nodiscard]] std::uint32_t ClientId() const noexcept { return client_id_; }
+    [[nodiscard]] const std::optional<std::uint32_t> &UserId() const noexcept { return user_id_; }
+    [[nodiscard]] const std::string &Address() const noexcept { return address_; }
+    [[nodiscard]] const std::string &Transport() const noexcept { return transport_; }
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+    [[nodiscard]] const std::vector<ConsumerGroupInfo> &ConsumerGroups() const noexcept { return consumer_groups_; }
+
+  private:
+    ClientInfoDetails(std::uint32_t client_id,
+                      std::optional<std::uint32_t> user_id,
+                      std::string address,
+                      std::string transport,
+                      std::uint32_t consumer_groups_count,
+                      std::vector<ConsumerGroupInfo> consumer_groups)
+        : client_id_(client_id),
+          user_id_(user_id),
+          address_(std::move(address)),
+          transport_(std::move(transport)),
+          consumer_groups_count_(consumer_groups_count),
+          consumer_groups_(std::move(consumer_groups)) {}
+
+    static ClientInfoDetails FromFfi(ffi::ClientInfoDetails info);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t client_id_;
+    std::optional<std::uint32_t> user_id_;
+    std::string address_;
+    std::string transport_;
+    std::uint32_t consumer_groups_count_;
+    std::vector<ConsumerGroupInfo> consumer_groups_;
+};
+
 /**
  * @brief Compression algorithm used for topic messages.
  *
@@ -2205,6 +2562,17 @@ class IggyBlockingClient final {
      */
     void Logout();
 
+    UserInfoDetails GetUser(const Identifier &user);
+    std::vector<UserInfo> GetUsers();
+    UserInfoDetails CreateUser(std::string username,
+                               std::string password,
+                               UserStatus status,
+                               const std::optional<Permissions> &permissions = std::nullopt);
+    void DeleteUser(const Identifier &user);
+    void UpdateUser(const Identifier &user,
+                    std::optional<std::string> username = std::nullopt,
+                    std::optional<UserStatus> status    = std::nullopt);
+
     /**
      * @brief Creates a top-level stream in the cluster metadata.
      *
@@ -2620,6 +2988,10 @@ class IggyBlockingClient final {
                               const Identifier &stream,
                               const Identifier &topic,
                               std::optional<std::uint32_t> partition_id = std::nullopt);
+
+    ClientInfoDetails GetMe();
+    ClientInfoDetails GetClient(std::uint32_t client_id);
+    std::vector<ClientInfo> GetClients();
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);
