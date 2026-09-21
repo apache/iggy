@@ -31,10 +31,14 @@
 //! purge completion and consumer recovery with `SimStorage`, then polls through
 //! the real `Next` path. Message recovery is narrower than server boot: a helper
 //! replays a durable journal into a new partition. No partition memory survives
-//! recovery. These controls do not inject sync failures or exercise purge retries.
+//! recovery. Failure cases inject an error before either offset directory sync
+//! takes effect. They check both the immediate completion contract and recovery
+//! with fresh history. Purge retries and write acknowledgments are not exercised.
 
-use super::tests::owned_prepare;
-use super::{Crash, SimStorage};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+
 use configs::server::ServerConfig;
 use consensus::{LocalPipeline, Sequencer, VsrConsensus};
 use futures::executor::block_on;
@@ -54,9 +58,9 @@ use partitions::{
 use server::configure_consumer_offsets_with_storage;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, ShardId};
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::Arc;
+
+use super::tests::owned_prepare;
+use super::{Crash, FaultMode, SimStorage, StorageOperation};
 
 const CREATED_REVISION: u64 = 7;
 const OLD_GENERATION: u64 = 4;
@@ -79,6 +83,13 @@ struct PurgeStorageHarness {
     namespace: IggyNamespace,
     /// Policy for consumer offsets; message durability is established by the fixture.
     policy: Durability,
+}
+
+#[derive(Debug)]
+struct ConsumerPoll {
+    consumer: PollingConsumer,
+    stored_offset: Option<u64>,
+    offsets: Vec<u64>,
 }
 
 impl PurgeStorageHarness {
@@ -227,17 +238,29 @@ impl PurgeStorageHarness {
         .unwrap();
     }
 
-    /// Poll `Next` for the consumer and group, checking actual offsets and payloads.
-    /// This executes and completes real polls with automatic offset commits disabled;
-    /// it consumes the partition because completing polls can update live tracking.
+    /// Poll both consumers before asserting so a failure cannot hide the second result.
     async fn poll_next_and_assert_messages(
         &self,
         partition: TestPartition,
         expected_offsets: &[u64],
     ) {
+        for poll in Box::pin(self.poll_next(partition)).await {
+            assert_eq!(
+                poll.offsets, expected_offsets,
+                "{:?}, {:?}",
+                self.policy, poll.consumer
+            );
+        }
+    }
+
+    /// Complete real polls with automatic commits disabled, retaining each saved
+    /// bookmark for diagnostics. Poll completion can still update live tracking.
+    async fn poll_next(&self, partition: TestPartition) -> Vec<ConsumerPoll> {
+        let stored_offsets = consumers().map(|consumer| partition.get_consumer_offset(consumer));
         let partitions = IggyPartitions::new(ShardId::new(0), partition_config());
         partitions.insert(self.namespace, partition);
-        for consumer in consumers() {
+        let mut polls = Vec::with_capacity(consumers().len());
+        for (consumer, stored_offset) in consumers().into_iter().zip(stored_offsets) {
             let plan = partitions
                 .build_poll_snapshot(
                     &self.namespace,
@@ -254,7 +277,7 @@ impl PurgeStorageHarness {
                 .complete_poll(&self.namespace, plan.execute().await)
                 .unwrap();
             assert!(completion.replication.is_none());
-            let actual_offsets: Vec<_> = completion
+            let offsets = completion
                 .fragments
                 .iter()
                 .map(|fragment| {
@@ -266,9 +289,67 @@ impl PurgeStorageHarness {
                     batch.header.base_offset
                 })
                 .collect();
-            assert_eq!(
-                actual_offsets, expected_offsets,
-                "{:?}, {consumer:?}",
+            polls.push(ConsumerPoll {
+                consumer,
+                stored_offset,
+                offsets,
+            });
+        }
+        polls
+    }
+
+    async fn partition_with_stored_progress(&self) -> TestPartition {
+        let mut partition = self.empty_partition();
+        self.recover_progress(&mut partition, STORED_OFFSET).await;
+        assert_eq!(partition.applied_purge_generation(), OLD_GENERATION);
+        for consumer in consumers() {
+            assert_eq!(partition.get_consumer_offset(consumer), Some(STORED_OFFSET));
+        }
+        partition
+    }
+
+    /// Discover the barrier in a successful run instead of hardcoding an operation
+    /// number. Completion syncs the consumer directory, then the group directory,
+    /// before syncing the completion marker's parent. Return the expected trace
+    /// through the selected barrier so the failing run must reach the same point.
+    async fn arm_offset_directory_sync_failure(
+        &self,
+        failed_kind: ConsumerKind,
+    ) -> Vec<StorageOperation> {
+        let control = Self::with_stored_progress(self.policy).await;
+        let mut partition = control.partition_with_stored_progress().await;
+        control.storage.clear_trace();
+        partition
+            .complete_purge_with_storage(&control.storage, NEW_GENERATION)
+            .await
+            .unwrap();
+        let trace = control.storage.trace();
+        let directory_index = match failed_kind {
+            ConsumerKind::Consumer => 0,
+            ConsumerKind::ConsumerGroup => 1,
+        };
+        let (operation_index, _) = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| **operation == StorageOperation::DirectorySync)
+            .nth(directory_index)
+            .expect("purge must sync each offset directory before recording completion");
+        self.storage.fail_at(operation_index, FaultMode::Before);
+        trace[..=operation_index].to_vec()
+    }
+
+    async fn assert_failure_reached_after_unlinks(&self, expected_trace: &[StorageOperation]) {
+        let actual_trace = self.storage.trace();
+        assert_eq!(
+            actual_trace.get(..expected_trace.len()),
+            Some(expected_trace),
+            "purge must reach the selected directory sync before the injected failure"
+        );
+        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+            let directory = self.offset_directory(kind);
+            assert!(
+                self.storage.entries(&directory).await.unwrap().is_empty(),
+                "{:?}, {kind:?}: bookmark files must be unlinked before the sync failure",
                 self.policy
             );
         }
@@ -466,4 +547,146 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
                 .await;
         }
     });
+}
+
+/// A directory sync error must leave completion pending even before a crash.
+/// Read the marker into a new partition before checking the result, so a failure
+/// reports the live and stored generations as well as the returned status.
+async fn assert_failed_sync_leaves_purge_pending(policy: Durability, failed_kind: ConsumerKind) {
+    let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+    let mut partition = harness.partition_with_stored_progress().await;
+    let expected_trace = harness.arm_offset_directory_sync_failure(failed_kind).await;
+
+    let result = partition
+        .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+        .await;
+    harness
+        .assert_failure_reached_after_unlinks(&expected_trace)
+        .await;
+    let live_generation = partition.applied_purge_generation();
+    let mut reloaded = harness.empty_partition();
+    reloaded
+        .hydrate_applied_purge_generation_with_storage(&harness.storage)
+        .await
+        .unwrap();
+    let stored_generation = reloaded.applied_purge_generation();
+
+    assert!(
+        result.is_err(),
+        "{policy:?}, {failed_kind:?}: sync failure must reject purge; got {result:?}, \
+         live generation {live_generation}, stored generation {stored_generation}"
+    );
+    assert_eq!(live_generation, OLD_GENERATION);
+    assert_eq!(stored_generation, OLD_GENERATION);
+}
+
+/// A completed purge must never recover an old bookmark alongside fresh history.
+/// If cleanup reports failure, retaining the earlier generation keeps cleanup
+/// pending; this test does not demand cleared bookmarks before that retry occurs.
+async fn assert_failed_sync_recovers_consistently(policy: Durability, failed_kind: ConsumerKind) {
+    let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+    let mut partition = harness.partition_with_stored_progress().await;
+    let expected_trace = harness.arm_offset_directory_sync_failure(failed_kind).await;
+
+    let result = partition
+        .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+        .await;
+    harness
+        .assert_failure_reached_after_unlinks(&expected_trace)
+        .await;
+    drop(partition);
+
+    // These durable messages make bookmark 2 valid in the new history, so recovery
+    // cannot hide the stale bookmark by clamping it to the last message. This
+    // fixture does not pass through the server's write acknowledgment path.
+    harness.persist_fresh_history().await;
+    harness.storage.crash(Crash::PowerLoss);
+    let recovered = harness.recover_partition().await;
+    let recovered_generation = recovered.applied_purge_generation();
+    let failed_consumer = match failed_kind {
+        ConsumerKind::Consumer => PollingConsumer::Consumer(CONSUMER_ID, 42),
+        ConsumerKind::ConsumerGroup => PollingConsumer::ConsumerGroup(GROUP_ID, 1),
+    };
+    let restored_bookmark = recovered.get_consumer_offset(failed_consumer);
+    let polls = harness.poll_next(recovered).await;
+
+    let safe_recovery = match &result {
+        Err(_) => recovered_generation == OLD_GENERATION,
+        Ok(()) => {
+            recovered_generation == NEW_GENERATION
+                && polls
+                    .iter()
+                    .all(|poll| poll.stored_offset.is_none() && poll.offsets == [0, 1, 2, 3, 4])
+        }
+    };
+    assert!(
+        safe_recovery,
+        "{policy:?}, {failed_kind:?}: purge must remain pending or recover all fresh \
+         messages without old bookmarks; got {result:?}, generation {recovered_generation}, \
+         bookmark from the directory that failed to sync {restored_bookmark:?}, polls {polls:?}"
+    );
+}
+
+#[test]
+fn given_replicated_consumer_sync_failure_when_completing_purge_should_leave_generation_pending() {
+    block_on(assert_failed_sync_leaves_purge_pending(
+        Durability::Replicated,
+        ConsumerKind::Consumer,
+    ));
+}
+
+#[test]
+fn given_replicated_group_sync_failure_when_completing_purge_should_leave_generation_pending() {
+    block_on(assert_failed_sync_leaves_purge_pending(
+        Durability::Replicated,
+        ConsumerKind::ConsumerGroup,
+    ));
+}
+
+#[test]
+fn given_persisted_consumer_sync_failure_when_completing_purge_should_leave_generation_pending() {
+    block_on(assert_failed_sync_leaves_purge_pending(
+        Durability::Persisted,
+        ConsumerKind::Consumer,
+    ));
+}
+
+#[test]
+fn given_persisted_group_sync_failure_when_completing_purge_should_leave_generation_pending() {
+    block_on(assert_failed_sync_leaves_purge_pending(
+        Durability::Persisted,
+        ConsumerKind::ConsumerGroup,
+    ));
+}
+
+#[test]
+fn given_replicated_consumer_sync_failure_when_power_is_lost_should_recover_consistently() {
+    block_on(assert_failed_sync_recovers_consistently(
+        Durability::Replicated,
+        ConsumerKind::Consumer,
+    ));
+}
+
+#[test]
+fn given_replicated_group_sync_failure_when_power_is_lost_should_recover_consistently() {
+    block_on(assert_failed_sync_recovers_consistently(
+        Durability::Replicated,
+        ConsumerKind::ConsumerGroup,
+    ));
+}
+
+#[test]
+fn given_persisted_consumer_sync_failure_when_power_is_lost_should_recover_consistently() {
+    block_on(assert_failed_sync_recovers_consistently(
+        Durability::Persisted,
+        ConsumerKind::Consumer,
+    ));
+}
+
+#[test]
+fn given_persisted_group_sync_failure_when_power_is_lost_should_recover_consistently() {
+    block_on(assert_failed_sync_recovers_consistently(
+        Durability::Persisted,
+        ConsumerKind::ConsumerGroup,
+    ));
 }
