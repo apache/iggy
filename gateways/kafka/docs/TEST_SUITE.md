@@ -20,10 +20,10 @@ suite goes through `tests/common/fixtures.rs::load_fixture_body_or_skip`, which 
 regeneration hint when a fixture is missing, and panics instead when `KAFKA_FIXTURES_REQUIRED=1`
 is set (CI sets this) so a broken generation step can't leave a suite green with zero assertions.
 
-### `iggy-server` binary (required for `bridge_iggy_integration_tests`)
+### `iggy-server` binary (required for `bridge_iggy_integration_tests`, `list_offsets_real_bridge_tests` and `produce_real_bridge_tests`)
 
-No fixtures needed, but `iggy-server` has to be built *first* - this suite spawns it directly and
-does not build it for you:
+No fixtures needed, but `iggy-server` has to be built *first* - these suites spawn it directly and
+do not build it for you:
 
 ```bash
 cargo build --package server --bin iggy-server
@@ -64,9 +64,10 @@ file under `tests/` anymore.
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |
 | [`listener_robustness_tests.rs`](../tests/listener_robustness_tests.rs) | TCP listener robustness — framing, pipelining, concurrency, connection limits | No |
 | [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`produce_real_bridge_tests.rs`](../tests/produce_real_bridge_tests.rs) | Produce (key 0) through the whole handler against a real, spawned `iggy-server` — records go in as Kafka wire bytes and come back through the Iggy SDK, plus one error code per partition | No (needs the `iggy-server` binary - see Prerequisites) |
 
 `tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `scope.rs`, `server.rs`,
-`tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`
+`iggy_server.rs`, `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`
 is test-only primitive encode/decode scaffolding for hand-building legacy/adversarial wire shapes
 `kafka_protocol`'s spec-correct encoder cannot produce - it is not the gateway's production codec.
 

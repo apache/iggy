@@ -282,9 +282,11 @@ states its output size up front, and `snap` reads that number without allocating
 size is charged before the decoder runs, for Kafka's own block framing and for raw snappy alike.
 
 `records::decode_batches` decompresses, and `records::DecompressionBudget` is the bound. The
-budget is a parameter, so setting it to `max_frame_size` for the whole request belongs to the
-Produce handler in [#3535](https://github.com/apache/iggy/issues/3535). Until that lands, nothing
-calls either one in a server path.
+budget is a parameter, and the Produce handler
+([#3535](https://github.com/apache/iggy/issues/3535)) sets it to `max_frame_size` once per
+request. That handler converts every partition entry before it writes any of them. The budget
+holds its remaining allowance in a `Cell`, so a reference to it held across an await makes every
+connection task `!Send`. Converting first keeps the budget out of the async half.
 
 ## Offsets
 

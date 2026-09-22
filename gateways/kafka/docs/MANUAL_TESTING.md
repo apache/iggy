@@ -70,13 +70,19 @@ The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:909
 broker's usual port). Every command below passes `--host 127.0.0.1:9093` explicitly - omitting it
 connection-refuses before any assertion runs.
 
+Every case below describes a gateway started **without** a bridge (`IGGY_KAFKA_BRIDGE_ENABLED`
+unset). That is the only mode where every API answers with a stub. With a bridge, Produce writes
+to Iggy instead, and the empty record blob that the fixture tool sends answers `ec=87`
+(INVALID_RECORD) and not `ec=6`. To drive that path by hand you need real record batches, so
+`tests/produce_real_bridge_tests.rs` covers it against a real `iggy-server`.
+
 | ID | Test | Steps | Expected result | Pass criteria |
 | ---- | ------ | ------- | ----------------- | --------------- |
 | A1 | Gateway starts | Run `iggy-gateway-kafka` | Binds to `:9093`, no panic | Log shows bind address |
 | A2 | ApiVersions v1 | `cargo run -p kafka-message-gen -- send --host 127.0.0.1:9093 --api-key 18 --version 1` | Response received | `ec=0`, non-zero byte count |
 | A3 | ApiVersions v3 (flexible) | Same with `--version 3` | Response received | `ec=0` |
 | A4 | Metadata v0 | `send --host 127.0.0.1:9093 --api-key 3 --version 0` | Stub broker in response | Topic entries show `ec=3` (UNKNOWN_TOPIC_OR_PARTITION, stub) |
-| A5 | Produce v3 | `send --host 127.0.0.1:9093 --api-key 0 --version 3` | Decode + stub retriable error | `ec=6` (NOT_LEADER_OR_FOLLOWER) per partition |
+| A5 | Produce v3 | `send --host 127.0.0.1:9093 --api-key 0 --version 3` | Decode + stub retriable error, no bridge | `ec=6` (NOT_LEADER_OR_FOLLOWER) per partition |
 | A6 | Fetch v4 | `send --host 127.0.0.1:9093 --api-key 1 --version 4` | Decode + stub response | Top-level `ec=0`; per-partition `ec=6` (NOT_LEADER_OR_FOLLOWER) |
 | A7 | ListOffsets v1 | `send --host 127.0.0.1:9093 --api-key 2 --version 1` | Decode + stub offsets | Per-partition `ec=6` (NOT_LEADER_OR_FOLLOWER) - no top-level error field on this response |
 | A8 | CreateTopics v2 | `send --host 127.0.0.1:9093 --api-key 19 --version 2` | Decode + stub non-creation ack | `ec=41` (NOT_CONTROLLER) per topic |
@@ -132,8 +138,8 @@ that one connection) is still serving other clients.
 
 Run every `send` below with `--host 127.0.0.1:9093`. This category validates that the wire
 encoding round-trips at the legacy/flexible boundary - not the stub error code, which is
-per-API and constant across both rows (see Category A: `ec=6` for Produce, `ec=41` for
-CreateTopics, and so on).
+per-API and constant across both rows (see Category A: `ec=6` for Produce with no bridge, `ec=41`
+for CreateTopics, and so on).
 
 | ID | API key | Version | Encoding | Validation |
 | ---- | --------- | --------- | ---------- | ------------ |
@@ -175,7 +181,7 @@ Requires `kcat` installed. Gateway does **not** implement SASL or full broker se
 | ID | Test | Command | Expected (foundation) |
 | ---- | ------ | --------- | --------------------- |
 | G1 | Broker metadata | `kcat -b 127.0.0.1:9093 -L` | ApiVersions + Metadata handshake; broker appears in metadata |
-| G2 | Produce (likely fails later) | `echo "hello" \| kcat -b 127.0.0.1:9093 -t test -P` | May fail at coordinator/group stage — document actual error |
+| G2 | Produce (fails at metadata) | `echo "hello" \| kcat -b 127.0.0.1:9093 -t test -P` | Fails before it sends a Produce request. Metadata reports every topic as unknown, so the client finds no leader. [#3534](https://github.com/apache/iggy/issues/3534) unblocks this, not the Produce handler |
 | G3 | Consumer (likely fails later) | `kcat -b 127.0.0.1:9093 -t test -C -o beginning` | May fail without consumer groups — document actual error |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
@@ -198,8 +204,11 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | ------ | ------ | --------------- |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
 | 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub, per partition (retriable; payload not persisted) |
+| 10 | MESSAGE_TOO_LARGE | Produce with a bridge: a record Iggy cannot hold, or a request that decompresses past its budget |
+| 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
+| 87 | INVALID_RECORD | Produce with a bridge: a record batch this gateway cannot map, including a missing or empty one |
 | 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic |
-| 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception). Every other API key's out-of-range version closes the connection instead - see Category B |
+| 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception), plus a Produce with a bridge that carries a transactional or control batch. Every other API key's out-of-range version closes the connection instead - see Category B |
 | 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
 | 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
 | 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |

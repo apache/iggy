@@ -4,7 +4,7 @@
 
 Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. **No Iggy backend integration.**
 
-**Stub semantics (important):** Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). CreateTopics validates the request but answers with `NOT_CONTROLLER` (41) so clients do not believe topics were created. Do not treat `ec=0` stub success as durable storage — that arrives in the Iggy bridge phase.
+**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). CreateTopics validates the request but answers `NOT_CONTROLLER` (41), so clients do not believe topics were created. Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores real data once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
@@ -44,7 +44,7 @@ it knows the server supports flexible encoding.
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
-| 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | Decode request; stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
+| 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition entry. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
@@ -89,7 +89,7 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
 | **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
-| **3 — Iggy bridge** | Landed, not wired in | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed; Produce/Fetch handler wiring itself is a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
+| **3 — Iggy bridge** | Produce and ListOffsets wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `send_records`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)) and ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) call it. Fetch does not call it yet ([#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
 
@@ -103,10 +103,11 @@ Items from the [hybrid architecture review](https://github.com/apache/iggy/discu
 below it are still open for the issues that build on top of it.
 
 - [x] Add `bridge/` module (`iggy_bridge`) - connection lifecycle, topic mapping, provisioning,
-      high watermark, error mapping. See [README.md](../README.md#iggy-bridge-3533). Produce →
-      `send_messages` / Fetch → `poll_messages` handler wiring itself is
-      [#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536),
-      not part of `bridge/`'s own scope.
+      high watermark, error mapping. See [README.md](../README.md#iggy-bridge-3533).
+- [x] Produce → `send_messages` ([#3535](https://github.com/apache/iggy/issues/3535)) - one call
+      per partition entry, base offset from the send confirmation, one error code per partition.
+      See [README.md](../README.md#produce-3535).
+- [ ] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)).
 - [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
       exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
 - [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):

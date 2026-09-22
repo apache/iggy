@@ -233,11 +233,12 @@ fn produce_error_response_v9_uses_flexible_record_errors_shape() {
         Some(String::new())
     );
     assert_eq!(d.read_varint().unwrap(), 2); // one partition
-    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_i32().unwrap(), 0); // partition index
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
-    assert_eq!(d.read_i64().unwrap(), 0);
-    assert_eq!(d.read_i64().unwrap(), -1);
-    assert_eq!(d.read_i64().unwrap(), 0);
+    // An error appended nothing, so there is no offset to name and none is invented.
+    assert_eq!(d.read_i64().unwrap(), -1); // base_offset
+    assert_eq!(d.read_i64().unwrap(), -1); // log_append_time_ms, CreateTime
+    assert_eq!(d.read_i64().unwrap(), -1); // log_start_offset, not looked up
     assert_eq!(d.read_varint().unwrap(), 1); // empty record_errors array
     assert_eq!(d.read_compact_nullable_string().unwrap(), None);
 }

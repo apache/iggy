@@ -127,6 +127,12 @@ impl BridgeError {
 /// `ClientState::Connected`, the ordinary window between a reconnect's TCP handshake completing
 /// and its auto-sign-in landing, not for a rejected login.
 ///
+/// `ResourceNotFound` joins them despite naming no resource. `dispatch_partition_request`
+/// (`core/server/src/dispatch/partition.rs`) flattens every unresolved stream, topic and
+/// partition into it, so a `send_messages` to a missing topic or partition arrives as this and
+/// never as the typed variants, which only the bridge's own `get_topic` paths build locally.
+/// Every resource this bridge addresses is one of those three.
+///
 /// `TransientNotAccepted` (Iggy replica-side "retry, on any replica") is retriable the same way.
 /// `TransientNotCommitted` is not folded into that set: its outcome is genuinely unknown rather
 /// than known-safe-to-retry, so it maps to `REQUEST_TIMED_OUT` instead of
@@ -152,7 +158,8 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::StreamNameNotFound(_)
         | IggyError::TopicIdNotFound(_, _)
         | IggyError::TopicNameNotFound(_, _)
-        | IggyError::PartitionNotFound(_, _, _) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        | IggyError::PartitionNotFound(_, _, _)
+        | IggyError::ResourceNotFound(_) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
         IggyError::Unauthorized => ERROR_TOPIC_AUTHORIZATION_FAILED,
         IggyError::Disconnected
         | IggyError::EmptyResponse
@@ -191,6 +198,14 @@ mod tests {
             "orders".to_string(),
             "kafka".to_string(),
         ));
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    #[test]
+    fn resource_not_found_maps_to_unknown_topic_or_partition() {
+        // The only code a `send_messages` to a missing topic or partition ever comes back as:
+        // the server flattens both to this one rather than to the typed variants above.
+        let err = BridgeError::Iggy(IggyError::ResourceNotFound(String::new()));
         assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 

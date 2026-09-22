@@ -51,12 +51,18 @@ pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 /// real regardless of which retriable code is sent; it closes only once `#3535` has an idempotent
 /// produce path, not by picking a different error code here.
 pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
+/// Produce: a record over Iggy's `MAX_PAYLOAD_SIZE`, or a request decompressing past its budget.
+/// Terminal, correctly: the same bytes never fit on a second try.
+pub const ERROR_MESSAGE_TOO_LARGE: i16 = 10;
 /// `bridge`'s mapping for a Kafka-side topic name that fails Kafka's own naming rules.
 ///
 /// Empty, whitespace-padded, over 249 bytes, or outside `[A-Za-z0-9._-]`, checked before any Iggy
 /// call is made - a real Kafka client library validates topic names client-side and would never
 /// send one of these, but a raw/non-conformant client could.
 pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
+/// Produce: `acks` is not 0, 1 or -1. A conformant client never sends one, since `acks` comes
+/// from validated configuration rather than from application input.
+pub const ERROR_INVALID_REQUIRED_ACKS: i16 = 21;
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
@@ -82,6 +88,12 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// Non-retriable, so a Java client resolves immediately instead of retrying
 /// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+/// Produce: a record or batch this gateway cannot map.
+///
+/// Not `CORRUPT_MESSAGE` (2), whose text fits but which `kafka-protocol`'s table marks
+/// retriable, so a client would resend a batch that can never decode. A client older than Kafka
+/// 2.4 reads 87 as a generic server error, which is still terminal and still better than a loop.
+pub const ERROR_INVALID_RECORD: i16 = 87;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]

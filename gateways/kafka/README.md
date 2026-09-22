@@ -2,13 +2,13 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
-> **Stub warning:** most APIs still don't persist or read real data. Produce and Fetch return
-> retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
-> trusting a fake success. CreateTopics does **not** create topics; valid requests return
-> `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. ListOffsets is wired
-> to the Iggy bridge: with `IGGY_KAFKA_BRIDGE_ENABLED=true` it answers `EARLIEST`/`LATEST` from
-> real partition state; with the bridge off (the default) it stays a stub and answers
-> `NOT_LEADER_OR_FOLLOWER` (6). See [docs/SCOPE.md](docs/SCOPE.md).
+> **Stub warning:** When you set `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce writes to Iggy and
+> ListOffsets answers `EARLIEST`/`LATEST` from real partition state. No other API stores or reads
+> real data. Produce and ListOffsets without a bridge, and Fetch with or without one, answer
+> retriable `NOT_LEADER_OR_FOLLOWER` (6). Clients then keep their data and do not trust a fake
+> success. CreateTopics answers `NOT_CONTROLLER` (41) and creates nothing. Metadata reports every
+> topic as unknown, so a real client cannot reach Produce or ListOffsets yet. See
+> [docs/SCOPE.md](docs/SCOPE.md).
 
 ## Run
 
@@ -87,10 +87,41 @@ guards the hop from the gateway to Iggy rather than the hop from the producer to
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
 streams/topics, provisions them on demand, and looks up high watermarks (one or many partitions of
 a topic per call) for `ListOffsets`.
-**Not wired into the live Produce/Fetch dispatch path yet** - that lands with
-[#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536).
-Exercised today by `bridge`'s own unit tests and `tests/bridge_iggy_integration_tests.rs` (spawns a
-real `iggy-server`).
+ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) and Produce
+([#3535](https://github.com/apache/iggy/issues/3535), see below) call it. Fetch does not call it
+yet ([#3536](https://github.com/apache/iggy/issues/3536)).
+Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs`,
+`tests/list_offsets_real_bridge_tests.rs` and `tests/produce_real_bridge_tests.rs`. The last three
+start a real `iggy-server`.
+
+### Produce ([#3535](https://github.com/apache/iggy/issues/3535))
+
+Each partition entry in a Produce request becomes one Iggy `send_messages` call. Each entry
+answers for itself. A partition that fails carries its own error code, and the partitions that
+worked keep their offsets.
+
+| Field | What the gateway does |
+| ------- | ----------------------- |
+| Partition | Uses the index the client sent. Both systems number partitions from 0. |
+| Base offset | Takes it from the send confirmation. Sends `-1` when the server confirms the write but names no offset. |
+| `log_start_offset` | Always `-1`. The real value costs one extra call per request, and no producer reads it yet. |
+| `acks` | Writes the same way for `0`, `1` and `-1`. Durability is the Iggy topic's setting. Any other value answers `INVALID_REQUIRED_ACKS` (21). |
+| Topics | Creates none. A missing topic answers `UNKNOWN_TOPIC_OR_PARTITION` (3). Metadata creates topics. |
+| `timeout_ms` | Honors it, up to 20 seconds. Partitions past the deadline answer `REQUEST_TIMED_OUT` (7). |
+| Compression | Reads gzip, snappy, lz4 and zstd. |
+
+`acks=0` still writes the records. It answers nothing, because the wire protocol forbids a reply.
+
+Bad records get one of two codes. A record Iggy cannot hold answers `MESSAGE_TOO_LARGE` (10). A
+record this gateway cannot map answers `INVALID_RECORD` (87). A transactional or control batch
+answers `UNSUPPORTED_VERSION` (35), which is the code that stops a transactional producer. None of
+the three is retriable, because the same bytes never succeed on a second try.
+
+All batches in one request share one decompression budget, set to `max_frame_size`. A compressed
+request therefore cannot produce more bytes than the same client could have sent uncompressed. A
+request past the budget answers `MESSAGE_TOO_LARGE` (10).
+
+[docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) describes what a record becomes once it is stored.
 
 ### Connection config
 
@@ -117,11 +148,11 @@ a detached background task specifically so that dropping the awaiting future - w
 does on expiry - cannot abort it mid-flight. A timed-out call can leave that task holding the
 shared client's connection lock for up to another 30s (the SDK's own reply deadline), queuing
 every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
-Concurrency ceiling below) and no semaphore bounding concurrent bridge calls - no longer a
-hypothetical now that ListOffsets (`#3537`) calls it from a real handler; more pressing once
-CreateTopics (`#3538`), Metadata (`#3534`), Produce (`#3535`) and Fetch (`#3536`) add their own
-concurrent callers. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't a
-followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
+Concurrency ceiling below) and no semaphore bounding concurrent bridge calls. ListOffsets
+(`#3537`) and Produce (`#3535`) call it from real handlers, Produce on every write, so this is no
+longer a hypothetical. CreateTopics (`#3538`), Metadata (`#3534`) and Fetch (`#3536`) add more
+concurrent callers when they land. See `IggyBridge`'s own doc comment (its rustdoc is private, so
+this isn't a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
 
 ### Topic mapping
 
@@ -180,15 +211,22 @@ One `IggyBridge` (one `IggyClient`) is meant to serve every Kafka connection thi
 and the Iggy SDK's TCP transport is lockstep - one request in flight per client, its stream mutex
 held across write, flush, and read. Every concurrent Kafka connection ends up serialized behind
 whichever single Iggy request is in flight; the Kafka side's own connection limit
-(`IGGY_KAFKA_MAX_CONNECTIONS`) does nothing to relieve this. No connection pooling exists yet - it
-is a known gap to address before `#3535`/`#3536` put this on a hot path, not a design decision to
-rely on.
+(`IGGY_KAFKA_MAX_CONNECTIONS`) does nothing to relieve this. No connection pooling exists yet, and
+Produce puts this on a hot path as of `#3535` - it is a known gap, not a design decision to rely
+on.
+
+Message order does not depend on the pool. The connection loop reads one frame, runs the handler,
+then writes the answer. One Kafka connection therefore never has two requests in flight, and a
+producer's writes to a partition stay in the order it sent them. The single client costs
+throughput instead. A producer set up for several requests in flight gains nothing from them, and
+every Kafka connection waits behind the Iggy call that is running.
 
 ### Error mapping
 
 `BridgeError::to_kafka_error_code()` maps Iggy failures to Kafka wire error codes:
 
-- Stream/topic/partition not found → `UNKNOWN_TOPIC_OR_PARTITION` (3)
+- Stream, topic or partition not found → `UNKNOWN_TOPIC_OR_PARTITION` (3). This includes the
+  generic `ResourceNotFound` that a partition request returns when the server cannot resolve it
 - A rejected *permission* (`Unauthorized`) → `TOPIC_AUTHORIZATION_FAILED` (29) - a real,
   fixable-by-the-Kafka-operator ACL problem
 - A rejected *login* (the bridge's own `IGGY_KAFKA_IGGY_USERNAME`/`_PASSWORD` are wrong) →
