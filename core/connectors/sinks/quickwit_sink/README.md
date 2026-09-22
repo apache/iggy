@@ -97,7 +97,7 @@ The stream's `schema` selects the runtime decoder. The sink sends JSON objects u
 | Raw non-UTF-8 bytes | `{"data":"/wCA","data_type":"raw","data_encoding":"base64"}` |
 | Text | `{"text":"ready","data_type":"text"}` |
 
-Raw JSON arrays and scalars remain UTF-8 strings in the raw wrapper. Malformed JSON also preserves the original bytes. `data_encoding` distinguishes literal text from base64. The sink handles `Payload::Avro` and `Payload::FlatBuffer` with the raw path, and `Payload::Proto` with the text wrapper. Runtime decoder settings determine which payload variant reaches the sink.
+Raw JSON arrays and scalars remain UTF-8 strings in the raw wrapper. Malformed JSON also preserves the original bytes. `data_encoding` distinguishes literal text from base64. The sink handles `Payload::Avro` and `Payload::FlatBuffer` with the raw path. `Payload::Proto` whose text is a JSON document (the descriptor-less `proto_convert` fallback) takes the JSON path; any other proto text takes the text wrapper. Runtime decoder settings determine which payload variant reaches the sink.
 
 The examples use `mode: dynamic` to retain wrapper fields. With `mode: strict`, map every field emitted by the selected payload shape or Quickwit rejects the document during indexing, even after a successful HTTP response. Timestamp sharding and retention are optional here: raw/text wrappers have no `timestamp`, and the `add_fields` transform only enriches JSON payloads. Configure them only when every document supplies the required timestamp.
 
