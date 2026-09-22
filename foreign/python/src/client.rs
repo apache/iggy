@@ -49,7 +49,8 @@ use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
-    UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
+    IdentityInfo as PyIdentityInfo, UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails,
+    UserStatus as PyUserStatus,
 };
 use tokio::sync::Mutex;
 
@@ -252,8 +253,14 @@ impl IggyClient {
     }
 
     /// Logs in the user with the given credentials.
-    /// Raises `RuntimeError` on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `IdentityInfo`.
+    ///     `access_token` is set only on HTTP; binary transports leave it `None`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IdentityInfo]", imports=("collections.abc")))]
     fn login_user<'a>(
         &self,
         py: Python<'a>,
@@ -262,11 +269,37 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
+            let identity = inner
                 .login_user(&username, &password)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(())
+            Ok(PyIdentityInfo::from(identity))
+        })
+    }
+
+    /// Logs in with a personal access token minted out of band.
+    ///
+    /// Args:
+    ///     token: Raw PAT string.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `IdentityInfo`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IdentityInfo]", imports=("collections.abc")))]
+    fn login_with_personal_access_token<'a>(
+        &self,
+        py: Python<'a>,
+        token: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let identity = inner
+                .login_with_personal_access_token(&token)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(PyIdentityInfo::from(identity))
         })
     }
 
