@@ -979,6 +979,24 @@ mod tests {
         }
     }
 
+    /// Drops every message, standing in for a filter transform that matches the
+    /// whole batch.
+    struct DroppingTransform;
+
+    impl Transform for DroppingTransform {
+        fn r#type(&self) -> TransformType {
+            TransformType::AvroConvert
+        }
+
+        fn transform(
+            &self,
+            _metadata: &TopicMetadata,
+            _message: DecodedMessage,
+        ) -> Result<Option<DecodedMessage>, Error> {
+            Ok(None)
+        }
+    }
+
     fn next_plugin_id() -> u32 {
         TEST_PLUGIN_ID.fetch_add(1, Ordering::Relaxed)
     }
@@ -1139,18 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn given_mixed_payload_variants_when_batch_is_processed_should_split_into_runs() {
         let plugin_id = next_plugin_id();
-        let transform = Arc::new(RetaggingTransform {
-            payloads: vec![
-                Payload::Text("first".to_owned()),
-                Payload::Text("second".to_owned()),
-                Payload::Raw(vec![9]),
-                Payload::Text("fourth".to_owned()),
-            ],
-            next: std::sync::Mutex::new(0),
-        });
-        let messages = (0..4)
-            .map(|offset| test_message(offset, br#"{"id":1}"#.to_vec()))
-            .collect();
+        let (transform, messages) = split_batch();
 
         let timing = run(plugin_id, Schema::Json.decoder(), vec![transform], messages).await;
         let batches = captured(plugin_id);
@@ -1210,6 +1217,31 @@ mod tests {
             3,
             "one error per failed run"
         );
+    }
+
+    #[tokio::test]
+    async fn given_a_batch_that_lost_every_message_when_processed_should_still_be_one_run() {
+        let plugin_id = next_plugin_id();
+        let messages = (0..3)
+            .map(|offset| test_message(offset, br#"{"id":1}"#.to_vec()))
+            .collect();
+
+        let timing = run(
+            plugin_id,
+            Schema::Json.decoder(),
+            vec![Arc::new(DroppingTransform)],
+            messages,
+        )
+        .await;
+        let batches = captured(plugin_id);
+
+        assert_eq!(timing.processed_count, 0);
+        assert_eq!(timing.runs, 1, "an empty batch is still one FFI call");
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].offsets.is_empty());
+        // Nothing is left to read a variant from, so the run carries the
+        // stream's configured schema rather than a payload's.
+        assert_eq!(batches[0].metadata_schema, Schema::Json);
     }
 
     #[tokio::test]
