@@ -135,7 +135,13 @@ pub trait Sink: Send + Sync {
     /// Invoked when the sink is initialized, allowing it to perform any necessary setup.
     async fn open(&mut self) -> Result<(), Error>;
 
-    /// Invoked every time a batch of messages is received from the configured stream(s) and topic(s).
+    /// Invoked for each run of messages polled from the configured stream(s) and topic(s).
+    ///
+    /// One poll can reach the plugin as more than one call. The runtime groups a batch into
+    /// contiguous runs of a single payload variant and sends each run on its own, so a batch
+    /// whose variant changes partway through arrives as several calls, every one of them
+    /// repeating the same `messages_metadata.current_offset`. A batch that lost every message
+    /// to the decoder or to a transform still arrives, as one call carrying no messages.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,
@@ -383,11 +389,20 @@ pub struct TopicMetadata {
     pub topic: String,
 }
 
+/// Describes the run of messages carried by one `Sink::consume` call.
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessagesMetadata {
+    /// The partition the run was polled from.
     pub partition_id: u32,
+    /// The partition's high-water offset at the time of the poll, not the offset of the last
+    /// message in this run. Every call the poll produces repeats it, so a sink that keys a
+    /// commit, a file name or a table version on it has to tolerate the repeat.
     pub current_offset: u64,
+    /// The variant every `Payload` in this run holds, which is not always the stream's
+    /// configured `schema`: a decoder may return a different form than the wire format it
+    /// reads, and a transform may change the variant again. An empty run has no payload to
+    /// read a variant from and carries the stream's configured schema instead.
     pub schema: Schema,
 }
 

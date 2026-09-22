@@ -54,7 +54,7 @@ value.static = "hello"
 
 `retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.
 
-Two items changed in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
+Two symbols were removed and one field changed meaning, each in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
 
 | Removed | Replacement |
 | --- | --- |
@@ -62,6 +62,8 @@ Two items changed in a way that breaks out-of-tree plugins, so those plugins mus
 | `jitter` (was public) | `retry_backoff`, which applies the jitter itself. |
 
 Both types carry `(u32, Duration, Duration)` and the two delay roles cross over, so a field-by-field rename compiles and swaps the base delay for the cap. Map the fields by name.
+
+`MessagesMetadata.schema` and `RawMessages.schema` now name the variant the `Payload` holds rather than the wire format the stream's decoder reads. `Schema::Proto` means a `Payload::Proto` string on the sink path where it meant protobuf wire bytes before, so a plugin built against 0.4.0 rebuilds the run as the wrong variant with no error anywhere.
 
 ## Protocol Buffers Support
 
