@@ -2700,14 +2700,14 @@ where
 
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
-        if let Some(persistence) = &self.persistence {
-            self.start_persistence();
-            persistence.drain_with_timeout().await.map_err(|source| {
-                PartitionInstallError::SwapIo {
+        if self.persistence.is_some() {
+            if let Err(source) = self.barrier_install_files_locked().await {
+                self.fence_install_failure(commit_op);
+                return Err(PartitionInstallError::SwapIo {
                     path: partition_dir.clone(),
                     source,
-                }
-            })?;
+                });
+            }
             if let Err(source) = crate::install_backup::begin(Path::new(&partition_dir)).await {
                 // The backup rename may have landed before its directory barrier failed.
                 // Further commits could then be erased by rollback on the next boot.
