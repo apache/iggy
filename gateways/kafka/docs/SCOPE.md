@@ -109,11 +109,83 @@ below it are still open for the issues that build on top of it.
       not part of `bridge/`'s own scope.
 - [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
       exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
+- [x] Real CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)): with
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, creates the Iggy stream/topic through
+      `IggyBridge::create_kafka_topic` - an atomic create-or-report-exists call, not a separate
+      existence read followed by an idempotent create (that sequence has a TOCTOU window: two
+      concurrent requests for the same new name could both observe "doesn't exist yet" and both
+      receive `NONE`, when Kafka guarantees exactly one caller does).
+      `src/protocol/handlers/create_topics.rs`, `tests/create_topics_real_bridge_tests.rs`. With
+      the bridge off, the stub from #3421 answers `NOT_CONTROLLER` (41) as before.
+  - Every occurrence of a duplicate topic name within one request is rejected with
+    `INVALID_REQUEST` (42) and nothing is created for it, matching real Kafka
+    (`ControllerApis.createTopics`) rather than creating the first occurrence and reporting the
+    rest as already existing.
+  - A manual partition `assignments` list combined with an explicit `num_partitions`/
+    `replication_factor` is rejected with `INVALID_REQUEST` (42) even when the count agrees with
+    `assignments.len()` - real Kafka's own `ReplicationControlManager` treats the two as mutually
+    exclusive inputs, not independently-checked values that happen to agree. Retired
+    `ERROR_INVALID_REPLICA_ASSIGNMENT` (39), which this bridge never actually needed: the earlier
+    "count disagrees with assignment length" check it backed doesn't correspond to a condition
+    real Kafka's own validation order can even reach.
+  - `IggyError::RequestAlreadyApplied` (the SDK's reconnect path replayed a write that already
+    committed) maps to `NONE`, not the `UNKNOWN_SERVER_ERROR` catch-all - the operation did
+    succeed, and a Java client treats `UNKNOWN_SERVER_ERROR` as non-retriable.
+  - `IggyBridge::get_kafka_topic` no longer probes `get_stream` separately before `get_topic` -
+    `get_topic` already answers `Ok(None)` when the stream itself is missing, so the probe was a
+    second round trip to learn something the one call already told it.
+  - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
+    still a pre-decode ceiling, not a usability one): a duplicate name never reaches the bridge at
+    all (rejected up front, see above), a request naming more than 100 distinct non-duplicate
+    topics is rejected outright (`INVALID_REQUEST`, no bridge call for any of them), and the
+    request's own wire `timeout_ms` (clamped to `[1s, 30s]`) now bounds the whole handler's
+    aggregate bridge work, not just decoded and discarded - a deadline that fires answers every
+    topic `REQUEST_TIMED_OUT` rather than continuing to hold the shared lockstep `IggyClient`.
 - [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
   - Kafka consumer groups do **not** map onto Iggy consumer groups. Assignment stays client-side, and Iggy's group registry is used as an offset key only ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md))
   - `Partitioning::partition_id(index)` on every Produce. A Kafka producer resolves the partition before it builds the request, so `Partitioning::balanced()` has no trigger there. The `-1` default-partition-count case belongs to CreateTopics
-- [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
+- [x] Real Metadata topic/partition data ([#3534](https://github.com/apache/iggy/issues/3534)):
+      with `IGGY_KAFKA_BRIDGE_ENABLED=true`, a named lookup answers from
+      `IggyBridge::get_kafka_topic` (`UNKNOWN_TOPIC_OR_PARTITION` if not found) and a null
+      topics array ("all topics") answers from `IggyBridge::list_kafka_topics` - the target of
+      every configured `TopicMapping` override plus every other topic in the default stream, so
+      an Iggy stream this bridge has no mapping rule pointing at is never listed (nothing a Kafka
+      client ever named). Every reported partition names this gateway's single broker (node id 1)
+      as leader/replica/ISR, since there is only ever one. `src/protocol/handlers/metadata.rs`,
+      `src/bridge/iggy_bridge/topics.rs` (`get_kafka_topic`/`list_kafka_topics`),
+      `tests/metadata_real_bridge_tests.rs`. With the bridge off, the stub from #3421 reports
+      every requested topic unknown, as before.
+  - Fixed alongside: the stub's `decode_topics` collapsed a null topics array ("all topics") and
+    an explicit empty one (`Some(vec![])`, "these zero topics") to the same `Vec::new()` - the
+    real path's `decode_requested_topics` keeps `Option<Vec<_>>` so the two aren't conflated.
+    Also: at `api_version == 0` an explicit empty array is folded into "all topics" too, matching
+    Kafka's own `isAllTopics()` rule (`topics == null || (topics.isEmpty() && version == 0)`) -
+    there is no v0 wire shape for "cluster info only, zero topics" (that distinct shape, KIP-4's
+    `describeCluster()`, starts at v1).
+  - `get_kafka_topic` shares its implementation with CreateTopics' own existence check above -
+    both need "does this Kafka-side name resolve to a real Iggy topic," so this bridge exposes one
+    method returning the SDK's own `TopicDetails`, not two narrower, independently-maintained
+    lookups.
+  - The response-size cap above only covers the "all topics" and per-name-expansion cases. A
+    named lookup is separately bounded on the request side: names repeated in one request are
+    deduped to one `get_kafka_topic` round trip before any bridge call (not one per occurrence),
+    a lookup naming more than 100 distinct topics is rejected outright
+    (`INVALID_REQUEST`, no bridge call for any of them - `bounds_guard`'s `MAX_REQUEST_ELEMENTS`
+    (4,096) is a pre-decode ceiling, not a usability one), and the whole lookup's aggregate bridge
+    work runs under a fixed 20s wall-clock deadline (`Metadata` carries no `timeout_ms` field in
+    any version, unlike `CreateTopics`, so this cannot be client-honored) - a deadline that fires
+    answers every name `REQUEST_TIMED_OUT` rather than continuing to hold the shared lockstep
+    `IggyClient`. The "all topics" path is server-driven, not client-count-driven, so it has no
+    equivalent cap - only the response-size projection applies there.
+- [ ] Multi-broker topology (this gateway is, and will stay, a single logical broker - node id 1
+      always leads every partition it reports; nothing here models an Iggy cluster as multiple
+      Kafka-visible brokers)
+- [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
+      against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
+      not reproduced or root-caused against the current `kafka_protocol`-based decode path in this
+      session, so not carried forward as a fix here rather than guessed at. Needs fresh
+      reproduction against a real `kcat` before it's re-closed.
 
 ### `kafka-protocol` crate adoption — superseded, done differently
 

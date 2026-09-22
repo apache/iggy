@@ -2,7 +2,15 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
-> **Stub warning:** no API persists or reads real data yet. Produce, Fetch, and ListOffsets return retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of trusting a fake success. CreateTopics does **not** create topics; valid requests return `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. Persistence lands with the Iggy bridge (see [docs/SCOPE.md](docs/SCOPE.md)).
+> **Stub warning:** Produce, Fetch, and ListOffsets still don't persist or read real data - they
+> return retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere
+> instead of trusting a fake success. CreateTopics and Metadata are wired to the Iggy bridge: with
+> `IGGY_KAFKA_BRIDGE_ENABLED=true`, CreateTopics creates a real Iggy stream/topic and Metadata
+> reports real topics and partition counts (a topic not requested by name and not found is
+> silently absent from a null-topics "list all" response, and `UNKNOWN_TOPIC_OR_PARTITION` when
+> named explicitly); with the bridge off (the default), both stay stubs - CreateTopics answers
+> `NOT_CONTROLLER` (41), Metadata reports every requested topic unknown. See
+> [docs/SCOPE.md](docs/SCOPE.md).
 
 ## Run
 
