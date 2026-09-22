@@ -33,7 +33,9 @@
 //! replays a durable journal into a new partition. No partition memory survives
 //! recovery. Failure cases inject an error before either offset directory sync
 //! takes effect. They check both the immediate completion contract and recovery
-//! with fresh history. Purge retries and write acknowledgments are not exercised.
+//! with fresh history. Recovery finishes pending cleanup before loading bookmarks.
+//! Partition tests cover full purge retries. This fixture does not model client
+//! acknowledgments.
 
 use std::cell::Cell;
 use std::io;
@@ -66,6 +68,7 @@ use super::{Crash, SimFile, SimStorage};
 
 const CREATED_REVISION: u64 = 7;
 const OLD_GENERATION: u64 = 4;
+const OLD_LAST_OPERATION: u64 = 3;
 const NEW_GENERATION: u64 = 5;
 const STORED_OFFSET: u64 = 2;
 const CONSUMER_ID: usize = 7;
@@ -120,41 +123,40 @@ async fn purge_sync_failure_preserves_recovery_contract_after_power_loss(
     // Persist the messages without syncing the offset directories again.
     harness.persist_fresh_history().await;
     harness.storage.crash(Crash::PowerLoss);
+    let restored = harness
+        .storage
+        .entries(&harness.offset_directory(failed_kind))
+        .await
+        .unwrap();
+    assert!(
+        !restored.is_empty(),
+        "power loss must restore the unsynced bookmarks"
+    );
     let recovered = harness.recover_partition().await;
     let recovered_generation = recovered.applied_purge_generation();
+    assert_eq!(recovered.purge_floor_op(), OLD_LAST_OPERATION);
     let polls = harness.poll_next(recovered).await;
 
     // Both real Next polls must finish before regression assertions,
     // so a failure shows the results for the consumer and the group.
-    #[expect(
-        clippy::single_match_else,
-        reason = "Both purge outcomes define distinct recovery contracts."
-    )]
-    match purge_result {
-        Err(error) => {
-            // Cleanup is still pending; bookmarks may return until a retry.
-            assert_eq!(
-                recovered_generation, OLD_GENERATION,
-                "rejected purge must remain pending after power loss; \
-                 error {error:?}, polls {polls:?}"
-            );
-        }
-        Ok(()) => {
-            assert_eq!(recovered_generation, NEW_GENERATION);
-            for poll in &polls {
-                assert_eq!(
-                    poll.stored_offset, None,
-                    "successful purge at generation {recovered_generation} \
-                     must not restore an old bookmark; polls {polls:?}"
-                );
-                assert_eq!(
-                    poll.offsets,
-                    [0, 1, 2, 3, 4],
-                    "successful purge must make every fresh message readable; \
-                     polls {polls:?}"
-                );
-            }
-        }
+    assert!(matches!(
+        purge_result,
+        Err(PurgeError::OffsetCleanupNotRecorded(_))
+    ));
+    assert_eq!(
+        recovered_generation, NEW_GENERATION,
+        "recovery must finish pending cleanup before loading bookmarks; polls {polls:?}"
+    );
+    for poll in &polls {
+        assert_eq!(
+            poll.stored_offset, None,
+            "recovery must remove restored bookmarks; polls {polls:?}"
+        );
+        assert_eq!(
+            poll.offsets,
+            [0, 1, 2, 3, 4],
+            "cleanup after power loss must preserve every fresh message; polls {polls:?}"
+        );
     }
 }
 
@@ -167,7 +169,7 @@ fn given_replicated_consumer_sync_failure_when_completing_purge_should_keep_gene
 }
 
 #[test]
-fn given_replicated_consumer_sync_failure_when_power_is_lost_should_not_skip_messages_after_successful_purge()
+fn given_replicated_consumer_sync_failure_when_power_is_lost_should_resume_cleanup_without_skipping_fresh_messages()
  {
     block_on(
         purge_sync_failure_preserves_recovery_contract_after_power_loss(
@@ -186,7 +188,7 @@ fn given_replicated_group_sync_failure_when_completing_purge_should_keep_generat
 }
 
 #[test]
-fn given_replicated_group_sync_failure_when_power_is_lost_should_not_skip_messages_after_successful_purge()
+fn given_replicated_group_sync_failure_when_power_is_lost_should_resume_cleanup_without_skipping_fresh_messages()
  {
     block_on(
         purge_sync_failure_preserves_recovery_contract_after_power_loss(
@@ -205,7 +207,7 @@ fn given_persisted_consumer_sync_failure_when_completing_purge_should_keep_gener
 }
 
 #[test]
-fn given_persisted_consumer_sync_failure_when_power_is_lost_should_not_skip_messages_after_successful_purge()
+fn given_persisted_consumer_sync_failure_when_power_is_lost_should_resume_cleanup_without_skipping_fresh_messages()
  {
     block_on(
         purge_sync_failure_preserves_recovery_contract_after_power_loss(
@@ -224,7 +226,7 @@ fn given_persisted_group_sync_failure_when_completing_purge_should_keep_generati
 }
 
 #[test]
-fn given_persisted_group_sync_failure_when_power_is_lost_should_not_skip_messages_after_successful_purge()
+fn given_persisted_group_sync_failure_when_power_is_lost_should_resume_cleanup_without_skipping_fresh_messages()
  {
     block_on(
         purge_sync_failure_preserves_recovery_contract_after_power_loss(
@@ -232,6 +234,59 @@ fn given_persisted_group_sync_failure_when_power_is_lost_should_not_skip_message
             ConsumerKind::ConsumerGroup,
         ),
     );
+}
+
+#[test]
+fn given_pending_cleanup_when_recovery_sync_fails_should_refuse_stale_bookmarks() {
+    block_on(async {
+        for policy in [Durability::Replicated, Durability::Persisted] {
+            for failed_kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+                let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+                let mut partition = harness.partition_with_stored_progress().await;
+                assert!(
+                    harness
+                        .complete_purge_with_failed_directory_sync(&mut partition, failed_kind)
+                        .await
+                        .is_err()
+                );
+                drop(partition);
+                harness.persist_fresh_history().await;
+                harness.storage.crash(Crash::PowerLoss);
+
+                let mut recovering = harness.empty_partition();
+                recovering
+                    .hydrate_applied_purge_generation_with_storage(&harness.storage)
+                    .await
+                    .unwrap();
+                let directory = harness.offset_directory(failed_kind);
+                let failing_storage = FailingDirectorySync::new(&harness.storage, &directory);
+                let recovery_result = configure_consumer_offsets_with_storage(
+                    &failing_storage,
+                    &mut recovering,
+                    &harness.config,
+                    harness.namespace,
+                    FRESH_MESSAGE_COUNT - 1,
+                )
+                .await;
+
+                assert!(recovery_result.is_err(), "{policy:?}, {failed_kind:?}");
+                assert_eq!(failing_storage.entries_at_failed_sync(), Some(0));
+                assert_eq!(harness.stored_purge_generation().await, OLD_GENERATION);
+                for consumer in consumers() {
+                    assert_eq!(recovering.get_consumer_offset(consumer), None);
+                }
+                drop(recovering);
+
+                // Discard another failed boot: cleanup must still succeed later.
+                harness.storage.crash(Crash::PowerLoss);
+                let recovered = harness.recover_partition().await;
+                assert_eq!(recovered.applied_purge_generation(), NEW_GENERATION);
+                harness
+                    .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
+                    .await;
+            }
+        }
+    });
 }
 
 /// After power loss, a new partition must load the consumer and group
@@ -587,9 +642,11 @@ impl PurgeStorageHarness {
         )
         .await
         .unwrap();
+        // The fixture starts after the old history, whose last operation was 3.
+        journal.reset(OLD_LAST_OPERATION, Some(0)).await.unwrap();
         let mut parent_checksum = 0;
         for offset in 0..FRESH_MESSAGE_COUNT {
-            let operation_number = offset + 1;
+            let operation_number = OLD_LAST_OPERATION + offset + 1;
             // The helper fills the payload with the operation number, allowing
             // polls to verify message contents as well as their offsets.
             let prepare = owned_prepare(operation_number, parent_checksum, offset);
@@ -620,6 +677,10 @@ impl PurgeStorageHarness {
         .await
         .unwrap();
         let mut partition = self.empty_partition();
+        partition
+            .hydrate_applied_purge_generation_with_storage(&self.storage)
+            .await
+            .unwrap();
         for prepare in journal.prepares().await.unwrap() {
             let operation_number = prepare.header().op;
             partition.append_messages(prepare).await.unwrap();
@@ -701,7 +762,8 @@ impl PurgeStorageHarness {
                     let batch = decode_batch_slice(fragment.as_slice()).unwrap();
                     assert_eq!(batch.message_count(), 1);
                     let message = batch.iter().next().unwrap();
-                    let expected_byte = u8::try_from(batch.header.base_offset + 1).unwrap();
+                    let expected_byte =
+                        u8::try_from(OLD_LAST_OPERATION + batch.header.base_offset + 1).unwrap();
                     assert!(message.payload.iter().all(|byte| *byte == expected_byte));
                     batch.header.base_offset
                 })
@@ -721,12 +783,14 @@ impl PurgeStorageHarness {
         let consensus = VsrConsensus::new(
             1,
             0,
-            1,
+            3,
             self.namespace.inner(),
             Rc::new(IggyMessageBus::new(0)),
             LocalPipeline::new(),
         );
         consensus.init();
+        consensus.sequencer().set_sequence(OLD_LAST_OPERATION);
+        consensus.restore_commit_state(OLD_LAST_OPERATION, OLD_LAST_OPERATION);
         let mut partition = IggyPartition::with_in_memory_storage(
             Arc::new(PartitionStats::default()),
             consensus,
