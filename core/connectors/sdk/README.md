@@ -33,9 +33,11 @@ Source-side ACK work should be idempotent because process termination can interr
 
 A source whose accepted input cannot be re-read after a restart can override `Source::batch_policy()` and call `BatchPolicy::with_max_consecutive_nacks(None)` to keep retrying until shutdown. The policy also offers `with_result_timeout` for sources that need a different batch-result deadline. `on_batch_result()` errors still stop polling regardless of the NACK limit.
 
+Sources that can distinguish retryable NACKs from ones that should count toward the breaker can override `Source::nack_disposition()`. Returning `NackDisposition::Retry` after a successful `on_batch_result(Nack)` keeps polling even when the configured limit has been reached, while retaining capped backoff. The default `ApplyPolicy` preserves the existing breaker. If `on_batch_result()` returns an error, polling still stops because its staged-work outcome is unknown.
+
 The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it. The SDK stops polling if the handler returns an error, preventing a failed rollback from advancing to another batch.
 
-SDK 0.6 adds `Source::batch_policy()` with a default implementation, so existing source implementations need no code change when rebuilt. Sources that opt out of the NACK breaker must retain and replay their rejected batch; otherwise disabling the stop only turns a visible failure into a silent drop.
+SDK 0.6 adds `Source::batch_policy()` and `Source::nack_disposition()` with default implementations, so existing source implementations need no code change when rebuilt. Sources that opt out of the NACK breaker must retain and replay their rejected batch; otherwise disabling the stop only turns a visible failure into a silent drop.
 
 The original batch-acknowledgment contract introduced a breaking FFI change. Source plugins built before it must be rebuilt with the matching SDK. The runtime loads `iggy_source_handle_v2`, which supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK. SDK 0.6 does not change these FFI signatures.
 

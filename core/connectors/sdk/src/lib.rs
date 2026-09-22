@@ -117,6 +117,16 @@ pub trait Source: Send + Sync {
         source::BatchPolicy::default()
     }
 
+    /// Decides whether a successfully handled NACK should trip the configured stop limit.
+    ///
+    /// `Retry` keeps polling with capped backoff. This is useful when the source can safely
+    /// replay a rejected batch and knows the failure is transient. The default applies the
+    /// policy's limit. An error from `on_batch_result` is always terminal: the source may not
+    /// have rolled back its staged work safely.
+    fn nack_disposition(&self) -> source::NackDisposition {
+        source::NackDisposition::ApplyPolicy
+    }
+
     /// Retrieves the next batch for the runtime to process and deliver.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
 
