@@ -33,15 +33,20 @@ name = "iggy-gateway-kafka"
 path = "src/main.rs"
 
 [dependencies]
+# Required by kafka-protocol: its custom-decompression hook is typed on anyhow::Result.
+anyhow = { workspace = true }
 bytes = { workspace = true }
+# The four codecs are driven from `records::decompress` rather than through kafka-protocol,
+# whose decompressors materialize the whole stream before a budget can see it.
+flate2 = { workspace = true }
 iggy = { workspace = true }
-# Broker-role only: decodes requests and encodes responses. Default features also pull in
-# client-role codec paths and compression codecs (gzip/lz4/snappy/zstd) this gateway never
-# uses, since RecordBatch payloads stay opaque `Bytes` here.
-kafka-protocol = { workspace = true }
+# The codec features stay on for the encoder, which the batch tests use to build fixtures.
+kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
+lz4 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+snap = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
@@ -58,8 +63,11 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
+# Repairs the CRC of a batch header a test rewrote, which the decoder checks first.
+crc32c = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
