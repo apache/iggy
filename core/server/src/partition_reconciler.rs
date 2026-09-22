@@ -1488,6 +1488,7 @@ mod tests {
         Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
         RequestPreparesHeader, RoutedRequestHeader, WireIdentifier, WireOptions,
     };
+    use journal::Journal;
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
     use metadata::MuxStateMachine;
@@ -3081,6 +3082,72 @@ mod tests {
                 .partition_repair_serves_deferred_purge_value(),
             deferred_before + 1,
             "the retried frame must pass the gate without another deferral"
+        );
+    }
+
+    /// Receive half of the inverted-range fix: a `RepairDone` landing on a
+    /// session whose floor the commit walk already passed must close the
+    /// session. Verifying the moot floor kept it armed while the walk ran to
+    /// the fetch ceiling, and the next chunk request was `9..=8`.
+    #[compio::test]
+    async fn repair_done_over_a_passed_floor_closes_the_session() {
+        const NONCE: u128 = 13;
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-repair-ceiling");
+        seed_topic(&mux, 2, 0, "topic-repair-ceiling", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        let ns = IggyNamespace::new(0, 0, 0);
+        let served = CreateStreamRequest {
+            name: WireName::new("served-op").expect("test stream name fits WireName"),
+            options: WireOptions::empty(),
+        };
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions
+                .get_mut_by_ns(&ns)
+                .expect("partition is materialised");
+            // Ops 5..=7 committed and evicted after the request went out, op 8
+            // is the served remainder, and the window's first batch sits above
+            // the boot-recovered durable end.
+            partition.consensus().restore_commit_state(7, 8);
+            partition.recovered_durable_offset = Some(10);
+            partition
+                .log
+                .journal()
+                .inner
+                .append(build_prepare(8, Operation::CreateStream, &served).into_frozen())
+                .await
+                .expect("journal the served op");
+            partition.repair = Some(RepairSession {
+                nonce: NONCE,
+                view: 0,
+                commit_to_op: 8,
+                fetch_to_op: 8,
+                floor: Some(5),
+                peer: 1,
+                first_batch_offset: Some(20),
+                idle_ticks: 0,
+            });
+        }
+
+        shard
+            .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+            .await;
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_mut_by_ns(&ns)
+            .expect("partition survives the reply");
+        assert_eq!(partition.consensus().commit_min(), 8);
+        assert!(
+            partition.repair.is_none(),
+            "a walk that reached the fetch ceiling leaves nothing to request"
         );
     }
 
