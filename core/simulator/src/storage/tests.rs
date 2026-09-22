@@ -787,6 +787,8 @@ fn synchronized_corruption_in_any_record_block_is_refused() {
 
 async fn interrupted_install() -> SimStorage {
     let (storage, mut journal) = baseline().await;
+    // `baseline` completed its original-writer syncs before this test-only
+    // [`install_backup::begin_with_storage`] call.
     install_backup::begin_with_storage(Path::new(DIRECTORY), &storage)
         .await
         .unwrap();
@@ -800,7 +802,8 @@ async fn interrupted_install() -> SimStorage {
 }
 
 /// A hard link preserves the inode, not the writer's error cursor. Opening the
-/// backup name after writeback failed must not authorize destructive install.
+/// backup name after writeback failed must not authorize destructive install;
+/// [`CheckpointBarrier::from_file`] must retain the original error cursor.
 #[test]
 fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publication() {
     block_on(async {
@@ -2537,6 +2540,8 @@ async fn install(
     storage: &SimStorage,
     journal: &mut PartitionPrepareJournal<SimStorage>,
 ) -> io::Result<()> {
+    // Fault-matrix setup injects no background writeback error before this
+    // test-only [`install_backup::begin_with_storage`] call.
     install_backup::begin_with_storage(Path::new(DIRECTORY), storage).await?;
     replace(storage, Path::new("/partition/state"), b"new").await?;
     for path in MATERIALIZED_FILES {
