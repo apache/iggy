@@ -347,7 +347,7 @@ mod tests {
     /// act on it.
     #[test]
     #[serial]
-    fn given_an_unparseable_instance_id_when_loading_config_should_reject_and_name_it() {
+    fn given_an_unparsable_instance_id_when_loading_config_should_reject_and_name_it() {
         for raw in ["abc", "-1", "", " 7", "7.0"] {
             unsafe {
                 std::env::set_var("IGGY_KAFKA_INSTANCE_ID", raw);
