@@ -250,6 +250,12 @@ impl TopicMapping {
         &self.default_stream
     }
 
+    /// Every configured `(kafka_topic, override)` pair, for callers that need to enumerate the
+    /// mapping rather than resolve one name through it (`Metadata`'s "list all topics" case).
+    pub fn overrides(&self) -> impl Iterator<Item = (&str, &TopicOverride)> {
+        self.topics.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Resolves a Kafka topic name to `(iggy_stream, iggy_topic)`.
     ///
     /// Not injective: two distinct Kafka topics can resolve to the same Iggy stream/topic pair,

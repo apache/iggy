@@ -75,6 +75,12 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// `CreateTopics`: a requested topic carried one or more per-topic Kafka configs.
+///
+/// None of `retention.ms`, `cleanup.policy`, etc. maps onto an Iggy topic option this bridge
+/// applies, so every non-empty `configs` list is rejected outright rather than silently dropping
+/// a subset an operator might believe took effect.
+pub const ERROR_INVALID_CONFIG: i16 = 40;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]

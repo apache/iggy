@@ -28,5 +28,5 @@ pub mod topic_map;
 
 pub use config::IggyBridgeConfig;
 pub use error::BridgeError;
-pub use iggy_bridge::IggyBridge;
+pub use iggy_bridge::{IggyBridge, KafkaTopicMetadata, TopicCreationOutcome};
 pub use topic_map::{TopicMapping, TopicOverride};

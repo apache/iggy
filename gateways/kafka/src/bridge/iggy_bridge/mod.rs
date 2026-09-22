@@ -29,6 +29,8 @@ mod offsets;
 mod produce;
 mod topics;
 
+pub use topics::{KafkaTopicMetadata, TopicCreationOutcome};
+
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
 ///
 /// Not the SDK's own default (`TcpClientReconnectionConfig::default()` is `max_retries: None` -
