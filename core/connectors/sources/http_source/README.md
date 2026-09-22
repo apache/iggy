@@ -107,7 +107,11 @@ auth_secret = "partner-token"
 
 The stream's `schema` **must be `raw`**. This connector always produces raw bodies; with `schema = "json"` the runtime's encoder rejects every message, which counts as a processing error and becomes a NACK rather than a drop.
 
-The batch is then replayed on every poll and the SDK stops the poll task after five consecutive NACKs, while the listener keeps answering 200. The connector cannot guard against this itself: `schema` lives under `[[streams]]` and the plugin only ever receives `[plugin_config]`, so nothing in `open()` can see it.
+The batch is then replayed on every poll. This source disables the SDK's consecutive-NACK breaker by default because accepted webhooks exist only in its in-memory bridge. Repeated failures back off to a five-second retry delay, and the listener answers 429 once the bridge fills.
+
+Set `max_consecutive_nacks` in `[plugin_config]` to a positive integer only if an external replay mechanism makes stopping safe. This does not make a mismatched stream schema valid: `schema` lives under `[[streams]]` and the plugin only receives `[plugin_config]`.
+
+Rebuild the HTTP source plugin with SDK 0.6 to get this behavior. An older plugin binary still uses the five-NACK limit.
 
 ### Options
 
@@ -122,6 +126,7 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 67108864**; a larger value fails `open()`. |
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. **Max 100000**; a larger value fails `open()`. |
+| `max_consecutive_nacks` | positive integer | disabled | Optional SDK breaker limit. Omit to keep retrying NACKed batches with capped backoff; set only when accepted events can be replayed after a restart. Zero is invalid. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
 | `forward_headers` | array | `[]` | Request headers copied onto the message. Invalid names fail `open()`, as do `Authorization`, `Proxy-Authorization`, and `Cookie`, because forwarding a reusable credential would copy it onto every message and persist it in the log. |
 | `endpoints` | array | `[]` | Static secret-path endpoints. |
