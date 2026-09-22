@@ -68,7 +68,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
@@ -93,8 +93,12 @@ jobs:
       - name: Generate third-party license manifest
         run: |
           TARGET="$(uname -m)-unknown-linux-musl"
-          curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
-            | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about"
+          tarball="$(mktemp)"
+          # Staged to a file because curl --retry cannot rewind a pipe.
+          curl -sSfL --retry 5 --retry-all-errors -o "$tarball" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz"
+          tar -xzf "$tarball" -C "$HOME/.cargo/bin" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about"
+          rm -f "$tarball"
           ./scripts/ci/third-party-licenses.sh --generate --manifest foreign/python/Cargo.toml --output foreign/python/LICENSE-binary
 
       - name: Build wheels
@@ -130,7 +134,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
@@ -160,8 +164,11 @@ jobs:
           ARCH="$(uname -m | sed 's/arm64/aarch64/')"
           if [ "$ARCH" = "aarch64" ]; then
             TARGET="aarch64-apple-darwin"
-            curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
-              | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about"
+            tarball="$(mktemp)"
+            curl -sSfL --retry 5 --retry-all-errors -o "$tarball" \
+              "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz"
+            tar -xzf "$tarball" -C "$HOME/.cargo/bin" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about"
+            rm -f "$tarball"
           else
             cargo install cargo-about --locked --version 0.9.0 --features cli
           fi
@@ -200,7 +207,7 @@ jobs:
         if: inputs.use_latest_ci
         shell: bash
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
@@ -246,8 +253,11 @@ jobs:
           TARGET="x86_64-pc-windows-msvc"
           # HOME is Windows-style here, which MSYS tar mishandles as -C.
           CARGO_BIN="$(cygpath -u "$HOME")/.cargo/bin"
-          curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
-            | tar -xz -C "$CARGO_BIN" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about.exe"
+          tarball="$(cygpath -u "$(mktemp)")"
+          curl -sSfL --retry 5 --retry-all-errors -o "$tarball" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz"
+          tar -xzf "$tarball" -C "$CARGO_BIN" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about.exe"
+          rm -f "$tarball"
           ./scripts/ci/third-party-licenses.sh --generate --manifest foreign/python/Cargo.toml --output foreign/python/LICENSE-binary
 
       - name: Build wheels
@@ -272,7 +282,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
@@ -318,10 +328,10 @@ jobs:
 
       - name: List wheels
         run: |
-          echo "## 📦 Built Python Wheels" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Platform | Architecture | File |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Built Python Wheels" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Platform | Architecture | File |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------------|------|" >> "$GITHUB_STEP_SUMMARY"
 
           for wheel in dist/*.whl; do
             filename=$(basename "$wheel")
@@ -335,11 +345,11 @@ jobs:
             elif [[ "$filename" == *"i686"* ]]; then arch="x86"
             else arch="any"; fi
 
-            echo "| $platform | $arch | \`$filename\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| $platform | $arch | \`$filename\` |" >> "$GITHUB_STEP_SUMMARY"
           done
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Total wheels built:** $(ls -1 dist/*.whl | wc -l)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total wheels built:** $(ls -1 dist/*.whl | wc -l)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined artifact
         uses: actions/upload-artifact@v7
@@ -349,7 +359,7 @@ jobs:
           retention-days: 30
 
       - id: output
-        run: echo "artifact_name=python-wheels-all" >> $GITHUB_OUTPUT
+        run: echo "artifact_name=python-wheels-all" >> "$GITHUB_OUTPUT"
 
       # Runs last so the artifact and the summary survive for inspection
       # when a leg is missing. A failed build job uploads nothing, so a
