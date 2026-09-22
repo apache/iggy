@@ -78,7 +78,7 @@ public class FetchMessagesTests
         });
 
         response.Messages.Count.ShouldBe(10);
-        response.PartitionId.ShouldBe(0);
+        response.PartitionId.ShouldBe(0u);
         response.CurrentOffset.ShouldBe(19u);
 
         foreach (var responseMessage in response.Messages)
@@ -129,7 +129,7 @@ public class FetchMessagesTests
 
         var response = await client.PollMessagesAsync(headersMessageFetchRequest);
         response.Messages.Count.ShouldBe(10);
-        response.PartitionId.ShouldBe(0);
+        response.PartitionId.ShouldBe(0u);
         response.CurrentOffset.ShouldBe(19u);
         foreach (var responseMessage in response.Messages)
         {

@@ -19,8 +19,8 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::SystemClient;
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, OptionSpec, OptionsScope, Snapshot,
-    SnapshotCompression, Stats, SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec, OptionsScope,
+    Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
 };
 
 #[async_trait]
@@ -85,7 +85,7 @@ impl SystemClient for ClientWrapper {
         }
     }
 
-    async fn heartbeat_interval(&self) -> IggyDuration {
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         match self {
             ClientWrapper::Iggy(client) => client.heartbeat_interval().await,
             ClientWrapper::Http(client) => client.heartbeat_interval().await,

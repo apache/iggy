@@ -29,10 +29,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(20);
 
 pub struct ConnectorsRuntimeHandle {
     server_id: u32,
@@ -42,6 +44,7 @@ pub struct ConnectorsRuntimeHandle {
     child_handle: Option<Child>,
     server_address: SocketAddr,
     iggy_address: Option<SocketAddr>,
+    iggy_connection_options: Option<String>,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
     _port_reserver: SinglePortReserver,
@@ -78,6 +81,14 @@ impl ConnectorsRuntimeHandle {
         common::collect_logs(&self.stdout_path, &self.stderr_path)
     }
 
+    pub fn set_iggy_connection_options(&mut self, options: impl Into<String>) {
+        self.iggy_connection_options = Some(options.into());
+    }
+
+    pub fn clear_iggy_connection_options(&mut self) {
+        self.iggy_connection_options = None;
+    }
+
     fn build_envs(&mut self) {
         let state_path = self.context.connectors_runtime_state_path(self.server_id);
         self.envs.insert(
@@ -90,8 +101,12 @@ impl ConnectorsRuntimeHandle {
         );
 
         if let Some(addr) = self.iggy_address {
+            let address = self
+                .iggy_connection_options
+                .as_ref()
+                .map_or_else(|| addr.to_string(), |options| format!("{addr}?{options}"));
             self.envs
-                .insert("IGGY_CONNECTORS_IGGY_ADDRESS".to_string(), addr.to_string());
+                .insert("IGGY_CONNECTORS_IGGY_ADDRESS".to_string(), address);
         }
 
         if let Some(ref config_path) = self.config.config_path {
@@ -125,6 +140,7 @@ impl ConnectorsRuntimeHandle {
             child_handle: None,
             server_address,
             iggy_address: None,
+            iggy_connection_options: None,
             stdout_path: None,
             stderr_path: None,
             _port_reserver: reserver,
@@ -243,20 +259,48 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
-        let http_address = self.http_url();
-        let client = reqwest::Client::new();
+        let health_url = format!("{}/health", self.http_url());
+        let client = reqwest::Client::builder()
+            .timeout(HEALTH_PROBE_TIMEOUT)
+            .build()
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!("Failed to build connectors health client: {error}"),
+            })?;
 
-        for retry in 0..common::DEFAULT_HEALTH_CHECK_RETRIES {
-            match client.get(&http_address).send().await {
-                Ok(_) => {
-                    return Ok(());
-                }
-                Err(_) => {
-                    if retry == common::DEFAULT_HEALTH_CHECK_RETRIES - 1 {
+        let deadline = Instant::now() + HEALTH_CHECK_BUDGET;
+        let mut retries = 0u32;
+
+        loop {
+            if let Some(pid) = self.pid()
+                && !common::is_process_alive(pid)
+            {
+                let (stdout, stderr) = self.collect_logs();
+                return Err(TestBinaryError::ProcessCrashed {
+                    binary: "iggy-connectors".to_string(),
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TestBinaryError::HealthCheckFailed {
+                    binary: "iggy-connectors".to_string(),
+                    address: health_url,
+                    retries,
+                });
+            }
+
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(_) | Err(_) => {
+                    retries += 1;
+                    if Instant::now() >= deadline {
                         return Err(TestBinaryError::HealthCheckFailed {
                             binary: "iggy-connectors".to_string(),
-                            address: http_address,
-                            retries: common::DEFAULT_HEALTH_CHECK_RETRIES,
+                            address: health_url,
+                            retries,
                         });
                     }
                     sleep(Duration::from_millis(
@@ -266,8 +310,6 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
                 }
             }
         }
-
-        unreachable!()
     }
 }
 

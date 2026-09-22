@@ -35,15 +35,37 @@ impl MessageClient for ClientWrapper {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_strategy_for(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            &|_: u32| *strategy,
+            count,
+            auto_commit,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_strategy_for(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+    ) -> Result<PolledMessages, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_strategy_for(
                         stream_id,
                         topic_id,
                         partition_id,
                         consumer,
-                        strategy,
+                        strategy_for,
                         count,
                         auto_commit,
                     )
@@ -51,12 +73,12 @@ impl MessageClient for ClientWrapper {
             }
             ClientWrapper::Http(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_strategy_for(
                         stream_id,
                         topic_id,
                         partition_id,
                         consumer,
-                        strategy,
+                        strategy_for,
                         count,
                         auto_commit,
                     )
@@ -64,12 +86,12 @@ impl MessageClient for ClientWrapper {
             }
             ClientWrapper::Tcp(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_strategy_for(
                         stream_id,
                         topic_id,
                         partition_id,
                         consumer,
-                        strategy,
+                        strategy_for,
                         count,
                         auto_commit,
                     )
@@ -77,12 +99,12 @@ impl MessageClient for ClientWrapper {
             }
             ClientWrapper::Quic(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_strategy_for(
                         stream_id,
                         topic_id,
                         partition_id,
                         consumer,
-                        strategy,
+                        strategy_for,
                         count,
                         auto_commit,
                     )
@@ -90,12 +112,12 @@ impl MessageClient for ClientWrapper {
             }
             ClientWrapper::WebSocket(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_strategy_for(
                         stream_id,
                         topic_id,
                         partition_id,
                         consumer,
-                        strategy,
+                        strategy_for,
                         count,
                         auto_commit,
                     )

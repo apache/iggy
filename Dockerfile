@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.98
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
 WORKDIR /build

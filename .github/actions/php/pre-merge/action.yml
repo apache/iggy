@@ -161,10 +161,9 @@ runs:
       shell: bash
       working-directory: foreign/php
       env:
-        IGGY_HOST: 127.0.0.1
-        IGGY_PORT: 8090
-        IGGY_USERNAME: iggy
-        IGGY_PASSWORD: iggy
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
+        IGGY_ROOT_USERNAME: iggy
+        IGGY_ROOT_PASSWORD: iggy
       run: |
         mkdir -p ../../reports
         ./scripts/test.sh --log-junit ../../reports/php-junit.xml
@@ -194,8 +193,7 @@ runs:
       shell: bash
       working-directory: foreign/php
       env:
-        IGGY_HOST: 127.0.0.1
-        IGGY_PORT: 8090
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
         IGGY_TLS_CONNECTION_STRING: iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=${{ github.workspace }}/core/certs/iggy_ca_cert.pem
         IGGY_TLS_PLAINTEXT_ADDRESS: 127.0.0.1:8090
       run: ./scripts/test.sh --log-junit ../../reports/php-tls-junit.xml tests/TlsTest.php

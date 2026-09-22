@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.98
 FROM rust:${RUST_VERSION}-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -36,8 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV PHP=/usr/bin/php
 ENV PHP_CONFIG=/usr/bin/php-config
-ENV IGGY_HOST=iggy-server
-ENV IGGY_PORT=8090
+ENV IGGY_TCP_ADDRESS=iggy-server:8090
 
 WORKDIR /workspace
 

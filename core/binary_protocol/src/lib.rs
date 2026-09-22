@@ -74,17 +74,19 @@ pub use consensus::{
     DoViewChangeHeader, EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
     ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
-    PrepareOkHeader, RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader,
-    ReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET,
-    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
-    frame_body, frame_checksum_bytes, read_size_field, result_code, result_section_len,
+    PrepareOkHeader, REJECTION_SECTION_LEN, RESERVED_COMMAND_LEN, RepairPrepareHeader,
+    RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes,
+    prepare_identity_checksum_bytes, read_size_field, result_code, result_section_len,
+    write_rejection_section,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
 pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
 pub use primitives::ack_level::AckLevel;
-pub use primitives::consumer::{KIND_CONSUMER_GROUP, WireConsumer};
+pub use primitives::consumer::{KIND_CONSUMER, KIND_CONSUMER_GROUP, WireConsumer};
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
 pub use primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions, validate_options};
 pub use primitives::partition_assignment::CreatedPartitionAssignment;

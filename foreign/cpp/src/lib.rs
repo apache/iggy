@@ -22,7 +22,7 @@ mod messages;
 mod producer;
 mod type_conversion;
 
-use client::{Client, delete_connection as delete_client, new_connection};
+use client::{Client, delete_connection as delete_client, from_connection_string, new_connection};
 use consumer::Consumer;
 use messages::make_message;
 use producer::Producer;
@@ -185,9 +185,8 @@ mod ffi {
         /// the same batch at a lower offset, so this never identifies a batch
         /// uniquely.
         ///
-        /// A batch is confirmed once it is committed in memory, not once it is
-        /// fsynced. A crash-restart can stamp a later batch with an offset a
-        /// client has already recorded.
+        /// Confirmation follows VSR quorum commit. Persisted message durability
+        /// also requires recoverable stable-storage copies on the quorum.
         base_offset: u64,
     }
 
@@ -372,33 +371,125 @@ mod ffi {
         streams: Vec<StreamPermissionEntry>,
     }
 
+    #[repr(u8)]
+    enum UserStatus {
+        Active = 1,
+        Inactive = 2,
+    }
+
+    struct UserInfo {
+        id: u32,
+        created_at: u64,
+        status: UserStatus,
+        username: String,
+    }
+
+    struct UserInfoDetails {
+        id: u32,
+        created_at: u64,
+        status: UserStatus,
+        username: String,
+        has_permissions: bool,
+        permissions: Permissions,
+    }
+
+    struct LoginInfo {
+        user_id: u32,
+        has_access_token: bool,
+        access_token: String,
+        access_token_expiry: u64,
+    }
+
+    #[repr(u8)]
+    enum AutoLoginKind {
+        Disabled = 0,
+        UsernamePassword,
+        PersonalAccessToken,
+    }
+
+    struct IggyClientConfig {
+        server_address: String,
+        auto_login_kind: AutoLoginKind,
+        username: String,
+        password: String,
+        personal_access_token: String,
+        has_reconnection_max_retries: bool,
+        reconnection_max_retries: u32,
+        has_reconnection_interval: bool,
+        reconnection_interval_micros: u64,
+        has_reestablish_after: bool,
+        reestablish_after_micros: u64,
+        tls_enabled: bool,
+        tls_domain: String,
+        tls_ca_file: String,
+        has_tls_validate_certificate: bool,
+        tls_validate_certificate: bool,
+        no_delay: bool,
+    }
+
+    struct TopicCreateOptions {
+        has_partitions_count: bool,
+        partitions_count: u32,
+        has_compression_algorithm: bool,
+        compression_algorithm: String,
+        has_message_expiry: bool,
+        message_expiry_kind: String,
+        message_expiry_value: u64,
+        has_max_topic_size: bool,
+        max_topic_size: String,
+        has_segment_size: bool,
+        segment_size: u64,
+        has_durability: bool,
+        durability: String,
+        has_consumer_offset_durability: bool,
+        consumer_offset_durability: String,
+        has_messages_required_to_save: bool,
+        messages_required_to_save: u32,
+        has_size_of_messages_required_to_save: bool,
+        size_of_messages_required_to_save: u64,
+        has_preallocate_segments: bool,
+        preallocate_segments: bool,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct TopicUpdateOptions {
+        has_compression_algorithm: bool,
+        compression_algorithm: String,
+        has_message_expiry: bool,
+        message_expiry_kind: String,
+        message_expiry_value: u64,
+        has_max_topic_size: bool,
+        max_topic_size: String,
+        raw_options: Vec<HeaderEntry>,
+    }
+
     extern "Rust" {
         type Client;
         type Consumer;
         type Producer;
 
         // Client functions
-        fn new_connection(connection_string: String) -> Result<*mut Client>;
-        fn login_user(self: &Client, username: String, password: String) -> Result<()>;
+        fn new_connection(config: IggyClientConfig) -> Result<*mut Client>;
+        fn from_connection_string(connection_string: String) -> Result<*mut Client>;
+        fn login_user(self: &Client, username: String, password: String) -> Result<LoginInfo>;
         fn logout_user(self: &Client) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
         fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
-        fn update_stream(self: &Client, stream_id: Identifier, stream_name: String) -> Result<()>;
+        fn update_stream(
+            self: &Client,
+            stream_id: Identifier,
+            stream_name: String,
+            options: Vec<HeaderEntry>,
+        ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         fn purge_stream(self: &Client, stream_id: Identifier) -> Result<()>;
-        #[allow(clippy::too_many_arguments)]
         fn create_topic(
             self: &Client,
             stream_id: Identifier,
             topic_name: String,
-            partitions_count: u32,
-            compression_algorithm: String,
-            message_expiry_kind: String,
-            message_expiry_value: u64,
-            max_topic_size: String,
-            options: Vec<HeaderEntry>,
+            options: TopicCreateOptions,
         ) -> Result<TopicDetails>;
         fn get_topic(
             self: &Client,
@@ -406,17 +497,12 @@ mod ffi {
             topic_id: Identifier,
         ) -> Result<TopicDetails>;
         fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
-        #[allow(clippy::too_many_arguments)]
         fn update_topic(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             topic_name: String,
-            compression_algorithm: String,
-            message_expiry_kind: String,
-            message_expiry_value: u64,
-            max_topic_size: String,
-            options: Vec<HeaderEntry>,
+            options: TopicUpdateOptions,
         ) -> Result<()>;
         fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
@@ -542,7 +628,6 @@ mod ffi {
         ) -> Result<Vec<u8>>;
         fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
 
-        // Future functions
         fn disconnect(self: &Client) -> Result<()>;
         fn shutdown(self: &Client) -> Result<()>;
         // fn subscribe_events(self: &Client) -> Result<()>;
@@ -553,11 +638,25 @@ mod ffi {
             partition_id: u32,
             segments_count: u32,
         ) -> Result<()>;
-        // fn get_user(self: &Client, user_id: Identifier) -> Result<()>;
-        // fn get_users(self: &Client) -> Result<()>;
-        // fn create_user(self: &Client, username: String, password: String, status: u8) -> Result<()>;
-        // fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
-        // fn update_user(self: &Client, user_id: Identifier, username: String, status: u8) -> Result<()>;
+        fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
+        fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
+        fn create_user(
+            self: &Client,
+            username: String,
+            password: String,
+            status: UserStatus,
+            has_permissions: bool,
+            permissions: Permissions,
+        ) -> Result<UserInfoDetails>;
+        fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
+        fn update_user(
+            self: &Client,
+            user_id: Identifier,
+            has_username: bool,
+            username: String,
+            has_status: bool,
+            status: UserStatus,
+        ) -> Result<()>;
         fn update_permissions(
             self: &Client,
             user_id: Identifier,
@@ -580,7 +679,7 @@ mod ffi {
         // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
-        unsafe fn delete_client(client: *mut Client) -> Result<()>;
+        unsafe fn delete_client(client: *mut Client);
 
         // Identifier functions
         fn set_string(self: &mut Identifier, id: String) -> Result<()>;

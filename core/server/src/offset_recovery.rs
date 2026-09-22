@@ -26,169 +26,196 @@
 //! ways: it reads the first eight bytes and stops, and a file it wrote itself decodes
 //! here as unchecksummed.
 
-use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
-use partitions::offset_storage::{OffsetRecord, decode_offset_record};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
+
+use futures::StreamExt;
+use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
+#[cfg(test)]
+use journal::durable_storage::DiskStorage;
+use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
+use partitions::offset_storage::{OffsetRecord, decode_offset_record, offset_replacement_id};
 use tracing::{error, trace, warn};
 
 const COMPONENT: &str = "STREAMING_PARTITIONS";
 
-pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyError> {
-    trace!("Loading consumer offsets from path: {path}...");
-    let Ok(dir_entries) = std::fs::read_dir(path) else {
-        return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
-    };
+pub struct RecoveredOffsets<T> {
+    pub entries: Vec<T>,
+    pub stranded_ids: Vec<u32>,
+}
 
-    let mut consumer_offsets = Vec::new();
-    for dir_entry in dir_entries {
-        let dir_entry = match dir_entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                warn!(
-                    "Failed to read directory entry in consumer offsets path: {path}, \
-                     error: {e}, skipping."
-                );
-                continue;
+enum OffsetFileLoad {
+    Loaded(AtomicU64),
+    Removed,
+    Stranded,
+}
+
+impl<T> Default for RecoveredOffsets<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            stranded_ids: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub async fn load_consumer_offsets(
+    path: &str,
+) -> Result<RecoveredOffsets<ConsumerOffset>, IggyError> {
+    load_consumer_offsets_with_storage(&DiskStorage, path).await
+}
+
+/// Recover consumer records, ordered by consumer ID, from a storage backend.
+/// Invalid records are removed when possible. Unreadable records or removals
+/// that cannot be made durable retain their IDs in `stranded_ids`.
+///
+/// # Errors
+/// Returns [`IggyError::CannotReadConsumerOffsets`] if the directory cannot be
+/// enumerated, including when it is missing.
+pub async fn load_consumer_offsets_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+) -> Result<RecoveredOffsets<ConsumerOffset>, IggyError> {
+    let mut recovered =
+        load_offsets(storage, path, ConsumerKind::Consumer, |offset| offset).await?;
+    recovered.entries.sort_by_key(|offset| offset.consumer_id);
+    Ok(recovered)
+}
+
+#[cfg(test)]
+pub async fn load_consumer_group_offsets(
+    path: &str,
+) -> Result<RecoveredOffsets<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
+    load_consumer_group_offsets_with_storage(&DiskStorage, path).await
+}
+
+/// Recover group records with the same cleanup and stranded file handling as
+/// [`load_consumer_offsets_with_storage`].
+///
+/// # Errors
+/// Returns [`IggyError::CannotReadConsumerOffsets`] if the directory cannot be
+/// enumerated, including when it is missing.
+pub async fn load_consumer_group_offsets_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+) -> Result<RecoveredOffsets<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
+    load_offsets(storage, path, ConsumerKind::ConsumerGroup, |offset| {
+        (ConsumerGroupId(offset.consumer_id as usize), offset)
+    })
+    .await
+}
+
+async fn load_offsets<S: DurableStorage, T>(
+    storage: &S,
+    path: &str,
+    kind: ConsumerKind,
+    construct: impl Fn(ConsumerOffset) -> T,
+) -> Result<RecoveredOffsets<T>, IggyError> {
+    trace!(?kind, path, "loading consumer offsets");
+    let mut dir_entries = storage
+        .regular_files(Path::new(path))
+        .await
+        .map_err(|error| {
+            warn!(?kind, path, %error, "failed to enumerate offset directory");
+            IggyError::CannotReadConsumerOffsets(path.to_owned())
+        })?;
+    let mut recovered = RecoveredOffsets::default();
+    while let Some(entry) = dir_entries.next().await {
+        let entry_path = match entry {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(?kind, path, %error, "failed to enumerate offset directory");
+                return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
             }
         };
-
-        let metadata = match dir_entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "Failed to read metadata for entry in consumer offsets path: {path}, \
-                     error: {e}, skipping."
-                );
-                continue;
-            }
-        };
-
-        if metadata.is_dir() {
+        let name = entry_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if offset_replacement_id(&name).is_some() {
+            remove_stale_replacement(storage, &entry_path, &name).await;
             continue;
         }
-
-        let name = dir_entry.file_name().to_string_lossy().to_string();
         let Ok(consumer_id) = name.parse::<u32>() else {
             warn!(
-                "Unexpected non-numeric consumer offset file: '{}', skipping.",
-                name
+                ?kind,
+                name, "unexpected non-numeric consumer offset file, skipping"
             );
             continue;
         };
-
-        let path = dir_entry.path();
-        let Some(path) = path.to_str().map(str::to_owned) else {
-            error!("Invalid consumer ID path for file with name: '{}'.", name);
+        let Some(path) = entry_path.to_str().map(str::to_owned) else {
+            error!(?kind, name, "invalid consumer offset path");
             continue;
         };
-
-        let Some(offset) = read_offset_file(&path, "consumer offset") else {
-            continue;
+        let offset = match read_offset_file(storage, &path, offset_kind_label(kind)).await {
+            OffsetFileLoad::Loaded(offset) => offset,
+            OffsetFileLoad::Removed => continue,
+            OffsetFileLoad::Stranded => {
+                recovered.stranded_ids.push(consumer_id);
+                continue;
+            }
         };
-
-        consumer_offsets.push(ConsumerOffset {
-            kind: ConsumerKind::Consumer,
+        recovered.entries.push(construct(ConsumerOffset {
+            kind,
             consumer_id,
             offset,
             path,
-        });
+        }));
     }
-
-    consumer_offsets.sort_by_key(|consumer_offset| consumer_offset.consumer_id);
-    Ok(consumer_offsets)
+    Ok(recovered)
 }
 
-pub fn load_consumer_group_offsets(
+/// A crashed atomic replacement leaves its sibling behind. The rename never
+/// landed, so the sibling is never authoritative. Removal needs no directory
+/// sync because a resurrected sibling is still ignored on the next load.
+async fn remove_stale_replacement<S: DurableStorage>(storage: &S, path: &Path, name: &str) {
+    match storage.remove_file(path).await {
+        Ok(()) => trace!("Removed stale offset replacement file: '{name}'."),
+        Err(e) => warn!(
+            "{COMPONENT} (error: {e}) - could not remove stale offset replacement \
+             file: '{name}', skipping."
+        ),
+    }
+}
+
+const fn offset_kind_label(kind: ConsumerKind) -> &'static str {
+    match kind {
+        ConsumerKind::Consumer => "consumer offset",
+        ConsumerKind::ConsumerGroup => "consumer group offset",
+    }
+}
+
+async fn read_offset_file<S: DurableStorage>(
+    storage: &S,
     path: &str,
-) -> Result<Vec<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
-    trace!("Loading consumer group offsets from path: {path}...");
-    let Ok(dir_entries) = std::fs::read_dir(path) else {
-        return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
-    };
-
-    let mut consumer_group_offsets = Vec::new();
-    for dir_entry in dir_entries {
-        let dir_entry = match dir_entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                warn!(
-                    "Failed to read directory entry in consumer group offsets path: {path}, \
-                     error: {e}, skipping."
-                );
-                continue;
-            }
-        };
-
-        let metadata = match dir_entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "Failed to read metadata for entry in consumer group offsets path: {path}, \
-                     error: {e}, skipping."
-                );
-                continue;
-            }
-        };
-
-        if metadata.is_dir() {
-            continue;
-        }
-
-        let name = dir_entry.file_name().to_string_lossy().to_string();
-        let Ok(raw_consumer_group_id) = name.parse::<u32>() else {
-            warn!(
-                "Unexpected non-numeric consumer group offset file: '{}', skipping.",
-                name
-            );
-            continue;
-        };
-        let consumer_group_id = ConsumerGroupId(raw_consumer_group_id as usize);
-
-        let path = dir_entry.path();
-        let Some(path) = path.to_str().map(str::to_owned) else {
-            error!(
-                "Invalid consumer group offset path for file with name: '{}'.",
-                name
-            );
-            continue;
-        };
-
-        let Some(offset) = read_offset_file(&path, "consumer group offset") else {
-            continue;
-        };
-
-        let consumer_offset = ConsumerOffset {
-            kind: ConsumerKind::ConsumerGroup,
-            consumer_id: raw_consumer_group_id,
-            offset,
-            path,
-        };
-
-        consumer_group_offsets.push((consumer_group_id, consumer_offset));
+    offset_kind: &'static str,
+) -> OffsetFileLoad {
+    let bytes = match async {
+        let file = storage.open(Path::new(path), OpenMode::Read).await?;
+        let length = usize::try_from(file.length().await?).map_err(std::io::Error::other)?;
+        file.read(0, length).await
     }
-
-    Ok(consumer_group_offsets)
-}
-
-fn read_offset_file(path: &str, offset_kind: &'static str) -> Option<AtomicU64> {
-    let bytes = match std::fs::read(path) {
+    .await
+    {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
                 "{COMPONENT} (error: {e}) - failed to read offset file, \
                  path: {path}, skipping."
             );
-            return None;
+            return OffsetFileLoad::Stranded;
         }
     };
     match decode_offset_record(&bytes) {
-        OffsetRecord::Value { offset, .. } => Some(AtomicU64::new(offset)),
+        OffsetRecord::Value { offset, .. } => OffsetFileLoad::Loaded(AtomicU64::new(offset)),
         OffsetRecord::Torn => {
             warn!(
                 "{COMPONENT} - failed to read {offset_kind} from file (truncated), \
-                 path: {path}, skipping."
+                 path: {path}, removing invalid file."
             );
-            None
+            remove_invalid_offset_file(storage, path, offset_kind).await
         }
         // Skipped rather than loaded: resuming from a cursor provably not the one
         // written reads as ordinary redelivery or a gap, never as corruption.
@@ -206,13 +233,73 @@ fn read_offset_file(path: &str, offset_kind: &'static str) -> Option<AtomicU64> 
                  (offset: {offset}, expected: {expected}, found: {found}), \
                  path: {path}, removing it and resuming this consumer from the start."
             );
-            if let Err(e) = std::fs::remove_file(path) {
-                error!(
-                    "{COMPONENT} (error: {e}) - could not remove the corrupt \
-                     {offset_kind} file, path: {path}; remove it manually."
-                );
-            }
-            None
+            remove_invalid_offset_file(storage, path, offset_kind).await
         }
+    }
+}
+
+async fn remove_invalid_offset_file<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    offset_kind: &'static str,
+) -> OffsetFileLoad {
+    if let Err(error) = storage.remove_file(Path::new(path)).await {
+        error!(
+            "{COMPONENT} (error: {error}) - could not remove the invalid \
+             {offset_kind} file, path: {path}; remove it manually."
+        );
+        return OffsetFileLoad::Stranded;
+    }
+    let Some(parent) = Path::new(path).parent() else {
+        return OffsetFileLoad::Removed;
+    };
+    match storage.sync_directory(parent).await {
+        Ok(()) => OffsetFileLoad::Removed,
+        Err(error) => {
+            error!(
+                "{COMPONENT} (error: {error}) - removed invalid {offset_kind} file but \
+                 could not sync its directory, path: {path}; retaining its capacity slot."
+            );
+            OffsetFileLoad::Stranded
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[compio::test]
+    async fn given_missing_directory_when_loading_should_report_error_instead_of_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(matches!(
+            load_consumer_offsets(missing.to_str().unwrap()).await,
+            Err(IggyError::CannotReadConsumerOffsets(_))
+        ));
+    }
+
+    #[compio::test]
+    async fn given_numeric_directory_and_torn_file_when_loading_should_remove_only_invalid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("7")).unwrap();
+        std::fs::write(dir.path().join("8"), [1, 2]).unwrap();
+        std::fs::write(dir.path().join("9"), 12_u64.to_le_bytes()).unwrap();
+        std::fs::write(dir.path().join("10"), []).unwrap();
+        std::fs::write(dir.path().join("9.tmp"), [0_u8; 4]).unwrap();
+        std::fs::write(dir.path().join("notes.tmp"), b"unrelated").unwrap();
+        let path = dir.path().to_str().unwrap();
+        let consumers = load_consumer_offsets(path).await.unwrap();
+        assert!(!dir.path().join("9.tmp").exists());
+        assert!(dir.path().join("notes.tmp").exists());
+        assert_eq!(consumers.entries.len(), 1);
+        assert_eq!(consumers.entries[0].consumer_id, 9);
+        assert!(consumers.stranded_ids.is_empty());
+        assert!(!dir.path().join("8").exists());
+        assert!(!dir.path().join("10").exists());
+        let groups = load_consumer_group_offsets(path).await.unwrap();
+        assert_eq!(groups.entries.len(), 1);
+        assert_eq!(groups.entries[0].0, ConsumerGroupId(9));
+        assert!(groups.stranded_ids.is_empty());
     }
 }

@@ -27,20 +27,24 @@
 //!   by plane.
 //! - `IggyShard::park_if_unmaterialised` - partition frames shed because the
 //!   park buffer is at its frame or byte cap.
-//! - `IggyShard::apply_reconcile_ops` - parked frames whose re-dispatch onto
-//!   this shard's own inbox was refused.
+//! - `IggyShard::retire_parked_frames` - parked frames retired with no client
+//!   to answer.
 //!
 //! The counter uses atomic interior mutability, safe to bump from `!Send`
 //! compio reactor contexts. Each shard owns its own instance, and the server
 //! exposes every shard's instance through the `[http.metrics]` scrape
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
-//! sub-registry per shard); every drop site also logs via `tracing`.
+//! sub-registry per shard). Drop-site tracing supplements the counters.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::sync::{Arc, OnceLock};
+
+use iggy_common::ConsumerKind;
+use message_bus::ReplicaReadMetrics;
 
 /// Label for `frame_drops_total`.
 ///
@@ -62,6 +66,11 @@ pub struct FrameDropLabel {
     pub reason: &'static str,
 }
 
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct ConsumerOffsetKindLabel {
+    pub kind: &'static str,
+}
+
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
 /// catch typos at compile time and to keep the cardinality bounded.
 ///
@@ -77,18 +86,17 @@ pub struct FrameDropLabel {
 ///
 /// `PARTITION` covers the partition plane: a frame shed because the namespace
 /// had not materialised and its park buffer was at capacity
-/// (`reason=park_overflow`), a re-dispatch the shard's own inbox refused, or a
-/// routing send the target inbox refused. A shed client request is answered with
-/// a retriable status, so the client recovers -- but a shed *prepare* is not
-/// covered by retransmit once its op has reached quorum
-/// (`consensus::retransmit_targets` skips `ok_quorum_received`, and the
-/// partition plane creates a repair session only in `on_start_view`), so it
-/// leaves that backup behind until an unrelated view change.
-//
-// TODO(krishna): give the partition plane a normal-status repair driver so a
-// shed or refused prepare is repaired without waiting for a view change. Until
-// then `variant=partition` is the only signal that a backup may be stranded
-// behind `commit_max`.
+/// (`reason=park_overflow`), a parked frame retired with no client to answer
+/// (`reason=park_dropped`), an incarnation rejection, or a routing send the
+/// target inbox refused. A shed client request is answered with a retriable
+/// status, so the client recovers. A shed *prepare* has nobody to answer and is
+/// not covered by retransmit once its op has reached quorum
+/// (`consensus::retransmit_targets` skips `ok_quorum_received`), so the backup
+/// gap-stops; `tick_partitions`' sweep is what repairs it, escalating to
+/// partition state transfer when the primary has evicted the range, and
+/// `partition_prepare_gap_drops_total` is what counts the prepares that reached
+/// the gap check. The counter therefore signals a data-plane gap or recovery
+/// burden, not a requirement for a view change.
 pub mod frame_drop_variant {
     pub const CONSENSUS: &str = "consensus";
     pub const FD_TRANSFER: &str = "fd_transfer";
@@ -100,6 +108,10 @@ pub mod frame_drop_variant {
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
     pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
+    pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
+    /// A disk poll could not reserve completion capacity or return its result
+    /// to the owning shard.
+    pub const PARTITION_POLL_COMPLETION: &str = "partition_poll_completion";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -114,12 +126,21 @@ pub mod frame_drop_variant {
 /// `PARK_OVERFLOW` ticks when a partition frame arrives for a namespace this
 /// shard has not materialised and the per-namespace park buffer is already at
 /// its cap, so the frame is shed with no reply. `PARK_DROPPED` ticks when a
-/// frame that did park leaves unserved: its namespace became unreachable, or a
-/// request outlived `MAX_PARKED_PASSES` with no pump to take the deny. A request
-/// also bumps `partition_requests_denied_transient_total` when answered;
-/// replicated traffic has nobody to answer, so this is the only record the op
-/// was destroyed.
+/// frame that did park leaves unserved: its namespace became unreachable, its
+/// incarnation stamp was rejected, reclassification failed, or a request
+/// outlived `MAX_PARKED_PASSES` with no pump to take the deny. A request also
+/// bumps `partition_requests_denied_transient_total` when answered; replicated
+/// traffic has nobody to answer, so this is the direct record that local bytes
+/// were destroyed and repair may be required.
 pub mod frame_drop_reason {
+    /// Operation discriminant unknown to this build: the sender is newer.
+    ///
+    /// Distinct from `UNPARSABLE` because upgrading this node is the fix, and
+    /// until it is, the frame's consensus group gap-stops here.
+    pub const UNSUPPORTED_OPERATION: &str = "unsupported_operation";
+    /// A consensus frame failed typed decode for any other reason (corrupt
+    /// header, bad size, client-bound command on the inbound path).
+    pub const UNPARSABLE: &str = "unparsable";
     pub const FULL: &str = "full";
     pub const DISCONNECTED: &str = "disconnected";
     pub const UNROUTABLE: &str = "unroutable";
@@ -127,14 +148,19 @@ pub mod frame_drop_reason {
     pub const MISROUTED: &str = "misrouted";
     pub const PARK_OVERFLOW: &str = "park_overflow";
     pub const PARK_DROPPED: &str = "park_dropped";
+    /// A partition write's reply channel was dropped before a reply arrived
+    /// (view-change pipeline reset, park teardown, shutdown): the outcome is
+    /// unknown and the client is left to its read-timeout.
+    pub const SUBMIT_ABANDONED: &str = "submit_abandoned";
+    /// A partition write's reply did not arrive within the submit budget.
+    pub const SUBMIT_TIMEOUT: &str = "submit_timeout";
 }
 
-// The tables only index the lazy fast-path cache below; a `{variant, reason}`
+// The tables only index the lazy cache below. A `{variant, reason}`
 // pair enters the `Family` (and therefore the scrape) the first time a drop
-// site actually produces it, so the unreachable corners of the 7 x 7 cross
-// product never appear as permanent zero-valued series.
-const VARIANT_COUNT: usize = 7;
-const REASON_COUNT: usize = 7;
+// site produces it, so unproduced combinations never enter the scrape.
+const VARIANT_COUNT: usize = 9;
+const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::CONSENSUS,
@@ -144,9 +170,13 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::FORWARD_REPLICA_SEND,
     frame_drop_variant::METADATA_COMMIT_TICK,
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
+    frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
+    frame_drop_variant::PARTITION_POLL_COMPLETION,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
+    frame_drop_reason::UNSUPPORTED_OPERATION,
+    frame_drop_reason::UNPARSABLE,
     frame_drop_reason::FULL,
     frame_drop_reason::DISCONNECTED,
     frame_drop_reason::UNROUTABLE,
@@ -154,6 +184,8 @@ const REASONS: [&str; REASON_COUNT] = [
     frame_drop_reason::MISROUTED,
     frame_drop_reason::PARK_OVERFLOW,
     frame_drop_reason::PARK_DROPPED,
+    frame_drop_reason::SUBMIT_ABANDONED,
+    frame_drop_reason::SUBMIT_TIMEOUT,
 ];
 
 fn variant_index(s: &str) -> Option<usize> {
@@ -162,6 +194,13 @@ fn variant_index(s: &str) -> Option<usize> {
 
 fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
+}
+
+const fn consumer_kind_index(kind: ConsumerKind) -> usize {
+    match kind {
+        ConsumerKind::Consumer => 0,
+        ConsumerKind::ConsumerGroup => 1,
+    }
 }
 
 /// Per-shard metric handles.
@@ -182,8 +221,19 @@ fn reason_index(s: &str) -> Option<usize> {
 /// resolved at scrape time via the per-shard registry, not as a label.
 #[derive(Clone)]
 pub struct ShardMetrics {
-    frame_drops_total: Family<FrameDropLabel, Counter>,
-    cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
+    partition_wal_disk_bytes: Gauge,
+    partition_wal_retained_bytes: Gauge,
+    partition_wal_queued_bytes: Gauge,
+    partition_wal_in_flight_bytes: Gauge,
+    partition_wal_checkpoints_pending: Gauge,
+    partition_wal_batches: Counter,
+    partition_wal_prepares: Counter,
+    partition_wal_group_commit_waits: Counter,
+    partition_repair_ring_entries: Gauge,
+    partition_repair_ring_bytes: Gauge,
+    partition_wal_checkpoints: Counter,
+    partition_wal_errors: Counter,
+    frame_drops: FrameDropMetrics,
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
@@ -193,6 +243,16 @@ pub struct ShardMetrics {
     partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
+    partition_prepare_gap_drops_total: Counter,
+    metadata_prepare_gap_drops_total: Counter,
+    metadata_read_frontier_refusals_total: Counter,
+    client_requests_denied_queue_full_total: Counter,
+    replica_socket_reads_total: Counter,
+    replica_inbound_frames_total: Counter,
+    partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
+    consumer_offset_denied_counters: [Counter; 2],
+    partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
+    consumer_offset_stranded_gauges: [Gauge; 2],
 }
 
 impl ShardMetrics {
@@ -205,9 +265,51 @@ impl ShardMetrics {
         let cached_counters = Arc::new(std::array::from_fn(|_| {
             std::array::from_fn(|_| OnceLock::new())
         }));
+        let partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter> =
+            Family::default();
+        let consumer_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
+                .clone()
+        };
+        let consumer_group_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel {
+                    kind: "consumer_group",
+                })
+                .clone()
+        };
+        let consumer_offset_denied_counters = [consumer_denied, consumer_group_denied];
+        let partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge> =
+            Family::default();
+        // End each Family read guard before creating the next series, which
+        // needs the same family's write lock on a miss.
+        let consumer_stranded = partition_consumer_offsets_stranded
+            .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
+            .clone();
+        let group_stranded = partition_consumer_offsets_stranded
+            .get_or_create(&ConsumerOffsetKindLabel {
+                kind: "consumer_group",
+            })
+            .clone();
+        let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
         Self {
-            frame_drops_total,
-            cached_counters,
+            partition_wal_disk_bytes: Gauge::default(),
+            partition_wal_retained_bytes: Gauge::default(),
+            partition_wal_queued_bytes: Gauge::default(),
+            partition_wal_in_flight_bytes: Gauge::default(),
+            partition_wal_checkpoints_pending: Gauge::default(),
+            partition_wal_batches: Counter::default(),
+            partition_wal_prepares: Counter::default(),
+            partition_wal_group_commit_waits: Counter::default(),
+            partition_repair_ring_entries: Gauge::default(),
+            partition_repair_ring_bytes: Gauge::default(),
+            partition_wal_checkpoints: Counter::default(),
+            partition_wal_errors: Counter::default(),
+            frame_drops: FrameDropMetrics {
+                total: frame_drops_total,
+                cached_counters,
+            },
             partitions_materialised_total: Counter::default(),
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
@@ -217,7 +319,184 @@ impl ShardMetrics {
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
+            partition_prepare_gap_drops_total: Counter::default(),
+            metadata_prepare_gap_drops_total: Counter::default(),
+            metadata_read_frontier_refusals_total: Counter::default(),
+            client_requests_denied_queue_full_total: Counter::default(),
+            replica_socket_reads_total: Counter::default(),
+            replica_inbound_frames_total: Counter::default(),
+            partition_consumer_offsets_denied_total,
+            consumer_offset_denied_counters,
+            partition_consumer_offsets_stranded,
+            consumer_offset_stranded_gauges,
         }
+    }
+
+    pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
+        self.partition_wal_disk_bytes
+            .set(i64::try_from(metrics.disk_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_retained_bytes
+            .set(i64::try_from(metrics.retained_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_queued_bytes
+            .set(i64::try_from(metrics.queued_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_in_flight_bytes
+            .set(i64::try_from(metrics.in_flight_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_checkpoints_pending
+            .set(i64::try_from(metrics.checkpoints_pending).unwrap_or(i64::MAX));
+        self.partition_wal_batches.inc_by(metrics.completed_batches);
+        self.partition_wal_prepares.inc_by(metrics.batched_prepares);
+        self.partition_wal_group_commit_waits
+            .inc_by(metrics.group_commit_waits);
+        self.partition_wal_checkpoints
+            .inc_by(metrics.completed_checkpoints);
+        self.partition_wal_errors.inc_by(metrics.failed_writes);
+    }
+
+    /// Fold one sweep's worth of replica socket-read deltas in.
+    ///
+    /// Deltas, never running totals: [`ReplicaReadMetrics`] comes from a
+    /// take that resets the source, so feeding cumulative values here
+    /// would double count every sweep. Both counters stay at zero on a
+    /// shard that owns no plaintext replica link, which is what makes
+    /// them identify the link shard.
+    pub fn record_replica_reads(&self, metrics: &ReplicaReadMetrics) {
+        self.replica_socket_reads_total.inc_by(metrics.reads);
+        self.replica_inbound_frames_total.inc_by(metrics.frames);
+    }
+
+    fn register_persistence(&self, registry: &mut Registry) {
+        registry.register(
+            "partition_wal_disk_bytes",
+            "active partition WAL bytes",
+            self.partition_wal_disk_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_retained_bytes",
+            "retained partition prepare bytes charged to the WAL budget",
+            self.partition_wal_retained_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_queued_bytes",
+            "queued partition WAL bytes",
+            self.partition_wal_queued_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_in_flight_bytes",
+            "partition WAL bytes being written",
+            self.partition_wal_in_flight_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_checkpoints_pending",
+            "partition checkpoints awaiting storage completion",
+            self.partition_wal_checkpoints_pending.clone(),
+        );
+        registry.register(
+            "partition_wal_batches",
+            "completed partition WAL durability batches",
+            self.partition_wal_batches.clone(),
+        );
+        registry.register(
+            "partition_wal_prepares",
+            "prepares covered by completed partition WAL batches",
+            self.partition_wal_prepares.clone(),
+        );
+        registry.register(
+            "partition_wal_group_commit_waits",
+            "durable groups that took the optional pre-barrier wait",
+            self.partition_wal_group_commit_waits.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_entries",
+            "committed entries this shard's partitions retain for peer repair",
+            self.partition_repair_ring_entries.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_bytes",
+            "payload bytes this shard's partitions retain for peer repair, excluding allocation overhead",
+            self.partition_repair_ring_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_checkpoints",
+            "completed partition WAL checkpoints",
+            self.partition_wal_checkpoints.clone(),
+        );
+        registry.register(
+            "partition_wal_errors",
+            "partition WAL writer failures",
+            self.partition_wal_errors.clone(),
+        );
+    }
+
+    /// Republished by every partition sweep: what the repair rings on this
+    /// shard actually hold, which the configured per-partition ceilings do not
+    /// say. The ceilings multiply by the partition count on every replica, so
+    /// this is the only place an operator can see the real cost of raising
+    /// them.
+    pub fn set_repair_ring(&self, entries: usize, bytes: u64) {
+        self.partition_repair_ring_entries
+            .set(i64::try_from(entries).unwrap_or(i64::MAX));
+        self.partition_repair_ring_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Count consumer offset capacity denials from explicit client requests
+    /// and automatic commit admission during poll completion.
+    pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].inc();
+    }
+
+    /// Republished by every partition sweep: the sum over this shard's
+    /// partitions of offset keys whose file could not be loaded or unlinked.
+    /// Such a key stays counted against `consumer_offsets_max` until a later
+    /// store or delete of it succeeds, so a non-zero value that never falls is
+    /// an offsets directory an operator has to repair.
+    pub fn set_consumer_offsets_stranded(&self, kind: ConsumerKind, count: usize) {
+        self.consumer_offset_stranded_gauges[consumer_kind_index(kind)]
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn consumer_offset_denied_value(&self, kind: ConsumerKind) -> u64 {
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].get()
+    }
+
+    /// Bumped every time a client request is answered with a retryable denial
+    /// because that client already has the maximum number of requests queued
+    /// behind one the shard has not answered yet.
+    ///
+    /// The queue only grows while a client pipelines faster than its own
+    /// frames are served, so a sustained rate means one connection is stalled
+    /// on something - a held metadata read, a slow commit - while it keeps
+    /// sending.
+    pub fn record_client_request_denied_queue_full(&self) {
+        self.client_requests_denied_queue_full_total.inc();
+    }
+
+    /// Current value of [`Self::record_client_request_denied_queue_full`], for
+    /// tests that assert the denial was counted.
+    #[must_use]
+    pub fn client_requests_denied_queue_full_value(&self) -> u64 {
+        self.client_requests_denied_queue_full_total.get()
+    }
+
+    /// Bumped every time a metadata read is refused because this node's
+    /// applied frontier never reached what the caller was told committed.
+    ///
+    /// The counter is the signal, not a log line: a node that lags durably
+    /// refuses every held read of every client for as long as it lags, so the
+    /// refusal itself logs at `debug!` and this is what a dashboard alerts on.
+    /// Any sustained rate means reads on this node are failing retryable while
+    /// its commit walk stays behind.
+    pub fn record_metadata_read_frontier_refusal(&self) {
+        self.metadata_read_frontier_refusals_total.inc();
+    }
+
+    /// Current value of [`Self::record_metadata_read_frontier_refusal`], for
+    /// tests that assert a refusal was counted rather than scraping it.
+    #[must_use]
+    pub fn metadata_read_frontier_refusals_value(&self) -> u64 {
+        self.metadata_read_frontier_refusals_total.get()
     }
 
     /// Increment `frame_drops_total{variant, reason}` by 1.
@@ -228,19 +507,12 @@ impl ShardMetrics {
     /// path so accounting is preserved even if a future caller forgets
     /// to extend the const tables above.
     pub fn record_frame_drop(&self, variant: &'static str, reason: &'static str) {
-        if let (Some(v_idx), Some(r_idx)) = (variant_index(variant), reason_index(reason)) {
-            self.cached_counters[v_idx][r_idx]
-                .get_or_init(|| {
-                    self.frame_drops_total
-                        .get_or_create(&FrameDropLabel { variant, reason })
-                        .clone()
-                })
-                .inc();
-        } else {
-            self.frame_drops_total
-                .get_or_create(&FrameDropLabel { variant, reason })
-                .inc();
-        }
+        self.frame_drops.record(variant, reason);
+    }
+
+    /// The completion lane shares these handles once during shard setup.
+    pub(crate) const fn frame_drop_metrics(&self) -> &FrameDropMetrics {
+        &self.frame_drops
     }
 
     /// Bumped on the owning shard each time the partition reconciliation
@@ -323,10 +595,31 @@ impl ShardMetrics {
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
     pub fn frame_drops_value(&self) -> u64 {
-        self.cached_counters
+        self.frame_drops
+            .cached_counters
             .iter()
             .flatten()
             .filter_map(OnceLock::get)
+            .map(prometheus_client::metrics::counter::Counter::get)
+            .sum()
+    }
+
+    /// One `reason` summed over every variant, for the assertions that are about
+    /// the reason alone: `unroutable` and `misrouted` must stay at zero however
+    /// the drop was classified, while `full` and `disconnected` are what a
+    /// crashed inbox produces and cannot be asserted on. Listing variants at the
+    /// call site would let a new drop site under an unlisted one escape.
+    /// Unknown reasons read as zero, as in [`Self::frame_drop_count`].
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn frame_drop_count_for_reason(&self, reason: &'static str) -> u64 {
+        let Some(reason_idx) = reason_index(reason) else {
+            return 0;
+        };
+        self.frame_drops
+            .cached_counters
+            .iter()
+            .filter_map(|variant| variant[reason_idx].get())
             .map(prometheus_client::metrics::counter::Counter::get)
             .sum()
     }
@@ -390,6 +683,66 @@ impl ShardMetrics {
         self.partition_repair_serves_deferred_purge_total.get()
     }
 
+    /// Add the prepares a partition's backup gap check destroyed since the last
+    /// sweep. Drained per tick from `IggyPartition::take_prepare_gap_drops`,
+    /// and once more when `ConfirmRemove` drops the partition: a tombstoned
+    /// namespace is invisible to the sweep, so the tail it left would otherwise
+    /// go to the floor with the value.
+    ///
+    /// Counts the prepares that ARRIVED after a hole, not the holes: a gap
+    /// opened by the last prepare of a burst leaves this at zero. A nonzero
+    /// value proves the repair driver has work; a zero one proves nothing.
+    ///
+    /// Deliberately NOT a `frame_drops_total{variant=partition}` reason: that
+    /// family means the bus or the router shed a frame, and the simulator
+    /// asserts it stays at zero on runs with no injected loss. A gap drop is a
+    /// protocol-ordering drop that any real loss produces, and the sweep repairs
+    /// it, so folding the two would turn a routing-fault alert into noise.
+    ///
+    /// Shard-scoped, with no namespace label: a server runs hundreds of groups
+    /// per shard, so labelling by namespace is unbounded cardinality, and every
+    /// other partition counter in this file is shard-scoped for the same
+    /// reason. The per-group detail is in the arm's log line.
+    ///
+    /// The metadata plane's own gap drop is NOT counted here: it has its own
+    /// counter, and its own level-triggered driver in `tick_metadata`. See
+    /// [`Self::record_metadata_prepare_gap_drops`].
+    pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
+        self.partition_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `partition_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_prepare_gap_drops_value(&self) -> u64 {
+        self.partition_prepare_gap_drops_total.get()
+    }
+
+    /// Add the prepares the metadata backup gap check destroyed since the last
+    /// tick, drained from `IggyMetadata::take_prepare_gap_drops`.
+    ///
+    /// The sibling of [`Self::record_partition_prepare_gap_drops`], and it
+    /// carries every caveat that one does: it counts the prepares that ARRIVED
+    /// after a hole rather than the holes, so a nonzero value proves the
+    /// metadata repair driver has work and a zero one proves nothing. There is
+    /// one metadata group per node, so unlike the partition counter it needs no
+    /// argument about namespace cardinality.
+    ///
+    /// Deliberately NOT a `frame_drops_total` reason, for the same reason: that
+    /// family means the bus or the router shed a frame and the simulator
+    /// asserts it stays at zero on runs with no injected loss, while a gap drop
+    /// is a protocol-ordering drop the tick repairs.
+    pub fn record_metadata_prepare_gap_drops(&self, drops: u64) {
+        self.metadata_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `metadata_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_prepare_gap_drops_value(&self) -> u64 {
+        self.metadata_prepare_gap_drops_total.get()
+    }
+
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
     /// accessor, readable from any crate under those cfgs so the crates that
     /// drive the reconciler can assert a reject did not happen.
@@ -418,7 +771,7 @@ impl ShardMetrics {
     #[must_use]
     pub fn frame_drop_count(&self, variant: &'static str, reason: &'static str) -> u64 {
         match (variant_index(variant), reason_index(reason)) {
-            (Some(v_idx), Some(r_idx)) => self.cached_counters[v_idx][r_idx]
+            (Some(v_idx), Some(r_idx)) => self.frame_drops.cached_counters[v_idx][r_idx]
                 .get()
                 .map_or(0, prometheus_client::metrics::counter::Counter::get),
             _ => 0,
@@ -431,10 +784,11 @@ impl ShardMetrics {
     /// `_total` suffix; the prometheus text exposition appends it for
     /// counters.
     pub fn register(&self, registry: &mut Registry) {
+        self.register_persistence(registry);
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",
-            self.frame_drops_total.clone(),
+            self.frame_drops.total.clone(),
         );
         registry.register(
             "partitions_materialised",
@@ -481,6 +835,77 @@ impl ShardMetrics {
             "partition repair serves or completions deferred until a committed purge applies",
             self.partition_repair_serves_deferred_purge_total.clone(),
         );
+        registry.register(
+            "partition_prepare_gap_drops",
+            "replicated prepares dropped out of order by a backup's gap check",
+            self.partition_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "replica_socket_reads",
+            "completed socket reads on this shard's plaintext replica links",
+            self.replica_socket_reads_total.clone(),
+        );
+        registry.register(
+            "replica_inbound_frames",
+            "frames decoded off this shard's plaintext replica links",
+            self.replica_inbound_frames_total.clone(),
+        );
+        registry.register(
+            "metadata_prepare_gap_drops",
+            "replicated metadata prepares dropped out of order by a backup's gap check",
+            self.metadata_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "metadata_read_frontier_refusals",
+            "metadata reads refused because this node never applied the caller's committed op",
+            self.metadata_read_frontier_refusals_total.clone(),
+        );
+        registry.register(
+            "client_requests_denied_queue_full",
+            "client requests denied retryable because that client's request queue was full",
+            self.client_requests_denied_queue_full_total.clone(),
+        );
+        registry.register(
+            "partition_consumer_offsets_denied",
+            "consumer offset creations denied at the per-partition admission limit (best effort: \
+             explicit client denials and poll-side reservation refusals)",
+            self.partition_consumer_offsets_denied_total.clone(),
+        );
+        registry.register(
+            "partition_consumer_offsets_stranded",
+            "consumer offset keys whose file could not be loaded or unlinked, still counted \
+             against the limit",
+            self.partition_consumer_offsets_stranded.clone(),
+        );
+    }
+}
+
+/// Frame drop accounting shared with the registered shard metrics.
+/// Clones retain the same family and lazy cache, so detached work records
+/// visible drops without carrying unrelated counters or creating unused series.
+#[derive(Clone)]
+pub(crate) struct FrameDropMetrics {
+    total: Family<FrameDropLabel, Counter>,
+    cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
+}
+
+impl FrameDropMetrics {
+    pub(crate) fn record(&self, variant: &'static str, reason: &'static str) {
+        if let (Some(variant_index), Some(reason_index)) =
+            (variant_index(variant), reason_index(reason))
+        {
+            self.cached_counters[variant_index][reason_index]
+                .get_or_init(|| {
+                    self.total
+                        .get_or_create(&FrameDropLabel { variant, reason })
+                        .clone()
+                })
+                .inc();
+        } else {
+            self.total
+                .get_or_create(&FrameDropLabel { variant, reason })
+                .inc();
+        }
     }
 }
 
@@ -500,7 +925,8 @@ mod tests {
 
         let count = |variant, reason| {
             metrics
-                .frame_drops_total
+                .frame_drops
+                .total
                 .get_or_create(&FrameDropLabel { variant, reason })
                 .get()
         };
@@ -517,6 +943,54 @@ mod tests {
             ),
             1,
             "a distinct reason gets its own counter",
+        );
+    }
+
+    #[test]
+    fn frame_drop_count_for_reason_sums_one_reason_across_variants() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE);
+        metrics.record_frame_drop(frame_drop_variant::PARTITION, frame_drop_reason::UNROUTABLE);
+        metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
+
+        assert_eq!(
+            metrics.frame_drop_count_for_reason(frame_drop_reason::UNROUTABLE),
+            2,
+            "one reason sums across every variant that recorded it",
+        );
+        assert_eq!(
+            metrics.frame_drop_count_for_reason(frame_drop_reason::MISROUTED),
+            0,
+            "an unproduced reason reads as zero, not as the total",
+        );
+        assert_eq!(
+            metrics.frame_drops_value(),
+            3,
+            "the per-reason view must not disturb the total",
+        );
+    }
+
+    #[test]
+    fn persistence_scrape_distinguishes_retained_budget_from_wal_file_bytes() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_persistence(&partitions::PersistenceMetrics {
+            disk_bytes: 4096,
+            retained_bytes: 65536,
+            ..Default::default()
+        });
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_disk_bytes 4096")
+        );
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_retained_bytes 65536")
         );
     }
 
@@ -553,13 +1027,43 @@ mod tests {
             metrics.record_frame_drop(frame_drop_variant::PARTITION, frame_drop_reason::UNROUTABLE);
         }
         let from_family = metrics
-            .frame_drops_total
+            .frame_drops
+            .total
             .get_or_create(&FrameDropLabel {
                 variant: frame_drop_variant::PARTITION,
                 reason: frame_drop_reason::UNROUTABLE,
             })
             .get();
         assert_eq!(from_family, 5);
+    }
+
+    #[test]
+    fn consumer_offset_denials_use_two_cached_kind_series() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::ConsumerGroup);
+
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::Consumer),
+            2
+        );
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::ConsumerGroup),
+            1
+        );
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        assert_eq!(
+            buffer
+                .lines()
+                .filter(|line| line.starts_with("partition_consumer_offsets_denied_total"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -570,7 +1074,8 @@ mod tests {
         let metrics = ShardMetrics::for_shard();
         metrics.record_frame_drop("unexpected_variant", "unexpected_reason");
         let from_family = metrics
-            .frame_drops_total
+            .frame_drops
+            .total
             .get_or_create(&FrameDropLabel {
                 variant: "unexpected_variant",
                 reason: "unexpected_reason",

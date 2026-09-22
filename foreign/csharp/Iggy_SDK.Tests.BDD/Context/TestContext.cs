@@ -24,9 +24,9 @@ namespace Apache.Iggy.Tests.BDD.Context;
 public class TestContext
 {
     public IIggyClient IggyClient { get; set; } = null!;
-    public string TcpUrl { get; set; } = string.Empty;
-    public string LeaderTcpUrl { get; set; } = string.Empty;
-    public string FollowerTcpUrl { get; set; } = string.Empty;
+    public string TcpUrl => TestEnvironment.TcpAddress;
+    public string LeaderTcpUrl => TestEnvironment.LeaderTcpAddress;
+    public string FollowerTcpUrl => TestEnvironment.FollowerTcpAddress;
     public Dictionary<string, IIggyClient> Clients { get; } = new();
     public StreamResponse? CreatedStream { get; set; }
     public TopicResponse? CreatedTopic { get; set; }

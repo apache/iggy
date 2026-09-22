@@ -69,7 +69,6 @@ public class UsersTests
         var response = await client.GetUserAsync(Identifier.String(username));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Username.ShouldBe(username);
         response.Status.ShouldBe(UserStatus.Active);
         response.CreatedAt.ShouldBeGreaterThan(0u);
@@ -109,7 +108,6 @@ public class UsersTests
         var user = await client.GetUserAsync(Identifier.String(newUsername));
 
         user.ShouldNotBeNull();
-        user.Id.ShouldBeGreaterThanOrEqualTo(0u);
         user.Username.ShouldBe(newUsername);
         user.Status.ShouldBe(UserStatus.Active);
         user.CreatedAt.ShouldBeGreaterThan(0u);
@@ -144,7 +142,7 @@ public class UsersTests
         user.Permissions.Global.ReadUsers.ShouldBeTrue();
         user.Permissions.Global.SendMessages.ShouldBeTrue();
         user.Permissions.Streams.ShouldNotBeNull();
-        user.Permissions.Streams.ShouldContainKey(1);
+        user.Permissions.Streams.ShouldContainKey(1u);
         user.Permissions.Streams[1].ManageStream.ShouldBeTrue();
         user.Permissions.Streams[1].ManageTopics.ShouldBeTrue();
         user.Permissions.Streams[1].ReadStream.ShouldBeTrue();
@@ -152,7 +150,7 @@ public class UsersTests
         user.Permissions.Streams[1].ReadTopics.ShouldBeTrue();
         user.Permissions.Streams[1].PollMessages.ShouldBeTrue();
         user.Permissions.Streams[1].Topics.ShouldNotBeNull();
-        user.Permissions.Streams[1].Topics!.ShouldContainKey(1);
+        user.Permissions.Streams[1].Topics!.ShouldContainKey(1u);
         user.Permissions.Streams[1].Topics![1].ManageTopic.ShouldBeTrue();
         user.Permissions.Streams[1].Topics![1].PollMessages.ShouldBeTrue();
         user.Permissions.Streams[1].Topics![1].ReadTopic.ShouldBeTrue();
@@ -175,7 +173,7 @@ public class UsersTests
         var loginClient = await Fixture.CreateClient(protocol, true);
         var loginResponse = await loginClient.LoginUserAsync(username, "new_password");
         loginResponse.ShouldNotBeNull();
-        loginResponse.UserId.ShouldBeGreaterThan(0);
+        loginResponse.UserId.ShouldBeGreaterThan(0u);
     }
 
     [Test]
@@ -204,7 +202,7 @@ public class UsersTests
         var response = await loginClient.LoginUserAsync(username, "login_password");
 
         response.ShouldNotBeNull();
-        response.UserId.ShouldBeGreaterThan(0);
+        response.UserId.ShouldBeGreaterThan(0u);
         switch (protocol)
         {
             case Protocol.Tcp:
@@ -255,7 +253,7 @@ public class UsersTests
                 ReadUsers = true,
                 SendMessages = true
             },
-            Streams = new Dictionary<int, StreamPermissions>
+            Streams = new Dictionary<uint, StreamPermissions>
             {
                 {
                     1, new StreamPermissions
@@ -266,7 +264,7 @@ public class UsersTests
                         SendMessages = true,
                         ReadTopics = true,
                         PollMessages = true,
-                        Topics = new Dictionary<int, TopicPermissions>
+                        Topics = new Dictionary<uint, TopicPermissions>
                         {
                             {
                                 1, new TopicPermissions

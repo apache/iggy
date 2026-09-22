@@ -21,6 +21,11 @@ use thiserror::Error;
 pub enum RuntimeError {
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
+    #[error(
+        "Invalid connector key {0:?}: expected at most {max_length} bytes of ASCII letters, digits, '-', '_' or '.', starting with a letter or digit",
+        max_length = crate::configs::connectors::ConnectorKey::MAX_LENGTH
+    )]
+    InvalidConnectorKey(String),
     #[error("Failed to serialize topic metadata")]
     FailedToSerializeTopicMetadata,
     #[error("Failed to serialize messages metadata")]
@@ -31,6 +36,15 @@ pub enum RuntimeError {
     SinkRejectedBatch(u32, i32),
     #[error("Connector SDK error")]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
+    /// A classified state-store failure while loading an enabled source's
+    /// state. Process-level: treating it as "no state" would silently rewind
+    /// the source, and parking the source as a failed plugin would hide a
+    /// store outage that a restart could clear.
+    #[error("Failed to load state for source connector '{connector_key}': {source}")]
+    StateLoadFailed {
+        connector_key: String,
+        source: iggy_connector_sdk::Error,
+    },
     #[error("Iggy client error")]
     IggyClient(#[from] iggy::prelude::ClientError),
     #[error("Iggy error")]
@@ -72,7 +86,9 @@ impl RuntimeError {
             RuntimeError::SourceConfigNotFound(_, _) => "source_config_not_found",
             RuntimeError::MissingIggyCredentials => "invalid_configuration",
             RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
+            RuntimeError::InvalidConnectorKey(_) => "invalid_connector_key",
             RuntimeError::HttpRequestFailed(_) => "http_request_failed",
+            RuntimeError::StateLoadFailed { .. } => "state_load_failed",
             RuntimeError::TokenFileNotFound(_) => "invalid_configuration",
             RuntimeError::TokenFileReadError(_, _) => "invalid_configuration",
             RuntimeError::TokenFileEmpty(_) => "invalid_configuration",

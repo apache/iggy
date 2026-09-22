@@ -14,16 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
 import { Client } from '../client/index.js';
 import { Given } from "@cucumber/cucumber";
 import type { TestWorld } from './world.js';
-import { getIggyAddress } from '../tcp.sm.utils.js';
+import { getRootCredentials, getServerAddress } from './env.js';
 
-const credentials = { username: 'iggy', password: 'iggy' };
-const [host, port] = getIggyAddress();
+const credentials = getRootCredentials();
+const [host, port] = getServerAddress();
 
 const opt = {
   transport: 'TCP' as const,

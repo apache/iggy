@@ -14,30 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { createPool, type Pool } from 'generic-pool';
-import type { RawClient, ClientConfig } from "./client.type.js"
+import type { RawClient, ClientConfig, ClientConfigOrString } from "./client.type.js"
 import { getRawClient } from '../client/client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
 import { normalizeClientConfig } from './client.config.js';
 
-
-/**
- * Creates a pool factory for managing RawClient instances.
- *
- * @param config - Client configuration
- * @returns Pool factory with create and destroy methods
- */
-const createPoolFactory = (config: ClientConfig) => ({
-  create: async function () {
-    return getRawClient(config);
-  },
-  destroy: async function (client: RawClient) {
-    return client.destroy();
-  }
-});
 
 /**
  * Creates a client provider that uses connection pooling.
@@ -47,20 +31,33 @@ const createPoolFactory = (config: ClientConfig) => ({
  * @returns Client provider and its connection pool
  */
 const createPooledClientProvider = (config: ClientConfig) => {
+  // Constructed eagerly rather than inside the factory: generic-pool never
+  // rejects waiting acquires when a create fails, and keeps re-dispatching
+  // the doomed factory, which hangs every command. Normalization already
+  // pins this pool to exactly one pooled connection, so there is nothing
+  // lazy to preserve.
+  const client = getRawClient(config);
   const minPoolSize = config.poolSize?.min || 1;
   const maxPoolSize = config.poolSize?.max || 4;
-  const pool = createPool(createPoolFactory(config), {
+  const pool = createPool({
+    create: async function () {
+      return client;
+    },
+    destroy: async function () {
+      return client.destroy();
+    }
+  }, {
     min: minPoolSize,
     max: maxPoolSize
   });
   const clientProvider = async () => {
-    const client = await pool.acquire();
+    const pooled = await pool.acquire();
     debug('client acquired from pool. pool size is', pool.size);
-    client.once('finishQueue', () => {
-      pool.release(client)
+    pooled.once('finishQueue', () => {
+      pool.release(pooled)
       debug('client released to pool. pool size is', pool.size);
     });
-    return client;
+    return pooled;
   }
   return { clientProvider, pool };
 };
@@ -79,9 +76,9 @@ export class Client extends CommandAPI {
   /**
    * Creates a new pooled client.
    *
-  * @param config - Client configuration
+  * @param config - Client configuration or connection string
   */
-  constructor(config: ClientConfig) {
+  constructor(config: ClientConfigOrString) {
     const normalizedConfig = normalizeClientConfig(config);
     const { clientProvider, pool } =
       createPooledClientProvider(normalizedConfig);
@@ -125,11 +122,12 @@ export class SingleClient extends CommandAPI {
   /**
    * Creates a new single-connection client.
    *
-  * @param config - Client configuration
+  * @param config - Client configuration or connection string
   */
-  constructor(config: ClientConfig) {
-    super(createSingleClientProvider(config));
-    this._config = config;
+  constructor(config: ClientConfigOrString) {
+    const normalizedConfig = normalizeClientConfig(config);
+    super(createSingleClientProvider(normalizedConfig));
+    this._config = normalizedConfig;
   }
 
   /**
@@ -170,10 +168,10 @@ export class SimpleClient extends CommandAPI {
  * Creates a SimpleClient with the given configuration.
  * Convenience function for quickly creating a client.
  *
- * @param config - Client configuration
+ * @param config - Client configuration or connection string
  * @returns SimpleClient instance
  */
-export const getClient = async (config: ClientConfig) => {
+export const getClient = async (config: ClientConfigOrString) => {
   const client = getRawClient(config);
   return new SimpleClient(client);
 };

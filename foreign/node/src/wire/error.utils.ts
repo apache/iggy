@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { translateCommandCode } from './command.code.js';
 import { translateErrorCode } from './error.code.js';

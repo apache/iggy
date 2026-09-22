@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.IntConsumer;
 
 /**
  * Correlates multiplexed requests by operation and request id, decodes VSR
@@ -54,10 +55,10 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private final ConcurrentMap<RequestKey, CompletableFuture<ByteBuf>> pendingRequests = new ConcurrentHashMap<>();
     private final ConsensusSession session;
-    private final Runnable onEviction;
+    private final IntConsumer onEviction;
     private final AtomicReference<Throwable> closeCause = new AtomicReference<>();
 
-    public VsrResponseHandler(ConsensusSession session, Runnable onEviction) {
+    public VsrResponseHandler(ConsensusSession session, IntConsumer onEviction) {
         this.session = session;
         this.onEviction = onEviction;
     }
@@ -136,6 +137,12 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             return;
         }
         int replyOperation = VsrHeaders.readReplyOperation(msg);
+        if (VsrHeaders.peekCommand(msg) == VsrHeaders.COMMAND_REPLY
+                && (VsrOperation.isMetadata(replyOperation)
+                        || replyOperation == VsrOperation.REGISTER
+                        || replyOperation == VsrOperation.LOGOUT)) {
+            session.observeMetadata(msg.getLongLE(msg.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
+        }
         RequestKey key =
                 new RequestKey(VsrOperation.correlationOperation(replyOperation), VsrHeaders.readReplyRequestId(msg));
         CompletableFuture<ByteBuf> future = pendingRequests.remove(key);
@@ -162,7 +169,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         IggyServerException error = VsrHeaders.evictionToException(frame);
         session.reset();
         try {
-            onEviction.run();
+            // The reason travels with the notification so the listener can drop
+            // what belonged to the evicted session and say which eviction it
+            // was. None of them ends the sign-in: the next request
+            // re-establishes the session.
+            onEviction.accept(error.getRawErrorCode());
         } catch (RuntimeException listenerError) {
             log.warn("Eviction listener failed: {}", listenerError.getMessage());
         }

@@ -254,6 +254,16 @@ fn build_servers(
         return Ok(vec![ServerHandle::with_config(config, context.clone())]);
     }
 
+    // The roster below names every node's ports before any node boots, which
+    // is exactly what ephemeral ports cannot do.
+    if config.ephemeral_ports {
+        return Err(TestBinaryError::InvalidState {
+            message: format!(
+                "ephemeral_ports needs a single node, but the harness has {node_count} nodes"
+            ),
+        });
+    }
+
     // Multi-node cluster: pre-reserve all ports
     let cluster_ports = ClusterPortReserver::reserve(node_count, config.ip_kind, &config)?;
     let all_addrs = cluster_ports.all_addresses();
@@ -317,10 +327,7 @@ fn build_cluster_envs(
 ) -> HashMap<String, String> {
     let mut envs = HashMap::new();
 
-    let loopback = match ip_kind {
-        IpAddrKind::V4 => "127.0.0.1",
-        IpAddrKind::V6 => "::1",
-    };
+    let loopback = ip_kind.loopback();
 
     envs.insert("IGGY_CLUSTER_ENABLED".to_string(), "true".to_string());
     envs.insert("IGGY_CLUSTER_NAME".to_string(), cluster_name.to_string());
@@ -386,7 +393,7 @@ mod tests {
             .server(
                 TestServerConfig::builder()
                     .extra_envs(HashMap::from([(
-                        "IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM".to_string(),
+                        "IGGY_PARTITION_VALIDATE_CHECKSUM".to_string(),
                         "false".to_string(),
                     )]))
                     .build(),
@@ -447,7 +454,7 @@ mod tests {
                     .websocket_enabled(false)
                     .extra_envs(HashMap::from([
                         (
-                            "IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM".to_string(),
+                            "IGGY_PARTITION_VALIDATE_CHECKSUM".to_string(),
                             "false".to_string(),
                         ),
                         ("TEST".to_string(), "value".to_string()),

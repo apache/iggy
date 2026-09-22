@@ -1,23 +1,22 @@
 <!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
 
-    Licensed to the Apache Software Foundation (ASF) under one
-    or more contributor license agreements.  See the NOTICE file
-    distributed with this work for additional information
-    regarding copyright ownership.  The ASF licenses this file
-    to you under the Apache License, Version 2.0 (the
-    "License"); you may not use this file except in compliance
-    with the License.  You may obtain a copy of the License at
+  http://www.apache.org/licenses/LICENSE-2.0
 
-      http://www.apache.org/licenses/LICENSE-2.0
-
-    Unless required by applicable law or agreed to in writing,
-    software distributed under the License is distributed on an
-    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-    KIND, either express or implied.  See the License for the
-    specific language governing permissions and limitations
-    under the License.
-
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
 -->
+
 <script lang="ts">
   import { page } from '$app/state';
   import { typedRoute } from '$lib/types/appRoutes';
@@ -25,9 +24,10 @@
   import { isNumber } from '$lib/utils/parsers';
   import { twMerge } from 'tailwind-merge';
   import { resolve } from '$app/paths';
+  import type { Pathname } from '$app/types';
 
   type Crumb = {
-    path: string;
+    path: Pathname;
     label: string;
   };
 
@@ -51,7 +51,7 @@
   }
 
   function formatPathSegment(segment: string, index: number, parts: string[]): Crumb {
-    const path = `/dashboard/${parts.slice(0, index + 1).join('/')}`;
+    const path = `/dashboard/${parts.slice(0, index + 1).join('/')}` as Pathname;
 
     if (isNumber(segment)) {
       const prevSegment = parts[index - 1];

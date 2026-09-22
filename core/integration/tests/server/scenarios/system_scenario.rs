@@ -32,6 +32,7 @@ use tokio::time::sleep;
 // expires), then run the terminal assertions on the returned details.
 const TOPIC_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
 const TOPIC_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const COORDINATOR_CONNECTIONS: usize = 1;
 
 async fn get_topic_when(
     client: &IggyClient,
@@ -61,6 +62,16 @@ pub async fn run(harness: &TestHarness) {
         .root_client()
         .await
         .expect("Failed to get root client");
+    let coordinator = if client.get_connection_info().await.protocol == TransportProtocol::Http {
+        None
+    } else {
+        Some(
+            client
+                .get_me()
+                .await
+                .expect("Failed to get coordinator client"),
+        )
+    };
 
     let consumer = Consumer {
         kind: CONSUMER_KIND,
@@ -865,10 +876,32 @@ pub async fn run(harness: &TestHarness) {
     let streams = client.get_streams().await.unwrap();
     assert!(streams.is_empty());
 
-    // 47. Get clients and ensure that there's 0 (HTTP) or 1 (TCP, QUIC) client
     let clients = client.get_clients().await.unwrap();
-
-    assert!(clients.len() <= 1);
+    if let Some(coordinator) = coordinator {
+        assert_eq!(
+            client.get_me().await.unwrap().client_id,
+            coordinator.client_id,
+            "Polling must preserve the coordinator client"
+        );
+        assert!(
+            clients
+                .iter()
+                .any(|connected| connected.client_id == coordinator.client_id),
+            "Coordinator client missing from client listing: {clients:?}"
+        );
+        // The one polled primary may be on this node or another node.
+        let max_connections = COORDINATOR_CONNECTIONS + usize::from(harness.cluster_size() > 1);
+        assert!(
+            clients.len() <= max_connections,
+            "Unexpected connections after polling one primary: {clients:?}"
+        );
+        for connected in clients {
+            assert_eq!(connected.user_id, coordinator.user_id);
+            assert_eq!(connected.consumer_groups_count, 0);
+        }
+    } else {
+        assert!(clients.is_empty(), "Unexpected binary clients: {clients:?}");
+    }
 
     assert_clean_system(&client).await;
 }

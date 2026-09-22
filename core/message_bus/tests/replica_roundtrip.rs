@@ -28,7 +28,7 @@ use common::{
     set_replica_ctx,
 };
 use iggy_binary_protocol::Command;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
 use std::rc::Rc;
@@ -70,7 +70,7 @@ async fn two_replicas_exchange_prepare_and_ack() {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 

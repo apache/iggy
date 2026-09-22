@@ -44,6 +44,27 @@ class GlobalContext:
     last_raw_error: RuntimeError | None = None
 
 
+def required_env(name: str) -> str:
+    """Read a variable the suite cannot run without.
+
+    A default here would turn a dropped compose variable into a run against
+    whatever happens to listen on the fallback address, so a missing value
+    aborts the suite instead.
+    """
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"{name} must be set; run the suite via scripts/run-bdd-tests.sh"
+        )
+    return value
+
+
+@pytest.fixture(scope="session")
+def root_credentials() -> tuple[str, str]:
+    """Root username and password the server was started with."""
+    return required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD")
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create an instance of the default event loop for the test session."""
@@ -57,7 +78,6 @@ def context():
     """Create a fresh context for each test scenario."""
     ctx = GlobalContext()
 
-    # Get server address from environment or use default
-    ctx.server_addr = os.environ.get("IGGY_TCP_ADDRESS", "127.0.0.1:8090")
+    ctx.server_addr = required_env("IGGY_TCP_ADDRESS")
 
     yield ctx

@@ -19,9 +19,12 @@ mod common;
 
 use async_channel::bounded;
 use common::{header_only, install_wss_clients_locally, loopback};
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
+use compio::tls::TlsConnector;
 use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
+use message_bus::BusMessage;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::wss::{bind, run};
 use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
@@ -30,7 +33,8 @@ use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, MessageBusConfig, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use server_common::Message;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,7 +82,7 @@ async fn wss_client_listener_accepts_and_round_trips() {
     let client_tcp = TcpStream::connect(server_addr).await.expect("client dial");
     let conn = WssTransportConn::new_client(client_tcp, client_cfg, server_name);
 
-    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
+    let (out_tx, out_rx) = bounded::<BusMessage>(8);
     let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
     let (client_shutdown, client_token) = Shutdown::new();
     let ctx = ActorContext {
@@ -94,7 +98,7 @@ async fn wss_client_listener_accepts_and_round_trips() {
     let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
     let request = header_only(Command::Request, 7, 0).into_frozen();
-    out_tx.send(request).await.expect("client send");
+    out_tx.send(request.into()).await.expect("client send");
 
     let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
         .await
@@ -167,5 +171,110 @@ async fn slow_handshake_evicts_registry() {
     assert_eq!(
         outcome.force, 0,
         "graceful shutdown should not force-cancel"
+    );
+}
+
+#[compio::test]
+async fn failed_and_interrupted_wss_handshakes_release_delegated_connections() {
+    common::assert_failed_tls_installs_are_removed(message_bus::ClientTransportKind::Wss).await;
+}
+
+#[compio::test]
+async fn stalled_rejected_and_interrupted_websocket_upgrades_release_delegated_connections() {
+    const OWNER: u16 = 1;
+    const FIRST_CLIENT_ID: u128 = (OWNER as u128) << 112 | 1;
+    const HANDSHAKE_GRACE: Duration = Duration::from_secs(2);
+    const TLS_DELAY: Duration = Duration::from_millis(1_200);
+    const DEADLINE_MARGIN: Duration = Duration::from_millis(400);
+    const IO_TIMEOUT: Duration = Duration::from_secs(3);
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+    const UPGRADE_WAIT: Duration = Duration::from_millis(10);
+
+    install_default_crypto_provider();
+    let bus = Rc::new(IggyMessageBus::with_tunables(
+        OWNER,
+        MessageBusConfig {
+            handshake_grace: HANDSHAKE_GRACE,
+            ..MessageBusConfig::default()
+        },
+    ));
+    let credentials = self_signed_for_loopback();
+    let mut roots = RootCertStore::empty();
+    for cert in &credentials.cert_chain {
+        roots.add(cert.clone()).unwrap();
+    }
+    let connector = TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let (listener, config, address) = bind(loopback(), credentials).unwrap();
+    let request_seen = Rc::new(Cell::new(false));
+    let seen_by_handler = Rc::clone(&request_seen);
+    let on_request: RequestHandler = Rc::new(move |_, _| seen_by_handler.set(true));
+    let accepted = install_wss_clients_locally(Rc::clone(&bus), on_request);
+
+    let tcp = TcpStream::connect(address).await.unwrap();
+    accepted(listener.accept().await.unwrap().0, Arc::clone(&config));
+    let installed_at = Instant::now();
+    compio::time::sleep(TLS_DELAY).await;
+    let mut tls = compio::time::timeout(IO_TIMEOUT, connector.connect("localhost", tcp))
+        .await
+        .unwrap()
+        .unwrap();
+    common::wait_for_client_count(&bus, 0).await;
+    assert!(
+        installed_at.elapsed() < HANDSHAKE_GRACE + DEADLINE_MARGIN,
+        "TLS and WebSocket must share one deadline, elapsed {:?}",
+        installed_at.elapsed()
+    );
+    assert!(bus.client_meta(FIRST_CLIENT_ID).is_none());
+    let closed = compio::time::timeout(IO_TIMEOUT, tls.read(vec![0]))
+        .await
+        .unwrap()
+        .0;
+    assert!(closed.is_err() || closed.unwrap() == 0);
+
+    let tcp = TcpStream::connect(address).await.unwrap();
+    accepted(listener.accept().await.unwrap().0, Arc::clone(&config));
+    let mut tls = compio::time::timeout(IO_TIMEOUT, connector.connect("localhost", tcp))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(bus.client_meta(FIRST_CLIENT_ID + 1).is_some());
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .0
+        .unwrap();
+    tls.flush().await.unwrap();
+    common::wait_for_client_count(&bus, 0).await;
+    assert!(bus.client_meta(FIRST_CLIENT_ID + 1).is_none());
+
+    let tcp = TcpStream::connect(address).await.unwrap();
+    accepted(listener.accept().await.unwrap().0, config);
+    let mut tls = compio::time::timeout(IO_TIMEOUT, connector.connect("localhost", tcp))
+        .await
+        .unwrap()
+        .unwrap();
+    tls.write_all(b"GET / HTTP/1.1\r\n").await.0.unwrap();
+    tls.flush().await.unwrap();
+    // Let the server finish TLS and wait for the remaining upgrade headers.
+    compio::time::sleep(UPGRADE_WAIT).await;
+    assert!(bus.client_meta(FIRST_CLIENT_ID + 2).is_some());
+    assert_eq!(
+        bus.shutdown(SHUTDOWN_TIMEOUT).await.force,
+        0,
+        "pending WebSocket upgrade must observe shutdown without force-cancellation"
+    );
+    assert!(bus.clients().is_empty());
+    assert!(bus.client_meta(FIRST_CLIENT_ID + 2).is_none());
+    let closed = compio::time::timeout(IO_TIMEOUT, tls.read(vec![0]))
+        .await
+        .unwrap()
+        .0;
+    assert!(closed.is_err() || closed.unwrap() == 0);
+    assert!(
+        !request_seen.get(),
+        "failed upgrades must not dispatch requests"
     );
 }

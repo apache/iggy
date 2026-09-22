@@ -19,8 +19,8 @@ use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use core::fmt;
-use iggy_common::Client;
 use iggy_common::create_topic::CreateTopic;
+use iggy_common::{Client, Durability};
 use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicCreateOptions};
 use std::collections::BTreeMap;
 use tracing::{Level, event};
@@ -30,6 +30,8 @@ pub struct CreateTopicCmd {
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
     raw_options: BTreeMap<String, String>,
+    durability: Durability,
+    consumer_offset_durability: Durability,
 }
 
 impl CreateTopicCmd {
@@ -42,6 +44,8 @@ impl CreateTopicCmd {
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
         raw_options: BTreeMap<String, String>,
+        durability: Durability,
+        consumer_offset_durability: Durability,
     ) -> Self {
         Self {
             create_topic: CreateTopic {
@@ -56,6 +60,8 @@ impl CreateTopicCmd {
             message_expiry,
             max_topic_size,
             raw_options,
+            durability,
+            consumer_offset_durability,
         }
     }
 }
@@ -82,6 +88,8 @@ impl CliCommand for CreateTopicCmd {
                         != MaxTopicSize::ServerDefault)
                         .then_some(self.create_topic.max_topic_size),
                     raw: self.raw_options.clone(),
+                    durability: self.durability,
+                    consumer_offset_durability: self.consumer_offset_durability,
                     ..TopicCreateOptions::default()
                 },
             )

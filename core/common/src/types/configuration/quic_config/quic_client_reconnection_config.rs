@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::IggyDuration;
+use crate::{IggyDuration, NonZeroIggyDuration};
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct QuicClientReconnectionConfig {
     pub enabled: bool,
     pub max_retries: Option<u32>,
-    pub interval: IggyDuration,
+    /// Delay between connection attempts.
+    pub interval: NonZeroIggyDuration,
     pub reestablish_after: IggyDuration,
 }
 
@@ -30,7 +31,7 @@ impl QuicClientReconnectionConfig {
     pub fn new(
         enabled: bool,
         max_retries: Option<u32>,
-        interval: IggyDuration,
+        interval: NonZeroIggyDuration,
         reestablish_after: IggyDuration,
     ) -> Self {
         Self {
@@ -47,7 +48,7 @@ impl Default for QuicClientReconnectionConfig {
         QuicClientReconnectionConfig {
             enabled: true,
             max_retries: None,
-            interval: IggyDuration::from_str("1s").unwrap(),
+            interval: NonZeroIggyDuration::from_str("1s").unwrap(),
             reestablish_after: IggyDuration::from_str("5s").unwrap(),
         }
     }

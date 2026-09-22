@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig, validate_server_address};
+use crate::{
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, TcpClientConfig,
+    validate_server_address,
+};
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -59,7 +62,7 @@ impl TcpClientConfigBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(mut self, interval: NonZeroIggyDuration) -> Self {
         self.config.reconnection.interval = interval;
         self
     }

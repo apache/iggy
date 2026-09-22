@@ -15,16 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::ffi;
+use std::{collections::BTreeMap, str::FromStr};
+
 use bytes::Bytes;
 use iggy::prelude::{
-    ConsumerGroupDetails as RustConsumerGroupDetails, IdKind, Identifier as RustIdentifier,
-    IggyMessage as RustIggyMessage, OptionSpec as RustOptionSpec, Partition as RustPartition,
-    PolledMessages as RustPolledMessages,
+    CompressionAlgorithm as RustCompressionAlgorithm,
+    ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
+    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
+    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec,
+    Partition as RustPartition, PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
-    StreamDetails as RustStreamDetails, Topic as RustTopic, TopicDetails as RustTopicDetails,
-    Validatable,
+    StreamDetails as RustStreamDetails, Topic as RustTopic,
+    TopicCreateOptions as RustTopicCreateOptions, TopicDetails as RustTopicDetails,
+    TopicUpdateOptions as RustTopicUpdateOptions, Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::{
@@ -34,11 +38,13 @@ use iggy_common::{
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
-    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, Permissions as RustPermissions,
-    Stats as RustStats, StreamPermissions as RustStreamPermissions,
+    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
+    Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
     TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
+    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
-use std::collections::BTreeMap;
+
+use crate::ffi;
 
 impl From<RustIdentifier> for ffi::Identifier {
     fn from(identifier: RustIdentifier) -> Self {
@@ -124,6 +130,80 @@ impl TryFrom<Option<RustClientInfoDetails>> for ffi::ClientInfoDetails {
         match client {
             Some(client) => Ok(ffi::ClientInfoDetails::from(client)),
             None => Err("client not found".to_string()),
+        }
+    }
+}
+
+impl From<RustIdentityInfo> for ffi::LoginInfo {
+    fn from(identity: RustIdentityInfo) -> Self {
+        let has_access_token = identity.access_token.is_some();
+        let (access_token, access_token_expiry) = identity
+            .access_token
+            .map(|token| (token.token, token.expiry))
+            .unwrap_or_default();
+
+        ffi::LoginInfo {
+            user_id: identity.user_id,
+            has_access_token,
+            access_token,
+            access_token_expiry,
+        }
+    }
+}
+
+impl From<RustUserInfo> for ffi::UserInfo {
+    fn from(user: RustUserInfo) -> Self {
+        ffi::UserInfo {
+            id: user.id,
+            created_at: user.created_at.as_micros(),
+            status: ffi::UserStatus::from(user.status),
+            username: user.username,
+        }
+    }
+}
+
+impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
+    fn from(user: RustUserInfoDetails) -> Self {
+        let has_permissions = user.permissions.is_some();
+        ffi::UserInfoDetails {
+            id: user.id,
+            created_at: user.created_at.as_micros(),
+            status: ffi::UserStatus::from(user.status),
+            username: user.username,
+            has_permissions,
+            permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
+        }
+    }
+}
+
+impl From<RustUserStatus> for ffi::UserStatus {
+    fn from(status: RustUserStatus) -> Self {
+        match status {
+            RustUserStatus::Active => ffi::UserStatus::Active,
+            RustUserStatus::Inactive => ffi::UserStatus::Inactive,
+        }
+    }
+}
+
+impl TryFrom<ffi::UserStatus> for RustUserStatus {
+    type Error = String;
+
+    fn try_from(status: ffi::UserStatus) -> Result<Self, Self::Error> {
+        match status {
+            ffi::UserStatus::Active => Ok(RustUserStatus::Active),
+            ffi::UserStatus::Inactive => Ok(RustUserStatus::Inactive),
+            _ => Err("invalid user status".to_owned()),
+        }
+    }
+}
+
+impl TryFrom<Option<RustUserInfoDetails>> for ffi::UserInfoDetails {
+    type Error = String;
+
+    fn try_from(user: Option<RustUserInfoDetails>) -> Result<Self, Self::Error> {
+        match user {
+            Some(user) => Ok(ffi::UserInfoDetails::from(user)),
+            None => Err("user not found".to_string()),
         }
     }
 }
@@ -228,6 +308,73 @@ impl From<RustClusterMetadata> for ffi::ClusterMetadata {
                 .nodes
                 .into_iter()
                 .map(ffi::ClusterNode::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<RustGlobalPermissions> for ffi::GlobalPermissions {
+    fn from(permissions: RustGlobalPermissions) -> Self {
+        ffi::GlobalPermissions {
+            manage_servers: permissions.manage_servers,
+            read_servers: permissions.read_servers,
+            manage_users: permissions.manage_users,
+            read_users: permissions.read_users,
+            manage_streams: permissions.manage_streams,
+            read_streams: permissions.read_streams,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<RustTopicPermissions> for ffi::TopicPermissions {
+    fn from(permissions: RustTopicPermissions) -> Self {
+        ffi::TopicPermissions {
+            manage_topic: permissions.manage_topic,
+            read_topic: permissions.read_topic,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<RustStreamPermissions> for ffi::StreamPermissions {
+    fn from(permissions: RustStreamPermissions) -> Self {
+        ffi::StreamPermissions {
+            manage_stream: permissions.manage_stream,
+            read_stream: permissions.read_stream,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+            topics: permissions
+                .topics
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(topic_id, permissions)| ffi::TopicPermissionEntry {
+                    topic_id: topic_id as u32,
+                    permissions: ffi::TopicPermissions::from(permissions),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RustPermissions> for ffi::Permissions {
+    fn from(permissions: RustPermissions) -> Self {
+        ffi::Permissions {
+            global: ffi::GlobalPermissions::from(permissions.global),
+            streams: permissions
+                .streams
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(stream_id, permissions)| ffi::StreamPermissionEntry {
+                    stream_id: stream_id as u32,
+                    permissions: ffi::StreamPermissions::from(permissions),
+                })
                 .collect(),
         }
     }
@@ -357,8 +504,8 @@ fn resource_options_to_ffi(
 /// value. A key this build cannot read at all is dropped rather than guessed.
 pub(crate) fn ffi_options_to_raw(
     options: Vec<ffi::HeaderEntry>,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let mut raw = std::collections::BTreeMap::new();
+) -> Result<BTreeMap<String, String>, String> {
+    let mut raw = BTreeMap::new();
     for entry in options {
         let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
         let key = key
@@ -372,6 +519,30 @@ pub(crate) fn ffi_options_to_raw(
     Ok(raw)
 }
 
+fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
+    match kind {
+        "server_default" | "default" => Ok(RustIggyExpiry::ServerDefault),
+        "never_expire" => Ok(RustIggyExpiry::NeverExpire),
+        "duration" if value == 0 => {
+            Err("message expiry duration must be greater than zero".to_string())
+        }
+        "duration" => Ok(RustIggyExpiry::ExpireDuration(
+            iggy::prelude::IggyDuration::from(value),
+        )),
+        _ => Err(format!("invalid message expiry kind '{kind}'")),
+    }
+}
+
+fn parse_compression_algorithm(value: &str) -> Result<RustCompressionAlgorithm, String> {
+    RustCompressionAlgorithm::from_str(value)
+        .map_err(|error| format!("invalid compression algorithm '{value}': {error}"))
+}
+
+fn parse_max_topic_size(value: &str) -> Result<RustMaxTopicSize, String> {
+    RustMaxTopicSize::from_str(value)
+        .map_err(|error| format!("invalid max topic size '{value}': {error}"))
+}
+
 impl From<RustOptionSpec> for ffi::OptionSpec {
     fn from(spec: RustOptionSpec) -> Self {
         ffi::OptionSpec {
@@ -380,6 +551,121 @@ impl From<RustOptionSpec> for ffi::OptionSpec {
             default_value: spec.default_value,
             description: spec.description,
         }
+    }
+}
+
+impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::TopicCreateOptions) -> Result<Self, Self::Error> {
+        let compression_algorithm = if options.has_compression_algorithm {
+            Some(parse_compression_algorithm(&options.compression_algorithm)?)
+        } else {
+            None
+        };
+        let message_expiry = if options.has_message_expiry {
+            Some(parse_message_expiry(
+                &options.message_expiry_kind,
+                options.message_expiry_value,
+            )?)
+        } else {
+            None
+        };
+        let max_topic_size = if options.has_max_topic_size {
+            Some(parse_max_topic_size(&options.max_topic_size)?)
+        } else {
+            None
+        };
+        let durability = if options.has_durability {
+            RustDurability::from_str(&options.durability)
+                .map_err(|error| format!("invalid durability '{}': {error}", options.durability))?
+        } else {
+            RustDurability::default()
+        };
+        let consumer_offset_durability = if options.has_consumer_offset_durability {
+            RustDurability::from_str(&options.consumer_offset_durability).map_err(|error| {
+                format!(
+                    "invalid consumer offset durability '{}': {error}",
+                    options.consumer_offset_durability
+                )
+            })?
+        } else {
+            RustDurability::default()
+        };
+        let mut raw = ffi_options_to_raw(options.raw_options)?;
+        if options.has_durability {
+            raw.remove("durability");
+        }
+        if options.has_consumer_offset_durability {
+            raw.remove("consumer_offset_durability");
+        }
+        Ok(RustTopicCreateOptions {
+            partitions_count: if options.has_partitions_count {
+                Some(options.partitions_count)
+            } else {
+                None
+            },
+            compression_algorithm,
+            message_expiry,
+            max_topic_size,
+            segment_size: if options.has_segment_size {
+                Some(RustIggyByteSize::from(options.segment_size))
+            } else {
+                None
+            },
+            durability,
+            consumer_offset_durability,
+            messages_required_to_save: if options.has_messages_required_to_save {
+                Some(options.messages_required_to_save)
+            } else {
+                None
+            },
+            size_of_messages_required_to_save: if options.has_size_of_messages_required_to_save {
+                Some(RustIggyByteSize::from(
+                    options.size_of_messages_required_to_save,
+                ))
+            } else {
+                None
+            },
+            preallocate_segments: if options.has_preallocate_segments {
+                Some(options.preallocate_segments)
+            } else {
+                None
+            },
+            raw,
+        })
+    }
+}
+
+impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::TopicUpdateOptions) -> Result<Self, Self::Error> {
+        let compression_algorithm = if options.has_compression_algorithm {
+            Some(parse_compression_algorithm(&options.compression_algorithm)?)
+        } else {
+            None
+        };
+        let message_expiry = if options.has_message_expiry {
+            Some(parse_message_expiry(
+                &options.message_expiry_kind,
+                options.message_expiry_value,
+            )?)
+        } else {
+            None
+        };
+        let max_topic_size = if options.has_max_topic_size {
+            Some(parse_max_topic_size(&options.max_topic_size)?)
+        } else {
+            None
+        };
+        let raw = ffi_options_to_raw(options.raw_options)?;
+        Ok(RustTopicUpdateOptions {
+            compression_algorithm,
+            message_expiry,
+            max_topic_size,
+            raw,
+        })
     }
 }
 
@@ -731,5 +1017,18 @@ impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
                 .map(ffi::SendMessagesConfirmation::from)
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_reject_zero_message_expiry_duration() {
+        assert_eq!(
+            parse_message_expiry("duration", 0).err().as_deref(),
+            Some("message expiry duration must be greater than zero")
+        );
     }
 }

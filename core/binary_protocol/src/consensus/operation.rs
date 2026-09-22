@@ -31,7 +31,7 @@ pub enum Operation {
     /// consensus pipeline (prepare/replicate/commit) as normal operations
     /// but skips state machine dispatch at commit time, the metadata
     /// plane calls `commit_register` directly, which mints the session's
-    /// fence epoch (1 at first register, +1 per rebind).
+    /// fence epoch from the committed Register log position.
     Register = 1,
 
     /// Non-replicated client request carried in VSR framing. The concrete
@@ -98,6 +98,17 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Whether `code` is a discriminant this build defines.
+    ///
+    /// The typed decode needs this to tell an operation a newer release added
+    /// from a corrupted header byte: bytemuck's checked cast rejects both with
+    /// one undifferentiated error, and only the former is fixable by upgrading
+    /// this node.
+    #[must_use]
+    pub fn is_known_code(code: u8) -> bool {
+        bytemuck::checked::try_cast::<u8, Self>(code).is_ok()
+    }
+
     pub const INTERNAL_START: u8 = Self::CreateTopicWithAssignments as u8;
     pub const METADATA_START: u8 = Self::CreateStream as u8;
     pub const PARTITION_START: u8 = Self::SendMessages as u8;
@@ -190,6 +201,14 @@ impl Operation {
     #[inline]
     pub const fn is_metadata_plane(&self) -> bool {
         self.is_metadata() || matches!(self, Self::Register | Self::Logout)
+    }
+
+    /// Whether a consensus plane claims this operation. Anything else the plane
+    /// chain drops in its `()` terminator, so entry paths must refuse it first.
+    #[must_use]
+    #[inline]
+    pub const fn is_plane_routable(&self) -> bool {
+        self.is_metadata_plane() || self.is_partition()
     }
 
     /// Operations clients are allowed to send directly.
@@ -356,5 +375,37 @@ mod tests {
         assert!(!Operation::TruncatePartition.is_client_allowed());
         assert!(Operation::StoreConsumerOffset.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
+    }
+
+    /// Every operation belongs to exactly one plane, or to the short list
+    /// answered before the chain. Walks `is_known_code` so a new variant fails
+    /// here rather than on the first frame carrying it.
+    #[test]
+    fn unroutable_operations_are_listed() {
+        // Answered earlier: `Reserved` by `validate_request_fields`,
+        // `NonReplicated` by the reads router, `DeleteSegments` by resolution to
+        // `TruncatePartition` (`server::dispatch::classify`).
+        const UNROUTABLE: [Operation; 3] = [
+            Operation::Reserved,
+            Operation::NonReplicated,
+            Operation::DeleteSegments,
+        ];
+
+        for code in 0..=u8::MAX {
+            if !Operation::is_known_code(code) {
+                continue;
+            }
+            let operation: Operation = bytemuck::checked::cast(code);
+            assert!(
+                !(operation.is_metadata_plane() && operation.is_partition()),
+                "{operation:?} is claimed by both planes; the chain takes the first"
+            );
+            assert_eq!(
+                operation.is_plane_routable(),
+                !UNROUTABLE.contains(&operation),
+                "{operation:?}: is_plane_routable={} disagrees with the unroutable list",
+                operation.is_plane_routable(),
+            );
+        }
     }
 }

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { toDate } from '../serialize.utils.js';
 import type { ValueOf } from '../../type.utils.js';
@@ -241,3 +240,10 @@ export const deserializeTopics = (p: Buffer, pos = 0): Topic[] => {
   }
   return topics;
 };
+
+export const Durability = {
+  Replicated: 'replicated',
+  Persisted: 'persisted'
+} as const;
+
+export type Durability = typeof Durability[keyof typeof Durability];

@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{HttpClientConfig, IggyError, utils::net::validate_api_url};
+use crate::{HttpClientConfig, IggyError, NonZeroIggyDuration, utils::net::validate_api_url};
 
 /// The builder for the `HttpClientConfig` configuration.
 /// Allows configuring the HTTP client with custom settings or using defaults:
 /// - `api_url`: Default is "http://127.0.0.1:3000"
 /// - `retries`: Default is 3.
+/// - `heartbeat_interval`: Default is 5 seconds.
 #[derive(Debug, Default)]
 pub struct HttpClientConfigBuilder {
     config: HttpClientConfig,
@@ -44,6 +45,12 @@ impl HttpClientConfigBuilder {
         self
     }
 
+    /// Sets the interval between the heartbeats sent to the server.
+    pub fn with_heartbeat_interval(mut self, interval: NonZeroIggyDuration) -> Self {
+        self.config.heartbeat_interval = interval;
+        self
+    }
+
     /// Sets the JWT for A2A authentication.
     pub fn with_jwt(mut self, token: String) -> Self {
         self.config.jwt = Some(token);
@@ -62,6 +69,7 @@ impl HttpClientConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn build_should_trim_and_validate_api_url() {
@@ -81,6 +89,18 @@ mod tests {
             .expect("expected build() to trim before validation");
 
         assert_eq!(config.api_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn build_should_keep_the_heartbeat_interval() {
+        let interval = NonZeroIggyDuration::from_str("10s").unwrap();
+
+        let config = HttpClientConfigBuilder::default()
+            .with_heartbeat_interval(interval)
+            .build()
+            .expect("expected valid HTTP client config");
+
+        assert_eq!(interval, config.heartbeat_interval);
     }
 
     #[test]

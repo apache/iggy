@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import type { Id } from '../identifier.utils.js';
 import type {
@@ -45,6 +44,7 @@ const GROUP_POLL_MAX_ATTEMPTS = 2;
 const GROUP_ASSIGNMENT_REFRESH_MS = 5_000;
 const GROUP_MEMBER_NOT_FOUND = 5006;
 const GROUP_PARTITION_NOT_OWNED = 5009;
+const TRANSIENT_NOT_COMMITTED = 57;
 
 type GroupCursor = {
   generation: bigint,
@@ -258,7 +258,9 @@ export const pollMessages = (getClient: ClientProvider) =>
             // Retry only when the command stream confirms that the VSR session
             // was reset. Other command, authorization, and decode errors remain
             // terminal for the caller.
-            if (state.sessionGeneration === sessionGeneration)
+            if (state.sessionGeneration === sessionGeneration ||
+                (error instanceof ResponseError &&
+                  error.errorCode === TRANSIENT_NOT_COMMITTED))
               throw error;
           }
         }

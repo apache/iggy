@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -275,6 +274,20 @@ describe('VSR consumer-group polling', () => {
         COMMAND_CODE.PollMessages
       ]
     );
+  });
+
+  it('does not replay an ambiguous auto-commit poll when its coordinator also resets', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, [4]),
+      new ResponseError(COMMAND_CODE.PollMessages, 57)
+    ], (command, emitter) => {
+      if (command === COMMAND_CODE.PollMessages)
+        emitter.emit('sessionReset');
+    });
+    await assert.rejects(pollMessages(async () => client)({ ...groupRequest, autocommit: true }),
+      (error: unknown) => error instanceof ResponseError && error.errorCode === 57);
+    assert.deepEqual(commands.map(({ command }) => command),
+      [COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages]);
   });
 
   it('resynchronizes twice before returning an empty result', async () => {

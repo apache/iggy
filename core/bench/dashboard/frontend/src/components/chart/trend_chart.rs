@@ -105,7 +105,7 @@ pub fn trend_chart(props: &TrendChartProps) -> Html {
                         Err(e) => log!(format!("Error rendering chart: {}", e)),
                     }
                 } else {
-                    log!(format!("No data to render chart"));
+                    log!("No data to render chart");
                 }
 
                 || ()

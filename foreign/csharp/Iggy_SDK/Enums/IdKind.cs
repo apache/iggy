@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 using System.Runtime.CompilerServices;
 
 namespace Apache.Iggy.Enums;

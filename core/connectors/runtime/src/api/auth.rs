@@ -25,6 +25,7 @@ use axum::{
 };
 use secrecy::ExposeSecret;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 const API_KEY_HEADER: &str = "api-key";
 const PUBLIC_PATHS: &[&str] = &["/", "/health"];
@@ -50,7 +51,11 @@ pub async fn resolve_api_key(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    if api_key != context.api_key.expose_secret() {
+    let matches: bool = api_key
+        .as_bytes()
+        .ct_eq(context.api_key.expose_secret().as_bytes())
+        .into();
+    if !matches {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

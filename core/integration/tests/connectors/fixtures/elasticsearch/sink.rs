@@ -33,6 +33,7 @@ use uuid::Uuid;
 const SINK_INDEX_PREFIX: &str = "iggy_messages";
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
+const PROBE_REQUEST_TIMEOUT_MS: u64 = 2_000;
 
 pub struct ElasticsearchSinkFixture {
     container: ElasticsearchContainer,
@@ -61,22 +62,43 @@ impl ElasticsearchSinkFixture {
         &self,
         expected_count: usize,
     ) -> Result<usize, TestBinaryError> {
+        // Built once, reused across every probe below: a fresh reqwest::Client
+        // re-parses the system CA store via rustls-platform-verifier on every
+        // build() (even for plain http) and loses keep-alive between probes.
+        let client = probe_client()?;
+        let mut last_error: Option<TestBinaryError> = None;
+
         for _ in 0..POLL_ATTEMPTS {
-            match self.count_documents(&self.index).await {
+            // Short-timeout probes: create_http_client() is 30s + 3 retries and
+            // would inflate failure-path wait_for_documents up to minutes.
+            if let Err(error) = self.refresh_index_probe(&client).await {
+                last_error = Some(error);
+                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                continue;
+            }
+
+            match self.count_documents_probe(&client).await {
                 Ok(count) if count >= expected_count => {
                     info!("Found {count} documents in Elasticsearch (expected {expected_count})");
                     return Ok(count);
                 }
-                Ok(_) => {}
-                Err(_) => {}
+                Ok(_) => {
+                    last_error = None;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
             }
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
-        let final_count = self.count_documents(&self.index).await.unwrap_or(0);
+        let final_count = self.count_documents_probe(&client).await.unwrap_or(0);
+        let detail = last_error
+            .map(|error| format!("; last error: {error}"))
+            .unwrap_or_default();
         Err(TestBinaryError::InvalidState {
             message: format!(
-                "Expected at least {expected_count} documents, found {final_count} after {POLL_ATTEMPTS} attempts"
+                "Expected at least {expected_count} documents, found {final_count} after {POLL_ATTEMPTS} attempts{detail}"
             ),
         })
     }
@@ -88,6 +110,75 @@ impl ElasticsearchSinkFixture {
     pub async fn refresh_index(&self) -> Result<(), TestBinaryError> {
         ElasticsearchOps::refresh_index(self, &self.index).await
     }
+
+    /// Refresh with the short-timeout probe client shared across one poll loop.
+    async fn refresh_index_probe(&self, client: &reqwest::Client) -> Result<(), TestBinaryError> {
+        let url = format!("{}/{}/_refresh", self.container.base_url, self.index);
+        let response =
+            client
+                .post(&url)
+                .send()
+                .await
+                .map_err(|error| TestBinaryError::InvalidState {
+                    message: format!("Failed to refresh index: {error}"),
+                })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(TestBinaryError::InvalidState {
+                message: format!("Failed to refresh index: status={status}, body={body}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Count with the short-timeout probe client shared across one poll loop.
+    ///
+    /// `count_documents` (via `ElasticsearchOps`) goes through the shared
+    /// `create_http_client()` - 30s timeout plus 3 retries - so a degraded
+    /// `_count` endpoint could block this poll for minutes even though
+    /// `refresh_index_probe` already uses a short timeout.
+    async fn count_documents_probe(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<usize, TestBinaryError> {
+        let url = format!("{}/{}/_count", self.container.base_url, self.index);
+        let response =
+            client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|error| TestBinaryError::InvalidState {
+                    message: format!("Failed to count documents: {error}"),
+                })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(TestBinaryError::InvalidState {
+                message: format!("Failed to count documents: status={status}, body={body}"),
+            });
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CountResponse {
+            count: usize,
+        }
+        let count_response = response.json::<CountResponse>().await.map_err(|error| {
+            TestBinaryError::InvalidState {
+                message: format!("Failed to parse count response: {error}"),
+            }
+        })?;
+        Ok(count_response.count)
+    }
+}
+
+fn probe_client() -> Result<reqwest::Client, TestBinaryError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(PROBE_REQUEST_TIMEOUT_MS))
+        .build()
+        .map_err(|error| TestBinaryError::InvalidState {
+            message: format!("Failed to build probe client: {error}"),
+        })
 }
 
 #[async_trait]
@@ -97,8 +188,6 @@ impl TestFixture for ElasticsearchSinkFixture {
         let http_client = create_http_client();
         let index = format!("{SINK_INDEX_PREFIX}_{}", Uuid::new_v4().simple());
 
-        // Container startup already waits for /_cluster/health to return 200
-        // via HttpWaitStrategy, so no additional health check is needed.
         Ok(Self {
             container,
             http_client,

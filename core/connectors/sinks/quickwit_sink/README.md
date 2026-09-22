@@ -1,22 +1,44 @@
 # Quickwit Sink
 
-The Quickwit connector allows you to send data to the Quickwit API using HTTP. This sink will ensure that the index exists (create it if it doesn't) and will append the data to the index using the same batch size as specified in the Iggy configuration.
+The Quickwit connector sends data to the Quickwit API using HTTP. It checks readiness when opening, creates the index if needed, and appends messages as NDJSON. Requests are split at 8 MiB, including the newline after each document. A larger individual document is logged and rejected while other documents continue.
 
 ## Configuration
 
-- `url`: The URL of the Quickwit server.
-- `index`: The index configuration using YAML, as described in the [Quickwit index configuration docs](https://quickwit.io/docs/configuration/index-config)
+| Key | Default | Description |
+| --- | --- | --- |
+| `url` | Required | Quickwit base URL with an `http` or `https` scheme and host. Path prefixes and a trailing slash are supported; query strings and fragments are rejected. |
+| `index` | Required | Index configuration as YAML, with a nonempty `index_id`. See the [Quickwit index configuration docs](https://quickwit.io/docs/configuration/index-config). |
+| `verbose_logging` | `false` | Log received and ingested message counts at `info` instead of `debug`. |
+| `max_retries` | `3` | Total HTTP attempts including the first; `0` and `1` both allow one attempt. |
+| `retry_delay` | `"1s"` | Base exponential delay for HTTP retries and readiness probes. |
+| `retry_max_delay` | `"5s"` | Cap for calculated HTTP retry delays; a valid `Retry-After` on HTTP 429 overrides it. |
+| `max_open_retries` | `10` | One initial probe per readiness check, with up to `max_open_retries - 1` retries shared between them; `0` and `1` disable retries. |
+| `open_retry_max_delay` | `"30s"` | Maximum delay between readiness probes. |
+| `timeout` | `"30s"` | Timeout per HTTP attempt; retries and waits can extend the complete operation. |
+
+Duration values require units, such as `250ms` or `30s`. Invalid or zero durations prevent initialization. Unknown plugin configuration keys are rejected.
+
+The runtime's `plugin_config_format` can be set in the connector TOML or with the `IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_FORMAT` environment variable. The `index` field itself is always a YAML string. The following fragment belongs in a complete sink entry with a plugin path and stream configuration; see the [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink/).
 
 ```toml
 [plugin_config]
 url = "http://localhost:7280"
+verbose_logging = false
+# Total attempts including the first; 1 disables retries.
+max_retries = 3
+retry_delay = "1s"
+retry_max_delay = "5s"
+# One initial probe per readiness check; share up to max_open_retries - 1 retries.
+max_open_retries = 10
+open_retry_max_delay = "30s"
+timeout = "30s"
 index = """
 version: 0.9
 
 index_id: events
 
 doc_mapping:
-  mode: strict
+  mode: dynamic
   field_mappings:
     - name: timestamp
       type: datetime
@@ -50,13 +72,47 @@ doc_mapping:
       type: text
       tokenizer: default
 
-  timestamp_field: timestamp
+  # Enable only when every document contains timestamp.
+  # timestamp_field: timestamp
 
 indexing_settings:
   commit_timeout_secs: 10
 
-retention:
-  period: 7 days
-  schedule: daily
+# Retention requires timestamp_field above.
+# retention:
+#   period: 7 days
+#   schedule: daily
 """
 ```
+
+## Document shapes
+
+The stream's `schema` selects the runtime decoder. The sink sends JSON objects using these shapes:
+
+| Payload | Example document |
+| --- | --- |
+| JSON object, including an object parsed from raw bytes | `{"message":"ready"}` |
+| JSON array or scalar | `{"data":[1,2],"data_type":"json"}` or `{"data":42,"data_type":"json"}` |
+| Raw UTF-8 that is not a JSON object | `{"data":"ready","data_type":"raw","data_encoding":"utf8"}` |
+| Raw non-UTF-8 bytes | `{"data":"/wCA","data_type":"raw","data_encoding":"base64"}` |
+| Text | `{"text":"ready","data_type":"text"}` |
+
+Raw JSON arrays and scalars remain UTF-8 strings in the raw wrapper. Malformed JSON also preserves the original bytes. `data_encoding` distinguishes literal text from base64. The sink handles `Payload::Avro` and `Payload::FlatBuffer` with the raw path. `Payload::Proto` whose text is a JSON document (the descriptor-less `proto_convert` fallback) takes the JSON path; any other proto text takes the text wrapper. Runtime decoder settings determine which payload variant reaches the sink.
+
+The examples use `mode: dynamic` to retain wrapper fields. With `mode: strict`, map every field emitted by the selected payload shape or Quickwit rejects the document during indexing, even after a successful HTTP response. Timestamp sharding and retention are optional here: raw/text wrappers have no `timestamp`, and the `add_fields` transform only enriches JSON payloads. Configure them only when every document supplies the required timestamp.
+
+## Delivery semantics
+
+Transient HTTP failures, including 429, can retry a request that Quickwit already accepted. Quickwit ingest has no deduplication key, so these retries can produce duplicate documents. Set `max_retries = 1` to disable the sink's HTTP retry loop. Calculated delays use exponential backoff with jitter; a valid `Retry-After` on HTTP 429 replaces the calculated delay.
+
+Service readiness retries any failed health probe. After verifying or creating the index, the sink probes its ingest endpoint with an empty body before accepting messages.
+This is intentional: legacy index metadata can exist before the ingest queue is ready, while the read-only `/tail` endpoint checks only legacy ingestion.
+The probe uses `commit=auto`, so it adds no documents and does not force a commit; see Quickwit's [ingest implementation](https://github.com/quickwit-oss/quickwit/blob/v0.8.2/quickwit/quickwit-serve/src/ingest_api/rest_handler.rs) and [legacy/V2 routing](https://github.com/quickwit-oss/quickwit/blob/v0.9.0/quickwit/quickwit-serve/src/ingest_api/rest_handler.rs).
+Ingest V2 accepts empty requests without checking shard readiness, so this probe does not guarantee that the first data request will succeed.
+Index readiness retries HTTP 404, 429, 5xx and network failures.
+The two checks share up to `max_open_retries - 1` retries, in addition to one initial probe each.
+Values of `0` or `1` disable retries. Delays use `open_retry_max_delay`; these probes submit no documents.
+
+The sink cannot guarantee at-least-once delivery. The runtime commits offsets when polling, logs/counts plugin callback errors and continues without replaying the failed batch. A permanent error or exhausted retry budget is logged, but affected messages are not redelivered. The runtime's processed-message count does not prove successful indexing.
+
+Chunks are independent: successful writes remain committed if another chunk fails. The sink continues later chunks and returns the last error. A successful ingest response acknowledges submission for indexing, not search visibility or acceptance of every document. The sink checks the HTTP status without inspecting per-document rejection counts. It does not add Iggy metadata or headers, and it does not update or compare an existing index's mapping. This sink has no circuit breaker.

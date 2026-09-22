@@ -161,6 +161,8 @@ public class HttpMessageStream : IIggyClient
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
         IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
     {
+
+        options = TopicOptions.WithDurabilityDefaults(options);
         var json = JsonSerializer.Serialize(new CreateTopicRequest
         {
             Name = name,
@@ -216,16 +218,13 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
+    public async Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
-        return _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token)
-            .ContinueWith(async response =>
-            {
-                if (!response.Result.IsSuccessStatusCode)
-                {
-                    await HandleResponseAsync(response.Result);
-                }
-            }, token);
+        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token);
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
     }
 
     /// <inheritdoc />
@@ -339,7 +338,7 @@ public class HttpMessageStream : IIggyClient
 
             if (MessageEncryptor is not null)
             {
-                DecryptMessages(pollMessages.Messages, (uint)pollMessages.PartitionId);
+                DecryptMessages(pollMessages.Messages, pollMessages.PartitionId);
             }
 
             return pollMessages;
@@ -950,6 +949,7 @@ public class HttpMessageStream : IIggyClient
     /// </summary>
     public void Dispose()
     {
+        _httpClient.Dispose();
     }
 
     /// <inheritdoc />
@@ -999,11 +999,11 @@ public class HttpMessageStream : IIggyClient
         var partition = partitioning.Kind switch
         {
             Enums.Partitioning.Balanced => _groupState.NextBalancedPartition(key, partitionCount.Value),
-            Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Value) % partitionCount.Value,
+            Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Bytes) % partitionCount.Value,
             _ => throw new FeatureUnavailableException()
         };
 
-        return Partitioning.PartitionId((int)partition);
+        return Partitioning.PartitionId(partition);
     }
 
     private void DecryptMessages(IReadOnlyList<MessageResponse> messages, uint partitionId)
@@ -1100,7 +1100,7 @@ public class HttpMessageStream : IIggyClient
         return plaintext;
     }
 
-    private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
+    private async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
     {
         if (response.IsSuccessStatusCode)
         {
@@ -1117,7 +1117,7 @@ public class HttpMessageStream : IIggyClient
         ErrorResponse? errorModel = null;
         try
         {
-            errorModel = JsonSerializer.Deserialize<ErrorResponse>(err);
+            errorModel = JsonSerializer.Deserialize<ErrorResponse>(err, _jsonSerializerOptions);
         }
         catch (JsonException)
         {

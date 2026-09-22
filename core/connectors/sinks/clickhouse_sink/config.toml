@@ -37,16 +37,13 @@ database = "default"
 username = "default"
 password = ""
 table = "events"
-# TODO: validate database/table with a strict allowlist (^[A-Za-z_][A-Za-z0-9_]*$) and
-# escape backslashes in SQL string literals (currently only ' is escaped). Deferred
-# because sinks run in operator-controlled environments where config values are trusted.
 
 # Insert format: "json_each_row" (default), "row_binary", or "string"
-#   json_each_row  — accepts Payload::Json; ClickHouse handles type coercion
-#   row_binary     — accepts Payload::Json; connector validates + serialises
+#   json_each_row  - accepts Payload::Json; ClickHouse handles type coercion
+#   row_binary     - accepts Payload::Json; connector validates + serialises
 #                    to RowBinaryWithDefaults (table must exist, schema is
 #                    fetched at startup; fails if table has unsupported types)
-#   string         — accepts Payload::Text; raw passthrough
+#   string         - accepts Payload::Text; appends a newline when absent
 insert_format = "json_each_row"
 
 # Only relevant when insert_format = "string":
@@ -54,6 +51,6 @@ insert_format = "json_each_row"
 # string_format = "csv"
 
 timeout_seconds = 30
-max_retries = 3
-retry_delay = 1 # seconds
+max_retries = 3 # total attempts, including the initial request
+retry_delay = 1 # base delay in seconds, before exponential backoff and jitter
 verbose_logging = false

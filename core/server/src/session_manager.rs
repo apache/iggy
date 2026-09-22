@@ -26,12 +26,37 @@
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
 use crate::cluster_meta::ClusterRoster;
+use ahash::AHashMap;
+use consensus::client_table::SessionAttachment;
+use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+/// What the request funnel resolves from one `connections` lookup per frame.
+///
+/// The bound consensus session, the acting user, the transport peer address
+/// and the read-your-writes floor. `Default` (everything absent, no address,
+/// floor `0`) stands for a connection neither this map nor the bus knows.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ConnectionContext {
+    /// `(client_id, session)` once register committed, `None` before.
+    pub bound: Option<(u128, u64)>,
+    /// Acting user from `login`, `None` while still `Connected`.
+    pub user_id: Option<u32>,
+    /// Peer address recorded by [`SessionManager::ensure_connection`]; the
+    /// non-replicated reads pick the advertised address from it, and
+    /// `None` degrades to the catch-all address.
+    pub address: Option<SocketAddr>,
+    /// Read-your-writes floor: the metadata commit this connection's own
+    /// writes have reached, which its reads must not be served below.
+    ///
+    /// A connection this map does not know reads as `0` -- it was promised
+    /// nothing, so its reads wait for nothing.
+    pub metadata_watermark: u64,
+}
 
 /// Connection lifecycle states.
 ///
@@ -79,6 +104,19 @@ pub struct Connection {
     pub last_heartbeat: Instant,
     /// Recorded at login; `None` until the connection authenticates.
     pub sdk: Option<ClientSdkInfo>,
+    /// Highest metadata op this connection has been told committed.
+    ///
+    /// Seeded from the bound session (the register's own commit op, which
+    /// floors everything the client committed before it re-homed) and raised by
+    /// every committed reply relayed on this connection. The read gate holds a
+    /// local read until the node's applied frontier covers it, so a client
+    /// cannot be served state older than a write it already saw acked.
+    ///
+    /// Per-connection rather than per-client: the number only has to cover what
+    /// THIS socket was told, and a client that reconnects re-seeds from the
+    /// session it binds.
+    pub metadata_watermark: u64,
+    consumer_session: Option<(u128, SessionAttachment)>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -95,10 +133,14 @@ pub struct Connection {
 ///   per consensus session). If a client reconnects with the same `client_id`,
 ///   the old connection must be evicted first.
 pub struct SessionManager {
-    connections: HashMap<u128, Connection>,
+    /// `ahash` over `std`: connection and client ids are server-minted, so
+    /// there is no `HashDoS` surface, and both maps sit on the per-frame path.
+    /// Neither is order-sensitive (`iter_clients` and `collect_stale` both
+    /// consume the whole map).
+    connections: AHashMap<u128, Connection>,
     /// Reverse index: `client_id` → `connection_id` for fast lookup when
     /// a consensus reply arrives and needs routing to the right connection.
-    client_to_connection: HashMap<u128, u128>,
+    client_to_connection: AHashMap<u128, u128>,
     /// This shard's copy of the configured cluster roster, served by the
     /// `GetClusterMetadata` read. Lives here because it is the
     /// per-shard context already threaded to the non-replicated read path;
@@ -110,8 +152,8 @@ impl SessionManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            connections: HashMap::new(),
-            client_to_connection: HashMap::new(),
+            connections: AHashMap::new(),
+            client_to_connection: AHashMap::new(),
             cluster_roster: Rc::new(ClusterRoster::disabled()),
         }
     }
@@ -141,15 +183,36 @@ impl SessionManager {
                 state: ConnectionState::Connected,
                 last_heartbeat: Instant::now(),
                 sdk: None,
+                metadata_watermark: 0,
+                consumer_session: None,
             });
     }
 
-    /// Record a liveness heartbeat (`ping`) for a connection, resetting its
-    /// staleness clock. No-op for an unknown connection.
-    pub fn record_heartbeat(&mut self, connection_id: u128) {
-        if let Some(conn) = self.connections.get_mut(&connection_id) {
-            conn.last_heartbeat = Instant::now();
-        }
+    /// The request funnel's per-frame view of a connection: stamp the
+    /// liveness clock and read back everything the dispatch arms resolve
+    /// from it, in ONE map lookup.
+    ///
+    /// `None` means the connection is not registered yet, which happens
+    /// only on a transport's first frame; the caller installs it from the
+    /// bus metadata ([`Self::ensure_connection`]) and asks again.
+    pub(crate) fn touch_connection(&mut self, connection_id: u128) -> Option<ConnectionContext> {
+        let conn = self.connections.get_mut(&connection_id)?;
+        conn.last_heartbeat = Instant::now();
+        let (bound, user_id) = match conn.state {
+            ConnectionState::Bound {
+                user_id,
+                client_id,
+                session,
+            } => (Some((client_id, session)), Some(user_id)),
+            ConnectionState::Authenticated { user_id } => (None, Some(user_id)),
+            ConnectionState::Connected => (None, None),
+        };
+        Some(ConnectionContext {
+            bound,
+            user_id,
+            address: Some(conn.address),
+            metadata_watermark: conn.metadata_watermark,
+        })
     }
 
     /// Connection ids whose last heartbeat is older than `max_age` -- the
@@ -215,6 +278,14 @@ impl SessionManager {
         match conn.state {
             ConnectionState::Connected => {
                 conn.state = ConnectionState::Authenticated { user_id };
+                // The floor belongs to whoever was told those ops committed,
+                // and this socket now serves someone else: a `Connected`
+                // connection is either fresh or one `bind_session` demoted, so
+                // carrying the old mark over would make the new login wait for
+                // a write it never issued. Never the other direction - the
+                // bind below re-seeds from the register epoch.
+                conn.metadata_watermark = 0;
+                conn.consumer_session = None;
                 Ok(())
             }
             _ => Err(SessionError::InvalidTransition {
@@ -268,18 +339,121 @@ impl SessionManager {
         }
 
         // Now mutate the target connection.
-        self.connections.get_mut(&connection_id).unwrap().state = ConnectionState::Bound {
+        let bound = self
+            .connections
+            .get_mut(&connection_id)
+            .expect("bind_session: connection validated above, single-threaded");
+        bound.state = ConnectionState::Bound {
             user_id,
             client_id,
             session,
         };
+        // The session IS the register's commit op, so it floors every metadata
+        // op this client saw committed before it re-homed here. Without the
+        // seed a re-homed connection reads at zero and the gate admits the
+        // pre-write state its own last write already replaced.
+        bound.metadata_watermark = bound.metadata_watermark.max(session);
         self.client_to_connection.insert(client_id, connection_id);
         Ok(())
     }
 
+    /// Raise this connection's metadata watermark to `commit`. Monotone, so a
+    /// late or out-of-order reply cannot lower it; no-op for an unknown
+    /// connection.
+    ///
+    /// Only committed replies belong here. A pre-consensus rejection stamps the
+    /// primary's `commit_max`, which is an op this connection was never
+    /// promised and, on a backup-homed connection, one it would then wait for.
+    pub fn record_metadata_watermark(&mut self, connection_id: u128, commit: u64) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.metadata_watermark = conn.metadata_watermark.max(commit);
+        }
+    }
+
+    /// Attach a consumer-group identity to an authenticated data connection.
+    ///
+    /// This connection retains its own consensus identity and disconnect cleanup.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` for an unbound connection or `StaleClient`
+    /// when the parent epoch has ended.
+    pub fn attach_consumer_session(
+        &mut self,
+        connection_id: u128,
+        client_id: u128,
+        attachment: SessionAttachment,
+        metadata_watermark: u64,
+    ) -> Result<(), IggyError> {
+        let connection = self
+            .connections
+            .get_mut(&connection_id)
+            .ok_or(IggyError::Unauthenticated)?;
+        if !matches!(connection.state, ConnectionState::Bound { .. }) {
+            return Err(IggyError::Unauthenticated);
+        }
+        if !attachment.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        connection.consumer_session = Some((client_id, attachment));
+        connection.metadata_watermark = connection.metadata_watermark.max(metadata_watermark);
+        Ok(())
+    }
+
+    /// Resolve the attached group identity without extending its lifetime.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` without an authenticated attachment, or
+    /// `StaleClient` when the parent epoch has ended.
+    pub fn consumer_session(
+        &self,
+        connection_id: u128,
+    ) -> Result<(u128, SessionAttachment), IggyError> {
+        self.attached_consumer_session(connection_id)?
+            .ok_or(IggyError::Unauthenticated)
+    }
+
+    /// An absent alias is an ordinary session; an expired alias must fail closed.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` for an unbound connection and `StaleClient`
+    /// when its attached parent session has ended.
+    pub fn attached_consumer_session(
+        &self,
+        connection_id: u128,
+    ) -> Result<Option<(u128, SessionAttachment)>, IggyError> {
+        let connection = self
+            .connections
+            .get(&connection_id)
+            .ok_or(IggyError::Unauthenticated)?;
+        if !matches!(connection.state, ConnectionState::Bound { .. }) {
+            return Err(IggyError::Unauthenticated);
+        }
+        let Some((client_id, attachment)) = connection.consumer_session.as_ref() else {
+            return Ok(None);
+        };
+        if !attachment.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        Ok(Some((*client_id, attachment.clone())))
+    }
+
+    /// The highest metadata op this connection was told committed, or `0` when
+    /// it was told none (an unknown or still-unbound connection, which has no
+    /// write to read back).
+    #[must_use]
+    pub fn metadata_watermark(&self, connection_id: u128) -> u64 {
+        self.connections
+            .get(&connection_id)
+            .map_or(0, |conn| conn.metadata_watermark)
+    }
+
     /// Look up the consensus session for a connection.
     ///
-    /// Returns `(client_id, session)` if the connection is `Bound`, `None` otherwise.
+    /// Returns `(client_id, session)` if the connection is `Bound`, `None`
+    /// otherwise. The request funnel reads it through the crate-private
+    /// `touch_connection` instead, which resolves it in the same lookup as
+    /// the heartbeat; this is for the session-op paths that only need the
+    /// binding.
     #[must_use]
     pub fn get_session(&self, connection_id: u128) -> Option<(u128, u64)> {
         let conn = self.connections.get(&connection_id)?;
@@ -289,34 +463,6 @@ impl SessionManager {
             } => Some((client_id, session)),
             _ => None,
         }
-    }
-
-    /// The transport-level peer address a connection arrived from, recorded by
-    /// [`Self::ensure_connection`] for every transport. The non-replicated
-    /// read path uses it to pick the advertised address a client is told
-    /// about; `None` (unknown connection) degrades to the catch-all address.
-    #[must_use]
-    pub fn connection_address(&self, connection_id: u128) -> Option<SocketAddr> {
-        self.connections
-            .get(&connection_id)
-            .map(|conn| conn.address)
-    }
-
-    /// Acting user and transport peer address for a connection, in one map
-    /// lookup: the non-replicated dispatch path needs both, and the separate
-    /// accessors would walk the connection map twice per request.
-    #[must_use]
-    pub fn read_context(&self, connection_id: u128) -> (Option<u32>, Option<SocketAddr>) {
-        let Some(conn) = self.connections.get(&connection_id) else {
-            return (None, None);
-        };
-        let user_id = match conn.state {
-            ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
-                Some(user_id)
-            }
-            ConnectionState::Connected => None,
-        };
-        (user_id, Some(conn.address))
     }
 
     /// Look up the authenticated user id for a connection.
@@ -422,10 +568,58 @@ const fn state_name(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reply_frame::build_empty_reply;
+    use consensus::ClientTable;
+    use consensus::client_table::SessionEnd;
+    use iggy_binary_protocol::{Operation, RoutedRequestHeader};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn data_disconnect_releases_only_its_own_session_and_parent_logout_fences_attachments() {
+        const USER: u32 = 7;
+        const PARENT: u128 = 11;
+        const DATA: u128 = 22;
+        const OTHER_DATA: u128 = 33;
+        let mut sessions = SessionManager::new();
+        let mut table = ClientTable::new(3);
+        let header = RoutedRequestHeader {
+            operation: Operation::Register,
+            ..Default::default()
+        };
+        for (client, epoch) in [(PARENT, 1), (DATA, 2), (OTHER_DATA, 3)] {
+            table.commit_register(
+                client,
+                USER,
+                build_empty_reply(&header, client, epoch, epoch),
+            );
+            sessions.ensure_connection(client, addr(5000), ClientTransportKind::Tcp);
+            sessions.login(client, USER).unwrap();
+            sessions.bind_session(client, client, epoch).unwrap();
+        }
+        for data in [DATA, OTHER_DATA] {
+            let attachment = table.attach_session(PARENT, 1, USER).unwrap();
+            sessions
+                .attach_consumer_session(data, PARENT, attachment, 3)
+                .unwrap();
+            assert_eq!(sessions.consumer_session(data).unwrap().0, PARENT);
+        }
+
+        let disconnected = sessions.remove_connection(DATA);
+        assert_eq!(disconnected, Some((DATA, 2)));
+        table.remove_client(DATA, USER, SessionEnd::DisconnectCleanup);
+        assert_eq!(sessions.get_session(PARENT), Some((PARENT, 1)));
+        assert_eq!(sessions.consumer_session(OTHER_DATA).unwrap().0, PARENT);
+
+        table.remove_client(PARENT, USER, SessionEnd::Explicit);
+        assert!(matches!(
+            sessions.consumer_session(OTHER_DATA),
+            Err(IggyError::StaleClient)
+        ));
+        assert_eq!(sessions.get_session(OTHER_DATA), Some((OTHER_DATA, 3)));
     }
 
     #[test]
@@ -602,5 +796,79 @@ mod tests {
             None,
             "a second disconnect has nothing left to release"
         );
+    }
+
+    /// The bind seed is what makes a re-homed connection safe: the register's
+    /// commit op floors every metadata op the client committed elsewhere, so
+    /// the read gate cannot admit the pre-write state on a node that has not
+    /// caught up. A recorder that could lower the mark would undo it.
+    #[test]
+    fn given_a_bound_connection_when_replies_arrive_should_keep_the_watermark_monotone() {
+        let mut mgr = SessionManager::new();
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5200), ClientTransportKind::Tcp);
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            0,
+            "an unbound connection was promised nothing"
+        );
+
+        mgr.login(conn, 3).unwrap();
+        mgr.bind_session(conn, 100, 42).unwrap();
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            42,
+            "the bound session is the register's commit op and floors the mark"
+        );
+
+        mgr.record_metadata_watermark(conn, 50);
+        mgr.record_metadata_watermark(conn, 7);
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            50,
+            "a lower commit must not lower the mark"
+        );
+    }
+
+    /// A socket that logs in again is serving a new caller, so it must not
+    /// inherit the floor of the one before it: the mark is what the PREVIOUS
+    /// login was told committed, and waiting for it would only ever delay the
+    /// new one.
+    #[test]
+    fn given_a_rebound_connection_when_it_logs_in_again_should_start_from_no_floor() {
+        let mut mgr = SessionManager::new();
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5201), ClientTransportKind::Tcp);
+        mgr.login(conn, 3).unwrap();
+        mgr.bind_session(conn, 100, 42).unwrap();
+        mgr.record_metadata_watermark(conn, 50);
+
+        // `bind_session` for the same client id on ANOTHER connection demotes
+        // this one to `Connected`, which is the state a re-login accepts.
+        mgr.ensure_connection(2, addr(5202), ClientTransportKind::Tcp);
+        mgr.login(2, 3).unwrap();
+        mgr.bind_session(2, 100, 43).unwrap();
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            50,
+            "the demotion alone leaves the mark; the re-login is what clears it"
+        );
+
+        mgr.login(conn, 7).unwrap();
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            0,
+            "a different user on this socket was promised nothing"
+        );
+    }
+
+    /// An unknown connection is not an error: the disconnect callback can win
+    /// the race against a reply relay, and a gate reading `0` then serves the
+    /// read instead of parking a socket that is already gone.
+    #[test]
+    fn given_an_unknown_connection_when_recording_a_watermark_should_be_inert() {
+        let mut mgr = SessionManager::new();
+        mgr.record_metadata_watermark(9, 5);
+        assert_eq!(mgr.metadata_watermark(9), 0);
     }
 }

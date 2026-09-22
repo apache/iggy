@@ -22,7 +22,7 @@ use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
-use tracing::trace;
+use tracing::{error, trace};
 
 /// A dedicated struct for writing to the messages file.
 #[derive(Debug)]
@@ -62,10 +62,6 @@ impl MessagesWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.error(|e: &std::io::Error| {
-                format!("Failed to fsync messages file after creation: {file_path}, error: {e}")
-            });
-
             let actual_messages_size = file
                 .metadata()
                 .await
@@ -75,7 +71,20 @@ impl MessagesWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            messages_size_bytes.store(actual_messages_size, Ordering::Relaxed);
+            // The caller seeds the size counter from recovered, validated bounds
+            // and recovery truncates the file to them. A divergent on-disk length
+            // means appending would resurrect or shear bytes those bounds
+            // exclude, so refuse the open.
+            let expected_messages_size = messages_size_bytes.load(Ordering::Relaxed);
+            if actual_messages_size != expected_messages_size {
+                error!(
+                    "Messages file size on disk: {actual_messages_size} does not match expected size: {expected_messages_size}, file: {file_path}"
+                );
+                return Err(IggyError::SegmentSizeMismatchAtOpen(
+                    actual_messages_size,
+                    expected_messages_size,
+                ));
+            }
         }
 
         trace!(

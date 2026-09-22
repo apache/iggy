@@ -28,6 +28,7 @@ use encoders::{
 use iggy::prelude::{HeaderKey, HeaderValue};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use strum_macros::{Display, IntoStaticStr};
@@ -108,7 +109,7 @@ pub trait Source: Send + Sync {
     /// Invoked when the source is initialized, allowing it to perform any necessary setup.
     async fn open(&mut self) -> Result<(), Error>;
 
-    /// Invoked every time a batch of messages is produced to the configured stream and topic.
+    /// Retrieves the next batch for the runtime to process and deliver.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
 
     /// Invoked after the runtime has finished processing the most recently polled batch.
@@ -134,7 +135,13 @@ pub trait Sink: Send + Sync {
     /// Invoked when the sink is initialized, allowing it to perform any necessary setup.
     async fn open(&mut self) -> Result<(), Error>;
 
-    /// Invoked every time a batch of messages is received from the configured stream(s) and topic(s).
+    /// Invoked for each run of messages polled from the configured stream(s) and topic(s).
+    ///
+    /// One poll can reach the plugin as more than one call. The runtime groups a batch into
+    /// contiguous runs of a single payload variant and sends each run on its own, so a batch
+    /// whose variant changes partway through arrives as several calls, every one of them
+    /// repeating the same `messages_metadata.current_offset`. A batch that lost every message
+    /// to the decoder or to a transform still arrives, as one call carrying no messages.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,
@@ -157,6 +164,87 @@ pub enum Payload {
 }
 
 impl Payload {
+    /// The `Schema` describing this payload's variant.
+    ///
+    /// Not the same thing as `StreamDecoder::schema`, which names the wire
+    /// format a decoder reads rather than the variant it hands back: the Avro
+    /// and FlatBuffer decoders return `Payload::Json` whenever `extract_as_json`
+    /// is set, and the Proto decoder returns `Payload::Json` or `Payload::Raw`
+    /// depending on the path it takes. A transform may change the variant again
+    /// after that. Anything tagging a payload for transport has to read the tag
+    /// off the payload it actually holds.
+    pub const fn schema(&self) -> Schema {
+        match self {
+            Payload::Json(_) => Schema::Json,
+            Payload::Raw(_) => Schema::Raw,
+            Payload::Text(_) => Schema::Text,
+            Payload::Proto(_) => Schema::Proto,
+            Payload::FlatBuffer(_) => Schema::FlatBuffer,
+            Payload::Avro(_) => Schema::Avro,
+        }
+    }
+
+    /// Rebuilds a payload from a tag produced by `Payload::schema`.
+    ///
+    /// The variant-preserving inverse of `Payload::schema`, and not the same
+    /// thing as `Schema::try_into_payload`, which reads a tag naming the wire
+    /// format a source plugin sent. The two disagree on `Schema::Proto`: it
+    /// means protobuf wire bytes to a source and a `Payload::Proto` string
+    /// here, so the sink path needs its own inverse to get its variant back.
+    pub fn try_from_schema(schema: Schema, mut value: Vec<u8>) -> Result<Self, Error> {
+        match schema {
+            Schema::Json => Ok(Payload::Json(
+                simd_json::to_owned_value(&mut value).map_err(|_| Error::InvalidJsonPayload)?,
+            )),
+            Schema::Raw => Ok(Payload::Raw(value)),
+            Schema::Text => Ok(Payload::Text(
+                String::from_utf8(value).map_err(|_| Error::InvalidTextPayload)?,
+            )),
+            Schema::Proto => Ok(Payload::Proto(
+                String::from_utf8(value).map_err(|_| Error::InvalidProtobufPayload)?,
+            )),
+            Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
+            Schema::Avro => Ok(Payload::Avro(value)),
+        }
+    }
+
+    /// The JSON document this payload holds, when it holds one.
+    ///
+    /// A `Payload::Json` is borrowed as it is. A `Payload::Proto` is parsed,
+    /// because `proto_convert` puts the JSON text it was handed there whenever
+    /// it has no descriptor or the encode fails, and puts arbitrary text there
+    /// on its text and raw paths. The parse can therefore fail by design, and
+    /// `None` means the text has to be treated as text. Every other variant is
+    /// `None`.
+    ///
+    /// Proto text is parsed from a copy: simd_json mutates its buffer even when
+    /// the parse fails, and the text has to survive for the fallback.
+    pub fn json_document(&self) -> Option<Cow<'_, simd_json::OwnedValue>> {
+        match self {
+            Payload::Json(value) => Some(Cow::Borrowed(value)),
+            Payload::Proto(text) => {
+                let mut bytes = text.as_bytes().to_vec();
+                simd_json::to_owned_value(&mut bytes).ok().map(Cow::Owned)
+            }
+            _ => None,
+        }
+    }
+
+    /// The same payload, with proto text that holds a JSON document replaced by
+    /// that document.
+    ///
+    /// The consuming counterpart to `json_document`, for a sink that wants the
+    /// descriptor-less `proto_convert` fallback to take its existing JSON path.
+    /// A `Payload::Json` already holds the document and is returned as it is,
+    /// and proto text that is not JSON stays `Payload::Proto` for the sink's
+    /// text handling. Every other variant is returned unchanged.
+    pub fn into_json_document(self) -> Self {
+        match self.json_document() {
+            Some(Cow::Owned(document)) => Payload::Json(document),
+            _ => self,
+        }
+    }
+
     /// Consuming conversion — transfers ownership of inner buffers.
     pub fn try_into_vec(self) -> Result<Vec<u8>, Error> {
         match self {
@@ -240,6 +328,13 @@ pub enum Schema {
 }
 
 impl Schema {
+    /// Rebuilds a payload from a tag naming the wire format its bytes are in.
+    ///
+    /// Carries the source path, where a plugin sets `ProducedMessages::schema`
+    /// to describe the bytes it produced. `Schema::Proto` therefore means
+    /// protobuf wire bytes and is read as a `prost_types::Any`. Use
+    /// `Payload::try_from_schema` to invert a tag that came from
+    /// `Payload::schema` instead.
     pub fn try_into_payload(self, mut value: Vec<u8>) -> Result<Payload, Error> {
         match self {
             Schema::Json => Ok(Payload::Json(
@@ -294,11 +389,20 @@ pub struct TopicMetadata {
     pub topic: String,
 }
 
+/// Describes the run of messages carried by one `Sink::consume` call.
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessagesMetadata {
+    /// The partition the run was polled from.
     pub partition_id: u32,
+    /// The partition's high-water offset at the time of the poll, not the offset of the last
+    /// message in this run. Every call the poll produces repeats it, so a sink that keys a
+    /// commit, a file name or a table version on it has to tolerate the repeat.
     pub current_offset: u64,
+    /// The variant every `Payload` in this run holds, which is not always the stream's
+    /// configured `schema`: a decoder may return a different form than the wire format it
+    /// reads, and a transform may change the variant again. An empty run has no payload to
+    /// read a variant from and carries the stream's configured schema instead.
     pub schema: Schema,
 }
 
@@ -455,4 +559,247 @@ pub enum Error {
     /// be duplicated.
     #[error("Catalog commit error: {0}")]
     CatalogCommitError(String),
+    /// The state store is temporarily unavailable (5xx, timeout, connect
+    /// failure) and bounded retries were exhausted. The operation may succeed
+    /// later; the batch-ack path Nacks and the plugin re-polls.
+    #[error("Transient state error: {0}")]
+    TransientState(String),
+    /// The state store rejected the operation in a way retrying cannot fix
+    /// (version conflict, revoked authorization, protocol violation). No
+    /// write from this process can be expected to succeed again.
+    #[error("Permanent state error: {0}")]
+    PermanentState(String),
+    /// A previous save failed permanently, so the state provider refuses
+    /// further saves without touching the network. Fail-fast marker, never
+    /// retried.
+    #[error("State provider latched after a permanent state error")]
+    StateLatched,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_payloads() -> Vec<(Payload, Schema)> {
+        vec![
+            (Payload::Json(simd_json::json!({"id": 1})), Schema::Json),
+            (Payload::Json(simd_json::json!([1, 2, 3])), Schema::Json),
+            (Payload::Json(simd_json::json!("scalar")), Schema::Json),
+            (Payload::Json(simd_json::json!(null)), Schema::Json),
+            (Payload::Raw(vec![1, 2, 3]), Schema::Raw),
+            (Payload::Raw(Vec::new()), Schema::Raw),
+            (Payload::Text("hello".to_owned()), Schema::Text),
+            (Payload::Text(String::new()), Schema::Text),
+            (Payload::Proto("proto text".to_owned()), Schema::Proto),
+            (Payload::Proto(String::new()), Schema::Proto),
+            (Payload::FlatBuffer(vec![4, 5, 6]), Schema::FlatBuffer),
+            (Payload::FlatBuffer(Vec::new()), Schema::FlatBuffer),
+            (Payload::Avro(vec![7, 8, 9]), Schema::Avro),
+            (Payload::Avro(Vec::new()), Schema::Avro),
+        ]
+    }
+
+    #[test]
+    fn given_a_json_payload_when_the_document_is_read_should_borrow_it() {
+        let payload = Payload::Json(simd_json::json!({"id": 1}));
+
+        let document = payload
+            .json_document()
+            .expect("a JSON payload is a document");
+
+        assert!(matches!(document, Cow::Borrowed(_)));
+        assert_eq!(*document, simd_json::json!({"id": 1}));
+    }
+
+    #[test]
+    fn given_proto_text_holding_json_when_the_document_is_read_should_parse_it() {
+        let payload = Payload::Proto(r#"{"id": 1, "name": "row-1"}"#.to_owned());
+
+        let document = payload
+            .json_document()
+            .expect("proto text holding JSON is a document");
+
+        assert!(matches!(document, Cow::Owned(_)));
+        assert_eq!(*document, simd_json::json!({"id": 1, "name": "row-1"}));
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_when_the_document_is_read_should_leave_the_text_intact() {
+        let text = r#"binary_data: "AQID""#;
+        let payload = Payload::Proto(text.to_owned());
+
+        assert!(payload.json_document().is_none());
+        // simd_json overwrites its input buffer on a failed parse, so this
+        // only holds because the parse ran on a copy.
+        let Payload::Proto(kept) = &payload else {
+            panic!("the variant must not change");
+        };
+        assert_eq!(kept, text);
+    }
+
+    #[test]
+    fn given_a_payload_that_is_not_json_or_proto_when_the_document_is_read_should_return_none() {
+        for payload in [
+            Payload::Text(r#"{"id": 1}"#.to_owned()),
+            Payload::Raw(br#"{"id": 1}"#.to_vec()),
+            Payload::FlatBuffer(vec![1, 2, 3]),
+            Payload::Avro(vec![1, 2, 3]),
+        ] {
+            assert!(
+                payload.json_document().is_none(),
+                "{payload} must not be read as a document"
+            );
+        }
+    }
+
+    #[test]
+    fn given_proto_text_holding_json_when_converted_should_become_a_json_payload() {
+        let payload = Payload::Proto(r#"{"id": 1, "name": "row-1"}"#.to_owned());
+
+        let Payload::Json(document) = payload.into_json_document() else {
+            panic!("proto text holding JSON becomes a JSON payload");
+        };
+
+        assert_eq!(document, simd_json::json!({"id": 1, "name": "row-1"}));
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_when_converted_should_keep_the_text_intact() {
+        let text = r#"binary_data: "AQID""#;
+
+        let converted = Payload::Proto(text.to_owned()).into_json_document();
+
+        // The text survives only because the parse ran on a copy; an in-place
+        // parse would leave it overwritten here.
+        let Payload::Proto(kept) = &converted else {
+            panic!("the variant must not change");
+        };
+        assert_eq!(kept, text);
+    }
+
+    #[test]
+    fn given_a_json_payload_when_converted_should_return_it_unchanged() {
+        let payload = Payload::Json(simd_json::json!({"id": 1}));
+
+        let Payload::Json(document) = payload.into_json_document() else {
+            panic!("a JSON payload stays a JSON payload");
+        };
+
+        assert_eq!(document, simd_json::json!({"id": 1}));
+    }
+
+    #[test]
+    fn given_a_payload_that_is_not_json_or_proto_when_converted_should_return_it_unchanged() {
+        for payload in [
+            Payload::Text(r#"{"id": 1}"#.to_owned()),
+            Payload::Raw(br#"{"id": 1}"#.to_vec()),
+            Payload::FlatBuffer(vec![1, 2, 3]),
+            Payload::Avro(vec![1, 2, 3]),
+        ] {
+            let expected_schema = payload.schema();
+            let expected_bytes = payload
+                .clone()
+                .try_into_vec()
+                .expect("the payload should serialise");
+
+            let converted = payload.into_json_document();
+
+            assert_eq!(converted.schema(), expected_schema);
+            assert_eq!(
+                converted
+                    .try_into_vec()
+                    .expect("the payload should serialise"),
+                expected_bytes,
+                "the bytes must survive as well as the variant"
+            );
+        }
+    }
+
+    #[test]
+    fn given_every_payload_variant_when_schema_is_read_should_name_that_variant() {
+        for (payload, expected) in all_payloads() {
+            assert_eq!(
+                payload.schema(),
+                expected,
+                "wrong schema for {payload}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_payload_when_round_tripped_through_its_own_schema_should_keep_the_variant_and_the_bytes()
+     {
+        // The JSON rows are small objects, arrays and scalars, so their
+        // serialised bytes are stable. A row with many keys would need a value
+        // comparison instead, because simd_json objects do not keep key order
+        // past their small-map threshold.
+        for (payload, schema) in all_payloads() {
+            let bytes = payload
+                .try_to_bytes()
+                .unwrap_or_else(|error| panic!("failed to serialize {schema} payload: {error}"));
+            let rebuilt = Payload::try_from_schema(schema, bytes.clone())
+                .unwrap_or_else(|error| panic!("failed to rebuild {schema} payload: {error}"));
+
+            assert_eq!(
+                rebuilt.schema(),
+                schema,
+                "round trip through {schema} produced {rebuilt}"
+            );
+            assert_eq!(
+                rebuilt
+                    .try_to_bytes()
+                    .unwrap_or_else(|error| panic!("failed to serialize {rebuilt}: {error}")),
+                bytes,
+                "round trip through {schema} changed the payload bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn given_proto_text_when_rebuilt_from_a_variant_tag_should_return_the_proto_payload() {
+        let payload = Payload::Proto(r#"{"id":1}"#.to_owned());
+        let bytes = payload.try_into_vec().expect("failed to serialize");
+        let rebuilt = Payload::try_from_schema(Schema::Proto, bytes).expect("failed to rebuild");
+
+        let Payload::Proto(text) = rebuilt else {
+            panic!("expected a proto payload, got {rebuilt}");
+        };
+        assert_eq!(text, r#"{"id":1}"#);
+    }
+
+    #[test]
+    fn given_non_utf8_bytes_when_rebuilt_as_proto_from_a_variant_tag_should_fail() {
+        let error = Payload::try_from_schema(Schema::Proto, vec![0xff, 0xfe])
+            .expect_err("non UTF-8 bytes cannot be a proto text payload");
+
+        assert_eq!(error, Error::InvalidProtobufPayload);
+    }
+
+    #[test]
+    fn given_protobuf_wire_bytes_when_rebuilt_from_a_wire_tag_should_stay_an_any_document() {
+        // The source path keeps its own inverse: a plugin tagging
+        // `Schema::Proto` really does send protobuf, so those bytes are read as
+        // a `prost_types::Any` rather than as text.
+        let any = prost_types::Any {
+            type_url: "type.googleapis.com/test.Event".to_owned(),
+            value: vec![1, 2, 3],
+        };
+        let rebuilt = Schema::Proto
+            .try_into_payload(any.encode_to_vec())
+            .expect("failed to rebuild");
+
+        assert_eq!(rebuilt.schema(), Schema::Json);
+    }
+
+    #[test]
+    fn given_bytes_that_are_not_an_any_when_rebuilt_from_a_wire_tag_should_fall_back_to_raw() {
+        // The other half of the source arm. A plugin can tag `Schema::Proto`
+        // and send something that is not an `Any`, and those bytes still have
+        // to reach the sink rather than being dropped.
+        let rebuilt = Schema::Proto
+            .try_into_payload(b"not protobuf wire bytes".to_vec())
+            .expect("failed to rebuild");
+
+        assert_eq!(rebuilt.schema(), Schema::Raw);
+    }
 }

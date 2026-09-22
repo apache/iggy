@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionStringOptions, IggyDuration, IggyError, TcpClientReconnectionConfig};
+use crate::{
+    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration,
+    TcpClientReconnectionConfig,
+};
 use std::str::FromStr;
 
 #[derive(Debug)]
@@ -24,7 +27,7 @@ pub struct TcpConnectionStringOptions {
     tls_domain: String,
     tls_ca_file: Option<String>,
     reconnection: TcpClientReconnectionConfig,
-    heartbeat_interval: IggyDuration,
+    heartbeat_interval: NonZeroIggyDuration,
     nodelay: bool,
 }
 
@@ -55,7 +58,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
         self.reconnection.max_retries
     }
 
-    fn heartbeat_interval(&self) -> IggyDuration {
+    fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 
@@ -116,13 +119,13 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                         .map_err(|_| IggyError::InvalidNumberValue)?,
                 ),
             },
-            interval: IggyDuration::from_str(reconnection_interval.as_str())
+            interval: NonZeroIggyDuration::from_str(reconnection_interval.as_str())
                 .map_err(|_| IggyError::InvalidConnectionString)?,
             reestablish_after: IggyDuration::from_str(reestablish_after.as_str())
                 .map_err(|_| IggyError::InvalidConnectionString)?,
         };
 
-        let heartbeat_interval = IggyDuration::from_str(heartbeat_interval.as_str())
+        let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
         let connection_string_options = TcpConnectionStringOptions::new(
@@ -144,7 +147,7 @@ impl TcpConnectionStringOptions {
         tls_domain: String,
         tls_ca_file: Option<String>,
         reconnection: TcpClientReconnectionConfig,
-        heartbeat_interval: IggyDuration,
+        heartbeat_interval: NonZeroIggyDuration,
         nodelay: bool,
     ) -> Self {
         Self {
@@ -165,7 +168,7 @@ impl Default for TcpConnectionStringOptions {
             tls_domain: "".to_string(),
             tls_ca_file: None,
             reconnection: Default::default(),
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             nodelay: false,
         }
     }

@@ -19,12 +19,14 @@ use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
 use iggy::prelude::{
-    DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
-    IggyProducer,
+    DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
+    IggyMessage, IggyProducer, StreamClient, TopicClient, TopicCreateOptions,
 };
+use iggy_common::{Durability, TopicRuntimeOptions};
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
-    ConnectorState, DecodedMessage, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
+    ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
+    TopicMetadata,
     source::{BatchResultCallback, HandleCallback, SourceBatchResult},
     transforms::Transform,
 };
@@ -41,18 +43,21 @@ use crate::benchmark;
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
+use crate::metrics::ConnectorType;
 use crate::metrics::SourceLabels;
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
-    SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
-    state::{FileStateProvider, StateProvider, StateStorage},
+    SourceConnectorProducer, SourceConnectorWrapper, close_plugin_instance, resolve_plugin_path,
+    state::{StateStorage, StateStorageFactory},
     transform,
 };
 use iggy_connector_sdk::api::ConnectorStatus;
 use prometheus_client::metrics::counter::Counter;
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 const MAX_FAILED_TAIL_RETRIES: u32 = 3;
+const SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE: u32 = 1;
 
 pub(crate) struct SourceSenderEntry {
     pub(crate) sender: Sender<ProducedBatch>,
@@ -76,18 +81,22 @@ pub(crate) fn cleanup_sender(plugin_id: u32) {
 
 /// Initializes all enabled source connectors.
 ///
-/// Per-connector failures (path resolution, dlopen, state load, plugin init,
+/// Per-connector failures (path resolution, dlopen, plugin init,
 /// producer/encoder/transform setup) are captured against the offending
 /// connector and do not abort the runtime. Connectors that fail before their
 /// FFI container can be loaded are returned in the second tuple element so
 /// they remain visible in health/status output.
 ///
-/// Only system-level errors that prevent any connector from running (e.g. a
-/// poisoned global state) are propagated as `Err`.
+/// Only system-level errors that prevent any connector from running are
+/// propagated as `Err`. That includes classified state-store failures
+/// (`TransientState`/`PermanentState`/`StateLatched`) while loading an
+/// enabled source's state: the store is unhealthy, so the process must fail
+/// rather than rewind the source or mint a `FailedPlugin`. Unclassified
+/// state-load failures (the file backend) keep the per-connector path.
 pub async fn init(
     source_configs: HashMap<String, SourceConfig>,
     iggy_client: &IggyClient,
-    state_path: &str,
+    state_factory: &Arc<dyn StateStorageFactory>,
 ) -> Result<(HashMap<String, SourceConnector>, Vec<FailedPlugin>), RuntimeError> {
     let mut source_connectors: HashMap<String, SourceConnector> = HashMap::new();
     let mut failed_plugins: Vec<FailedPlugin> = Vec::new();
@@ -124,25 +133,38 @@ pub async fn init(
             &config.version
         );
 
-        let state_storage = get_state_storage(state_path, &key);
-        let state = match &state_storage {
-            StateStorage::File(file) => match file.load().await {
-                Ok(state) => state,
-                Err(error) => {
-                    let message = format!("Failed to load source state: {error}");
-                    error!("Source: {name} ({key}) - {message}");
-                    failed_plugins.push(FailedPlugin::new(
-                        plugin_id,
-                        &key,
-                        &name,
-                        &config.path,
-                        config.plugin_config_format,
-                        config.enabled,
-                        message,
-                    ));
-                    continue;
-                }
-            },
+        let state_storage = state_factory.storage_for(&key)?;
+        let state = match state_storage.load().await {
+            Ok(state) => state,
+            Err(
+                load_error @ (SdkError::TransientState(_)
+                | SdkError::PermanentState(_)
+                | SdkError::StateLatched),
+            ) => {
+                // A classified failure means the state store is unhealthy,
+                // not the plugin. Treating it as "no state" would silently
+                // rewind the source, and parking it as a failed plugin would
+                // hide an outage the next restart could clear, so abort boot.
+                error!("Source: {name} ({key}) - failed to load state: {load_error}");
+                return Err(RuntimeError::StateLoadFailed {
+                    connector_key: key,
+                    source: load_error,
+                });
+            }
+            Err(error) => {
+                let message = format!("Failed to load source state: {error}");
+                error!("Source: {name} ({key}) - {message}");
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
+                ));
+                continue;
+            }
         };
 
         if !source_connectors.contains_key(&path) {
@@ -167,7 +189,7 @@ pub async fn init(
             source_connectors.insert(
                 path.clone(),
                 SourceConnector {
-                    container,
+                    container: Arc::new(container),
                     plugins: Vec::new(),
                 },
             );
@@ -208,6 +230,15 @@ pub async fn init(
             continue;
         }
 
+        // A plugin left with `error` set is skipped by `handle`, so nothing
+        // would ever reach the instance `init_source` just created.
+        let instance_guard = {
+            let connector = source_connectors
+                .get_mut(&path)
+                .expect("source connector was inserted above");
+            SourceInstanceGuard::for_container(connector.container.clone(), plugin_id, &key)
+        };
+
         match setup_source_producer(&key, &config, iggy_client).await {
             Ok((producer, encoder, transforms)) => {
                 let connector = source_connectors
@@ -220,6 +251,7 @@ pub async fn init(
                     .expect("source plugin was pushed above");
                 plugin.producer = Some(SourceConnectorProducer { producer, encoder });
                 plugin.transforms = transforms;
+                instance_guard.disarm();
                 info!(
                     "Source container with name: {name} ({key}) initialized successfully with ID: {plugin_id}."
                 );
@@ -227,15 +259,10 @@ pub async fn init(
             Err(error) => {
                 let message = format!("Failed to set up source producer: {error}");
                 error!("Source: {name} ({key}) - {message}");
+                instance_guard.close().await;
                 let connector = source_connectors
                     .get_mut(&path)
                     .expect("source connector was inserted above");
-                let close_result = (connector.container.iggy_source_close)(plugin_id);
-                if close_result != 0 {
-                    warn!(
-                        "iggy_source_close returned {close_result} while cleaning up failed source connector with ID: {plugin_id} ({key})"
-                    );
-                }
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()
@@ -287,9 +314,113 @@ pub(crate) fn init_source(
     }
 }
 
-pub(crate) fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
-    let path = format!("{state_path}/source_{key}.state");
-    StateStorage::File(FileStateProvider::new(path))
+/// A plugin's `iggy_source_close` together with whatever keeps the library that
+/// exports it mapped, so the call stays valid once it is deferred off the
+/// calling thread.
+pub(crate) type SourceClose = Arc<dyn Fn(u32) -> i32 + Send + Sync>;
+
+/// Closes a source instance that `iggy_source_open` created and nothing else
+/// will ever reach.
+///
+/// Between `init_source` succeeding and the plugin id reaching `SourceDetails`,
+/// the instance exists inside the plugin and nothing outside it knows the id:
+/// `stop_connector` closes whatever `details.info.id` holds, which is still the
+/// previous instance. An early return there stranded the new one for the life
+/// of the process. A guard rather than a cleanup branch per fallible call,
+/// because the window is those two statements rather than whichever call
+/// between them is fallible today, so a `?` added inside it stays correct.
+/// Startup and restart both hand off through it.
+///
+/// Teardown runs two ways and they are not interchangeable. [`Self::close`]
+/// awaits, so an error returned after it means the instance is already gone
+/// and an immediate retry has nothing to collide with. `Drop` cannot await, so
+/// it hands the work to the blocking pool; the closure carries the container,
+/// which is what keeps the library mapped until the call returns.
+#[must_use = "dropping an armed guard closes the source instance"]
+pub(crate) struct SourceInstanceGuard {
+    /// `Some` while this guard owns the instance, `None` once something else
+    /// does. One representation rather than a close plus a flag that had to
+    /// agree with it, and taking it is what lets both teardown paths run
+    /// without cloning the callback.
+    close: Option<SourceClose>,
+    plugin_id: u32,
+    key: String,
+}
+
+impl SourceInstanceGuard {
+    /// Arms a guard over an instance the caller has just opened through
+    /// `container`, which it captures rather than borrows for the reason the
+    /// type documents.
+    pub(crate) fn for_container(
+        container: Arc<Container<SourceApi>>,
+        plugin_id: u32,
+        key: &str,
+    ) -> Self {
+        Self::new(
+            Arc::new(move |id| (container.iggy_source_close)(id)),
+            plugin_id,
+            key,
+        )
+    }
+
+    /// Kept behind `for_container` so no production caller can build a guard
+    /// that holds a close pointer without its library. Tests pass a closure.
+    fn new(close: SourceClose, plugin_id: u32, key: &str) -> Self {
+        Self {
+            close: Some(close),
+            plugin_id,
+            key: key.to_owned(),
+        }
+    }
+
+    /// Hands ownership of the instance to the caller, once something else can
+    /// close it. Call only after the plugin id is recorded on `SourceDetails`.
+    pub(crate) fn disarm(mut self) {
+        self.close = None;
+    }
+
+    /// The awaited half of the teardown the type documents. Error arms call it
+    /// rather than leaving the work to `Drop`, which cannot offer the ordering.
+    pub(crate) async fn close(mut self) {
+        let Some(close) = self.close.take() else {
+            return;
+        };
+        let plugin_id = self.plugin_id;
+        let key = std::mem::take(&mut self.key);
+        if tokio::task::spawn_blocking(move || {
+            close_plugin_instance(close.as_ref(), ConnectorType::Source, plugin_id, &key)
+        })
+        .await
+        .is_err()
+        {
+            warn!(
+                "Teardown of failed source connector with ID: {plugin_id} did not run to completion."
+            );
+        }
+    }
+}
+
+impl Drop for SourceInstanceGuard {
+    fn drop(&mut self) {
+        let Some(close) = self.close.take() else {
+            return;
+        };
+
+        let plugin_id = self.plugin_id;
+        let key = std::mem::take(&mut self.key);
+        // `SourceContainer::close` drives the plugin's own `close()` under
+        // `block_on` and runs for as long as the plugin takes, so it goes to
+        // the blocking pool where blocking is what the thread is for.
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    close_plugin_instance(close.as_ref(), ConnectorType::Source, plugin_id, &key)
+                });
+            }
+            // No runtime to hand it to, and no worker to protect either.
+            Err(_) => close_plugin_instance(close.as_ref(), ConnectorType::Source, plugin_id, &key),
+        }
+    }
 }
 
 pub(crate) async fn setup_source_producer(
@@ -323,9 +454,14 @@ pub(crate) async fn setup_source_producer(
             .map_err(|error| {
                 RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
             })?;
+        ensure_durable_source_topic(iggy_client, &stream.stream, &stream.topic).await?;
         let batch_length = stream.batch_length.unwrap_or(1000);
         let producer = iggy_client
             .producer(&stream.stream, &stream.topic)?
+            // The topic was validated above. If it disappears before init,
+            // recreating it with producer defaults would drop the durability guarantee.
+            .do_not_create_stream_if_not_exists()
+            .do_not_create_topic_if_not_exists()
             .direct(
                 DirectConfig::builder()
                     .batch_length(batch_length)
@@ -362,6 +498,57 @@ pub(crate) async fn setup_source_producer(
     })?;
 
     Ok((producer, encoder, transforms))
+}
+
+async fn ensure_durable_source_topic(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+) -> Result<(), RuntimeError> {
+    let stream_id = Identifier::try_from(stream_name)?;
+    if client.get_stream(&stream_id).await?.is_none() {
+        client.create_stream(stream_name).await?;
+    }
+
+    let topic_id = Identifier::try_from(topic_name)?;
+    let topic = match client.get_topic(&stream_id, &topic_id).await? {
+        Some(topic) => topic,
+        None => {
+            client
+                .create_topic(
+                    &stream_id,
+                    topic_name,
+                    &TopicCreateOptions {
+                        partitions_count: Some(1),
+                        durability: Durability::Persisted,
+                        messages_required_to_save: Some(SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE),
+                        ..TopicCreateOptions::default()
+                    },
+                )
+                .await?
+        }
+    };
+
+    validate_source_topic_durability(
+        stream_name,
+        topic_name,
+        TopicRuntimeOptions::from_resource_options(&topic.options),
+    )
+}
+
+fn validate_source_topic_durability(
+    stream_name: &str,
+    topic_name: &str,
+    options: TopicRuntimeOptions,
+) -> Result<(), RuntimeError> {
+    if options.durability == Durability::Persisted {
+        return Ok(());
+    }
+
+    Err(RuntimeError::InvalidConfiguration(format!(
+        "Source destination topic '{stream_name}/{topic_name}' must use durability=persisted; found durability={}",
+        options.durability
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -465,9 +652,14 @@ pub(crate) async fn source_forwarding_loop(
             .observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
         let prepared_count = processed.messages.len();
         let processing_errors = decode_errors + processed.error_count;
+        let pending_state_error = state_storage.resolve_pending().await.err();
+        let state_latched = state_storage.is_latched();
+        let state_unavailable = pending_state_error.is_some() || state_latched;
 
         let iggy_send_start = Instant::now();
-        let send_result = if processing_errors == 0 {
+        let send_result = if state_unavailable {
+            Err(IggyError::Error)
+        } else if processing_errors == 0 {
             send_with_failed_tail_retries(processed.messages, plugin_id, |messages| {
                 producer.send(messages)
             })
@@ -489,7 +681,15 @@ pub(crate) async fn source_forwarding_loop(
         let mut state_save_us: Option<u64> = None;
         let mut batch_result = SourceBatchResult::Nack;
         if let Err(error) = send_result {
-            let error_msg = if processing_errors > 0 {
+            let error_msg = if let Some(state_error) = pending_state_error.as_ref() {
+                format!(
+                    "Rejected source batch {batch_id} while resolving a pending checkpoint for source connector with ID: {plugin_id}. {state_error}"
+                )
+            } else if state_latched {
+                format!(
+                    "Rejected source batch {batch_id} because state storage is latched for source connector with ID: {plugin_id}"
+                )
+            } else if processing_errors > 0 {
                 format!(
                     "Rejected source batch {batch_id} after {processing_errors} decode or processing errors for source connector with ID: {plugin_id}"
                 )
@@ -502,7 +702,15 @@ pub(crate) async fn source_forwarding_loop(
             };
             error!("{error_msg}");
             context.metrics.inc_errors_with_labels(&labels.counter);
-            context.sources.set_error(&plugin_key, &error_msg).await;
+            let preserve_original_error =
+                matches!(pending_state_error.as_ref(), Some(SdkError::StateLatched))
+                    || (pending_state_error.is_none() && state_latched);
+            if !preserve_original_error {
+                context
+                    .sources
+                    .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                    .await;
+            }
         } else {
             context
                 .metrics
@@ -525,25 +733,27 @@ pub(crate) async fn source_forwarding_loop(
             let mut state_saved = true;
             if let Some(state) = produced_messages.state {
                 let state_save_start = Instant::now();
-                match &state_storage {
-                    StateStorage::File(file) => {
-                        if let Err(error) = file.save(state).await {
-                            state_saved = false;
-                            let error_msg = format!(
-                                "Failed to save state for source connector with ID: {plugin_id}. {error}"
-                            );
-                            error!("{error_msg}");
-                            context.metrics.inc_errors_with_labels(&labels.counter);
-                            context.sources.set_error(&plugin_key, &error_msg).await;
-                        } else {
-                            debug!("State saved for source connector with ID: {plugin_id}");
-                            let state_save_elapsed = state_save_start.elapsed();
-                            context.metrics.observe_stage_with_labels(
-                                &labels.stage_state_save,
-                                state_save_elapsed,
-                            );
-                            state_save_us = Some(benchmark::as_micros(state_save_elapsed));
-                        }
+                match state_storage.save(state).await {
+                    Ok(()) => {
+                        debug!("State saved for source connector with ID: {plugin_id}");
+                        let state_save_elapsed = state_save_start.elapsed();
+                        context.metrics.observe_stage_with_labels(
+                            &labels.stage_state_save,
+                            state_save_elapsed,
+                        );
+                        state_save_us = Some(benchmark::as_micros(state_save_elapsed));
+                    }
+                    Err(error) => {
+                        state_saved = false;
+                        let error_msg = format!(
+                            "Failed to save state for source connector with ID: {plugin_id}. {error}"
+                        );
+                        error!("{error_msg}");
+                        context.metrics.inc_errors_with_labels(&labels.counter);
+                        context
+                            .sources
+                            .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                            .await;
                     }
                 }
             } else {
@@ -572,8 +782,16 @@ pub(crate) async fn source_forwarding_loop(
                 );
                 error!("{error_msg}");
                 context.metrics.inc_errors_with_labels(&labels.counter);
-                context.sources.set_error(&plugin_key, &error_msg).await;
+                context
+                    .sources
+                    .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                    .await;
             }
+        } else if should_recover_source(batch_result, sent_count) {
+            context
+                .sources
+                .recover_from_error(&plugin_key, Some(&context.metrics))
+                .await;
         }
 
         let total_elapsed = total_start.elapsed();
@@ -606,6 +824,10 @@ pub(crate) async fn source_forwarding_loop(
             Some(&context.metrics),
         )
         .await;
+}
+
+fn should_recover_source(batch_result: SourceBatchResult, sent_count: usize) -> bool {
+    batch_result == SourceBatchResult::Ack && sent_count > 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -906,7 +1128,9 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::future::ready;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
 
     static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
 
@@ -929,6 +1153,166 @@ mod tests {
             stream_name: "test-stream".to_string(),
             topic_name: "test-topic".to_string(),
         }
+    }
+
+    /// A close that records the ids it was handed and answers `result`.
+    ///
+    /// The guard takes its close as a closure, so each test owns its recorder
+    /// and nothing is shared between tests. An `extern "C" fn` cannot capture,
+    /// which is what used to force this through statics.
+    fn recording_close(result: i32) -> (SourceClose, Arc<Mutex<Vec<u32>>>) {
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = closed.clone();
+        (
+            Arc::new(move |id| {
+                recorded.lock().expect("close recorder").push(id);
+                result
+            }),
+            closed,
+        )
+    }
+
+    /// The shape `start_connector` has: a guard armed over an instance nothing
+    /// else knows about, then a fallible step whose `?` returns before anything
+    /// records the id.
+    fn start_with_fallible_step(
+        close: SourceClose,
+        plugin_id: u32,
+        step: Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let instance_guard = SourceInstanceGuard::new(close, plugin_id, "random");
+        step?;
+        instance_guard.disarm();
+        Ok(())
+    }
+
+    #[test]
+    fn given_armed_guard_when_dropped_should_close_the_instance() {
+        // The leak this exists for: `init_source` has created the instance and
+        // nothing outside the plugin knows its id yet, so an early return here
+        // would strand it for the life of the process.
+        let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
+
+        drop(SourceInstanceGuard::new(close, plugin_id, "random"));
+
+        assert_eq!(
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "a guard still armed owns the instance and must close exactly it"
+        );
+    }
+
+    #[test]
+    fn given_fallible_step_when_it_returns_early_should_close_the_instance() {
+        // The shape dropping or disarming inline cannot show, and the one the
+        // guard is there for: the `?` leaves with the guard still armed and
+        // never reaches `disarm`. The error arms call `close()` directly now,
+        // so this is the net under a `?` added inside the window later.
+        let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
+
+        let result = start_with_fallible_step(
+            close,
+            plugin_id,
+            Err(RuntimeError::InvalidConfiguration("injected".to_string())),
+        );
+
+        assert!(result.is_err(), "the injected failure has to propagate");
+        assert_eq!(
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "a `?` must not strand the instance it left behind"
+        );
+    }
+
+    #[test]
+    fn given_fallible_step_when_it_succeeds_should_leave_the_instance_open() {
+        // The other half of the same helper: reaching `disarm` hands the
+        // instance on rather than closing it.
+        let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
+
+        let result = start_with_fallible_step(close, plugin_id, Ok(()));
+
+        assert!(result.is_ok());
+        assert!(
+            closed.lock().expect("close recorder").is_empty(),
+            "a step that succeeded leaves the instance for the manager to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_armed_guard_when_dropped_in_runtime_should_close_off_the_worker() {
+        // `drop` cannot await, and `SourceContainer::close` drives the plugin's
+        // own teardown under `block_on`, so closing here would hold a worker for
+        // however long the plugin takes. It goes to the blocking pool instead,
+        // which is what the differing thread asserts. The close still has to
+        // happen.
+        let plugin_id = next_plugin_id();
+        let dropping_thread = std::thread::current().id();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        drop(SourceInstanceGuard::new(
+            Arc::new(move |id| {
+                let _ = sender.send((id, std::thread::current().id()));
+                0
+            }),
+            plugin_id,
+            "random",
+        ));
+
+        let (closed_id, closing_thread) =
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("the deferred close should run")
+                .expect("the deferred close should report the instance");
+        assert_eq!(
+            closed_id, plugin_id,
+            "the deferred close must reach the instance the guard was armed over"
+        );
+        assert_ne!(
+            closing_thread, dropping_thread,
+            "closing on the dropping thread holds it for the plugin's teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_armed_guard_when_closed_should_finish_before_returning() {
+        // What the error arms rely on: once `close()` has returned the instance
+        // is gone, so the error they return cannot reach an operator who then
+        // retries into a collision with it.
+        let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(0);
+
+        SourceInstanceGuard::new(close, plugin_id, "random")
+            .close()
+            .await;
+
+        assert_eq!(
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "close() has to await the teardown, and the drop after it must not repeat it"
+        );
+    }
+
+    #[test]
+    fn given_refused_close_when_guard_drops_should_close_once_and_swallow_refusal() {
+        // The plugin answers -1 for an id it does not know. Both callers are
+        // already returning an error of their own, so the refusal is reported
+        // and not propagated: unwinding out of `drop` would be worse than the
+        // leak it is cleaning up after. The harness gives no-panic for free, so
+        // what this asserts is the single call.
+        let plugin_id = next_plugin_id();
+        let (close, closed) = recording_close(-1);
+
+        drop(SourceInstanceGuard::new(close, plugin_id, "random"));
+
+        assert_eq!(
+            *closed.lock().expect("close recorder"),
+            vec![plugin_id],
+            "a refusal must not become a retry or a second close"
+        );
     }
 
     #[test]
@@ -1010,6 +1394,57 @@ mod tests {
             handle_produced_messages(plugin_id, 1, serialized.as_ptr(), serialized.len()),
             -1
         );
+    }
+
+    #[test]
+    fn given_acknowledged_nonempty_batch_when_recovering_should_restore_source_status() {
+        assert!(should_recover_source(SourceBatchResult::Ack, 1));
+    }
+
+    #[test]
+    fn given_acknowledged_empty_batch_when_recovering_should_preserve_source_error() {
+        assert!(!should_recover_source(SourceBatchResult::Ack, 0));
+    }
+
+    #[test]
+    fn given_rejected_nonempty_batch_when_recovering_should_preserve_source_error() {
+        assert!(!should_recover_source(SourceBatchResult::Nack, 1));
+    }
+
+    #[test]
+    fn given_persisted_per_batch_topic_when_validating_source_destination_should_accept() {
+        let options = TopicRuntimeOptions {
+            durability: Durability::Persisted,
+            messages_required_to_save: Some(1),
+            ..TopicRuntimeOptions::default()
+        };
+
+        assert!(validate_source_topic_durability("stream", "topic", options).is_ok());
+    }
+
+    #[test]
+    fn given_replicated_topic_when_validating_source_destination_should_reject() {
+        let options = TopicRuntimeOptions {
+            durability: Durability::Replicated,
+            messages_required_to_save: Some(1),
+            ..TopicRuntimeOptions::default()
+        };
+
+        let error = validate_source_topic_durability("stream", "topic", options)
+            .expect_err("replicated topic must not receive checkpointed source data");
+
+        assert!(error.to_string().contains("durability=replicated"));
+    }
+
+    #[test]
+    fn given_persisted_buffered_topic_when_validating_source_destination_should_accept() {
+        let options = TopicRuntimeOptions {
+            durability: Durability::Persisted,
+            messages_required_to_save: Some(10),
+            ..TopicRuntimeOptions::default()
+        };
+
+        assert!(validate_source_topic_durability("stream", "topic", options).is_ok());
     }
 
     #[test]

@@ -1584,6 +1584,17 @@ func (e CannotOpenConsumerOffsetsFile) Is(target error) bool {
 	return ok
 }
 
+type TooManyConsumerOffsets struct{}
+
+func (e TooManyConsumerOffsets) Error() string {
+	return "consumer offset limit reached for partition, raise [partition] consumer_offsets_max"
+}
+func (e TooManyConsumerOffsets) Code() Code { return 3024 }
+func (e TooManyConsumerOffsets) Is(target error) bool {
+	_, ok := target.(TooManyConsumerOffsets)
+	return ok
+}
+
 type PartitionIdSpaceExhausted struct{}
 
 func (e PartitionIdSpaceExhausted) Error() string {
@@ -2169,6 +2180,20 @@ func (e InvalidReservedField) Error() string {
 func (e InvalidReservedField) Code() Code { return 4101 }
 func (e InvalidReservedField) Is(target error) bool {
 	_, ok := target.(InvalidReservedField)
+	return ok
+}
+
+type SegmentSizeMismatchAtOpen struct {
+	OnDisk   uint64
+	Expected uint64
+}
+
+func (e SegmentSizeMismatchAtOpen) Error() string {
+	return fmt.Sprintf("segment file size on disk: %d does not match expected size: %d", e.OnDisk, e.Expected)
+}
+func (e SegmentSizeMismatchAtOpen) Code() Code { return 4102 }
+func (e SegmentSizeMismatchAtOpen) Is(target error) bool {
+	_, ok := target.(SegmentSizeMismatchAtOpen)
 	return ok
 }
 
@@ -2770,6 +2795,7 @@ var (
 	ErrConsumerOffsetNotFound                     = ConsumerOffsetNotFound{}
 	ErrNotResolvedConsumer                        = NotResolvedConsumer{}
 	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
+	ErrTooManyConsumerOffsets                     = TooManyConsumerOffsets{}
 	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
@@ -2824,6 +2850,7 @@ var (
 	ErrProducerClosed                             = ProducerClosed{}
 	ErrInvalidOffset                              = InvalidOffset{}
 	ErrInvalidReservedField                       = InvalidReservedField{}
+	ErrSegmentSizeMismatchAtOpen                  = SegmentSizeMismatchAtOpen{}
 	ErrConsumerGroupIdNotFound                    = ConsumerGroupIdNotFound{}
 	ErrInvalidConsumerGroupId                     = InvalidConsumerGroupId{}
 	ErrConsumerGroupNameNotFound                  = ConsumerGroupNameNotFound{}
@@ -3012,6 +3039,7 @@ const (
 	ConsumerOffsetNotFoundCode                     Code = 3021
 	NotResolvedConsumerCode                        Code = 3022
 	CannotOpenConsumerOffsetsFileCode              Code = 3023
+	TooManyConsumerOffsetsCode                     Code = 3024
 	PartitionIdSpaceExhaustedCode                  Code = 3013
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
@@ -3066,6 +3094,7 @@ const (
 	ProducerClosedCode                             Code = 4057
 	InvalidOffsetCode                              Code = 4100
 	InvalidReservedFieldCode                       Code = 4101
+	SegmentSizeMismatchAtOpenCode                  Code = 4102
 	ConsumerGroupIdNotFoundCode                    Code = 5000
 	InvalidConsumerGroupIdCode                     Code = 5002
 	ConsumerGroupNameNotFoundCode                  Code = 5003
@@ -3393,6 +3422,8 @@ func (c Code) String() string {
 		return "NotResolvedConsumer"
 	case CannotOpenConsumerOffsetsFileCode:
 		return "CannotOpenConsumerOffsetsFile"
+	case TooManyConsumerOffsetsCode:
+		return "TooManyConsumerOffsets"
 	case PartitionIdSpaceExhaustedCode:
 		return "PartitionIdSpaceExhausted"
 	case SegmentNotFoundCode:
@@ -3501,6 +3532,8 @@ func (c Code) String() string {
 		return "InvalidOffset"
 	case InvalidReservedFieldCode:
 		return "InvalidReservedField"
+	case SegmentSizeMismatchAtOpenCode:
+		return "SegmentSizeMismatchAtOpen"
 	case ConsumerGroupIdNotFoundCode:
 		return "ConsumerGroupIdNotFound"
 	case InvalidConsumerGroupIdCode:
@@ -3874,6 +3907,8 @@ func FromCode(code Code) IggyError {
 		return ErrNotResolvedConsumer
 	case CannotOpenConsumerOffsetsFileCode:
 		return ErrCannotOpenConsumerOffsetsFile
+	case TooManyConsumerOffsetsCode:
+		return ErrTooManyConsumerOffsets
 	case PartitionIdSpaceExhaustedCode:
 		return ErrPartitionIdSpaceExhausted
 	case SegmentNotFoundCode:
@@ -3982,6 +4017,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidOffset
 	case InvalidReservedFieldCode:
 		return ErrInvalidReservedField
+	case SegmentSizeMismatchAtOpenCode:
+		return ErrSegmentSizeMismatchAtOpen
 	case ConsumerGroupIdNotFoundCode:
 		return ErrConsumerGroupIdNotFound
 	case InvalidConsumerGroupIdCode:

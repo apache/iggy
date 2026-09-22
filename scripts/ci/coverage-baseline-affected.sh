@@ -74,7 +74,7 @@ changed() {
 # iteration's paths.
 for gate in "${GATES[@]}"; do
   case "$gate" in
-    rust) paths=(core Cargo.toml Cargo.lock rust-toolchain.toml .cargo) ;;
+    rust) paths=(core gateways Cargo.toml Cargo.lock rust-toolchain.toml .cargo) ;;
     java) paths=(foreign/java) ;;
     csharp) paths=(foreign/csharp) ;;
     python) paths=(foreign/python) ;;

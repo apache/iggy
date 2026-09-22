@@ -19,6 +19,7 @@
 declare(strict_types=1);
 
 use Iggy\AutoCommit;
+use Iggy\AutoCommitWhen;
 use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
@@ -29,6 +30,12 @@ use PHPUnit\Framework\TestCase;
 
 final class IggySdkTest extends TestCase
 {
+    private const CREATE_USER_CODE = 33;
+    private const DELETE_USER_CODE = 34;
+    private const GET_ME_CODE = 20;
+    private const ACTIVE_USER_STATUS = 1;
+    private const STRING_IDENTIFIER_KIND = 2;
+
     #[TestDox('A connected client can ping the server')]
     public function testPing(): void
     {
@@ -51,7 +58,7 @@ final class IggySdkTest extends TestCase
 
         $client = new IggyClient('');
         $client->connect();
-        $client->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+        $client->loginUser(env_or_default('IGGY_ROOT_USERNAME', 'iggy'), env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
         $client->ping();
 
         assert_true($client instanceof IggyClient);
@@ -64,6 +71,62 @@ final class IggySdkTest extends TestCase
         $client->ping();
 
         assert_true($client instanceof IggyClient);
+    }
+
+    #[TestDox('Examples authenticate using literal environment credentials')]
+    public function testExamplesAuthenticateWithLiteralEnvironmentCredentials(): void
+    {
+        require_once __DIR__ . '/../../../examples/php/src/common.php';
+
+        $admin = new_client();
+        $username = unique_name('php-example-user');
+        $password = 'example % @:+= password';
+        $request = chr(strlen($username)) . $username
+            . chr(strlen($password)) . $password
+            . chr(self::ACTIVE_USER_STATUS) . chr(0);
+        $created = $admin->sendBinaryRequest(self::CREATE_USER_CODE, $request);
+        $userId = unpack('VuserId', $created)['userId'];
+        $keys = ['IGGY_CONNECTION_STRING', 'IGGY_HOST', 'IGGY_PORT', 'IGGY_USERNAME', 'IGGY_PASSWORD'];
+        $previous = array_combine($keys, array_map('getenv', $keys));
+
+        try {
+            putenv('IGGY_CONNECTION_STRING');
+            putenv('IGGY_HOST=' . server_host());
+            putenv('IGGY_PORT=' . server_port());
+            putenv('IGGY_USERNAME=' . $username);
+            putenv('IGGY_PASSWORD=' . $password);
+
+            $client = iggy_client();
+            $identity = $client->sendBinaryRequest(self::GET_ME_CODE, '');
+            assert_same($userId, unpack('VclientId/VuserId', $identity)['userId']);
+
+            putenv('IGGY_PASSWORD=incorrect-password');
+            assert_instance_of(
+                \Iggy\Exception\AuthenticationException::class,
+                assert_throws(static fn () => iggy_client()),
+            );
+        } finally {
+            foreach ($previous as $key => $value) {
+                putenv($value === false ? $key : $key . '=' . $value);
+            }
+            $admin->sendBinaryRequest(
+                self::DELETE_USER_CODE,
+                chr(self::STRING_IDENTIFIER_KIND) . chr(strlen($username)) . $username,
+            );
+        }
+    }
+
+    #[TestDox('Connection strings construct clients for every transport before connecting')]
+    public function testConnectionStringsConstructEveryTransport(): void
+    {
+        foreach ([
+            'iggy+tcp://iggy:iggy@127.0.0.1:8090',
+            'iggy+quic://iggy:iggy@127.0.0.1:8080',
+            'iggy+http://iggy:iggy@127.0.0.1:3000',
+            'iggy+ws://iggy:iggy@127.0.0.1:8092',
+        ] as $connectionString) {
+            assert_instance_of(IggyClient::class, IggyClient::fromConnectionString($connectionString));
+        }
     }
 
     #[TestDox('A stream can be created and fetched by name')]
@@ -409,6 +472,39 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('Consumer group accepts a zero polling interval')]
+    public function testConsumerGroupAcceptsZeroPollInterval(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-consumer');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                0,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::disabled(),
+                true,
+                true,
+                0,
+                null,
+                null,
+                null,
+                false,
+            );
+
+            assert_same($consumerName, $consumer->name());
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
     #[TestDox('Consumer group rejects zero duration options before initialization')]
     public function testConsumerGroupRejectsZeroDurationOptions(): void
     {
@@ -421,23 +517,13 @@ final class IggySdkTest extends TestCase
             create_stream_and_topic($client, $streamName, $topicName);
 
             assert_throws(
-                static fn () => $client->consumerGroup(
-                    $consumerName,
-                    $streamName,
-                    $topicName,
-                    0,
-                    PollingStrategy::next(),
-                    10,
-                    AutoCommit::disabled(),
-                    true,
-                    true,
-                    0,
-                    null,
-                    null,
-                    null,
-                    false,
-                ),
-                'poll_interval_micros',
+                static fn () => AutoCommit::interval(0),
+                'interval_micros',
+            );
+
+            assert_throws(
+                static fn () => AutoCommit::intervalOrWhen(0, AutoCommitWhen::pollingMessages()),
+                'interval_micros',
             );
 
             assert_throws(

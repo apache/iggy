@@ -24,6 +24,14 @@ use crate::error::RuntimeError;
 
 const TOKEN_FILE_PREFIX: &str = "file:";
 
+/// `address` must match the suffix of `connection_string`. It is inspected
+/// separately because credentials may contain `?`, which does not start the
+/// address query string.
+fn append_query_parameters(connection_string: &str, address: &str, parameters: &str) -> String {
+    let separator = if address.contains('?') { '&' } else { '?' };
+    format!("{connection_string}{separator}{parameters}")
+}
+
 fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -70,22 +78,28 @@ pub struct IggyClients {
 }
 
 pub async fn init(config: IggyConfig) -> Result<IggyClients, RuntimeError> {
+    let consumer = create_client(&config).await?;
+    let producer = create_client(&config).await?;
+    let iggy_clients = IggyClients { producer, consumer };
+    Ok(iggy_clients)
+}
+
+/// Builds the authenticated connection string for `config`, resolving a
+/// `file:`-prefixed token first. Every client of the configured Iggy server
+/// goes through this, so all of them authenticate identically.
+pub(crate) fn connection_string(config: &IggyConfig) -> Result<String, RuntimeError> {
     let token = if config.token.is_empty() {
         None
     } else {
         Some(resolve_token(&config.token)?)
     };
-
-    let consumer = create_client(&config, token.as_deref()).await?;
-    let producer = create_client(&config, token.as_deref()).await?;
-    let iggy_clients = IggyClients { producer, consumer };
-    Ok(iggy_clients)
+    connection_string_with_token(config, token.as_deref())
 }
 
-async fn create_client(
+fn connection_string_with_token(
     config: &IggyConfig,
     token: Option<&str>,
-) -> Result<IggyClient, RuntimeError> {
+) -> Result<String, RuntimeError> {
     let address = config.address.to_owned();
     let username = config.username.to_owned();
     let password = config.password.to_owned();
@@ -114,7 +128,7 @@ async fn create_client(
         format!("iggy://{username}:{password}@{address}")
     };
 
-    let connection_string = if config.tls.enabled {
+    if config.tls.enabled {
         let ca_file = &config.tls.ca_file;
         if ca_file.is_empty() {
             error!("TLS CA file must be provided when TLS is enabled.");
@@ -127,11 +141,18 @@ async fn create_client(
             .filter(|domain| !domain.is_empty())
             .map(|domain| format!("&tls_domain={domain}"))
             .unwrap_or_default();
-        format!("{connection_string}?tls=true&tls_ca_file={ca_file}{domain}")
+        Ok(append_query_parameters(
+            &connection_string,
+            &config.address,
+            &format!("tls=true&tls_ca_file={ca_file}{domain}"),
+        ))
     } else {
-        connection_string
-    };
+        Ok(connection_string)
+    }
+}
 
+async fn create_client(config: &IggyConfig) -> Result<IggyClient, RuntimeError> {
+    let connection_string = connection_string(config)?;
     let client = IggyClientBuilder::from_connection_string(&connection_string)?.build()?;
     client.connect().await?;
     Ok(client)
@@ -179,6 +200,39 @@ mod tests {
         let path = "relative/path";
         let result = expand_home(path);
         assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn given_existing_query_when_appending_parameters_should_use_ampersand() {
+        let connection_string = "iggy://user:password@127.0.0.1:8090?reconnection_retries=0";
+        let address = "127.0.0.1:8090?reconnection_retries=0";
+
+        let result = append_query_parameters(connection_string, address, "tls=true");
+
+        assert_eq!(
+            result,
+            "iggy://user:password@127.0.0.1:8090?reconnection_retries=0&tls=true"
+        );
+    }
+
+    #[test]
+    fn given_no_query_when_appending_parameters_should_use_question_mark() {
+        let connection_string = "iggy://user:password@127.0.0.1:8090";
+        let address = "127.0.0.1:8090";
+
+        let result = append_query_parameters(connection_string, address, "tls=true");
+
+        assert_eq!(result, "iggy://user:password@127.0.0.1:8090?tls=true");
+    }
+
+    #[test]
+    fn given_question_mark_in_credentials_should_use_address_separator() {
+        let connection_string = "iggy://user:pass?word@127.0.0.1:8090";
+        let address = "127.0.0.1:8090";
+
+        let result = append_query_parameters(connection_string, address, "tls=true");
+
+        assert_eq!(result, "iggy://user:pass?word@127.0.0.1:8090?tls=true");
     }
 
     #[test]
@@ -238,5 +292,74 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result, Err(RuntimeError::TokenFileEmpty(_))));
+    }
+
+    #[test]
+    fn test_connection_string_with_username_and_password() {
+        let config = IggyConfig::default();
+        let result = connection_string(&config).unwrap();
+        assert_eq!(
+            result,
+            format!(
+                "iggy://{}:{}@{}",
+                config.username, config.password, config.address
+            )
+        );
+    }
+
+    #[test]
+    fn test_connection_string_with_token() {
+        let config = IggyConfig {
+            token: "my-secret-token".to_owned(),
+            ..IggyConfig::default()
+        };
+        let result = connection_string(&config).unwrap();
+        assert_eq!(result, format!("iggy://my-secret-token@{}", config.address));
+    }
+
+    #[test]
+    fn test_connection_string_resolves_token_file() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "token-from-file").unwrap();
+        let config = IggyConfig {
+            token: format!("file:{}", temp_file.path().display()),
+            ..IggyConfig::default()
+        };
+        let result = connection_string(&config).unwrap();
+        assert_eq!(result, format!("iggy://token-from-file@{}", config.address));
+    }
+
+    #[test]
+    fn test_connection_string_without_credentials_fails() {
+        let config = IggyConfig {
+            username: String::new(),
+            ..IggyConfig::default()
+        };
+        let result = connection_string(&config);
+        assert!(matches!(result, Err(RuntimeError::MissingIggyCredentials)));
+    }
+
+    #[test]
+    fn test_connection_string_with_tls_appends_parameters() {
+        let mut config = IggyConfig::default();
+        config.tls.enabled = true;
+        config.tls.ca_file = "/certs/ca.pem".to_owned();
+        config.tls.domain = Some("iggy.internal".to_owned());
+        let result = connection_string(&config).unwrap();
+        assert!(
+            result.ends_with("?tls=true&tls_ca_file=/certs/ca.pem&tls_domain=iggy.internal"),
+            "unexpected connection string: {result}"
+        );
+    }
+
+    #[test]
+    fn test_connection_string_with_tls_without_ca_file_fails() {
+        let mut config = IggyConfig::default();
+        config.tls.enabled = true;
+        let result = connection_string(&config);
+        assert!(matches!(
+            result,
+            Err(RuntimeError::MissingTlsCertificateFile)
+        ));
     }
 }

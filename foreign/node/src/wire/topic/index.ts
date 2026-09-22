@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 export * from './create-topic.command.js';
 export * from './delete-topic.command.js';
@@ -23,4 +22,4 @@ export * from './get-topics.command.js';
 export * from './purge-topic.command.js';
 export * from './update-topic.command.js';
 export * from './ensure-topic.virtual.command.js';
-export { CompressionAlgorithm } from './topic.utils.js';
+export { CompressionAlgorithm, Durability } from './topic.utils.js';

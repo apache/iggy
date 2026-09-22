@@ -17,4 +17,6 @@
 
 mod benchmark;
 mod error_isolation;
+mod http_state;
 mod offset_commit;
+mod schema_tagging;

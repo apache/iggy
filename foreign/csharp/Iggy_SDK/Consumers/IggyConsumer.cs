@@ -18,11 +18,13 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
@@ -33,12 +35,25 @@ namespace Apache.Iggy.Consumers;
 /// </summary>
 public partial class IggyConsumer : IAsyncDisposable
 {
+    /// <summary>
+    ///     Backoff between poll iterations that found the group membership missing. It bounds the retry rate of
+    ///     the poll-side rejoin below and keeps the receive loop from spinning while the membership is
+    ///     unrecoverable (client disconnected, group deleted).
+    /// </summary>
+    private const int GroupRejoinRetryDelayMs = 1_000;
+
+    /// <summary>
+    ///     Backoff after a group poll reported <see cref="PolledMessages.NoAssignedPartition" />. Without it a
+    ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
+    /// </summary>
+    private const int NoAssignedPartitionBackoffMs = 100;
+
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
-    private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new();
+    private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
     private readonly Channel<ReceivedRentedMessage> _rentedChannel;
@@ -46,6 +61,13 @@ public partial class IggyConsumer : IAsyncDisposable
     private int _disposeState;
     private volatile bool _isInitialized;
     private volatile bool _joinedConsumerGroup;
+
+    /// <summary>
+    ///     Consensus session generation the group membership was established under. A later generation means the
+    ///     server session that held the membership is gone and the group must be rejoined.
+    /// </summary>
+    private ulong _joinedSessionGeneration;
+
     private long _lastPolledAtMs;
 
     /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
@@ -107,12 +129,21 @@ public partial class IggyConsumer : IAsyncDisposable
             }
         }
 
-        if (_config.CreateIggyClient && _isInitialized)
+        if (_config.CreateIggyClient)
         {
             try
             {
-                await _client.LogoutUserAsync();
-                _client.Dispose();
+                try
+                {
+                    if (_isInitialized)
+                    {
+                        await _client.LogoutUserAsync();
+                    }
+                }
+                finally
+                {
+                    _client.Dispose();
+                }
             }
             catch (Exception e)
             {
@@ -209,8 +240,8 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="resetLastPolled">
-    ///     When true, also advances the cached last-polled offset for the partition so the next poll
-    ///     resumes past the stored offset.
+    ///     When true, changes the cached duplicate-filter offset for the partition.
+    ///     Does not change the polling strategy or clear buffered messages.
     /// </param>
     /// <param name="ct">Cancellation token</param>
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
@@ -220,13 +251,13 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (resetLastPolled)
         {
-            _lastPolledOffset[(int)partitionId] = offset;
+            _lastPolledOffset[partitionId] = offset;
         }
     }
 
     /// <summary>
     ///     Deletes the stored consumer offset for a specific partition.
-    ///     The next poll will start from the beginning or based on the polling strategy.
+    ///     The local duplicate filter, polling strategy, and buffered messages remain unchanged.
     /// </summary>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="ct">Cancellation token</param>
@@ -263,8 +294,13 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
+        // Captured before the join: a session reset racing the join lands the membership on a later generation,
+        // and the mismatch triggers one redundant (idempotent) rejoin instead of a missed one.
+        var sessionGeneration = (_client as ISessionGenerationProvider)?.SessionGeneration ?? 0;
+
         if (_config.Consumer.Type == ConsumerType.Consumer)
         {
+            Interlocked.Exchange(ref _joinedSessionGeneration, sessionGeneration);
             _joinedConsumerGroup = true;
             return;
         }
@@ -306,6 +342,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId,
                     Identifier.String(_consumerGroupName), ct);
 
+                Interlocked.Exchange(ref _joinedSessionGeneration, sessionGeneration);
                 _joinedConsumerGroup = true;
                 LogConsumerGroupJoined(_consumerGroupName);
             }
@@ -364,9 +401,10 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
     {
-        if (!_joinedConsumerGroup)
+        if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
         {
             LogConsumerGroupNotJoinedYetSkippingPolling();
+            await TryRecoverGroupMembershipAsync(ct);
             return;
         }
 
@@ -387,6 +425,12 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (messages.Messages.Count == 0)
             {
+                if (messages.PartitionId == PolledMessages.NoAssignedPartition)
+                {
+                    LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
+                    await Task.Delay(NoAssignedPartitionBackoffMs, ct);
+                }
+
                 return;
             }
 
@@ -406,7 +450,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     Message = message,
                     CurrentOffset = message.Header.Offset,
-                    PartitionId = (uint)messages.PartitionId,
+                    PartitionId = messages.PartitionId,
                     Status = MessageStatus.Success,
                     Error = null
                 };
@@ -422,19 +466,22 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
                         lastPolledPartitionOffset, messages.PartitionId);
-                    await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, false, ct);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, false, ct);
                 }
 
                 return;
             }
 
-            _lastPolledOffset.AddOrUpdate(messages.PartitionId, currentOffset,
-                (_, _) => currentOffset);
+            _lastPolledOffset[messages.PartitionId] = currentOffset;
 
             if (_config.PollingStrategy.Kind == MessagePolling.Offset)
             {
                 _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (MessageDecryptionException ex)
         {
@@ -450,6 +497,57 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             _pollingSemaphore.Release();
         }
+    }
+
+    /// <summary>
+    ///     Whether the session generation the group membership was stamped under is still the transport's
+    ///     current one. Gating the poll here instead of clearing the joined flag on a Disconnected event survives
+    ///     a late event landing after a rejoin already re-stamped the generation: state events are published
+    ///     outside the state lock, so their order is not guaranteed. Runs outside
+    ///     <see cref="_connectionStateSemaphore" />, hence the interlocked read.
+    /// </summary>
+    private bool IsGroupMembershipCurrent()
+    {
+        if (_config.Consumer.Type != ConsumerType.ConsumerGroup
+            || _client is not ISessionGenerationProvider generationProvider)
+        {
+            return true;
+        }
+
+        return generationProvider.SessionGeneration == Interlocked.Read(ref _joinedSessionGeneration);
+    }
+
+    /// <summary>
+    ///     Poll-side rejoin for a membership found missing or stamped under a dead session. The state-event
+    ///     rejoin swallows its failures so the event loop survives them, and the transport suppresses a repeat
+    ///     event for an unchanged state, so without this backstop one failed rejoin would park the consumer for
+    ///     good. The trailing delay keeps the receive loop from spinning while the membership stays gone.
+    /// </summary>
+    private async Task TryRecoverGroupMembershipAsync(CancellationToken ct)
+    {
+        if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.JoinConsumerGroup)
+        {
+            await _connectionStateSemaphore.WaitAsync(ct);
+            try
+            {
+                if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
+                {
+                    _joinedConsumerGroup = false;
+                    await RejoinConsumerGroupOnReconnectionAsync();
+                }
+            }
+            finally
+            {
+                _connectionStateSemaphore.Release();
+            }
+
+            if (_joinedConsumerGroup && IsGroupMembershipCurrent())
+            {
+                return;
+            }
+        }
+
+        await Task.Delay(GroupRejoinRetryDelayMs, ct);
     }
 
     /// <summary>
@@ -502,9 +600,33 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
 
+        if (_config.Consumer.Type == ConsumerType.Consumer)
+        {
+            return;
+        }
+
         await _connectionStateSemaphore.WaitAsync();
         try
         {
+            if (_client is ISessionGenerationProvider generationProvider)
+            {
+                if (e.CurrentState != ConnectionState.Authenticated)
+                {
+                    return;
+                }
+
+                if (_joinedConsumerGroup
+                    && generationProvider.SessionGeneration == Interlocked.Read(ref _joinedSessionGeneration))
+                {
+                    return;
+                }
+
+                _joinedConsumerGroup = false;
+                await RejoinConsumerGroupOnReconnectionAsync();
+
+                return;
+            }
+
             if (e.CurrentState == ConnectionState.Disconnected)
             {
                 _joinedConsumerGroup = false;

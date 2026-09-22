@@ -775,6 +775,10 @@
   fields:
     - name: Path
       type: string
+- name: TooManyConsumerOffsets
+  code: 3024
+  format: "consumer offset limit reached for partition, raise [partition] consumer_offsets_max"
+  fields: []
 - name: PartitionIdSpaceExhausted
   code: 3013
   format: "partition id space exhausted for this topic"
@@ -1056,6 +1060,14 @@
   format: "invalid reserved field value: %d, expected: 0"
   fields:
     - name: Value
+      type: uint64
+- name: SegmentSizeMismatchAtOpen
+  code: 4102
+  format: "segment file size on disk: %d does not match expected size: %d"
+  fields:
+    - name: OnDisk
+      type: uint64
+    - name: Expected
       type: uint64
 - name: ConsumerGroupIdNotFound
   code: 5000

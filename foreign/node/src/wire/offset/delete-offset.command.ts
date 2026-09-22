@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import type { GetOffset } from './get-offset.command.js';

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { type Id } from '../identifier.utils.js';
 import { serializeSendMessages, type CreateMessage } from './message.utils.js';
@@ -60,9 +59,8 @@ export type SendMessagesConfirmation = {
    *
    * Delivery is at-least-once, so an earlier retry of the same batch may
    * already have committed at a lower offset: this never identifies a batch
-   * uniquely. A batch is confirmed once it is committed in memory, not once it
-   * is fsynced, so a crash-restart can stamp a later batch with an offset a
-   * client has already recorded.
+   * uniquely. Confirmation follows VSR quorum commit. Persisted message
+   * durability also requires recoverable stable-storage copies on the quorum.
    */
   baseOffset: bigint,
 };

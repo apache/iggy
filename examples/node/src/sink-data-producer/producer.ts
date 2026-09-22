@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client, Partitioning } from 'apache-iggy';
 import { log, sleep } from '../utils';
@@ -136,7 +135,7 @@ async function produceData(client: Client, streamName: string, topicName: string
   const maxBatches = 100;
 
   while (batchesCount < maxBatches) {
-    const recordsCount = Math.floor(Math.random() * 400) + 100; // 100-500
+    const recordsCount = Math.floor(Math.random() * 400) + 100;
     const messages = Array.from({ length: recordsCount }).map(() => {
       const record = randomRecord();
       return {

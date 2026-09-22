@@ -282,7 +282,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
 /// Returns `Err(())` on any write, read, command, status, or MAC
 /// failure (already logged).
 #[allow(clippy::future_not_send, clippy::similar_names)]
-pub async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
+pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
     stream: &mut S,
     ctx: &ReplicaHandshakeCtx,
     peer_id: u8,

@@ -85,8 +85,8 @@ impl CliCommand for GetClientsCmd {
                             Some(user_id) => format!("{user_id}"),
                             None => String::from(""),
                         },
-                        format!("{}", client_info.address),
-                        format!("{}", client_info.transport),
+                        client_info.address.clone(),
+                        client_info.transport.clone(),
                         format!("{}", client_info.consumer_groups_count),
                     ]);
                 });

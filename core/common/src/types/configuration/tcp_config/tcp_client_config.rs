@@ -18,7 +18,7 @@
 use crate::types::configuration::auth_config::connection_string::ConnectionString;
 use crate::types::configuration::auth_config::connection_string_options::ConnectionStringOptions;
 use crate::types::configuration::tcp_config::tcp_connection_string_options::TcpConnectionStringOptions;
-use crate::{AutoLogin, IggyDuration, TcpClientReconnectionConfig};
+use crate::{AutoLogin, NonZeroIggyDuration, TcpClientReconnectionConfig};
 use std::str::FromStr;
 
 /// Configuration for the TCP client.
@@ -40,7 +40,7 @@ pub struct TcpClientConfig {
     /// Whether to automatically reconnect when disconnected.
     pub reconnection: TcpClientReconnectionConfig,
     /// Interval of heartbeats sent by the client
-    pub heartbeat_interval: IggyDuration,
+    pub heartbeat_interval: NonZeroIggyDuration,
     /// Disable Nagle algorithm for the TCP socket.
     pub nodelay: bool,
 }
@@ -53,7 +53,7 @@ impl Default for TcpClientConfig {
             tls_domain: "".to_string(),
             tls_ca_file: None,
             tls_validate_certificate: true,
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             auto_login: AutoLogin::Disabled,
             reconnection: TcpClientReconnectionConfig::default(),
             nodelay: false,
@@ -69,7 +69,7 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
             tls_enabled: connection_string.options().tls_enabled(),
             tls_domain: connection_string.options().tls_domain().into(),
             tls_ca_file: connection_string.options().tls_ca_file().to_owned(),
-            // Always validate TLS certificate for connection strings, we don't want to allow self-signed certificates for connection strings
+            // Require certificate verification, including when trusting a private CA.
             tls_validate_certificate: true,
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),

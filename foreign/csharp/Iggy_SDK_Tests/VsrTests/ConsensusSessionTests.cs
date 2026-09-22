@@ -119,15 +119,30 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
-    public void Resolve_DoesNotConsumeAnIdForNonReplicatedOrPartitionOps()
+    public void Resolve_DoesNotConsumeAnIdForNonReplicatedOps()
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
         session.Bind(10);
 
         Assert.Equal(1UL, session.Resolve(VsrOperation.NonReplicated).RequestId);
-        Assert.Equal(1UL, session.Resolve(VsrOperation.SendMessages).RequestId);
         Assert.Equal(1UL, session.RequestCounter);
+    }
+
+    [Fact]
+    public void Resolve_PartitionOpsConsumeADistinctIdPerSend()
+    {
+        // Dedup identity requires each send to carry a distinct number, so
+        // partition ops advance the counter exactly like metadata ops and the
+        // two planes interleave on one sequence.
+        var session = new ConsensusSession(1);
+        session.Resolve(VsrOperation.Register);
+        session.Bind(10);
+
+        Assert.Equal(1UL, session.Resolve(VsrOperation.SendMessages).RequestId);
+        Assert.Equal(2UL, session.Resolve(VsrOperation.SendMessages).RequestId);
+        Assert.Equal(3UL, session.Resolve(VsrOperation.CreateStream).RequestId);
+        Assert.Equal(4UL, session.RequestCounter);
     }
 
     [Fact]
@@ -214,5 +229,25 @@ public sealed class ConsensusSessionTests
         Assert.False(session.IsBound);
         Assert.Equal(1UL, session.RequestCounter);
         Assert.NotEqual((UInt128)1, session.ClientId);
+    }
+
+    [Fact]
+    public void Generation_AdvancesOnEveryReArmAndNotOnBind()
+    {
+        var session = new ConsensusSession(1);
+        var initialGeneration = session.Generation;
+
+        session.Resolve(VsrOperation.Register);
+        session.Bind(10);
+        Assert.Equal(initialGeneration, session.Generation);
+
+        session.Reset();
+        Assert.Equal(initialGeneration + 1, session.Generation);
+
+        // A register on a previously bound session re-arms the identity, which is a new generation too.
+        session.Resolve(VsrOperation.Register);
+        session.Bind(11);
+        session.Resolve(VsrOperation.Register);
+        Assert.Equal(initialGeneration + 2, session.Generation);
     }
 }

@@ -20,7 +20,8 @@ use crate::WireIdentifier;
 use crate::codec::{WireDecode, WireEncode, read_u8};
 use bytes::{BufMut, BytesMut};
 
-const KIND_CONSUMER: u8 = 1;
+/// Wire discriminant for a single consumer (vs a `ConsumerGroup`).
+pub const KIND_CONSUMER: u8 = 1;
 /// Wire discriminant for a consumer-group consumer (vs a single `Consumer`).
 /// Public so the server dispatch can match on it by name instead of a raw `2`.
 pub const KIND_CONSUMER_GROUP: u8 = 2;

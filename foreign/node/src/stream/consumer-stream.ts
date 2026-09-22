@@ -14,10 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Readable } from "node:stream";
-import type { ClientConfig } from "../client/client.type.js";
+import type { ClientConfigOrString } from "../client/client.type.js";
 import type { Id } from '../wire/identifier.utils.js';
 import { getClient } from "../client/client.js";
 import {
@@ -79,7 +78,7 @@ export type SingleConsumerStreamRequest = ConsumerStreamRequest & {
 
 export type GroupConsumerStreamRequest = ConsumerStreamRequest & { groupName: string };
 
-export const singleConsumerStream = (config: ClientConfig) => async (
+export const singleConsumerStream = (config: ClientConfigOrString) => async (
   {
     streamId,
     topicId,
@@ -111,7 +110,7 @@ export const singleConsumerStream = (config: ClientConfig) => async (
 };
 
 
-export const groupConsumerStream = (config: ClientConfig) =>
+export const groupConsumerStream = (config: ClientConfigOrString) =>
   async function groupConsumerStream({
     groupName,
     streamId,

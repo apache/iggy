@@ -333,6 +333,8 @@ pub enum IggyError {
     NotResolvedConsumer(Identifier) = 3022,
     #[error("Cannot open consumer offsets file for path: {0}")]
     CannotOpenConsumerOffsetsFile(String) = 3023,
+    #[error("Consumer offset limit reached for partition, raise [partition] consumer_offsets_max")]
+    TooManyConsumerOffsets = 3024,
     #[error("Segment not found")]
     SegmentNotFound = 4000,
     #[error("Segment with start offset: {0} and partition with ID: {1} is closed")]
@@ -453,6 +455,11 @@ pub enum IggyError {
     InvalidOffset(u64) = 4100,
     #[error("Invalid reserved field value: {0}, expected: 0")]
     InvalidReservedField(u64) = 4101,
+    /// The on-disk segment file length disagrees with the recovered bounds the
+    /// writer was seeded with; appending would corrupt the segment, so the
+    /// open fails instead. Field order: `(on_disk, expected)`.
+    #[error("Segment file size on disk: {0} does not match expected size: {1}")]
+    SegmentSizeMismatchAtOpen(u64, u64) = 4102,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]
@@ -621,5 +628,13 @@ mod tests {
             IggyError::InvalidConsumerGroupName.as_string(),
             IggyError::from_code_as_string(GROUP_NAME_ERROR_CODE)
         )
+    }
+
+    #[test]
+    fn too_many_consumer_offsets_round_trips_by_code() {
+        let error = IggyError::TooManyConsumerOffsets;
+        assert_eq!(error.as_code(), 3024);
+        assert_eq!(IggyError::from_code(3024), error);
+        assert_eq!(IggyError::from_code_as_string(3024), error.as_string());
     }
 }

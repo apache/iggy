@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ClientState, DiagnosticEvent, IggyDuration, IggyError};
+use crate::{
+    ClientState, Credentials, DiagnosticEvent, Identifier, IggyError, NonZeroIggyDuration,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::WireEncode;
+use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use std::sync::Arc;
 
 #[async_trait]
@@ -28,18 +33,39 @@ pub trait BinaryTransport {
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
-    fn get_heartbeat_interval(&self) -> IggyDuration;
+    /// Route a store or delete offset request while retaining the membership connection.
+    async fn send_offset_write_with_response(
+        &self,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        self.send_raw_with_response(code, payload).await
+    }
+    /// Transports may route an auto-commit poll without moving the connection
+    /// that owns consumer-group membership.
+    async fn send_poll_with_response(
+        &self,
+        request: &PollMessagesRequest,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        self.send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
+            .await
+    }
+    fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve
-    /// partitioning client-side under VSR (the broker never picks a
-    /// partition). Shared via `Arc` so a refresh task can hold it.
+    /// partitioning client-side under VSR. Shared via `Arc` so a refresh task can hold it.
     fn consumer_group_state(&self) -> Arc<crate::ConsumerGroupClientState>;
 }
 
-/// Sealed marker. Downstream crates cannot implement
-/// [`VsrSessionControl`] because they cannot name
-/// `vsr_session_sealed::Sealed`. The session-mutation methods stay
-/// in-crate so only the SDK's login/logout flows can call them.
+/// Separate opt-in marker for session control. Exported as `VsrSessionSealed`
+/// so the SDK crate and external transport implementations can implement it;
+/// this does not restrict implementations to this crate.
 mod vsr_session_sealed {
     pub trait Sealed {}
 }
@@ -51,6 +77,28 @@ mod vsr_session_sealed {
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
     async fn reset_vsr_session(&self) -> Result<(), IggyError>;
+    /// Keep the credentials a sign-in succeeded with, so a transport that
+    /// loses its connection can re-establish the session -- on this node or,
+    /// after failing over, on another one. A caller that signs in by hand is
+    /// otherwise less reconnectable than one that configures `AutoLogin`,
+    /// which is a surprising difference between two ways of doing the same
+    /// thing. Transports that cannot reconnect leave this a no-op.
+    async fn remember_session_credentials(&self, _credentials: Credentials, _user_id: u32) {}
+    /// Drop them: after an explicit logout there is no session to restore,
+    /// and a reconnect must not resurrect one.
+    async fn forget_session_credentials(&self) {}
+    /// A committed password change for `user`: when it is the signed-in user,
+    /// the credentials the next reconnect signs in with switch to the new
+    /// password, or that reconnect would replay the old one and fail an
+    /// unrelated request with `InvalidCredentials`. Other users' changes are
+    /// ignored.
+    ///
+    /// This covers a configured `AutoLogin` as well as a sign-in the caller
+    /// ran: the configured credentials still decide *who* the client signs in
+    /// as, and a committed change decides what that user's password is.
+    async fn refresh_session_password(&self, _user: &Identifier, _new_password: &str) {}
+    /// Keep auxiliary logins and reconnects working after the session user is renamed.
+    async fn refresh_session_username(&self, _user: &Identifier, _new_username: &str) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.

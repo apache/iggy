@@ -21,12 +21,18 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -181,6 +187,88 @@ func TestE2E_ConsumerGroupFlow(t *testing.T) {
 	require.NoError(t, connected.DeleteConsumerGroup(ctx, streamId, topicId, groupId))
 }
 
+// The shared cluster fixture seeds these partitions before moving only metadata
+// leadership. Creating a fresh topic here would put both primaries together.
+func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
+	streamName := os.Getenv("IGGY_POLL_ROUTING_STREAM")
+	if streamName == "" {
+		t.Skip("set IGGY_POLL_ROUTING_STREAM and IGGY_POLL_ROUTING_TOPIC to a split-primary topic with eight messages per partition")
+	}
+	messagesPerPartition := 8
+	if value := os.Getenv("IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION"); value != "" {
+		var err error
+		messagesPerPartition, err = strconv.Atoi(value)
+		require.NoError(t, err, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
+		require.Positive(t, messagesPerPartition, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
+	}
+	stream, err := iggcon.NewIdentifier(streamName)
+	require.NoError(t, err)
+	topic, err := iggcon.NewIdentifier(os.Getenv("IGGY_POLL_ROUTING_TOPIC"))
+	require.NoError(t, err)
+	connected := connect(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	details, err := connected.GetTopic(ctx, stream, topic)
+	require.NoError(t, err)
+	group, err := connected.CreateConsumerGroup(ctx, stream, topic, fmt.Sprintf("go-primary-%d", time.Now().UnixNano()))
+	require.NoError(t, err)
+	groupID, err := iggcon.NewIdentifier(group.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
+	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
+	consumer := iggcon.NewGroupConsumer(groupID)
+	partition := uint32(0)
+	payload, err := (&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
+		PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}).MarshalBinary()
+	require.NoError(t, err)
+	route, err := connected.SendBinaryRequest(ctx, uint32(command.GetPollRoutingCode), payload)
+	require.NoError(t, err)
+	require.Greater(t, len(route), 32)
+	var primary iggcon.ClusterNode
+	require.NoError(t, primary.UnmarshalBinary(route[32:]))
+	coordinator := connected.GetConnectionInfo().ServerAddress
+	primaryAddress := net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
+	coordinatorEndpoint, err := net.ResolveTCPAddr("tcp", coordinator)
+	require.NoError(t, err)
+	primaryEndpoint, err := net.ResolveTCPAddr("tcp", primaryAddress)
+	require.NoError(t, err)
+	require.False(t, coordinatorEndpoint.Port == primaryEndpoint.Port && coordinatorEndpoint.IP.Equal(primaryEndpoint.IP),
+		"the fixture must separate metadata and partition primaries")
+	before, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	require.NoError(t, err)
+	beforeClient := binaryserialization.DeserializeClient(before)
+	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
+	counts := make(map[uint32]int)
+	for range int(details.PartitionsCount) * messagesPerPartition {
+		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, nil)
+		require.NoError(t, err)
+		require.Len(t, polled.Messages, 1)
+		counts[polled.PartitionId]++
+	}
+	for partition := range details.PartitionsCount {
+		assert.Equal(t, messagesPerPartition, counts[partition])
+		require.Eventually(t, func() bool {
+			offset, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
+			return err == nil && offset != nil && offset.StoredOffset == uint64(messagesPerPartition-1)
+		}, 5*time.Second, 50*time.Millisecond,
+			"partition %d auto-commit must replicate to the coordinator's backup", partition)
+		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
+		require.NoError(t, err)
+		assert.Empty(t, polled.Messages, "the group auto-commit advanced on the primary")
+		polled, err = connected.PollMessages(ctx, stream, topic, iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 1, true, &partition)
+		require.NoError(t, err)
+		require.Len(t, polled.Messages, 1)
+	}
+	after, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	require.NoError(t, err)
+	afterClient := binaryserialization.DeserializeClient(after)
+	assert.Equal(t, beforeClient.ID, afterClient.ID)
+	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount)
+	assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress)
+	t.Logf("coordinator=%s primary=%s messages=%d client=%d groups=%d", coordinator,
+		primaryAddress, int(details.PartitionsCount)*messagesPerPartition, afterClient.ID, afterClient.ConsumerGroupsCount)
+}
+
 func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
@@ -322,7 +410,7 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	for _, spec := range specs {
 		byKey[spec.Key] = spec
 	}
-	require.Contains(t, byKey, "enforce_fsync", "the catalog lists the keys create accepts")
+	require.Contains(t, byKey, "durability", "the catalog lists the keys create accepts")
 	require.Contains(t, byKey, "segment_size")
 	assert.NotEmpty(t, byKey["segment_size"].Description)
 	assert.Equal(t, iggcon.Uint64, byKey["segment_size"].DefaultValue.Kind)
@@ -343,8 +431,8 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	created, err := connected.CreateTopic(ctx, streamId, name, 1,
 		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
 		iggcon.HeaderEntry{
-			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("enforce_fsync")},
-			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("true")},
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("durability")},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("persisted")},
 		})
 	require.NoError(t, err)
 
@@ -353,16 +441,16 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	topic, err := connected.GetTopic(ctx, streamId, topicId)
 	require.NoError(t, err)
 
-	fsync, ok := topic.Options["enforce_fsync"]
+	durability, ok := topic.Options["durability"]
 	require.True(t, ok, "an explicitly set key is reported as explicit, got %v", topic.Options)
 	// Create admission re-encodes the block from its own parse, so the stored
 	// value carries the key's canonical kind whatever kind the client sent it
-	// as: this string "true" comes back as a Bool.
-	assert.Equal(t, iggcon.Bool, fsync.Kind)
-	assert.Equal(t, []byte{1}, fsync.Value)
+	// as: durability is a canonical String token.
+	assert.Equal(t, iggcon.String, durability.Kind)
+	assert.Equal(t, []byte("persisted"), durability.Value)
 	// Keys the client left alone are resolved by admission and reported apart.
 	require.Contains(t, topic.DerivedOptions, "max_topic_size")
-	assert.NotContains(t, topic.DerivedOptions, "enforce_fsync")
+	assert.NotContains(t, topic.DerivedOptions, "durability")
 
 	// A key outside the catalog is refused by name.
 	_, err = connected.CreateTopic(ctx, streamId, name+"-bad", 1,
@@ -383,7 +471,7 @@ func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
 	// nothing is reserved on disk.
 	typed := []iggcon.HeaderEntry{
 		iggcon.SegmentSizeOption(1024 * 1024),
-		iggcon.EnforceFsyncOption(true),
+		iggcon.DurabilityOption(iggcon.DurabilityPersisted),
 		iggcon.MessagesRequiredToSaveOption(7),
 		iggcon.SizeOfMessagesRequiredToSaveOption(4096),
 		iggcon.PreallocateSegmentsOption(false),
