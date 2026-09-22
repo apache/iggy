@@ -25,32 +25,38 @@ blog post for the checklist this template is built against.
   on `Nack` so a failed delivery gets re-polled instead of silently lost.
 - The `source_connector!` FFI macro invocation and a `Cargo.toml` with the
   right `crate-type`, workspace-pinned dependencies, and license header.
-- Tests for config validation and the Ack/Nack state-commit behavior.
+- `verbose_logging: Option<bool>` upgrading the per-poll log line from
+  `debug!` to `info!`, mirroring the runtime's own `verbose` flag.
+- The six canonical state/Ack-Nack tests, plus config validation and the
+  `verbose_logging` flag.
 
 ## What you need to fill in
 
-Search for `TODO(ConnectorDeveloper)` in `src/lib.rs` — there are exactly two spots:
+Search for `TODO(ConnectorDeveloper)` in `src/lib.rs` — there are exactly
+three spots: one required, one conditional, one documentation-only.
 
-1. **`build_raw_client()`** — if your source isn't HTTP, replace the
+1. **`fetch_records()`** (required) — fetch up to `self.batch_size` new
+   records from your system, ordered after `cursor` (`None` = start from the
+   beginning, or from "now" — whichever fits your source). Map each result
+   to a `FetchedRecord { cursor_value, payload }`, using something
+   monotonically increasing as `cursor_value` (a timestamp, an ID, a page
+   token) — that's what lets the cursor-staging logic advance correctly.
+2. **`build_raw_client()`** (only if your source isn't HTTP) — replace the
    `reqwest::Client` construction with your driver's connection/pool setup
    (see `core/connectors/sources/postgres_source` for a real non-HTTP
    example), store it on `TemplateSource` (you'll need to add a field —
    `client: Option<ClientWithMiddleware>` here is HTTP-specific), and adjust
    or remove the `check_connectivity_with_retry` call in `open()` in favor
    of whatever connectivity check your driver offers.
-2. **`fetch_records()`** — fetch up to `self.batch_size` new records from
-   your system, ordered after `cursor` (`None` = start from the beginning,
-   or from "now" — whichever fits your source). Map each result to a
-   `FetchedRecord { cursor_value, payload }`, using something monotonically
-   increasing as `cursor_value` (a timestamp, an ID, a page token) — that's
-   what lets the cursor-staging logic advance correctly.
+3. **`connection_string`'s doc comment** (documentation only) — describe
+   the exact shape your connector expects instead of the generic example.
 
 ## Using it
 
 1. Copy this directory, rename it and the package in `Cargo.toml`
    (`iggy_connector_<yourname>_source`), and add it to the `members` list in
    the workspace root `Cargo.toml`.
-2. Fill in the two `TODO(ConnectorDeveloper)` sections.
+2. Fill in `fetch_records()` (and `build_raw_client()` if not HTTP).
 3. Update `config.toml` with your real `connection_string` and any
    settings specific to your system; delete `auth_token` if you don't need
    it, or add fields of your own the same way (see `TemplateSourceConfig`).

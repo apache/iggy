@@ -153,7 +153,7 @@ These are "cheap" but burn full review rounds when missed.
 | Request timeout | `timeout` | Not `request_timeout` |
 | Retry attempts | `max_retries` | Total attempts, default 3 |
 | Base backoff | `retry_delay` | humantime `Option<String>` |
-| Backoff ceiling | `max_retry_delay` | Not `retry_max_delay` |
+| Backoff ceiling | `retry_max_delay` | Matches SDK's `ConnectivityConfig::open_retry_max_delay` |
 | Poll cadence (sources) | `poll_interval` | humantime; sleep first |
 | Plugin verbosity | `verbose_logging` | Mirror runtime `verbose` |
 | Credentials | `connection_string` / `api_key` / … | Always `SecretString` |

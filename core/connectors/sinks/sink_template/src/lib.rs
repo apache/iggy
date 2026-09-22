@@ -25,18 +25,23 @@
 //! are chunked by a configurable batch size instead of shipped as one
 //! unbounded request.
 //!
-//! There is exactly **one** place you need to touch, marked `TODO(ConnectorDeveloper)`:
-//!   `TemplateSink::push_batch()` — build the request/write that actually
-//!   pushes one chunk of messages to your destination, using
-//!   `self.config.connection_string` (and `self.config.target`, if your
-//!   destination has a table/index/collection-shaped name).
+//! There is exactly **one** place you need to write code, marked
+//! `TODO(ConnectorDeveloper)`: `TemplateSink::push_batch()` — build the
+//! request/write that actually pushes one chunk of messages to your
+//! destination, using `self.config.connection_string` (and
+//! `self.config.target`, if your destination has a table/index/
+//! collection-shaped name). A second `TODO(ConnectorDeveloper)` on the
+//! `connection_string` field's doc comment just asks you to describe its
+//! expected shape — not code, but worth personalizing too. `grep` for the
+//! marker and you'll find both, plus one more on `build_raw_client()` that
+//! only applies if your destination isn't HTTP (see below).
 //!
 //! This template assumes an HTTP-ish destination and uses `reqwest` wrapped
 //! by the SDK's retry middleware, because that's what
 //! `iggy_connector_sdk::retry` is built for and it covers the common case.
 //! If your destination talks something else (a database, a queue, object
-//! storage), swap the client type in `connect()`/`push_batch()` for your
-//! driver of choice and lean on its own retry/pooling behavior — keep the
+//! storage), swap the client type in `build_raw_client()`/`push_batch()` for
+//! your driver of choice and lean on its own retry/pooling behavior — keep the
 //! surrounding shape (validation in `open()`, circuit breaker, batching,
 //! identifier validation) unchanged. See `core/connectors/sinks/postgres_sink`
 //! or `core/connectors/sinks/s3_sink` in this repo for non-HTTP examples of
@@ -58,7 +63,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 sink_connector!(TemplateSink);
 
@@ -102,7 +107,7 @@ pub struct TemplateSinkConfig {
     /// `Debug`/log output; delete this field if `connection_string` already
     /// carries all required auth. Read it with `.expose_secret()` (from the
     /// `secrecy::ExposeSecret` trait) at the one place you actually need the
-    /// plaintext — e.g. when building an auth header in `connect()`.
+    /// plaintext — e.g. when building an auth header in `build_raw_client()`.
     #[serde(
         default,
         serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
@@ -118,11 +123,16 @@ pub struct TemplateSinkConfig {
     pub timeout: Option<String>,
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
-    pub max_retry_delay: Option<String>,
+    pub retry_max_delay: Option<String>,
     pub max_open_retries: Option<u32>,
     pub open_retry_max_delay: Option<String>,
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
+
+    /// Upgrades the per-batch log line from `debug!` to `info!`. Mirrors the
+    /// runtime's own `verbose` flag; keep the field name `verbose_logging`
+    /// (see `postgres_sink::PostgresSinkConfig::verbose_logging`).
+    pub verbose_logging: Option<bool>,
 }
 
 /// Rejects anything that isn't a plain alphanumeric/underscore identifier.
@@ -158,6 +168,7 @@ pub struct TemplateSink {
     circuit_breaker: Arc<CircuitBreaker>,
     batch_size_limit: usize,
     retry_delay: Duration,
+    verbose: bool,
     state: Mutex<State>,
     records_written_total: AtomicU64,
 }
@@ -175,6 +186,7 @@ impl TemplateSink {
             ),
         ));
         let batch_size_limit = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
+        let verbose = config.verbose_logging.unwrap_or(false);
 
         Self {
             id,
@@ -183,6 +195,7 @@ impl TemplateSink {
             circuit_breaker,
             batch_size_limit,
             retry_delay,
+            verbose,
             state: Mutex::new(State::default()),
             records_written_total: AtomicU64::new(0),
         }
@@ -213,7 +226,11 @@ impl TemplateSink {
     /// (network error, 5xx, timeout — should retry) by returning
     /// `Error::PermanentHttpError` for the former; see the doc comment on
     /// that variant in `iggy_connector_sdk::Error` for why the distinction
-    /// matters to the circuit breaker.
+    /// matters. `consume()` drops and counts a `PermanentHttpError` batch but
+    /// keeps processing the rest; any other error stops `consume()` and is
+    /// returned, which the runtime treats as fatal for the whole connector —
+    /// so a permanent classification is what keeps one bad message from
+    /// taking every future batch down with it.
     async fn push_batch(
         &self,
         client: &ClientWithMiddleware,
@@ -321,18 +338,33 @@ impl Sink for TemplateSink {
         let invocation = state.invocations_count;
         drop(state);
 
-        info!(
-            "{CONNECTOR_NAME} with ID: {} received: {} messages, schema: {}, stream: {}, topic: {}, \
-             partition: {}, offset: {}, invocation: {}",
-            self.id,
-            messages.len(),
-            messages_metadata.schema,
-            topic_metadata.stream,
-            topic_metadata.topic,
-            messages_metadata.partition_id,
-            messages_metadata.current_offset,
-            invocation
-        );
+        if self.verbose {
+            info!(
+                "{CONNECTOR_NAME} with ID: {} received: {} messages, schema: {}, stream: {}, \
+                 topic: {}, partition: {}, offset: {}, invocation: {}",
+                self.id,
+                messages.len(),
+                messages_metadata.schema,
+                topic_metadata.stream,
+                topic_metadata.topic,
+                messages_metadata.partition_id,
+                messages_metadata.current_offset,
+                invocation
+            );
+        } else {
+            debug!(
+                "{CONNECTOR_NAME} with ID: {} received: {} messages, schema: {}, stream: {}, \
+                 topic: {}, partition: {}, offset: {}, invocation: {}",
+                self.id,
+                messages.len(),
+                messages_metadata.schema,
+                topic_metadata.stream,
+                topic_metadata.topic,
+                messages_metadata.partition_id,
+                messages_metadata.current_offset,
+                invocation
+            );
+        }
 
         if self.circuit_breaker.is_open().await {
             warn!(
@@ -349,13 +381,32 @@ impl Sink for TemplateSink {
             Error::Connection("client not initialized -- was open() called?".into())
         })?;
 
-        let mut first_error: Option<Error> = None;
+        // Track the *last* transient error, not the first — an earlier chunk's
+        // failure may already be stale by the time later chunks run, and the
+        // circuit breaker below should react to the most recent signal. A
+        // `PermanentHttpError` batch (bad schema, will never succeed on retry)
+        // is dropped and counted here rather than kept as `last_err`: letting
+        // it propagate would return `Err` from `consume()`, and the runtime
+        // treats any `Err` here as fatal for the whole connector (see
+        // `runtime/src/sink.rs::consume_messages`), not just a retry of that
+        // one batch — so a single unprocessable message would take down every
+        // future batch instead of just being skipped.
+        let mut last_err: Option<Error> = None;
         let mut written = 0u64;
         let mut failed = 0u64;
 
         for batch in messages.chunks(self.batch_size_limit) {
             match self.push_batch(client, batch).await {
                 Ok(()) => written += batch.len() as u64,
+                Err(Error::PermanentHttpError(message)) => {
+                    failed += batch.len() as u64;
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} dropping a batch of {} \
+                         (permanent): {message}",
+                        self.id,
+                        batch.len()
+                    );
+                }
                 Err(err) => {
                     failed += batch.len() as u64;
                     error!(
@@ -363,23 +414,24 @@ impl Sink for TemplateSink {
                         self.id,
                         batch.len()
                     );
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                    last_err = Some(err);
                 }
             }
         }
 
         // Record the circuit breaker outcome once per `consume()` call, not
-        // once per chunk — recording success partway through would reset
-        // the failure counter mid-consume and prevent the breaker from
-        // opening on a batch with sustained, mixed-success chunks.
-        match &first_error {
-            None => self.circuit_breaker.record_success(),
-            Some(e) if !matches!(e, Error::PermanentHttpError(_)) => {
-                self.circuit_breaker.record_failure().await;
-            }
-            Some(_) => {}
+        // once per chunk — recording success partway through would reset the
+        // failure counter mid-consume and prevent the breaker from opening on
+        // a batch with sustained, mixed-success chunks. A transient failure
+        // always trips it. A batch where every failure was permanent records
+        // neither success nor failure — nothing demonstrated the destination
+        // is reachable, but a schema/data problem isn't a connectivity signal
+        // either. A batch with at least one real write (or no messages at
+        // all) counts as success.
+        match &last_err {
+            Some(_) => self.circuit_breaker.record_failure().await,
+            None if written > 0 || messages.is_empty() => self.circuit_breaker.record_success(),
+            None => {}
         }
 
         let mut state = self.state.lock().await;
@@ -389,7 +441,7 @@ impl Sink for TemplateSink {
         self.records_written_total
             .fetch_add(written, Ordering::Relaxed);
 
-        match first_error {
+        match last_err {
             None => Ok(()),
             Some(err) => Err(err),
         }
@@ -428,7 +480,22 @@ mod tests {
             open_retry_max_delay: Some("100ms".to_string()),
             circuit_breaker_threshold: Some(3),
             circuit_breaker_cool_down: Some("50ms".to_string()),
+            verbose_logging: None,
         }
+    }
+
+    #[test]
+    fn given_verbose_logging_enabled_should_set_verbose_flag() {
+        let mut config = test_config();
+        config.verbose_logging = Some(true);
+        let sink = TemplateSink::new(1, config);
+        assert!(sink.verbose);
+    }
+
+    #[test]
+    fn given_verbose_logging_disabled_should_not_set_verbose_flag() {
+        let sink = TemplateSink::new(1, test_config());
+        assert!(!sink.verbose);
     }
 
     #[tokio::test]
@@ -486,19 +553,57 @@ mod tests {
         sink.circuit_breaker.record_failure().await;
         assert!(sink.circuit_breaker.is_open().await);
 
-        let topic_metadata = TopicMetadata {
-            stream: "s".to_string(),
-            topic: "t".to_string(),
-        };
-        let messages_metadata = MessagesMetadata {
-            partition_id: 1,
-            current_offset: 0,
-            schema: iggy_connector_sdk::Schema::Json,
-        };
+        let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
 
         let result = sink
             .consume(&topic_metadata, messages_metadata, Vec::new())
             .await;
         assert!(matches!(result, Err(Error::CannotStoreData(_))));
+    }
+
+    fn consumed_message() -> ConsumedMessage {
+        ConsumedMessage {
+            id: 1,
+            offset: 0,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload: iggy_connector_sdk::Payload::Raw(b"payload".to_vec()),
+        }
+    }
+
+    fn topic_and_messages_metadata() -> (TopicMetadata, MessagesMetadata) {
+        (
+            TopicMetadata {
+                stream: "s".to_string(),
+                topic: "t".to_string(),
+            },
+            MessagesMetadata {
+                partition_id: 1,
+                current_offset: 0,
+                schema: iggy_connector_sdk::Schema::Json,
+            },
+        )
+    }
+
+    // push_batch() is an unimplemented TODO(ConnectorDeveloper) stub that
+    // always returns Error::InitError — not a PermanentHttpError — so a
+    // non-empty consume() call exercises the "last_err" (retryable) branch
+    // of the chunking loop end to end, including the failed-count and
+    // circuit-breaker bookkeeping.
+    #[tokio::test]
+    async fn consume_with_unimplemented_push_batch_returns_err_and_counts_failure() {
+        let mut sink = TemplateSink::new(1, test_config());
+        sink.open().await.expect("open should succeed");
+        let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
+
+        let result = sink
+            .consume(&topic_metadata, messages_metadata, vec![consumed_message()])
+            .await;
+
+        assert!(matches!(result, Err(Error::InitError(_))));
+        assert_eq!(sink.state.lock().await.messages_failed, 1);
+        assert_eq!(sink.state.lock().await.messages_written, 0);
     }
 }

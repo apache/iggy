@@ -3,10 +3,64 @@
 Boilerplate for a new `core/connectors/sources/<name>_source/`. Adapt
 the `MySource` / `Client` / row types to the backend driver.
 
-`Cargo.toml` is identical to a sink's (see
-[connector-sink/TEMPLATE.md](../connector-sink/TEMPLATE.md)) - only
-the crate name suffix changes (`iggy_connector_<name>_source`) and the
-upstream client dep.
+Also read [SKILL.md](SKILL.md) and pre-flight with
+[connector-pr-review](../connector-pr-review/SKILL.md) before `/ready`.
+
+Prefer starting from a compiling crate over copying this prose kit:
+`core/connectors/sources/source_template/` implements the same shape as
+real, tested code you can `cargo build`/`cargo test` immediately, with the
+same `TODO(ConnectorDeveloper)` markers. Use this kit instead only when
+copying a whole crate is more scaffolding than you need.
+
+## Files to create
+
+```text
+core/connectors/sources/<name>_source/
+├── Cargo.toml
+├── README.md
+├── config.toml
+└── src/lib.rs
+```
+
+Add a workspace member, a row in `sources/README.md`, and a sample under
+`runtime/example_config/connectors/`.
+
+---
+
+## Cargo.toml
+
+Same shape as the sink kit (`cdylib` + `lib`, workspace deps, Apache
+header). Only the package name suffix changes:
+
+```toml
+name = "iggy_connector_<name>_source"
+# ... identical metadata / machete ignored / crate-type ...
+# TODO(ConnectorDeveloper): add your client crate as a workspace dependency
+```
+
+---
+
+## config.toml (example)
+
+```toml
+path = "../../target/release/libiggy_connector_<name>_source"
+
+[[sources]]
+key = "<name>"
+enabled = true
+
+[sources.<name>.plugin_config]
+connection_string = "scheme://user:pass@host:port/db"
+poll_interval = "5s"
+batch_size = 100
+max_retries = 3
+retry_delay = "500ms"
+verbose_logging = false
+```
+
+Defaults in this file must match `DEFAULT_*` consts in code.
+
+---
 
 ## src/lib.rs
 
