@@ -36,6 +36,7 @@ pub fn emit_sink_event(
     current_offset: u64,
     batch_size: usize,
     processed_count: usize,
+    runs: usize,
     decode_us: u64,
     prepare_us: u64,
     ffi_us: u64,
@@ -51,6 +52,7 @@ pub fn emit_sink_event(
         current_offset = current_offset,
         batch_size = batch_size,
         processed_count = processed_count,
+        runs = runs,
         decode_us = decode_us,
         prepare_us = prepare_us,
         ffi_us = ffi_us,
@@ -185,7 +187,7 @@ mod tests {
     fn given_sink_event_emitted_when_captured_should_contain_all_fields() {
         let events = capture(|| {
             emit_sink_event(
-                "postgres", "qw", "records", 0, 100, 50, 50, 120, 234, 1456, 1700,
+                "postgres", "qw", "records", 0, 100, 50, 50, 2, 120, 234, 1456, 1700,
             );
         });
         let event = events
@@ -198,6 +200,7 @@ mod tests {
         assert_eq!(event.fields.get("topic").unwrap(), "records");
         assert_eq!(event.fields.get("batch_size").unwrap(), "50");
         assert_eq!(event.fields.get("processed_count").unwrap(), "50");
+        assert_eq!(event.fields.get("runs").unwrap(), "2");
         assert_eq!(event.fields.get("decode_us").unwrap(), "120");
         assert_eq!(event.fields.get("prepare_us").unwrap(), "234");
         assert_eq!(event.fields.get("ffi_us").unwrap(), "1456");
