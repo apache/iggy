@@ -26,13 +26,14 @@ use kafka_protocol::messages::list_offsets_response::{
     ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
 };
 use kafka_protocol::messages::{ListOffsetsRequest, ListOffsetsResponse};
+use tokio::time::Instant;
 
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_LIST_OFFSETS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState, HandleOutcome,
+    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
 use crate::protocol::handlers::{
@@ -46,15 +47,19 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 6,
 };
 
-/// Cap on distinct topics one `ListOffsets` request may address through the bridge.
+/// Cap on distinct topics one `ListOffsets` request resolves through the bridge in one pass.
 ///
 /// `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096) is a pre-decode `DoS` ceiling, not a usability
 /// recommendation: each distinct topic here costs one `high_watermarks` round trip against the
-/// single lockstep `IggyClient` every Kafka connection on this gateway shares
-/// (`bridge/iggy_bridge/mod.rs`'s "Concurrency ceiling"), so a large batch head-of-line-blocks
-/// every other client's control plane for its duration. 100 keeps a worst-case batch's aggregate
+/// single lockstep `IggyClient` every Kafka connection on this gateway shares (`README.md`'s
+/// "Concurrency ceiling"). Each call takes its own turn on that shared client and releases it
+/// before the next, so a large batch does not hold other connections off for its whole duration -
+/// only for whichever single call is in flight at a time. 100 keeps a worst-case batch's aggregate
 /// bridge cost small relative to that shared resource while remaining generous for any real
-/// consumer's offset lookup.
+/// consumer's offset lookup. A request naming more than this many distinct topics gets the first
+/// 100 resolved and the rest answered [`ERROR_REQUEST_TIMED_OUT`] with no bridge call at all - a
+/// client that retries only its still-erroring topics (the common case) narrows below the cap on
+/// its own within a couple of retries, rather than resending the same oversized request forever.
 const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 
 /// Wall-clock ceiling for one request's aggregate bridge work.
@@ -66,6 +71,12 @@ const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 /// common trigger, while still bounding the sum across up to [`MAX_BRIDGE_BACKED_TOPICS`] calls -
 /// without this, a large batch against a struggling bridge could hold the shared client for
 /// `MAX_BRIDGE_BACKED_TOPICS * 15s`, not just one call's worth.
+///
+/// Applied per call, not once around the whole batch: [`resolve_all_topics`] checks it before
+/// starting each topic's `high_watermarks` call and wraps the call itself in
+/// [`tokio::time::timeout_at`] against the same instant, so a topic already resolved when the
+/// deadline arrives keeps its real answer and only the not-yet-started ones fall back to
+/// [`ERROR_REQUEST_TIMED_OUT`].
 const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// KIP-79 sentinel: the offset of the next message that would be produced.
@@ -99,7 +110,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 
     if !is_supported_version(API_KEY_LIST_OFFSETS, api_version) {
         return unsupported_version_response(API_KEY_LIST_OFFSETS, api_version, |version| {
-            encode_error_response(version, ERROR_INVALID_REQUEST)
+            encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
         });
     }
 
@@ -117,94 +128,172 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
-    let distinct_names: HashSet<&str> = req.topics.iter().map(|t| t.name.as_str()).collect();
-    if distinct_names.len() > MAX_BRIDGE_BACKED_TOPICS {
-        tracing::warn!(
-            distinct_topics = distinct_names.len(),
-            max = MAX_BRIDGE_BACKED_TOPICS,
-            "ListOffsets request addresses too many distinct topics; rejecting"
-        );
-        let topics = req
-            .topics
-            .iter()
-            .map(|topic| error_topic_response(topic, ERROR_INVALID_REQUEST))
-            .collect();
-        let resp = ListOffsetsResponse::default().with_topics(topics);
-        return respond_or_close(encode_message(&resp, api_version, 256), "ListOffsets");
-    }
-
-    let topics =
-        match tokio::time::timeout(REQUEST_DEADLINE, resolve_all_topics(bridge, &req.topics)).await
-        {
-            Ok(topics) => topics,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    distinct_topics = distinct_names.len(),
-                    deadline_secs = REQUEST_DEADLINE.as_secs(),
-                    "ListOffsets request's aggregate bridge work exceeded its deadline; \
-                 answering retriable instead of blocking further"
-                );
-                req.topics
-                    .iter()
-                    .map(|topic| error_topic_response(topic, ERROR_REQUEST_TIMED_OUT))
-                    .collect()
-            }
-        };
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let topics = resolve_all_topics(bridge, &req.topics, deadline).await;
     let resp = ListOffsetsResponse::default().with_topics(topics);
     respond_or_close(encode_message(&resp, api_version, 256), "ListOffsets")
 }
 
-/// Resolves every requested topic entry, deduping by name first so a topic named in more than
-/// one request entry (or a name repeated verbatim) costs one `high_watermarks` round trip, not
-/// one per entry - the earlier per-entry loop paid a separate round trip for each, even for the
-/// same name.
+/// One topic's bridge-lookup outcome, decided once per distinct name in [`resolve_all_topics`]
+/// and reused for every partition of that topic in [`resolve_one_partition`].
+enum TopicLookup {
+    /// A real `high_watermarks` call was made and returned.
+    Watermarks(HighWatermarksResult),
+    /// No partition of this topic asked for [`LATEST_TIMESTAMP`] or [`EARLIEST_TIMESTAMP`], so no
+    /// call was made at all - every partition here answers
+    /// [`ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT`] regardless of what a lookup would have returned.
+    NoLookupNeeded,
+    /// Beyond [`MAX_BRIDGE_BACKED_TOPICS`], or the deadline elapsed before this topic's turn - no
+    /// call was made. Answered [`ERROR_REQUEST_TIMED_OUT`] (retriable) rather than
+    /// [`ERROR_INVALID_REQUEST`] so a client's own per-topic retry narrows the batch on its own.
+    NotAttempted,
+}
+
+/// Dedupes `requested` by topic name, merging every entry's partitions and noting - per name -
+/// whether any partition asked for [`LATEST_TIMESTAMP`] or [`EARLIEST_TIMESTAMP`].
 ///
-/// `EARLIEST`/`LATEST` are the only timestamps this bridge resolves - Iggy exposes no
-/// per-message timestamp index, so "offset of the first message at or after timestamp T" for any
-/// other `T` cannot be answered without one. Those partitions get [`ERROR_UNKNOWN_SERVER_ERROR`],
-/// not a fabricated offset.
-async fn resolve_all_topics(
-    bridge: &IggyBridge,
+/// `order` preserves first-seen order so the topic cap in [`resolve_topic_lookups`] keeps a
+/// deterministic prefix of the request rather than an arbitrary hash-order subset.
+fn group_requested_topics(
     requested: &[ListOffsetsTopic],
-) -> Vec<ListOffsetsTopicResponse> {
+) -> (Vec<&str>, HashMap<&str, Vec<u32>>, HashSet<&str>) {
+    let mut order: Vec<&str> = Vec::new();
     let mut partitions_by_name: HashMap<&str, Vec<u32>> = HashMap::new();
+    let mut needs_lookup: HashSet<&str> = HashSet::new();
     for topic in requested {
-        let valid = topic
-            .partitions
-            .iter()
-            .filter_map(|p| u32::try_from(p.partition_index).ok());
-        partitions_by_name
-            .entry(topic.name.as_str())
-            .or_default()
-            .extend(valid);
+        let name = topic.name.as_str();
+        if !partitions_by_name.contains_key(name) {
+            order.push(name);
+        }
+        let entry = partitions_by_name.entry(name).or_default();
+        for p in &topic.partitions {
+            if let Ok(index) = u32::try_from(p.partition_index) {
+                entry.push(index);
+            }
+            if matches!(p.timestamp, LATEST_TIMESTAMP | EARLIEST_TIMESTAMP) {
+                needs_lookup.insert(name);
+            }
+        }
     }
     for partitions in partitions_by_name.values_mut() {
         partitions.sort_unstable();
         partitions.dedup();
     }
+    (order, partitions_by_name, needs_lookup)
+}
 
-    let mut watermarks_by_name: HashMap<&str, HighWatermarksResult> = HashMap::new();
-    for (&name, partitions) in &partitions_by_name {
-        let result = if partitions.is_empty() {
-            Ok(Vec::new())
-        } else {
-            bridge.high_watermarks(name, partitions).await
-        };
-        watermarks_by_name.insert(name, result);
+/// Resolves one [`TopicLookup`] per name in `order`: [`TopicLookup::NotAttempted`] beyond
+/// [`MAX_BRIDGE_BACKED_TOPICS`] or once `deadline` has passed, [`TopicLookup::NoLookupNeeded`]
+/// when `needs_lookup` excludes the name, otherwise a real `high_watermarks` call wrapped in
+/// [`tokio::time::timeout_at`] against `deadline` so a topic already resolved when time runs out
+/// keeps its real answer.
+async fn resolve_topic_lookups<'a>(
+    bridge: &IggyBridge,
+    order: &[&'a str],
+    partitions_by_name: &HashMap<&'a str, Vec<u32>>,
+    needs_lookup: &HashSet<&'a str>,
+    deadline: Instant,
+) -> HashMap<&'a str, TopicLookup> {
+    let accepted: HashSet<&str> = order
+        .iter()
+        .take(MAX_BRIDGE_BACKED_TOPICS)
+        .copied()
+        .collect();
+    if order.len() > MAX_BRIDGE_BACKED_TOPICS {
+        // debug!, not warn!: the client controls how many topics it batches into one request and
+        // the connection stays open, so a consumer stuck above the cap logs this every retry.
+        tracing::debug!(
+            distinct_topics = order.len(),
+            max = MAX_BRIDGE_BACKED_TOPICS,
+            "ListOffsets request exceeds the per-request topic cap; resolving the first {} and \
+             answering the rest retriable",
+            MAX_BRIDGE_BACKED_TOPICS
+        );
     }
+
+    let mut lookups: HashMap<&str, TopicLookup> = HashMap::new();
+    let mut deadline_exceeded = false;
+    for &name in order {
+        if !accepted.contains(name) {
+            lookups.insert(name, TopicLookup::NotAttempted);
+            continue;
+        }
+        if !needs_lookup.contains(name) {
+            lookups.insert(name, TopicLookup::NoLookupNeeded);
+            continue;
+        }
+        if deadline_exceeded || Instant::now() >= deadline {
+            if !deadline_exceeded {
+                deadline_exceeded = true;
+                tracing::warn!(
+                    deadline_secs = REQUEST_DEADLINE.as_secs(),
+                    "ListOffsets request's aggregate bridge work exceeded its deadline; \
+                     answering remaining topics retriable instead of starting new bridge calls"
+                );
+            }
+            lookups.insert(name, TopicLookup::NotAttempted);
+            continue;
+        }
+
+        let partitions = partitions_by_name[name].as_slice();
+        let result =
+            match tokio::time::timeout_at(deadline, bridge.high_watermarks(name, partitions)).await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    deadline_exceeded = true;
+                    tracing::warn!(
+                        topic = name,
+                        deadline_secs = REQUEST_DEADLINE.as_secs(),
+                        "ListOffsets bridge call for this topic exceeded the request's aggregate \
+                     deadline; answering retriable instead of blocking further"
+                    );
+                    lookups.insert(name, TopicLookup::NotAttempted);
+                    continue;
+                }
+            };
+
+        if let Err(call_err) = &result {
+            let kafka_code = call_err.to_kafka_error_code();
+            if kafka_code == ERROR_UNKNOWN_TOPIC_OR_PARTITION {
+                // Client-caused (topic doesn't exist / isn't mapped): expected traffic, not
+                // operator-actionable.
+                tracing::debug!(topic = name, %call_err, "ListOffsets bridge lookup: topic not found");
+            } else {
+                tracing::error!(topic = name, %call_err, "ListOffsets bridge lookup failed");
+            }
+        }
+        lookups.insert(name, TopicLookup::Watermarks(result));
+    }
+    lookups
+}
+
+/// Resolves every requested topic entry via [`group_requested_topics`] +
+/// [`resolve_topic_lookups`], then stamps each requested partition with its topic's
+/// [`TopicLookup`] outcome. `EARLIEST`/`LATEST` are the only timestamps this bridge resolves -
+/// Iggy exposes no per-message timestamp index - so every other requested timestamp gets
+/// [`ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT`] rather than a fabricated offset.
+async fn resolve_all_topics(
+    bridge: &IggyBridge,
+    requested: &[ListOffsetsTopic],
+    deadline: Instant,
+) -> Vec<ListOffsetsTopicResponse> {
+    let (order, partitions_by_name, needs_lookup) = group_requested_topics(requested);
+    let lookups =
+        resolve_topic_lookups(bridge, &order, &partitions_by_name, &needs_lookup, deadline).await;
 
     requested
         .iter()
         .map(|topic| {
-            // Always present: partitions_by_name (and so watermarks_by_name) was built from
-            // exactly these same requested topic names, just above.
-            let watermarks = watermarks_by_name
+            // Always present: `order` (and so `lookups`) was built from exactly these same
+            // requested topic names, just above.
+            let lookup = lookups
                 .get(topic.name.as_str())
                 .expect("every requested topic name was resolved above");
             let partitions = topic
                 .partitions
                 .iter()
-                .map(|requested| resolve_one_partition(requested, watermarks))
+                .map(|requested| resolve_one_partition(requested, lookup))
                 .collect();
             ListOffsetsTopicResponse::default()
                 .with_name(topic.name.clone())
@@ -213,44 +302,43 @@ async fn resolve_all_topics(
         .collect()
 }
 
-/// One response entry for `topic`, every requested partition carrying `error_code` - used for a
-/// whole-request failure (over the topic cap, or the aggregate deadline) where no bridge call
-/// was made for this topic at all.
-fn error_topic_response(topic: &ListOffsetsTopic, error_code: i16) -> ListOffsetsTopicResponse {
-    let partitions = topic
-        .partitions
-        .iter()
-        .map(|p| error_response(p.partition_index, error_code))
-        .collect();
-    ListOffsetsTopicResponse::default()
-        .with_name(topic.name.clone())
-        .with_partitions(partitions)
-}
-
-/// `watermarks` is the whole topic's batched result: `Err` is a call-level failure (e.g. the
-/// mapped stream doesn't exist) applying to every partition alike; the inner per-partition
-/// `Result` inside `Ok` is [`BridgeError::PartitionOutOfRange`] for one bad index among otherwise
-/// resolvable ones.
+/// `lookup` is the whole topic's resolution outcome: an errored [`TopicLookup::Watermarks`] is a
+/// call-level failure (e.g. the mapped stream doesn't exist) applying to every partition alike;
+/// the inner per-partition `Result` inside its `Ok` is [`BridgeError::PartitionOutOfRange`] for one
+/// bad index among otherwise resolvable ones.
 fn resolve_one_partition(
     requested: &ListOffsetsPartition,
-    watermarks: &HighWatermarksResult,
+    lookup: &TopicLookup,
 ) -> ListOffsetsPartitionResponse {
     let Ok(partition_index) = u32::try_from(requested.partition_index) else {
         return error_response(requested.partition_index, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     };
 
-    let results = match watermarks {
-        Err(call_err) => {
+    let results = match lookup {
+        TopicLookup::NotAttempted => {
+            return error_response(requested.partition_index, ERROR_REQUEST_TIMED_OUT);
+        }
+        // By construction (`needs_lookup` in `resolve_all_topics`) every partition of a topic in
+        // this state has a non-sentinel timestamp, so there is nothing to branch on here.
+        TopicLookup::NoLookupNeeded => {
+            return error_response(
+                requested.partition_index,
+                ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT,
+            );
+        }
+        TopicLookup::Watermarks(Err(call_err)) => {
             return error_response(requested.partition_index, call_err.to_kafka_error_code());
         }
-        Ok(results) => results,
+        TopicLookup::Watermarks(Ok(results)) => results,
     };
 
-    // Always present: `valid_partitions` (built from the same `topic.partitions`) is exactly
-    // what was passed to `high_watermarks`, which returns one result per requested partition.
-    let Some((_, watermark)) = results.iter().find(|(index, _)| *index == partition_index) else {
+    // `results` preserves the order of the sorted, deduped partition list `resolve_all_topics`
+    // passed to `high_watermarks` (`IggyBridge::high_watermarks` maps over its input in place),
+    // so a binary search is correct here, not just faster than the linear scan this replaced.
+    let Ok(found) = results.binary_search_by_key(&partition_index, |(index, _)| *index) else {
         return error_response(requested.partition_index, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     };
+    let (_, watermark) = &results[found];
 
     let watermark = match watermark {
         Err(err) => return error_response(requested.partition_index, err.to_kafka_error_code()),
@@ -266,7 +354,12 @@ fn resolve_one_partition(
         // only because Fetch (`#3536`) is still a stub - nothing yet reads at the offset this
         // returns. Not fixable client-side; needs the bridge to expose a real start offset.
         EARLIEST_TIMESTAMP => offset_response(requested.partition_index, 0),
-        _ => error_response(requested.partition_index, ERROR_UNKNOWN_SERVER_ERROR),
+        // Non-retriable, unlike ERROR_UNKNOWN_SERVER_ERROR: a Java client resolves this
+        // immediately instead of retrying the request until its own default.api.timeout.ms.
+        _ => error_response(
+            requested.partition_index,
+            ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT,
+        ),
     }
 }
 
@@ -360,71 +453,80 @@ mod tests {
 
     #[test]
     fn latest_resolves_to_the_watermark() {
-        let watermarks: HighWatermarksResult = Ok(ok_watermarks(&[(0, 42)]));
-        let resp = resolve_one_partition(&partition(0, LATEST_TIMESTAMP), &watermarks);
+        let lookup = TopicLookup::Watermarks(Ok(ok_watermarks(&[(0, 42)])));
+        let resp = resolve_one_partition(&partition(0, LATEST_TIMESTAMP), &lookup);
         assert_eq!(resp.error_code, ERROR_NONE);
         assert_eq!(resp.offset, 42);
     }
 
     #[test]
     fn earliest_resolves_to_zero_regardless_of_the_watermark() {
-        let watermarks: HighWatermarksResult = Ok(ok_watermarks(&[(0, 42)]));
-        let resp = resolve_one_partition(&partition(0, EARLIEST_TIMESTAMP), &watermarks);
+        let lookup = TopicLookup::Watermarks(Ok(ok_watermarks(&[(0, 42)])));
+        let resp = resolve_one_partition(&partition(0, EARLIEST_TIMESTAMP), &lookup);
         assert_eq!(resp.error_code, ERROR_NONE);
         assert_eq!(resp.offset, 0);
     }
 
     #[test]
     fn an_arbitrary_timestamp_is_unsupported() {
-        let watermarks: HighWatermarksResult = Ok(ok_watermarks(&[(0, 42)]));
-        let resp = resolve_one_partition(&partition(0, 1_700_000_000_000), &watermarks);
-        assert_eq!(resp.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        let lookup = TopicLookup::Watermarks(Ok(ok_watermarks(&[(0, 42)])));
+        let resp = resolve_one_partition(&partition(0, 1_700_000_000_000), &lookup);
+        assert_eq!(resp.error_code, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT);
+        assert_eq!(resp.offset, NO_OFFSET);
+    }
+
+    #[test]
+    fn a_topic_with_no_partition_needing_a_lookup_skips_the_bridge_call() {
+        let resp = resolve_one_partition(
+            &partition(0, 1_700_000_000_000),
+            &TopicLookup::NoLookupNeeded,
+        );
+        assert_eq!(resp.error_code, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT);
+        assert_eq!(resp.offset, NO_OFFSET);
+    }
+
+    #[test]
+    fn a_topic_beyond_the_cap_or_past_the_deadline_answers_retriable() {
+        let resp =
+            resolve_one_partition(&partition(0, LATEST_TIMESTAMP), &TopicLookup::NotAttempted);
+        assert_eq!(resp.error_code, ERROR_REQUEST_TIMED_OUT);
         assert_eq!(resp.offset, NO_OFFSET);
     }
 
     #[test]
     fn a_negative_partition_index_is_rejected_without_consulting_the_bridge_result() {
-        let watermarks: HighWatermarksResult = Ok(vec![]);
-        let resp = resolve_one_partition(&partition(-1, LATEST_TIMESTAMP), &watermarks);
+        let lookup = TopicLookup::Watermarks(Ok(vec![]));
+        let resp = resolve_one_partition(&partition(-1, LATEST_TIMESTAMP), &lookup);
         assert_eq!(resp.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 
     #[test]
     fn a_partition_specific_error_only_affects_that_partition() {
-        let watermarks: HighWatermarksResult = Ok(vec![(
+        let lookup = TopicLookup::Watermarks(Ok(vec![(
             0,
             Err(BridgeError::PartitionOutOfRange {
                 topic: "orders".to_string(),
                 partition: 0,
                 partitions_count: 0,
             }),
-        )]);
-        let resp = resolve_one_partition(&partition(0, LATEST_TIMESTAMP), &watermarks);
+        )]));
+        let resp = resolve_one_partition(&partition(0, LATEST_TIMESTAMP), &lookup);
         assert_eq!(resp.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 
     #[test]
     fn a_call_level_error_applies_regardless_of_the_requested_timestamp() {
-        let watermarks: HighWatermarksResult = Err(BridgeError::Timeout);
-        let resp = resolve_one_partition(&partition(0, EARLIEST_TIMESTAMP), &watermarks);
+        let lookup = TopicLookup::Watermarks(Err(BridgeError::Timeout));
+        let resp = resolve_one_partition(&partition(0, EARLIEST_TIMESTAMP), &lookup);
         assert_eq!(resp.error_code, BridgeError::Timeout.to_kafka_error_code());
     }
 
     #[test]
-    fn error_topic_response_stamps_every_requested_partition_with_the_same_code() {
-        let topic = ListOffsetsTopic::default()
-            .with_name(kafka_protocol::messages::TopicName(
-                kafka_protocol::protocol::StrBytes::from_static_str("orders"),
-            ))
-            .with_partitions(vec![
-                partition(0, LATEST_TIMESTAMP),
-                partition(1, LATEST_TIMESTAMP),
-            ]);
-        let resp = error_topic_response(&topic, ERROR_INVALID_REQUEST);
-        assert_eq!(resp.partitions.len(), 2);
-        for p in &resp.partitions {
-            assert_eq!(p.error_code, ERROR_INVALID_REQUEST);
-            assert_eq!(p.offset, NO_OFFSET);
-        }
+    fn a_partition_index_absent_from_a_sorted_result_is_rejected() {
+        // Exercises the binary search on a multi-entry, sorted-by-index result - a single-entry
+        // vec would pass a linear scan and a broken binary search alike.
+        let lookup = TopicLookup::Watermarks(Ok(ok_watermarks(&[(0, 10), (2, 30), (5, 60)])));
+        let resp = resolve_one_partition(&partition(3, LATEST_TIMESTAMP), &lookup);
+        assert_eq!(resp.error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 }

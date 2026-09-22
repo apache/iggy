@@ -29,8 +29,8 @@ use serial_test::serial;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    BrokerAdvertise, ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::list_offsets;
 
@@ -270,7 +270,7 @@ async fn an_arbitrary_timestamp_is_unsupported() {
         .expect("seed the topic");
 
     let (error_code, _) = send(&state, "orders", 0, 1_700_000_000_000).await;
-    assert_eq!(error_code, ERROR_UNKNOWN_SERVER_ERROR);
+    assert_eq!(error_code, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT);
 }
 
 /// Regression test: a topic named in two separate request entries must still resolve every
@@ -312,9 +312,16 @@ async fn a_topic_named_in_two_request_entries_resolves_both_entries_correctly() 
 async fn more_than_the_topic_cap_is_rejected() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
-    let (state, _seed) = connected_state(&server).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("seed the one real, resolvable topic");
 
-    let names: Vec<String> = (0..101).map(|i| format!("topic-{i}")).collect();
+    // 100 nonexistent names fill the cap; the one real, resolvable topic goes last so a correct
+    // cap leaves it untouched by this round entirely - proving the cap bounds *which* topics get
+    // a bridge call, not just that a request over the cap fails uniformly.
+    let mut names: Vec<String> = (0..100).map(|i| format!("topic-{i}")).collect();
+    names.push("orders".to_string());
     let partitions = [(0, LATEST_TIMESTAMP)];
     let topics: Vec<TopicRequest> = names
         .iter()
@@ -326,7 +333,14 @@ async fn more_than_the_topic_cap_is_rejected() {
 
     let results = send_multi(&state, &topics).await;
     assert_eq!(results.len(), 101);
-    for (_, _, error_code, _) in &results {
-        assert_eq!(*error_code, ERROR_INVALID_REQUEST);
+    for (name, _, error_code, _) in &results {
+        if name == "orders" {
+            assert_eq!(
+                *error_code, ERROR_REQUEST_TIMED_OUT,
+                "the 101st topic must be left unattempted by the cap, not looked up"
+            );
+        } else {
+            assert_eq!(*error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        }
     }
 }
