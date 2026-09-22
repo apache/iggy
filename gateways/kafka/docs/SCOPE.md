@@ -113,6 +113,28 @@ below it are still open for the issues that build on top of it.
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
   - Kafka consumer groups do **not** map onto Iggy consumer groups. Assignment stays client-side, and Iggy's group registry is used as an offset key only ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md))
   - `Partitioning::partition_id(index)` on every Produce. A Kafka producer resolves the partition before it builds the request, so `Partitioning::balanced()` has no trigger there. The `-1` default-partition-count case belongs to CreateTopics
+- [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::high_watermarks` and
+      `EARLIEST` answers `0`. Any other requested timestamp (arbitrary-timestamp offset search) is
+      unsupported - Iggy exposes no per-message timestamp index - and answers
+      `UNKNOWN_SERVER_ERROR` (-1) per partition rather than a fabricated offset.
+      `src/protocol/handlers/list_offsets.rs`, `tests/list_offsets_real_bridge_tests.rs`. With the
+      bridge off, the stub from #3421 answers `NOT_LEADER_OR_FOLLOWER` (6) as before.
+  - `EARLIEST = 0` is real *only* for a partition this bridge has never had retention trim: Iggy
+    tracks no rolling low-watermark distinct from partition creation, so once a partition is
+    old enough for retention to purge its first segment, `0` names a log-start offset that no
+    longer exists - a real consumer with `auto.offset.reset=earliest` seeks into a hole. Not
+    fixable client-side; needs the bridge to expose a real start offset. Harmless *today* only
+    because Fetch (`#3536`) is still a stub - nothing yet reads at the offset this returns.
+  - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
+    still a pre-decode ceiling, not a usability one): topic entries sharing a name are deduped to
+    one `high_watermarks` call before any bridge work starts (a name repeated across request
+    entries no longer costs one round trip per entry), a request naming more than 100 distinct
+    topics is rejected outright (`INVALID_REQUEST`, no bridge call at all), and the whole
+    request's aggregate bridge work runs under one 20s wall-clock deadline (`ListOffsets` carries
+    no `timeout_ms` field in any version this gateway supports, so this is a fixed ceiling, not a
+    client-honored one) - a deadline that fires answers every topic `REQUEST_TIMED_OUT` rather
+    than continuing to hold the shared lockstep `IggyClient`.
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
 ### `kafka-protocol` crate adoption — superseded, done differently
