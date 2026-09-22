@@ -2701,6 +2701,8 @@ where
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
         if self.persistence.is_some() {
+            // [`IggyPartition::barrier_install_files_locked`] covers original
+            // writers even when no [`crate::PartitionPersistence`] checkpoint can advance.
             if let Err(source) = self.barrier_install_files_locked().await {
                 self.fence_install_failure(commit_op);
                 return Err(PartitionInstallError::SwapIo {

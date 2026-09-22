@@ -67,6 +67,8 @@ pub async fn begin(directory: &Path) -> io::Result<()> {
     begin_with_storage(directory, &DiskStorage).await
 }
 
+/// Storage-generic form of [`begin`] used by deterministic storage tests.
+///
 /// # Errors
 /// Returns an error when the install transaction cannot complete durably.
 pub async fn begin_with_storage<S: DurableStorage>(
@@ -76,6 +78,12 @@ pub async fn begin_with_storage<S: DurableStorage>(
     begin_with_synced_files(directory, BTreeSet::new(), storage).await
 }
 
+/// Simulator form of [`begin_with_storage`] that retains original writers in
+/// [`CheckpointBarrier`] values until their durability barriers complete.
+///
+/// # Errors
+/// Returns an error when an original-writer barrier fails or the install
+/// transaction cannot complete durably.
 #[cfg(feature = "simulator")]
 pub async fn begin_with_storage_and_barriers<S: DurableStorage>(
     directory: &Path,
@@ -220,6 +228,8 @@ mod tests {
         ] {
             std::fs::write(root.join(name), name.as_bytes()).unwrap();
         }
+        // These std writes are closed before [`begin`], so no original writer
+        // remains to synchronize.
         begin(root).await.unwrap();
         // Model the install's unlink and atomic replacement operations.
         for name in ["0.log", "offsets/1", "prepares-1/frontier"] {
@@ -247,6 +257,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::write(root.join("0.log"), b"old").unwrap();
+        // The fixture has no live writer outside [`begin`].
         begin(root).await.unwrap();
         std::fs::remove_file(root.join("0.log")).unwrap();
         std::fs::write(root.join("0.log"), b"new").unwrap();

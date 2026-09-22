@@ -1046,6 +1046,9 @@ where
                 });
                 return;
             }
+            // [`IggyIndexWriter::fsync`] used the original descriptor above.
+            // The marker tells [`PartitionPersistence::checkpoint_files`] not
+            // to replace that proof with a fresh-handle sync.
             barriers.push(CheckpointBarrier::already_synced(writer.path()));
         }
         let (files, directories) = self.persistence_checkpoint_files(config);
@@ -1053,6 +1056,11 @@ where
         self.start_persistence();
     }
 
+    /// Synchronize every live original writer while the caller holds
+    /// [`IggyPartition::write_lock`].
+    ///
+    /// Unlike [`IggyPartition::checkpoint_persistence`], this barrier runs even
+    /// when the checkpoint frontier cannot advance.
     pub(crate) async fn barrier_install_files_locked(&self) -> std::io::Result<()> {
         let Some(persistence) = &self.persistence else {
             return Ok(());

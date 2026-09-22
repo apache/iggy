@@ -137,7 +137,11 @@ pub struct CheckpointBarrier {
 }
 
 impl CheckpointBarrier {
-    /// Retain a simulator file's original writer until checkpoint synchronizes it.
+    /// Retains a simulator file's original writer until
+    /// [`PartitionPersistence::checkpoint_files`] or an install barrier runs.
+    ///
+    /// Production writers are synchronized by their owning modules and use an
+    /// internal already-synchronized [`CheckpointBarrier`] for the covered path.
     #[cfg(feature = "simulator")]
     pub fn from_file<F: DurableFile + 'static>(path: impl Into<PathBuf>, file: F) -> Self {
         Self::from_future(path, async move { file.sync().await })
@@ -480,6 +484,8 @@ enum Mutation<S: DurableStorage> {
     },
 }
 
+/// Original-writer synchronization shared by [`Mutation::Checkpoint`] and
+/// [`Mutation::Barrier`].
 struct SyncBarrier<S: DurableStorage> {
     barriers: Vec<CheckpointBarrier>,
     offset_files: Vec<RetainedOffsetFile<S::File>>,
@@ -890,6 +896,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn checkpoint(&self, through_op: u64) {
+        // This shorthand has no materialized paths, so
+        // [`CheckpointBarrier`] has no original writer to retain.
         self.checkpoint_files(through_op, Vec::new(), Vec::new(), Vec::new());
     }
 
@@ -915,6 +923,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         });
     }
 
+    /// Queue a durability barrier through every retained original writer
+    /// without advancing [`PartitionPersistence::checkpoint_op`].
     pub(crate) fn barrier_files(&self, barriers: Vec<CheckpointBarrier>) {
         let sync = self.sync_barrier(barriers);
         self.queue.borrow_mut().push_back(Mutation::Barrier {
