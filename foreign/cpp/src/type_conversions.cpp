@@ -42,6 +42,10 @@ ffi::Identifier Identifier::ToFfi() const {
     return identifier;
 }
 
+ConsumerOffsetInfo ConsumerOffsetInfo::FromFfi(ffi::ConsumerOffsetInfo offset) {
+    return ConsumerOffsetInfo(offset.partition_id, offset.current_offset, offset.stored_offset);
+}
+
 HeaderField HeaderField::FromFfi(ffi::HeaderField field) {
     return HeaderField(static_cast<HeaderKind>(field.kind),
                        std::vector<std::uint8_t>(field.value.begin(), field.value.end()));
@@ -49,6 +53,47 @@ HeaderField HeaderField::FromFfi(ffi::HeaderField field) {
 
 HeaderEntry HeaderEntry::FromFfi(ffi::HeaderEntry entry) {
     return HeaderEntry(HeaderField::FromFfi(std::move(entry.key)), HeaderField::FromFfi(std::move(entry.value)));
+}
+
+ffi::IggyMessageToSend IggyMessageToSend::ToFfi() const {
+    ffi::IggyMessageToSend ffi_message;
+    ffi_message.id_lo = absl::Uint128Low64(id_);
+    ffi_message.id_hi = absl::Uint128High64(id_);
+    ffi_message.payload.reserve(payload_.size());
+    for (const auto byte : payload_) {
+        ffi_message.payload.push_back(byte);
+    }
+    ffi_message.user_headers.reserve(user_headers_.size());
+    for (const auto &entry : user_headers_) {
+        const auto &key   = entry.Key();
+        const auto &value = entry.Value();
+        ffi::HeaderEntry ffi_entry;
+        ffi_entry.key.kind = static_cast<std::uint8_t>(key.Kind());
+        ffi_entry.key.value.reserve(key.Value().size());
+        for (const auto byte : key.Value()) {
+            ffi_entry.key.value.push_back(byte);
+        }
+        ffi_entry.value.kind = static_cast<std::uint8_t>(value.Kind());
+        ffi_entry.value.value.reserve(value.Value().size());
+        for (const auto byte : value.Value()) {
+            ffi_entry.value.value.push_back(byte);
+        }
+        ffi_message.user_headers.push_back(std::move(ffi_entry));
+    }
+    return ffi_message;
+}
+
+IggyMessagePolled IggyMessagePolled::FromFfi(ffi::IggyMessagePolled message) {
+    std::vector<HeaderEntry> user_headers;
+    user_headers.reserve(message.user_headers.size());
+    for (auto &entry : message.user_headers) {
+        user_headers.push_back(HeaderEntry::FromFfi(std::move(entry)));
+    }
+
+    return IggyMessagePolled(
+        message.checksum, absl::MakeUint128(message.id_hi, message.id_lo), message.offset, message.timestamp,
+        message.origin_timestamp, message.user_headers_length, message.payload_length, message.reserved,
+        std::vector<std::uint8_t>(message.payload.begin(), message.payload.end()), std::move(user_headers));
 }
 
 ResourceOptions ResourceOptions::FromFfi(rust::Vec<ffi::HeaderEntry> explicit_entries,
@@ -87,7 +132,7 @@ TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {
     std::vector<Partition> partitions;
     partitions.reserve(topic.partitions.size());
     for (auto &partition : topic.partitions) {
-        partitions.push_back(Partition::FromFfi(std::move(partition)));
+        partitions.push_back(Partition::FromFfi(partition));
     }
 
     return TopicDetails(topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()),
@@ -113,6 +158,27 @@ Stream Stream::FromFfi(ffi::Stream stream) {
     return Stream(stream.id, stream.created_at, std::string(stream.name.c_str(), stream.name.size()), stream.size_bytes,
                   stream.messages_count, stream.topics_count,
                   ResourceOptions::FromFfi(std::move(stream.options), rust::Vec<ffi::HeaderEntry>{}));
+}
+
+ConsumerGroupMember ConsumerGroupMember::FromFfi(ffi::ConsumerGroupMember member) {
+    return ConsumerGroupMember(member.id, member.partitions_count,
+                               std::vector<std::uint32_t>(member.partitions.begin(), member.partitions.end()));
+}
+
+ConsumerGroup ConsumerGroup::FromFfi(ffi::ConsumerGroup group) {
+    return ConsumerGroup(group.id, std::string(group.name.c_str(), group.name.size()), group.partitions_count,
+                         group.members_count);
+}
+
+ConsumerGroupDetails ConsumerGroupDetails::FromFfi(ffi::ConsumerGroupDetails group) {
+    std::vector<ConsumerGroupMember> members;
+    members.reserve(group.members.size());
+    for (auto &member : group.members) {
+        members.push_back(ConsumerGroupMember::FromFfi(std::move(member)));
+    }
+
+    return ConsumerGroupDetails(group.id, std::string(group.name.c_str(), group.name.size()), group.partitions_count,
+                                group.members_count, std::move(members));
 }
 
 }  // namespace iggy
