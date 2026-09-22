@@ -26,17 +26,18 @@
 //! ways: it reads the first eight bytes and stops, and a file it wrote itself decodes
 //! here as unchecksummed.
 
-use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
-use partitions::offset_storage::{OffsetRecord, decode_offset_record, offset_replacement_id};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use tokio::sync::{Semaphore, mpsc};
+
+use futures::StreamExt;
+use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
+#[cfg(test)]
+use journal::durable_storage::DiskStorage;
+use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
+use partitions::offset_storage::{OffsetRecord, decode_offset_record, offset_replacement_id};
 use tracing::{error, trace, warn};
 
 const COMPONENT: &str = "STREAMING_PARTITIONS";
-const OFFSET_DIRECTORY_BUFFER: usize = 64;
-static OFFSET_DIRECTORY_READERS: Semaphore = Semaphore::const_new(4);
-type OffsetDirectoryEntries = mpsc::Receiver<std::io::Result<Option<PathBuf>>>;
 
 pub struct RecoveredOffsets<T> {
     pub entries: Vec<T>,
@@ -58,40 +59,75 @@ impl<T> Default for RecoveredOffsets<T> {
     }
 }
 
+#[cfg(test)]
 pub async fn load_consumer_offsets(
     path: &str,
 ) -> Result<RecoveredOffsets<ConsumerOffset>, IggyError> {
-    let mut recovered = load_offsets(path, ConsumerKind::Consumer, |offset| offset).await?;
+    load_consumer_offsets_with_storage(&DiskStorage, path).await
+}
+
+/// Recover consumer records, ordered by consumer ID, from a storage backend.
+/// Invalid records are removed when possible. Unreadable records or removals
+/// that cannot be made durable retain their IDs in `stranded_ids`.
+///
+/// # Errors
+/// Returns [`IggyError::CannotReadConsumerOffsets`] if the directory cannot be
+/// enumerated, including when it is missing.
+pub async fn load_consumer_offsets_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+) -> Result<RecoveredOffsets<ConsumerOffset>, IggyError> {
+    let mut recovered =
+        load_offsets(storage, path, ConsumerKind::Consumer, |offset| offset).await?;
     recovered.entries.sort_by_key(|offset| offset.consumer_id);
     Ok(recovered)
 }
 
+#[cfg(test)]
 pub async fn load_consumer_group_offsets(
     path: &str,
 ) -> Result<RecoveredOffsets<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
-    load_offsets(path, ConsumerKind::ConsumerGroup, |offset| {
+    load_consumer_group_offsets_with_storage(&DiskStorage, path).await
+}
+
+/// Recover group records with the same cleanup and stranded file handling as
+/// [`load_consumer_offsets_with_storage`].
+///
+/// # Errors
+/// Returns [`IggyError::CannotReadConsumerOffsets`] if the directory cannot be
+/// enumerated, including when it is missing.
+pub async fn load_consumer_group_offsets_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+) -> Result<RecoveredOffsets<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
+    load_offsets(storage, path, ConsumerKind::ConsumerGroup, |offset| {
         (ConsumerGroupId(offset.consumer_id as usize), offset)
     })
     .await
 }
 
-async fn load_offsets<T>(
+async fn load_offsets<S: DurableStorage, T>(
+    storage: &S,
     path: &str,
     kind: ConsumerKind,
     construct: impl Fn(ConsumerOffset) -> T,
 ) -> Result<RecoveredOffsets<T>, IggyError> {
     trace!(?kind, path, "loading consumer offsets");
-    let mut dir_entries = offset_directory_entries(path).await?;
+    let mut dir_entries = storage
+        .regular_files(Path::new(path))
+        .await
+        .map_err(|error| {
+            warn!(?kind, path, %error, "failed to enumerate offset directory");
+            IggyError::CannotReadConsumerOffsets(path.to_owned())
+        })?;
     let mut recovered = RecoveredOffsets::default();
-    loop {
-        let entry_path = match dir_entries.recv().await {
-            Some(Ok(Some(path))) => path,
-            Some(Ok(None)) => break,
-            Some(Err(error)) => {
+    while let Some(entry) = dir_entries.next().await {
+        let entry_path = match entry {
+            Ok(path) => path,
+            Err(error) => {
                 warn!(?kind, path, %error, "failed to enumerate offset directory");
                 return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
             }
-            None => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
         };
         let name = entry_path
             .file_name()
@@ -99,7 +135,7 @@ async fn load_offsets<T>(
             .to_string_lossy()
             .into_owned();
         if offset_replacement_id(&name).is_some() {
-            remove_stale_replacement(&entry_path, &name).await;
+            remove_stale_replacement(storage, &entry_path, &name).await;
             continue;
         }
         let Ok(consumer_id) = name.parse::<u32>() else {
@@ -113,7 +149,7 @@ async fn load_offsets<T>(
             error!(?kind, name, "invalid consumer offset path");
             continue;
         };
-        let offset = match read_offset_file(&path, offset_kind_label(kind)).await {
+        let offset = match read_offset_file(storage, &path, offset_kind_label(kind)).await {
             OffsetFileLoad::Loaded(offset) => offset,
             OffsetFileLoad::Removed => continue,
             OffsetFileLoad::Stranded => {
@@ -131,62 +167,11 @@ async fn load_offsets<T>(
     Ok(recovered)
 }
 
-async fn offset_directory_entries(path: &str) -> Result<OffsetDirectoryEntries, IggyError> {
-    // Compio has no asynchronous directory iterator and the shard's blocking
-    // pool is disabled. Bound both OS threads and buffered paths. The worker
-    // owns the permit so cancellation cannot exceed the concurrency bound.
-    let permit = OFFSET_DIRECTORY_READERS
-        .acquire()
-        .await
-        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
-    let (sender, receiver) = mpsc::channel(OFFSET_DIRECTORY_BUFFER);
-    let directory = path.to_owned();
-    std::thread::Builder::new()
-        .name("iggy-offset-recovery".to_owned())
-        .spawn(move || {
-            let _permit = permit;
-            let result = (|| {
-                // Only the directory read itself is fatal. One unreadable
-                // entry is skipped with a warning, as the on-reactor loader
-                // did, so a single bad dirent cannot keep a partition from
-                // booting.
-                for entry in std::fs::read_dir(&directory)? {
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            warn!(path = directory, %error, "failed to read offset directory entry");
-                            continue;
-                        }
-                    };
-                    let is_file = match entry.file_type() {
-                        Ok(file_type) => file_type.is_file(),
-                        Err(error) => {
-                            warn!(path = directory, %error, "failed to read offset entry type");
-                            continue;
-                        }
-                    };
-                    if is_file && sender.blocking_send(Ok(Some(entry.path()))).is_err() {
-                        return Ok(());
-                    }
-                }
-                Ok(())
-            })();
-            // Explicit completion distinguishes an empty directory from an
-            // interrupted worker. Closed receivers simply abandon enumeration.
-            let _ = sender.blocking_send(result.map(|()| None));
-        })
-        .map_err(|error| {
-            error!(path, %error, "failed to start offset directory reader");
-            IggyError::CannotReadConsumerOffsets(path.to_owned())
-        })?;
-    Ok(receiver)
-}
-
 /// A crashed atomic replacement leaves its sibling behind. The rename never
 /// landed, so the sibling is never authoritative. Removal needs no directory
 /// sync because a resurrected sibling is still ignored on the next load.
-async fn remove_stale_replacement(path: &std::path::Path, name: &str) {
-    match compio::fs::remove_file(path).await {
+async fn remove_stale_replacement<S: DurableStorage>(storage: &S, path: &Path, name: &str) {
+    match storage.remove_file(path).await {
         Ok(()) => trace!("Removed stale offset replacement file: '{name}'."),
         Err(e) => warn!(
             "{COMPONENT} (error: {e}) - could not remove stale offset replacement \
@@ -202,8 +187,18 @@ const fn offset_kind_label(kind: ConsumerKind) -> &'static str {
     }
 }
 
-async fn read_offset_file(path: &str, offset_kind: &'static str) -> OffsetFileLoad {
-    let bytes = match compio::fs::read(path).await {
+async fn read_offset_file<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    offset_kind: &'static str,
+) -> OffsetFileLoad {
+    let bytes = match async {
+        let file = storage.open(Path::new(path), OpenMode::Read).await?;
+        let length = usize::try_from(file.length().await?).map_err(std::io::Error::other)?;
+        file.read(0, length).await
+    }
+    .await
+    {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -220,7 +215,7 @@ async fn read_offset_file(path: &str, offset_kind: &'static str) -> OffsetFileLo
                 "{COMPONENT} - failed to read {offset_kind} from file (truncated), \
                  path: {path}, removing invalid file."
             );
-            remove_invalid_offset_file(path, offset_kind).await
+            remove_invalid_offset_file(storage, path, offset_kind).await
         }
         // Skipped rather than loaded: resuming from a cursor provably not the one
         // written reads as ordinary redelivery or a gap, never as corruption.
@@ -238,28 +233,27 @@ async fn read_offset_file(path: &str, offset_kind: &'static str) -> OffsetFileLo
                  (offset: {offset}, expected: {expected}, found: {found}), \
                  path: {path}, removing it and resuming this consumer from the start."
             );
-            remove_invalid_offset_file(path, offset_kind).await
+            remove_invalid_offset_file(storage, path, offset_kind).await
         }
     }
 }
 
-async fn remove_invalid_offset_file(path: &str, offset_kind: &'static str) -> OffsetFileLoad {
-    if let Err(error) = compio::fs::remove_file(path).await {
+async fn remove_invalid_offset_file<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    offset_kind: &'static str,
+) -> OffsetFileLoad {
+    if let Err(error) = storage.remove_file(Path::new(path)).await {
         error!(
             "{COMPONENT} (error: {error}) - could not remove the invalid \
              {offset_kind} file, path: {path}; remove it manually."
         );
         return OffsetFileLoad::Stranded;
     }
-    let Some(parent) = std::path::Path::new(path).parent() else {
+    let Some(parent) = Path::new(path).parent() else {
         return OffsetFileLoad::Removed;
     };
-    match async {
-        let directory = compio::fs::File::open(parent).await?;
-        directory.sync_all().await
-    }
-    .await
-    {
+    match storage.sync_directory(parent).await {
         Ok(()) => OffsetFileLoad::Removed,
         Err(error) => {
             error!(
@@ -286,26 +280,12 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_full_directory_buffer_when_loader_is_cancelled_should_release_worker_capacity() {
-        let dir = tempfile::tempdir().unwrap();
-        for id in 0..OFFSET_DIRECTORY_BUFFER * 2 {
-            std::fs::write(dir.path().join(id.to_string()), 0_u64.to_le_bytes()).unwrap();
-        }
-        let path = dir.path().to_str().unwrap();
-        for _ in 0..8 {
-            let entries = offset_directory_entries(path).await.unwrap();
-            drop(entries);
-        }
-        let loaded = load_consumer_offsets(path).await.unwrap();
-        assert_eq!(loaded.entries.len(), OFFSET_DIRECTORY_BUFFER * 2);
-    }
-
-    #[compio::test]
     async fn given_numeric_directory_and_torn_file_when_loading_should_remove_only_invalid_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("7")).unwrap();
         std::fs::write(dir.path().join("8"), [1, 2]).unwrap();
         std::fs::write(dir.path().join("9"), 12_u64.to_le_bytes()).unwrap();
+        std::fs::write(dir.path().join("10"), []).unwrap();
         std::fs::write(dir.path().join("9.tmp"), [0_u8; 4]).unwrap();
         std::fs::write(dir.path().join("notes.tmp"), b"unrelated").unwrap();
         let path = dir.path().to_str().unwrap();
@@ -316,6 +296,7 @@ mod tests {
         assert_eq!(consumers.entries[0].consumer_id, 9);
         assert!(consumers.stranded_ids.is_empty());
         assert!(!dir.path().join("8").exists());
+        assert!(!dir.path().join("10").exists());
         let groups = load_consumer_group_offsets(path).await.unwrap();
         assert_eq!(groups.entries.len(), 1);
         assert_eq!(groups.entries[0].0, ConsumerGroupId(9));

@@ -17,8 +17,6 @@
  * under the License.
  */
 
-// TODO(slbotbm): Add tests for store_consumer_offset, get_consumer_offset, and delete_consumer_offset functions
-// attached to client after implementing consumer group functions
 // TODO(slbotbm): Add tests for update_permissions after creating create_user, get_user, etc. functions
 #include <algorithm>
 #include <chrono>

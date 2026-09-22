@@ -100,9 +100,10 @@ fn is_supported_version_matches_scope_table() {
 /// (Produce, Fetch, `ListOffsets`, Metadata, `ApiVersions`, `CreateTopics`) -
 /// `supported_ranges_table_has_six_entries` plus `is_supported_version_matches_scope_table`
 /// already pin that both tables cover the same six keys.
-#[test]
-fn apiversions_advertises_exact_supported_ranges_v1() {
+#[tokio::test]
+async fn apiversions_advertises_exact_supported_ranges_v1() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
@@ -128,14 +129,15 @@ fn apiversions_advertises_exact_supported_ranges_v1() {
 
 /// See `apiversions_advertises_exact_supported_ranges_v1` for why this checks against
 /// `SCOPED_API_KEYS`, not `supported_api_ranges()`.
-#[test]
-fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
+#[tokio::test]
+async fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
     let body = handle_request(
         API_KEY_API_VERSIONS,
         3,
         build_api_versions_flexible_request("iggy-test", "0.1.0"),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
@@ -166,8 +168,8 @@ fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
 // `SCOPED_API_KEYS` (independent of `supported_api_ranges()`, the function under test) plus the
 // acks=0/acks!=0 behavioral split this shorter version never covered.
 
-#[test]
-fn apiversions_all_versions_return_success() {
+#[tokio::test]
+async fn apiversions_all_versions_return_success() {
     for version in 0i16..=3 {
         let request = if version >= 3 {
             build_api_versions_flexible_request("iggy-test", "0.1.0")
@@ -175,15 +177,17 @@ fn apiversions_all_versions_return_success() {
             Bytes::new()
         };
         let body = handle_request(API_KEY_API_VERSIONS, version, request, &default_broker())
+            .await
             .expect_response("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         assert_eq!(d.read_i16().unwrap(), 0, "ApiVersions v{version}");
     }
 }
 
-#[test]
-fn apiversions_out_of_range_returns_unsupported_in_body() {
+#[tokio::test]
+async fn apiversions_out_of_range_returns_unsupported_in_body() {
     let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
@@ -193,8 +197,8 @@ fn metadata_request_one_topic() -> Bytes {
     build_metadata_legacy_request(&["test-topic"])
 }
 
-#[test]
-fn metadata_below_min_version_closes_connection() {
+#[tokio::test]
+async fn metadata_below_min_version_closes_connection() {
     assert!(
         handle_request(
             API_KEY_METADATA,
@@ -202,13 +206,14 @@ fn metadata_below_min_version_closes_connection() {
             metadata_request_one_topic(),
             &default_broker(),
         )
+        .await
         .is_close(),
         "Metadata below supported min must close rather than return a clamped body"
     );
 }
 
-#[test]
-fn metadata_above_max_version_closes_connection() {
+#[tokio::test]
+async fn metadata_above_max_version_closes_connection() {
     // v10 request uses flexible encoding; a clamped v9 reply would not survive client parsing.
     assert!(
         handle_request(
@@ -217,6 +222,7 @@ fn metadata_above_max_version_closes_connection() {
             build_metadata_flexible_request_v10(&["test-topic"]),
             &default_broker(),
         )
+        .await
         .is_close(),
         "Metadata above supported max must close rather than return a clamped body"
     );
@@ -238,8 +244,8 @@ async fn e2e_metadata_above_max_version_closes_tcp_connection() {
     );
 }
 
-#[test]
-fn produce_below_min_version_with_nonzero_acks_closes_connection() {
+#[tokio::test]
+async fn produce_below_min_version_with_nonzero_acks_closes_connection() {
     // Produce v2 is below both the firewall min (3) and `kafka_protocol`'s schema floor (3-13)
     // - no encodable response exists at this version, so a client expecting a reply (acks != 0)
     // gets a close instead of the pre-migration downgraded error response. acks=0 still keeps
@@ -250,83 +256,98 @@ fn produce_below_min_version_with_nonzero_acks_closes_connection() {
         2,
         build_produce_v2_body(1, 0),
         &default_broker(),
-    );
+    )
+    .await;
     assert!(
         body.is_close(),
         "Produce v2 with acks != 0 has no encodable response shape and must close"
     );
 }
 
-#[test]
-fn fetch_below_min_version_closes_connection() {
+#[tokio::test]
+async fn fetch_below_min_version_closes_connection() {
     // Fetch v3 is below both the firewall min (4) and `kafka_protocol`'s schema floor (4-18) -
     // no encodable response exists at this version, so this closes instead of the
     // pre-migration downgraded error response.
     assert!(
-        handle_request(API_KEY_FETCH, 3, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_FETCH, 3, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "Fetch v3 has no encodable response shape and must close"
     );
 }
 
-#[test]
-fn fetch_unsupported_version_above_max_closes_connection() {
+#[tokio::test]
+async fn fetch_unsupported_version_above_max_closes_connection() {
     // Fetch v13+ response shape differs from the v12 encoder; a clamped body is unparsable.
     assert!(
-        handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "Fetch above encoder max must close rather than return a clamped body"
     );
 }
 
-#[test]
-fn produce_unsupported_version_above_max_closes_connection() {
+#[tokio::test]
+async fn produce_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_PRODUCE, 13, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_PRODUCE, 13, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "Produce above encoder max must close rather than return a clamped body"
     );
 }
 
-#[test]
-fn create_topics_unsupported_version_above_max_closes_connection() {
+#[tokio::test]
+async fn create_topics_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_CREATE_TOPICS, 7, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_CREATE_TOPICS, 7, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "CreateTopics above encoder max must close rather than return a clamped body"
     );
 }
 
-#[test]
-fn list_offsets_unsupported_version_above_max_closes_connection() {
+#[tokio::test]
+async fn list_offsets_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_LIST_OFFSETS, 7, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_LIST_OFFSETS, 7, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "ListOffsets above encoder max must close rather than return a clamped body"
     );
 }
 
-#[test]
-fn list_offsets_v0_closes_connection() {
+#[tokio::test]
+async fn list_offsets_v0_closes_connection() {
     // `kafka_protocol` has no encoder for ListOffsets v0's legacy `old_style_offsets` shape (it
     // predates the schema the crate generates from), so a v0 request - already below the
     // firewall's min=1 - now closes instead of getting the pre-migration downgraded response.
     assert!(
-        handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "ListOffsets v0 has no encodable response shape and must close"
     );
 }
 
-#[test]
-fn create_topics_below_min_version_closes_connection() {
+#[tokio::test]
+async fn create_topics_below_min_version_closes_connection() {
     // CreateTopics v1 is below both the firewall min (2) and `kafka_protocol`'s schema floor
     // (2-7) - no encodable response exists at this version, so this closes instead of the
     // pre-migration downgraded error response.
     assert!(
-        handle_request(API_KEY_CREATE_TOPICS, 1, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_CREATE_TOPICS, 1, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "CreateTopics v1 has no encodable response shape and must close"
     );
 }
 
-#[test]
-fn unsupported_api_keys_close_connection() {
+#[tokio::test]
+async fn unsupported_api_keys_close_connection() {
     for key in [8, 9, 10, 11, 17, 20, 42, 999] {
-        let outcome = handle_request(key, 0, Bytes::new(), &default_broker());
+        let outcome = handle_request(key, 0, Bytes::new(), &default_broker()).await;
         assert!(
             outcome.is_close(),
             "unknown api_key {key} must close (no parseable response schema)"
@@ -338,8 +359,8 @@ fn unsupported_api_keys_close_connection() {
 // `api_handler_tests.rs::handle_request_succeeds_for_every_supported_version_with_fixture` -
 // that generic per-scoped-API loop already exercises the exact same fixtures and version ranges.
 
-#[test]
-fn corrupt_produce_body_with_acks_stays_silent() {
+#[tokio::test]
+async fn corrupt_produce_body_with_acks_stays_silent() {
     // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes `acks`
     // (unlike the pre-migration field-by-field decoder, which could still answer with
     // INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure now stays
@@ -351,27 +372,30 @@ fn corrupt_produce_body_with_acks_stays_silent() {
         0xFF, 0xFF, 0xFF, // truncated topics count
     ]);
     assert!(
-        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
+            .await
+            .is_no_response(),
         "malformed Produce body must stay silent regardless of acks"
     );
 }
 
-#[test]
-fn corrupt_produce_body_before_acks_is_silent() {
+#[tokio::test]
+async fn corrupt_produce_body_before_acks_is_silent() {
     // Decode fails before acks is read: the client's response expectation is unknowable, and an
     // error response could desync an acks=0 fire-and-forget client, so the server stays silent.
     let body = Bytes::from_static(&[0xFF, 0xFF]); // null transactional_id, then EOF
-    let outcome = handle_request(API_KEY_PRODUCE, 3, body, &default_broker());
+    let outcome = handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).await;
     assert!(
         outcome.is_no_response(),
         "produce decode failure before acks must be silent"
     );
 }
 
-#[test]
-fn corrupt_fetch_body_returns_invalid_request_error() {
+#[tokio::test]
+async fn corrupt_fetch_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
     let resp = handle_request(API_KEY_FETCH, 4, body, &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
     assert_eq!(d.read_i32().unwrap(), 0);
@@ -384,11 +408,13 @@ fn corrupt_fetch_body_returns_invalid_request_error() {
 
 // ── ListOffsets v0 (no encodable representation in kafka_protocol) ─────────
 
-#[test]
-fn list_offsets_v0_with_topic_closes_connection() {
+#[tokio::test]
+async fn list_offsets_v0_with_topic_closes_connection() {
     let request_body = build_list_offsets_v0_request_with_topic_t();
     assert!(
-        handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker()).is_close(),
+        handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker())
+            .await
+            .is_close(),
         "ListOffsets v0 has no encodable response shape and must close, even with a well-formed body"
     );
 }
@@ -571,10 +597,10 @@ async fn apiversions_v4_out_of_range_e2e_returns_unsupported() {
 
 // ── Out-of-scope API keys (SCOPE.md unsupported list) ───────────────────────
 
-#[test]
-fn out_of_scope_api_keys_close_without_panic() {
+#[tokio::test]
+async fn out_of_scope_api_keys_close_without_panic() {
     for &(api_key, name) in OUT_OF_SCOPE_API_KEYS {
-        let outcome = handle_request(api_key, 0, Bytes::new(), &default_broker());
+        let outcome = handle_request(api_key, 0, Bytes::new(), &default_broker()).await;
         assert!(outcome.is_close(), "{name} (key {api_key}) must close");
     }
 }
@@ -685,8 +711,8 @@ async fn each_scoped_api_below_min_version_e2e_closes_except_api_versions() {
     );
 }
 
-#[test]
-fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
+#[tokio::test]
+async fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
     let range = SCOPED_API_KEYS
         .iter()
         .find(|(k, _, _, _)| *k == API_KEY_PRODUCE)
@@ -706,6 +732,7 @@ fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
             build_produce_v2_body(0, 0),
             &default_broker(),
         )
+        .await
         .is_no_response(),
         "Produce v2 acks=0 must stay silent, not close"
     );
@@ -718,6 +745,7 @@ fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
             build_produce_v2_body(1, 0),
             &default_broker(),
         )
+        .await
         .is_close(),
         "Produce v2 acks != 0 has no encodable response shape and must close"
     );
@@ -770,10 +798,11 @@ async fn create_topics_v1_unsupported_e2e_closes_connection() {
 /// `ERROR_INVALID_REQUEST` specifically - never `ERROR_UNSUPPORTED_VERSION`, which
 /// `handle_versioned_request` only reaches on the *unsupported-version* branch, not a decode
 /// failure - so this is a precise decode, not a scan for either.
-#[test]
-fn corrupt_list_offsets_body_returns_invalid_request_error() {
+#[tokio::test]
+async fn corrupt_list_offsets_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
     let resp = handle_request(API_KEY_LIST_OFFSETS, 1, body, &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
     // v1 has no throttle_time_ms (added v2+).
@@ -786,10 +815,11 @@ fn corrupt_list_offsets_body_returns_invalid_request_error() {
 
 /// v2 (legacy, non-flexible) - see `corrupt_list_offsets_body_returns_invalid_request_error`
 /// above for why this is a precise decode of `ERROR_INVALID_REQUEST`, not a scan for either code.
-#[test]
-fn corrupt_create_topics_body_returns_invalid_request_error() {
+#[tokio::test]
+async fn corrupt_create_topics_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
     let resp = handle_request(API_KEY_CREATE_TOPICS, 2, body, &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
     assert_eq!(d.read_i32().unwrap(), 0, "throttle");
