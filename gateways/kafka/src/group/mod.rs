@@ -44,6 +44,12 @@ use crate::protocol::api::{ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
 const DEFAULT_MIN_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
 /// Kafka's own `group.max.session.timeout.ms` default.
 const DEFAULT_MAX_SESSION_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Kafka does not cap `rebalance.timeout.ms`, so this is a gateway resource bound rather than a
+/// protocol rule. It matches `DEFAULT_MAX_SESSION_TIMEOUT` because a barrier deadline is what
+/// bounds a park, and a larger value here would lengthen how long one request holds a connection
+/// and its `max_connections` permit. A client asking for more is clamped, never refused.
+const DEFAULT_MAX_REBALANCE_TIMEOUT: Duration = Duration::from_mins(30);
 /// Kafka's own `group.initial.rebalance.delay.ms` default.
 const DEFAULT_INITIAL_REBALANCE_DELAY: Duration = Duration::from_secs(3);
 
@@ -60,6 +66,13 @@ const DEFAULT_INITIAL_REBALANCE_DELAY: Duration = Duration::from_secs(3);
 pub struct GroupCoordinatorConfig {
     pub min_session_timeout: Duration,
     pub max_session_timeout: Duration,
+    /// Ceiling on what a member's `rebalance_timeout` may contribute to a barrier deadline.
+    ///
+    /// A client derives this from `max.poll.interval.ms`, which no broker range-checks, so it is
+    /// clamped rather than rejected: a value above the ceiling is honoured up to it instead of
+    /// failing the join. Without a bound it would be the only limit on how long a parked waiter
+    /// holds its connection, since a parked member's session is refreshed rather than expiring.
+    pub max_rebalance_timeout: Duration,
     /// How long a brand-new group waits for more members before completing its first join.
     pub initial_rebalance_delay: Duration,
     pub max_groups: usize,
@@ -76,6 +89,7 @@ impl Default for GroupCoordinatorConfig {
         Self {
             min_session_timeout: DEFAULT_MIN_SESSION_TIMEOUT,
             max_session_timeout: DEFAULT_MAX_SESSION_TIMEOUT,
+            max_rebalance_timeout: DEFAULT_MAX_REBALANCE_TIMEOUT,
             initial_rebalance_delay: DEFAULT_INITIAL_REBALANCE_DELAY,
             max_groups: 1_000,
             max_members_per_group: 1_000,

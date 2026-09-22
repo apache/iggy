@@ -92,13 +92,34 @@ pub struct Member {
     join_response: Option<JoinResult>,
 }
 
+/// Copy what a member keeps out of the request frame.
+///
+/// `StrBytes` and `Bytes` are refcounted views, so retaining them verbatim keeps the whole frame
+/// alive: a member whose counted metadata is a few hundred bytes can pin megabytes. Copying costs
+/// one allocation per protocol on a control-plane path, and bounds what a member actually retains
+/// to what the caps actually measure.
+fn retained_protocols(protocols: &[(StrBytes, Bytes)]) -> Vec<(StrBytes, Bytes)> {
+    protocols
+        .iter()
+        .map(|(name, metadata)| {
+            (
+                StrBytes::from_string(name.as_str().to_owned()),
+                Bytes::copy_from_slice(metadata),
+            )
+        })
+        .collect()
+}
+
 impl Member {
-    fn new(request: &JoinRequest, now: Instant) -> Self {
+    fn new(request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) -> Self {
         Self {
-            group_instance_id: request.group_instance_id.clone(),
+            group_instance_id: request
+                .group_instance_id
+                .as_ref()
+                .map(|id| StrBytes::from_string(id.as_str().to_owned())),
             session_timeout: request.session_timeout,
-            rebalance_timeout: request.rebalance_timeout,
-            protocols: request.protocols.clone(),
+            rebalance_timeout: request.rebalance_timeout.min(max_rebalance_timeout),
+            protocols: retained_protocols(&request.protocols),
             assignment: Bytes::new(),
             session_deadline: now + request.session_timeout,
             rejoined: true,
@@ -107,12 +128,14 @@ impl Member {
         }
     }
 
-    fn rejoin(&mut self, request: &JoinRequest, now: Instant) {
-        self.group_instance_id
-            .clone_from(&request.group_instance_id);
+    fn rejoin(&mut self, request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) {
+        self.group_instance_id = request
+            .group_instance_id
+            .as_ref()
+            .map(|id| StrBytes::from_string(id.as_str().to_owned()));
         self.session_timeout = request.session_timeout;
-        self.rebalance_timeout = request.rebalance_timeout;
-        self.protocols.clone_from(&request.protocols);
+        self.rebalance_timeout = request.rebalance_timeout.min(max_rebalance_timeout);
+        self.protocols = retained_protocols(&request.protocols);
         self.session_deadline = now + request.session_timeout;
         self.rejoined = true;
         // Cleared here rather than when a rebalance opens: a member that has rejoined is asking
@@ -528,12 +551,18 @@ fn join_request_error(config: &GroupCoordinatorConfig, request: &JoinRequest) ->
     if request.protocol_type.is_empty() || request.protocols.is_empty() {
         return Some(ERROR_INCONSISTENT_GROUP_PROTOCOL);
     }
-    let metadata_bytes: usize = request
+    // Names count too: they are retained alongside the metadata, and a request can carry many
+    // long ones while declaring almost no metadata at all.
+    let retained_bytes: usize = request
         .protocols
         .iter()
-        .map(|(_, metadata)| metadata.len())
-        .sum();
-    if metadata_bytes > config.max_member_blob_bytes {
+        .map(|(name, metadata)| name.len() + metadata.len())
+        .sum::<usize>()
+        + request
+            .group_instance_id
+            .as_ref()
+            .map_or(0, |id| id.as_str().len());
+    if retained_bytes > config.max_member_blob_bytes {
         return Some(ERROR_INVALID_REQUEST);
     }
     None
@@ -665,12 +694,13 @@ pub fn join_step(
     let protocols_changed = member.protocols != request.protocols;
     let is_leader = group.leader.as_ref() == Some(&request.member_id);
 
-    rejoin_step(group, request, is_leader, protocols_changed, now)
+    rejoin_step(group, config, request, is_leader, protocols_changed, now)
 }
 
 /// Dispatch for a member the group already knows, by phase.
 fn rejoin_step(
     group: &mut GroupState,
+    config: &GroupCoordinatorConfig,
     request: &JoinRequest,
     is_leader: bool,
     protocols_changed: bool,
@@ -679,7 +709,7 @@ fn rejoin_step(
     match group.phase {
         Phase::PreparingRebalance => {
             if let Some(member) = group.members.get_mut(&request.member_id) {
-                member.rejoin(request, now);
+                member.rejoin(request, now, config.max_rebalance_timeout);
             }
             group.bump();
             group.maybe_complete_join(now);
@@ -687,7 +717,7 @@ fn rejoin_step(
         }
         Phase::Stable if is_leader || protocols_changed => {
             if let Some(member) = group.members.get_mut(&request.member_id) {
-                member.rejoin(request, now);
+                member.rejoin(request, now, config.max_rebalance_timeout);
             }
             group.prepare_rebalance(now, Some(&request.member_id));
             group.maybe_complete_join(now);
@@ -695,7 +725,7 @@ fn rejoin_step(
         }
         Phase::CompletingRebalance if protocols_changed => {
             if let Some(member) = group.members.get_mut(&request.member_id) {
-                member.rejoin(request, now);
+                member.rejoin(request, now, config.max_rebalance_timeout);
             }
             group.prepare_rebalance(now, Some(&request.member_id));
             group.maybe_complete_join(now);
@@ -887,9 +917,10 @@ fn admit(
     now: Instant,
 ) -> Step<JoinResult> {
     group.pending.remove(member_id);
-    group
-        .members
-        .insert(member_id.clone(), Member::new(request, now));
+    group.members.insert(
+        member_id.clone(),
+        Member::new(request, now, config.max_rebalance_timeout),
+    );
     if group.leader.is_none() {
         group.leader = Some(member_id.clone());
     }
@@ -918,6 +949,15 @@ fn park_or_respond(group: &mut GroupState, member_id: &StrBytes, now: Instant) -
     };
     if let Some(result) = member.join_response.take() {
         return Step::Respond(result);
+    }
+    // Two calls can be in flight for one member id, and only one snapshot is ever minted, so the
+    // loser finds nothing here. While a barrier is open it is right to wait for the next one.
+    // Once it has closed there is nothing left to wait for, and parking again would be
+    // permanent: the session refresh on resume means such a waiter is never reaped, so it would
+    // hold its connection, its `max_connections` permit and its member slot until the process
+    // dies, and the group could never empty for reclamation either.
+    if group.phase != Phase::PreparingRebalance {
+        return Step::Respond(group.current_generation_result(member_id));
     }
     Step::Wait {
         member_id: member_id.clone(),
@@ -1060,6 +1100,13 @@ mod tests {
         match step {
             Step::Respond(result) => result.member_id.clone(),
             Step::Wait { member_id, .. } => member_id.clone(),
+        }
+    }
+
+    fn error_of_or_none(step: &Step<JoinResult>) -> Option<i16> {
+        match step {
+            Step::Respond(result) => Some(result.error),
+            Step::Wait { .. } => None,
         }
     }
 
@@ -1218,6 +1265,422 @@ mod tests {
         assert!(
             result.members.is_empty(),
             "a follower runs no assignor and must not receive the roster"
+        );
+    }
+
+    /// Two calls can be in flight for one member id and only one snapshot is minted, so the
+    /// loser finds nothing. Once the barrier has closed there is nothing left to wait for, and
+    /// re-parking would be permanent: the resume refreshes the session, so nothing would ever
+    /// reap it, and it would hold a connection, a permit and a member slot until the process
+    /// died. Its group could never empty, so reclamation could not free it either.
+    #[test]
+    fn given_a_waiter_with_no_answer_when_the_barrier_has_closed_should_be_answered_not_parked() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&leader, generation),
+            now,
+        );
+        assert_eq!(groups[&group_id()].phase, Phase::Stable);
+
+        // The follower collects its answer, which is destructive.
+        let first = join_resume_step(&mut groups, &group_id(), &follower, now);
+        assert!(matches!(first, Step::Respond(_)));
+
+        // A second in-flight call for the same member now finds no snapshot at all.
+        let stranded = join_resume_step(&mut groups, &group_id(), &follower, now);
+
+        assert!(
+            matches!(stranded, Step::Respond(_)),
+            "a waiter with no barrier to wait on must be answered; parking it again is permanent"
+        );
+    }
+
+    /// A client derives `rebalance_timeout` from `max.poll.interval.ms`, which no broker
+    /// range-checks and which slow-processing deployments raise well past any gateway ceiling.
+    /// Rejecting is fatal on the Java client and an endless rejoin on librdkafka, so the value is
+    /// clamped instead: the member is admitted and only what it contributes to a deadline is
+    /// bounded.
+    #[test]
+    fn given_a_rebalance_timeout_beyond_the_ceiling_when_joining_should_be_clamped_not_rejected() {
+        let config = config();
+        let mut groups = Groups::new();
+        let beyond = config.max_rebalance_timeout.as_secs() * 3;
+
+        let step = join_step(
+            &mut groups,
+            &config,
+            &request_with("", &["x"], 10, beyond),
+            Instant::now(),
+        );
+
+        let member_id = member_id_of(&step);
+        assert_ne!(
+            error_of_or_none(&step),
+            Some(ERROR_INVALID_SESSION_TIMEOUT),
+            "a long max.poll.interval.ms is a legal tuning every real broker accepts"
+        );
+        assert_eq!(
+            groups[&group_id()].members[&member_id].rebalance_timeout,
+            config.max_rebalance_timeout,
+            "the value must be bounded for deadline purposes even though the join succeeds"
+        );
+    }
+
+    /// The cap has to measure everything a member retains. Protocol names are kept alongside the
+    /// metadata, so counting metadata alone lets a request declare almost none while pinning
+    /// megabytes, which is what `max_member_blob_bytes` exists to prevent.
+    #[test]
+    fn given_long_protocol_names_when_joining_should_count_against_the_retention_cap() {
+        let config = config();
+        let mut groups = Groups::new();
+        let long_name = "n".repeat(config.max_member_blob_bytes + 1);
+        let request = JoinRequest {
+            protocols: vec![(
+                StrBytes::from_string(long_name),
+                Bytes::from_static(b"tiny"),
+            )],
+            ..request("", &["x"])
+        };
+
+        let step = join_step(&mut groups, &config, &request, Instant::now());
+
+        assert_eq!(
+            error_of(&step),
+            ERROR_INVALID_REQUEST,
+            "a name is retained just like metadata, so it has to be counted like metadata"
+        );
+    }
+
+    /// What a member keeps must be its own allocation. `StrBytes` and `Bytes` are refcounted
+    /// views into the request frame, so retaining them verbatim keeps the entire frame alive for
+    /// the member's lifetime, however little of it the caps actually measured.
+    #[test]
+    fn given_a_join_when_a_member_is_retained_should_not_hold_the_request_buffer() {
+        let config = config();
+        let mut groups = Groups::new();
+        let frame = Bytes::from(vec![7u8; 4096]);
+        let metadata = frame.slice(0..8);
+        let request = JoinRequest {
+            protocols: vec![(StrBytes::from_static_str("x"), metadata)],
+            ..request("", &["x"])
+        };
+
+        let step = join_step(&mut groups, &config, &request, Instant::now());
+        let member_id = member_id_of(&step);
+        let retained = &groups[&group_id()].members[&member_id].protocols[0].1;
+
+        assert_eq!(
+            retained.as_ref(),
+            &[7u8; 8],
+            "the bytes themselves must survive"
+        );
+        assert!(
+            !std::ptr::eq(retained.as_ptr(), frame.as_ptr()),
+            "a retained member must own its bytes, not pin the frame they arrived in"
+        );
+    }
+
+    /// The park bound has to be asserted on what the waiter is actually told, because that is
+    /// what the coordinator sleeps on. Asserting `wake_at()` alone leaves every park site free to
+    /// return any deadline it likes.
+    #[test]
+    fn given_a_parked_waiter_should_be_told_a_wake_time_within_its_session() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let _leader = join_step(
+            &mut groups,
+            &config,
+            &request_with("", &["x"], 10, 300),
+            now,
+        );
+        let step = join_step(
+            &mut groups,
+            &config,
+            &request_with("", &["x"], 10, 300),
+            now,
+        );
+
+        let Step::Wait { wake_at, .. } = step else {
+            panic!("the second joiner waits on the barrier");
+        };
+        assert!(
+            wake_at <= now + Duration::from_secs(10),
+            "the wake time handed to the coordinator must stay inside the session timeout"
+        );
+    }
+
+    /// The stranded-waiter answer has to be usable. Telling it `UNKNOWN_MEMBER_ID`, or handing it
+    /// generation -1, sends a live consumer into a reset or an `ILLEGAL_GENERATION` on its next
+    /// `SyncGroup`.
+    #[test]
+    fn given_a_stranded_waiter_when_answered_should_receive_a_usable_generation() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&leader, generation),
+            now,
+        );
+
+        let _collected = join_resume_step(&mut groups, &group_id(), &follower, now);
+        let stranded = join_resume_step(&mut groups, &group_id(), &follower, now);
+
+        let Step::Respond(result) = stranded else {
+            panic!("a waiter with no barrier to wait on must be answered");
+        };
+        assert_eq!(result.error, ERROR_NONE);
+        assert_eq!(
+            result.generation_id, generation,
+            "must name a live generation"
+        );
+        assert_eq!(
+            result.leader, leader,
+            "the client needs to know who assigns"
+        );
+        assert_eq!(
+            result.member_id, follower,
+            "must answer the member that asked"
+        );
+        assert!(
+            result.protocol_name.is_some(),
+            "the client checks the protocol"
+        );
+    }
+
+    /// A stranded waiter in `CompletingRebalance` must be answered too. Re-parking it there leaves
+    /// it for the sync-deadline sweep, which evicts it as unsynced: it loses its slot instead of
+    /// receiving its generation.
+    #[test]
+    fn given_a_stranded_waiter_while_completing_should_be_answered_not_reparked() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        assert_eq!(groups[&group_id()].phase, Phase::CompletingRebalance);
+
+        let _collected = join_resume_step(&mut groups, &group_id(), &follower, now);
+        let stranded = join_resume_step(&mut groups, &group_id(), &follower, now);
+
+        assert!(
+            matches!(stranded, Step::Respond(_)),
+            "the barrier has closed, so there is nothing left to wait for in this phase either"
+        );
+    }
+
+    /// A rejected join must not remove a group that was already there with live members.
+    #[test]
+    fn given_an_incompatible_join_when_the_group_exists_should_leave_it_intact() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, _follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+
+        let step = join_step(&mut groups, &config, &request("", &["z"]), now);
+
+        assert_eq!(error_of(&step), ERROR_INCONSISTENT_GROUP_PROTOCOL);
+        assert!(
+            groups[&group_id()].members.contains_key(&leader),
+            "rejecting a newcomer must not delete the group its members are using"
+        );
+    }
+
+    /// A follower that changes its subscription must open a rebalance; replaying the generation
+    /// would discard the new subscription until some unrelated member triggered one.
+    #[test]
+    fn given_a_follower_changing_protocols_while_stable_should_open_a_rebalance() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&leader, generation),
+            now,
+        );
+        assert_eq!(groups[&group_id()].phase, Phase::Stable);
+
+        let _ = join_step(
+            &mut groups,
+            &config,
+            &request(follower.as_str(), &["x", "y"]),
+            now,
+        );
+
+        assert_eq!(
+            groups[&group_id()].phase,
+            Phase::PreparingRebalance,
+            "a changed subscription must reach the assignor, which needs a new generation"
+        );
+    }
+
+    fn sync_request(member_id: &StrBytes, generation_id: i32) -> SyncRequest {
+        SyncRequest {
+            group_id: group_id(),
+            generation_id,
+            member_id: member_id.clone(),
+            protocol_type: None,
+            protocol_name: None,
+            assignments: Vec::new(),
+        }
+    }
+
+    /// The member cap counts across every group, so a dead group holding member slots wedges it
+    /// exactly as a dead group wedges the group cap. Pinning one reclaim site does not pin both.
+    #[test]
+    fn given_a_dead_group_holding_member_slots_when_a_new_group_joins_should_reclaim_them() {
+        let config = GroupCoordinatorConfig {
+            max_total_members: 1,
+            max_groups: 10,
+            ..config()
+        };
+        let mut groups = Groups::new();
+        let start = Instant::now();
+        assert!(matches!(
+            join_step(&mut groups, &config, &request_for("dead", ""), start),
+            Step::Respond(_)
+        ));
+
+        let later = start + Duration::from_secs(3600);
+        let Step::Respond(result) =
+            join_step(&mut groups, &config, &request_for("fresh", ""), later)
+        else {
+            panic!("a join that reclaims a dead group must answer, not park");
+        };
+        assert_eq!(
+            result.error, ERROR_NONE,
+            "the total-member cap must count live members, not ones no request will ever tick"
+        );
+        assert!(!groups.contains_key(&StrBytes::from_static_str("dead")));
+    }
+
+    /// The sync barrier has the same problem the join barrier had: a member parked inside
+    /// `SyncGroup` cannot heartbeat, and Kafka's defaults put the session well inside the
+    /// rebalance window.
+    #[test]
+    fn given_a_parked_sync_waiter_when_its_own_session_passes_should_stay_a_member() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let leader = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &request_with("", &["x"], 600, 300),
+            now,
+        ));
+        let follower = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &request_with("", &["x"], 10, 300),
+            now,
+        ));
+        let _ = join_step(
+            &mut groups,
+            &config,
+            &request_with(leader.as_str(), &["x"], 600, 300),
+            now,
+        );
+        let generation = groups[&group_id()].generation_id;
+
+        let parked = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&follower, generation),
+            now,
+        );
+        let Step::Wait { wake_at, .. } = parked else {
+            panic!("a follower waits for the leader's assignment");
+        };
+        assert!(
+            wake_at <= now + Duration::from_secs(10),
+            "the wake time handed to the coordinator must stay inside the session timeout"
+        );
+
+        let woken = now + Duration::from_secs(11);
+        let step = sync_resume_step(&mut groups, &group_id(), &follower, generation, woken);
+
+        assert!(
+            groups[&group_id()].members.contains_key(&follower),
+            "a member parked inside SyncGroup cannot heartbeat and must not be evicted for it"
+        );
+        let Step::Wait { wake_at, .. } = step else {
+            panic!("the assignment has not arrived, so the follower waits again");
+        };
+        assert!(
+            wake_at <= woken + Duration::from_secs(10),
+            "a resumed park must also stay inside the session timeout"
+        );
+    }
+
+    /// A member rejoining an open barrier wants the NEXT generation. Handing it the previous
+    /// generation's uncollected answer lets it leave while the barrier still counts it.
+    #[test]
+    fn given_a_rejoin_into_an_open_barrier_should_drop_the_uncollected_answer() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        assert!(
+            groups[&group_id()].members[&follower]
+                .join_response
+                .is_some()
+        );
+
+        let _ = join_step(&mut groups, &config, &request("", &["x"]), now);
+        assert_eq!(groups[&group_id()].phase, Phase::PreparingRebalance);
+
+        match join_step(
+            &mut groups,
+            &config,
+            &request(follower.as_str(), &["x"]),
+            now,
+        ) {
+            Step::Wait { .. } => {}
+            Step::Respond(result) => panic!(
+                "a rejoin into an open barrier must park for the next generation, not replay \
+                 generation {} it never collected",
+                result.generation_id
+            ),
+        }
+        assert_eq!(groups[&group_id()].generation_id, generation);
+    }
+
+    /// A leader rejoining a stable group is how a Kafka client signals new topic metadata.
+    /// Replaying the generation instead would leave new partitions unassigned, with no error.
+    #[test]
+    fn given_a_leader_rejoin_while_stable_should_open_a_rebalance() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, _follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&leader, generation),
+            now,
+        );
+        assert_eq!(groups[&group_id()].phase, Phase::Stable);
+
+        let _ = join_step(&mut groups, &config, &request(leader.as_str(), &["x"]), now);
+
+        assert_eq!(
+            groups[&group_id()].phase,
+            Phase::PreparingRebalance,
+            "a leader rejoin in Stable must open a rebalance, not replay the generation"
         );
     }
 
