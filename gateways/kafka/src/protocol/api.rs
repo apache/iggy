@@ -19,15 +19,23 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::bridge::IggyBridge;
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::handlers::{
-    api_versions, create_topics, dispatch, fetch, list_offsets, metadata, produce,
+    api_versions, create_topics, dispatch, fetch, find_coordinator, heartbeat, join_group,
+    list_offsets, metadata, produce, sync_group,
 };
 
 pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
 pub const API_KEY_LIST_OFFSETS: i16 = 2;
 pub const API_KEY_METADATA: i16 = 3;
+pub const API_KEY_FIND_COORDINATOR: i16 = 10;
+pub const API_KEY_JOIN_GROUP: i16 = 11;
+pub const API_KEY_HEARTBEAT: i16 = 12;
+pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
 
@@ -57,6 +65,22 @@ pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 /// call is made - a real Kafka client library validates topic names client-side and would never
 /// send one of these, but a raw/non-conformant client could.
 pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
+/// Retriable. Sent when this coordinator is at one of its `GroupCoordinatorConfig` capacity
+/// caps: the client should back off and retry rather than treat the group as unusable.
+pub const ERROR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
+/// Retriable. Sent to a parked `JoinGroup`/`SyncGroup` waiter when the gateway starts draining,
+/// so a shutdown does not hold a connection open for a full rebalance timeout.
+pub const ERROR_NOT_COORDINATOR: i16 = 16;
+/// The member's generation is not the group's current one; it must rejoin.
+pub const ERROR_ILLEGAL_GENERATION: i16 = 22;
+/// No protocol name is supported by every member, or the first member sent an empty protocol
+/// type / empty protocol list.
+pub const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+pub const ERROR_INVALID_GROUP_ID: i16 = 24;
+pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
+pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
+/// How a follower learns to rejoin: its heartbeat is answered with this while the group prepares.
+pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
@@ -75,6 +99,10 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// KIP-394: a `JoinGroup` v4+ with an empty member id is answered with a freshly minted id and
+/// this code, and the client rejoins carrying it.
+pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
+pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -142,6 +170,10 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     metadata::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    find_coordinator::RANGE,
+    join_group::RANGE,
+    heartbeat::RANGE,
+    sync_group::RANGE,
 ];
 
 #[must_use]
@@ -161,6 +193,9 @@ pub struct GatewayState {
     pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
     pub max_frame_size: usize,
+    /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
+    /// the connection that created it, and group coordination needs no Iggy call.
+    pub groups: GroupCoordinator,
 }
 
 impl GatewayState {
@@ -169,18 +204,27 @@ impl GatewayState {
         broker: BrokerAdvertise,
         bridge: Option<Arc<IggyBridge>>,
         max_frame_size: usize,
+        groups: GroupCoordinator,
     ) -> Self {
         Self {
             broker,
             bridge,
             max_frame_size,
+            groups,
         }
     }
 
     /// State with no bridge, so every handler takes its stub path.
+    ///
+    /// The coordinator is real but fresh, so two calls never share group state.
     #[must_use]
-    pub const fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
-        Self::new(broker, None, max_frame_size)
+    pub fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
+        Self::new(
+            broker,
+            None,
+            max_frame_size,
+            GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+        )
     }
 }
 

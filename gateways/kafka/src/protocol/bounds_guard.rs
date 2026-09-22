@@ -27,7 +27,7 @@
 //! any of `SUPPORTED_RANGES`, so this is reachable by anyone who can `connect()`.
 //!
 //! This module walks the same field shape `kafka_protocol`'s real decode walks for each of the
-//! six accepted message types, but only to validate every length-prefixed field (array count,
+//! ten accepted message types, but only to validate every length-prefixed field (array count,
 //! string length, bytes length, tagged-field size) against what could still fit in the bytes
 //! remaining in the frame - it never materializes a value or allocates a collection. Call the
 //! matching `validate_*_shape` function before handing the body to `kafka_protocol`.
@@ -342,6 +342,45 @@ impl ShapeCursor {
                 self.remaining()
             ))
         })?;
+        self.skip(len)
+    }
+
+    /// Bytes the response hands back to a client: `JoinGroup` subscription metadata (relayed to
+    /// the leader) and `SyncGroup` assignments (relayed to each member). Produce's `records` are
+    /// deliberately not charged because nothing echoes them; these are, so they have to be.
+    fn echoed_bytes(&mut self, nullable: bool, flexible: bool) -> Result<()> {
+        let len = if flexible {
+            let n = self.read_varint()?;
+            if n == 0 {
+                return if nullable {
+                    Ok(())
+                } else {
+                    Err(KafkaProtocolError::Malformed(
+                        "null bytes where non-null bytes are required".to_string(),
+                    ))
+                };
+            }
+            usize::try_from(n - 1).map_err(|_| {
+                KafkaProtocolError::Malformed(format!(
+                    "collection length {n} exceeds remaining {} bytes",
+                    self.remaining()
+                ))
+            })?
+        } else {
+            let n = self.read_i32()?;
+            if n < 0 {
+                return if nullable {
+                    Ok(())
+                } else {
+                    Err(KafkaProtocolError::Malformed(
+                        "null bytes where non-null bytes are required".to_string(),
+                    ))
+                };
+            }
+            // Safe: n is in [0, i32::MAX], checked above.
+            n.unsigned_abs() as usize
+        };
+        self.charge_response_bytes(len)?;
         self.skip(len)
     }
 
@@ -730,6 +769,198 @@ pub fn validate_api_versions_shape(version: i16, body: &Bytes) -> Result<()> {
     Ok(())
 }
 
+/// Mirrors the field order `FindCoordinatorRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_find_coordinator_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 3;
+
+    if version <= 3 {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+    }
+    if version >= 1 {
+        let _key_type = c.read_i8()?;
+    }
+    if version >= 4 {
+        let keys_count = c.compact_array_count()?;
+        for _ in 0..keys_count {
+            c.compact_string(false)?;
+        }
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `JoinGroupRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_join_group_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 6;
+
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    let _session_timeout_ms = c.read_i32()?;
+    if version >= 1 {
+        let _rebalance_timeout_ms = c.read_i32()?;
+    }
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    if version >= 5 {
+        if flexible {
+            c.compact_string(true)?;
+        } else {
+            c.legacy_string(true)?;
+        }
+    }
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+
+    let protocols_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..protocols_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        c.echoed_bytes(false, flexible)?;
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+
+    if version >= 8 {
+        c.compact_string(true)?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `HeartbeatRequest::decode` walks.
+///
+/// No response-size guard is needed: a Heartbeat response is a throttle time and an error code,
+/// so nothing in the request can amplify it (same reasoning as `validate_api_versions_shape`).
+///
+/// # Errors
+///
+/// Returns an error when a declared string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_heartbeat_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    let flexible = version >= 4;
+
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    let _generation_id = c.read_i32()?;
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    if version >= 3 {
+        if flexible {
+            c.compact_string(true)?;
+        } else {
+            c.legacy_string(true)?;
+        }
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `SyncGroupRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_sync_group_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 4;
+
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    let _generation_id = c.read_i32()?;
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    if version >= 3 {
+        if flexible {
+            c.compact_string(true)?;
+        } else {
+            c.legacy_string(true)?;
+        }
+    }
+    if version >= 5 {
+        c.compact_string(true)?;
+        c.compact_string(true)?;
+    }
+
+    let assignments_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..assignments_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        c.echoed_bytes(false, flexible)?;
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,5 +1133,115 @@ mod tests {
     #[test]
     fn api_versions_v3_truncated_rejected() {
         assert!(validate_api_versions_shape(3, &Bytes::new()).is_err());
+    }
+
+    // ── Consumer group coordination validators ──────────────────────────────
+
+    /// A `JoinGroup` v6 body carrying one protocol with `metadata` bytes of `metadata_len`.
+    fn join_group_v6_body(metadata_len: usize) -> Bytes {
+        let mut body = vec![
+            0x02, b'g', // group_id "g"
+            0x00, 0x00, 0x27, 0x10, // session_timeout_ms
+            0x00, 0x00, 0x4E, 0x20, // rebalance_timeout_ms
+            0x01, // member_id ""
+            0x00, // group_instance_id null
+            0x09, b'c', b'o', b'n', b's', b'u', b'm', b'e', b'r', // protocol_type
+            0x02, // protocols count 1
+            0x06, b'r', b'a', b'n', b'g', b'e', // protocol name
+        ];
+        let mut length = metadata_len + 1;
+        while length >= 0x80 {
+            body.push(u8::try_from(length & 0x7F).expect("masked to 7 bits") | 0x80);
+            length >>= 7;
+        }
+        body.push(u8::try_from(length).expect("below 0x80 after the loop"));
+        body.extend(std::iter::repeat_n(0xAB, metadata_len));
+        body.push(0x00); // protocol tagged fields
+        body.push(0x00); // request tagged fields
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn find_coordinator_v4_huge_key_count_rejected() {
+        let body = Bytes::from_static(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_find_coordinator_shape(4, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn find_coordinator_v4_single_key_accepted() {
+        let body = Bytes::from_static(&[0x00, 0x02, 0x02, b'g', 0x00]);
+        assert!(validate_find_coordinator_shape(4, &body, TEST_MAX_FRAME_SIZE).is_ok());
+    }
+
+    #[test]
+    fn join_group_v6_huge_group_id_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_join_group_shape(6, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn join_group_v6_minimal_body_accepted() {
+        let body = join_group_v6_body(2);
+        assert!(validate_join_group_shape(6, &body, TEST_MAX_FRAME_SIZE).is_ok());
+    }
+
+    /// Subscription metadata is echoed to the group leader, so unlike Produce's `records` it has
+    /// to count against the projected response size. Charging it is the only thing separating
+    /// this frame from the accepted one above.
+    #[test]
+    fn join_group_metadata_is_charged_against_the_response_budget() {
+        let body = join_group_v6_body(4_096);
+        assert!(validate_join_group_shape(6, &body, 8 * 1024 * 1024).is_ok());
+        assert!(validate_join_group_shape(6, &body, 1_024).is_err());
+    }
+
+    #[test]
+    fn heartbeat_v4_huge_group_id_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_heartbeat_shape(4, &body).is_err());
+    }
+
+    #[test]
+    fn heartbeat_v4_minimal_body_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // generation_id
+            0x02, b'm', // member_id
+            0x00, // group_instance_id null
+            0x00, // tagged fields
+        ]);
+        assert!(validate_heartbeat_shape(4, &body).is_ok());
+    }
+
+    #[test]
+    fn sync_group_v5_huge_assignment_count_rejected() {
+        let body = Bytes::from_static(&[
+            0x02, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // generation_id
+            0x02, b'm', // member_id
+            0x00, // group_instance_id null
+            0x00, // protocol_type null
+            0x00, // protocol_name null
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // assignments count
+        ]);
+        assert!(validate_sync_group_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn sync_group_v5_minimal_body_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // generation_id
+            0x02, b'm', // member_id
+            0x00, // group_instance_id null
+            0x00, // protocol_type null
+            0x00, // protocol_name null
+            0x02, // assignments count 1
+            0x02, b'm', // assignment member_id
+            0x03, 0x01, 0x02, // assignment bytes
+            0x00, // entry tagged fields
+            0x00, // request tagged fields
+        ]);
+        assert!(validate_sync_group_shape(5, &body, TEST_MAX_FRAME_SIZE).is_ok());
     }
 }

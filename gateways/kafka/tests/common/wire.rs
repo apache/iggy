@@ -34,11 +34,7 @@ use super::codec::Encoder;
 pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
     (8, "OffsetCommit"),
     (9, "OffsetFetch"),
-    (10, "FindCoordinator"),
-    (11, "JoinGroup"),
-    (12, "Heartbeat"),
     (13, "LeaveGroup"),
-    (14, "SyncGroup"),
     (15, "DescribeGroups"),
     (16, "ListGroups"),
     (17, "SaslHandshake"),
@@ -443,5 +439,194 @@ pub fn build_create_topics_request_with_sections(version: i16, topic: &str) -> B
         enc.write_empty_tagged_fields();
     }
 
+    enc.freeze()
+}
+
+// ── Consumer group coordination (keys 10, 11, 12, 14) ───────────────────────
+
+/// Write a Kafka string, compact or legacy by `flexible`.
+fn write_string(enc: &mut Encoder, flexible: bool, value: Option<&str>) {
+    if flexible {
+        enc.write_compact_nullable_string(value);
+    } else {
+        enc.write_nullable_string(value).expect("string fits");
+    }
+}
+
+/// Write a Kafka bytes field, compact or legacy by `flexible`.
+fn write_bytes_field(enc: &mut Encoder, flexible: bool, value: &[u8]) {
+    if flexible {
+        enc.write_compact_nullable_bytes(Some(value));
+    } else {
+        enc.write_nullable_bytes(Some(value)).expect("bytes fit");
+    }
+}
+
+fn write_array_count(enc: &mut Encoder, flexible: bool, count: usize) {
+    if flexible {
+        enc.write_varint((count + 1) as u64);
+    } else {
+        enc.write_i32(i32::try_from(count).expect("count fits i32"));
+    }
+}
+
+/// `FindCoordinator` request. `keys` carries one entry below v4 and any number from v4.
+pub fn build_find_coordinator_request(version: i16, keys: &[&str], key_type: i8) -> Bytes {
+    let flexible = version >= 3;
+    let mut enc = Encoder::with_capacity(64);
+
+    if version <= 3 {
+        write_string(
+            &mut enc,
+            flexible,
+            Some(keys.first().copied().unwrap_or("")),
+        );
+    }
+    if version >= 1 {
+        enc.write_i8(key_type);
+    }
+    if version >= 4 {
+        enc.write_varint((keys.len() + 1) as u64);
+        for key in keys {
+            enc.write_compact_nullable_string(Some(key));
+        }
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+pub const DEFAULT_JOIN_PROTOCOLS: &[(&str, &[u8])] = &[("range", b"subscription")];
+
+/// Everything a `JoinGroup` body carries, so callers vary one field at a time.
+pub struct JoinGroupParams<'a> {
+    pub group_id: &'a str,
+    pub session_timeout_ms: i32,
+    pub rebalance_timeout_ms: i32,
+    pub member_id: &'a str,
+    pub group_instance_id: Option<&'a str>,
+    pub protocol_type: &'a str,
+    pub protocols: &'a [(&'a str, &'a [u8])],
+}
+
+impl Default for JoinGroupParams<'_> {
+    fn default() -> Self {
+        Self {
+            group_id: "test-group",
+            session_timeout_ms: 10_000,
+            rebalance_timeout_ms: 20_000,
+            member_id: "",
+            group_instance_id: None,
+            protocol_type: "consumer",
+            protocols: DEFAULT_JOIN_PROTOCOLS,
+        }
+    }
+}
+
+pub fn build_join_group_request(version: i16, params: &JoinGroupParams<'_>) -> Bytes {
+    let flexible = version >= 6;
+    let mut enc = Encoder::with_capacity(256);
+
+    write_string(&mut enc, flexible, Some(params.group_id));
+    enc.write_i32(params.session_timeout_ms);
+    if version >= 1 {
+        enc.write_i32(params.rebalance_timeout_ms);
+    }
+    write_string(&mut enc, flexible, Some(params.member_id));
+    if version >= 5 {
+        write_string(&mut enc, flexible, params.group_instance_id);
+    }
+    write_string(&mut enc, flexible, Some(params.protocol_type));
+
+    write_array_count(&mut enc, flexible, params.protocols.len());
+    for (name, metadata) in params.protocols {
+        write_string(&mut enc, flexible, Some(name));
+        write_bytes_field(&mut enc, flexible, metadata);
+        if flexible {
+            enc.write_empty_tagged_fields();
+        }
+    }
+
+    if version >= 8 {
+        enc.write_compact_nullable_string(None); // reason
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+pub fn build_heartbeat_request(
+    version: i16,
+    group_id: &str,
+    generation_id: i32,
+    member_id: &str,
+) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(64);
+
+    write_string(&mut enc, flexible, Some(group_id));
+    enc.write_i32(generation_id);
+    write_string(&mut enc, flexible, Some(member_id));
+    if version >= 3 {
+        write_string(&mut enc, flexible, None); // group_instance_id
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// Everything a `SyncGroup` body carries. `protocol_type`/`protocol_name` are written from v5.
+pub struct SyncGroupParams<'a> {
+    pub group_id: &'a str,
+    pub generation_id: i32,
+    pub member_id: &'a str,
+    pub protocol_type: Option<&'a str>,
+    pub protocol_name: Option<&'a str>,
+    pub assignments: &'a [(&'a str, &'a [u8])],
+}
+
+impl Default for SyncGroupParams<'_> {
+    fn default() -> Self {
+        Self {
+            group_id: "test-group",
+            generation_id: 1,
+            member_id: "",
+            protocol_type: None,
+            protocol_name: None,
+            assignments: &[],
+        }
+    }
+}
+
+pub fn build_sync_group_request(version: i16, params: &SyncGroupParams<'_>) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(256);
+
+    write_string(&mut enc, flexible, Some(params.group_id));
+    enc.write_i32(params.generation_id);
+    write_string(&mut enc, flexible, Some(params.member_id));
+    if version >= 3 {
+        write_string(&mut enc, flexible, None); // group_instance_id
+    }
+    if version >= 5 {
+        enc.write_compact_nullable_string(params.protocol_type);
+        enc.write_compact_nullable_string(params.protocol_name);
+    }
+
+    write_array_count(&mut enc, flexible, params.assignments.len());
+    for (member_id, assignment) in params.assignments {
+        write_string(&mut enc, flexible, Some(member_id));
+        write_bytes_field(&mut enc, flexible, assignment);
+        if flexible {
+            enc.write_empty_tagged_fields();
+        }
+    }
+
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
     enc.freeze()
 }

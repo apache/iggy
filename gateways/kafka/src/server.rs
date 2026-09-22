@@ -33,6 +33,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::api::{
     BrokerAdvertise, DEFAULT_KAFKA_PORT, GatewayState, HandleOutcome, handle_request_bounded,
 };
@@ -63,6 +64,9 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
+    /// Consumer-group timeouts and capacity caps. No environment variable maps onto these yet;
+    /// Kafka's own defaults apply.
+    pub group: GroupCoordinatorConfig,
 }
 
 impl Default for GatewayConfig {
@@ -77,6 +81,7 @@ impl Default for GatewayConfig {
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(25),
+            group: GroupCoordinatorConfig::default(),
         }
     }
 }
@@ -203,17 +208,20 @@ impl KafkaGateway {
             "kafka listener bound on {} (advertised as {}:{})",
             local_addr, broker.host, broker.port
         );
+        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits until
+        // `idle_timeout` (or forever if that is raised). Created before the state so the group
+        // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
+        // otherwise hold the drain open for a full rebalance timeout.
+        let cancel = CancellationToken::new();
         let state = Arc::new(GatewayState::new(
             broker,
             self.bridge.clone(),
             self.config.max_frame_size,
+            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
         ));
 
         let tracker = TaskTracker::new();
         let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
-        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits
-        // until `idle_timeout` (or forever if that is raised).
-        let cancel = CancellationToken::new();
 
         let drain_timeout = self.config.shutdown_drain_timeout;
 

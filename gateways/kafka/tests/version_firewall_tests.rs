@@ -37,10 +37,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
-    supported_api_ranges,
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
+    API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE,
+    API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION,
+    advertised_min_version, handle_request, is_supported_version, supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -53,15 +53,17 @@ use tcp::{
     parse_response_payload, read_byte_with_timeout, round_trip,
 };
 use wire::{
-    OUT_OF_SCOPE_API_KEYS, build_api_versions_flexible_request, build_create_topics_empty_request,
-    build_fetch_empty_topics_request, build_list_offsets_request,
-    build_metadata_all_topics_flexible, build_metadata_all_topics_legacy,
-    build_metadata_flexible_request_v10,
+    JoinGroupParams, OUT_OF_SCOPE_API_KEYS, SyncGroupParams, build_api_versions_flexible_request,
+    build_create_topics_empty_request, build_fetch_empty_topics_request,
+    build_find_coordinator_request, build_heartbeat_request, build_join_group_request,
+    build_list_offsets_request, build_metadata_all_topics_flexible,
+    build_metadata_all_topics_legacy, build_metadata_flexible_request_v10,
+    build_sync_group_request,
 };
 
 #[test]
-fn supported_ranges_table_has_six_entries() {
-    assert_eq!(supported_api_ranges().len(), 6);
+fn supported_ranges_table_has_ten_entries() {
+    assert_eq!(supported_api_ranges().len(), 10);
 }
 
 #[test]
@@ -97,9 +99,9 @@ fn is_supported_version_matches_scope_table() {
 /// `advertised_min_version` - the same reasoning applies to it as the function under test.
 ///
 /// Relies on `SUPPORTED_RANGES` (src) and `SCOPED_API_KEYS` (test) sharing declaration order
-/// (Produce, Fetch, `ListOffsets`, Metadata, `ApiVersions`, `CreateTopics`) -
-/// `supported_ranges_table_has_six_entries` plus `is_supported_version_matches_scope_table`
-/// already pin that both tables cover the same six keys.
+/// (Produce, Fetch, `ListOffsets`, Metadata, `ApiVersions`, `CreateTopics`, `FindCoordinator`,
+/// `JoinGroup`, Heartbeat, `SyncGroup`) - `supported_ranges_table_has_ten_entries` plus
+/// `is_supported_version_matches_scope_table` already pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())
@@ -346,7 +348,7 @@ async fn create_topics_below_min_version_closes_connection() {
 
 #[tokio::test]
 async fn unsupported_api_keys_close_connection() {
-    for key in [8, 9, 10, 11, 17, 20, 42, 999] {
+    for key in [8, 9, 13, 15, 17, 20, 42, 999] {
         let outcome = handle_request(key, 0, Bytes::new(), &default_broker()).await;
         assert!(
             outcome.is_close(),
@@ -495,6 +497,27 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
             .flatten()
             .unwrap_or_else(|| build_list_offsets_request(version, "scope-topic", 0)),
         API_KEY_CREATE_TOPICS => build_create_topics_empty_request(version),
+        API_KEY_FIND_COORDINATOR => build_find_coordinator_request(version, &["scope-group"], 0),
+        // A member id the coordinator never handed out, so every in-range version answers
+        // UNKNOWN_MEMBER_ID immediately instead of creating a group and parking on its join
+        // barrier for the initial rebalance delay.
+        API_KEY_JOIN_GROUP => build_join_group_request(
+            version,
+            &JoinGroupParams {
+                group_id: "scope-group",
+                member_id: "scope-member",
+                ..JoinGroupParams::default()
+            },
+        ),
+        API_KEY_HEARTBEAT => build_heartbeat_request(version, "scope-group", 1, "scope-member"),
+        API_KEY_SYNC_GROUP => build_sync_group_request(
+            version,
+            &SyncGroupParams {
+                group_id: "scope-group",
+                member_id: "scope-member",
+                ..SyncGroupParams::default()
+            },
+        ),
         _ => Bytes::new(),
     }
 }

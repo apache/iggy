@@ -21,6 +21,8 @@
 mod codec;
 #[path = "common/fixtures.rs"]
 mod fixtures;
+#[path = "common/scope.rs"]
+mod scope;
 #[path = "common/server.rs"]
 mod server;
 #[path = "common/tcp.rs"]
@@ -70,7 +72,7 @@ async fn e2e_apiversions_v3_flexible_preserves_correlation_id() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).expect("api count fits usize");
-    assert_eq!(count, 6);
+    assert_eq!(count, scope::SCOPED_API_KEYS.len());
 }
 
 #[tokio::test]

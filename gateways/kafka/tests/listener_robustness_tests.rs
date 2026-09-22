@@ -19,6 +19,8 @@
 
 #[path = "common/codec.rs"]
 mod codec;
+#[path = "common/scope.rs"]
+mod scope;
 #[path = "common/server.rs"]
 mod server;
 #[path = "common/tcp.rs"]
@@ -34,6 +36,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 
 use iggy_gateway_kafka::GatewayConfig;
+use iggy_gateway_kafka::group::GroupCoordinatorConfig;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_FETCH, API_KEY_METADATA, API_KEY_PRODUCE, BrokerAdvertise,
     ERROR_INVALID_REQUEST, handle_request,
@@ -98,6 +101,7 @@ async fn e2e_frame_within_custom_max_frame_size_accepted() {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        group: GroupCoordinatorConfig::default(),
     })
     .await;
 
@@ -129,6 +133,7 @@ async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        group: GroupCoordinatorConfig::default(),
     })
     .await;
 
@@ -159,6 +164,7 @@ async fn e2e_truncated_frame_body_closes_connection() {
         read_timeout: Duration::from_secs(1),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        group: GroupCoordinatorConfig::default(),
     })
     .await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -311,6 +317,7 @@ async fn e2e_slow_client_can_complete_request_within_read_timeout() {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        group: GroupCoordinatorConfig::default(),
     })
     .await;
 
@@ -371,7 +378,11 @@ async fn e2e_flexible_apiversions_v3_request_succeeds() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).unwrap();
-    assert_eq!(count, 6, "must advertise all six scoped API keys");
+    assert_eq!(
+        count,
+        scope::SCOPED_API_KEYS.len(),
+        "must advertise every scoped API key"
+    );
 }
 
 #[tokio::test]
@@ -510,6 +521,7 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
         read_timeout: Duration::from_secs(3),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        group: GroupCoordinatorConfig::default(),
     })
     .await;
 

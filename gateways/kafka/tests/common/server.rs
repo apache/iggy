@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
+use iggy_gateway_kafka::group::GroupCoordinatorConfig;
 use iggy_gateway_kafka::server::bind_listener;
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -38,6 +39,7 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
+        group: GroupCoordinatorConfig::default(),
     })
     .await
 }

@@ -94,13 +94,17 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
 | 2 | ListOffsets | 1 | 6 | 0, 1, 6, 7 |
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
+| 10 | FindCoordinator | 0 | 4 | −1, 0, 4, 5 |
+| 11 | JoinGroup | 0 | 9 | −1, 0, 9, 10 |
+| 12 | Heartbeat | 0 | 4 | −1, 0, 4, 5 |
+| 14 | SyncGroup | 0 | 5 | −1, 0, 5, 6 |
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
 | ---- | ------ | ---------------------- | --------------------------- |
-| B1 | ApiVersions negotiation | `error_code=0`; body lists 6 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
+| B1 | ApiVersions negotiation | `error_code=0`; body lists 10 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
 | B3 | Produce/Fetch/ListOffsets/CreateTopics out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these four messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,18,19 only — no consumer-group keys |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,10,11,12,14,18,19 only — no OffsetCommit/OffsetFetch/LeaveGroup |
 
 Only ApiVersions (B1) ever returns `error_code=35` on this gateway. Every other API key's
 out-of-range case closes the connection - see B2/B3.
@@ -175,8 +179,10 @@ Requires `kcat` installed. Gateway does **not** implement SASL or full broker se
 | ID | Test | Command | Expected (foundation) |
 | ---- | ------ | --------- | --------------------- |
 | G1 | Broker metadata | `kcat -b 127.0.0.1:9093 -L` | ApiVersions + Metadata handshake; broker appears in metadata |
-| G2 | Produce (likely fails later) | `echo "hello" \| kcat -b 127.0.0.1:9093 -t test -P` | May fail at coordinator/group stage — document actual error |
-| G3 | Consumer (likely fails later) | `kcat -b 127.0.0.1:9093 -t test -C -o beginning` | May fail without consumer groups — document actual error |
+| G2 | Produce (likely fails later) | `echo "hello" \| kcat -b 127.0.0.1:9093 -t test -P` | Produce is still a stub: retriable `NOT_LEADER_OR_FOLLOWER` (6), so kcat retries — document actual error |
+| G3 | Consumer group rebalance | `kcat -b 127.0.0.1:9093 -G g1 test` in two terminals | Each prints its assigned partitions and the two sets are disjoint; then both stall, because OffsetFetch (9) is unlisted and closes the connection — the client re-runs FindCoordinator and loops. Record the exact librdkafka log lines |
+| G4 | Ungraceful consumer exit | `kill -9` one of G3's kcats | Within `session.timeout.ms` the survivor logs a rebalance and is assigned every partition |
+| G5 | Java console consumer | `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g2 --topic test` | Exercises JoinGroup v9, SyncGroup v5, Heartbeat v4, FindCoordinator v4. A 4.0 client may need `--consumer-property group.protocol=classic`, or it sends ConsumerGroupHeartbeat (68) and the connection closes |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
 
@@ -300,8 +306,8 @@ _________________________________
 These are documented as TODO in [SCOPE.md](SCOPE.md) — do not fail #3421 validation for these:
 
 - Message persistence to Iggy
-- Consumer group join/sync/heartbeat
 - SASL authentication
 - Accurate partition leadership / ISR
 - Transactional produce
 - Real offset commit semantics
+- Consumer group offset commit/fetch, LeaveGroup, and admin group views (join/sync/heartbeat themselves are covered by G3-G5)
