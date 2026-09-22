@@ -14,14 +14,14 @@ _This is part of the Apache Iggy monorepo. For the main project, see the [root r
 
 ## Installation
 
-These examples target server **0.9.0**. The released `0.8.0` artifact uses the older TCP protocol. Use `0.9.0-SNAPSHOT` for the pre-release SDK, with the ASF repository configured under [Snapshot Versions](#snapshot-versions), or build the SDK and server from the same checkout. Java 17 or newer is required.
+These examples target server **0.9.0**. SDK `0.9.0` is on Maven Central and works with server `0.9.0`. The older `0.8.0` artifact speaks the previous TCP protocol and does not work with server `0.9.0`. Java 17 or newer is required.
 
 Add the dependency to your project:
 
 **Gradle:**
 
 ```gradle
-implementation 'org.apache.iggy:iggy:0.9.0-SNAPSHOT'
+implementation 'org.apache.iggy:iggy:0.9.0'
 ```
 
 **Maven:**
@@ -30,15 +30,15 @@ implementation 'org.apache.iggy:iggy:0.9.0-SNAPSHOT'
 <dependency>
     <groupId>org.apache.iggy</groupId>
     <artifactId>iggy</artifactId>
-    <version>0.9.0-SNAPSHOT</version>
+    <version>0.9.0</version>
 </dependency>
 ```
 
-Check [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) for `0.9.0` release availability.
+See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) for all published versions.
 
 ### Snapshot Versions
 
-Snapshot versions are also available through the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.1-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.0-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.1-SNAPSHOT'
 }
 ```
 
@@ -72,20 +72,14 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.0-SNAPSHOT</version>
+        <version>0.9.1-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
 
 ## Quick Start
 
-Cluster auto-commit polling over TCP/TLS keeps group membership on the
-coordinator and uses separate connections to partition primaries. It requires
-server support for binary commands 14, 103 and 104. Pause binary auto-commit
-consumers for the whole upgrade: upgrade every server first, then the SDKs,
-and restart consumers so they rejoin their groups. Older SDKs can lose membership
-when a backup refuses an offset commit; the new SDK does not fall back to legacy
-polling. Use `Iggy.tcpClientBuilder()` to get this routing and session management.
+`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It polls each partition through a separate connection to the primary of that partition.
 
 Start the server with the [example prerequisites](../../examples/java/#running-examples) and matching credentials. The following snippets show alternative clients. Close a blocking client with `close()` or an async client with `close().join()` when finished.
 
@@ -231,7 +225,7 @@ callback stalls every client that shares the group.
 
 ```java
 // Get SDK version
-String version = Iggy.version();  // e.g., "0.9.0-SNAPSHOT"
+String version = Iggy.version();  // e.g., "0.9.0"
 
 // Get detailed version info
 IggyVersion info = Iggy.versionInfo();
@@ -243,7 +237,7 @@ info.getUserAgent();   // User-Agent string for HTTP
 
 ## Exception Handling
 
-The SDK's custom exception types inherit from `IggyException`. Joining a failed future can wrap the cause in `CompletionException`; the HTTP client's `close()` method declares `IOException`. Handle those boundaries as well as specific SDK errors.
+The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
 
 ## Examples
 
@@ -278,7 +272,7 @@ The wrapper script will:
 
 No manual Gradle installation is required.
 
-**Note:** Only the Unix shell wrapper (`gradlew`) is provided. Windows users should use WSL, Git Bash, or install Gradle manually.
+**Note:** Only the Unix shell wrapper (`gradlew`) is provided. On Windows, use WSL or Git Bash, or install Gradle manually.
 
 ## Contributing
 
@@ -286,6 +280,6 @@ Before opening a pull request:
 
 1. **Format code:** `./gradlew spotlessApply`
 2. **Validate build:** `./gradlew check`
-3. **Use AssertJ for assertions:** Tests should use [AssertJ](https://assertj.github.io/doc/) (`assertThat(...)`) instead of JUnit assertions.
+3. **Use AssertJ for assertions:** Write test assertions with [AssertJ](https://assertj.github.io/doc/) (`assertThat(...)`) instead of JUnit assertions.
 
-This ensures code style compliance and that all tests and checkstyle validations pass.
+These steps keep the code style compliant and make sure that all tests and checkstyle validations pass.

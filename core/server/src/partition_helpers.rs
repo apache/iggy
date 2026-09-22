@@ -30,7 +30,7 @@
 //! partition yet.
 
 use crate::offset_recovery::{
-    RecoveredOffsets, load_consumer_group_offsets, load_consumer_offsets,
+    RecoveredOffsets, load_consumer_group_offsets_with_storage, load_consumer_offsets_with_storage,
 };
 use crate::segment_recovery::{
     RecoveredSegment, load_persisted_segments, load_persisted_segments_with_checkpoint,
@@ -140,9 +140,9 @@ pub async fn create_partition_file_hierarchy(
     Ok(())
 }
 
-/// Populate `partition` with consumer-offset / consumer-group-offset storage.
+/// Populate `partition` with consumer and consumer group offset storage from disk.
 ///
-/// Hydrates from on-disk state if files exist (recovery path) or
+/// Hydrates from state on disk if files exist (recovery path) or
 /// configures empty maps (fresh partition path). Recovered offsets are bounded
 /// so a partition that lost its tail does not surface consumer offsets ahead of
 /// an offset it never handed out, and `current_offset` is where a bounded one
@@ -150,11 +150,46 @@ pub async fn create_partition_file_hierarchy(
 ///
 /// # Errors
 ///
-/// Returns [`ServerError::ConsumerOffsetsLoad`] when the on-disk files
-/// exist but fail to decode. A stored offset past the offset space is clamped
+/// Returns [`ServerError::ConsumerOffsetsLoad`] when an existing offset
+/// directory cannot be enumerated. A stored offset past the offset space is clamped
 /// to `current_offset` (with a warning), not an error.
-#[allow(clippy::too_many_lines)]
 pub async fn configure_consumer_offsets(
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    current_offset: u64,
+) -> Result<(), ServerError> {
+    configure_consumer_offsets_with_storage(
+        &DiskStorage,
+        partition,
+        config,
+        namespace,
+        current_offset,
+    )
+    .await
+}
+
+/// Recover consumer and group offsets from `storage` into a new partition.
+///
+/// Restore the partition's message offset and reservation frontier before
+/// calling this, and pass its restored offset counter as `current_offset`.
+/// These values bound which saved consumer positions are plausible.
+///
+/// Missing directories produce empty maps. Valid records seed the visible
+/// offsets and their persistence state. Unreadable records and invalid records
+/// whose removal cannot be made durable retain their admission capacity slots.
+/// Offsets beyond the space reserved by the partition are clamped to
+/// `current_offset`, as during server boot. Clamping changes the visible position
+/// without rewriting its file; persistence tracking retains the original value
+/// read from storage.
+///
+/// # Errors
+/// Returns [`ServerError::ConsumerOffsetsLoad`] if an existing offset directory
+/// cannot be enumerated. Consumer recovery may already have seeded the partition
+/// when group recovery fails, so callers must discard a failed recovery.
+#[allow(clippy::too_many_lines)]
+pub async fn configure_consumer_offsets_with_storage<S: DurableStorage>(
+    storage: &S,
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
     namespace: IggyNamespace,
@@ -179,6 +214,7 @@ pub async fn configure_consumer_offsets(
     let offset_space_ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
 
     let recovered_consumers = load_partition_consumer_offsets(
+        storage,
         &consumer_offsets_path,
         "consumer",
         stream_id,
@@ -221,6 +257,7 @@ pub async fn configure_consumer_offsets(
     }
 
     let recovered_groups = load_partition_consumer_group_offsets(
+        storage,
         &consumer_group_offsets_path,
         stream_id,
         topic_id,
@@ -249,7 +286,7 @@ pub async fn configure_consumer_offsets(
             let committed_offset = offset.offset.load(Ordering::Relaxed);
             partition.seed_recovered_consumer_offset(
                 ConsumerKind::ConsumerGroup,
-                u32::try_from(group_id.0).expect("recovered group id originated as u32"),
+                offset.consumer_id,
                 committed_offset,
                 recovered_offset,
             );
@@ -295,35 +332,45 @@ pub async fn configure_consumer_offsets(
     Ok(())
 }
 
-async fn load_partition_consumer_offsets(
+async fn load_partition_consumer_offsets<S: DurableStorage>(
+    storage: &S,
     path: &str,
     consumer_kind: &'static str,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
 ) -> Result<RecoveredOffsets<iggy_common::ConsumerOffset>, ServerError> {
-    if !Path::new(path).exists() {
+    if !storage
+        .exists_following_links(Path::new(path))
+        .await
+        .unwrap_or(false)
+    {
         return Ok(RecoveredOffsets::default());
     }
 
-    load_consumer_offsets(path).await.or_else(|source| {
-        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
+    match load_consumer_offsets_with_storage(storage, path).await {
+        Ok(offsets) => Ok(offsets),
+        Err(IggyError::CannotReadConsumerOffsets(_))
+            if !storage
+                .exists_following_links(Path::new(path))
+                .await
+                .unwrap_or(false) =>
         {
-            return Ok(RecoveredOffsets::default());
+            Ok(RecoveredOffsets::default())
         }
-
-        Err(ServerError::ConsumerOffsetsLoad {
+        Err(source) => Err(ServerError::ConsumerOffsetsLoad {
             consumer_kind,
             stream_id,
             topic_id,
             partition_id,
             path: path.to_string(),
             source: Box::new(source),
-        })
-    })
+        }),
+    }
 }
 
-async fn load_partition_consumer_group_offsets(
+async fn load_partition_consumer_group_offsets<S: DurableStorage>(
+    storage: &S,
     path: &str,
     stream_id: usize,
     topic_id: usize,
@@ -332,25 +379,33 @@ async fn load_partition_consumer_group_offsets(
     RecoveredOffsets<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>,
     ServerError,
 > {
-    if !Path::new(path).exists() {
+    if !storage
+        .exists_following_links(Path::new(path))
+        .await
+        .unwrap_or(false)
+    {
         return Ok(RecoveredOffsets::default());
     }
 
-    load_consumer_group_offsets(path).await.or_else(|source| {
-        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
+    match load_consumer_group_offsets_with_storage(storage, path).await {
+        Ok(offsets) => Ok(offsets),
+        Err(IggyError::CannotReadConsumerOffsets(_))
+            if !storage
+                .exists_following_links(Path::new(path))
+                .await
+                .unwrap_or(false) =>
         {
-            return Ok(RecoveredOffsets::default());
+            Ok(RecoveredOffsets::default())
         }
-
-        Err(ServerError::ConsumerOffsetsLoad {
+        Err(source) => Err(ServerError::ConsumerOffsetsLoad {
             consumer_kind: "consumer group",
             stream_id,
             topic_id,
             partition_id,
             path: path.to_string(),
             source: Box::new(source),
-        })
-    })
+        }),
+    }
 }
 
 /// Provision an initial segment + writers for a partition that has none.

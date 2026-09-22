@@ -33,6 +33,7 @@ default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
 
 [dependencies]
+apache-avro = { workspace = true }
 arrow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }

@@ -122,7 +122,7 @@ runs:
           echo "📦 Publishing packages to NuGet..."
           # Push to NuGet
           for package in ./nupkgs/*.nupkg; do
-            echo "Publishing: $(basename $package)"
+            echo "Publishing: $(basename "$package")"
             dotnet nuget push "$package" \
               --api-key "$NUGET_API_KEY" \
               --source https://api.nuget.org/v3/index.json \
