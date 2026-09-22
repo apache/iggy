@@ -649,7 +649,7 @@ impl StateHandler for UpdatePermissionsRequest {
 /// every WAL and snapshot. So the raw token leaves the primary by a side channel
 /// (`maybe_rewrite_pat_request` returns it alongside the rewritten request) and
 /// the home shard splices it into this op's reply as a typed
-/// `RawPersonalAccessTokenResponse` (server `responses::build_raw_pat_reply`).
+/// `RawPersonalAccessTokenResponse` (server `reply_frame::build_raw_pat_reply`).
 ///
 /// One consequence rides on that: the secret exists only on the wire of the
 /// original reply, so a replayed request cannot be served from the client-table

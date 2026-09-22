@@ -29,8 +29,8 @@ use iggy_gateway_kafka::protocol::api::{
 use codec::Encoder;
 use wire::build_api_versions_flexible_request;
 
-#[test]
-fn golden_apiversions_v3_flexible_response_fixture() {
+#[tokio::test]
+async fn golden_apiversions_v3_flexible_response_fixture() {
     // Field-by-field structural tests (`version_firewall_tests.rs`'s `apiversions_advertises_
     // exact_supported_ranges_v3_flexible`) check values against `SCOPED_API_KEYS`, but only this
     // exact-byte pin catches a wrong tagged-fields byte, wrong varint encoding, or misordered
@@ -38,6 +38,7 @@ fn golden_apiversions_v3_flexible_response_fixture() {
     let broker = BrokerAdvertise::default();
     let request = build_api_versions_flexible_request("iggy-test", "0.1.0");
     let actual = handle_request(API_KEY_API_VERSIONS, 3, request, &broker)
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
     // error_code=0, api_count=6 (compact array: N+1=7)
@@ -63,10 +64,11 @@ fn golden_apiversions_v3_flexible_response_fixture() {
     assert_eq!(actual.as_ref(), &expected);
 }
 
-#[test]
-fn golden_apiversions_v1_response_fixture() {
+#[tokio::test]
+async fn golden_apiversions_v1_response_fixture() {
     let broker = BrokerAdvertise::default();
     let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &broker)
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
     // error_code=0, api_count=6
@@ -91,8 +93,8 @@ fn golden_apiversions_v1_response_fixture() {
     assert_eq!(actual.as_ref(), &expected);
 }
 
-#[test]
-fn golden_metadata_v0_single_topic_response_fixture() {
+#[tokio::test]
+async fn golden_metadata_v0_single_topic_response_fixture() {
     let mut request = Encoder::with_capacity(32);
     request.write_i32(1); // one topic
     request
@@ -101,6 +103,7 @@ fn golden_metadata_v0_single_topic_response_fixture() {
     let req_bytes = request.freeze();
 
     let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
     // Metadata v0 layout: brokers[], topics[]  (no controller_id - added in v1)

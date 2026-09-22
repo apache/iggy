@@ -53,8 +53,8 @@ impl IggyBridgeConfig {
     /// `KNOWN_KAFKA_ENV_VARS`, not one merged copy - a var added only here is already
     /// recognized there with no corresponding edit needed, and vice versa. A var this module
     /// reads still has to be listed *somewhere* the guard checks, or a typo silently no-ops
-    /// instead of surfacing (`IGGY_KAFKA_` is a `DELEGATED_ENV_VAR_PREFIXES` entry in
-    /// `core/configs`, so the central provider's own typo-detection doesn't cover this namespace
+    /// instead of surfacing (`IGGY_KAFKA_` is a `SERVER_ALLOWED_ENV_PREFIXES` entry in
+    /// `core/configs`, so the server's own unknown-variable check doesn't cover this namespace
     /// either).
     pub const KNOWN_ENV_VARS: &'static [&'static str] = &[
         "IGGY_KAFKA_IGGY_ADDR",

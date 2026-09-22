@@ -32,11 +32,12 @@ use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::auth::{AuthError, SaslAuthenticator};
+use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise, DEFAULT_KAFKA_PORT,
     ERROR_ILLEGAL_SASL_STATE, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
-    ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, HandleOutcome,
+    ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
     decode_sasl_auth_bytes, decode_sasl_mechanism, encode_error_for_key, handle_request_bounded,
     sasl_authenticate_outcome, sasl_handshake_outcome,
 };
@@ -229,6 +230,7 @@ pub fn bind_listener(addr: &str) -> Result<TcpListener> {
 pub struct KafkaGateway {
     config: Arc<GatewayConfig>,
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
+    bridge: Option<Arc<IggyBridge>>,
 }
 
 /// Owned by [`KafkaGateway::run`] and shared by every connection it serves.
@@ -243,7 +245,17 @@ impl KafkaGateway {
         Self {
             config: Arc::new(config),
             authenticator: None,
+            bridge: None,
         }
+    }
+
+    /// Serve requests against `bridge` instead of the stub answers.
+    ///
+    /// `None` is the default and keeps every handler on its stub.
+    #[must_use]
+    pub fn with_bridge(mut self, bridge: Option<Arc<IggyBridge>>) -> Self {
+        self.bridge = bridge;
+        self
     }
 
     /// Supplies the verifier that SASL credentials are checked against.
@@ -290,14 +302,17 @@ impl KafkaGateway {
             ));
         }
         let local_addr = listener.local_addr()?;
-        let broker = Arc::new(BrokerAdvertise::from_server_config(
-            &self.config,
-            local_addr,
-        )?);
+        let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
         info!(
             "kafka listener bound on {} (advertised as {}:{})",
             local_addr, broker.host, broker.port
         );
+        let state = Arc::new(GatewayState::new(
+            broker,
+            self.bridge.clone(),
+            self.config.max_frame_size,
+            self.config.sasl_enabled,
+        ));
 
         let shared_auth = Arc::new(SharedAuth {
             authenticator: self.authenticator.clone(),
@@ -346,13 +361,13 @@ impl KafkaGateway {
                                 warn!(%peer, "TCP_KEEPALIVE failed: {e}");
                             }
                             let cfg = Arc::clone(&self.config);
-                            let broker = Arc::clone(&broker);
+                            let state = Arc::clone(&state);
                             let auth = Arc::clone(&shared_auth);
                             let conn_cancel = cancel.child_token();
                             tracker.spawn(async move {
                                 let _permit = permit;
                                 if let Err(err) =
-                                    handle_connection(stream, cfg, peer, broker, auth, conn_cancel)
+                                    handle_connection(stream, cfg, peer, state, auth, conn_cancel)
                                         .await
                                 {
                                     // debug!, not warn!: every `KafkaProtocolError` that can
@@ -424,7 +439,7 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 /// for no gain in clarity.
 struct ConnectionContext<'a> {
     config: &'a GatewayConfig,
-    broker: &'a BrokerAdvertise,
+    state: &'a GatewayState,
     authenticator: Option<&'a dyn SaslAuthenticator>,
     auth_slots: &'a Semaphore,
     peer: &'a SocketAddr,
@@ -457,14 +472,15 @@ async fn route_frame(
         mechanism.as_deref(),
     );
     match action {
-        SaslAction::Dispatch => handle_request_bounded(
-            req.request_api_key,
-            req.request_api_version,
-            body,
-            ctx.broker,
-            ctx.config.max_frame_size,
-            ctx.config.sasl_enabled,
-        ),
+        SaslAction::Dispatch => {
+            handle_request_bounded(
+                ctx.state,
+                req.request_api_key,
+                req.request_api_version,
+                body,
+            )
+            .await
+        }
         SaslAction::DispatchPreAuthApiVersions => {
             // Counted whatever the answer says. A refusal the client is entitled to retry at a
             // lower version, which is what the KIP-511 downgrade path does, is covered by the
@@ -473,13 +489,12 @@ async fn route_frame(
             // on every frame and holding a `max_connections` permit with it.
             sasl_state.count_api_versions_answer();
             handle_request_bounded(
+                ctx.state,
                 req.request_api_key,
                 req.request_api_version,
                 body,
-                ctx.broker,
-                ctx.config.max_frame_size,
-                ctx.config.sasl_enabled,
             )
+            .await
         }
         SaslAction::AcceptHandshake(mechanism) => {
             debug!(%peer, %mechanism, "SASL mechanism negotiated");
@@ -538,7 +553,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<GatewayConfig>,
     peer: SocketAddr,
-    broker: Arc<BrokerAdvertise>,
+    state: Arc<GatewayState>,
     shared_auth: Arc<SharedAuth>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -553,7 +568,7 @@ async fn handle_connection(
     };
     let ctx = ConnectionContext {
         config: &config,
-        broker: &broker,
+        state: &state,
         authenticator: shared_auth.authenticator.as_deref(),
         auth_slots: &shared_auth.slots,
         peer: &peer,

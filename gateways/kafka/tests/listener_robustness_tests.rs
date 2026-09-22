@@ -221,6 +221,7 @@ async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
         request.clone(),
         &BrokerAdvertise::default(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response")
     .len();
     // The wire frame also carries the response header `handle_request`'s return value doesn't
