@@ -83,6 +83,12 @@ const BATCH_VERSION: i8 = 2;
 /// Smallest v2 record: a length, an attributes byte, two deltas, two field lengths and a header
 /// count, each a one-byte varint at least.
 const MIN_RECORD_BYTES: usize = 7;
+/// Smallest v2 record header: a name length varint and a value length varint, both empty.
+const MIN_HEADER_BYTES: usize = 2;
+/// Bytes a zigzag varint occupies at most, which is what `kafka_protocol` reads.
+const MAX_VARINT_BYTES: usize = 5;
+/// Bytes a zigzag varlong occupies at most, on the same terms.
+const MAX_VARLONG_BYTES: usize = 10;
 /// Base offset, batch length, leader epoch, magic, CRC, attributes, last offset delta, first and
 /// max timestamp, producer id, producer epoch, base sequence and record count.
 const BATCH_HEADER_BYTES: usize = 61;
@@ -111,6 +117,8 @@ pub enum RecordCodecError {
     MappingVersion(u8),
     #[error("value marker {0:?} is neither null nor empty")]
     ValueMarker(Bytes),
+    #[error("two stored header keys both name {0}")]
+    HeaderNameCollision(String),
     #[error("timestamp marker {0:?} is not epoch")]
     TimestampMarker(Bytes),
     #[error("envelope for this record is {size} bytes, over Iggy's {MAX_PAYLOAD_SIZE} byte limit")]
@@ -127,6 +135,12 @@ pub enum RecordCodecError {
     Batch(String),
     #[error("batch declares {count} records, and {limit} bytes can hold fewer")]
     RecordCountTooLarge { count: i32, limit: usize },
+    #[error("record declares {count} headers, and {limit} bytes can hold fewer")]
+    HeaderCountTooLarge { count: i32, limit: usize },
+    #[error("record batch ends inside a record")]
+    RecordTruncated,
+    #[error("record field declares {0} bytes")]
+    RecordFieldLength(i32),
     #[error("{0} batches are out of scope")]
     UnsupportedBatch(&'static str),
     #[error("decompressed {produced} bytes with {remaining} left in the request budget")]
@@ -179,8 +193,13 @@ pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
 /// None of the `kafka.` headers carries meaning on such a message, because the namespace is
 /// reserved by `BRIDGE_MAPPING.md` and by nothing the server enforces.
 ///
-/// A message with `kafka.v` was written here, so every marker on it is authoritative and one this
-/// build does not recognize is an error rather than a guess.
+/// A message with `kafka.v` is taken as written here, so every marker on it is authoritative and
+/// one this build does not recognize is an error rather than a guess. Nothing on the server
+/// enforces the namespace, so that is a claim the message makes and not one the server keeps: an
+/// Iggy writer can set `kafka.v` to a version this build does not implement, and every read of
+/// that message then fails. Fetch cannot serve a record it cannot decode and a Kafka consumer
+/// cannot step over one, so the handler in #3536 owns the skip-or-quarantine policy for a message
+/// that fails here. `BRIDGE_MAPPING.md` records that as the open end of the provenance design.
 ///
 /// # Errors
 ///
@@ -451,10 +470,17 @@ fn gateway_fields(
         let Some(name) = header_name(name).and_then(|name| name.strip_prefix(HEADER_PREFIX)) else {
             continue;
         };
-        headers.insert(
-            StrBytes::from_string(name.to_string()),
-            Some(stored_value.value()),
-        );
+        // Two stored keys can hold the same bytes under different kinds, because an Iggy header
+        // key orders on kind before bytes (`user_headers.rs:209`). `to_iggy` writes one kind, so
+        // on a message this build wrote the names cannot collide, and a collision here says the
+        // message is not what its `kafka.v` claims. Overwriting would drop a header quietly.
+        let name = StrBytes::from_string(name.to_string());
+        if headers
+            .insert(name.clone(), Some(stored_value.value()))
+            .is_some()
+        {
+            return Err(RecordCodecError::HeaderNameCollision(name.to_string()));
+        }
     }
     Ok((key, value, headers))
 }
@@ -464,6 +490,12 @@ fn gateway_fields(
 /// Every header passes through under its own name, including one in the `kafka.` namespace. The
 /// alternative was to treat any namespaced header as gateway metadata, which made a single
 /// `kafka.`-prefixed header hide every other header on the message.
+///
+/// Two keys holding the same bytes under different kinds are two stored headers and one Kafka
+/// header, and the later one in key order wins. Kafka carries headers as a list and would hold
+/// both, but a `Record` keys them in an `IndexMap`, so there is no shape here that keeps the
+/// pair. Refusing the message instead would let one Iggy writer stall a partition for every
+/// Kafka consumer of it, which is the worse of the two. `BRIDGE_MAPPING.md` records the loss.
 fn foreign_fields(
     message: &IggyMessage,
     stored: &BTreeMap<HeaderKey, HeaderValue>,
@@ -558,9 +590,10 @@ fn header_value(value: &[u8]) -> HeaderValue {
 /// never reaches its full decompressed size in memory.
 pub struct DecompressionBudget {
     remaining: Cell<usize>,
-    /// What the charge was when it first tripped. Decompression reports failure through
-    /// `io::Error` and `anyhow`, which the decoder stringifies, so the typed reason is kept here.
-    overflow: Cell<Option<(usize, usize)>>,
+    /// Why this module refused a batch, when it did. Everything this module reports from inside
+    /// the decoder's decompression hook leaves as an `io::Error` or an `anyhow::Error`, which the
+    /// decoder stringifies, so the typed reason is parked here and taken by `decode_batches`.
+    reason: Cell<Option<RecordCodecError>>,
 }
 
 impl DecompressionBudget {
@@ -568,14 +601,17 @@ impl DecompressionBudget {
     pub const fn new(bytes: usize) -> Self {
         Self {
             remaining: Cell::new(bytes),
-            overflow: Cell::new(None),
+            reason: Cell::new(None),
         }
     }
 
     fn charge(&self, produced: usize) -> io::Result<()> {
         let remaining = self.remaining.get();
         if produced > remaining {
-            self.overflow.set(Some((produced, remaining)));
+            self.refuse(RecordCodecError::BudgetExceeded {
+                produced,
+                remaining,
+            });
             return Err(io::Error::other(format!(
                 "decompressed {produced} bytes with {remaining} left in the budget"
             )));
@@ -584,18 +620,19 @@ impl DecompressionBudget {
         Ok(())
     }
 
-    /// The typed reason for a decoder error, when the budget is what caused it.
+    /// Parks the typed reason for the error about to be raised through the hook.
+    fn refuse(&self, reason: RecordCodecError) {
+        self.reason.set(Some(reason));
+    }
+
+    /// The typed reason for a decoder error, when this module is what caused it.
     ///
     /// Taken rather than read, because the budget outlives one batch. Left in place, the first
-    /// overrun would reclassify every later error on the same request as a budget overrun.
-    fn overflow(&self, error: &str) -> RecordCodecError {
-        self.overflow.take().map_or_else(
-            || RecordCodecError::Batch(error.to_string()),
-            |(produced, remaining)| RecordCodecError::BudgetExceeded {
-                produced,
-                remaining,
-            },
-        )
+    /// refusal would reclassify every later error on the same request as that same refusal.
+    fn reason(&self, error: &str) -> RecordCodecError {
+        self.reason
+            .take()
+            .unwrap_or_else(|| RecordCodecError::Batch(error.to_string()))
     }
 }
 
@@ -647,7 +684,7 @@ pub fn decode_batches(buf: &mut Bytes, budget: &DecompressionBudget) -> Result<V
             buf,
             Some(|compressed: &mut Bytes, compression| decompress(compressed, compression, budget)),
         )
-        .map_err(|error| budget.overflow(&error.to_string()))?;
+        .map_err(|error| budget.reason(&error.to_string()))?;
         records.extend(set.records);
     }
     Ok(records)
@@ -657,13 +694,14 @@ pub fn decode_batches(buf: &mut Bytes, budget: &DecompressionBudget) -> Result<V
 ///
 /// `RecordBatchDecoder` reserves from the batch header's record count before it reads the first
 /// record (`kafka-protocol-0.18.0/src/records.rs:517`), and that count is checked for sign only.
-/// A 61-byte batch can therefore ask for `i32::MAX` records. The frame plus what the budget still
-/// allows is the most the records of the whole blob can come to, so the counts are charged against
-/// that together rather than one batch at a time: a blob holds many batches, and each reserve
-/// lands in the same `Vec`. Reading the headers costs one `Bytes` clone, which is a refcount.
+/// A 61-byte batch can therefore ask for `i32::MAX` records. The counts are charged against what
+/// the blob can produce, together rather than one batch at a time, because a blob holds many
+/// batches and each reserve lands in the same `Vec`. Reading the headers costs one `Bytes` clone,
+/// which is a refcount.
 ///
-/// What is left is the ratio between a minimal wire record and a decoded `Record`, which one
-/// legitimate request pays as well. This bounds the count, not that ratio.
+/// What the blob can produce is its own length, and the decompression budget on top only when
+/// something in it is compressed. An uncompressed batch's records are already in the blob, so
+/// granting it the budget as well would let a 70-byte batch declare a million records.
 ///
 /// Control and transactional batches are refused in the same pass. `record()` cannot carry either
 /// flag, so a control batch admitted here would reach consumers as ordinary data, and consumers
@@ -673,7 +711,15 @@ fn preflight(buf: &Bytes, budget: &DecompressionBudget) -> Result<()> {
     let infos = RecordBatchDecoder::decode_batch_info(&mut headers)
         .map_err(|error| RecordCodecError::Batch(error.to_string()))?;
 
-    let limit = buf.len().saturating_add(budget.remaining.get());
+    let compressed = infos
+        .iter()
+        .any(|info| info.compression != Compression::None);
+    let limit = if compressed {
+        buf.len().saturating_add(budget.remaining.get())
+    } else {
+        buf.len()
+    };
+
     let mut declared = 0usize;
     for info in &infos {
         if info.transactional {
@@ -759,6 +805,9 @@ fn batch_size(records: &[Record]) -> usize {
 /// `kafka_protocol`'s own decompressors write the whole stream into a growing buffer before they
 /// hand it over, so the four codecs are driven from here instead. Each one writes through
 /// `BudgetedWriter`, which bounds the peak rather than reporting an overrun after the fact.
+///
+/// The decoder calls this for every batch, uncompressed ones included, which is what makes it the
+/// one place that sees the record bytes before anything reserves from what they declare.
 fn decompress(
     compressed: &mut Bytes,
     compression: Compression,
@@ -766,25 +815,127 @@ fn decompress(
 ) -> anyhow::Result<Bytes> {
     let body = compressed.copy_to_bytes(compressed.remaining());
     let mut writer = BudgetedWriter::new(budget);
-    match compression {
+    let records = match compression {
         Compression::None => {
             budget.charge(body.len())?;
-            return Ok(body);
+            body
         }
         Compression::Gzip => {
             let mut decoder = flate2::write::GzDecoder::new(&mut writer);
             decoder.write_all(&body)?;
             decoder.finish()?;
+            writer.out.freeze()
         }
-        Compression::Zstd => zstd::stream::copy_decode(body.as_ref(), &mut writer)?,
+        Compression::Zstd => {
+            zstd::stream::copy_decode(body.as_ref(), &mut writer)?;
+            writer.out.freeze()
+        }
         Compression::Lz4 => {
             let mut decoder = lz4::Decoder::new(body.as_ref())?;
             io::copy(&mut decoder, &mut writer)?;
             decoder.finish().1?;
+            writer.out.freeze()
         }
-        Compression::Snappy => inflate_snappy(&body, &mut writer)?,
+        Compression::Snappy => {
+            inflate_snappy(&body, &mut writer)?;
+            writer.out.freeze()
+        }
+    };
+
+    if let Err(reason) = scan_records(&records) {
+        let message = reason.to_string();
+        budget.refuse(reason);
+        anyhow::bail!(message);
     }
-    Ok(writer.out.freeze())
+    Ok(records)
+}
+
+/// Walks the records of one batch and refuses a header count the record cannot hold.
+///
+/// `kafka_protocol` reserves an `IndexMap` from each record's own header count
+/// (`kafka-protocol-0.18.0/src/records.rs:896`), which is checked there for sign alone. That
+/// count is a varint inside a record body, so no batch header reports it and `preflight` cannot
+/// see it. A 72-byte batch declaring `i32::MAX` headers on its one record therefore reaches the
+/// reserve, and that allocation is resident rather than virtual, because hashbrown writes its
+/// control bytes. Every header costs two length varints at least, so a count past half the
+/// record's remaining bytes is refused before the decoder reads the record.
+///
+/// The framing below mirrors `Record::decode_new`, field for field, so a record this refuses is
+/// one the decoder would refuse too. The one place the two differ is trailing bytes: the decoder
+/// stops after the count the batch header gave and ignores anything after it, while this walks to
+/// the end of the blob. A v2 batch carries its records and nothing else, so there is nothing to
+/// ignore.
+fn scan_records(records: &Bytes) -> Result<()> {
+    let mut blob = records.as_ref();
+    while !blob.is_empty() {
+        let size = take_varint(&mut blob)?;
+        let size = usize::try_from(size).map_err(|_| RecordCodecError::RecordFieldLength(size))?;
+        let mut record = take_bytes(&mut blob, size)?;
+
+        take_bytes(&mut record, 1)?; // attributes
+        skip_varint(&mut record, MAX_VARLONG_BYTES)?; // timestamp delta
+        skip_varint(&mut record, MAX_VARINT_BYTES)?; // offset delta
+        skip_field(&mut record)?; // key
+        skip_field(&mut record)?; // value
+
+        let count = take_varint(&mut record)?;
+        let holds = usize::try_from(count)
+            .map_err(|_| RecordCodecError::HeaderCountTooLarge {
+                count,
+                limit: record.len(),
+            })?
+            .saturating_mul(MIN_HEADER_BYTES);
+        if holds > record.len() {
+            return Err(RecordCodecError::HeaderCountTooLarge {
+                count,
+                limit: record.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reads a zigzag varint, five bytes at most, the way `kafka_protocol` reads one.
+fn take_varint(buf: &mut &[u8]) -> Result<i32> {
+    let mut value = 0u32;
+    for index in 0..MAX_VARINT_BYTES {
+        let byte = take_bytes(buf, 1)?[0];
+        value |= u32::from(byte & 0x7f) << (index * 7);
+        if byte < 0x80 {
+            break;
+        }
+    }
+    Ok((value >> 1).cast_signed() ^ -(value & 1).cast_signed())
+}
+
+/// Steps over a zigzag varint of up to `most` bytes, for the fields the scan does not read.
+fn skip_varint(buf: &mut &[u8], most: usize) -> Result<()> {
+    for _ in 0..most {
+        if take_bytes(buf, 1)?[0] < 0x80 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn take_bytes<'a>(buf: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
+    let (head, rest) = buf
+        .split_at_checked(len)
+        .ok_or(RecordCodecError::RecordTruncated)?;
+    *buf = rest;
+    Ok(head)
+}
+
+/// A length-prefixed record field, where `-1` is the absent one Kafka writes for a null.
+fn skip_field(buf: &mut &[u8]) -> Result<()> {
+    let len = take_varint(buf)?;
+    if len < -1 {
+        return Err(RecordCodecError::RecordFieldLength(len));
+    }
+    if len > 0 {
+        take_bytes(buf, usize::try_from(len).unwrap_or_default())?;
+    }
+    Ok(())
 }
 
 /// Kafka's snappy, and raw snappy for the producers that send it.
@@ -1370,7 +1521,11 @@ mod tests {
             panic!("a 4 MB output against a 1 KB budget has to be refused");
         };
         drop(error);
-        let Some((produced, remaining)) = budget.overflow.take() else {
+        let Some(RecordCodecError::BudgetExceeded {
+            produced,
+            remaining,
+        }) = budget.reason.take()
+        else {
             panic!("the budget is what refused it");
         };
         assert_eq!(remaining, 1024);
@@ -1389,10 +1544,10 @@ mod tests {
         let mut compressed = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0x0f, 0x00]);
         let budget = DecompressionBudget::new(1024);
         assert!(decompress(&mut compressed, Compression::Snappy, &budget).is_err());
-        assert_eq!(
-            budget.overflow.take().map(|(produced, _)| produced),
-            Some(u32::MAX as usize)
-        );
+        assert!(matches!(
+            budget.reason.take(),
+            Some(RecordCodecError::BudgetExceeded { produced, .. }) if produced == u32::MAX as usize
+        ));
     }
 
     #[test]
@@ -1432,6 +1587,163 @@ mod tests {
             decode_batches(&mut blob.freeze(), &budget),
             Err(RecordCodecError::RecordCountTooLarge { .. })
         ));
+    }
+
+    /// A one-record v2 batch whose record body declares `headers` headers and carries none.
+    ///
+    /// Built by hand because no encoder writes that, and it is the shape that reaches
+    /// `IndexMap::with_capacity` inside kafka-protocol.
+    fn batch_declaring_headers(headers: i32) -> Bytes {
+        fn put_varint(buf: &mut BytesMut, value: i32) {
+            let mut zigzag = ((value << 1) ^ (value >> 31)).cast_unsigned();
+            while zigzag >= 0x80 {
+                buf.put_u8(u8::try_from(zigzag & 0x7f).unwrap() | 0x80);
+                zigzag >>= 7;
+            }
+            buf.put_u8(u8::try_from(zigzag).unwrap());
+        }
+
+        let mut record = BytesMut::new();
+        record.put_u8(0); // attributes
+        put_varint(&mut record, 0); // timestamp delta
+        put_varint(&mut record, 0); // offset delta
+        put_varint(&mut record, -1); // null key
+        put_varint(&mut record, -1); // null value
+        put_varint(&mut record, headers);
+
+        let mut records = BytesMut::new();
+        put_varint(&mut records, i32::try_from(record.len()).unwrap());
+        records.extend_from_slice(&record);
+
+        // Everything from the attributes field on, which is what the CRC covers.
+        let mut body = BytesMut::new();
+        body.put_i16(0); // attributes: no compression, CreateTime
+        body.put_i32(0); // last offset delta
+        body.put_i64(CREATE_TIME); // first timestamp
+        body.put_i64(CREATE_TIME); // max timestamp
+        body.put_i64(NO_PRODUCER_ID);
+        body.put_i16(NO_PRODUCER_EPOCH);
+        body.put_i32(NO_SEQUENCE);
+        body.put_i32(1); // record count
+        body.extend_from_slice(&records);
+
+        let mut batch = BytesMut::new();
+        batch.put_i64(0); // base offset
+        batch.put_i32(i32::try_from(body.len() + 9).unwrap()); // batch length, from leader epoch on
+        batch.put_i32(NO_PARTITION_LEADER_EPOCH);
+        batch.put_i8(BATCH_VERSION);
+        batch.put_u32(crc32c::crc32c(&body));
+        batch.extend_from_slice(&body);
+        batch.freeze()
+    }
+
+    #[test]
+    fn given_a_header_count_past_the_record_when_decoded_should_reject() {
+        // The batch header says one record, so the record count bound passes. The count that
+        // matters is the one inside the record, and no batch header reports it.
+        let mut batch = batch_declaring_headers(i32::MAX);
+        let budget = DecompressionBudget::new(8 * 1024 * 1024);
+
+        assert!(
+            matches!(
+                decode_batches(&mut batch, &budget),
+                Err(RecordCodecError::HeaderCountTooLarge { count, .. }) if count == i32::MAX
+            ),
+            "this reserve is resident memory, not address space"
+        );
+    }
+
+    #[test]
+    fn given_a_hand_built_batch_when_its_header_count_fits_should_decode() {
+        // The same builder with a count the record can hold, so the scan cannot be passing the
+        // test above by rejecting every hand-built batch.
+        let mut batch = batch_declaring_headers(0);
+        let budget = DecompressionBudget::new(1024);
+        assert_eq!(decode_batches(&mut batch, &budget).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn given_records_carrying_headers_when_round_tripped_should_keep_them() {
+        // Exercises the header framing the scan walks, on a batch an encoder wrote.
+        let mut with_headers = vec![record_with(
+            Some(b"k"),
+            Some(b"v"),
+            &[("trace", Some(b"abc"))],
+        )];
+        let mut encoded = encode_batch(&mut with_headers).unwrap();
+        let budget = DecompressionBudget::new(1024);
+
+        let decoded = decode_batches(&mut encoded, &budget).unwrap();
+        assert_eq!(
+            decoded[0].headers.get(&StrBytes::from_static_str("trace")),
+            Some(&Some(Bytes::from_static(b"abc")))
+        );
+    }
+
+    #[test]
+    fn given_an_uncompressed_batch_when_preflighting_should_not_grant_it_the_budget() {
+        // One record's worth of bytes, declaring far more records than it holds. The budget is
+        // the documented 8 MiB, which an uncompressed batch has no claim on.
+        let batch = encode_batch(&mut [record_at_offset(0, b"v")]).unwrap();
+        let mut patched = patch_header(&batch, 57, &100_000i32.to_be_bytes());
+        let budget = DecompressionBudget::new(8 * 1024 * 1024);
+
+        assert!(matches!(
+            decode_batches(&mut patched, &budget),
+            Err(RecordCodecError::RecordCountTooLarge { limit, .. }) if limit == batch.len()
+        ));
+    }
+
+    #[test]
+    fn given_two_key_kinds_naming_one_header_on_a_gateway_message_when_read_should_fail() {
+        let mut headers = BTreeMap::new();
+        headers.insert(header_key(VERSION_HEADER), header_value(&[MAPPING_VERSION]));
+        headers.insert(header_key("kafka.h.trace"), header_value(b"string"));
+        headers.insert(
+            HeaderKey::from_raw(HeaderKind::Raw, b"kafka.h.trace").unwrap(),
+            header_value(b"raw"),
+        );
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"v"))
+            .user_headers(headers)
+            .build()
+            .unwrap();
+
+        assert!(
+            matches!(
+                from_iggy(&message, 0),
+                Err(RecordCodecError::HeaderNameCollision(_))
+            ),
+            "to_iggy writes one key kind, so a collision means the message is not what it claims"
+        );
+    }
+
+    #[test]
+    fn given_two_key_kinds_naming_one_header_on_an_iggy_message_when_read_should_keep_one() {
+        let mut headers = BTreeMap::new();
+        headers.insert(header_key("trace"), header_value(b"string"));
+        headers.insert(
+            HeaderKey::from_raw(HeaderKind::Raw, b"trace").unwrap(),
+            header_value(b"raw"),
+        );
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"v"))
+            .user_headers(headers)
+            .build()
+            .unwrap();
+
+        let record = from_iggy(&message, 0).unwrap();
+        assert_eq!(
+            record.headers.len(),
+            1,
+            "a Record keys headers in an IndexMap, so the pair cannot both survive"
+        );
+        assert!(
+            record
+                .headers
+                .contains_key(&StrBytes::from_static_str("trace")),
+            "refusing the message instead would stall the partition for every Kafka consumer"
+        );
     }
 
     #[test]

@@ -78,6 +78,18 @@ The native path is versioned for a second reason. It is the storage form for nea
 and open questions 2 and 3 below can still change it. Without a version on the stored message, a
 change to either one decodes older records wrongly and gives no way to notice.
 
+What `kafka.v` does not give is enforcement. It is a claim the message makes. The server keeps no
+namespace for it, so an Iggy writer can set `kafka.v` to a version no build implements. Every read
+of that message then fails. Fetch cannot serve a record it cannot decode, and a Kafka consumer
+cannot step over one. One such message therefore stalls the partition for every Kafka consumer.
+
+This is the open end of the provenance design, and it belongs to Fetch rather than to the mapping.
+The handler in [#3536](https://github.com/apache/iggy/issues/3536) owns the policy for a message
+the mapping refuses. Two shapes are on the table. Skipping serves the records around it and
+leaves a gap, which Kafka consumers already tolerate on a compacted topic. Its cost is that a
+message goes missing with no signal. Quarantining records the offset and surfaces a metric. Its
+cost is somewhere to keep the record. Neither is decided here.
+
 ### Timestamps
 
 Kafka carries a record timestamp in milliseconds. Iggy carries `origin_timestamp` in
@@ -221,11 +233,26 @@ Fetch writes one batch per response rather than one per record. The encoder grou
 response. The record constructor leaves `sequence` at `-1` on every record. That breaks the group
 on every record, and each one then carries its own 61-byte batch header.
 
-Produce reads every batch header before it decodes a record. The header's record count is four
-bytes a client chooses, and upstream checks it for sign alone. `RecordBatchDecoder` then reserves
-from it (`kafka-protocol-0.18.0/src/records.rs:517`), so a 61-byte batch declaring `i32::MAX`
-records asks for 377 GB. The records can come to no more than the frame plus what the
-decompression budget still allows. A count that needs more is refused before anything decodes.
+Two counts in a batch drive an allocation, and upstream checks each one for sign alone. Both are
+bounded here, in different places, because no single place can see them both.
+
+The batch header's record count sits in the header, and `RecordBatchDecoder` reserves a `Vec` from
+it (`kafka-protocol-0.18.0/src/records.rs:517`). A 61-byte batch declaring `i32::MAX` records asks
+for 377 GB. Produce reads every batch header before it decodes a record and refuses a count the
+blob cannot produce. That ceiling is the blob's own length. If something in the blob is
+compressed, the decompression budget is added to it. An uncompressed batch's records are already
+in the blob, and granting it the budget as well lets a 70-byte batch declare a million records.
+
+The per-record header count sits inside a record body, as a varint, so no batch header reports it
+and the header pass cannot see it. `Record::decode_new` reserves an `IndexMap` from it
+(`kafka-protocol-0.18.0/src/records.rs:896`), and that allocation is resident rather than virtual,
+because hashbrown writes its control bytes. A 72-byte batch declaring one record and `i32::MAX`
+headers aborts the process. Produce therefore walks the record bytes in the decompression step,
+which runs for every batch including an uncompressed one. It refuses a header count the record's
+own bytes cannot hold, at two length varints per header.
+
+Neither bound changes the ratio between a minimal wire record and a decoded `Record`. A
+legitimate request of small records pays that ratio too.
 
 Produce decompresses gzip, snappy, lz4 and zstd batches. `gateways/kafka/Cargo.toml` turns those
 four features on for `kafka-protocol` and the workspace entry stays on `broker` alone, so the
@@ -283,6 +310,22 @@ There is no fallback for this, because the gateway cannot tell whether a record'
 carries meaning. The envelope does preserve order, since it stores the headers as a list, but a
 record only reaches the envelope for one of the reasons above. A consumer that depends on header
 order therefore sees a different order through the gateway than a real broker would give it.
+
+### Header name collisions
+
+An Iggy header key is bytes plus a kind, and the key orders on kind before bytes
+(`core/common/src/types/message/user_headers.rs:209`). Two keys holding the same bytes under
+different kinds are therefore two stored headers. A Kafka header name is a string, so both map to
+one name.
+
+Kafka carries headers as a list and holds both. A `kafka_protocol` `Record` keys them in an
+`IndexMap`, so nothing here keeps the pair, and the later key in stored order wins.
+
+On a message the gateway wrote this cannot happen, because `to_iggy` writes one key kind. Fetch
+therefore refuses such a message, rather than dropping a header from it quietly. On a message an
+Iggy client wrote it can happen, and Fetch keeps one header and loses the other. Refusing that
+message lets one Iggy writer stall the partition for every Kafka consumer of it, which is the
+worse of the two.
 
 ## Partitioning
 
