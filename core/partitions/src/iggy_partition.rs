@@ -28,7 +28,9 @@ use crate::offset_storage::{
     persist_offset, persist_offset_max, persist_purge_generation_with_storage,
     read_purge_generation,
 };
-use crate::persistence::{PartitionPersistence, PersistenceCompletion, PersistenceNotifier};
+use crate::persistence::{
+    CheckpointBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
+};
 use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
     PollTier, ResidentTailSnapshot,
@@ -1033,19 +1035,21 @@ where
                 return;
             }
         }
-        if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref)
-            && let Err(error) = writer.fsync().await
-        {
-            error!(%error, namespace_raw = self.namespace().inner(), "partition checkpoint index sync failed");
-            self.fatal = Some(FatalCommit {
-                namespace_raw: self.namespace().inner(),
-                op: through_op,
-                operation: Operation::SendMessages,
-            });
-            return;
+        let mut barriers = Vec::new();
+        if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref) {
+            if let Err(error) = writer.fsync().await {
+                error!(%error, namespace_raw = self.namespace().inner(), "partition checkpoint index sync failed");
+                self.fatal = Some(FatalCommit {
+                    namespace_raw: self.namespace().inner(),
+                    op: through_op,
+                    operation: Operation::SendMessages,
+                });
+                return;
+            }
+            barriers.push(CheckpointBarrier::already_synced(writer.path()));
         }
         let (files, directories) = self.persistence_checkpoint_files(config);
-        persistence.checkpoint_files(through_op, files, directories);
+        persistence.checkpoint_files(through_op, files, directories, barriers);
         self.start_persistence();
     }
 
