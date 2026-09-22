@@ -8206,7 +8206,16 @@ where
             self.repair = None;
             return RepairConclusion::Done;
         }
-        if let Some(floor) = session.floor {
+        // A floor at or below the live commit point is moot: it cannot move
+        // `commit_min`, so nothing below it is skipped and the connection
+        // check has no jump to guard. Verifying it could only refuse: below
+        // `commit_to_op` the window never proved complete, because the ops
+        // between the floor and `commit_min` are committed with their headers
+        // evicted, and at `commit_to_op` the empty window refused outright.
+        if let Some(floor) = session
+            .floor
+            .filter(|&floor| floor > self.consensus().commit_min())
+        {
             // A peer may have evicted past this replica's commit frontier;
             // an unclamped floor would drive commit_min above commit_max and
             // panic the next advance.
@@ -8280,8 +8289,7 @@ where
                 }
                 return RepairConclusion::InProgress;
             }
-            let commit_min = self.consensus().commit_min();
-            if floor > commit_min {
+            if floor > self.consensus().commit_min() {
                 self.consensus().set_commit_floor(floor);
             }
         }
@@ -15667,6 +15675,72 @@ mod tests {
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_some());
     }
+
+    /// A `RangeEvicted` floor arrives above `commit_min`, and the walk passes
+    /// it before `RepairDone` lands: ops resident just above the commit point
+    /// committed and their headers were evicted. Verifying that moot floor
+    /// refused every round (evicted headers never complete the window) while
+    /// the walk inside the refusal ran `commit_min` to the fetch ceiling, and
+    /// the reply handler asked the peer for `fetch_to_op + 1 ..= fetch_to_op`.
+    #[compio::test]
+    async fn given_floor_below_commit_min_when_completing_repair_should_ignore_the_floor() {
+        let mut partition = test_partition();
+        partition.consensus().restore_commit_state(7, 8);
+        // Disconnected on its face: the served window starts at offset 20 and
+        // the boot-recovered segments end at 10. Meaningless below commit_min.
+        partition.recovered_durable_offset = Some(10);
+        journal_prepare(&partition, 8, Operation::CreateStream).await;
+        partition.repair = Some(armed_session(8, 5, Some(20)));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::Done);
+        assert_eq!(partition.consensus().commit_min(), 8);
+        assert!(
+            partition.repair.is_none(),
+            "nothing is left to fetch, so the session must close instead of \
+             re-requesting past its ceiling"
+        );
+    }
+
+    #[compio::test]
+    async fn given_floor_clamped_to_commit_min_when_completing_repair_should_still_refuse() {
+        let mut partition = test_partition();
+        partition.consensus().restore_commit_state(5, 5);
+        // The peer retains nothing below op 10, so it cannot serve the suffix
+        // either. Only the raw floor tells this apart from a moot one.
+        partition.repair = Some(armed_fetch_session(5, 9, 9, None));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 5, to_op: 5 },
+            "a floor the clamp pulls down to commit_min still names an evicted \
+             range and must escape to state transfer"
+        );
+        assert!(partition.repair.is_none());
+    }
+
+    #[compio::test]
+    async fn given_moot_floor_with_unfetched_suffix_when_completing_repair_should_keep_repairing() {
+        let mut partition = test_partition();
+        partition.consensus().restore_commit_state(5, 5);
+        // The peer retains from op 6, everything this replica still needs, so
+        // the suffix fetch must go on. Escaping to state transfer here copied
+        // segments for a window the peer can serve.
+        partition.repair = Some(armed_fetch_session(5, 9, 5, None));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        let session = partition.repair.expect("the suffix fetch stays armed");
+        assert!(
+            partition.consensus().commit_min() < session.fetch_to_op,
+            "the stall retry must still have a range to ask for"
+        );
+    }
+
     /// Temp partition directory for the state-transfer fence specs below.
     async fn transfer_fence_dir(label: &str) -> String {
         let dir = std::env::temp_dir().join(format!(

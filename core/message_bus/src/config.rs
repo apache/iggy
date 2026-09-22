@@ -138,6 +138,12 @@ pub struct MessageBusConfig {
     /// validator; undersize or oversize frames are rejected.
     pub max_message_size: usize,
 
+    /// Read-ahead buffer per plaintext replica link, in bytes. Threaded
+    /// into `TcpTransportConn::with_replica_read` by the replica
+    /// installer; zero selects the unbuffered read path. The client
+    /// plane and the TLS-family transports ignore it.
+    pub replica_read_buffer_size: usize,
+
     /// Bound on each replica peer's mpsc queue. The writer task drains; the
     /// `send_to_*` path enqueues. Too small drops under burst; too
     /// large delays backpressure signalling.
@@ -216,6 +222,8 @@ impl From<&ServerConfig> for MessageBusConfig {
             max_batch: bus.max_batch,
             max_message_size: usize::try_from(bus.max_message_size.as_bytes_u64())
                 .expect("message_bus.max_message_size fits usize on supported targets"),
+            replica_read_buffer_size: usize::try_from(bus.replica_read_buffer_size.as_bytes_u64())
+                .expect("message_bus.replica_read_buffer_size fits usize on supported targets"),
             peer_queue_capacity: bus.peer_queue_capacity,
             client_queue_capacity: bus.client_queue_capacity,
             reconnect_period: bus.reconnect_period.get_duration(),
