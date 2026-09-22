@@ -137,61 +137,60 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 /// One topic's bridge-lookup outcome, decided once per distinct name in [`resolve_all_topics`]
 /// and reused for every partition of that topic in [`resolve_one_partition`].
 enum TopicLookup {
-    /// A real `high_watermarks` call was made and returned.
+    /// A real `high_watermarks` call was made and returned - or every partition requested was an
+    /// invalid index and there was nothing to call `high_watermarks` for, which is `Ok(vec![])`
+    /// as far as [`resolve_one_partition`] is concerned (every partition in it fails its own
+    /// `u32::try_from` before ever consulting this).
     Watermarks(HighWatermarksResult),
-    /// No partition of this topic asked for [`LATEST_TIMESTAMP`] or [`EARLIEST_TIMESTAMP`], so no
-    /// call was made at all - every partition here answers
-    /// [`ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT`] regardless of what a lookup would have returned.
-    NoLookupNeeded,
     /// Beyond [`MAX_BRIDGE_BACKED_TOPICS`], or the deadline elapsed before this topic's turn - no
     /// call was made. Answered [`ERROR_REQUEST_TIMED_OUT`] (retriable) rather than
     /// [`ERROR_INVALID_REQUEST`] so a client's own per-topic retry narrows the batch on its own.
     NotAttempted,
 }
 
-/// Dedupes `requested` by topic name, merging every entry's partitions and noting - per name -
-/// whether any partition asked for [`LATEST_TIMESTAMP`] or [`EARLIEST_TIMESTAMP`].
+/// Dedupes `requested` by topic name, merging every entry's partitions.
 ///
 /// `order` preserves first-seen order so the topic cap in [`resolve_topic_lookups`] keeps a
 /// deterministic prefix of the request rather than an arbitrary hash-order subset.
-fn group_requested_topics(
-    requested: &[ListOffsetsTopic],
-) -> (Vec<&str>, HashMap<&str, Vec<u32>>, HashSet<&str>) {
+///
+/// Deliberately does *not* skip a topic based on what timestamp its partitions ask for: the only
+/// place this bridge checks whether a topic exists at all is the `get_topic` call
+/// `high_watermarks` makes internally, so a topic whose partitions all ask an unsupported
+/// timestamp still needs that same call to tell a nonexistent topic
+/// (`ERROR_UNKNOWN_TOPIC_OR_PARTITION`) apart from an existing one with an unsupported timestamp
+/// (`ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT`) - skipping it would report the latter for both.
+fn group_requested_topics(requested: &[ListOffsetsTopic]) -> (Vec<&str>, HashMap<&str, Vec<u32>>) {
     let mut order: Vec<&str> = Vec::new();
     let mut partitions_by_name: HashMap<&str, Vec<u32>> = HashMap::new();
-    let mut needs_lookup: HashSet<&str> = HashSet::new();
     for topic in requested {
         let name = topic.name.as_str();
         if !partitions_by_name.contains_key(name) {
             order.push(name);
         }
         let entry = partitions_by_name.entry(name).or_default();
-        for p in &topic.partitions {
-            if let Ok(index) = u32::try_from(p.partition_index) {
-                entry.push(index);
-            }
-            if matches!(p.timestamp, LATEST_TIMESTAMP | EARLIEST_TIMESTAMP) {
-                needs_lookup.insert(name);
-            }
-        }
+        let valid = topic
+            .partitions
+            .iter()
+            .filter_map(|p| u32::try_from(p.partition_index).ok());
+        entry.extend(valid);
     }
     for partitions in partitions_by_name.values_mut() {
         partitions.sort_unstable();
         partitions.dedup();
     }
-    (order, partitions_by_name, needs_lookup)
+    (order, partitions_by_name)
 }
 
 /// Resolves one [`TopicLookup`] per name in `order`: [`TopicLookup::NotAttempted`] beyond
-/// [`MAX_BRIDGE_BACKED_TOPICS`] or once `deadline` has passed, [`TopicLookup::NoLookupNeeded`]
-/// when `needs_lookup` excludes the name, otherwise a real `high_watermarks` call wrapped in
-/// [`tokio::time::timeout_at`] against `deadline` so a topic already resolved when time runs out
-/// keeps its real answer.
+/// [`MAX_BRIDGE_BACKED_TOPICS`] or once `deadline` has passed, otherwise a real `high_watermarks`
+/// call wrapped in [`tokio::time::timeout_at`] against `deadline` so a topic already resolved
+/// when time runs out keeps its real answer. A topic with no *valid* partition index at all
+/// skips the call - there is nothing `high_watermarks` could tell us that would change any
+/// partition's answer, since every one of them already fails its own index check.
 async fn resolve_topic_lookups<'a>(
     bridge: &IggyBridge,
     order: &[&'a str],
     partitions_by_name: &HashMap<&'a str, Vec<u32>>,
-    needs_lookup: &HashSet<&'a str>,
     deadline: Instant,
 ) -> HashMap<&'a str, TopicLookup> {
     let accepted: HashSet<&str> = order
@@ -218,8 +217,9 @@ async fn resolve_topic_lookups<'a>(
             lookups.insert(name, TopicLookup::NotAttempted);
             continue;
         }
-        if !needs_lookup.contains(name) {
-            lookups.insert(name, TopicLookup::NoLookupNeeded);
+        let partitions = partitions_by_name[name].as_slice();
+        if partitions.is_empty() {
+            lookups.insert(name, TopicLookup::Watermarks(Ok(Vec::new())));
             continue;
         }
         if deadline_exceeded || Instant::now() >= deadline {
@@ -235,7 +235,6 @@ async fn resolve_topic_lookups<'a>(
             continue;
         }
 
-        let partitions = partitions_by_name[name].as_slice();
         let result =
             match tokio::time::timeout_at(deadline, bridge.high_watermarks(name, partitions)).await
             {
@@ -278,9 +277,8 @@ async fn resolve_all_topics(
     requested: &[ListOffsetsTopic],
     deadline: Instant,
 ) -> Vec<ListOffsetsTopicResponse> {
-    let (order, partitions_by_name, needs_lookup) = group_requested_topics(requested);
-    let lookups =
-        resolve_topic_lookups(bridge, &order, &partitions_by_name, &needs_lookup, deadline).await;
+    let (order, partitions_by_name) = group_requested_topics(requested);
+    let lookups = resolve_topic_lookups(bridge, &order, &partitions_by_name, deadline).await;
 
     requested
         .iter()
@@ -317,14 +315,6 @@ fn resolve_one_partition(
     let results = match lookup {
         TopicLookup::NotAttempted => {
             return error_response(requested.partition_index, ERROR_REQUEST_TIMED_OUT);
-        }
-        // By construction (`needs_lookup` in `resolve_all_topics`) every partition of a topic in
-        // this state has a non-sentinel timestamp, so there is nothing to branch on here.
-        TopicLookup::NoLookupNeeded => {
-            return error_response(
-                requested.partition_index,
-                ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT,
-            );
         }
         TopicLookup::Watermarks(Err(call_err)) => {
             return error_response(requested.partition_index, call_err.to_kafka_error_code());
@@ -476,13 +466,14 @@ mod tests {
     }
 
     #[test]
-    fn a_topic_with_no_partition_needing_a_lookup_skips_the_bridge_call() {
-        let resp = resolve_one_partition(
-            &partition(0, 1_700_000_000_000),
-            &TopicLookup::NoLookupNeeded,
-        );
-        assert_eq!(resp.error_code, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT);
-        assert_eq!(resp.offset, NO_OFFSET);
+    fn a_nonexistent_topic_is_unknown_regardless_of_the_requested_timestamp() {
+        // Regression for the NoLookupNeeded design this replaced: existence is only ever
+        // established by the high_watermarks call itself, so a call-level error must win over
+        // the timestamp branch even when the requested timestamp is unsupported - the call is
+        // never skipped just because nothing would use its watermark.
+        let lookup = TopicLookup::Watermarks(Err(BridgeError::Timeout));
+        let resp = resolve_one_partition(&partition(0, 1_700_000_000_000), &lookup);
+        assert_eq!(resp.error_code, BridgeError::Timeout.to_kafka_error_code());
     }
 
     #[test]

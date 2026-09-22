@@ -305,6 +305,61 @@ async fn a_topic_named_in_two_request_entries_resolves_both_entries_correctly() 
     }
 }
 
+/// Regression test: the binary search in `resolve_one_partition` must map each partition index to
+/// *its own* watermark, not just pass when both happen to agree. The two-empty-partitions test
+/// above can't catch a broken search or a constant-index bug - both partitions are 0 either way.
+#[tokio::test]
+#[serial]
+async fn distinct_partitions_resolve_to_their_own_distinct_watermarks() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed a 2-partition topic");
+
+    let raw = iggy_server::raw_client(&server).await;
+    let stream_id = Identifier::named("kafka").expect("valid stream name");
+    let topic_id = Identifier::named("orders").expect("valid topic name");
+    let mut partition_0: Vec<IggyMessage> = (0..3)
+        .map(|i| IggyMessage::from(format!("p0-{i}")))
+        .collect();
+    raw.send_messages(
+        &stream_id,
+        &topic_id,
+        &Partitioning::partition_id(0),
+        &mut partition_0,
+    )
+    .await
+    .expect("seed partition 0 with 3 messages");
+    let mut partition_1: Vec<IggyMessage> = (0..7)
+        .map(|i| IggyMessage::from(format!("p1-{i}")))
+        .collect();
+    raw.send_messages(
+        &stream_id,
+        &topic_id,
+        &Partitioning::partition_id(1),
+        &mut partition_1,
+    )
+    .await
+    .expect("seed partition 1 with 7 messages");
+
+    let topics = [TopicRequest {
+        name: "orders",
+        partitions: &[(1, LATEST_TIMESTAMP), (0, LATEST_TIMESTAMP)], // deliberately out of index order
+    }];
+    let results = send_multi(&state, &topics).await;
+    assert_eq!(results.len(), 2);
+    for (_, partition_index, error_code, offset) in &results {
+        assert_eq!(*error_code, ERROR_NONE);
+        let expected = if *partition_index == 0 { 3 } else { 7 };
+        assert_eq!(
+            *offset, expected,
+            "partition {partition_index} got the wrong watermark"
+        );
+    }
+}
+
 /// Regression test: a request naming more than the bridge-backed topic cap must be rejected
 /// wholesale (every entry, `INVALID_REQUEST`) rather than partially served or left unbounded.
 #[tokio::test]
