@@ -15,12 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::CREATED_REVISION_FILE;
+use std::collections::BTreeSet;
+use std::io;
+use std::path::Path;
+
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
-use std::io;
-use std::path::Path;
+
+#[cfg(feature = "simulator")]
+use crate::persistence::CheckpointBarrier;
+use crate::CREATED_REVISION_FILE;
 
 const BACKUP: &str = ".install-backup";
 const BUILDING: &str = ".install-building";
@@ -58,7 +63,7 @@ pub async fn recover_with_storage<S: DurableStorage>(
         }
         storage.remove_tree(&directory.join(&entry.name)).await?;
     }
-    link_tree(&backup, directory, false, storage).await?;
+    link_tree(&backup, directory, false, &BTreeSet::new(), storage).await?;
     finish_with_storage(directory, storage).await
 }
 
@@ -80,6 +85,28 @@ pub async fn begin_with_storage<S: DurableStorage>(
     directory: &Path,
     storage: &S,
 ) -> io::Result<()> {
+    begin_with_synced_files(directory, BTreeSet::new(), storage).await
+}
+
+#[cfg(feature = "simulator")]
+pub async fn begin_with_storage_and_barriers<S: DurableStorage>(
+    directory: &Path,
+    barriers: Vec<CheckpointBarrier>,
+    storage: &S,
+) -> io::Result<()> {
+    let synced_files =
+        futures::future::try_join_all(barriers.into_iter().map(CheckpointBarrier::run))
+            .await?
+            .into_iter()
+            .collect();
+    begin_with_synced_files(directory, synced_files, storage).await
+}
+
+async fn begin_with_synced_files<S: DurableStorage>(
+    directory: &Path,
+    synced_files: BTreeSet<std::path::PathBuf>,
+    storage: &S,
+) -> io::Result<()> {
     if storage.exists(&directory.join(BACKUP)).await? {
         return Err(io::Error::other("partition install recovery is pending"));
     }
@@ -87,7 +114,7 @@ pub async fn begin_with_storage<S: DurableStorage>(
     storage.remove_tree(&building).await?;
     storage.remove_tree(&directory.join(RETIRED)).await?;
     storage.create_directories(&building).await?;
-    link_tree(directory, &building, true, storage).await?;
+    link_tree(directory, &building, true, &synced_files, storage).await?;
     storage.rename(&building, &directory.join(BACKUP)).await?;
     storage.sync_directory(directory).await
 }
@@ -122,6 +149,7 @@ async fn link_tree<S: DurableStorage>(
     source: &Path,
     target: &Path,
     skip_scratch: bool,
+    synced_files: &BTreeSet<std::path::PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     let mut pending = vec![(source.to_path_buf(), target.to_path_buf())];
@@ -150,12 +178,15 @@ async fn link_tree<S: DurableStorage>(
             } else {
                 // Transfer unlinks or atomically replaces these frozen files.
                 // Hard links retain the old bytes without copying segment data.
-                storage.hard_link(&source.join(&name), &destination).await?;
-                storage
-                    .open(&destination, OpenMode::Read)
-                    .await?
-                    .sync()
-                    .await?;
+                let source_file = source.join(&name);
+                storage.hard_link(&source_file, &destination).await?;
+                if !synced_files.contains(&source_file) {
+                    storage
+                        .open(&destination, OpenMode::Read)
+                        .await?
+                        .sync()
+                        .await?;
+                }
             }
         }
     }
