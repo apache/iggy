@@ -136,7 +136,8 @@ Permissions Permissions::FromFfi(ffi::Permissions permissions) {
 
 UserInfo UserInfo::FromFfi(ffi::UserInfo user) {
     return UserInfo(user.id, user.created_at, static_cast<UserStatus>(user.status),
-                    std::string(user.username.c_str(), user.username.size()));
+                    std::string(user.username.c_str(), user.username.size()),
+                    ResourceOptions::FromFfi(std::move(user.options), rust::Vec<ffi::HeaderEntry>{}));
 }
 
 UserInfoDetails UserInfoDetails::FromFfi(ffi::UserInfoDetails user) {
@@ -145,7 +146,8 @@ UserInfoDetails UserInfoDetails::FromFfi(ffi::UserInfoDetails user) {
         permissions = ::iggy::Permissions::FromFfi(std::move(user.permissions));
     }
     return UserInfoDetails(user.id, user.created_at, static_cast<UserStatus>(user.status),
-                           std::string(user.username.c_str(), user.username.size()), std::move(permissions));
+                           std::string(user.username.c_str(), user.username.size()), std::move(permissions),
+                           ResourceOptions::FromFfi(std::move(user.options), rust::Vec<ffi::HeaderEntry>{}));
 }
 
 ffi::Identifier Identifier::ToFfi() const {
@@ -338,7 +340,7 @@ Stats Stats::FromFfi(ffi::Stats stats) {
     std::vector<CacheMetricEntry> cache_metrics;
     cache_metrics.reserve(stats.cache_metrics.size());
     for (auto &entry : stats.cache_metrics) {
-        cache_metrics.push_back(CacheMetricEntry::FromFfi(std::move(entry)));
+        cache_metrics.push_back(CacheMetricEntry::FromFfi(entry));
     }
     return Stats(stats.process_id, stats.cpu_usage, stats.total_cpu_usage, stats.memory_usage, stats.total_memory,
                  stats.available_memory, stats.run_time_micros, stats.start_time_epoch_micros, stats.read_bytes,

@@ -365,7 +365,8 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW((void)client.GetUsers(), iggy::IggyException);
     EXPECT_THROW((void)client.CreateUser("user", "secret123", iggy::UserStatus::Active), iggy::IggyException);
     EXPECT_THROW(client.DeleteUser(stream), iggy::IggyException);
-    EXPECT_THROW(client.UpdateUser(stream, "updated-user", iggy::UserStatus::Active), iggy::IggyException);
+    EXPECT_THROW(client.UpdateUser(stream, "updated-user", iggy::UserStatus::Active, iggy::UserUpdateOptions{}),
+                 iggy::IggyException);
     EXPECT_THROW(client.CreateStream("stream"), iggy::IggyException);
     EXPECT_THROW(client.UpdateStream(stream, "updated-stream"), iggy::IggyException);
     EXPECT_THROW(client.GetStreams(), iggy::IggyException);
