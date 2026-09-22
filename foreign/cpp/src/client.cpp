@@ -137,10 +137,13 @@ void IggyBlockingClient::DeleteUser(const Identifier &user) {
 
 void IggyBlockingClient::UpdateUser(const Identifier &user,
                                     const std::optional<std::string> username,
-                                    const std::optional<UserStatus> status) {
-    RethrowAsIggyException([this, &user, &username, status] {
+                                    const std::optional<UserStatus> status,
+                                    const UserUpdateOptions &options) {
+    RethrowAsIggyException([this, &user, &username, status, &options] {
+        auto ffi_options = ToFfiRawOptions(options.RawEntries());
         Handle()->update_user(user.ToFfi(), username.has_value(), username.value_or(""), status.has_value(),
-                              static_cast<ffi::UserStatus>(status.value_or(UserStatus::Active)));
+                              static_cast<ffi::UserStatus>(status.value_or(UserStatus::Active)),
+                              std::move(ffi_options));
     });
 }
 
