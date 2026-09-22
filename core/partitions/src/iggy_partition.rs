@@ -1760,6 +1760,9 @@ where
                 });
                 return;
             }
+            // [`IggyIndexWriter::fsync`] used the original descriptor above.
+            // The marker tells [`PartitionPersistence::checkpoint_files`] not
+            // to replace that proof with a fresh-handle sync.
             barriers.push(CheckpointBarrier::already_synced(writer.path()));
         }
         if let Err(error) = self.persist_retry_checkpoint(through_op).await {
@@ -1778,6 +1781,8 @@ where
         self.start_persistence();
     }
 
+    /// Queue original-writer syncs before the install backup is published.
+    /// This runs even when the checkpoint frontier cannot advance.
     pub(crate) fn barrier_install_files_locked(&self) {
         let Some(persistence) = &self.persistence else {
             return;
