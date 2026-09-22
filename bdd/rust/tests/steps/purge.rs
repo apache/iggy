@@ -16,20 +16,19 @@
 // under the License.
 
 use crate::common::purge_context::PurgeContext;
+use crate::helpers::env::{root_password, root_username, server_address};
 use crate::helpers::test_data::create_test_messages;
 use cucumber::{given, then, when};
 use iggy::prelude::{
-    Client, ClientWrapper, Consumer, ConsumerKind, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
-    Identifier, IggyError, IggyExpiry, MessageClient, Partitioning, PollingStrategy, StreamClient,
-    SystemClient, TcpClient, TcpClientConfig, TopicClient, TopicCreateOptions, UserClient,
+    Client, ClientWrapper, Consumer, ConsumerKind, Identifier, IggyError, IggyExpiry,
+    MessageClient, Partitioning, PollingStrategy, StreamClient, SystemClient, TcpClient,
+    TcpClientConfig, TopicClient, TopicCreateOptions, UserClient,
 };
 use std::sync::Arc;
 
 #[given("I have a running Iggy server")]
 pub async fn given_running_server(world: &mut PurgeContext) {
-    let server_addr =
-        std::env::var("IGGY_TCP_ADDRESS").unwrap_or_else(|_| "localhost:8090".to_string());
-    world.server_addr = Some(server_addr);
+    world.server_addr = Some(server_address());
 }
 
 #[given("I am authenticated as the root user")]
@@ -55,7 +54,7 @@ pub async fn given_authenticated_as_root(world: &mut PurgeContext) {
 
     client.ping().await.expect("Server should respond to ping");
     client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .login_user(&root_username(), &root_password())
         .await
         .expect("Failed to login as root");
 

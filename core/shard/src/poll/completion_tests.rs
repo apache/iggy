@@ -26,6 +26,7 @@ use consensus::{
     ClientTable, MetadataHandle, PartitionsHandle, Sequencer, SessionEnd, build_reply_message_with,
 };
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+use iggy_binary_protocol::requests::streams::PurgeStreamRequest;
 use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, PurgeTopicRequest};
 use iggy_binary_protocol::{AckLevel, ReplyHeader, RoutedRequestHeader, WireConsumer};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader, WireEncode, WireIdentifier};
@@ -281,6 +282,92 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 "new polls must wait until the committed purge is materialized"
             );
         }
+    }
+}
+
+#[compio::test]
+async fn given_committed_purge_when_polling_should_reject_unapplied_history() {
+    for (operation, body) in [
+        (
+            Operation::PurgeTopic,
+            PurgeTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            }
+            .to_bytes(),
+        ),
+        (
+            Operation::PurgeStream,
+            PurgeStreamRequest {
+                stream_id: WireIdentifier::numeric(0),
+            }
+            .to_bytes(),
+        ),
+    ] {
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+        let mut inner = StreamsInner::default();
+        let mut stream = Stream::default();
+        let mut topic = Topic::default();
+        topic.partitions.push(Partition::new(
+            0,
+            namespace.inner(),
+            IggyTimestamp::default(),
+            0,
+            0,
+        ));
+        stream.topics.insert(topic);
+        inner.items.insert(stream);
+        let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
+        let (owner, _owner_sender) = owner_with_metadata(&bus, config, namespace, metadata);
+        owner.plane.partitions().insert(namespace, partition);
+        let (_stop, stop) = channel(1);
+        let pump = owner.run_message_pump(stop, Arc::new(AtomicBool::new(false)));
+        futures::pin_mut!(pump);
+
+        let before_purge = queue_resident_poll(&owner, namespace);
+        assert!(futures::poll!(pump.as_mut()).is_pending());
+        assert_single_message_reply(&before_purge);
+
+        let pending = queue_resident_poll(&owner, namespace);
+        apply_poll_metadata(&owner, operation, body);
+        assert!(futures::poll!(pump.as_mut()).is_pending());
+        let pending_reply = pending
+            .try_recv()
+            .expect("owner completed the pending read");
+
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(
+                namespace,
+                PartitionRead::Poll {
+                    consumer: PollingConsumer::ConsumerGroup(1, 0),
+                    args: PollingArgs {
+                        strategy: PollingStrategy::first(),
+                        count: 1,
+                        auto_commit: true,
+                    },
+                },
+                reply,
+            )
+            .await;
+        let new_reply = replies.try_recv().expect("owner completed the new read");
+
+        for reply in [pending_reply, new_reply] {
+            assert!(
+                matches!(
+                    reply,
+                    PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                ),
+                "{operation:?}: an acknowledged purge must fence old messages before cleanup, got {reply:?}"
+            );
+        }
+        assert_eq!(
+            owner.plane.partitions().group_offset_state(&namespace, 1),
+            Some((None, None)),
+            "rejected polls must not advance group progress or commit offsets"
+        );
     }
 }
 

@@ -28,10 +28,6 @@ import (
 	"github.com/google/uuid"
 )
 
-func defaultServerAddress() string {
-	return env.ServerAddress()
-}
-
 func connectToServer(ctx context.Context, addr string) (iggcon.Client, error) {
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
@@ -85,7 +81,7 @@ func sendTestMessages(
 		return nil, err
 	}
 	partitioning := iggcon.PartitionId(partitionID)
-	if err = cli.SendMessages(ctx, streamID, topicID, partitioning, messages); err != nil {
+	if _, err = cli.SendMessages(ctx, streamID, topicID, partitioning, messages); err != nil {
 		return nil, fmt.Errorf("failed to send messages: %w", err)
 	}
 	last := messages[len(messages)-1]

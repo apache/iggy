@@ -70,6 +70,7 @@ func TestFeatures(t *testing.T) {
 			Options: &godog.Options{
 				Format:   "pretty",
 				Paths:    []string{"../../scenarios/stream_topic_purge.feature"},
+				Strict:   true,
 				TestingT: t,
 			},
 		})

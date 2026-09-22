@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/cucumber/godog"
@@ -46,7 +47,7 @@ type purgeSteps struct{}
 
 func (s purgeSteps) givenRunningServer(ctx context.Context) error {
 	c := getPurgeCtx(ctx)
-	cli, err := connectToServer(ctx, defaultServerAddress())
+	cli, err := connectToServer(ctx, env.ServerAddress())
 	if err != nil {
 		return err
 	}

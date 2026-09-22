@@ -116,15 +116,6 @@ run_suite(){
     esac
   fi
 
-  if [ "$FEATURE" = "stream_topic_purge" ]; then
-    case "$svc" in
-      rust-bdd|go-bdd) ;;
-      *)
-        unsupported "$FEATURE" "$svc" || return 1
-        return 0 ;;
-    esac
-  fi
-
   if [ "$FEATURE" = "stream_crud" ]; then
     case "$svc" in
       rust-bdd|java-bdd) ;;
