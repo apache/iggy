@@ -3010,6 +3010,8 @@ where
             InstallPhase::Drain => {
                 if let Some(persistence) = &self.persistence {
                     if install.drain.is_none() {
+                        // Checkpoint syncs may be skipped when the frontier is unchanged.
+                        // The backup still needs proof from each original writer.
                         self.barrier_install_files_locked();
                         install.disposition = InstallDisposition::Backup;
                     }
