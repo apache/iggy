@@ -17,3 +17,4 @@
 
 mod doris_sink;
 mod doris_stream_load_format_bench;
+mod proto_text;

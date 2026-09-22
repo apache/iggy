@@ -59,11 +59,14 @@ max_open_retries = 5
 JSON object payloads are indexed as documents. JSON arrays or scalar values are
 wrapped in a `value` field because Meilisearch documents must be objects. Raw
 payloads are parsed as JSON when possible; otherwise, they are indexed as base64
-data. Text payloads are indexed in a `text` field. Unsupported payload schemas
-are skipped with a warning and counted in the plugin's private error counter.
-The callback returns success after these drops, so runtime statistics can count
-those records as processed. Offsets are auto-committed while polling, before
-indexing completes. There is no built-in dead-letter queue for these drops.
+data. Text payloads are indexed in a `text` field. Proto payloads holding a JSON
+document, which is what the descriptor-less `proto_convert` fallback produces,
+are indexed as that document; proto text that is not JSON is indexed in the
+`text` field alongside text payloads. Avro and FlatBuffer payloads are skipped
+with a warning and counted in the plugin's private error counter. The callback
+returns success after these drops, so runtime statistics can count those records
+as processed. Offsets are auto-committed while polling, before indexing
+completes. There is no built-in dead-letter queue for these drops.
 
 When the configured primary key is absent, the connector injects a stable value
 derived from the exact Iggy stream, topic, partition, offset, and message ID.
