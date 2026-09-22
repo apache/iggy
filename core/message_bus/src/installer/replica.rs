@@ -123,12 +123,16 @@ pub fn install_replica_inbound(
         async move {
             match ctx.tls.clone() {
                 None => {
+                    let read_buffer = bus.config().replica_read_buffer_size;
+                    let read_stats = bus.replica_read_stats();
                     accept_and_install(
                         &bus,
                         stream,
                         &ctx,
                         ChannelBinding::Plaintext,
-                        TcpTransportConn::new,
+                        move |stream| {
+                            TcpTransportConn::new(stream).with_replica_read(read_buffer, read_stats)
+                        },
                         on_message,
                         &peer,
                     )
@@ -232,13 +236,17 @@ pub fn install_replica_outbound(
         async move {
             match ctx.tls.clone() {
                 None => {
+                    let read_buffer = bus.config().replica_read_buffer_size;
+                    let read_stats = bus.replica_read_stats();
                     dial_and_install(
                         &bus,
                         stream,
                         &ctx,
                         peer_id,
                         ChannelBinding::Plaintext,
-                        TcpTransportConn::new,
+                        move |stream| {
+                            TcpTransportConn::new(stream).with_replica_read(read_buffer, read_stats)
+                        },
                         on_message,
                     )
                     .await

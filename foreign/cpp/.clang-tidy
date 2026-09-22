@@ -1,0 +1,49 @@
+Checks: [
+  '*',
+  '-altera-unroll-loops',
+  '-bugprone-easily-swappable-parameters',
+  '-fuchsia-default-arguments-calls',
+  '-fuchsia-default-arguments-declarations',
+  '-fuchsia-trailing-return',
+  '-llvm-header-guard',
+  '-llvmlibc-callee-namespace',
+  '-llvmlibc-implementation-in-namespace',
+  '-llvmlibc-inline-function-decl',
+  '-llvmlibc-restrict-system-libc-headers',
+  '-misc-include-cleaner',
+  '-modernize-return-braced-init-list',
+  '-modernize-use-trailing-return-type',
+  '-cppcoreguidelines-rvalue-reference-param-not-moved'
+]
+
+WarningsAsErrors: '*'
+
+HeaderFileExtensions:
+- 'hpp'
+
+ImplementationFileExtensions:
+- 'cpp'
+
+HeaderFilterRegex: '.*\.hpp$'
+
+CheckOptions:
+  readability-identifier-naming.ClassCase: CamelCase
+  readability-identifier-naming.EnumCase: CamelCase
+  readability-identifier-naming.LocalVariableCase: lower_case
+  readability-identifier-naming.StaticConstantCase: aNy_CasE
+  readability-identifier-naming.MemberCase: lower_case
+  readability-identifier-naming.MemberSuffix: '_'
+  readability-identifier-naming.PrivateMemberSuffix: '_'
+  readability-identifier-naming.ProtectedMemberSuffix: '_'
+  readability-identifier-naming.PublicMemberCase: lower_case
+  readability-identifier-naming.PublicMemberSuffix: '_'
+  readability-identifier-naming.MethodCase: CamelCase
+  readability-identifier-naming.ParameterPackCase: lower_case
+  readability-identifier-naming.StructCase: CamelCase
+  readability-identifier-naming.TemplateTemplateParameterCase: CamelCase
+  readability-identifier-naming.TemplateParameterCase: lower_case
+  readability-identifier-naming.TypeTemplateParameterCase: CamelCase
+  readability-identifier-naming.TypedefCase: CamelCase
+  readability-identifier-naming.UnionCase: CamelCase
+  readability-identifier-length.MinimumParameterNameLength: 2
+  readability-identifier-length.MinimumVariableNameLength: 2
