@@ -51,7 +51,9 @@ jobs:
             This pull request was automatically closed because it has been
             inactive for 14 days. Feel free to reopen it if you'd like to
             continue working on it.
-          exempt-pr-labels: "pinned"
+          # S-waiting-on-review means the next move is ours, not the author's,
+          # so the inactivity clock should not run against them.
+          exempt-pr-labels: "pinned,S-waiting-on-review"
           exempt-draft-pr: true
           days-before-issue-stale: -1
           days-before-issue-close: -1

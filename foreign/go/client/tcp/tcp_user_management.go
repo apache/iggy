@@ -70,6 +70,9 @@ func (c *IggyTcpClient) UpdateUser(ctx context.Context, userID iggcon.Identifier
 		Username: username,
 		Status:   status,
 	})
+	if err == nil && username != nil {
+		c.refreshCredentials(userID, username, nil)
+	}
 	return err
 }
 
@@ -94,5 +97,42 @@ func (c *IggyTcpClient) ChangePassword(ctx context.Context, userID iggcon.Identi
 		CurrentPassword: currentPassword,
 		NewPassword:     newPassword,
 	})
+	if err == nil {
+		c.refreshCredentials(userID, nil, &newPassword)
+	}
 	return err
+}
+
+func (c *IggyTcpClient) refreshCredentials(userID iggcon.Identifier, username, password *string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	oldUsername := c.rememberedLogin.credentials.username
+	self := c.rememberedLogin.enabled && matchesUser(userID, c.sessionUserID, oldUsername)
+	configured := c.config.autoLogin.enabled &&
+		((self && oldUsername == c.config.autoLogin.credentials.username) ||
+			matchesUser(userID, 0, c.config.autoLogin.credentials.username) && userID.Kind() == iggcon.StringId)
+	for _, login := range []struct {
+		value   *AutoLogin
+		matches bool
+	}{{&c.rememberedLogin, self}, {&c.config.autoLogin, configured}} {
+		if !login.matches || login.value.credentials.personalAccessToken != "" {
+			continue
+		}
+		if username != nil {
+			login.value.credentials.username = *username
+		}
+		if password != nil {
+			login.value.credentials.password = *password
+		}
+	}
+	c.publishPollSession()
+}
+
+func matchesUser(identifier iggcon.Identifier, userID uint32, username string) bool {
+	if identifier.Kind() == iggcon.NumericId {
+		value, err := identifier.Uint32()
+		return err == nil && value == userID
+	}
+	value, err := identifier.String()
+	return err == nil && value == username
 }

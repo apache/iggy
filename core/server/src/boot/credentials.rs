@@ -111,7 +111,9 @@ fn create_root_credentials() -> (String, String) {
     let password = crypto::generate_secret(20..40);
     // Through tracing, not stdout: this is the only time the operator can read
     // the password, so it has to reach the log file too.
-    warn!("Generated root user password: {password}");
+    warn!(
+        "Generated root user password: {password}. It is shown only once. To reset it, stop the server and delete the data directory, or start the server with --fresh. Both delete all stored data."
+    );
     (
         DEFAULT_ROOT_USERNAME.to_string(),
         crypto::hash_password(&password),

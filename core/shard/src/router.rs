@@ -747,6 +747,30 @@ where
                 self.bus
                     .install_client_ws_fd(fd, meta, self.on_client_request.clone());
             }
+            LifecycleFrame::ClientTcpTlsConnectionSetup { fd, meta, config } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated TCP-TLS client fd (pre-handshake)"
+                );
+                self.bus.install_client_tcp_tls_fd(
+                    fd,
+                    meta,
+                    config,
+                    self.on_client_request.clone(),
+                );
+            }
+            LifecycleFrame::ClientWssConnectionSetup { fd, meta, config } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated WSS client fd (pre-handshake)"
+                );
+                self.bus
+                    .install_client_wss_fd(fd, meta, config, self.on_client_request.clone());
+            }
             LifecycleFrame::ForwardReplicaSend { replica_id, msg } => {
                 if let Err(e) = self.bus.send_to_replica(replica_id, msg).await {
                     tracing::debug!(
@@ -802,13 +826,27 @@ where
             } => {
                 self.on_partition_read(namespace, read, reply).await;
             }
-            LifecycleFrame::PartitionSubmit { request, reply } => {
+            LifecycleFrame::PartitionSubmit {
+                request,
+                reply,
+                attachment,
+            } => {
                 // Addressed to the shard owning the request's namespace (the
                 // sender resolved it via the shards table, same fallback as
                 // `route_typed`). Every refusal answers on `reply`, so the
                 // awaiting shard never waits out its budget on a decision
                 // already made.
-                self.on_partition_submit(request, reply).await;
+                if let Some(attachment) = attachment
+                    && let Err(error) = self.validate_offset_attachment(&request, &attachment)
+                {
+                    let deny = consensus::build_deny_reply_from_request_header(
+                        request.header(),
+                        error.as_code(),
+                    );
+                    let _ = reply.try_send(Some(deny.into_generic()));
+                } else {
+                    self.on_partition_submit(request, reply).await;
+                }
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or

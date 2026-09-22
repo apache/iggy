@@ -27,7 +27,6 @@ use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
 use message_bus::BusMessage;
 use message_bus::client_listener::RequestHandler;
-use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
 use message_bus::replica::io::start_on_shard_zero;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
@@ -92,7 +91,7 @@ async fn start_on_shard_zero_wss_round_trip() {
         None,
         None,
         Some(accepted_wss),
-        DEFAULT_RECONNECT_PERIOD,
+        bus.config().reconnect_period,
     )
     .await
     .expect("start_on_shard_zero must succeed")

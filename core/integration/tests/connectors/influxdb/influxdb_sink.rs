@@ -26,8 +26,7 @@ use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::json;
 
-// seeds::connector_stream creates the topic with 1 partition (Iggy partition IDs are 1-based).
-// Use Partitioning::balanced() so the runtime picks partition 1 automatically.
+// The seed creates one partition; balanced partitioning selects it.
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
@@ -230,8 +229,7 @@ async fn influxdb_sink_multiple_partitions(harness: &TestHarness, fixture: Influ
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
-    // Topic has only 1 partition — send 3 messages via balanced partitioning
-    // (they all go to partition 1, which is correct for a 1-partition topic).
+    // All three messages use the single seeded partition.
     for i in 1u32..=3 {
         let payload = serde_json::to_vec(&json!({"msg_index": i})).expect("Failed to serialize");
         let mut messages = vec![

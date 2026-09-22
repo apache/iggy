@@ -45,6 +45,17 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 Run from your application crate. Use a release compatible with your server; for
 unreleased changes, build the SDK and server from the same source checkout.
 
+Cluster auto-commit polling requires servers that support consumer session
+attachment and primary poll routing (binary commands 14, 103 and 104).
+Rust manual and interval offset writes also require command 123. It discovers
+the primary while allowing final commits for partitions awaiting handoff;
+stores and deletes retain their existing wire formats and deduplication keys. Pause
+binary auto-commit consumers during this upgrade, upgrade every server first,
+then upgrade the SDKs and restart the consumers so they join their groups again.
+Older SDKs can lose group membership when a backup refuses an offset commit;
+the new SDK does not fall back to that path on an older server.
+HTTP clients use server-side forwarding and need no new routing commands.
+
 ```bash
 cargo add iggy
 ```

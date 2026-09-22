@@ -532,14 +532,10 @@ repair_chunk_max = 128
 # cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
 
-# DOWNGRADE, every deployment: this release grew the superblock record from 66
-# to 74 bytes to carry partition.offset_reservation_lease's claim. The metadata
-# superblock is written by EVERY server, clustered or not, so upgrading rewrites
-# it at the new length on a plain single node too. A build that predates the
-# field refuses a record of that length and treats the refusal as a durability
-# violation, which fails the whole node's boot -- so rolling BACK to
-# server-0.9.0-edge.6 or earlier needs the data directory wiped on every node.
-# Upgrading needs nothing: the 66-byte record still decodes.
+# Superblock compatibility: 74-byte records include the partition offset
+# reservation frontier; legacy 66-byte records remain readable. Every server
+# writes a metadata superblock, including standalone deployments. Builds
+# without this field reject the larger record and cannot boot from it.
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
@@ -722,11 +718,11 @@ pin_cores = true
 
 # Per-shard inter-shard inbox capacity (the main lane: consensus frames,
 # connection setup, reconcile wakes). Bounded by design; consensus-frame
-# drops recover via VSR retransmit. Size for the consensus working set:
-# ~ the prepare queue depth of the planes the shard hosts ([metadata] on
-# shard 0, [partition] elsewhere) times replica_count times directions.
-# Both depths are tunable, so raising either raises the capacity needed here.
-inbox_capacity = 1024
+# drops recover via VSR retransmit. Size for the combined consensus traffic of
+# all groups hosted by the shard, including replica fan-out and burst headroom.
+# Per-group prepare queue depth alone does not determine this capacity.
+# Slots are allocated at startup per shard, even before traffic arrives.
+inbox_capacity = 65536
 
 # Capacity of the reply lane: a separate bounded channel for cross-shard
 # client-reply forwards, whose drops are terminal (no in-protocol
@@ -912,6 +908,9 @@ clients_table_max = 8192
 # completed batch, prepare, checkpoint and error counters.
 # partition_wal_retained_bytes plus queued_bytes and in_flight_bytes measures budget usage;
 # partition_wal_disk_bytes measures WAL file length, excluding referenced segment bodies.
+# partition_wal_prepares over partition_wal_batches is the prepares per durable group, and
+# partition_wal_group_commit_waits counts the groups that actually took the optional wait
+# below, so a delay that never fires is distinguishable from one that fires and buys nothing.
 wal_bytes_max = "256 MiB"
 
 # Bounded wait for more prepares before a persisted partition's WAL writer
@@ -984,8 +983,7 @@ consumer_offsets_max = 4096
 # journaled it, so re-minting there needs a full-cluster crash; it claims
 # nothing, pays no write, and ignores this value.
 #
-# DOWNGRADE: see the note on superblock_wedged_fatal_timeout in [cluster].
-# Upgrading needs nothing.
+# For superblock compatibility, see superblock_wedged_fatal_timeout in [cluster].
 offset_reservation_lease = 65536
 
 # Entries the evicted ring retains per multi-replica partition for journal
@@ -993,12 +991,15 @@ offset_reservation_lease = 65536
 # served from the ring before falling back to bulk sync, at the cost of pinned
 # memory per partition. Must be > 0 and <= 65536. Single-replica partitions
 # retain nothing regardless.
-evicted_ring_capacity = 4096
+evicted_ring_capacity = 65536
 
-# Byte ceiling for the evicted ring per partition; whichever ring cap (this or
-# evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
-# large batches can pin. Must be > 0 and <= "256 MiB".
-evicted_ring_bytes_max = "16 MiB"
+# Payload-byte ceiling per partition and replica; the first ring cap reached
+# evicts the lowest ops, retaining the newest entry even if it alone exceeds
+# this budget. Must be > 0 and <= "256 MiB". Allocation capacity, alignment and
+# index overhead are additional memory, especially for small offset commits.
+# There is no node-wide budget. partition_repair_ring_bytes reports payload
+# bytes summed across a shard's partitions, not their allocated memory or RSS.
+evicted_ring_bytes_max = "64 MiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core
@@ -1056,12 +1057,36 @@ max_batch = 256
 # also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
 
-# Bound on the per-peer mpsc queue. The writer task drains; the
+# Read-ahead buffer per plaintext replica link. The framing layer decodes every
+# complete frame a fill delivered, and a fill takes what the socket holds rather
+# than waiting for a full buffer. 0 selects the unbuffered path (one read per
+# header, one per body), and so do unlimited and none, which the byte-size parser
+# reads as 0. No-op under cluster.tls.
+#
+# A read at least this size that starts on an empty buffer goes straight to the
+# socket. The bypass needs an empty buffer, so a body between one and two buffers
+# crosses the buffer whole, and a body of two buffers or more crosses it for about
+# one buffer.
+#
+# 32 KiB holds 128 PrepareOks or 8 average Prepares of one burst. It sits below the
+# kernel's default receive buffer (tcp_rmem[1], 128 KiB), which autotuning grows
+# further once the reader falls behind: a backlog then costs several reads rather
+# than one. That is the trade this value sets, fewer bytes copied per Prepare
+# against a lower batching factor under backlog. Boot rejects a nonzero value
+# outside 4 KiB..16 MiB.
+replica_read_buffer_size = "32 KiB"
+
+# Bound on each replica peer's mpsc queue. The writer task drains; the
 # send_to_* path enqueues.
-peer_queue_capacity = 256
+peer_queue_capacity = 4096
+
+# Each SDK connection allocates separate inbound and outbound queues.
+# Keep their capacity independent of replica repair bursts.
+client_queue_capacity = 256
 
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
-reconnect_period = "5 s"
+# Also bounds each dial, so a peer that drops SYNs cannot stall the sweep.
+reconnect_period = "1 s"
 
 # Timeout for per-peer close drain (flush writer, tear down reader)
 # before force-cancellation.

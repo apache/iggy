@@ -191,7 +191,7 @@ jobs:
         if: inputs.use_latest_ci
         run: |
           # Download the copy script from master branch
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -374,7 +374,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -413,15 +413,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "## 🏷️ Tag Existence Check" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🏷️ Tag Existence Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
-            echo "### ℹ️ Tag Creation Disabled" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Tag creation has been explicitly disabled for this run." >> $GITHUB_STEP_SUMMARY
-            echo "Components will be published without creating git tags." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ℹ️ Tag Creation Disabled" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Tag creation has been explicitly disabled for this run." >> "$GITHUB_STEP_SUMMARY"
+            echo "Components will be published without creating git tags." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           TARGETS_JSON='${{ needs.plan.outputs.targets }}'
@@ -430,8 +430,22 @@ jobs:
           NEW_TAGS=()
           WRONG_TARGET_TAGS=()  # populated when a tag exists at a commit != this run's target
 
-          echo "| Component | Version | Tag | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|---------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          # Every tag step is gated on dry_run == false at job or step level, and
+          # skip_tag_creation suppresses the tag push, so neither mode may
+          # render the "Will create" cell that promises a real tag write.
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            NEW_TAG_CELL="🔍 Would create (dry run)"
+            NEW_TAG_LOG="🔍 Tag would be created (dry run):"
+          elif [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+            NEW_TAG_CELL="ℹ️ Would create (tag creation disabled)"
+            NEW_TAG_LOG="ℹ️ Tag would be created (tag creation disabled):"
+          else
+            NEW_TAG_CELL="✅ Will create"
+            NEW_TAG_LOG="✅ Tag will be created:"
+          fi
+
+          echo "| Component | Version | Tag | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|---------|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
 
           # Process substitution (not pipe) so EXISTING_TAGS / NEW_TAGS
           # mutations survive the loop: `jq | while ...` puts the loop
@@ -466,7 +480,7 @@ jobs:
             SHOULD_TAG=$(scripts/extract-version.sh "$KEY" --should-tag 2>/dev/null || echo "false")
             if [ "$SHOULD_TAG" = "false" ]; then
               echo "ℹ️ $NAME: no tag will be created (SNAPSHOT or no tag_pattern)"
-              echo "| $NAME | $VERSION | _(none)_ | ℹ️ No tag (SNAPSHOT / no pattern) |" >> $GITHUB_STEP_SUMMARY
+              echo "| $NAME | $VERSION | _(none)_ | ℹ️ No tag (SNAPSHOT / no pattern) |" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
 
@@ -476,14 +490,14 @@ jobs:
             if [ "${{ inputs.create_edge_docker_tag }}" = "true" ] && [ "$REGISTRY" = "dockerhub" ]; then
               if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
                 echo "⏭️ $NAME: Stable Docker version in auto-publish mode, tag will be skipped"
-                echo "| $NAME | $VERSION | $TAG | ⏭️ Stable (manual publish only) |" >> $GITHUB_STEP_SUMMARY
+                echo "| $NAME | $VERSION | $TAG | ⏭️ Stable (manual publish only) |" >> "$GITHUB_STEP_SUMMARY"
                 continue
               fi
             fi
 
             if [ "$VERSION" = "ERROR" ] || [ "$TAG" = "ERROR" ]; then
               echo "❌ Failed to extract version/tag for $NAME"
-              echo "| $NAME | ERROR | ERROR | ❌ Failed to extract |" >> $GITHUB_STEP_SUMMARY
+              echo "| $NAME | ERROR | ERROR | ❌ Failed to extract |" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
 
@@ -514,7 +528,7 @@ jobs:
               # exit 1 below cannot trigger.
               if [ "${{ inputs.create_edge_docker_tag }}" = "true" ]; then
                 echo "ℹ️ $NAME: $TAG already exists at $SHORT_SHA - already released, run will refresh :edge only"
-                echo "| $NAME | $VERSION | $TAG | ℹ️ Already released ($SHORT_SHA) - :edge refresh only |" >> $GITHUB_STEP_SUMMARY
+                echo "| $NAME | $VERSION | $TAG | ℹ️ Already released ($SHORT_SHA) - :edge refresh only |" >> "$GITHUB_STEP_SUMMARY"
               # Fail-fast on wrong-target for MANUAL publish. A wrong-target tag
               # means create-git-tag would hard-fail 20-40 minutes later after
               # publishing artifacts to crates.io / PyPI / npm / Maven /
@@ -534,69 +548,74 @@ jobs:
                 WRONG_TARGET_TAGS+=("$TAG|$SHORT_SHA")
                 if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
                   echo "⚠️  Tag exists on remote at WRONG target: $TAG (points to $SHORT_SHA, not enforced: skip_tag_creation=true)"
-                  echo "| $NAME | $VERSION | $TAG | ⚠️ Wrong target at $SHORT_SHA (NOT enforced) |" >> $GITHUB_STEP_SUMMARY
+                  echo "| $NAME | $VERSION | $TAG | ⚠️ Wrong target at $SHORT_SHA (NOT enforced) |" >> "$GITHUB_STEP_SUMMARY"
                 else
                   echo "❌ Tag exists on remote at wrong target: $TAG (points to $SHORT_SHA)"
-                  echo "| $NAME | $VERSION | $TAG | ❌ Wrong target at $SHORT_SHA |" >> $GITHUB_STEP_SUMMARY
+                  echo "| $NAME | $VERSION | $TAG | ❌ Wrong target at $SHORT_SHA |" >> "$GITHUB_STEP_SUMMARY"
                 fi
               else
                 echo "⚠️  Tag exists on remote at same target: $TAG (points to $SHORT_SHA)"
-                echo "| $NAME | $VERSION | $TAG | ⚠️ Exists at $SHORT_SHA (benign) |" >> $GITHUB_STEP_SUMMARY
+                echo "| $NAME | $VERSION | $TAG | ⚠️ Exists at $SHORT_SHA (benign) |" >> "$GITHUB_STEP_SUMMARY"
               fi
             else
               NEW_TAGS+=("$TAG")
-              echo "✅ Tag will be created: $TAG"
-              echo "| $NAME | $VERSION | $TAG | ✅ Will create |" >> $GITHUB_STEP_SUMMARY
+              echo "$NEW_TAG_LOG $TAG"
+              echo "| $NAME | $VERSION | $TAG | $NEW_TAG_CELL |" >> "$GITHUB_STEP_SUMMARY"
             fi
           done < <(echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64')
 
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
           # Summary
           if [ ${#EXISTING_TAGS[@]} -gt 0 ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### ⚠️ Warning: Existing Tags Detected" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The following tags already exist on the remote:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ⚠️ Warning: Existing Tags Detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The following tags already exist on the remote:" >> "$GITHUB_STEP_SUMMARY"
             for tag in "${EXISTING_TAGS[@]}"; do
-              echo "- $tag" >> $GITHUB_STEP_SUMMARY
+              echo "- $tag" >> "$GITHUB_STEP_SUMMARY"
             done
-            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
 
             if [ "${{ inputs.dry_run }}" = "false" ]; then
               if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
-                echo "**Note:** Tag creation is disabled for this run." >> $GITHUB_STEP_SUMMARY
-                echo "Components will be (re)published, but no git tags will be pushed." >> $GITHUB_STEP_SUMMARY
+                echo "**Note:** Tag creation is disabled for this run." >> "$GITHUB_STEP_SUMMARY"
+                echo "Components will be (re)published, but no git tags will be pushed." >> "$GITHUB_STEP_SUMMARY"
               else
-                echo "**Tag behavior with \`create-git-tag\` (SHA-match invariant):**" >> $GITHUB_STEP_SUMMARY
-                echo "" >> $GITHUB_STEP_SUMMARY
-                echo "- If a pre-existing tag points at the SAME commit this run is publishing, the tag step is a no-op (benign skip). The artifact is (re)published; the tag stays." >> $GITHUB_STEP_SUMMARY
-                echo "- If a pre-existing tag points at a DIFFERENT commit, the tag step hard-fails with recovery instructions. The artifact publish still runs (registries are idempotent) but no tag is pushed." >> $GITHUB_STEP_SUMMARY
-                echo "" >> $GITHUB_STEP_SUMMARY
-                echo "To recover from a wrong-target tag:" >> $GITHUB_STEP_SUMMARY
-                echo "1. Verify the intended release commit." >> $GITHUB_STEP_SUMMARY
-                echo "2. Delete the existing tag on origin: \`git push --delete origin <tag>\`" >> $GITHUB_STEP_SUMMARY
-                echo "3. Rerun this workflow." >> $GITHUB_STEP_SUMMARY
-                echo "" >> $GITHUB_STEP_SUMMARY
-                echo "To republish without touching tags, set \`skip_tag_creation: true\` on the workflow dispatch." >> $GITHUB_STEP_SUMMARY
+                echo "**Tag behavior with \`create-git-tag\` (SHA-match invariant):**" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "- If a pre-existing tag points at the SAME commit this run is publishing, the tag step is a no-op (benign skip). The artifact is (re)published; the tag stays." >> "$GITHUB_STEP_SUMMARY"
+                echo "- If a pre-existing tag points at a DIFFERENT commit, the tag step hard-fails with recovery instructions. The artifact publish still runs (registries are idempotent) but no tag is pushed." >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "To recover from a wrong-target tag:" >> "$GITHUB_STEP_SUMMARY"
+                echo "1. Verify the intended release commit." >> "$GITHUB_STEP_SUMMARY"
+                echo "2. Delete the existing tag on origin: \`git push --delete origin <tag>\`" >> "$GITHUB_STEP_SUMMARY"
+                echo "3. Rerun this workflow." >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "To republish without touching tags, set \`skip_tag_creation: true\` on the workflow dispatch." >> "$GITHUB_STEP_SUMMARY"
               fi
             fi
           fi
 
           if [ ${#NEW_TAGS[@]} -eq 0 ] && [ ${#EXISTING_TAGS[@]} -gt 0 ]; then
-            echo "### ℹ️ No New Tags to Create" >> $GITHUB_STEP_SUMMARY
-            echo "All specified components are already tagged at some commit. If tags match this run's commit, the rerun converges cleanly. If not, see the wrong-target recovery above or bump versions." >> $GITHUB_STEP_SUMMARY
+            echo "### ℹ️ No New Tags to Create" >> "$GITHUB_STEP_SUMMARY"
+            echo "All specified components are already tagged at some commit. If tags match this run's commit, the rerun converges cleanly. If not, see the wrong-target recovery above or bump versions." >> "$GITHUB_STEP_SUMMARY"
           elif [ ${#NEW_TAGS[@]} -gt 0 ]; then
-            if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
-              echo "### ℹ️ Tags That Would Be Created (Skipped)" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "The following tags would be created if tag creation wasn't disabled:" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "### 🔍 Tags That Would Be Created (Dry Run)" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "The following tags would be created by a real run:" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            elif [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+              echo "### ℹ️ Tags That Would Be Created (Skipped)" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "The following tags would be created if tag creation wasn't disabled:" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "### ✅ Tags to be Created" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### ✅ Tags to be Created" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
             fi
             for tag in "${NEW_TAGS[@]}"; do
-              echo "- $tag" >> $GITHUB_STEP_SUMMARY
+              echo "- $tag" >> "$GITHUB_STEP_SUMMARY"
             done
           fi
 
@@ -627,7 +646,7 @@ jobs:
               echo "1. Delete the wrong tag(s) on origin: \`git push --delete origin <tag>\`"
               echo "2. Or bump the version(s) and rerun the workflow"
               echo "3. Or rerun with \`skip_tag_creation: true\` to republish artifacts only"
-            } >> $GITHUB_STEP_SUMMARY
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "❌ Wrong-target tags detected: ${WRONG_TARGET_TAGS[*]}"
             echo "See the Wrong-target tags block in the step summary for recovery steps."
             if [ "${{ inputs.skip_tag_creation }}" != "true" ]; then
@@ -689,7 +708,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -862,7 +881,7 @@ jobs:
           if ! command -v yq >/dev/null 2>&1; then
             YQ_VERSION="v4.47.1"
             YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
             echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
             chmod +x /usr/local/bin/yq
           fi
@@ -1015,7 +1034,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -1317,7 +1336,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"

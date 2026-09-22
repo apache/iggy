@@ -27,7 +27,7 @@ use journal::partition_journal::{
     PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference, record_length,
 };
 use journal::{DurableAppend, PartitionPrepareJournal};
-use partitions::{PartitionPersistence, install_backup};
+use partitions::{CheckpointBarrier, PartitionPersistence, PersistenceMetrics, install_backup};
 use server_common::send_messages::{
     BATCH_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
 };
@@ -36,6 +36,7 @@ use server_common::{
     Message,
     iobuf::{IOV_MAX, Owned},
 };
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
@@ -651,6 +652,7 @@ fn replacing_a_retained_offset_writer_keeps_both_inodes_until_checkpoint() {
             1,
             vec![path.to_path_buf()],
             vec![Path::new(DIRECTORY).to_path_buf()],
+            Vec::new(),
         );
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
@@ -730,6 +732,7 @@ fn checkpoint_skips_duplicate_offset_sync_but_still_refuses_a_missing_path() {
                 1,
                 vec![path.to_path_buf()],
                 vec![Path::new(DIRECTORY).to_path_buf()],
+                Vec::new(),
             );
             storage.clear_trace();
             assert!(persistence.start());
@@ -794,6 +797,39 @@ async fn interrupted_install() -> SimStorage {
     drop(journal);
     storage.crash(Crash::PowerLoss);
     storage
+}
+
+/// A hard link preserves the inode, not the writer's error cursor. Opening the
+/// backup name after writeback failed must not authorize destructive install.
+#[test]
+#[ignore = "`install_backup::link_tree` synchronizes hard links through handles opened after the writeback failure"]
+fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publication() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let path = Path::new("/partition/materialized");
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"pending".to_vec()).await.unwrap();
+        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        let result = install_backup::begin_with_storage(Path::new(DIRECTORY), &storage).await;
+
+        assert!(
+            writer.sync().await.is_err(),
+            "the original writer did not observe the injected writeback failure"
+        );
+        assert!(
+            result.is_err(),
+            "install backup published after synchronizing a fresh hard-link handle past the writeback error"
+        );
+        assert!(
+            !storage
+                .exists(Path::new("/partition/.install-backup"))
+                .await
+                .unwrap(),
+            "a failed backup was published"
+        );
+    });
 }
 
 #[test]
@@ -1113,7 +1149,12 @@ fn checkpoint_syncs_the_retained_writer_before_reclaiming_its_history() {
         );
         storage.remove_file(path).await.unwrap();
         persistence.retire_offset_file(path.to_str().unwrap());
-        persistence.checkpoint_files(4, Vec::new(), vec![Path::new(DIRECTORY).to_path_buf()]);
+        persistence.checkpoint_files(
+            4,
+            Vec::new(),
+            vec![Path::new(DIRECTORY).to_path_buf()],
+            Vec::new(),
+        );
         storage.fail_at(0, FaultMode::Before);
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
@@ -1141,10 +1182,12 @@ fn checkpoint_barriers_complete_before_wal_reclamation() {
             .unwrap();
         let mut file = storage.open(path, OpenMode::Create).await.unwrap();
         file.write(0, b"committed".to_vec()).await.unwrap();
+        let barrier = CheckpointBarrier::from_file(path, file);
         persistence.checkpoint_files(
             4,
             vec![path.to_path_buf()],
             vec![Path::new(DIRECTORY).to_path_buf()],
+            vec![barrier],
         );
         assert!(persistence.checkpoint_pending());
         assert!(!persistence.needs_checkpoint());
@@ -1184,7 +1227,7 @@ fn failed_materialization_keeps_wal_coverage_and_fences_completion() {
             } else {
                 (missing, Vec::new())
             };
-            persistence.checkpoint_files(4, files, directories);
+            persistence.checkpoint_files(4, files, directories, Vec::new());
             assert!(persistence.start());
             Rc::clone(&persistence).run().await;
             assert_eq!(
@@ -1209,6 +1252,7 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
         let (storage, mut journal) = baseline().await;
         storage.clear_trace();
         journal.checkpoint(2).await.unwrap();
+        journal.cleanup_obsolete().await;
         let unlink = storage
             .trace()
             .iter()
@@ -1218,6 +1262,7 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
             let (storage, mut journal) = baseline().await;
             storage.fail_at(unlink, FaultMode::Before);
             journal.checkpoint(2).await.unwrap();
+            journal.cleanup_obsolete().await;
             storage.clear_trace();
             let obsolete = Path::new("/partition/wal/prepares-0.wal");
             assert!(storage.exists(obsolete).await.unwrap());
@@ -1249,6 +1294,11 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
                     .append(prepare(4, parent).into_frozen())
                     .await
                     .unwrap();
+                // Reclamation is not on the append path: the append must not
+                // have waited on the retry, and the writer's own maintenance
+                // pass is what must still take it.
+                assert!(storage.exists(obsolete).await.unwrap());
+                journal.cleanup_obsolete().await;
             }
             assert!(!storage.exists(obsolete).await.unwrap());
             assert_eq!(journal.checkpoint_op(), 2);
@@ -1259,6 +1309,35 @@ fn obsolete_wal_generations_are_reclaimed_after_restart_and_failed_unlink() {
                 .op == 2
             }));
         }
+    });
+}
+
+#[test]
+fn checkpoint_notifies_before_reclaiming_its_obsolete_generation() {
+    block_on(async {
+        let (storage, persistence) = queued_batch(4).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        storage.clear_trace();
+        let notified = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&notified);
+        let observed_storage = storage.clone();
+        persistence.set_notifier(Rc::new(move |_| {
+            assert!(!observed_storage.trace().contains(&StorageOperation::Unlink));
+            observed.set(true);
+        }));
+        persistence.checkpoint(2);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(notified.get());
+        assert!(storage.trace().contains(&StorageOperation::Unlink));
+        assert_eq!(persistence.checkpoint_op(), 2);
+        storage.crash(Crash::PowerLoss);
+        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+            .await
+            .unwrap();
+        assert_eq!(recovered.head(), 4);
+        assert_eq!(recovered.checkpoint_op(), 2);
     });
 }
 
@@ -2198,7 +2277,7 @@ async fn assert_owned_segments(
     );
 }
 
-fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
+pub(super) fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
     let payload = vec![
         u8::try_from(op).unwrap();
         OWNED_BATCH_BYTES - BATCH_HEADER_SIZE - BATCH_MESSAGE_HEADER_SIZE
@@ -2721,7 +2800,6 @@ fn given_a_silent_short_write_when_recovering_then_the_record_should_be_refused(
 }
 
 #[test]
-#[ignore = "PR #4092 review: `checkpoint_files` syncs materialized files through a descriptor opened after the writeback failure, which samples errseq too late and reports success over lost bytes; it must sync through the writer that issued them"]
 fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_reclaimed() {
     block_on(async {
         let (storage, persistence) = queued_batch(4).await;
@@ -2730,6 +2808,7 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
         let path = Path::new("/partition/materialized");
         let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
         writer.write(0, b"committed".to_vec()).await.unwrap();
+        let barrier = CheckpointBarrier::from_file(path, writer);
 
         // The device drops the dirty pages before the checkpoint's barrier. The
         // writer that issued them is the only handle told; the descriptor
@@ -2740,6 +2819,7 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
             4,
             vec![path.to_path_buf()],
             vec![Path::new(DIRECTORY).to_path_buf()],
+            vec![barrier],
         );
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
@@ -2759,6 +2839,48 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
             0,
             "WAL history was reclaimed although its materialization never reached stable storage"
         );
+        assert_eq!(recovered.head(), 4);
+    });
+}
+
+#[test]
+fn given_multiple_writers_for_one_checkpoint_file_when_one_has_not_observed_the_writeback_failure_then_wal_history_should_not_be_reclaimed()
+ {
+    block_on(async {
+        let (storage, persistence) = queued_batch(4).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let path = Path::new("/partition/materialized");
+        let mut first_writer = storage.open(path, OpenMode::Create).await.unwrap();
+        first_writer.write(0, b"first".to_vec()).await.unwrap();
+        let mut second_writer = storage.open(path, OpenMode::ReadWrite).await.unwrap();
+        second_writer.write(5, b"second".to_vec()).await.unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        // Consuming the inode error through one file description must not let
+        // checkpoint skip another writer that still has the error pending.
+        assert!(first_writer.sync().await.is_err());
+        let barriers = vec![
+            CheckpointBarrier::from_file(path, first_writer),
+            CheckpointBarrier::from_file(path, second_writer),
+        ];
+        persistence.checkpoint_files(
+            4,
+            vec![path.to_path_buf()],
+            vec![Path::new(DIRECTORY).to_path_buf()],
+            barriers,
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+
+        assert!(persistence.failure().is_some());
+        assert_eq!(persistence.checkpoint_op(), 0);
+        storage.crash(Crash::PowerLoss);
+        let recovered =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        assert_eq!(recovered.checkpoint_op(), 0);
         assert_eq!(recovered.head(), 4);
     });
 }
@@ -2816,45 +2938,56 @@ fn given_an_interrupted_writer_when_the_process_restarts_then_the_partition_shou
 }
 
 #[test]
-#[ignore = "PR #4092 review: append coalescing is gated on message-body bytes, not the WAL extent, so batching is inert at the benchmarked batch sizes"]
 fn given_large_bodies_when_appending_then_wal_records_should_coalesce_into_one_barrier_group() {
     block_on(async {
         const PREPARES: u64 = 8;
-        let storage = storage_for_partition().await;
-        let (persistence, _) =
-            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
-                .await
-                .unwrap();
-        persistence.enable_segment_storage(
-            SegmentPosition::default(),
-            PREPARES * LARGE_BATCH_BYTES as u64,
-        );
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-        persistence.take_metrics();
-
-        let mut parent = 0;
-        for offset in 0..PREPARES {
-            let prepare = owned_prepare_sized(offset + 1, parent, offset, LARGE_BATCH_BYTES);
-            parent = prepare.header().checksum;
-            persistence.append(prepare.into_frozen(), true).unwrap();
-        }
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-
-        let metrics = persistence.take_metrics();
+        let metrics = large_body_batch_metrics(PREPARES).await;
         assert_eq!(metrics.batched_prepares, PREPARES);
         // Under segment references a record occupies one 4 KiB extent, so all
-        // eight fit far inside APPEND_BATCH_BYTES_MAX. The gate measures the
-        // message body instead, so each prepare takes its own barrier group.
+        // eight fit far inside the group-commit WAL byte budget.
         assert_eq!(
             metrics.completed_batches,
             1,
-            "coalescing is gated on body bytes, so {PREPARES} prepares paid {} barrier groups for {} bytes of WAL extent",
+            "{PREPARES} prepares paid {} barrier groups for {} bytes of WAL extent",
             metrics.completed_batches,
             PREPARES * PARTITION_WAL_BLOCK_SIZE as u64
         );
     });
+}
+
+#[test]
+fn given_segment_body_work_exceeds_the_limit_when_appending_then_the_batch_should_split() {
+    block_on(async {
+        const PREPARES: u64 = 9;
+        let metrics = large_body_batch_metrics(PREPARES).await;
+        assert_eq!(metrics.batched_prepares, PREPARES);
+        assert_eq!(metrics.completed_batches, 2);
+    });
+}
+
+async fn large_body_batch_metrics(prepares: u64) -> PersistenceMetrics {
+    let storage = storage_for_partition().await;
+    let (persistence, _) =
+        PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    persistence.enable_segment_storage(
+        SegmentPosition::default(),
+        prepares * LARGE_BATCH_BYTES as u64,
+    );
+    assert!(persistence.start());
+    Rc::clone(&persistence).run().await;
+    persistence.take_metrics();
+
+    let mut parent = 0;
+    for offset in 0..prepares {
+        let prepare = owned_prepare_sized(offset + 1, parent, offset, LARGE_BATCH_BYTES);
+        parent = prepare.header().checksum;
+        persistence.append(prepare.into_frozen(), true).unwrap();
+    }
+    assert!(persistence.start());
+    Rc::clone(&persistence).run().await;
+    persistence.take_metrics()
 }
 
 fn owned_prepare_sized(

@@ -41,6 +41,14 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
+For cluster auto-commit consumers, upgrade all servers and binary SDKs together.
+Pause those consumers, upgrade every server, then update their SDKs and restart
+them to rejoin their groups. Primary polling uses binary commands 14, 103 and
+104; routed manual and interval offset writes also use command 123.
+Older SDKs can lose membership when a backup refuses an offset commit,
+and new SDKs require servers supporting those commands. HTTP polling is
+forwarded by the server and keeps its existing client API.
+
 ## Systemd integration
 
 Build with the `systemd` feature to enable readiness and watchdog notifications:

@@ -296,7 +296,9 @@ impl Default for MessageBusConfig {
         MessageBusConfig {
             max_batch: bus.max_batch as usize,
             max_message_size: bus.max_message_size.parse().unwrap(),
+            replica_read_buffer_size: bus.replica_read_buffer_size.parse().unwrap(),
             peer_queue_capacity: bus.peer_queue_capacity as usize,
+            client_queue_capacity: bus.client_queue_capacity as usize,
             reconnect_period: bus.reconnect_period.parse().unwrap(),
             close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
             close_grace: bus.close_grace.parse().unwrap(),

@@ -24,7 +24,7 @@ mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
-pub use poll::PollCompleted;
+pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
@@ -58,7 +58,7 @@ use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
-use message_bus::{BusMessage, MessageBus};
+use message_bus::{BusMessage, MessageBus, SharedTlsServerConfig};
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
@@ -211,6 +211,12 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Logout preserves them so its caller can distinguish an unknown outcome
 /// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
+    AttachConsumerSession {
+        vsr_client_id: u128,
+        session: u64,
+        user_id: u32,
+        reply: Sender<Result<consensus::client_table::SessionAttachment, IggyError>>,
+    },
     Register {
         vsr_client_id: u128,
         user_id: u32,
@@ -326,6 +332,12 @@ const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// see [`IggyShard::partition_read`].
 #[derive(Debug)]
 pub enum PartitionRead {
+    Primary,
+    PollOnPrimary {
+        consumer: PollingConsumer,
+        args: PollingArgs,
+        attachment: poll::ConsumerAttachment,
+    },
     Poll {
         consumer: PollingConsumer,
         args: PollingArgs,
@@ -360,6 +372,7 @@ pub enum PartitionRead {
 /// Reply to a [`PartitionRead`].
 #[derive(Debug)]
 pub enum PartitionReadReply {
+    Primary(u8),
     Poll {
         fragments: PollFragments,
         current_offset: u64,
@@ -702,7 +715,7 @@ pub enum LifecycleFrame {
     /// Shard 0 distributes an inbound SDK WebSocket client's pre-upgrade
     /// TCP connection fd to the owning shard. The HTTP-Upgrade handshake
     /// has NOT run yet at this point: the fd is plain TCP, the dup is
-    /// safe (cross-shard fd-delegation only happens for plain TCP), and
+    /// safe before any transport state is created, and
     /// `compio_ws::WebSocketStream<TcpStream>`'s `!Send` constraint
     /// (compio `Rc<...>` driver state, post-upgrade) does not apply.
     /// The receiving shard wraps the fd, runs `compio_ws::accept_async`,
@@ -720,6 +733,21 @@ pub enum LifecycleFrame {
     ClientWsConnectionSetup {
         fd: DupedFd,
         meta: ClientConnMeta,
+    },
+    /// Delegate TCP-TLS before reading TLS bytes. The destination wraps the
+    /// fd on its runtime and owns the handshake and connection tasks.
+    ClientTcpTlsConnectionSetup {
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+    },
+    /// Delegate WSS before either handshake. The listener's configuration
+    /// travels with the socket; all TLS and WebSocket state stays local to
+    /// the destination runtime.
+    ClientWssConnectionSetup {
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
     },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.
@@ -764,6 +792,7 @@ pub enum LifecycleFrame {
     PartitionSubmit {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
+        attachment: Option<ConsumerAttachment>,
     },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
@@ -880,6 +909,10 @@ pub enum ShardFrame {
 // rather than as a failing test.
 const _: () = assert!(std::mem::size_of::<ShardFrame>() == std::mem::size_of::<LifecycleFrame>());
 
+// Every inbox slot pays for the largest variant, including consensus traffic.
+const MAX_SHARD_FRAME_SIZE: usize = 160;
+const _: () = assert!(std::mem::size_of::<ShardFrame>() <= MAX_SHARD_FRAME_SIZE);
+
 impl ShardFrame {
     /// Create a consensus frame addressed to `target_shard`. The sender
     /// is the routing authority; `accept_frame_for_self` compares this
@@ -901,7 +934,7 @@ impl ShardFrame {
 
 /// Prepares served per `RequestPrepares` round.
 ///
-/// The per-peer bus queues are bounded (`peer_queue_capacity`, 256 by default)
+/// The per-peer bus queues are bounded (`peer_queue_capacity`)
 /// and overrun frames drop silently, so an unbounded burst loses its own tail;
 /// the receiver pulls the window chunk by chunk instead (each walked
 /// `RepairDone` immediately requests the next chunk while progress holds).
@@ -2085,6 +2118,19 @@ where
         namespace: IggyNamespace,
         request: Message<RoutedRequestHeader>,
     ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
+        self.partition_submit_attached(namespace, request, None)
+    }
+
+    /// Submit an offset write with its parent consumer's admission fence.
+    ///
+    /// # Errors
+    /// Returns [`PartitionSubmitRefused`] before admission when the inbox is unavailable.
+    pub fn partition_submit_attached(
+        &self,
+        namespace: IggyNamespace,
+        request: Message<RoutedRequestHeader>,
+        attachment: Option<ConsumerAttachment>,
+    ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
         let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
             // Same fallback as `route_typed`: a miss means "not seeded yet",
             // not "unroutable", and the owning shard parks what arrives early.
@@ -2097,6 +2143,7 @@ where
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
             request,
             reply: reply_tx,
+            attachment,
         });
         let Some(sender) = self.senders.get(target as usize) else {
             self.metrics.record_frame_drop(
@@ -5654,17 +5701,18 @@ where
                 } else {
                     let commit_min = partition.consensus().commit_min();
                     let next = partition.repair.as_ref().and_then(|live| {
-                        (commit_min > before).then_some((live.peer, live.nonce, live.fetch_to_op))
+                        partition_repair_next_chunk(before, commit_min, live.fetch_to_op)
+                            .map(|from_op| (live.peer, live.nonce, from_op, live.fetch_to_op))
                     });
                     let cluster = partition.consensus().cluster();
                     let self_id = partition.consensus().replica();
-                    if let Some((peer, nonce, to_op)) = next {
+                    if let Some((peer, nonce, from_op, to_op)) = next {
                         self.send_request_prepares(
                             cluster,
                             self_id,
                             peer,
                             nonce,
-                            commit_min + 1,
+                            from_op,
                             to_op,
                             header.group,
                         )
@@ -6134,7 +6182,7 @@ where
         // number and a backup can sit above it. Splitting on the view's number
         // would drop already-executed ops with no rollback, and silently.
         let announced_commit = pending.as_ref().map_or(0, |pending| pending.commit_max);
-        let applied_floor = announced_commit.max(consensus.commit_min());
+        let applied_floor = consensus.commit_min();
 
         let mut repairable_from: Option<u64> = None;
         for canonical in pending.as_ref().map_or(&[][..], |pending| &pending.headers) {
@@ -7565,9 +7613,14 @@ where
         }
 
         let mut persistence_metrics = partitions::PersistenceMetrics::default();
+        let mut repair_ring_entries = 0usize;
+        let mut repair_ring_bytes = 0u64;
         for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_mut_by_ns(namespace) {
                 partition.drive_persistence().await;
+                let (entries, bytes) = partition.repair_ring_occupancy();
+                repair_ring_entries += entries;
+                repair_ring_bytes += bytes;
                 if let Some(metrics) = partition.take_persistence_metrics() {
                     persistence_metrics.disk_bytes += metrics.disk_bytes;
                     persistence_metrics.retained_bytes += metrics.retained_bytes;
@@ -7576,12 +7629,17 @@ where
                     persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
                     persistence_metrics.completed_batches += metrics.completed_batches;
                     persistence_metrics.batched_prepares += metrics.batched_prepares;
+                    persistence_metrics.group_commit_waits += metrics.group_commit_waits;
                     persistence_metrics.completed_checkpoints += metrics.completed_checkpoints;
                     persistence_metrics.failed_writes += metrics.failed_writes;
                 }
             }
         }
         self.metrics.record_persistence(&persistence_metrics);
+        self.metrics
+            .record_replica_reads(&self.bus.take_replica_read_stats());
+        self.metrics
+            .set_repair_ring(repair_ring_entries, repair_ring_bytes);
 
         // Counted at most ONCE per sweep and only if a re-arm actually fires,
         // then tracked locally as arms land. Counting per namespace is a full
@@ -10342,13 +10400,15 @@ where
     let action = VsrAction::SendStartView {
         view: consensus.view(),
         op: consensus.sequencer().current_sequence(),
-        commit: consensus.commit_max(),
+        commit: consensus.dvc_commit(),
         incarnation: 0,
         target: None,
         group: consensus.group(),
-        // Correcting a peer on a stale view, not concluding a view change: this
-        // publishes the settled frontier, which the peer reaches by repair.
-        suffix: Vec::new(),
+        // The headers, not just the frontier. Repair skips an op whose header is
+        // already resident, so a peer holding a DIFFERENT entry at an op under
+        // this commit point never learns of it from repair alone: it adopts the
+        // commit point and applies what it already has.
+        suffix: consensus.local_dvc_suffix().headers().to_vec(),
     };
     dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
 }
@@ -11002,6 +11062,18 @@ fn partition_repair_fetch_to_op(
         .then(|| missing_suffix.unwrap_or(commit_max))
 }
 
+/// Start of the next chunk to pull after a `RepairDone`, or `None` when the
+/// walk made no progress (the stall retry owns the remainder) or already
+/// stands at the session's fetch ceiling. The sweep closes such a session,
+/// because `fetch_to_op` never sits below `commit_to_op`.
+///
+/// A session can outlive its last fetchable op until that close, and
+/// `from_op > to_op` fails `RequestPreparesHeader::validate` on the serving
+/// peer, which drops the frame as unparsable.
+fn partition_repair_next_chunk(before: u64, commit_min: u64, fetch_to_op: u64) -> Option<u64> {
+    (commit_min > before && commit_min < fetch_to_op).then_some(commit_min + 1)
+}
+
 /// Highest adopted suffix op whose bodies are not all present above `commit_max`.
 ///
 /// The shape `maybe_request_partition_repair` widens its window for, read here
@@ -11275,7 +11347,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
     let announced_commit = pending.map_or(0, |pending| pending.commit_max);
-    let applied_floor = announced_commit.max(partition.consensus().commit_min());
+    let applied_floor = partition.consensus().commit_min();
 
     let mut repairable_from: Option<u64> = None;
     for canonical in pending.map_or(&[][..], |pending| &pending.headers) {
@@ -12006,6 +12078,17 @@ mod repair_scope_tests {
         let mut missing = pending;
         missing.headers.retain(|header| header.op != 99);
         assert_eq!(adopted_suffix_head(&missing, 98, 101), None);
+    }
+
+    #[test]
+    fn given_a_walk_at_the_fetch_ceiling_when_repair_done_lands_should_not_request_a_chunk() {
+        assert_eq!(super::partition_repair_next_chunk(4, 7, 8), Some(8));
+        // No progress leaves the remainder to the stall retry.
+        assert_eq!(super::partition_repair_next_chunk(7, 7, 8), None);
+        // Progress that reached the ceiling has nothing left to ask for: the
+        // sweep closes the session, and `9..=8` is not a range.
+        assert_eq!(super::partition_repair_next_chunk(7, 8, 8), None);
+        assert_eq!(super::partition_repair_next_chunk(7, 9, 8), None);
     }
 
     #[test]

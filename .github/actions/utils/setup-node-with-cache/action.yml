@@ -67,7 +67,7 @@ runs:
         echo "📦 Installing Node.js dependencies..."
         if [ "${{ inputs.workspace }}" != "." ]; then
           echo "Changing to workspace directory: ${{ inputs.workspace }}"
-          cd ${{ inputs.workspace }}
+          cd "${{ inputs.workspace }}"
           pwd # Print working directory to verify
         fi
 
