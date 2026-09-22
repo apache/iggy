@@ -88,9 +88,9 @@ impl DynamicRouter {
 }
 
 /// The routing value a payload carries under `route_field`, read from the JSON
-/// document it holds. Proto text holding JSON is the descriptor-less
-/// `proto_convert` fallback and routes like the document it holds; a payload
-/// with no document does not route.
+/// document it holds. `route_data` normalises the payload first, so proto text
+/// holding JSON arrives here as `Payload::Json`; proto text that is not JSON
+/// holds no document and does not route, and neither does any other variant.
 fn route_value(payload: &Payload, route_field: &str) -> Option<String> {
     let Some(document) = payload.json_document() else {
         warn!("Unsupported format for iceberg connector");
@@ -110,7 +110,10 @@ impl Router for DynamicRouter {
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
         let mut writer = DynamicWriter::new();
-        for message in messages {
+        for mut message in messages {
+            // Normalised once here so the routing read and the later write both
+            // work off the document, rather than parsing the same proto text twice.
+            message.payload = message.payload.into_json_document();
             let route_field_val = match self.extract_route_field(&message) {
                 Some(val) => val,
                 None => continue,

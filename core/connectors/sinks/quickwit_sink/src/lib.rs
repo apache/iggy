@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::borrow::Cow;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -314,13 +313,7 @@ impl QuickwitSink {
     fn extract_json_payloads(&self, messages: Vec<ConsumedMessage>) -> Vec<OwnedValue> {
         let mut json_payloads = Vec::with_capacity(messages.len());
         for message in messages {
-            // The descriptor-less `proto_convert` fallback puts a JSON document
-            // in `Payload::Proto`. It is indexed as that document, and the text
-            // arm below is kept for proto text that is not JSON.
-            let payload = match message.payload.json_document() {
-                Some(Cow::Owned(document)) => Payload::Json(document),
-                _ => message.payload,
-            };
+            let payload = message.payload.into_json_document();
             let val = match payload {
                 Payload::Json(value @ OwnedValue::Object(_)) => value,
                 Payload::Json(value) => simd_json::json!({

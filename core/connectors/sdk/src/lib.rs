@@ -224,6 +224,21 @@ impl Payload {
         }
     }
 
+    /// The same payload, with proto text that holds a JSON document replaced by
+    /// that document.
+    ///
+    /// The consuming counterpart to `json_document`, for a sink that wants the
+    /// descriptor-less `proto_convert` fallback to take its existing JSON path.
+    /// A `Payload::Json` already holds the document and is returned as it is,
+    /// and proto text that is not JSON stays `Payload::Proto` for the sink's
+    /// text handling. Every other variant is returned unchanged.
+    pub fn into_json_document(self) -> Self {
+        match self.json_document() {
+            Some(Cow::Owned(document)) => Payload::Json(document),
+            _ => self,
+        }
+    }
+
     /// Consuming conversion — transfers ownership of inner buffers.
     pub fn try_into_vec(self) -> Result<Vec<u8>, Error> {
         match self {
@@ -618,6 +633,69 @@ mod tests {
             assert!(
                 payload.json_document().is_none(),
                 "{payload} must not be read as a document"
+            );
+        }
+    }
+
+    #[test]
+    fn given_proto_text_holding_json_when_converted_should_become_a_json_payload() {
+        let payload = Payload::Proto(r#"{"id": 1, "name": "row-1"}"#.to_owned());
+
+        let Payload::Json(document) = payload.into_json_document() else {
+            panic!("proto text holding JSON becomes a JSON payload");
+        };
+
+        assert_eq!(document, simd_json::json!({"id": 1, "name": "row-1"}));
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_when_converted_should_keep_the_text_intact() {
+        let text = r#"binary_data: "AQID""#;
+
+        let converted = Payload::Proto(text.to_owned()).into_json_document();
+
+        // The text survives only because the parse ran on a copy; an in-place
+        // parse would leave it overwritten here.
+        let Payload::Proto(kept) = &converted else {
+            panic!("the variant must not change");
+        };
+        assert_eq!(kept, text);
+    }
+
+    #[test]
+    fn given_a_json_payload_when_converted_should_return_it_unchanged() {
+        let payload = Payload::Json(simd_json::json!({"id": 1}));
+
+        let Payload::Json(document) = payload.into_json_document() else {
+            panic!("a JSON payload stays a JSON payload");
+        };
+
+        assert_eq!(document, simd_json::json!({"id": 1}));
+    }
+
+    #[test]
+    fn given_a_payload_that_is_not_json_or_proto_when_converted_should_return_it_unchanged() {
+        for payload in [
+            Payload::Text(r#"{"id": 1}"#.to_owned()),
+            Payload::Raw(br#"{"id": 1}"#.to_vec()),
+            Payload::FlatBuffer(vec![1, 2, 3]),
+            Payload::Avro(vec![1, 2, 3]),
+        ] {
+            let expected_schema = payload.schema();
+            let expected_bytes = payload
+                .clone()
+                .try_into_vec()
+                .expect("the payload should serialise");
+
+            let converted = payload.into_json_document();
+
+            assert_eq!(converted.schema(), expected_schema);
+            assert_eq!(
+                converted
+                    .try_into_vec()
+                    .expect("the payload should serialise"),
+                expected_bytes,
+                "the bytes must survive as well as the variant"
             );
         }
     }

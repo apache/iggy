@@ -36,7 +36,7 @@ use meilisearch_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{borrow::Cow, cmp, future::Future, net::IpAddr, time::Duration};
+use std::{cmp, future::Future, net::IpAddr, time::Duration};
 use tokio::{
     sync::Mutex,
     time::{Instant, sleep},
@@ -339,13 +339,7 @@ impl MeilisearchSink {
             payload,
         } = message;
 
-        // The descriptor-less `proto_convert` fallback puts a JSON document in
-        // `Payload::Proto`. It is indexed as that document, and the text arm
-        // below is kept for proto text that is not JSON.
-        let payload = match payload.json_document() {
-            Some(Cow::Owned(document)) => Payload::Json(document),
-            _ => payload,
-        };
+        let payload = payload.into_json_document();
         let mut document = match payload {
             Payload::Json(value) => {
                 Self::document_from_json_value(owned_value_into_serde_json(value))

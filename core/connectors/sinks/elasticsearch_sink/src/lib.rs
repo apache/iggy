@@ -30,7 +30,6 @@ use iggy_connector_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use simd_json::{OwnedValue, prelude::*};
-use std::borrow::Cow;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -315,14 +314,7 @@ impl ElasticsearchSink {
 
 /// The document a payload indexes as. `None` skips the message.
 fn document_from_payload(payload: Payload, schema: Schema) -> Option<OwnedValue> {
-    // The descriptor-less `proto_convert` fallback puts a JSON document in
-    // `Payload::Proto`. It indexes field by field, the way the same bytes did
-    // when the batch was tagged `json`, and the text arm below is kept for
-    // proto text that is not JSON.
-    let payload = match payload.json_document() {
-        Some(Cow::Owned(document)) => Payload::Json(document),
-        _ => payload,
-    };
+    let payload = payload.into_json_document();
     match payload {
         Payload::Json(value) => Some(value),
         Payload::Raw(bytes) => {

@@ -28,7 +28,6 @@ use reqwest::{Body, Client as HttpClient, RequestBuilder, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -894,14 +893,7 @@ fn build_insert_query(table: &str, records: &[Value]) -> Result<Bytes, Error> {
 }
 
 fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
-    // Proto text holding JSON is the descriptor-less `proto_convert` fallback
-    // and is stored as the document it holds, the way the same bytes were
-    // stored when the batch was tagged `json`. Proto text that is not JSON
-    // stays text.
-    let payload = match payload.json_document() {
-        Some(Cow::Owned(document)) => Payload::Json(document),
-        _ => payload,
-    };
+    let payload = payload.into_json_document();
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
             value: owned_value_to_serde_json(&value),

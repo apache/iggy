@@ -30,7 +30,6 @@ use reqwest_retry::{
 };
 use reqwest_tracing::TracingMiddleware;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -379,14 +378,7 @@ impl HttpSink {
     /// Note: All current `Payload` variants produce infallible conversions.
     /// The `Result` return type exists as a safety net for future variants.
     fn payload_to_json(&self, payload: Payload) -> Result<serde_json::Value, Error> {
-        // Proto text holding JSON is the descriptor-less `proto_convert`
-        // fallback and is sent as the document it holds, the way the same
-        // bytes were sent when the batch was tagged `json`. Proto text that is
-        // not JSON is text, and is sent the way `Payload::Text` is.
-        let payload = match payload.json_document() {
-            Some(Cow::Owned(document)) => Payload::Json(document),
-            _ => payload,
-        };
+        let payload = payload.into_json_document();
         match payload {
             Payload::Json(value) => {
                 // Direct structural conversion (not serialization roundtrip).
