@@ -1430,6 +1430,34 @@ where
         self.start_persistence();
     }
 
+    pub(crate) fn barrier_install_files_locked(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let mut barriers = Vec::with_capacity(2);
+        if let Some(writer) = self.log.messages_writers().last().and_then(Option::as_ref) {
+            let path = writer.path();
+            let writer = Rc::clone(writer);
+            barriers.push(CheckpointBarrier::from_future(path, async move {
+                writer
+                    .fsync()
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            }));
+        }
+        if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref) {
+            let path = writer.path().to_owned();
+            let writer = Rc::clone(writer);
+            barriers.push(CheckpointBarrier::from_future(path, async move {
+                writer
+                    .fsync()
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            }));
+        }
+        persistence.barrier_files(barriers);
+    }
+
     fn persistence_checkpoint_files(
         &self,
         config: &PartitionsConfig,
@@ -12012,6 +12040,64 @@ mod tests {
                 "checkpoint failure must fence before transfer-flush recovery; fail_capture: {fail_capture}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_a_failed_writeback_when_installing_state_transfer_should_refuse_backup_publication()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 3);
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        for kind in ["consumers", "groups"] {
+            std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
+        }
+        partition.consumer_offsets_path = Some(format!("{partition_dir}/offsets/consumers"));
+        partition.consumer_group_offsets_path = Some(format!("{partition_dir}/offsets/groups"));
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"durable");
+        persistence
+            .append(prepare.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition.consensus.restore_commit_state(1, 1);
+        persistence.checkpoint(1);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert_eq!(persistence.checkpoint_op(), 1);
+
+        let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
+            .await
+            .unwrap();
+        assert_eq!(writer.save_indexes_buffered_at(vec![1; 32], 0).await.unwrap(), 32);
+        let active = partition.log.index_writers().len() - 1;
+        partition.log.index_writers_mut()[active] = Some(Rc::new(writer));
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: partition.dedup().capacity(),
+            required_metadata_frontier: 0,
+            prepare_checksum: Some(prepare.header().checksum),
+            checkpoint_prepare: prepare.as_slice().to_vec(),
+            next_offset: 1,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            external_groups: Vec::new(),
+            dedup: Vec::new(),
+        };
+
+        let result = partition
+            .install_state_transfer(&repair_config(), 1, Vec::new(), &offsets.encode())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::state_transfer::PartitionInstallError::SwapIo { .. })
+        ));
+        assert!(partition.fatal().is_some());
+        assert!(!directory.path().join(".install-backup").exists());
     }
 
     #[compio::test]

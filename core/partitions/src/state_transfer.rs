@@ -3009,13 +3009,16 @@ where
             }
             InstallPhase::Drain => {
                 if let Some(persistence) = &self.persistence {
+                    if install.drain.is_none() {
+                        self.barrier_install_files_locked();
+                        install.disposition = InstallDisposition::Backup;
+                    }
                     self.start_persistence();
                     let drain = install
                         .drain
                         .get_or_insert_with(|| persistence.begin_drain());
                     match persistence.observe_drain(drain) {
                         Ok(true) => {
-                            install.disposition = InstallDisposition::Backup;
                             install.phase = InstallPhase::Backup;
                         }
                         Ok(false) => step = crate::PartitionIoStep::Pending,
