@@ -148,6 +148,7 @@ configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
 cpu_allocation = { path = "core/cpu_allocation" }
+crc32c = "0.6.8"
 crossbeam = "0.8.5"
 crossfire = "3.1.20"
 csv = "1.4.0"
@@ -177,6 +178,7 @@ figlet-rs = "1.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 file-operation = "0.8.32"
 flatbuffers = "25.12.19"
+flate2 = "1.1.10"
 flume = "0.12.0"
 fs2 = "0.4.3"
 futures = "0.3.34"
@@ -225,6 +227,7 @@ lazy_static = "1.5.0"
 left-right = "=0.11.8"
 libc = "0.2.189"
 log = "0.4.34"
+lz4 = "1.28.1"
 lz4_flex = "0.14.0"
 meilisearch-sdk = { version = "0.33.0", default-features = false, features = [
     "reqwest",
@@ -308,6 +311,7 @@ server_common = { path = "core/server_common" }
 shard = { path = "core/shard" }
 simd-json = { version = "0.18.1", features = ["serde_impl"] }
 smallvec = "1.16"
+snap = "1.1.2"
 socket2 = "0.6.5"
 sqlparser = { version = "0.63.0", features = ["visitor"] }
 sqlx = { version = "0.9.0", features = [
@@ -379,6 +383,7 @@ yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 zeroize = "1.9.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zstd = "0.13.3"
 
 [profile.release]
 lto = true
