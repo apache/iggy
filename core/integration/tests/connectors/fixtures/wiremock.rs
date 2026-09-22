@@ -61,6 +61,12 @@ impl WireMockContainer {
                     .to_string(),
                 "/home/wiremock/__files",
             ))
+            // Bind-mounted fixture files keep the host's SELinux label, which the
+            // container's confined context can't read on SELinux-enforcing hosts
+            // (denied even though the host user has full Unix permissions).
+            // `label=disable` skips that check instead of requiring every
+            // contributor to relabel the fixture directory themselves.
+            .with_security_opt("label=disable")
             .with_container_name(fixtures::unique_container_name("wiremock"))
             .start()
             .await
