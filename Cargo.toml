@@ -37,6 +37,7 @@ members = [
     "core/connectors/sinks/delta_sink",
     "core/connectors/sinks/doris_sink",
     "core/connectors/sinks/elasticsearch_sink",
+    "core/connectors/sinks/fluss_sink",
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/influxdb_sink",
@@ -180,6 +181,7 @@ file-operation = "0.8.32"
 flatbuffers = "25.12.19"
 flate2 = "1.1.10"
 flume = "0.12.0"
+fluss-rs = { version = "1.0.0" }
 fs2 = "0.4.3"
 futures = "0.3.34"
 futures-core = { version = "0.3.34", default-features = false }
