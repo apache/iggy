@@ -21,17 +21,19 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use bytes::Bytes;
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use iggy::prelude::IggyError;
+use kafka_protocol::messages::create_topics_request::{CreatableReplicaAssignment, CreatableTopic};
 use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
 use kafka_protocol::messages::{CreateTopicsRequest, CreateTopicsResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
-use crate::bridge::{IggyBridge, TopicCreationOutcome};
+use crate::bridge::{BridgeError, IggyBridge, TopicCreationOutcome};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
-    ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
+    ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
+    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
+    GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::{
@@ -268,7 +270,7 @@ async fn create_one_topic(
             Ok(None) => success(),
             Err(err) => result
                 .with_error_code(err.to_kafka_error_code())
-                .with_error_message(Some(StrBytes::from(err.to_string()))),
+                .with_error_message(Some(StrBytes::from(error_message_for(&err)))),
         };
     }
 
@@ -276,13 +278,35 @@ async fn create_one_topic(
         .create_kafka_topic(kafka_topic, partition_count)
         .await
     {
-        Ok(TopicCreationOutcome::Created) => success(),
+        // The second arm: the write committed on its first attempt, the SDK's own reconnect path
+        // replayed it, and the server's client-table dedup caught the replay - not a fault.
+        // `to_kafka_error_code`'s shared mapping deliberately doesn't special-case this - it's a
+        // write-only fact, checked here, at the one write this bridge makes, rather than assumed
+        // true for the reads that share that mapping too.
+        Ok(TopicCreationOutcome::Created)
+        | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => success(),
         Ok(TopicCreationOutcome::AlreadyExists) => {
             result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS)
         }
         Err(err) => result
             .with_error_code(err.to_kafka_error_code())
-            .with_error_message(Some(StrBytes::from(err.to_string()))),
+            .with_error_message(Some(StrBytes::from(error_message_for(&err)))),
+    }
+}
+
+/// Error text for `CreatableTopicResult.error_message`, without re-embedding the topic name:
+/// `result.name` (`CreatableTopicResult::with_name`) already carries it, so `err.to_string()`'s
+/// own embedded copy for these two variants would double the per-topic response cost for a name
+/// the client already sent and already has back. Validation runs before any bridge I/O, so this
+/// is a purely local, zero-round-trip amplification if left in - 100 topics named with a maximal
+/// legal length build a response roughly twice the size the name alone would justify.
+fn error_message_for(err: &BridgeError) -> String {
+    match err {
+        BridgeError::InvalidKafkaTopicName { reason, .. } => reason.clone(),
+        BridgeError::InvalidPartitionCount { .. } => {
+            "partition count must be at least 1".to_string()
+        }
+        other => other.to_string(),
     }
 }
 
@@ -295,6 +319,13 @@ async fn create_one_topic(
 /// that only *disagrees* with the assignment length is not a distinct, more lenient case - the
 /// combination itself is what's invalid, so both are `INVALID_REQUEST` (42), never `NONE`.
 ///
+/// An assignment's own partition indices are checked too, not just its length: real Kafka
+/// requires the key set to be exactly `0..assignments.len()`, each index appearing once, and
+/// rejects anything else - a duplicate or non-consecutive index (`{5: [...], 7: [...]}`) - with
+/// `INVALID_REPLICA_ASSIGNMENT` (39), the one condition that code exists for. This bridge doesn't
+/// model per-partition replica placement, so only the index set is checked, not each entry's
+/// replica list.
+///
 /// With no assignments, `num_partitions = -1` / `replication_factor = -1` mean "use the broker
 /// default" from v4+ (pre-v4 requires an explicit positive value for both, since v2/v3 have no
 /// broker-default sentinel absent a manual assignment).
@@ -305,6 +336,9 @@ fn validate_create_topic_shape(
     if !topic.assignments.is_empty() {
         if topic.num_partitions != -1 || topic.replication_factor != -1 {
             return Err(ERROR_INVALID_REQUEST);
+        }
+        if !assignment_indices_are_consecutive_from_zero(&topic.assignments) {
+            return Err(ERROR_INVALID_REPLICA_ASSIGNMENT);
         }
         return Ok(u32::try_from(topic.assignments.len()).unwrap_or(DEFAULT_PARTITION_COUNT));
     }
@@ -335,6 +369,26 @@ fn validate_create_topic_shape(
         DEFAULT_PARTITION_COUNT
     };
     Ok(partition_count)
+}
+
+/// Real Kafka requires a manual `assignments` list's partition indices to be exactly
+/// `0..assignments.len()`, each appearing once - not merely that many entries as there are
+/// partitions. `{5: [...], 7: [...]}` has the right length for a 2-partition topic but names
+/// neither partition `0` nor `1`.
+fn assignment_indices_are_consecutive_from_zero(
+    assignments: &[CreatableReplicaAssignment],
+) -> bool {
+    let Some(last_index) = assignments.len().checked_sub(1) else {
+        return false; // empty: the caller never reaches here with an empty list, but no gap math to underflow on.
+    };
+    let mut indices: Vec<i32> = assignments.iter().map(|a| a.partition_index).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    // Sorted, deduped, and matching the original count rules out both a duplicate and a gap: `n`
+    // distinct integers spanning exactly `[0, n-1]` must be all of `0..n`, nothing else fits.
+    indices.len() == assignments.len()
+        && indices.first().copied() == Some(0)
+        && indices.last().copied() == i32::try_from(last_index).ok()
 }
 
 /// Well-formed `CreateTopics` response with a single placeholder topic.
@@ -411,8 +465,6 @@ fn encode_inner(version: i16, topics: &[CreatableTopic], forced_error: i16) -> R
 
 #[cfg(test)]
 mod tests {
-    use kafka_protocol::messages::create_topics_request::CreatableReplicaAssignment;
-
     use super::*;
 
     fn topic_name(name: &str) -> TopicName {

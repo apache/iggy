@@ -36,8 +36,9 @@ use serial_test::serial;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
-    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
+    BrokerAdvertise, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
+    ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
+    ERROR_NONE, ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_topics;
 
@@ -348,6 +349,85 @@ async fn create_topics_rejects_an_explicit_partition_count_alongside_a_manual_as
     let raw = raw_client(&server).await;
     let streams = raw.get_streams().await.expect("get_streams call");
     assert!(streams.is_empty());
+}
+
+/// Regression test: real Kafka's `ReplicationControlManager` requires a manual assignment's
+/// partition indices to be exactly `0..assignments.len()`, each appearing once - a topic whose
+/// assignment keys are `{5, 7}` has the right *length* for a 2-partition topic but names neither
+/// partition `0` nor `1`. Checking only `assignments.len()` (the pre-fix behavior) would silently
+/// create a 2-partition topic whose real partitions are `0`/`1`, disagreeing with what the client
+/// asked for.
+#[tokio::test]
+#[serial]
+async fn create_topics_rejects_a_manual_assignment_with_non_consecutive_indices() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let topic = TopicSpec {
+        replication_factor: -1,
+        assignments: &[5, 7],
+        ..TopicSpec::new("orders", -1)
+    };
+    let (error_code, _) = send(&state, &[topic], false).await;
+    assert_eq!(error_code, ERROR_INVALID_REPLICA_ASSIGNMENT);
+
+    let raw = raw_client(&server).await;
+    let streams = raw.get_streams().await.expect("get_streams call");
+    assert!(streams.is_empty());
+}
+
+/// Regression test: a manual assignment repeating one partition index (`{0, 0}`) is the other
+/// half of the same real-Kafka rule - same index set size as a valid 2-partition assignment, but
+/// not the distinct `0..2` it requires.
+#[tokio::test]
+#[serial]
+async fn create_topics_rejects_a_manual_assignment_with_a_duplicate_index() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let topic = TopicSpec {
+        replication_factor: -1,
+        assignments: &[0, 0],
+        ..TopicSpec::new("orders", -1)
+    };
+    let (error_code, _) = send(&state, &[topic], false).await;
+    assert_eq!(error_code, ERROR_INVALID_REPLICA_ASSIGNMENT);
+}
+
+/// Regression test: `error_message` must not re-embed the topic name `CreatableTopicResult.name`
+/// already carries. `BridgeError::InvalidKafkaTopicName`'s `Display` embeds the full (invalid)
+/// name in its text; validation runs before any bridge I/O, so an unfixed double-echo here costs
+/// nothing to trigger and roughly doubles the response per invalid name for free.
+#[tokio::test]
+#[serial]
+async fn create_topics_error_message_does_not_repeat_the_topic_name() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let bad_name = "has a space";
+    let topic = TopicSpec::new(bad_name, 1);
+    let body = build_request(&[topic], false);
+    let outcome = create_topics::handle(&state, REQUEST_VERSION, body).await;
+    let resp_body = outcome.expect_response("CreateTopics request always answers");
+
+    let mut d = Decoder::new(resp_body);
+    let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
+    let _topics_plus_one = d.read_varint().expect("topics array count");
+    let _name = d.read_compact_nullable_string().expect("topic name");
+    let error_code = d.read_i16().expect("error_code");
+    let error_message = d
+        .read_compact_nullable_string()
+        .expect("error_message")
+        .unwrap_or_default();
+
+    assert_eq!(error_code, ERROR_INVALID_TOPIC_EXCEPTION);
+    assert!(
+        !error_message.contains(bad_name),
+        "error_message repeats the topic name `.name` already carries: {error_message:?}"
+    );
 }
 
 /// Regression test: real Kafka refuses every occurrence of a duplicate topic name in one request

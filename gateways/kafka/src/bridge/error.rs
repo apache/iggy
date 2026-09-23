@@ -19,7 +19,7 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
     ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
     ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
@@ -177,12 +177,14 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
         // client-visible error message that contradicts the actual request it sent.
         IggyError::TooManyPartitions => ERROR_INVALID_REQUEST,
-        // The operation *did* commit - the SDK's own reconnect path replayed a write whose first
-        // attempt already applied, and the server's client-table dedup caught the replay. Falling
-        // into the catch-all below would report a permanent server fault for a request that
-        // actually succeeded; a Java client treats `UNKNOWN_SERVER_ERROR` as non-retriable and
-        // would surface a spurious failure for a `CreateTopics` that in fact created the topic.
-        IggyError::RequestAlreadyApplied => ERROR_NONE,
+        // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
+        // handler's error path, but "the operation did commit, so report success" only holds for
+        // a caller that issued a *write* - the SDK's own reconnect path replayed a write whose
+        // first attempt already applied, and the server's client-table dedup caught the replay.
+        // A read that somehow reaches this variant has no write to have "already applied"; a
+        // write-side caller (CreateTopics) special-cases it locally, close to the write it
+        // concerns, instead of baking a write-only assumption into a mapping every read also
+        // goes through.
         _ => ERROR_UNKNOWN_SERVER_ERROR,
     }
 }
@@ -239,12 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn request_already_applied_maps_to_no_error_not_unknown_server_error() {
-        // The operation committed on its first attempt; the client-table dedup on a replay is
-        // not a fault. Falling into the catch-all (-1) would tell a Java client the CreateTopics
-        // it just replayed permanently failed, when the topic it asked for now exists.
+    fn request_already_applied_falls_to_the_generic_mapping_here() {
+        // This shared mapping has no write to know "already applied" refers to - CreateTopics
+        // (the only caller for whom that's a success, not a fault) special-cases it locally
+        // instead (`create_topics.rs`), close to the write it concerns.
         let err = BridgeError::Iggy(IggyError::RequestAlreadyApplied);
-        assert_eq!(err.to_kafka_error_code(), ERROR_NONE);
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
     }
 
     #[test]

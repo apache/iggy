@@ -316,12 +316,50 @@ async fn a_response_projected_over_max_frame_size_closes_instead_of_answering() 
     assert!(outcome.is_close(), "expected Close, got {outcome:?}");
 }
 
-/// Regression test: a topic named more than once in one request must still resolve every
-/// occurrence correctly, not just avoid a crash - proves the dedup-by-name cache is actually
-/// populated and read back correctly, not merely harmless.
+/// Regression test: unlike the named-lookup path above, an all-topics response over budget must
+/// be truncated, not closed - its size is the cluster's own catalog, not anything the requesting
+/// client chose or can shrink, so closing would make every all-topics call (the bootstrap/refresh
+/// shape both librdkafka and the Java client use) fail identically and permanently.
 #[tokio::test]
 #[serial]
-async fn a_topic_named_twice_in_one_request_resolves_both_occurrences_correctly() {
+async fn an_all_topics_response_over_max_frame_size_truncates_instead_of_closing() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("small", 1)
+        .await
+        .expect("seed a topic that alone fits any reasonable budget");
+    seed.ensure_stream_and_topic("big", 50)
+        .await
+        .expect("seed a topic that alone exceeds the tiny budget below");
+
+    // 50 partitions * 64 bytes/partition (this crate's own conservative per-partition estimate)
+    // = 3200 bytes, comfortably over a 512-byte max_frame_size - so the catalog as a whole cannot
+    // fit, but neither topic's own partition count is malformed or attacker-shaped.
+    let tiny_state = GatewayState::new(state.broker, state.bridge, 512);
+    let topics = send(&tiny_state, None).await;
+    assert!(
+        topics.len() < 2,
+        "expected truncation to drop at least one topic, got {topics:?}"
+    );
+    let total_partitions: usize = topics
+        .iter()
+        .map(|(_, _, partitions)| partitions.len())
+        .sum();
+    assert!(
+        total_partitions * 64 <= 512,
+        "kept topics must themselves fit the budget, got {total_partitions} partitions"
+    );
+}
+
+/// Regression test: a topic named more than once in one request must resolve to exactly one
+/// response entry, not one per repeat - real Kafka answers a `Metadata` request naming the same
+/// topic twice with one entry, and this bridge re-expanding to match the request is what let a
+/// handful of repeats of one large topic name amplify a response sized off the repeat count
+/// instead of the distinct count.
+#[tokio::test]
+#[serial]
+async fn a_topic_named_twice_in_one_request_resolves_to_one_entry() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let (state, seed) = connected_state(&server).await;
@@ -330,17 +368,15 @@ async fn a_topic_named_twice_in_one_request_resolves_both_occurrences_correctly(
         .expect("seed the topic");
 
     let topics = send(&state, Some(&["orders", "orders"])).await;
-    assert_eq!(topics.len(), 2);
-    for topic in &topics {
-        assert_eq!(
-            topic,
-            &(
-                Some("orders".to_string()),
-                ERROR_NONE,
-                expected_partitions(2)
-            )
-        );
-    }
+    assert_eq!(topics.len(), 1);
+    assert_eq!(
+        topics[0],
+        (
+            Some("orders".to_string()),
+            ERROR_NONE,
+            expected_partitions(2)
+        )
+    );
 }
 
 /// Regression test: a named-lookup request addressing more than the bridge-backed topic cap must

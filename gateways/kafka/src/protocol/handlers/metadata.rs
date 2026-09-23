@@ -17,7 +17,7 @@
 
 //! Metadata (API key 3).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -108,7 +108,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 
     let results = match requested {
         None => match bridge.list_kafka_topics().await {
-            Ok(topics) => topics.into_iter().map(found_result).collect(),
+            Ok(topics) => {
+                let results: Vec<TopicResult> = topics.into_iter().map(found_result).collect();
+                truncate_all_topics_to_frame_budget(results, state.max_frame_size)
+            }
             Err(error) => {
                 // Same "no top-level error field" constraint as a decode failure: there is no
                 // way to answer "the bridge itself is unreachable" for an all-topics request
@@ -117,47 +120,18 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
                 return HandleOutcome::Close;
             }
         },
-        Some(names) => {
-            let distinct_names: HashSet<&str> = names.iter().map(StrBytes::as_str).collect();
-            if distinct_names.len() > MAX_BRIDGE_BACKED_TOPICS {
-                tracing::warn!(
-                    distinct_topics = distinct_names.len(),
-                    max = MAX_BRIDGE_BACKED_TOPICS,
-                    "Metadata request addresses too many distinct topics; rejecting"
-                );
-                names
-                    .iter()
-                    .map(|name| error_result(name.clone(), ERROR_INVALID_REQUEST))
-                    .collect()
-            } else {
-                match tokio::time::timeout(REQUEST_DEADLINE, resolve_named_topics(bridge, &names))
-                    .await
-                {
-                    Ok(results) => results,
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            distinct_topics = distinct_names.len(),
-                            deadline_secs = REQUEST_DEADLINE.as_secs(),
-                            "Metadata request's aggregate bridge work exceeded its deadline; \
-                             answering retriable instead of blocking further"
-                        );
-                        names
-                            .iter()
-                            .map(|name| error_result(name.clone(), ERROR_REQUEST_TIMED_OUT))
-                            .collect()
-                    }
-                }
-            }
-        }
+        Some(names) => resolve_requested_named_topics(bridge, &names).await,
     };
 
     // `bounds_guard` cannot see this: it charges the projected response by *requested* element
     // (one topic name), but one real topic can carry up to Iggy's own per-topic partition cap
-    // (1000) - a handful of names, or one `list_kafka_topics()` call, can still expand into a
-    // response `bounds_guard` never had the information to price in before this bridge round
-    // trip returned. Checked here, before `encode_real_response` builds one
-    // `MetadataResponsePartition` per partition, not after - the expensive part is building that
-    // `Vec`, not encoding the bytes that follow it.
+    // (1000) - a handful of names can still expand into a response `bounds_guard` never had the
+    // information to price in before this bridge round trip returned. The all-topics arm is
+    // pre-truncated to this same budget above (`truncate_all_topics_to_frame_budget`) since its
+    // size is server-side, not client-controllable - closing over it would take down every
+    // client's bootstrap Metadata call, permanently, the moment the catalog grows past the
+    // trip point. This check is what still enforces the budget for the named-lookup arm, where
+    // the cap (100 distinct topics) bounds the request but not what each one costs to answer.
     let total_partitions: usize = results
         .iter()
         .filter(|result| result.error_code == ERROR_NONE)
@@ -178,6 +152,45 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     )
 }
 
+/// Resolves a named-lookup Metadata request's topics: dedupes first so every path below (cap,
+/// deadline, success) builds its response from the distinct set rather than one entry per
+/// request occurrence - real Kafka answers a topic named more than once with one response entry,
+/// not one per repeat, and re-expanding to match the request let a handful of repeats of one
+/// large topic name amplify a response sized off the repeat count instead of the distinct count.
+async fn resolve_requested_named_topics(
+    bridge: &IggyBridge,
+    names: &[StrBytes],
+) -> Vec<TopicResult> {
+    let distinct = dedup_topic_names(names);
+    if distinct.len() > MAX_BRIDGE_BACKED_TOPICS {
+        tracing::warn!(
+            distinct_topics = distinct.len(),
+            max = MAX_BRIDGE_BACKED_TOPICS,
+            "Metadata request addresses too many distinct topics; rejecting"
+        );
+        return distinct
+            .iter()
+            .map(|name| error_result(name.clone(), ERROR_INVALID_REQUEST))
+            .collect();
+    }
+
+    match tokio::time::timeout(REQUEST_DEADLINE, resolve_named_topics(bridge, &distinct)).await {
+        Ok(results) => results,
+        Err(_elapsed) => {
+            tracing::warn!(
+                distinct_topics = distinct.len(),
+                deadline_secs = REQUEST_DEADLINE.as_secs(),
+                "Metadata request's aggregate bridge work exceeded its deadline; answering \
+                 retriable instead of blocking further"
+            );
+            distinct
+                .iter()
+                .map(|name| error_result(name.clone(), ERROR_REQUEST_TIMED_OUT))
+                .collect()
+        }
+    }
+}
+
 /// Conservative per-partition byte cost of one encoded `MetadataResponsePartition` at v9 (the
 /// densest wire shape this handler emits): measured ~26 bytes (`error_code` + `partition_index` +
 /// `leader_id` + `leader_epoch` + a 1-entry `replica_nodes` + a 1-entry `isr_nodes` + an empty
@@ -188,6 +201,48 @@ const RESPONSE_BYTES_PER_PARTITION: usize = 64;
 
 const fn response_would_exceed_frame_size(total_partitions: usize, max_frame_size: usize) -> bool {
     total_partitions.saturating_mul(RESPONSE_BYTES_PER_PARTITION) > max_frame_size
+}
+
+/// Trims an all-topics [`IggyBridge::list_kafka_topics`] result to fit `max_frame_size`, keeping
+/// as many whole topics (in listing order) as the budget allows.
+///
+/// Unlike the named-lookup arm, the all-topics response's size is a server-side property (the
+/// cluster's total partition count) that the requesting client never chose and cannot shrink -
+/// closing the connection over it, as the shared frame-size guard below does for the
+/// client-controllable named-lookup case, would make every all-topics Metadata call fail
+/// identically and permanently once the catalog crosses the trip point. That call is the
+/// bootstrap and refresh shape both librdkafka and the Java client use, so a hard close reads as
+/// "broker down" and reconnect-loops rather than surfacing a usable, if partial, result. This
+/// wire protocol has no pagination cursor to ask for the rest with, so a truncated list - honest
+/// about being incomplete via the dropped entries, not via an error code - is what's available.
+fn truncate_all_topics_to_frame_budget(
+    mut results: Vec<TopicResult>,
+    max_frame_size: usize,
+) -> Vec<TopicResult> {
+    let mut cumulative_partitions = 0usize;
+    let mut keep = results.len();
+    for (index, result) in results.iter().enumerate() {
+        if result.error_code != ERROR_NONE {
+            continue;
+        }
+        let next = cumulative_partitions + result.partitions_count as usize;
+        if response_would_exceed_frame_size(next, max_frame_size) {
+            keep = index;
+            break;
+        }
+        cumulative_partitions = next;
+    }
+    if keep < results.len() {
+        tracing::warn!(
+            total_topics = results.len(),
+            kept_topics = keep,
+            max_frame_size,
+            "All-topics Metadata response would exceed max_frame_size; truncating rather than \
+             closing the connection"
+        );
+        results.truncate(keep);
+    }
+    results
 }
 
 /// One resolved topic result for the real (bridge-backed) path - `partitions_count` is
@@ -237,39 +292,30 @@ const fn error_result(name: StrBytes, error_code: i16) -> TopicResult {
     }
 }
 
-/// Resolves every requested name, deduping first so a name repeated in the request (or asked
-/// about more than once, which the wire technically allows) costs one `get_kafka_topic` round
-/// trip, not one per occurrence.
-async fn resolve_named_topics(bridge: &IggyBridge, names: &[StrBytes]) -> Vec<TopicResult> {
+/// Drops repeats, keeping first-seen order so a capped or timed-out response still answers a
+/// deterministic prefix of the request rather than an arbitrary hash-order subset.
+fn dedup_topic_names(names: &[StrBytes]) -> Vec<StrBytes> {
     let mut seen = HashSet::with_capacity(names.len());
-    let mut distinct = Vec::new();
+    let mut distinct = Vec::with_capacity(names.len());
     for name in names {
         if seen.insert(name.as_str()) {
             distinct.push(name.clone());
         }
     }
+    distinct
+}
 
-    let mut results_by_name: HashMap<&str, TopicResult> = HashMap::with_capacity(distinct.len());
-    for name in &distinct {
-        let result = lookup_one_topic(bridge, name.clone()).await;
-        results_by_name.insert(name.as_str(), result);
+/// Resolves each of `names`, one `get_kafka_topic` round trip per entry.
+///
+/// `names` must already be the distinct set ([`dedup_topic_names`]) - this makes no attempt to
+/// re-derive or re-expand it, so a caller passing a list with repeats gets one round trip and one
+/// result per repeat, silently paying for the amplification this split was written to avoid.
+async fn resolve_named_topics(bridge: &IggyBridge, names: &[StrBytes]) -> Vec<TopicResult> {
+    let mut results = Vec::with_capacity(names.len());
+    for name in names {
+        results.push(lookup_one_topic(bridge, name.clone()).await);
     }
-
-    names
-        .iter()
-        .map(|name| {
-            // Always present: `distinct` (and so results_by_name) was built from exactly these
-            // same requested names, just above.
-            let cached = results_by_name
-                .get(name.as_str())
-                .expect("every requested name was resolved above");
-            TopicResult {
-                name: name.clone(),
-                error_code: cached.error_code,
-                partitions_count: cached.partitions_count,
-            }
-        })
-        .collect()
+    results
 }
 
 /// # Errors

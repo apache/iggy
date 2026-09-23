@@ -124,13 +124,22 @@ below it are still open for the issues that build on top of it.
   - A manual partition `assignments` list combined with an explicit `num_partitions`/
     `replication_factor` is rejected with `INVALID_REQUEST` (42) even when the count agrees with
     `assignments.len()` - real Kafka's own `ReplicationControlManager` treats the two as mutually
-    exclusive inputs, not independently-checked values that happen to agree. Retired
-    `ERROR_INVALID_REPLICA_ASSIGNMENT` (39), which this bridge never actually needed: the earlier
-    "count disagrees with assignment length" check it backed doesn't correspond to a condition
-    real Kafka's own validation order can even reach.
+    exclusive inputs, not independently-checked values that happen to agree.
+  - A manual assignment's own partition indices are checked too, not just its length:
+    `ERROR_INVALID_REPLICA_ASSIGNMENT` (39) for a duplicate index or one that isn't exactly
+    `0..assignments.len()` - `{5: [...], 7: [...]}` has the right length for a 2-partition topic
+    but names neither partition `0` nor `1`, matching real Kafka's own
+    `ReplicationControlManager.createTopic` key-set validation.
   - `IggyError::RequestAlreadyApplied` (the SDK's reconnect path replayed a write that already
     committed) maps to `NONE`, not the `UNKNOWN_SERVER_ERROR` catch-all - the operation did
-    succeed, and a Java client treats `UNKNOWN_SERVER_ERROR` as non-retriable.
+    succeed, and a Java client treats `UNKNOWN_SERVER_ERROR` as non-retriable. Special-cased
+    locally in `create_topics.rs`, not in the shared `BridgeError -> Kafka error code` mapping
+    every handler's error path goes through: "the write already applied" is a write-only fact,
+    and a read (Metadata, ListOffsets) reaching this variant has no write to have applied.
+  - `error_message` on a rejected topic never re-embeds the topic name `CreatableTopicResult.name`
+    already carries - `BridgeError::InvalidKafkaTopicName`'s `Display` does, so using it directly
+    would roughly double the response cost per invalid name, for free (name validation runs before
+    any bridge I/O).
   - `IggyBridge::get_kafka_topic` no longer probes `get_stream` separately before `get_topic` -
     `get_topic` already answers `Ok(None)` when the stream itself is missing, so the probe was a
     second round trip to learn something the one call already told it.
@@ -169,15 +178,24 @@ below it are still open for the issues that build on top of it.
     lookups.
   - The response-size cap above only covers the "all topics" and per-name-expansion cases. A
     named lookup is separately bounded on the request side: names repeated in one request are
-    deduped to one `get_kafka_topic` round trip before any bridge call (not one per occurrence),
-    a lookup naming more than 100 distinct topics is rejected outright
-    (`INVALID_REQUEST`, no bridge call for any of them - `bounds_guard`'s `MAX_REQUEST_ELEMENTS`
-    (4,096) is a pre-decode ceiling, not a usability one), and the whole lookup's aggregate bridge
-    work runs under a fixed 20s wall-clock deadline (`Metadata` carries no `timeout_ms` field in
-    any version, unlike `CreateTopics`, so this cannot be client-honored) - a deadline that fires
-    answers every name `REQUEST_TIMED_OUT` rather than continuing to hold the shared lockstep
-    `IggyClient`. The "all topics" path is server-driven, not client-count-driven, so it has no
-    equivalent cap - only the response-size projection applies there.
+    deduped up front to one response entry, not just one `get_kafka_topic` round trip - real
+    Kafka answers a topic named twice in one request with one response entry, and re-expanding to
+    match the request would let a handful of repeats of one large topic name amplify a response
+    sized off the repeat count instead of the distinct count. A lookup naming more than 100
+    distinct topics is rejected outright (`INVALID_REQUEST`, no bridge call for any of them -
+    `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096) is a pre-decode ceiling, not a usability one),
+    and the whole lookup's aggregate bridge work runs under a fixed 20s wall-clock deadline
+    (`Metadata` carries no `timeout_ms` field in any version, unlike `CreateTopics`, so this cannot
+    be client-honored) - a deadline that fires answers every name `REQUEST_TIMED_OUT` rather than
+    continuing to hold the shared lockstep `IggyClient`.
+  - The "all topics" path is server-driven, not client-count-driven, so it has no distinct-topic
+    cap - only the response-size projection applies there, and it **truncates** rather than
+    closes on overflow: `list_kafka_topics()`'s result is trimmed to as many whole topics (in
+    listing order) as `max_frame_size` allows. Closing instead, as the named-lookup path still
+    does, would make every all-topics Metadata call - the bootstrap/refresh shape both librdkafka
+    and the Java client use - fail identically and permanently once the cluster's total partition
+    count crosses the trip point, since that size is the catalog's own, not anything the
+    requesting client chose or can shrink.
 - [ ] Multi-broker topology (this gateway is, and will stay, a single logical broker - node id 1
       always leads every partition it reports; nothing here models an Iggy cluster as multiple
       Kafka-visible brokers)
