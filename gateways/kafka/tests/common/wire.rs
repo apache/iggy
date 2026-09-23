@@ -34,7 +34,6 @@ use super::codec::Encoder;
 pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
     (8, "OffsetCommit"),
     (9, "OffsetFetch"),
-    (13, "LeaveGroup"),
     (15, "DescribeGroups"),
     (16, "ListGroups"),
     (17, "SaslHandshake"),
@@ -571,6 +570,39 @@ pub fn build_heartbeat_request(
     write_string(&mut enc, flexible, Some(member_id));
     if version >= 3 {
         write_string(&mut enc, flexible, None); // group_instance_id
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `LeaveGroup` request. Each member is `(member_id, group_instance_id, reason)`. Below v3 the
+/// body carries one member id and no identities array, so only `members[0].0` is written.
+pub fn build_leave_group_request(
+    version: i16,
+    group_id: &str,
+    members: &[(&str, Option<&str>, Option<&str>)],
+) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(64);
+
+    write_string(&mut enc, flexible, Some(group_id));
+    if version <= 2 {
+        let member_id = members.first().map_or("", |(member_id, _, _)| *member_id);
+        write_string(&mut enc, false, Some(member_id));
+    } else {
+        write_array_count(&mut enc, flexible, members.len());
+        for (member_id, group_instance_id, reason) in members {
+            write_string(&mut enc, flexible, Some(member_id));
+            write_string(&mut enc, flexible, *group_instance_id);
+            if version >= 5 {
+                enc.write_compact_nullable_string(*reason);
+            }
+            if flexible {
+                enc.write_empty_tagged_fields();
+            }
+        }
     }
     if flexible {
         enc.write_empty_tagged_fields();

@@ -25,7 +25,7 @@ use crate::bridge::IggyBridge;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::handlers::{
     api_versions, create_topics, dispatch, fetch, find_coordinator, heartbeat, join_group,
-    list_offsets, metadata, produce, sync_group,
+    leave_group, list_offsets, metadata, produce, sync_group,
 };
 
 pub const API_KEY_PRODUCE: i16 = 0;
@@ -35,6 +35,7 @@ pub const API_KEY_METADATA: i16 = 3;
 pub const API_KEY_FIND_COORDINATOR: i16 = 10;
 pub const API_KEY_JOIN_GROUP: i16 = 11;
 pub const API_KEY_HEARTBEAT: i16 = 12;
+pub const API_KEY_LEAVE_GROUP: i16 = 13;
 pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
@@ -103,6 +104,8 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// this code, and the client rejoins carrying it.
 pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
 pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
+/// Sent only by `LeaveGroup`: the member id does not hold the `group_instance_id` it named.
+pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -173,6 +176,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     find_coordinator::RANGE,
     join_group::RANGE,
     heartbeat::RANGE,
+    leave_group::RANGE,
     sync_group::RANGE,
 ];
 

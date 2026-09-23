@@ -18,9 +18,9 @@
 //! In-memory coordinator for Kafka's classic consumer group protocol.
 //!
 //! [`GroupCoordinator`] owns every group this gateway instance coordinates and is the only
-//! module that awaits: `FindCoordinator`/`JoinGroup`/`Heartbeat`/`SyncGroup` handlers translate
-//! wire messages into the request types here, and `state` holds the synchronous state machine
-//! those requests drive.
+//! module that awaits: `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup` handlers
+//! translate wire messages into the request types here, and `state` holds the synchronous state
+//! machine those requests drive.
 //!
 //! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
 //! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
@@ -31,14 +31,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
-use kafka_protocol::messages::{JoinGroupRequest, SyncGroupRequest};
+use kafka_protocol::messages::{JoinGroupRequest, LeaveGroupRequest, SyncGroupRequest};
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::group::state::{GroupState, Step};
-use crate::protocol::api::{ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
+use crate::protocol::api::{ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
 
 /// Kafka's own `group.min.session.timeout.ms` default.
 const DEFAULT_MIN_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
@@ -228,6 +228,97 @@ impl SyncResult {
     }
 }
 
+/// One `LeaveGroup` request, normalized across wire versions.
+#[derive(Debug, Clone)]
+pub struct LeaveRequest {
+    pub group_id: StrBytes,
+    /// Request order, which is also the order the v3+ response answers in.
+    pub members: Vec<LeavingMember>,
+}
+
+/// One identity a `LeaveGroup` asks to remove.
+#[derive(Debug, Clone)]
+pub struct LeavingMember {
+    /// Empty when a v3+ request leaves by `group_instance_id` alone.
+    pub member_id: StrBytes,
+    pub group_instance_id: Option<StrBytes>,
+}
+
+impl From<(i16, &LeaveGroupRequest)> for LeaveRequest {
+    fn from((api_version, request): (i16, &LeaveGroupRequest)) -> Self {
+        let members = if api_version >= 3 {
+            request
+                .members
+                .iter()
+                .map(|member| LeavingMember {
+                    member_id: member.member_id.clone(),
+                    group_instance_id: member.group_instance_id.clone(),
+                })
+                .collect()
+        } else {
+            vec![LeavingMember {
+                member_id: request.member_id.clone(),
+                group_instance_id: None,
+            }]
+        };
+        Self {
+            group_id: request.group_id.0.clone(),
+            members,
+        }
+    }
+}
+
+/// Everything a `LeaveGroup` response carries, before the handler shapes it for a wire version.
+#[derive(Debug, Clone)]
+pub struct LeaveResult {
+    /// A whole-request failure. When set, `members` is empty.
+    pub error: i16,
+    /// One entry per request identity, in request order, echoing exactly what was sent.
+    pub members: Vec<LeftMember>,
+}
+
+impl LeaveResult {
+    #[must_use]
+    pub const fn error(error: i16) -> Self {
+        Self {
+            error,
+            members: Vec::new(),
+        }
+    }
+
+    /// The single code a v0-v2 response carries: the request's own error, else the first
+    /// member's, as Kafka's `LeaveGroupResponse.getError` folds them.
+    #[must_use]
+    pub fn top_level_error(&self) -> i16 {
+        if self.error != ERROR_NONE {
+            return self.error;
+        }
+        self.members
+            .iter()
+            .map(|member| member.error)
+            .find(|error| *error != ERROR_NONE)
+            .unwrap_or(ERROR_NONE)
+    }
+}
+
+/// The answer for one `LeavingMember`.
+#[derive(Debug, Clone)]
+pub struct LeftMember {
+    pub member_id: StrBytes,
+    pub group_instance_id: Option<StrBytes>,
+    pub error: i16,
+}
+
+impl From<(&LeavingMember, i16)> for LeftMember {
+    fn from((identity, error): (&LeavingMember, i16)) -> Self {
+        Self {
+            member_id: identity.member_id.clone(),
+            group_instance_id: identity.group_instance_id.clone(),
+            error,
+        }
+    }
+}
+
 /// Every consumer group this gateway instance coordinates.
 ///
 /// There is no timer task. A request that touches a group first expires whatever is overdue in
@@ -333,6 +424,12 @@ impl GroupCoordinator {
         )
     }
 
+    /// Removes `request`'s members and releases whoever is parked on the group. Never parks.
+    pub async fn leave(&self, request: &LeaveRequest) -> LeaveResult {
+        let mut groups = self.groups.lock().await;
+        state::leave_step(&mut groups, request, Instant::now())
+    }
+
     /// Sleeps until the group changes or `wake_at` passes. `false` means the gateway is draining.
     async fn wait_until(&self, mut receiver: watch::Receiver<u64>, wake_at: Instant) -> bool {
         tokio::select! {
@@ -370,6 +467,8 @@ fn millis_to_duration(millis: i32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::messages::leave_group_request::MemberIdentity;
+
     use super::*;
 
     #[test]
@@ -395,5 +494,46 @@ mod tests {
             JoinRequest::from((4, &request)).rebalance_timeout,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn given_a_v2_leave_when_normalizing_should_use_the_top_level_member_id() {
+        let request = LeaveGroupRequest::default()
+            .with_group_id(StrBytes::from_static_str("g").into())
+            .with_member_id(StrBytes::from_static_str("m-1"));
+
+        let normalized = LeaveRequest::from((2, &request));
+
+        assert_eq!(normalized.group_id.as_str(), "g");
+        assert_eq!(normalized.members.len(), 1);
+        assert_eq!(normalized.members[0].member_id.as_str(), "m-1");
+        assert_eq!(normalized.members[0].group_instance_id, None);
+    }
+
+    #[test]
+    fn given_a_v3_leave_when_normalizing_should_use_the_members_array() {
+        let request = LeaveGroupRequest::default()
+            .with_group_id(StrBytes::from_static_str("g").into())
+            .with_member_id(StrBytes::from_static_str("ignored"))
+            .with_members(vec![
+                MemberIdentity::default().with_member_id(StrBytes::from_static_str("m-1")),
+                MemberIdentity::default()
+                    .with_member_id(StrBytes::new())
+                    .with_group_instance_id(Some(StrBytes::from_static_str("i-2"))),
+            ]);
+
+        let normalized = LeaveRequest::from((3, &request));
+
+        let identities: Vec<(&str, Option<&str>)> = normalized
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.member_id.as_str(),
+                    member.group_instance_id.as_ref().map(StrBytes::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(identities, vec![("m-1", None), ("", Some("i-2"))]);
     }
 }

@@ -52,6 +52,7 @@ it knows the server supports flexible encoding.
 | 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `INVALID_REQUEST` (42) for transaction/share keys; flexible encoding at v3+ |
 | 11 | JoinGroup | 0 | 9 | 0 … 9 | Real membership; parks on the group's join barrier; flexible encoding at v6+ |
 | 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
+| 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above). Any unlisted API key also closes the connection: no api-specific response schema exists for it, so any body this gateway could send would be misparsed by the client against the schema it expected.
@@ -69,6 +70,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 10 | FindCoordinator | 0–4 | v3 |
 | 11 | JoinGroup | 0–9 | v6 |
 | 12 | Heartbeat | 0–4 | v4 |
+| 13 | LeaveGroup | 0–5 | v4 |
 | 14 | SyncGroup | 0–5 | v4 |
 | 18 | ApiVersions | 0–3 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
@@ -83,7 +85,6 @@ All API keys not listed above close the connection (see Governance model above) 
 | --------- | ------ | ------- |
 | 8 | OffsetCommit | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542) |
 | 9 | OffsetFetch | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542); sent right after SyncGroup, so a joined consumer loops on it today ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)) |
-| 13 | LeaveGroup | Graceful shutdown — [#3543](https://github.com/apache/iggy/issues/3543); without it a departing member is evicted by session expiry instead |
 | 15, 16 | DescribeGroups, ListGroups | Admin views — [#3548](https://github.com/apache/iggy/issues/3548) |
 | 17 | SaslHandshake | Auth — later issue |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol; a 4.0 client may need `group.protocol=classic` |
@@ -98,7 +99,7 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 10 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 11 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
 | **3 — Iggy bridge** | Landed, not wired in | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed; Produce/Fetch handler wiring itself is a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
@@ -147,9 +148,9 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
 
 - [x] FindCoordinator (10), JoinGroup (11), Heartbeat (12), SyncGroup (14) -
-      [#3541](https://github.com/apache/iggy/issues/3541), see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
+      [#3541](https://github.com/apache/iggy/issues/3541); LeaveGroup (13) -
+      [#3543](https://github.com/apache/iggy/issues/3543); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
 - [ ] OffsetCommit (8), OffsetFetch (9)
-- [ ] LeaveGroup (13)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning

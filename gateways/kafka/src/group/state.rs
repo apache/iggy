@@ -25,7 +25,7 @@
 //! Kafka's `Empty` group state is "absent from the map": offsets live in Iggy, so an empty group
 //! holds nothing worth keeping and retaining it would be an unbounded-memory vector.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -35,12 +35,13 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::group::{
-    GroupCoordinatorConfig, JoinRequest, JoinResult, JoinedMember, SyncRequest, SyncResult,
+    GroupCoordinatorConfig, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult,
+    LeavingMember, LeftMember, SyncRequest, SyncResult,
 };
 use crate::protocol::api::{
-    ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
-    ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST,
-    ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
+    ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID, ERROR_GROUP_MAX_SIZE_REACHED,
+    ERROR_ILLEGAL_GENERATION, ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID,
+    ERROR_INVALID_REQUEST, ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
     ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID,
 };
 
@@ -74,6 +75,17 @@ pub enum Step<T> {
         wake_at: Instant,
     },
 }
+
+/// What one `LeaveGroup` removed, which decides how the group reacts afterwards.
+#[derive(Default)]
+struct Departures {
+    members: bool,
+    pending: bool,
+}
+
+/// Member ids per `group_instance_id`. Without KIP-345 replacement one instance id can be held by
+/// several members, so each maps to a set.
+type InstanceHolders = HashMap<StrBytes, HashSet<StrBytes>>;
 
 pub struct Member {
     group_instance_id: Option<StrBytes>,
@@ -298,6 +310,88 @@ impl GroupState {
         self.members.remove(member_id);
         if self.leader.as_ref() == Some(member_id) {
             self.leader = self.members.keys().next().cloned();
+        }
+    }
+
+    fn instance_holders(&self) -> InstanceHolders {
+        let mut holders = InstanceHolders::new();
+        for (member_id, member) in &self.members {
+            if let Some(instance_id) = &member.group_instance_id {
+                holders
+                    .entry(instance_id.clone())
+                    .or_default()
+                    .insert(member_id.clone());
+            }
+        }
+        holders
+    }
+
+    /// Removes one `LeaveGroup` identity, following Kafka's `handleLeaveGroup` order.
+    ///
+    /// `holders` must stay exact across calls: a later identity in the same request is resolved
+    /// against it.
+    fn leave_one(
+        &mut self,
+        identity: &LeavingMember,
+        holders: &mut InstanceHolders,
+        departed: &mut Departures,
+    ) -> i16 {
+        let holders_of = identity
+            .group_instance_id
+            .as_ref()
+            .and_then(|instance_id| holders.get_mut(instance_id))
+            .filter(|ids| !ids.is_empty());
+
+        if identity.member_id.is_empty() {
+            let Some(ids) = holders_of else {
+                return ERROR_UNKNOWN_MEMBER_ID;
+            };
+            for id in std::mem::take(ids) {
+                self.remove_member(&id);
+            }
+            departed.members = true;
+            return ERROR_NONE;
+        }
+        if self.pending.remove(&identity.member_id).is_some() {
+            departed.pending = true;
+            return ERROR_NONE;
+        }
+        match (identity.group_instance_id.is_some(), holders_of) {
+            (_, Some(ids)) if ids.contains(&identity.member_id) => {}
+            (_, Some(_)) => return ERROR_FENCED_INSTANCE_ID,
+            (true, None) => return ERROR_UNKNOWN_MEMBER_ID,
+            (false, None) if !self.members.contains_key(&identity.member_id) => {
+                return ERROR_UNKNOWN_MEMBER_ID;
+            }
+            (false, None) => {}
+        }
+        if let Some(ids) = self
+            .members
+            .get(&identity.member_id)
+            .and_then(|member| member.group_instance_id.as_ref())
+            .and_then(|instance_id| holders.get_mut(instance_id))
+        {
+            ids.remove(&identity.member_id);
+        }
+        self.remove_member(&identity.member_id);
+        departed.members = true;
+        ERROR_NONE
+    }
+
+    /// React to a `LeaveGroup` the way the session sweep reacts to an expiry.
+    ///
+    /// The rebalance opens only after the removals, so its join window is sized from the
+    /// members that remain. The final `bump` is unconditional on any removal: it is what answers
+    /// a waiter the departed member still has parked on another connection.
+    fn after_departure(&mut self, departed: &Departures, now: Instant) {
+        if departed.members && !self.members.is_empty() && self.phase != Phase::PreparingRebalance {
+            self.prepare_rebalance(now, None);
+        }
+        if self.phase == Phase::PreparingRebalance {
+            self.maybe_complete_join(now);
+        }
+        if departed.members || departed.pending {
+            self.bump();
         }
     }
 
@@ -906,6 +1000,53 @@ pub fn sync_resume_step(
     Step::Wait {
         member_id: member_id.clone(),
         wake_at: group.wake_at(now),
+    }
+}
+
+/// Never creates a group, and removes one the leave empties rather than leaving it for
+/// `reclaim_expired`.
+pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> LeaveResult {
+    if request.group_id.is_empty() {
+        return LeaveResult::error(ERROR_INVALID_GROUP_ID);
+    }
+    let unknown = || LeaveResult {
+        error: ERROR_NONE,
+        members: request
+            .members
+            .iter()
+            .map(|identity| LeftMember::from((identity, ERROR_UNKNOWN_MEMBER_ID)))
+            .collect(),
+    };
+    if !tick_group(groups, &request.group_id, now) {
+        return unknown();
+    }
+    let Some(group) = groups.get_mut(&request.group_id) else {
+        return unknown();
+    };
+
+    let mut holders = if request
+        .members
+        .iter()
+        .any(|identity| identity.group_instance_id.is_some())
+    {
+        group.instance_holders()
+    } else {
+        InstanceHolders::new()
+    };
+    let mut departed = Departures::default();
+    let mut members = Vec::with_capacity(request.members.len());
+    for identity in &request.members {
+        let error = group.leave_one(identity, &mut holders, &mut departed);
+        members.push(LeftMember::from((identity, error)));
+    }
+    group.after_departure(&departed, now);
+
+    if group.is_empty() {
+        groups.remove(&request.group_id);
+    }
+    LeaveResult {
+        error: ERROR_NONE,
+        members,
     }
 }
 
@@ -1919,5 +2060,639 @@ mod tests {
 
         assert_eq!(error_of(&step), ERROR_UNKNOWN_MEMBER_ID);
         assert!(groups.is_empty(), "a rejected join must not create a group");
+    }
+
+    fn leave(
+        groups: &mut Groups,
+        identities: &[(&str, Option<&str>)],
+        now: Instant,
+    ) -> LeaveResult {
+        let request = LeaveRequest {
+            group_id: group_id(),
+            members: identities
+                .iter()
+                .map(|(member_id, instance_id)| LeavingMember {
+                    member_id: StrBytes::from_string((*member_id).to_owned()),
+                    group_instance_id: instance_id.map(|id| StrBytes::from_string(id.to_owned())),
+                })
+                .collect(),
+        };
+        leave_step(groups, &request, now)
+    }
+
+    fn codes(result: &LeaveResult) -> Vec<i16> {
+        result.members.iter().map(|member| member.error).collect()
+    }
+
+    fn static_request(instance_id: &str) -> JoinRequest {
+        JoinRequest {
+            group_instance_id: Some(StrBytes::from_string(instance_id.to_owned())),
+            ..request("", &["x"])
+        }
+    }
+
+    fn pending_request() -> JoinRequest {
+        JoinRequest {
+            require_known_member_id: true,
+            ..request("", &["x"])
+        }
+    }
+
+    /// `two_members` carried through the leader's `SyncGroup`, so the group is Stable.
+    fn stable_two_members(
+        groups: &mut Groups,
+        config: &GroupCoordinatorConfig,
+        now: Instant,
+    ) -> (StrBytes, StrBytes) {
+        let (leader, follower) = two_members(groups, config, &["x"], &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(groups, config, &sync_request(&leader, generation), now);
+        assert_eq!(groups[&group_id()].phase, Phase::Stable);
+        (leader, follower)
+    }
+
+    /// The generation must hold: a bumped one turns the survivor's heartbeat into
+    /// `ILLEGAL_GENERATION`, which a Java client handles as lost partitions instead of a rejoin.
+    #[test]
+    fn given_a_member_leaving_a_stable_group_should_open_a_rebalance_without_bumping_the_generation()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+
+        let result = leave(&mut groups, &[(follower.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        let group = &groups[&group_id()];
+        assert_eq!(group.phase, Phase::PreparingRebalance);
+        assert_eq!(group.generation_id, generation);
+        assert!(!group.members.contains_key(&follower));
+        assert_eq!(
+            heartbeat_step(&mut groups, &group_id(), generation, &leader, now),
+            ERROR_REBALANCE_IN_PROGRESS
+        );
+    }
+
+    /// Asserted with no time advance: `reclaim_expired` would free the slot later anyway, so
+    /// only an immediate check proves the leave removed the group itself.
+    #[test]
+    fn given_the_last_member_leaving_should_remove_the_group_immediately() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let member = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+
+        let result = leave(&mut groups, &[(member.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        assert!(!groups.contains_key(&group_id()));
+    }
+
+    #[test]
+    fn given_a_leave_for_an_unknown_group_should_not_create_it() {
+        let mut groups = Groups::new();
+
+        let result = leave(
+            &mut groups,
+            &[("ghost", None), ("", Some("instance"))],
+            Instant::now(),
+        );
+
+        assert_eq!(result.error, ERROR_NONE);
+        assert_eq!(
+            codes(&result),
+            vec![ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_MEMBER_ID]
+        );
+        assert!(groups.is_empty());
+    }
+
+    /// Checked straight after `leave_step`: a woken waiter's own tick would also complete the
+    /// join, so only this proves the leave did.
+    #[test]
+    fn given_the_last_straggler_leaving_a_preparing_group_should_complete_the_join() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+        let rejoin = join_step(&mut groups, &config, &request(leader.as_str(), &["x"]), now);
+        assert!(matches!(rejoin, Step::Wait { .. }));
+
+        let _ = leave(&mut groups, &[(follower.as_str(), None)], now);
+
+        let group = &groups[&group_id()];
+        assert_eq!(group.phase, Phase::CompletingRebalance);
+        assert_eq!(group.generation_id, generation + 1);
+        let answer = group.members[&leader]
+            .join_response
+            .as_ref()
+            .expect("the completed join must leave the leader its answer");
+        let roster: Vec<&StrBytes> = answer.members.iter().map(|m| &m.member_id).collect();
+        assert_eq!(roster, vec![&leader]);
+    }
+
+    /// Without the rebalance the survivor becomes leader of a generation whose roster it never
+    /// received, and its `SyncGroup` would fan out an empty assignment.
+    #[test]
+    fn given_the_leader_leaving_while_completing_should_open_a_rebalance() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        assert_eq!(groups[&group_id()].phase, Phase::CompletingRebalance);
+
+        let _ = leave(&mut groups, &[(leader.as_str(), None)], now);
+
+        let group = &groups[&group_id()];
+        assert_eq!(group.phase, Phase::PreparingRebalance);
+        assert_eq!(group.leader.as_ref(), Some(&follower));
+        let Step::Respond(sync) = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&follower, generation),
+            now,
+        ) else {
+            panic!("a sync during a rebalance is answered, not parked");
+        };
+        assert_eq!(sync.error, ERROR_REBALANCE_IN_PROGRESS);
+    }
+
+    #[test]
+    fn given_a_leave_while_stable_should_size_the_join_window_from_the_remaining_members() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let survivor = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &request_with("", &["x"], 600, 5),
+            now,
+        ));
+        let leaver = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &request_with("", &["x"], 600, 300),
+            now,
+        ));
+        let _ = join_step(
+            &mut groups,
+            &config,
+            &request_with(survivor.as_str(), &["x"], 600, 5),
+            now,
+        );
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&survivor, generation),
+            now,
+        );
+        assert_eq!(groups[&group_id()].phase, Phase::Stable);
+
+        let _ = leave(&mut groups, &[(leaver.as_str(), None)], now);
+
+        assert_eq!(
+            groups[&group_id()].join_deadline,
+            Some(now + Duration::from_secs(5)),
+            "the leaver's own rebalance timeout must not stretch the survivors' join window"
+        );
+    }
+
+    /// A pending id never joined, so dropping it must not disturb a Stable group.
+    #[test]
+    fn given_a_pending_member_leaving_a_stable_group_should_not_open_a_rebalance() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let _ = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+        assert!(groups[&group_id()].pending.contains_key(&pending));
+
+        let result = leave(&mut groups, &[(pending.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        let group = &groups[&group_id()];
+        assert_eq!(group.phase, Phase::Stable);
+        assert_eq!(group.generation_id, generation);
+        assert!(group.pending.is_empty());
+    }
+
+    #[test]
+    fn given_a_pending_member_leaving_a_preparing_group_should_unblock_the_join() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+        let _ = join_step(&mut groups, &config, &request(leader.as_str(), &["x"]), now);
+        let _ = join_step(
+            &mut groups,
+            &config,
+            &request(follower.as_str(), &["x"]),
+            now,
+        );
+        assert_eq!(
+            groups[&group_id()].phase,
+            Phase::PreparingRebalance,
+            "the outstanding pending id must be what holds the barrier open"
+        );
+
+        let result = leave(&mut groups, &[(pending.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        let group = &groups[&group_id()];
+        assert_eq!(group.phase, Phase::CompletingRebalance);
+        assert_eq!(group.generation_id, generation + 1);
+    }
+
+    #[test]
+    fn given_a_leave_by_instance_id_without_a_member_id_should_remove_that_static_member() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let static_member = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let dynamic = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+
+        let result = leave(&mut groups, &[("", Some("i-a"))], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        let group = &groups[&group_id()];
+        assert!(!group.members.contains_key(&static_member));
+        assert!(group.members.contains_key(&dynamic));
+    }
+
+    /// The admin `removeMembersFromConsumerGroup` path: removing a holder must open a rebalance
+    /// and wake the survivors, or the group stays Stable with the removed member's partitions
+    /// assigned to nobody.
+    #[test]
+    fn given_a_stable_group_when_a_holder_leaves_by_instance_id_alone_should_open_a_rebalance_and_wake_waiters()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+        let group = groups.get_mut(&group_id()).expect("the stable group");
+        group
+            .members
+            .get_mut(&follower)
+            .expect("the follower")
+            .group_instance_id = Some(StrBytes::from_static_str("i-f"));
+        let mut changed = group.subscribe();
+        changed.mark_unchanged();
+
+        let result = leave(&mut groups, &[("", Some("i-f"))], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        assert!(
+            changed.has_changed().expect("the group is still live"),
+            "survivor waiters must be woken"
+        );
+        let group = &groups[&group_id()];
+        assert!(!group.members.contains_key(&follower));
+        assert_eq!(group.phase, Phase::PreparingRebalance);
+        assert_eq!(
+            heartbeat_step(&mut groups, &group_id(), generation, &leader, now),
+            ERROR_REBALANCE_IN_PROGRESS
+        );
+    }
+
+    /// What Java `CloseOptions.LEAVE_GROUP` and Kafka Streams send: the member's own pair. It is
+    /// the holder, so it must leave cleanly rather than be fenced.
+    #[test]
+    fn given_a_static_member_when_it_leaves_with_its_own_member_and_instance_id_should_leave() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let static_member = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let dynamic = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+
+        let result = leave(&mut groups, &[(static_member.as_str(), Some("i-a"))], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        let group = &groups[&group_id()];
+        assert!(!group.members.contains_key(&static_member));
+        assert!(group.members.contains_key(&dynamic));
+    }
+
+    /// The first instance-only leave takes every holder, so a repeat in the same request finds
+    /// nobody left holding the id.
+    #[test]
+    fn given_two_holders_when_one_request_leaves_their_instance_id_twice_should_answer_the_repeat_unknown_member_id()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let first = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let second = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        assert_ne!(first, second);
+
+        let result = leave(&mut groups, &[("", Some("i-a")), ("", Some("i-a"))], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE, ERROR_UNKNOWN_MEMBER_ID]);
+        assert!(!groups.contains_key(&group_id()));
+    }
+
+    /// A rebalance with no members would complete at once, clear `pending` and drop the group,
+    /// so the pending client's rejoin would be refused. Session expiry in `tick` holds the same
+    /// guard.
+    #[test]
+    fn given_a_pending_member_when_the_last_real_member_leaves_should_still_admit_the_pending_rejoin()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let member = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&member, generation),
+            now,
+        );
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+        assert!(groups[&group_id()].pending.contains_key(&pending));
+
+        let result = leave(&mut groups, &[(member.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        assert!(groups[&group_id()].pending.contains_key(&pending));
+        let Step::Respond(rejoined) = join_step(
+            &mut groups,
+            &config,
+            &request(pending.as_str(), &["x"]),
+            now,
+        ) else {
+            panic!("the pending rejoin must be answered, not parked");
+        };
+        assert_eq!(rejoined.error, ERROR_NONE);
+        assert!(groups[&group_id()].members.contains_key(&pending));
+    }
+
+    #[test]
+    fn given_a_stable_group_when_only_a_pending_member_leaves_should_wake_waiters() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let _ = stable_two_members(&mut groups, &config, now);
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+        let mut changed = groups[&group_id()].subscribe();
+        changed.mark_unchanged();
+
+        let result = leave(&mut groups, &[(pending.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        assert!(changed.has_changed().expect("the group is still live"));
+        assert_eq!(groups[&group_id()].phase, Phase::Stable);
+    }
+
+    #[test]
+    fn given_a_leave_whose_member_id_does_not_hold_the_instance_id_should_be_fenced() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let holder = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let other = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-b"),
+            now,
+        ));
+
+        let result = leave(&mut groups, &[(other.as_str(), Some("i-a"))], now);
+
+        assert_eq!(codes(&result), vec![ERROR_FENCED_INSTANCE_ID]);
+        let group = &groups[&group_id()];
+        assert!(group.members.contains_key(&holder));
+        assert!(group.members.contains_key(&other));
+    }
+
+    #[test]
+    fn given_a_leave_by_an_instance_id_nobody_holds_should_return_unknown_member_id() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let dynamic = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+
+        let result = leave(&mut groups, &[(dynamic.as_str(), Some("i-z"))], now);
+
+        assert_eq!(codes(&result), vec![ERROR_UNKNOWN_MEMBER_ID]);
+        assert!(groups[&group_id()].members.contains_key(&dynamic));
+    }
+
+    /// The Java client's `CloseOptions.LEAVE_GROUP` sends a static member's id with no instance id.
+    #[test]
+    fn given_a_static_member_leaving_by_member_id_alone_should_be_removed() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let static_member = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let dynamic = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+
+        let result = leave(&mut groups, &[(static_member.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        let group = &groups[&group_id()];
+        assert!(!group.members.contains_key(&static_member));
+        assert!(group.members.contains_key(&dynamic));
+    }
+
+    /// Without identity replacement a restarted static consumer leaves its old incarnation
+    /// behind under the same instance id. Both go, and the answer is still one entry.
+    #[test]
+    fn given_two_holders_of_one_instance_id_when_left_by_instance_should_remove_both() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let first = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let second = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let bystander = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+        assert_ne!(first, second);
+
+        let result = leave(&mut groups, &[("", Some("i-a"))], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        assert_eq!(result.members[0].member_id.as_str(), "");
+        assert_eq!(
+            result.members[0].group_instance_id.as_deref(),
+            Some("i-a"),
+            "the answer echoes the request identity, not either holder it resolved to"
+        );
+        let remaining: Vec<&StrBytes> = groups[&group_id()].members.keys().collect();
+        assert_eq!(remaining, vec![&bystander]);
+    }
+
+    #[test]
+    fn given_a_static_member_left_by_member_id_when_the_same_request_leaves_its_instance_should_answer_unknown_member_id()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let static_member = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-a"),
+            now,
+        ));
+        let _dynamic = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+
+        let result = leave(
+            &mut groups,
+            &[(static_member.as_str(), None), ("", Some("i-a"))],
+            now,
+        );
+
+        assert_eq!(codes(&result), vec![ERROR_NONE, ERROR_UNKNOWN_MEMBER_ID]);
+    }
+
+    #[test]
+    fn given_a_member_left_when_its_old_join_waiter_resumes_should_answer_unknown_member_id() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_leader, follower) = stable_two_members(&mut groups, &config, now);
+        let parked = join_step(
+            &mut groups,
+            &config,
+            &request(follower.as_str(), &["x", "y"]),
+            now,
+        );
+        assert!(matches!(parked, Step::Wait { .. }));
+
+        let _ = leave(&mut groups, &[(follower.as_str(), None)], now);
+        let resumed = join_resume_step(&mut groups, &group_id(), &follower, now);
+
+        assert_eq!(error_of(&resumed), ERROR_UNKNOWN_MEMBER_ID);
+        assert!(!groups[&group_id()].members.contains_key(&follower));
+    }
+
+    #[test]
+    fn given_a_member_that_left_when_a_new_member_joins_a_full_group_should_admit_it() {
+        let config = GroupCoordinatorConfig {
+            max_members_per_group: 1,
+            ..config()
+        };
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let member = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+        let _ = leave(&mut groups, &[(member.as_str(), None)], now);
+        assert_eq!(
+            error_of(&join_step(&mut groups, &config, &request("", &["x"]), now)),
+            ERROR_NONE,
+            "a member that left must give its slot back"
+        );
+
+        let mut groups = Groups::new();
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+        assert_eq!(
+            error_of(&join_step(&mut groups, &config, &request("", &["x"]), now)),
+            ERROR_GROUP_MAX_SIZE_REACHED,
+            "the pending id must be what fills the group"
+        );
+        let _ = leave(&mut groups, &[(pending.as_str(), None)], now);
+        assert_eq!(
+            error_of(&join_step(&mut groups, &config, &request("", &["x"]), now)),
+            ERROR_NONE,
+            "a pending id that left must give its slot back"
+        );
+    }
+
+    #[test]
+    fn given_a_leave_while_completing_should_keep_uncollected_answers_of_the_rest() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let leader = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+        let second = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+        let third = member_id_of(&join_step(&mut groups, &config, &request("", &["x"]), now));
+        let _ = join_step(&mut groups, &config, &request(leader.as_str(), &["x"]), now);
+        assert_eq!(groups[&group_id()].phase, Phase::CompletingRebalance);
+        assert!(groups[&group_id()].members[&second].join_response.is_some());
+
+        let _ = leave(&mut groups, &[(third.as_str(), None)], now);
+
+        assert_eq!(groups[&group_id()].phase, Phase::PreparingRebalance);
+        assert!(
+            groups[&group_id()].members[&second].join_response.is_some(),
+            "a leave must not revoke an answer another member's waiter has not collected"
+        );
+    }
+
+    #[test]
+    fn given_a_duplicate_identity_in_one_leave_should_answer_the_second_unknown_member_id() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_leader, follower) = stable_two_members(&mut groups, &config, now);
+
+        let result = leave(
+            &mut groups,
+            &[(follower.as_str(), None), (follower.as_str(), None)],
+            now,
+        );
+
+        assert_eq!(codes(&result), vec![ERROR_NONE, ERROR_UNKNOWN_MEMBER_ID]);
+    }
+
+    #[test]
+    fn given_an_empty_group_id_when_leaving_should_return_invalid_group_id() {
+        let mut groups = Groups::new();
+        let request = LeaveRequest {
+            group_id: StrBytes::new(),
+            members: vec![LeavingMember {
+                member_id: StrBytes::from_static_str("m"),
+                group_instance_id: None,
+            }],
+        };
+
+        let result = leave_step(&mut groups, &request, Instant::now());
+
+        assert_eq!(result.error, ERROR_INVALID_GROUP_ID);
+        assert!(result.members.is_empty());
     }
 }

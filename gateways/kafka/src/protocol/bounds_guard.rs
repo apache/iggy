@@ -27,7 +27,7 @@
 //! any of `SUPPORTED_RANGES`, so this is reachable by anyone who can `connect()`.
 //!
 //! This module walks the same field shape `kafka_protocol`'s real decode walks for each of the
-//! ten accepted message types, but only to validate every length-prefixed field (array count,
+//! eleven accepted message types, but only to validate every length-prefixed field (array count,
 //! string length, bytes length, tagged-field size) against what could still fit in the bytes
 //! remaining in the frame - it never materializes a value or allocates a collection. Call the
 //! matching `validate_*_shape` function before handing the body to `kafka_protocol`.
@@ -905,6 +905,54 @@ pub fn validate_heartbeat_shape(version: i16, body: &Bytes) -> Result<()> {
     Ok(())
 }
 
+/// Mirrors the field order `LeaveGroupRequest::decode` walks.
+///
+/// Unlike Heartbeat this is bounded by `max_frame_size`: a v3+ response echoes every identity's
+/// `member_id` and `group_instance_id`.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_leave_group_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 4;
+
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    if version <= 2 {
+        c.legacy_string(false)?;
+    } else {
+        let members_count = if flexible {
+            c.compact_array_count()?
+        } else {
+            c.legacy_array_count()?
+        };
+        for _ in 0..members_count {
+            if flexible {
+                c.compact_string(false)?;
+                c.compact_string(true)?;
+            } else {
+                c.legacy_string(false)?;
+                c.legacy_string(true)?;
+            }
+            if version >= 5 {
+                c.compact_string(true)?;
+            }
+            if flexible {
+                c.tagged_fields()?;
+            }
+        }
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `SyncGroupRequest::decode` walks.
 ///
 /// # Errors
@@ -963,7 +1011,10 @@ pub fn validate_sync_group_shape(version: i16, body: &Bytes, max_frame_size: usi
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::messages::LeaveGroupRequest;
+
     use super::*;
+    use crate::protocol::handlers::decode_exhaustive;
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
@@ -1243,5 +1294,77 @@ mod tests {
             0x00, // request tagged fields
         ]);
         assert!(validate_sync_group_shape(5, &body, TEST_MAX_FRAME_SIZE).is_ok());
+    }
+
+    fn leave_group_v4_body(member_id_len: usize) -> Bytes {
+        let mut body = vec![0x02, b'g', 0x02]; // group_id, members: 1
+        let mut length = member_id_len + 1;
+        while length >= 0x80 {
+            body.push(u8::try_from(length & 0x7F).expect("masked to 7 bits") | 0x80);
+            length >>= 7;
+        }
+        body.push(u8::try_from(length).expect("below 0x80 after the loop"));
+        body.extend(std::iter::repeat_n(b'm', member_id_len));
+        body.push(0x00); // group_instance_id null
+        body.push(0x00); // member tagged fields
+        body.push(0x00); // request tagged fields
+        Bytes::from(body)
+    }
+
+    fn assert_decodes(version: i16, body: &Bytes) {
+        decode_exhaustive::<LeaveGroupRequest>(version, body.clone())
+            .expect("kafka_protocol must agree the body is well formed");
+    }
+
+    #[test]
+    fn leave_group_v5_huge_members_count_rejected() {
+        let body = Bytes::from_static(&[0x02, b'g', 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_leave_group_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn leave_group_v0_minimal_body_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0x00, 0x01, b'm', // member_id
+        ]);
+        assert!(validate_leave_group_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        assert_decodes(0, &body);
+    }
+
+    #[test]
+    fn leave_group_v3_null_group_instance_id_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // members: 1
+            0x00, 0x01, b'm', // member_id
+            0xFF, 0xFF, // group_instance_id null
+        ]);
+        assert!(validate_leave_group_shape(3, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        assert_decodes(3, &body);
+    }
+
+    /// `reason` arrives at v5. Reading it at v4 would swallow each member's tagged-fields byte
+    /// and walk the rest of the frame out of step with the decoder.
+    #[test]
+    fn leave_group_v4_two_members_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, b'g', // group_id
+            0x03, // members: 2
+            0x02, b'a', 0x00, 0x00, // member_id, group_instance_id null, tagged fields
+            0x02, b'b', 0x00, 0x00, // member_id, group_instance_id null, tagged fields
+            0x00, // request tagged fields
+        ]);
+        assert!(validate_leave_group_shape(4, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        assert_decodes(4, &body);
+    }
+
+    /// From v3 every member id is echoed back, so it has to count against the response size.
+    #[test]
+    fn leave_group_member_strings_are_charged_against_the_response_budget() {
+        let body = leave_group_v4_body(4_096);
+        assert_decodes(4, &body);
+        assert!(validate_leave_group_shape(4, &body, 8 * 1024 * 1024).is_ok());
+        assert!(validate_leave_group_shape(4, &body, 1_024).is_err());
     }
 }

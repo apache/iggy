@@ -2,7 +2,7 @@
 
 What [#3541](https://github.com/apache/iggy/issues/3541) added: `FindCoordinator` (10),
 `JoinGroup` (11), `Heartbeat` (12) and `SyncGroup` (14), backed by an in-memory coordinator in
-`src/group/`. This is Kafka's *classic* group protocol. Offsets are a separate concern and live
+`src/group/`. [#3543](https://github.com/apache/iggy/issues/3543) added `LeaveGroup` (13). This is Kafka's *classic* group protocol. Offsets are a separate concern and live
 in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 
 | API key | Name | Versions | Notes |
@@ -10,6 +10,7 @@ in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 | 10 | FindCoordinator | 0-4 | Always answers "this gateway", the same node the Metadata broker list advertises |
 | 11 | JoinGroup | 0-9 | Parks until the group's join barrier completes |
 | 12 | Heartbeat | 0-4 | Refreshes a session; `REBALANCE_IN_PROGRESS` is how a follower learns to rejoin |
+| 13 | LeaveGroup | 0-5 | Removes members; survivors' parked joins and syncs are released at once |
 | 14 | SyncGroup | 0-5 | Relays the leader's assignment blobs; a follower parks until the leader syncs |
 
 `kafka-protocol` can encode FindCoordinator v5 and v6 as well, and they are byte-identical to v4.
@@ -73,14 +74,71 @@ group, at which point the joiner clears the stale ids and completes immediately.
 observe the difference, because there is no consumer. The only cost is stale memory, bounded by
 the caps below.
 
+## Generations
+
+The generation id increments only when a join barrier completes. Leaving never bumps it: the
+survivors keep the current generation and learn about the rebalance through
+`REBALANCE_IN_PROGRESS` (27) on their next heartbeat, which the Java client handles as a graceful
+rejoin rather than as lost partitions.
+
+When a group empties, by leave or by expiry, it is dropped, so the next group under that name
+starts again at generation 1. Kafka instead keeps the `Empty` group and its generation. This is
+safe because member ids carry a UUID and every generation check is preceded by a membership
+check, so a stale client is told `UNKNOWN_MEMBER_ID` before its generation is ever compared.
+
+## Leaving a group
+
+A dynamic consumer that closes cleanly sends `LeaveGroup`, and the survivors rebalance on their
+next heartbeat instead of after `session.timeout.ms`. A survivor already parked in `JoinGroup` is
+answered as soon as the leave completes the barrier. One parked in `SyncGroup` is answered
+`REBALANCE_IN_PROGRESS` and rejoins. A request left parked by the leaver itself on another
+connection is answered `UNKNOWN_MEMBER_ID`.
+
+| Client | Dynamic member on close | Static member on close |
+| --- | --- | --- |
+| Java consumer, classic protocol | Leaves (best effort) | Never leaves; Java 4.1+ `CloseOptions.LEAVE_GROUP` forces it |
+| Kafka Streams, classic protocol | Does not leave by default | Does not leave |
+| librdkafka / kcat | Leaves on `rd_kafka_consumer_close`, v0 or v1 only | Leaves on unsubscribe, not on termination |
+| Admin `removeMembersFromConsumerGroup` | | Leaves by `group_instance_id` with an empty `member_id`, v3+ |
+
+How each identity in a request is resolved:
+
+| `member_id` | `group_instance_id` | Result |
+| --- | --- | --- |
+| id of a member | null | removed, 0 |
+| id handed out with `MEMBER_ID_REQUIRED` and not yet claimed | any | id dropped, 0 |
+| id of a member holding `X` | `X` | removed, 0 |
+| id of any member | `X`, held by other members | `FENCED_INSTANCE_ID` (82) |
+| any | `X`, held by nobody | `UNKNOWN_MEMBER_ID` (25) |
+| `""` | `X`, held by members | every holder removed, 0 |
+| `""` | null or unheld | `UNKNOWN_MEMBER_ID` (25) |
+| unknown | null | `UNKNOWN_MEMBER_ID` (25) |
+
+A group that does not exist answers `UNKNOWN_MEMBER_ID` for every identity and is not created.
+From v3 the response carries one entry per request identity, in request order, echoing exactly
+the `member_id` and `group_instance_id` that were sent. Below v3 it carries one top-level code:
+the request's own error, else the first member's.
+
 ## Static membership is accepted, not honoured
 
 `group.instance.id` (JoinGroup v5+) is stored and echoed back to the leader, and it seeds the
 generated member id so a static member is recognisable in logs. Nothing else about KIP-345 is
-implemented: there is no `FENCED_INSTANCE_ID`, and a returning static member is **not** matched to
-its previous identity - it is a new dynamic member and its rejoin triggers a rebalance like any
-other. Full static membership belongs to
-[#3543](https://github.com/apache/iggy/issues/3543).
+implemented, and it would need its own issue: a returning static member is **not** matched to its
+previous identity. It gets a new member id and its join triggers a rebalance, while its previous
+incarnation stays a member, holding its partitions, until its session expires and triggers a
+second one. Kafka replaces the old identity with no rebalance at all.
+
+The consequences:
+
+- One instance id can be held by several members at once. A `LeaveGroup` by instance id removes
+  every holder, since leaving by instance id means that instance is gone, and still answers with
+  one entry. With at most one holder this is Kafka's behaviour.
+- `FENCED_INSTANCE_ID` (82) is returned only by `LeaveGroup`, never by `JoinGroup`, `SyncGroup` or
+  `Heartbeat`.
+- A static consumer does not send `LeaveGroup` on close, with either the Java client or
+  librdkafka, so its partitions stay assigned until its session expires, exactly as before
+  `LeaveGroup` existed. For prompt release use a short `session.timeout.ms`, or Java 4.1+
+  `CloseOptions.LEAVE_GROUP`.
 
 ## Capacity caps
 
@@ -113,11 +171,11 @@ survives that loop, because group state is not per-connection and heartbeats res
 connection - but the consumer never fetches. Fetch is a stub in any case, so nothing can be
 consumed until [#3535](https://github.com/apache/iggy/issues/3535)/#3542 land.
 
-`LeaveGroup` (13) is also out of scope ([#3543](https://github.com/apache/iggy/issues/3543)). The
-cost falls on the survivors, not the leaver: a consumer that shuts down gracefully stays a member
-until its session expires, so the next rebalance waits up to `session.timeout.ms` (45s for a
-default Java consumer) for an eviction. That is exactly what Kafka does for a *crashed* consumer,
-so it is a degraded shutdown rather than a wedge.
+A dynamic consumer releases its partitions on close through `LeaveGroup`. A static one does not
+send it (see [Static membership](#static-membership-is-accepted-not-honoured)), so a static
+consumer's shutdown still costs the survivors up to `session.timeout.ms` before they rebalance.
+That is exactly what Kafka does for a *crashed* consumer, so it is a degraded shutdown rather than
+a wedge.
 
 `ConsumerGroupHeartbeat` (68), the KIP-848 protocol, is not implemented and a client cannot fall
 back from it. A Kafka 4.0 client may need `group.protocol=classic` to reach these keys at all.

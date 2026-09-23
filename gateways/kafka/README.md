@@ -4,7 +4,7 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 
 > **Stub warning:** no API persists or reads real data yet. Produce, Fetch, and ListOffsets return retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of trusting a fake success. CreateTopics does **not** create topics; valid requests return `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. Persistence lands with the Iggy bridge (see [docs/SCOPE.md](docs/SCOPE.md)).
 >
-> Consumer group coordination is the exception: `FindCoordinator`, `JoinGroup`, `Heartbeat` and `SyncGroup` are real, with real membership, rebalances and session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). Offset commit/fetch is not, so a consumer can join a group and be assigned partitions but cannot yet consume.
+> Consumer group coordination is the exception: `FindCoordinator`, `JoinGroup`, `Heartbeat`, `LeaveGroup` and `SyncGroup` are real, with real membership, rebalances, graceful leave and session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). Offset commit/fetch is not, so a consumer can join a group and be assigned partitions but cannot yet consume.
 
 ## Run
 

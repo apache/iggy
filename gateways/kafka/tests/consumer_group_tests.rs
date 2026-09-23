@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Consumer group coordination: `FindCoordinator`, `JoinGroup`, Heartbeat, `SyncGroup`.
+//! Consumer group coordination: `FindCoordinator`, `JoinGroup`, Heartbeat, `LeaveGroup`,
+//! `SyncGroup`.
 //!
 //! Requests go through `handle_request_bounded` against one shared `GatewayState`, because
 //! `handle_request` builds a fresh coordinator per call and no two requests would ever see the
@@ -39,14 +40,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::time::advance;
+use tokio::time::{Instant, advance, timeout};
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_SYNC_GROUP,
-    BrokerAdvertise, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
+    API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
+    API_KEY_SYNC_GROUP, BrokerAdvertise, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
     ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST,
     ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
     ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID, GatewayState, handle_request_bounded,
@@ -57,13 +58,14 @@ use server::spawn_test_server_with_config;
 use tcp::{build_request_frame, parse_response_payload, read_response_frame};
 use wire::{
     JoinGroupParams, SyncGroupParams, build_find_coordinator_request, build_heartbeat_request,
-    build_join_group_request, build_sync_group_request,
+    build_join_group_request, build_leave_group_request, build_sync_group_request,
 };
 
 const GROUP: &str = "orders";
 const JOIN_VERSION: i16 = 9;
 const SYNC_VERSION: i16 = 5;
 const HEARTBEAT_VERSION: i16 = 4;
+const LEAVE_VERSION: i16 = 5;
 const SESSION_TIMEOUT_MS: i32 = 10_000;
 const REBALANCE_TIMEOUT_MS: i32 = 20_000;
 
@@ -129,6 +131,22 @@ async fn heartbeat(state: &GatewayState, generation_id: i32, member_id: &str) ->
         "Heartbeat response has trailing bytes"
     );
     error
+}
+
+async fn leave(
+    state: &GatewayState,
+    version: i16,
+    members: &[(&str, Option<&str>)],
+) -> LeaveResponse {
+    let identities: Vec<(&str, Option<&str>, Option<&str>)> = members
+        .iter()
+        .map(|(member_id, instance_id)| (*member_id, *instance_id, None))
+        .collect();
+    let body = build_leave_group_request(version, GROUP, &identities);
+    let response = handle_request_bounded(state, API_KEY_LEAVE_GROUP, version, body)
+        .await
+        .expect_response("LeaveGroup must answer");
+    LeaveResponse::decode(version, response)
 }
 
 /// Claim a member id, then join with it. Returns the id and the second join's answer, which is
@@ -286,6 +304,51 @@ impl SyncResponse {
             protocol_name,
             assignment,
         }
+    }
+}
+
+#[derive(Debug)]
+struct LeaveResponse {
+    error: i16,
+    /// `(member_id, group_instance_id, error)`, present from v3.
+    members: Vec<(String, Option<String>, i16)>,
+}
+
+impl LeaveResponse {
+    fn decode(version: i16, body: Bytes) -> Self {
+        let flexible = version >= 4;
+        let mut decoder = Decoder::new(body);
+        if version >= 1 {
+            decoder.read_i32().unwrap(); // throttle_time_ms
+        }
+        let error = decoder.read_i16().unwrap();
+        let mut members = Vec::new();
+        if version >= 3 {
+            let count = read_array_count(&mut decoder, flexible);
+            for _ in 0..count {
+                let member_id =
+                    read_nullable(&mut decoder, flexible).expect("member id is not nullable");
+                let instance_id = read_nullable(&mut decoder, flexible);
+                let member_error = decoder.read_i16().unwrap();
+                if flexible {
+                    decoder.read_tagged_fields().unwrap();
+                }
+                members.push((member_id, instance_id, member_error));
+            }
+        }
+        if flexible {
+            decoder.read_tagged_fields().unwrap();
+        }
+        assert_eq!(
+            decoder.remaining(),
+            0,
+            "LeaveGroup v{version} response has trailing bytes"
+        );
+        Self { error, members }
+    }
+
+    fn codes(&self) -> Vec<i16> {
+        self.members.iter().map(|(_, _, error)| *error).collect()
     }
 }
 
@@ -696,6 +759,337 @@ async fn given_every_member_expired_when_a_new_member_joins_should_start_a_fresh
     assert_ne!(second.member_id, first.member_id);
 }
 
+// ── LeaveGroup ──────────────────────────────────────────────────────────────
+
+/// How long a woken waiter may take to answer. Paused time auto-advances to the next timer, so
+/// a waiter still asleep on its own deadline loses this race instead of answering late.
+const PROMPT: Duration = Duration::from_millis(5);
+
+async fn sync_leader(state: &GatewayState, generation_id: i32, leader: &str) {
+    let response = sync(
+        state,
+        SYNC_VERSION,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id,
+            member_id: leader,
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(response.error, ERROR_NONE);
+}
+
+/// Three members through one full rebalance: generation 2, the first one leading, all three
+/// awaiting `SyncGroup`.
+async fn three_member_group(state: &Arc<GatewayState>) -> [String; 3] {
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    let leader = claim_member_id(state, b"sub").await;
+    let first = join(state, JOIN_VERSION, &join_params(&leader, protocols)).await;
+    assert_eq!(first.generation_id, 1);
+
+    let mut parked = Vec::new();
+    let mut followers = Vec::new();
+    for _ in 0..2 {
+        let follower = claim_member_id(state, b"sub").await;
+        followers.push(follower.clone());
+        let state = Arc::clone(state);
+        parked.push(tokio::spawn(async move {
+            let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+            join(&state, JOIN_VERSION, &join_params(&follower, protocols)).await
+        }));
+        yield_to_parked().await;
+    }
+
+    let rejoined = join(state, JOIN_VERSION, &join_params(&leader, protocols)).await;
+    assert_eq!(rejoined.generation_id, 2);
+    assert_eq!(rejoined.members.len(), 3);
+    for task in parked {
+        assert_eq!(task.await.expect("parked JoinGroup task").generation_id, 2);
+    }
+    let [second, third] = <[String; 2]>::try_from(followers).expect("two followers");
+    [leader, second, third]
+}
+
+/// Acceptance criterion: graceful shutdown releases partitions promptly. Paused time only moves
+/// when something sleeps, so the elapsed bound proves no one waited out the leaver's session.
+#[tokio::test(start_paused = true)]
+async fn given_a_member_leaving_a_stable_group_should_let_the_survivor_rebalance_without_a_session_wait()
+ {
+    let state = test_state(immediate_config());
+    let leader_protocols: &[(&str, &[u8])] = &[("range", b"leader-subscription")];
+    let (leader, follower) = two_member_group(&state).await;
+    sync_leader(&state, 2, &leader).await;
+    let start = Instant::now();
+
+    let left = leave(&state, LEAVE_VERSION, &[(follower.as_str(), None)]).await;
+    assert_eq!(left.error, ERROR_NONE);
+    assert_eq!(left.codes(), vec![ERROR_NONE]);
+    assert_eq!(
+        heartbeat(&state, 2, &leader).await,
+        ERROR_REBALANCE_IN_PROGRESS
+    );
+    let rejoined = join(
+        &state,
+        JOIN_VERSION,
+        &join_params(&leader, leader_protocols),
+    )
+    .await;
+
+    assert_eq!(rejoined.error, ERROR_NONE);
+    assert_eq!(rejoined.generation_id, 3);
+    let roster: Vec<&str> = rejoined.members.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(roster, vec![leader.as_str()]);
+    assert!(
+        Instant::now() - start < Duration::from_secs(1),
+        "the survivor must not wait for the leaver's session to expire"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_parked_rejoin_when_the_straggler_leaves_should_answer_it_promptly() {
+    let state = test_state(immediate_config());
+    let (leader, follower) = two_member_group(&state).await;
+    sync_leader(&state, 2, &leader).await;
+    let parked = {
+        let state = Arc::clone(&state);
+        let leader = leader.clone();
+        tokio::spawn(async move {
+            let protocols: &[(&str, &[u8])] = &[("range", b"leader-subscription")];
+            join(&state, JOIN_VERSION, &join_params(&leader, protocols)).await
+        })
+    };
+    yield_to_parked().await;
+    assert!(!parked.is_finished(), "the leader waits for the follower");
+
+    leave(&state, LEAVE_VERSION, &[(follower.as_str(), None)]).await;
+
+    let rejoined = timeout(PROMPT, parked)
+        .await
+        .expect("the leave must release the parked rejoin")
+        .expect("parked JoinGroup task");
+    assert_eq!(rejoined.error, ERROR_NONE);
+    assert_eq!(rejoined.generation_id, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_follower_parked_in_sync_when_another_member_leaves_should_answer_rebalance_in_progress()
+ {
+    let state = test_state(immediate_config());
+    let [_leader, second, third] = three_member_group(&state).await;
+    let parked = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            sync(
+                &state,
+                SYNC_VERSION,
+                &SyncGroupParams {
+                    group_id: GROUP,
+                    generation_id: 2,
+                    member_id: &second,
+                    ..SyncGroupParams::default()
+                },
+            )
+            .await
+        })
+    };
+    yield_to_parked().await;
+    assert!(!parked.is_finished(), "a follower waits for the leader");
+
+    leave(&state, LEAVE_VERSION, &[(third.as_str(), None)]).await;
+
+    let synced = timeout(PROMPT, parked)
+        .await
+        .expect("the leave must release the parked sync")
+        .expect("parked SyncGroup task");
+    assert_eq!(synced.error, ERROR_REBALANCE_IN_PROGRESS);
+}
+
+/// The member's `LeaveGroup` arrives on another connection while its own `JoinGroup` is parked,
+/// which is what a client that timed out and reconnected sends.
+#[tokio::test(start_paused = true)]
+async fn given_a_leaving_member_with_a_parked_join_should_answer_that_join_unknown_member_id() {
+    let state = test_state(immediate_config());
+    let (leader, follower) = two_member_group(&state).await;
+    sync_leader(&state, 2, &leader).await;
+    let parked = {
+        let state = Arc::clone(&state);
+        let follower = follower.clone();
+        tokio::spawn(async move {
+            let changed: &[(&str, &[u8])] = &[("range", b"new-subscription")];
+            join(&state, JOIN_VERSION, &join_params(&follower, changed)).await
+        })
+    };
+    yield_to_parked().await;
+    assert!(!parked.is_finished(), "the follower waits for the leader");
+
+    leave(&state, LEAVE_VERSION, &[(follower.as_str(), None)]).await;
+
+    let answered = timeout(PROMPT, parked)
+        .await
+        .expect("the leave must answer the member's own parked join")
+        .expect("parked JoinGroup task");
+    assert_eq!(answered.error, ERROR_UNKNOWN_MEMBER_ID);
+}
+
+/// librdkafka only ever sends v0 or v1 and reads nothing but the top-level code.
+#[tokio::test(start_paused = true)]
+async fn given_a_leave_at_v0_should_answer_with_a_top_level_code() {
+    let state = test_state(immediate_config());
+    let (_leader, follower) = two_member_group(&state).await;
+
+    let first = leave(&state, 0, &[(follower.as_str(), None)]).await;
+    let second = leave(&state, 0, &[(follower.as_str(), None)]).await;
+
+    assert_eq!(first.error, ERROR_NONE);
+    assert_eq!(second.error, ERROR_UNKNOWN_MEMBER_ID);
+}
+
+/// Every advertised version must succeed through the handler, not only the ones a fixture or a
+/// batching test happens to use: librdkafka sends v0-v1 and Java v3-v5.
+#[tokio::test(start_paused = true)]
+async fn given_each_supported_version_when_a_member_leaves_should_succeed() {
+    for version in 0..=5 {
+        let state = test_state(immediate_config());
+        let (_leader, follower) = two_member_group(&state).await;
+
+        let left = leave(&state, version, &[(follower.as_str(), None)]).await;
+
+        assert_eq!(left.error, ERROR_NONE, "LeaveGroup v{version}");
+        if version >= 3 {
+            assert_eq!(left.codes(), vec![ERROR_NONE], "LeaveGroup v{version}");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_v3_leave_for_two_members_should_answer_each_in_request_order() {
+    let state = test_state(immediate_config());
+    let (_leader, follower) = two_member_group(&state).await;
+
+    let left = leave(&state, 3, &[("ghost", None), (follower.as_str(), None)]).await;
+
+    assert_eq!(left.error, ERROR_NONE);
+    assert_eq!(
+        left.members,
+        vec![
+            ("ghost".to_owned(), None, ERROR_UNKNOWN_MEMBER_ID),
+            (follower, None, ERROR_NONE),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_an_unknown_group_when_leaving_at_v5_should_answer_unknown_member_id_per_member() {
+    let state = test_state(immediate_config());
+
+    let left = leave(&state, 5, &[("ghost", None), ("", Some("instance"))]).await;
+
+    assert_eq!(left.error, ERROR_NONE);
+    assert_eq!(
+        left.codes(),
+        vec![ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_MEMBER_ID]
+    );
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    let rejoin = join(&state, JOIN_VERSION, &join_params("ghost", protocols)).await;
+    assert_eq!(rejoin.error, ERROR_UNKNOWN_MEMBER_ID);
+}
+
+/// A Java client raises `IllegalStateException` on more than one member response, and admin
+/// `removeMembersFromConsumerGroup` keys results by the echoed pair, so a leave that removes
+/// two holders of one instance id still answers once, with what was sent.
+#[tokio::test(start_paused = true)]
+async fn given_one_identity_that_removed_two_holders_should_answer_one_member() {
+    let state = test_state(immediate_config());
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    let static_params = |member_id| JoinGroupParams {
+        group_instance_id: Some("instance-a"),
+        ..join_params(member_id, protocols)
+    };
+    let first = join(&state, JOIN_VERSION, &static_params(""))
+        .await
+        .member_id;
+    let joined = join(&state, JOIN_VERSION, &static_params(&first)).await;
+    assert_eq!(joined.generation_id, 1);
+    let second = join(&state, JOIN_VERSION, &static_params(""))
+        .await
+        .member_id;
+    let parked = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+            let params = JoinGroupParams {
+                group_instance_id: Some("instance-a"),
+                ..join_params(&second, protocols)
+            };
+            join(&state, JOIN_VERSION, &params).await
+        })
+    };
+    yield_to_parked().await;
+
+    let left = leave(&state, LEAVE_VERSION, &[("", Some("instance-a"))]).await;
+
+    assert_eq!(
+        left.members,
+        vec![(String::new(), Some("instance-a".to_owned()), ERROR_NONE)]
+    );
+    let parked = timeout(PROMPT, parked)
+        .await
+        .expect("the removed holder's parked join must be answered")
+        .expect("parked JoinGroup task");
+    assert_eq!(parked.error, ERROR_UNKNOWN_MEMBER_ID);
+    assert_eq!(heartbeat(&state, 1, &first).await, ERROR_UNKNOWN_MEMBER_ID);
+}
+
+/// Partitions are opaque assignor blobs here, so what proves reassignment is the leader's
+/// roster: each generation after a leave must list exactly the members still present.
+#[tokio::test(start_paused = true)]
+async fn given_n_members_when_they_leave_one_by_one_should_shrink_the_roster_each_generation() {
+    let state = test_state(immediate_config());
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    let [leader, second, third] = three_member_group(&state).await;
+    sync_leader(&state, 2, &leader).await;
+
+    leave(&state, LEAVE_VERSION, &[(third.as_str(), None)]).await;
+    let parked = {
+        let state = Arc::clone(&state);
+        let leader = leader.clone();
+        tokio::spawn(async move {
+            let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+            join(&state, JOIN_VERSION, &join_params(&leader, protocols)).await
+        })
+    };
+    yield_to_parked().await;
+    let second_join = join(&state, JOIN_VERSION, &join_params(&second, protocols)).await;
+    let leader_join = parked.await.expect("parked JoinGroup task");
+    assert_eq!(second_join.generation_id, 3);
+    assert_eq!(leader_join.generation_id, 3);
+    let mut roster: Vec<&str> = leader_join
+        .members
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
+    roster.sort_unstable();
+    let mut expected = vec![leader.as_str(), second.as_str()];
+    expected.sort_unstable();
+    assert_eq!(roster, expected);
+    sync_leader(&state, 3, &leader).await;
+
+    leave(&state, LEAVE_VERSION, &[(second.as_str(), None)]).await;
+    let alone = join(&state, JOIN_VERSION, &join_params(&leader, protocols)).await;
+    assert_eq!(alone.generation_id, 4);
+    let roster: Vec<&str> = alone.members.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(roster, vec![leader.as_str()]);
+
+    leave(&state, LEAVE_VERSION, &[(leader.as_str(), None)]).await;
+    let fresh = join(&state, 3, &join_params("", protocols)).await;
+    assert_eq!(fresh.error, ERROR_NONE);
+    assert_eq!(
+        fresh.generation_id, 1,
+        "the emptied group is dropped, so the next one starts over"
+    );
+}
+
 // ── Rejected requests ───────────────────────────────────────────────────────
 
 #[tokio::test(start_paused = true)]
@@ -990,6 +1384,96 @@ async fn given_two_tcp_clients_when_they_join_and_sync_should_each_receive_their
 
     assert_eq!(leader_sync.assignment.as_ref(), leader_blob);
     assert_eq!(follower_sync.assignment.as_ref(), follower_blob);
+}
+
+/// librdkafka's version (v1, header v1) and the flexible one (v5, header v2) over real sockets.
+#[tokio::test]
+async fn given_two_tcp_clients_when_one_leaves_should_let_the_other_rejoin_alone() {
+    for leave_version in [1, 5] {
+        tcp_leave_scenario(leave_version).await;
+    }
+}
+
+async fn tcp_leave_scenario(leave_version: i16) {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
+        group: immediate_config(),
+        ..GatewayConfig::default()
+    })
+    .await;
+    let mut leader_stream = TcpStream::connect(addr).await.expect("connect leader");
+    let mut follower_stream = TcpStream::connect(addr).await.expect("connect follower");
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+
+    let leader = tcp_join(&mut leader_stream, &join_params("", protocols))
+        .await
+        .member_id;
+    tcp_join(&mut leader_stream, &join_params(&leader, protocols)).await;
+    let follower = tcp_join(&mut follower_stream, &join_params("", protocols))
+        .await
+        .member_id;
+    write_request(
+        &mut follower_stream,
+        API_KEY_JOIN_GROUP,
+        JOIN_VERSION,
+        2,
+        &build_join_group_request(JOIN_VERSION, &join_params(&follower, protocols)),
+    )
+    .await;
+    let rejoined = tcp_join(&mut leader_stream, &join_params(&leader, protocols)).await;
+    assert_eq!(rejoined.generation_id, 2);
+    assert_eq!(read_join(&mut follower_stream).await.generation_id, 2);
+    write_request(
+        &mut leader_stream,
+        API_KEY_SYNC_GROUP,
+        SYNC_VERSION,
+        3,
+        &build_sync_group_request(
+            SYNC_VERSION,
+            &SyncGroupParams {
+                group_id: GROUP,
+                generation_id: 2,
+                member_id: &leader,
+                ..SyncGroupParams::default()
+            },
+        ),
+    )
+    .await;
+    assert_eq!(read_sync(&mut leader_stream).await.error, ERROR_NONE);
+
+    write_request(
+        &mut follower_stream,
+        API_KEY_LEAVE_GROUP,
+        leave_version,
+        4,
+        &build_leave_group_request(leave_version, GROUP, &[(&follower, None, None)]),
+    )
+    .await;
+    let payload = read_response_frame(&mut follower_stream, 8 * 1024 * 1024).await;
+    let (correlation_id, body) =
+        parse_response_payload(API_KEY_LEAVE_GROUP, leave_version, payload);
+    assert_eq!(correlation_id, 4);
+    let left = LeaveResponse::decode(leave_version, body);
+    assert_eq!(left.error, ERROR_NONE, "v{leave_version}");
+
+    write_request(
+        &mut leader_stream,
+        API_KEY_HEARTBEAT,
+        HEARTBEAT_VERSION,
+        5,
+        &build_heartbeat_request(HEARTBEAT_VERSION, GROUP, 2, &leader),
+    )
+    .await;
+    let payload = read_response_frame(&mut leader_stream, 8 * 1024 * 1024).await;
+    let (_, body) = parse_response_payload(API_KEY_HEARTBEAT, HEARTBEAT_VERSION, payload);
+    assert_eq!(
+        &body[4..6],
+        &ERROR_REBALANCE_IN_PROGRESS.to_be_bytes(),
+        "v{leave_version}"
+    );
+
+    let alone = tcp_join(&mut leader_stream, &join_params(&leader, protocols)).await;
+    assert_eq!(alone.generation_id, 3, "v{leave_version}");
+    assert_eq!(alone.members.len(), 1, "v{leave_version}");
 }
 
 async fn write_request(

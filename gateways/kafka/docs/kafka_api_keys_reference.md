@@ -279,9 +279,10 @@ Key new minimums:
 | FindCoordinator | v0-v4 | v6 | 2 versions behind |
 | JoinGroup | v0-v9 | v9 | current |
 | Heartbeat | v0-v4 | v4 | current |
+| LeaveGroup | v0-v5 | v5 | current |
 | SyncGroup | v0-v5 | v5 | current |
 
-### Missing from `SUPPORTED_RANGES` (78 of the 88 API keys in this document)
+### Missing from `SUPPORTED_RANGES` (77 of the 88 API keys in this document)
 
 Every key not in `SUPPORTED_RANGES` closes the connection - the same policy applied to every
 other unlisted key, not a special case for these. No api-specific response schema exists for an
@@ -289,11 +290,13 @@ unlisted key, so any body the gateway could send would be misparsed by the clien
 schema it expected. This includes:
 
 - **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9)
-- **Classic consumer group protocol**: LeaveGroup (13). FindCoordinator (10), JoinGroup (11), Heartbeat (12) and SyncGroup (14) are supported - see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
 - **New consumer group protocol**: ConsumerGroupHeartbeat (68) — default in Kafka 4.0
 - **Share groups (KIP-932)**: ShareFetch, ShareGroupHeartbeat, ShareAcknowledge
 - **Auth flow**: SaslHandshake (17), SaslAuthenticate (36)
 - **All broker/KRaft-internal keys** (Group 14)
+
+The classic consumer group keys FindCoordinator (10), JoinGroup (11), Heartbeat (12),
+LeaveGroup (13) and SyncGroup (14) are supported - see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 Remaining scope (consumer groups, auth, admin/tuning) is tracked in `SCOPE.md`'s TODO section,
 not duplicated here.

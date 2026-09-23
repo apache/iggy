@@ -30,6 +30,7 @@ pub mod fetch;
 pub mod find_coordinator;
 pub mod heartbeat;
 pub mod join_group;
+pub mod leave_group;
 pub mod list_offsets;
 pub mod metadata;
 pub mod produce;
@@ -41,9 +42,10 @@ use kafka_protocol::protocol::{Decodable, Encodable};
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
-    API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE,
-    API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState,
-    HandleOutcome, is_supported_version, supported_max_version,
+    API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS,
+    API_KEY_METADATA, API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
+    supported_max_version,
 };
 
 /// Routes one decoded request body to the module that owns its API key.
@@ -66,6 +68,7 @@ pub async fn dispatch(
         API_KEY_FIND_COORDINATOR => find_coordinator::handle(state, api_version, body).await,
         API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
         API_KEY_HEARTBEAT => heartbeat::handle(state, api_version, body).await,
+        API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
     }

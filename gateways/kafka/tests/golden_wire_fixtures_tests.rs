@@ -41,11 +41,11 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=10 (compact array: N+1=11)
+    // error_code=0, api_count=11 (compact array: N+1=12)
     // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
-    let expected: [u8; 78] = [
+    let expected: [u8; 85] = [
         0x00, 0x00, // error_code
-        0x0B, // compact array count (10+1)
+        0x0C, // compact array count (11+1)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets     1-6
@@ -55,6 +55,7 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         0x00, 0x0A, 0x00, 0x00, 0x00, 0x04, 0x00, // key 10: FindCoordinator 0-4
         0x00, 0x0B, 0x00, 0x00, 0x00, 0x09, 0x00, // key 11: JoinGroup       0-9
         0x00, 0x0C, 0x00, 0x00, 0x00, 0x04, 0x00, // key 12: Heartbeat       0-4
+        0x00, 0x0D, 0x00, 0x00, 0x00, 0x05, 0x00, // key 13: LeaveGroup      0-5
         0x00, 0x0E, 0x00, 0x00, 0x00, 0x05, 0x00, // key 14: SyncGroup       0-5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
         0x00, // top-level tagged fields
@@ -69,10 +70,10 @@ async fn golden_apiversions_v1_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=10; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
-    let expected: [u8; 70] = [
+    // error_code=0, api_count=11; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
+    let expected: [u8; 76] = [
         0x00, 0x00, // error_code
-        0x00, 0x00, 0x00, 0x0A, // api count = 10
+        0x00, 0x00, 0x00, 0x0B, // api count = 11
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets     1-6
@@ -82,6 +83,7 @@ async fn golden_apiversions_v1_response_fixture() {
         0x00, 0x0A, 0x00, 0x00, 0x00, 0x04, // key 10: FindCoordinator 0-4
         0x00, 0x0B, 0x00, 0x00, 0x00, 0x09, // key 11: JoinGroup       0-9
         0x00, 0x0C, 0x00, 0x00, 0x00, 0x04, // key 12: Heartbeat       0-4
+        0x00, 0x0D, 0x00, 0x00, 0x00, 0x05, // key 13: LeaveGroup      0-5
         0x00, 0x0E, 0x00, 0x00, 0x00, 0x05, // key 14: SyncGroup       0-5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
     ];
