@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClientBuilder, IggyError, Permissions,
 };
+use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
 
 use crate::protocol::acl::PrincipalPermissions;
@@ -74,9 +75,10 @@ const PERMISSION_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Budget for tearing the verification client down again.
 ///
-/// Deliberately far shorter than [`VERIFY_TIMEOUT`]. Teardown happens while the caller still holds
-/// an authentication permit, so every second here is a second some other connection waits. Nothing
-/// is lost by cutting it short: `Drop` aborts the heartbeat task regardless.
+/// Deliberately far shorter than [`VERIFY_TIMEOUT`]. The authentication slot is already released by
+/// the time teardown runs, but every second here still comes out of the caller's own
+/// pre-authentication budget. Nothing is lost by cutting it short: `Drop` aborts the heartbeat task
+/// regardless.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Why a SASL exchange did not produce a verified identity.
@@ -123,6 +125,11 @@ pub struct AuthenticatedPrincipal {
 pub trait SaslAuthenticator: Send + Sync + std::fmt::Debug {
     /// Returns the principal when `credentials` name a real, active Iggy user.
     ///
+    /// `slot` is the caller's authentication slot, which bounds how many logins run against Iggy at
+    /// once. An implementation should release it as soon as the credentials are checked: whatever
+    /// follows the login costs Iggy no password verify, and holding the slot across it makes other
+    /// connections queue behind work the slot does not exist to bound.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::Rejected`] when Iggy refuses the credentials and
@@ -130,6 +137,7 @@ pub trait SaslAuthenticator: Send + Sync + std::fmt::Debug {
     async fn authenticate(
         &self,
         credentials: &PlainCredentials,
+        slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError>;
 }
 
@@ -266,6 +274,7 @@ impl SaslAuthenticator for IggyAuthenticator {
     async fn authenticate(
         &self,
         credentials: &PlainCredentials,
+        slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         let auto_login = AutoLogin::Enabled(Credentials::UsernamePassword(
             credentials.username.clone(),
@@ -288,6 +297,10 @@ impl SaslAuthenticator for IggyAuthenticator {
         let client = builder.build().map_err(|error| classify(&error))?;
 
         let connected = tokio::time::timeout(VERIFY_TIMEOUT, client.connect()).await;
+        // The password verify the slot bounds is done. Holding it across the permission read and
+        // teardown kept a slot busy for up to two more seconds per login, and after a timed-out
+        // read for as long as the SDK's detached request still ran.
+        drop(slot);
         let outcome = match connected {
             Err(_elapsed) => Err(AuthError::Unavailable),
             Ok(Err(error)) => Err(classify(&error)),
@@ -301,7 +314,7 @@ impl SaslAuthenticator for IggyAuthenticator {
 
         // A timed-out permission read leaves the SDK's detached request task holding the stream
         // lock until its own response deadline, and `shutdown` needs that lock first, so waiting
-        // on it could only burn `TEARDOWN_TIMEOUT` with the caller's authentication slot held.
+        // on it could only burn `TEARDOWN_TIMEOUT` of the caller's pre-authentication budget.
         // Dropping the client instead still aborts the heartbeat, which is the part that would
         // reconnect. The socket itself lives on in that task until its deadline, which nothing on
         // this side of the SDK can shorten.
@@ -456,6 +469,7 @@ fn classify(error: &IggyError) -> AuthError {
 #[cfg(test)]
 mod tests {
     use secrecy::SecretString;
+    use tokio::sync::Semaphore;
 
     use super::*;
 
@@ -550,7 +564,13 @@ mod tests {
         // Port 1 on loopback refuses immediately, so this exercises the failure path without
         // waiting out VERIFY_TIMEOUT.
         let authenticator = IggyAuthenticator::new("127.0.0.1:1".to_string());
-        let result = authenticator.authenticate(&credentials()).await;
+        let slots = Semaphore::new(1);
+        let result = authenticator
+            .authenticate(
+                &credentials(),
+                slots.acquire().await.expect("an open semaphore"),
+            )
+            .await;
         assert!(
             matches!(result, Err(AuthError::Unavailable)),
             "an unreachable server must never be reported as a credential rejection: {result:?}"

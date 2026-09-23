@@ -668,11 +668,11 @@ async fn authenticate_token(
     // invariant `pre_auth_timeout` is documented to enforce.
     let verified = tokio::time::timeout(budget, async {
         // Acquire fails only once the semaphore is closed, which this gateway never does.
-        let Ok(_slot) = auth_slots.acquire().await else {
+        let Ok(slot) = auth_slots.acquire().await else {
             error!(%peer, "authentication slots unavailable");
             return None;
         };
-        Some(authenticator.authenticate(&credentials).await)
+        Some(authenticator.authenticate(&credentials, slot).await)
     })
     .await;
 

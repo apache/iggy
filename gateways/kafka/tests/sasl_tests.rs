@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::SemaphorePermit;
 
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
@@ -74,6 +75,7 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
     async fn authenticate(
         &self,
         credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         use secrecy::ExposeSecret;
         let matches = credentials.username == self.username
@@ -743,6 +745,7 @@ impl SaslAuthenticator for UnavailableAuthenticator {
     async fn authenticate(
         &self,
         _credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         Err(AuthError::Unavailable)
     }
@@ -946,6 +949,7 @@ impl SaslAuthenticator for StallingAuthenticator {
     async fn authenticate(
         &self,
         credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         let _held = self.release.acquire().await;
         Ok(AuthenticatedPrincipal {
@@ -1006,6 +1010,7 @@ impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
     async fn authenticate(
         &self,
         credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(in_flight, Ordering::SeqCst);
@@ -1324,6 +1329,7 @@ impl SaslAuthenticator for UnreadPermissionsAuthenticator {
     async fn authenticate(
         &self,
         credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
