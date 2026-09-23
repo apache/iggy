@@ -124,11 +124,13 @@ a birthday collision, not a remote one.
 The id is a pool key, not a dedup identity. Under the design above, the dedup identity is the
 session's own random client id, minted at register. The producer id only decides which connection
 serves a producer. Kafka still requires it to be unique across the cluster, which is what the
-instance number buys. It does not have to survive a restart while nothing keys state on it,
-which is true of allocate-only: the gateway hands an id out and forgets it. That stops being true
-the moment the pool lands or Produce persists, because a restarted allocator replays ids a live
-producer still holds, and `producer_epoch` is always 0 so the pair cannot tell the generations
-apart. Treat generation reuse as a pool blocker, not a detail.
+instance number buys. It also has to stay unique across a restart once the pool lands or
+Produce persists, because `producer_epoch` is always 0, so a replayed id is a replayed
+`(producer_id, producer_epoch)` pair a live producer may still hold. The counter therefore starts
+at the wall clock in milliseconds rather than at 0. A restarted gateway starts above every id its
+previous run handed out unless that run averaged more than one allocation per millisecond of its
+uptime, or the clock stepped back across the restart. Nothing is persisted for this, and 2^47
+milliseconds leaves the counter space thousands of years from running out.
 
 An empty `transactional_id` reads as absent. A wire null decodes to `None`, but
 `kafka-protocol`'s own `Default` is `Some("")`, and a producer that is idempotent-only names no
@@ -162,7 +164,9 @@ Produce:
 - accept `producer_id`, `producer_epoch` and `base_sequence` on the request and ignore them
 - never answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) or `DUPLICATE_SEQUENCE_NUMBER` (46)
 - reject a non-empty `transactional_id` (v3+) with `UNSUPPORTED_VERSION` (35), at the partition
-  level, keeping the connection open and keeping the `acks=0` silence rule
+  level, keeping the connection open. Under `acks=0` there is no response to carry 35, so the
+  gateway closes the connection instead, as a Kafka broker does on any `acks=0` produce error.
+  The check runs before the `acks=0` branch, so no write path can see a transactional batch
 
 Those first two codes stay unsent even once the pool lands. The watermark accepts any request
 above it without noticing a gap, so a gap cannot be told apart from ordinary traffic. Sending
@@ -180,6 +184,13 @@ Without this guard a transactional batch would land as ordinary records once
 [#3535](https://github.com/apache/iggy/issues/3535) wires the bridge: no last stable offset, no
 abort markers, `read_committed` unimplementable, and an aborted transaction's records delivered
 to every consumer.
+
+The guard reads the request-level `transactional_id` only. A record batch also carries a
+transactional bit in its attributes, and the stub keeps records opaque, so a hand-built frame
+that sets the bit without the request field gets the retriable stub error (6). Java and
+librdkafka set both, so no stock client reaches it, and the stub does not parse batches to close
+it. [#3535](https://github.com/apache/iggy/issues/3535) decodes each batch before persisting it,
+and must refuse one with the transactional bit set there, the same way.
 
 ## Invariants this design rests on
 

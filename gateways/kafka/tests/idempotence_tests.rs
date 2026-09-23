@@ -237,11 +237,10 @@ async fn given_no_transactional_id_when_producing_should_keep_the_retriable_stub
 }
 
 #[tokio::test]
-async fn given_acks_zero_and_a_transactional_id_when_producing_should_stay_silent() {
-    // Paired on purpose. Asserting silence alone passes even with the transactional guard gone,
-    // because acks=0 returns before the guard ever runs, so the assertion would hold over a
-    // gateway that refuses nothing. The acks=1 half establishes that this body is refused at all,
-    // which is what makes the acks=0 half a statement about suppressing a real error.
+async fn given_acks_zero_and_a_transactional_id_when_producing_should_close_the_connection() {
+    // acks=0 has no response to carry the refusal, and dropping the batch silently would leave
+    // the refusal to whatever write path lands later. The acks=1 half pins that the same body is
+    // refused when a response exists, so the close is the acks=0 form of that refusal.
     let refused = handle_request(
         API_KEY_PRODUCE,
         3,
@@ -264,8 +263,8 @@ async fn given_acks_zero_and_a_transactional_id_when_producing_should_stay_silen
     )
     .await;
     assert!(
-        outcome.is_no_response(),
-        "acks=0 is fire-and-forget: refusing a transaction must not put a frame on the wire"
+        outcome.is_close(),
+        "acks=0 cannot carry 35, so a transactional batch must be refused by closing"
     );
 }
 

@@ -192,7 +192,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | H2 | Random bytes | `dd if=/dev/urandom bs=64 count=1 \| nc 127.0.0.1 9093` | Connection closed or protocol error; gateway stays up |
 | H3 | Empty body after header | ApiVersions with valid header, empty body | `ec=0` (ApiVersions accepts empty body) |
 | H4 | Transactional InitProducerId | Send key 22 v4 with a non-null `transactional_id` | `ec=35` (UNSUPPORTED_VERSION); connection stays open (send A2 next to confirm) |
-| H5 | Transactional Produce | Send key 0 v3 with a non-null `transactional_id` and `acks=1` | `ec=35` per partition, **not** `ec=6`; connection stays open. With `acks=0`: no response at all |
+| H5 | Transactional Produce | Send key 0 v3 with a non-null `transactional_id` and `acks=1` | `ec=35` per partition, **not** `ec=6`; connection stays open. With `acks=0`: no response, and the gateway closes the connection |
 | H6 | Transaction API keys | `send --host 127.0.0.1:9093 --api-key 24` (also 25, 26, 28) | Connection closes, no response bytes - they are never advertised |
 
 ---

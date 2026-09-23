@@ -23,6 +23,7 @@
 //! stays at-least-once, and no retry is deduplicated. See `docs/IDEMPOTENCE.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use kafka_protocol::messages::{InitProducerIdRequest, InitProducerIdResponse, ProducerId};
@@ -57,6 +58,13 @@ const PRODUCER_EPOCH: i16 = 0;
 ///
 /// `instance_id` is configured (`IGGY_KAFKA_INSTANCE_ID`), not drawn at startup: a random 16-bit
 /// value collides at even odds around 300 instances.
+///
+/// The counter starts at the wall clock in milliseconds, not at 0. Kafka keys a producer on
+/// `(producer_id, producer_epoch)` and the epoch is always 0 here, so a counter restarting at 0
+/// would hand a restarted gateway's producers the pairs its previous run gave out. Seeding from
+/// the clock keeps every new id above the old ones unless the previous run averaged more than one
+/// allocation per millisecond of its uptime, or the clock stepped back across the restart, with
+/// nothing persisted.
 #[derive(Debug)]
 pub struct ProducerIdAllocator {
     instance_id: u16,
@@ -65,10 +73,10 @@ pub struct ProducerIdAllocator {
 
 impl ProducerIdAllocator {
     #[must_use]
-    pub const fn new(instance_id: u16) -> Self {
+    pub fn new(instance_id: u16) -> Self {
         Self {
             instance_id,
-            next_counter: AtomicU64::new(0),
+            next_counter: AtomicU64::new(clock_counter()),
         }
     }
 
@@ -132,6 +140,15 @@ pub fn encode_response(
     encode_inner(version, ERROR_NONE, producer_id)
 }
 
+/// Milliseconds since the Unix epoch, capped at [`MAX_COUNTER`] so a far-future clock spends the
+/// counter space instead of bleeding into the instance bits. A clock before the epoch reads as 0.
+fn clock_counter() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    u64::try_from(millis).map_or(MAX_COUNTER, |millis| millis.min(MAX_COUNTER))
+}
+
 fn encode_inner(version: i16, error_code: i16, producer_id: i64) -> Result<Bytes> {
     let resp = InitProducerIdResponse::default()
         .with_error_code(error_code)
@@ -143,6 +160,8 @@ fn encode_inner(version: i16, error_code: i16, producer_id: i64) -> Result<Bytes
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
 
     use super::{COUNTER_BITS, MAX_COUNTER, ProducerIdAllocator};
 
@@ -160,6 +179,19 @@ mod tests {
         let allocator = ProducerIdAllocator::new(0xBEEF);
         let id = allocator.allocate().expect("id");
         assert_eq!(id >> COUNTER_BITS, 0xBEEF);
+    }
+
+    #[test]
+    fn given_a_restarted_allocator_when_allocating_should_start_above_the_previous_run() {
+        let previous_run = ProducerIdAllocator::new(0);
+        let last_of_previous_run = previous_run.allocate().expect("previous run id");
+        thread::sleep(Duration::from_millis(2));
+        let restarted = ProducerIdAllocator::new(0);
+        let first_after_restart = restarted.allocate().expect("restarted id");
+        assert!(
+            first_after_restart > last_of_previous_run,
+            "a restart must not replay a (producer_id, epoch 0) pair a live producer still holds"
+        );
     }
 
     #[test]

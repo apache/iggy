@@ -107,7 +107,8 @@ Three things enforce that, in the order a client meets them:
    [`IDEMPOTENCE.md`](IDEMPOTENCE.md) records why that matters when FindCoordinator is advertised.
 3. **Produce with a non-empty `transactional_id`** answers `UNSUPPORTED_VERSION` (35) per
    partition, so a raw client that skipped both earlier gates still cannot write transactional
-   records. `acks=0` stays silent, and no case closes the connection.
+   records. Under `acks=0` there is no response to carry 35, so the connection is closed
+   instead, the same way a Kafka broker answers an `acks=0` produce error.
 
 An idempotent (non-transactional) producer is unaffected: it gets a producer id and works
 untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).

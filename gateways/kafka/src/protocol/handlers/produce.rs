@@ -80,6 +80,12 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     match decode_guarded::<ProduceRequest>(api_version, body, |v, b| {
         validate_produce_shape(v, b, state.max_frame_size)
     }) {
+        // The transactional refusal runs before the acks=0 silence, so no write path added
+        // after it can store a transactional batch. acks=0 has no response to carry 35, so the
+        // refusal is a close, which is what a Kafka broker does on an acks=0 produce error.
+        Ok(req) if req.acks == 0 && is_transactional(req.transactional_id.as_ref()) => {
+            HandleOutcome::Close
+        }
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
         Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
@@ -152,7 +158,8 @@ pub fn encode_response(version: i16, req: &ProduceRequest) -> Result<Bytes> {
 /// transactional bit in attributes, and the records stay opaque bytes here, so a hand-built
 /// frame setting the bit without the request field still gets the retriable stub error. Java
 /// and librdkafka both set the request field whenever they set the batch bit, so no real client
-/// reaches that gap; it has to close before records are ever persisted.
+/// reaches that gap. The stub does not parse batches to close it: the persist path (#3535)
+/// decodes every batch anyway and has to refuse the bit there.
 fn partition_error_code(req: &ProduceRequest) -> i16 {
     if is_transactional(req.transactional_id.as_ref()) {
         ERROR_UNSUPPORTED_VERSION

@@ -176,7 +176,7 @@ pub struct GatewayState {
 
 impl GatewayState {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         broker: BrokerAdvertise,
         bridge: Option<Arc<IggyBridge>>,
         max_frame_size: usize,
@@ -192,7 +192,7 @@ impl GatewayState {
 
     /// State with no bridge, so every handler takes its stub path.
     #[must_use]
-    pub const fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
+    pub fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
         Self::new(broker, None, max_frame_size, 0)
     }
 }
