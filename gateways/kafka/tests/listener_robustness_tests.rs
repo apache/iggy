@@ -536,14 +536,10 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
     assert_eq!(corr, 502);
 }
 
-// ── Corrupt body survives on the connection (no disconnect) ────────────────
+// ── Corrupt Produce body closes the connection ────────────────
 
 #[tokio::test]
-async fn corrupt_produce_body_e2e_stays_silent_without_disconnect() {
-    // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes whether
-    // `acks` was nonzero (unlike the pre-migration field-by-field decoder, which could still
-    // answer with INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure
-    // now stays silent - see `api::handle_produce_request` - but must not drop the connection.
+async fn corrupt_produce_body_e2e_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -557,20 +553,10 @@ async fn corrupt_produce_body_e2e_stays_silent_without_disconnect() {
         ],
     );
     stream.write_all(&bad).await.expect("corrupt produce");
-    assert!(
-        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_millis(200))
-            .await
-            .is_none(),
-        "corrupt Produce must stay silent, not respond with an error"
-    );
-
-    let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 392, Some("scope-test"), &[]);
-    stream.write_all(&ok).await.expect("follow-up");
-    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert_eq!(
-        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
-        392,
-        "connection must stay usable after the silent corrupt Produce"
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "corrupt Produce must close the connection"
     );
 }
 

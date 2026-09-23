@@ -46,9 +46,8 @@ impl IggyBridge {
     ///
     /// `partition_count` is `u32`, so it cannot carry Kafka's own `CreateTopics` sentinel
     /// (`num_partitions == -1`, KIP-464 "use the broker default" - `protocol/responses.rs`
-    /// already accepts that sentinel at the wire-validation layer). Resolving *what* the broker
-    /// default should be for this bridge is a decision for whichever of `#3535`/`#3536` first
-    /// calls this with a real Kafka request in hand, not one to invent here ahead of that need.
+    /// already accepts that sentinel at the wire-validation layer). The broker default is for
+    /// the first caller with a real Kafka request (`Metadata` or `CreateTopics`) to decide.
     ///
     /// No caching: every call pays a `get_stream` and a `get_topic` (two round trips once both
     /// already exist), even for a topic this same bridge already confirmed a moment ago. A cache
@@ -56,10 +55,9 @@ impl IggyBridge {
     /// cache entry ever get invalidated" - the topic being deleted and recreated with a different
     /// partition count out from under a stale cache entry is exactly
     /// `ensure_topic_targets_the_streams_live_incarnation_after_a_delete_and_recreate`'s own
-    /// scenario, and a naive cache breaks that guarantee to save two round trips. Whatever wires
-    /// this into `#3535`/`#3536` should call it once per topic and remember that it did, rather
-    /// than once per Produce/Fetch - the cost belongs at the call site's discretion, not hidden
-    /// (and potentially made wrong) inside this method.
+    /// scenario, and a naive cache breaks that guarantee to save two round trips. A caller must
+    /// call it once per topic and remember that it did, not once per request. Produce does not
+    /// call it: it creates nothing.
     ///
     /// # Errors
     ///

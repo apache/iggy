@@ -71,10 +71,8 @@ broker's usual port). Every command below passes `--host 127.0.0.1:9093` explici
 connection-refuses before any assertion runs.
 
 Every case below describes a gateway started **without** a bridge (`IGGY_KAFKA_BRIDGE_ENABLED`
-unset). That is the only mode where every API answers with a stub. With a bridge, Produce writes
-to Iggy instead, and the empty record blob that the fixture tool sends answers `ec=87`
-(INVALID_RECORD) and not `ec=6`. To drive that path by hand you need real record batches, so
-`tests/produce_real_bridge_tests.rs` covers it against a real `iggy-server`.
+unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
+`tests/produce_real_bridge_tests.rs` covers the bridge path.
 
 | ID | Test | Steps | Expected result | Pass criteria |
 | ---- | ------ | ------- | ----------------- | --------------- |
@@ -190,7 +188,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 
 | ID | Test | Steps | Expected |
 | ---- | ------ | ------- | ---------- |
-| H1 | Truncated Produce body | Send valid header + incomplete body | **No response at all** - `kafka_protocol` decodes the whole request in one shot, so a failure anywhere leaves `acks` unknowable; answering risks desyncing an `acks=0` fire-and-forget client's correlation stream, so every Produce decode failure stays silent. Connection stays open (send A2 next to confirm); **no panic** |
+| H1 | Truncated Produce body | Send valid header + incomplete body | No response. Connection closed. **No panic** |
 | H2 | Random bytes | `dd if=/dev/urandom bs=64 count=1 \| nc 127.0.0.1 9093` | Connection closed or protocol error; gateway stays up |
 | H3 | Empty body after header | ApiVersions with valid header, empty body | `ec=0` (ApiVersions accepts empty body) |
 
@@ -202,17 +200,22 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 
 | Code | Name | When returned |
 | ------ | ------ | --------------- |
+| -1 | UNKNOWN_SERVER_ERROR | Produce with a bridge: Iggy error with no closer code, or bad bridge login |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub, per partition (retriable; payload not persisted) |
-| 10 | MESSAGE_TOO_LARGE | Produce with a bridge: a record Iggy cannot hold, or a request that decompresses past its budget |
+| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce with a bridge: missing topic or partition |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or request budget used by earlier partitions and the entry fits alone |
+| 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored) |
+| 10 | MESSAGE_TOO_LARGE | Produce with a bridge: record, send or partition too large, even alone |
+| 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |
 | 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
-| 87 | INVALID_RECORD | Produce with a bridge: a record batch this gateway cannot map, including a missing or empty one |
-| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic |
-| 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception), plus a Produce with a bridge that carries a transactional or control batch. Every other API key's out-of-range version closes the connection instead - see Category B |
+| 29 | TOPIC_AUTHORIZATION_FAILED | Produce with a bridge: Iggy user lacks permission |
+| 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception), plus Produce with a bridge: transactional, control or idempotent batch. Every other API key's out-of-range version closes the connection instead - see Category B |
 | 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
 | 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
 | 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
-| 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. **Not** Produce - a Produce decode failure always stays silent (`NoResponse`), never `ec=42` - see H1 |
+| 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. Not Produce: it closes the connection (H1) |
+| 76 | UNSUPPORTED_COMPRESSION_TYPE | Produce with a bridge: zstd before v7 |
+| 87 | INVALID_RECORD | Produce with a bridge: a record batch this gateway cannot map, including a missing, empty or second one |
 
 A malformed request header (before any API-specific body is even reached) has no parsed header to
 build a version-correct response against, so it closes the connection rather than returning any

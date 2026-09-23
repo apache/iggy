@@ -16,13 +16,18 @@
 // under the License.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
-use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilder, IggyError};
+use iggy::prelude::{
+    AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
+};
+use tokio::sync::Semaphore;
 use tracing::info;
 
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
+use crate::bridge::topic_map::validate_kafka_topic_name;
 
 mod fetch;
 mod offsets;
@@ -47,51 +52,17 @@ const RECONNECTION_RETRIES: u32 = 3;
 /// and to every call made after it succeeds (`get_stream`, `create_stream`, `get_topic`,
 /// `create_topic`, `shutdown`).
 ///
-/// One constant, not two separately-named ones with the same value: both call sites bound the
-/// identical underlying hazard. `TcpClient::establish_bounded` only applies its own
-/// `FAILOVER_DIAL_TIMEOUT` (2s) when at least two failover candidates are configured
-/// (`tcp_client.rs`) - a bridge always configures exactly one address, so that guard never engages
-/// at either site, and the plain `TcpStream::connect` underneath has no deadline of its own.
-/// Against a firewall that drops SYN packets instead of refusing them, each dial attempt pays the
-/// kernel's own SYN-retry timeout (minutes, not seconds) rather than the `reconnection_interval`
-/// between attempts - a closed port (instant RST) never exercises this path, so the failure mode
-/// only shows up in production. 15s comfortably covers a slow-but-alive server's handshake (well
-/// above p99 login latency) while still failing well short of the pathological multi-minute case.
+/// 15s covers a slow but live server's handshake and login.
 ///
-/// Known limitation, not closed by this constant: [`with_request_timeout`] cancels only the
-/// *caller's* wait, not the SDK's own work. `TcpClient::send_raw_vsr_attempt` (`tcp_client.rs`)
-/// writes, flushes and reads inside a detached `tokio::spawn` specifically so that dropping the
-/// awaiting future - exactly what this timeout does on expiry - cannot abort it mid-flight (that
-/// function's own "SAFETY: we run code holding the `stream` lock in a task so we can't be
-/// cancelled while holding the lock"). A call that times out here can leave that detached task
-/// still holding `IggyClient`'s single stream mutex for up to `RESPONSE_READ_TIMEOUT` (30s,
-/// `tcp_client.rs`) longer, queuing every other bridge call behind it. Raising this constant does
-/// not close the gap either: a mid-call reconnect (`send_raw_with_response`, `tcp_client.rs`)
-/// replays on a fresh `RESPONSE_READ_TIMEOUT` budget, and the reconnect dial itself goes through
-/// the same undead-lined `TcpStream::connect` this constant exists to bound - genuinely unbounded,
-/// so no finite value here can guarantee catching it. That same unboundedness is why this timeout
-/// cannot simply be dropped for post-connect calls either: [`IggyBridge`] holds one `IggyClient`
-/// with no pooling, so an unbounded reconnect dial with nothing here to stop it would wedge every
-/// later call on this bridge, not just the one that triggered it. No longer a hypothetical: since
-/// `ListOffsets` (#3537) this bridge is called from a live Kafka handler, with no semaphore
-/// bounding concurrent bridge calls. Closing the underlying gap needs either a cooperatively
-/// cancellable SDK call or a deadline on the SDK's own reconnect dial, neither of which this
-/// bridge can add from the outside; bounding concurrent bridge calls is a separate, addressable
-/// fix that becomes more pressing as `CreateTopics` and `Metadata` (#3538/#3534) add more live
-/// callers.
+/// A reconnect dial runs in the caller's future, so this timeout cancels a hung dial too.
+///
+/// Sends use the Produce deadline instead. See `send_records`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`]. See that constant's doc for why every
-/// bridge method needs this, not just [`IggyBridge::connect`] - and for the cancellation gap this
-/// wrapper does not close.
+/// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`].
 ///
 /// On expiry, maps to [`BridgeError::Timeout`], not `IggyError::CannotEstablishConnection`: the
-/// SDK's write/read run in a detached task this timeout cannot abort (see [`REQUEST_TIMEOUT`]'s
-/// doc), so by the time this fires the request may already be on the wire, or already applied
-/// server-side - a genuinely unknown outcome, not a known connection failure. `BridgeError`'s own
-/// mapping already treats an unknown outcome (`IggyError::TransientNotCommitted`) as distinct from
-/// a known-safe-to-retry one for exactly this reason; a caller-side timeout is the same shape and
-/// must not borrow the known-safe code.
+/// SDK's write/read run in a detached task this timeout cannot abort, so the call may still land.
 async fn with_request_timeout<T>(
     op: impl Future<Output = Result<T, IggyError>>,
 ) -> Result<T, BridgeError> {
@@ -103,21 +74,19 @@ async fn with_request_timeout<T>(
 
 /// Owns one connected `IggyClient` and resolves Kafka topics against it.
 ///
-/// Produce/Fetch handler wiring is a separate, later change (`#3535`/`#3536`) - this type is the
-/// shared plumbing those handlers will call into, exercised standalone here via its own tests and
-/// an integration test against a real `iggy-server`.
-///
-/// One `IggyClient`, shared across every Kafka connection this gateway serves - and the SDK's TCP
-/// transport is lockstep, one request in flight at a time (`tcp_client.rs`: "the connection is
-/// lockstep", its stream mutex held across write, flush, and read). Every concurrent Kafka
-/// connection ends up serialized behind whichever single Iggy request is in flight; the Kafka
-/// side's own connection limit does nothing to relieve this. No pooling exists yet - `close`
-/// already takes `self` by value, which anticipates an eventual `Arc`-shared bridge, but nothing
-/// wires that up today. Documented here and in the README rather than silently discovered under
-/// load once `#3535`/`#3536` land.
+/// One lockstep client serves every Kafka connection, so Iggy calls run one at a time. A pool is
+/// a TODO in `docs/SCOPE.md`.
 pub struct IggyBridge {
-    client: IggyClient,
+    client: Arc<IggyClient>,
     config: IggyBridgeConfig,
+    /// One Produce send inside the SDK at a time. See `send_records`.
+    send_slot: Arc<Semaphore>,
+}
+
+/// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
+pub struct TopicTarget {
+    stream_id: Identifier,
+    topic_id: Identifier,
 }
 
 impl IggyBridge {
@@ -158,7 +127,28 @@ impl IggyBridge {
         with_request_timeout(client.connect()).await?;
         info!("Iggy bridge connected to {}", config.address);
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client: Arc::new(client),
+            config,
+            send_slot: Arc::new(Semaphore::new(1)),
+        })
+    }
+
+    /// Checks `kafka_topic` against Kafka's name rules and resolves its Iggy stream and topic.
+    ///
+    /// Creates nothing. `Metadata` owns topic creation.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError::InvalidKafkaTopicName`] if the name fails Kafka's own rules.
+    /// [`BridgeError::Iggy`] if a mapped name is not a valid Iggy identifier.
+    pub fn topic_target(&self, kafka_topic: &str) -> Result<TopicTarget, BridgeError> {
+        validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        Ok(TopicTarget {
+            stream_id: Identifier::named(stream_name).map_err(BridgeError::Iggy)?,
+            topic_id: Identifier::named(topic_name).map_err(BridgeError::Iggy)?,
+        })
     }
 
     /// Tears down the underlying Iggy client, including its background heartbeat task.
@@ -174,9 +164,8 @@ impl IggyBridge {
     /// dials past.
     ///
     /// Takes `self` by value: `shutdown` is terminal (no reconnect is coming back from it), so
-    /// nothing legitimate is left to call on this bridge afterward. This does mean a bridge shared
-    /// via `Arc` cannot call this directly (`Arc::try_unwrap` first) - not a concern before
-    /// `#3535`/`#3536` wire an owning caller in.
+    /// nothing legitimate is left to call on this bridge afterward. A bridge shared via `Arc`
+    /// needs `Arc::try_unwrap` first.
     ///
     /// # Errors
     ///

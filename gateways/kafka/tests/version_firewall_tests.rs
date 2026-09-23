@@ -360,11 +360,8 @@ async fn unsupported_api_keys_close_connection() {
 // that generic per-scoped-API loop already exercises the exact same fixtures and version ranges.
 
 #[tokio::test]
-async fn corrupt_produce_body_with_acks_stays_silent() {
-    // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes `acks`
-    // (unlike the pre-migration field-by-field decoder, which could still answer with
-    // INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure now stays
-    // silent regardless of whether acks was readable before the truncation.
+async fn corrupt_produce_body_with_acks_closes() {
+    // `acks` is unknown after a failed decode, so no reply is safe. Kafka closes too.
     let body = Bytes::from_static(&[
         0xFF, 0xFF, // null transactional_id
         0x00, 0x01, // acks = 1
@@ -374,20 +371,18 @@ async fn corrupt_produce_body_with_acks_stays_silent() {
     assert!(
         handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
             .await
-            .is_no_response(),
-        "malformed Produce body must stay silent regardless of acks"
+            .is_close(),
+        "malformed Produce body must close regardless of acks"
     );
 }
 
 #[tokio::test]
-async fn corrupt_produce_body_before_acks_is_silent() {
-    // Decode fails before acks is read: the client's response expectation is unknowable, and an
-    // error response could desync an acks=0 fire-and-forget client, so the server stays silent.
+async fn corrupt_produce_body_before_acks_closes() {
     let body = Bytes::from_static(&[0xFF, 0xFF]); // null transactional_id, then EOF
     let outcome = handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).await;
     assert!(
-        outcome.is_no_response(),
-        "produce decode failure before acks must be silent"
+        outcome.is_close(),
+        "produce decode failure before acks must close"
     );
 }
 

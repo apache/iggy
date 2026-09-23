@@ -17,11 +17,10 @@
 
 //! Offset and high-watermark lookups.
 
-use iggy::prelude::{Identifier, IggyError, TopicClient};
+use iggy::prelude::{IggyError, TopicClient};
 
 use super::{IggyBridge, with_request_timeout};
 use crate::bridge::error::BridgeError;
-use crate::bridge::topic_map::validate_kafka_topic_name;
 
 impl IggyBridge {
     /// Returns the high watermark (one past the highest *committed* offset - see
@@ -94,21 +93,19 @@ impl IggyBridge {
         kafka_topic: &str,
         partitions: &[u32],
     ) -> Result<Vec<(u32, Result<i64, BridgeError>)>, BridgeError> {
-        validate_kafka_topic_name("kafka_topic", kafka_topic)?;
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
-        let details = with_request_timeout(self.client.get_topic(&stream_id, &topic_id))
-            .await?
-            .ok_or_else(|| {
-                // A missing *stream* also makes get_topic return Ok(None) (responses.rs), so this
-                // reports TopicNameNotFound even when the stream is what's actually gone - both
-                // map to the same Kafka wire code either way, so only the log text is affected.
-                BridgeError::Iggy(IggyError::TopicNameNotFound(
-                    topic_name.to_string(),
-                    stream_name.to_string(),
-                ))
-            })?;
+        let target = self.topic_target(kafka_topic)?;
+        let details =
+            with_request_timeout(self.client.get_topic(&target.stream_id, &target.topic_id))
+                .await?
+                .ok_or_else(|| {
+                    // A missing *stream* also makes get_topic return Ok(None) (responses.rs), so this
+                    // reports TopicNameNotFound even when the stream is what's actually gone - both
+                    // map to the same Kafka wire code either way, so only the log text is affected.
+                    BridgeError::Iggy(IggyError::TopicNameNotFound(
+                        target.topic_id.to_string(),
+                        target.stream_id.to_string(),
+                    ))
+                })?;
 
         Ok(partitions
             .iter()
@@ -122,10 +119,8 @@ impl IggyBridge {
                     .binary_search_by_key(&partition, |p| p.id)
                     .map(|index| &details.partitions[index])
                     .map_err(|_| BridgeError::PartitionOutOfRange {
-                        // The Kafka-side name a caller (a future ListOffsets handler) actually
-                        // asked about, not `topic_name` - a mapping override would otherwise
-                        // quote the wrong (Iggy-side) name back at a Kafka client that never
-                        // heard of it.
+                        // The Kafka-side name the caller asked about. A mapping override
+                        // would otherwise quote an Iggy name the Kafka client never heard of.
                         topic: kafka_topic.to_string(),
                         partition,
                         partitions_count: details.partitions_count,

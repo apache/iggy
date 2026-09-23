@@ -1,6 +1,6 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it. Everything else is a stub.
 
 > **Stub warning:** When you set `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce writes to Iggy and
 > ListOffsets answers `EARLIEST`/`LATEST` from real partition state. No other API stores or reads
@@ -74,9 +74,11 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 ### Delivery guarantees
 
 Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
-restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
-a producer id so that it starts, but its retries are not deduplicated: a retry after a network
-timeout writes the record twice, and both copies reach the stream with their own offsets.
+restart. Transactions are not supported, and will not be. A retry after a timeout can write a
+record twice.
+
+Java producers must set `enable.idempotence=false`. The gateway does not serve `InitProducerId`
+yet ([#3545](https://github.com/apache/iggy/issues/3545)), and it refuses idempotent batches.
 
 Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
 guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
@@ -96,30 +98,37 @@ start a real `iggy-server`.
 
 ### Produce ([#3535](https://github.com/apache/iggy/issues/3535))
 
-Each partition entry in a Produce request becomes one Iggy `send_messages` call. Each entry
-answers for itself. A partition that fails carries its own error code, and the partitions that
-worked keep their offsets.
+One partition, one Iggy send, or more if its timestamps span over about 71 min. Each partition
+answers for itself.
 
-| Field | What the gateway does |
-| ------- | ----------------------- |
-| Partition | Uses the index the client sent. Both systems number partitions from 0. |
-| Base offset | Takes it from the send confirmation. Sends `-1` when the server confirms the write but names no offset. |
-| `log_start_offset` | Always `-1`. The real value costs one extra call per request, and no producer reads it yet. |
-| `acks` | Writes the same way for `0`, `1` and `-1`. Durability is the Iggy topic's setting. Any other value answers `INVALID_REQUIRED_ACKS` (21). |
-| Topics | Creates none. A missing topic answers `UNKNOWN_TOPIC_OR_PARTITION` (3). Metadata creates topics. |
-| `timeout_ms` | Honors it, up to 20 seconds. Partitions past the deadline answer `REQUEST_TIMED_OUT` (7). |
-| Compression | Reads gzip, snappy, lz4 and zstd. |
+| Field | Gateway |
+| ----- | ------- |
+| Partition | Index as sent. Both count from 0. |
+| Base offset | From the send confirmation. `-1` if none, or if another writer wrote between split sends. |
+| `log_start_offset` | Always `-1`. |
+| `acks` | `0`, `1`, `-1` write the same. Other values: 21, before any per-partition check. |
+| `acks=0` | Writes, answers nothing. Any failed partition closes the connection. |
+| Topics | Creates none. Missing: 3. Bad name: 17. |
+| `timeout_ms` | Honored, max 20 s. Past it: 7. |
+| Compression | gzip, snappy, lz4. zstd from v7, else 76. |
+| Timestamps over about 71 min apart | Several sends. A failure after the first can duplicate on retry. |
+| Several batches in one partition | 87, as Kafka. |
+| More records than the batch declares | 87, as Kafka. |
+| Same partition twice in one request | Written twice. Kafka keeps the last. |
+| Repeated header name in a record | 87. |
+| Produce v0-2, `acks=0` | Closes the connection. |
+| Undecodable request | Closes the connection. |
 
-`acks=0` still writes the records. It answers nothing, because the wire protocol forbids a reply.
+| Code | When | Client |
+| ---- | ---- | ------ |
+| 10 | Record, send or partition too large, even alone | Java splits multi-record batches. Else fails. |
+| 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
+| 35 | Transactional, control or idempotent batch | Fails. |
+| 6 | Earlier partitions used the request budget, and this one fits alone. Nothing written. | Retries. |
+| 7 | Deadline passed, or connection lost mid-send. May be written. | Retries. Can duplicate. |
 
-Bad records get one of two codes. A record Iggy cannot hold answers `MESSAGE_TOO_LARGE` (10). A
-record this gateway cannot map answers `INVALID_RECORD` (87). A transactional or control batch
-answers `UNSUPPORTED_VERSION` (35), which is the code that stops a transactional producer. None of
-the three is retriable, because the same bytes never succeed on a second try.
-
-All batches in one request share one decompression budget, set to `max_frame_size`. A compressed
-request therefore cannot produce more bytes than the same client could have sent uncompressed. A
-request past the budget answers `MESSAGE_TOO_LARGE` (10).
+Request budget: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
+per slot. 4 requests decode at once.
 
 [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) describes what a record becomes once it is stored.
 
@@ -132,6 +141,7 @@ request past the budget answers `MESSAGE_TOO_LARGE` (10).
 | `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only); otherwise it generates a random password, so a hardcoded default here could never be right and would invite running as root unnoticed |
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
 | `IGGY_KAFKA_TOPIC_MAP_PATH` | unset | Path to a topic-mapping TOML file (see below); omit to use only the default rule |
+| `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE` | `64MiB` | Iggy's `message_bus.max_message_size`. Set both together. Larger partitions answer 10 |
 
 The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETRIES = 3`, not the
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
@@ -143,16 +153,11 @@ reconnects internally, mid-call, on a transport error, through the same undead-l
 bridge call made well after the initial connect can still hit this if Iggy becomes unreachable
 later.
 
-This timeout only bounds the *caller's* wait, not the SDK's own work: the SDK writes and reads on
-a detached background task specifically so that dropping the awaiting future - what this timeout
-does on expiry - cannot abort it mid-flight. A timed-out call can leave that task holding the
-shared client's connection lock for up to another 30s (the SDK's own reply deadline), queuing
-every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
-Concurrency ceiling below) and no semaphore bounding concurrent bridge calls. ListOffsets
-(`#3537`) and Produce (`#3535`) call it from real handlers, Produce on every write, so this is no
-longer a hypothetical. CreateTopics (`#3538`), Metadata (`#3534`) and Fetch (`#3536`) add more
-concurrent callers when they land. See `IggyBridge`'s own doc comment (its rustdoc is private, so
-this isn't a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
+`send_records` uses the Produce deadline instead:
+
+- One send runs in the SDK at a time.
+- A send past its deadline keeps that slot until it ends, up to 45 s. Other sends answer 7 meanwhile.
+- ListOffsets needs no slot, but it waits behind a stuck send in the SDK. Past `REQUEST_TIMEOUT` it answers 7.
 
 ### Topic mapping
 
@@ -207,19 +212,11 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 ### Concurrency ceiling
 
-One `IggyBridge` (one `IggyClient`) is meant to serve every Kafka connection this gateway handles,
-and the Iggy SDK's TCP transport is lockstep - one request in flight per client, its stream mutex
-held across write, flush, and read. Every concurrent Kafka connection ends up serialized behind
-whichever single Iggy request is in flight; the Kafka side's own connection limit
-(`IGGY_KAFKA_MAX_CONNECTIONS`) does nothing to relieve this. No connection pooling exists yet, and
-Produce puts this on a hot path as of `#3535` - it is a known gap, not a design decision to rely
-on.
-
-Message order does not depend on the pool. The connection loop reads one frame, runs the handler,
-then writes the answer. One Kafka connection therefore never has two requests in flight, and a
-producer's writes to a partition stay in the order it sent them. The single client costs
-throughput instead. A producer set up for several requests in flight gains nothing from them, and
-every Kafka connection waits behind the Iggy call that is running.
+- One `IggyClient` serves every Kafka connection, one Iggy request at a time.
+- `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A client pool is a TODO in
+  [docs/SCOPE.md](docs/SCOPE.md).
+- Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
+  can land after later ones.
 
 ### Error mapping
 
@@ -233,8 +230,8 @@ every Kafka connection waits behind the Iggy call that is running.
   `UNKNOWN_SERVER_ERROR` (-1), deliberately **not** 29 - the Kafka client can't fix a bridge-side
   credential misconfiguration, and blaming its own ACLs for one is worse than an unexplained
   fatal error
-- Connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6, the same retriable code the
-  foundation's own stubs send, so a client backs off and retries)
+- Connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6). On a send, `Disconnected`,
+  `EmptyResponse`, `TcpError` and `StaleClient` → 7 instead: the write may have landed
 - An Iggy commit whose outcome is genuinely unknown (`TransientNotCommitted`) →
   `REQUEST_TIMED_OUT` (7) - retriable in real Kafka too, chosen because it's what a real broker
   sends for the same shape of failure, not to make a client stop retrying
