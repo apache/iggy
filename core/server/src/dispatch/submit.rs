@@ -24,6 +24,7 @@
 //! their replica forwards) delegate to `session_ops`, which owns that
 //! machinery.
 
+use crate::consumer_group::liveness::ConsumerGroupLiveness;
 use crate::dispatch::session_ops::{
     answer_forwarded_logout, answer_forwarded_register, submit_logout_local_or_forward,
     submit_register_local_or_forward,
@@ -31,13 +32,15 @@ use crate::dispatch::session_ops::{
 use crate::dispatch::upgrade_shard_handle;
 use crate::reply_frame::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
-use consensus::MetadataHandle;
+use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::{GenericHeader, PrepareHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use server_common::Message;
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Handler shard 0 runs for an inbound [`shard::MetadataSubmit`]: a peer
@@ -49,6 +52,8 @@ use tracing::warn;
 #[allow(clippy::too_many_lines)]
 pub fn make_metadata_submit_handler<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
+    liveness: &Rc<RefCell<ConsumerGroupLiveness>>,
+    session_timeout: Duration,
 ) -> shard::MetadataSubmitHandler
 where
     B: ShellBus,
@@ -58,13 +63,30 @@ where
     SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
+    let liveness = Rc::clone(liveness);
     Rc::new(move |submit| {
         let Some(shard) = upgrade_shard_handle(&shard_handle) else {
             return;
         };
         let bus = shard.bus.clone();
+        let liveness = Rc::clone(&liveness);
         bus.spawn(async move {
             match submit {
+                shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
+                    let metadata = shard.plane.metadata();
+                    if let Some(consensus) = metadata.consensus.as_ref() {
+                        liveness.borrow_mut().receive(
+                            consensus.cluster(),
+                            (consensus.is_primary()
+                                && consensus.is_normal()
+                                && !consensus.is_transferring())
+                            .then_some(consensus.view()),
+                            &message,
+                            Instant::now(),
+                            session_timeout,
+                        );
+                    }
+                }
                 shard::MetadataSubmit::AttachConsumerSession {
                     vsr_client_id,
                     session,

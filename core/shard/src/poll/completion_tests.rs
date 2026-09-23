@@ -190,6 +190,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                     group_id: WireIdentifier::numeric(u32::try_from(GROUP).unwrap()),
                     client_id: CLIENT,
                     in_flight: Vec::new(),
+                    session: None,
                 }
                 .to_bytes(),
             ),

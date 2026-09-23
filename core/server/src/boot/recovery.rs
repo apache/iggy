@@ -19,6 +19,7 @@
 
 use crate::boot::topology::{RosterCells, TcpTopology, build_cluster_roster};
 use crate::boot::wire_shell_handlers;
+use crate::consumer_group::liveness::ConsumerGroupLiveness;
 use crate::partition_helpers::load_partition_or_fence;
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
@@ -62,6 +63,7 @@ use tracing::{error, info, warn};
 pub(in crate::boot) struct ShardBuild {
     pub shard: Rc<ServerShard>,
     pub sessions: Rc<RefCell<SessionManager>>,
+    pub consumer_group_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
     pub on_client_request: RequestHandler,
     pub shard_handle: ShellShardHandle<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>,
 }
@@ -259,6 +261,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         on_metadata_submit,
         on_list_clients,
         sessions,
+        consumer_group_liveness,
     } = wire_shell_handlers(
         &bus,
         &shard_handle,
@@ -328,6 +331,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     Ok(ShardBuild {
         shard,
         sessions,
+        consumer_group_liveness,
         on_client_request,
         shard_handle,
     })

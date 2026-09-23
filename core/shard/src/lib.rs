@@ -41,12 +41,13 @@ use consensus::{
 use crossfire::AsyncRxTrait;
 use futures::FutureExt;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader,
-    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
-    ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
-    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, ConsumerSession,
+    ConsumerSessionHeartbeatHeader, DoViewChangeHeader, ForwardLogoutHeader,
+    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader,
+    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader,
 };
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
@@ -67,7 +68,9 @@ use partitions::state_transfer::TransferArtifact;
 use partitions::{
     FatalCommit, IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer,
 };
-use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+use server_common::sharding::{
+    IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, PartitionLocation, ShardId,
+};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
@@ -211,6 +214,8 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Logout preserves them so its caller can distinguish an unknown outcome
 /// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
+    /// Replica-link liveness report routed to shard 0; no proposal or reply.
+    ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
     AttachConsumerSession {
         vsr_client_id: u128,
         session: u64,
@@ -320,12 +325,20 @@ pub struct ConnectedClientInfo {
 /// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
 /// The server wires it to read the shard's `SessionManager` and push its
 /// connected clients back over the carried reply sender.
-pub type ListClientsHandler = Rc<dyn Fn(Sender<Vec<ConnectedClientInfo>>)>;
+pub type ListClientsHandler = Rc<dyn Fn(ListClientsReply)>;
 
-/// Per-shard reply budget for the `list_all_clients` gather. A shard that
-/// doesn't answer within this window is skipped (partial result) so one
-/// wedged shard can't hang the read.
-const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+#[derive(Debug)]
+pub enum ListClientsReply {
+    Clients(Sender<Vec<ConnectedClientInfo>>),
+    Sessions(Sender<Vec<ConsumerSession>>),
+}
+
+/// Best-effort client list plus whether every shard answered.
+pub struct GatheredClients<T = ConnectedClientInfo> {
+    pub clients: Vec<T>,
+    /// False if any shard rejected the request or failed to reply before the deadline.
+    pub complete: bool,
+}
 
 /// A read executed on the shard that owns a partition: a message poll or a
 /// consumer-offset lookup. Carried by [`LifecycleFrame::PartitionRead`];
@@ -772,7 +785,7 @@ pub enum LifecycleFrame {
     /// shard knows only its own connections). See
     /// [`IggyShard::list_all_clients`].
     ListClients {
-        reply: Sender<Vec<ConnectedClientInfo>>,
+        reply: ListClientsReply,
     },
     /// Execute a partition read (message poll / consumer-offset lookup) on
     /// the shard that owns `namespace` and push the result back over
@@ -1969,12 +1982,32 @@ where
     /// treat the result as best-effort-complete.
     #[allow(clippy::future_not_send)]
     pub async fn list_all_clients(&self) -> Vec<ConnectedClientInfo> {
+        self.gather_clients().await.clients
+    }
+
+    /// Gather administrative client details with completeness information.
+    #[allow(clippy::future_not_send)]
+    pub async fn gather_clients(&self) -> GatheredClients {
+        self.gather_client_info(ListClientsReply::Clients).await
+    }
+
+    /// Gather bound session identities with completeness information for expiry decisions.
+    #[allow(clippy::future_not_send)]
+    pub async fn gather_consumer_sessions(&self) -> GatheredClients<ConsumerSession> {
+        self.gather_client_info(ListClientsReply::Sessions).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn gather_client_info<ClientInfo: Send + 'static>(
+        &self,
+        reply: fn(Sender<Vec<ClientInfo>>) -> ListClientsReply,
+    ) -> GatheredClients<ClientInfo> {
         let shard_count = self.shard_count as usize;
-        let (reply_tx, reply_rx) = channel::<Vec<ConnectedClientInfo>>(shard_count.max(1));
+        let (reply_tx, reply_rx) = channel::<Vec<ClientInfo>>(shard_count.max(1));
         let mut expected = 0usize;
         for sender in &self.senders {
             let frame = ShardFrame::lifecycle(LifecycleFrame::ListClients {
-                reply: reply_tx.clone(),
+                reply: reply(reply_tx.clone()),
             });
             if let Err(error) = sender.try_send(frame) {
                 tracing::warn!(
@@ -2022,7 +2055,10 @@ where
                 "list_all_clients: gather timed out; returning partial result"
             );
         }
-        clients
+        GatheredClients {
+            clients,
+            complete: received == shard_count,
+        }
     }
 
     /// Run a partition read on the shard owning `namespace` and await the reply.
@@ -3237,6 +3273,13 @@ where
             MessageBag::ForwardRegister(ref msg) => self.on_forward_register(*msg.header()),
             MessageBag::ForwardRegisterResult(ref msg) => {
                 self.on_forward_register_result(*msg.header());
+            }
+            MessageBag::ConsumerSessionHeartbeat(msg) => {
+                if self.peer_is_known(msg.header().replica, "ConsumerSessionHeartbeat")
+                    && control_suffix_body_verified(&msg, msg.header().checksum_body).is_some()
+                {
+                    (self.on_metadata_submit)(MetadataSubmit::ConsumerSessionHeartbeat(msg));
+                }
             }
             MessageBag::ForwardLogout(ref msg) => self.on_forward_logout(*msg.header()),
             MessageBag::ForwardLogoutResult(ref msg) => {

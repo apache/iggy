@@ -25,6 +25,8 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
+pub mod liveness;
+
 use crate::namespace::{resolve_offset_group_id, resolve_partition_namespace};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
@@ -85,6 +87,7 @@ where
                 group_id: wire.group_id,
                 client_id,
                 in_flight,
+                session: Some(request.header().session),
             }
             .to_bytes()
         }
@@ -881,6 +884,7 @@ mod tests {
                     group_id: GROUP_ID,
                     client_id: FIRST_CLIENT,
                     in_flight: Vec::new(),
+                    session: None,
                 }
                 .to_bytes(),
             ))
