@@ -24,7 +24,7 @@ use crate::journal::{
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::persistence::{
-    CheckpointBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
+    FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
 use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
@@ -1415,7 +1415,7 @@ where
             // [`IggyIndexWriter::fsync`] used the original descriptor above.
             // The marker tells [`PartitionPersistence::checkpoint_files`] not
             // to replace that proof with a fresh-handle sync.
-            barriers.push(CheckpointBarrier::already_synced(writer.path()));
+            barriers.push(FileSyncBarrier::already_synced(writer.path()));
         }
         if let Err(error) = self.persist_retry_checkpoint(through_op).await {
             error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
@@ -1443,7 +1443,7 @@ where
         if let Some(writer) = self.log.messages_writers().last().and_then(Option::as_ref) {
             let path = writer.path();
             let writer = Rc::clone(writer);
-            barriers.push(CheckpointBarrier::from_future(path, async move {
+            barriers.push(FileSyncBarrier::from_future(path, async move {
                 writer
                     .fsync()
                     .await
@@ -1453,7 +1453,7 @@ where
         if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref) {
             let path = writer.path().to_owned();
             let writer = Rc::clone(writer);
-            barriers.push(CheckpointBarrier::from_future(path, async move {
+            barriers.push(FileSyncBarrier::from_future(path, async move {
                 writer
                     .fsync()
                     .await
