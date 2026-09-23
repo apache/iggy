@@ -38,6 +38,12 @@
 //! operations wait for their forward timeout in a mixed fleet. These commands are
 //! another reason the release cannot be rolled node by node.
 //!
+//! Consumer-session heartbeats (command 30) also require a coordinated upgrade.
+//! Older replicas reject this command and close the replica connection each time
+//! a new backup reports its sessions.
+//! Older replicas cannot report live sessions to a new primary, which would
+//! expire their consumer-group memberships after the configured timeout.
+//!
 //! `Prepare`, `Request`, `Reply`, and `Eviction` are unaffected. Prepares keep
 //! `checksum` as their view-independent identity, and the three client-facing
 //! headers are sealed on neither side, so SDKs are untouched.

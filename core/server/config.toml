@@ -18,10 +18,22 @@
 # Root directory for server data. Environment override: IGGY_PATH.
 path = "local_data"
 
-# Configuration for consumer group cooperative partition rebalancing.
+# Consumer group rebalancing and session liveness.
 [consumer_group]
 # Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
 rebalancing_timeout = "30s"
+# The metadata primary removes members whose hosting server stops reporting their
+# connections for this long, including after a crash. An isolated live consumer
+# loses its session and must log in again. Each new primary grants a fresh timeout.
+# Expiry is always enabled. Incomplete client lists defer expiry across the cluster
+# until a full timeout has passed without an incomplete report.
+# Must exceed cluster.heartbeat_timeout when clustering is enabled, and
+# three heartbeat_interval periods plus two gather (3s) and send (100ms)
+# deadlines, allowing one missed report before expiry.
+session_timeout = "30s"
+# Server-to-server session reports run even when client heartbeat checks are disabled.
+# Must be nonzero. Use the same settings on all nodes.
+heartbeat_interval = "5s"
 
 [data_maintenance.messages]
 # Enables or disables the segment cleaner. It deletes the oldest sealed segments of
@@ -1050,8 +1062,9 @@ transfer_artifact_bytes_max = "1088 MiB"
 # call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
 max_batch = 256
 
-# Wire-level cap on a single framed message. Boot refuses a value above the
-# frozen 256 MiB ceiling: segment recovery derives fixed scan and allocation
+# Wire-level cap on a single framed message. Must fit a consumer session report
+# (at least 280 B). Boot refuses a value above the frozen 256 MiB ceiling:
+# segment recovery derives fixed scan and allocation
 # limits from the widest LEGAL record, so batches admitted above the ceiling
 # would be refused as implausible on a later boot. Raising it past 64 MiB
 # also breaks Go clients, whose frame cap is a hard 64 MiB constant.

@@ -180,6 +180,16 @@ impl Default for HeartbeatConfig {
 impl Default for ConsumerGroupConfig {
     fn default() -> ConsumerGroupConfig {
         ConsumerGroupConfig {
+            session_timeout: SERVER_CONFIG
+                .consumer_group
+                .session_timeout
+                .parse()
+                .unwrap(),
+            heartbeat_interval: SERVER_CONFIG
+                .consumer_group
+                .heartbeat_interval
+                .parse()
+                .unwrap(),
             rebalancing_timeout: SERVER_CONFIG
                 .consumer_group
                 .rebalancing_timeout

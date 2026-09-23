@@ -384,12 +384,14 @@ macro_rules! define_state {
 /// # Requirements
 /// Each listed operation must have a corresponding `{Operation}Request` wire type
 /// that implements `WireDecode` and `StateHandler<State = {$state}Inner>`.
+/// Internal commands only implement `StateHandler` and are never decoded from wire data.
 #[macro_export]
 macro_rules! collect_handlers {
     (
         $state:ident {
             $($operation:ident),* $(,)?
         }
+        $(internal { $($internal:ident),* $(,)? })?
     ) => {
         paste::paste! {
             #[derive(Debug, Clone)]
@@ -397,6 +399,9 @@ macro_rules! collect_handlers {
                 $(
                     $operation([<$operation Request>], ::iggy_common::IggyTimestamp),
                 )*
+                $($(
+                    $internal([<$internal Request>], ::iggy_common::IggyTimestamp),
+                )*)?
                 /// Replace the whole state from a snapshot section, in place.
                 /// Never parsed off the wire (state transfer installs it via
                 /// `RestoreSnapshotInPlace`); absorbed on both left-right
@@ -448,6 +453,11 @@ macro_rules! collect_handlers {
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*
+                        $($(
+                            [<$state Command>]::$internal(payload, ts) => {
+                                $crate::stm::StateHandler::apply(payload, self, *ts)
+                            },
+                        )*)?
                         [<$state Command>]::RestoreSnapshot(snapshot) => {
                             self.restore_in_place(snapshot.clone());
                             $crate::stm::result::ApplyReply::default()

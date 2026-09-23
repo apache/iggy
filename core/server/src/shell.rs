@@ -23,6 +23,7 @@
 //! Everything here is type- and config-level; construction (wiring the
 //! handlers against a live bus) stays in [`crate::boot`].
 
+use crate::consumer_group::liveness::ConsumerGroupLiveness;
 use crate::session_manager::SessionManager;
 use configs::server::ServerConfig;
 use consensus::{ConsensusTimers, VsrConsensus};
@@ -93,6 +94,8 @@ pub struct ShellHandlers {
     /// Bound by the client-request handler, read by the get-clients
     /// handler; the caller keeps it to reach locally-homed sessions.
     pub sessions: Rc<RefCell<SessionManager>>,
+    /// Volatile leases shared by replica heartbeat ingress and shard 0's expiry task.
+    pub consumer_group_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
 }
 
 impl ShellHandlers {
@@ -108,6 +111,7 @@ impl ShellHandlers {
             on_metadata_submit: Rc::new(|_| {}),
             on_list_clients: Rc::new(|_| {}),
             sessions: Rc::new(RefCell::new(SessionManager::new())),
+            consumer_group_liveness: Rc::default(),
         }
     }
 }

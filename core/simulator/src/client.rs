@@ -19,7 +19,7 @@ use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{GET_STREAM_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
-    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest, JoinConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -425,6 +425,22 @@ impl SimClient {
             name: WireName::new(name).expect("consumer group name must be valid"),
         };
         self.build_request(Operation::CreateConsumerGroup, &wire.to_bytes())
+    }
+
+    /// # Panics
+    /// Panics if any identifier is not a valid name.
+    pub fn join_consumer_group(
+        &self,
+        stream: &str,
+        topic: &str,
+        group: &str,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = JoinConsumerGroupRequest {
+            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            group_id: WireIdentifier::named(group).expect("group name must be valid"),
+        };
+        self.build_request(Operation::JoinConsumerGroup, &wire.to_bytes())
     }
 
     /// # Panics

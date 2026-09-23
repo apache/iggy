@@ -335,7 +335,7 @@ pub struct PacketSimulator {
 
 /// One past the highest [`Command`] discriminant, sizing [`COMMAND_LABELS`] and
 /// the delivery counters. Raising it is part of adding a command.
-pub const COMMAND_COUNT_MAX: usize = 30;
+pub const COMMAND_COUNT_MAX: usize = 31;
 
 /// Names for each [`Command`] discriminant, so a coverage report reads as
 /// protocol rather than as integers. Indexed by discriminant; the trailing
@@ -371,13 +371,14 @@ pub const COMMAND_LABELS: [&str; COMMAND_COUNT_MAX] = [
     "ForwardRegisterResult",
     "ForwardLogout",
     "ForwardLogoutResult",
+    "ConsumerSessionHeartbeat",
 ];
 
 const _: () = {
     // Adding a command without extending the table would report it under the wrong
     // name or index past the end of `command_counts`. Asserts the TABLE's length
-    // rather than pinning one variant to the end: `ForwardLogoutResult ==
-    // COMMAND_COUNT_MAX - 1` still holds after a `NewThing = 30` is appended past
+    // rather than pinning one variant to the end: `ConsumerSessionHeartbeat ==
+    // COMMAND_COUNT_MAX - 1` still holds after a `NewThing = 31` is appended past
     // it, so that form passed exactly when it needed to fire.
     assert!(COMMAND_LABELS.len() == COMMAND_COUNT_MAX);
     assert!(enumset::EnumSet::<Command>::variant_count() as usize == COMMAND_COUNT_MAX);
