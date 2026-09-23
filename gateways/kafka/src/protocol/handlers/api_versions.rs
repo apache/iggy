@@ -73,7 +73,8 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 /// Returns an error when `kafka_protocol` cannot encode the response at `api_version`.
 pub fn encode_response(api_version: i16, error_code: i16, sasl_enabled: bool) -> Result<Bytes> {
     // The SASL keys are advertised only while the feature is on, and are deliberately kept out of
-    // `SUPPORTED_RANGES` so a gateway with SASL off treats them as any other unknown key.
+    // `SUPPORTED_RANGES` so dispatch never serves them. With SASL off the state machine still
+    // answers them with `ILLEGAL_SASL_STATE` and keeps the connection open.
     let sasl = if sasl_enabled {
         sasl_advertised_ranges()
     } else {

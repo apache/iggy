@@ -55,8 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if !authenticator.is_tls_enabled() {
             warn!(
-                "the link from this gateway to Iggy is also unencrypted; set \
-                 IGGY_KAFKA_IGGY_TLS_ENABLED=true to close the second hop"
+                "the credential check's link to Iggy is also unencrypted; set \
+                 IGGY_KAFKA_IGGY_TLS_ENABLED=true to encrypt it. The bridge's own connection has \
+                 no TLS at any setting"
             );
         }
         info!("SASL/PLAIN enabled; credentials verified against {authenticator}");
@@ -243,8 +244,34 @@ fn load_config() -> Result<GatewayConfig, String> {
             .map_err(|e| format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{raw}`: {e}"))?;
         config.shutdown_drain_timeout = Duration::from_secs(secs);
     }
+    reject_iggy_tls_without_sasl(config.sasl_enabled)?;
 
     Ok(config)
+}
+
+/// Refuses `IGGY_KAFKA_IGGY_TLS_*` while SASL is off.
+///
+/// Only the credential verifier reads them, and it is built only with SASL on. Accepting them
+/// otherwise lets an operator believe the link to Iggy is encrypted when nothing reads the switch,
+/// the same mistake `IggyAuthenticator::from_env` refuses to start for.
+fn reject_iggy_tls_without_sasl(sasl_enabled: bool) -> Result<(), String> {
+    if sasl_enabled {
+        return Ok(());
+    }
+    let set: Vec<&str> = IggyAuthenticator::KNOWN_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|var| var.starts_with("IGGY_KAFKA_IGGY_TLS_"))
+        .filter(|var| std::env::var(var).is_ok())
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} set but IGGY_KAFKA_SASL_ENABLED is not true; only the SASL credential check reads them, \
+         so nothing would be encrypted",
+        set.join(", ")
+    ))
 }
 
 fn env_var(key: &str) -> Option<String> {
@@ -296,11 +323,11 @@ async fn shutdown_signal() {
 mod tests {
     use serial_test::serial;
 
-    use super::{parse_positive, reject_unknown_kafka_env_vars};
+    use super::{parse_positive, reject_iggy_tls_without_sasl, reject_unknown_kafka_env_vars};
 
     /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - this binary's
-    /// default group). This is the only `#[serial]` test compiled into *this* binary
-    /// (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `auth`'s,
+    /// default group). The `#[serial]` tests in this module are the only ones compiled into *this*
+    /// binary (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `auth`'s,
     /// `bridge::config`'s and `server`'s env-touching tests compile into the separate lib test
     /// binary, and `serial_test`'s mutex is process-local, so it does not (and does not need to)
     /// coordinate with any of those; `server.rs`'s own `#[serial]` test makes the mirror-image
@@ -353,6 +380,25 @@ mod tests {
             bridge_var_result.is_ok(),
             "known bridge IGGY_KAFKA_ var must be accepted"
         );
+    }
+
+    /// `#[serial]` for the same reason as the test above: it mutates process-wide env state.
+    #[test]
+    #[serial]
+    fn given_iggy_tls_without_sasl_should_refuse_to_start() {
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_ENABLED", "true");
+        }
+        let without_sasl = reject_iggy_tls_without_sasl(false);
+        let with_sasl = reject_iggy_tls_without_sasl(true);
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_ENABLED");
+        }
+        assert!(
+            without_sasl.is_err(),
+            "nothing reads the TLS switch with SASL off, so accepting it hides that"
+        );
+        assert!(with_sasl.is_ok());
     }
 
     #[test]

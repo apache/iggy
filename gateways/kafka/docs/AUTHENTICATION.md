@@ -21,8 +21,10 @@ the only place a credential is defined or verified.
 verified on every connection, against Iggy, and that verification is deliberately not cached. See
 [Verification is per connection](#verification-is-per-connection-and-cannot-be-cached).
 
-**Authorization stays in Iggy.** The gateway does not implement its own ACL model. It authenticates a Kafka
-client into an Iggy identity and lets the server's existing permission checks decide what that identity can do.
+**Authorization is meant to stay in Iggy.** The gateway will not implement its own ACL model. The intent is
+to carry the authenticated Iggy identity onto the data plane and let the server's existing permission checks
+decide what it can do. That is later work: today the verified client is shut down as soon as the credential
+clears, and nothing carries the principal past authentication.
 
 ## Why SCRAM is out
 
@@ -165,24 +167,29 @@ Notes that decide the implementation.
 - **Produce with `acks=0` stays silent.** Answering an unauthenticated fire-and-forget produce desyncs the
   client's correlation stream, so that case closes without writing. The existing rationale in
   `protocol/api.rs` applies unchanged.
-- **Pre-authentication deadline.** An unauthenticated connection currently holds a `max_connections` permit
-  for up to the idle timeout, ten minutes by default. Authentication needs its own, much shorter deadline.
+- **Pre-authentication deadline.** An unauthenticated connection holds a `max_connections` permit, so it
+  gets `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` between frames rather than the ten-minute idle timeout.
 
 ## Error mapping
 
 At authentication time a rejected credential becomes `SASL_AUTHENTICATION_FAILED` (58) with a generic
-message. An Iggy that cannot be reached, or an overloaded gateway, closes the connection without a body
-instead: Kafka clients treat 58 as fatal and raise it to the application, so borrowing it for a transient
+message. An Iggy that cannot be reached, an overloaded gateway, or a peer still inside the delay a previous
+rejection earned, closes the connection without a body instead: Kafka clients treat 58 as fatal and raise it to the application, so borrowing it for a transient
 condition turns a blip into a permanent failure for credentials that were always correct. A close reads as
 a transport failure, which is retriable, and still says nothing about whether the account exists. Iggy's login path already runs a dummy hash for unknown users to avoid a user-enumeration oracle,
 so the gateway must not reintroduce one by distinguishing unknown user from wrong password in the message
 or by returning early.
 
+### Planned: authorization errors
+
+Not implemented. Today `bridge/error.rs` picks the Kafka code from the Iggy error, and neither 30 nor 31
+is produced anywhere.
+
 After authentication, Iggy reports exactly one permission-denied code, `IggyError::Unauthorized` (41,
 `core/common/src/error/iggy_error.rs:97`), alongside `Unauthenticated` (40). Kafka distinguishes
 `TOPIC_AUTHORIZATION_FAILED` (29), `GROUP_AUTHORIZATION_FAILED` (30) and `CLUSTER_AUTHORIZATION_FAILED`
-(31). The gateway therefore picks the Kafka code from the operation it was performing, not from the Iggy
-error, because the Iggy error cannot tell them apart.
+(31). Once handlers act as the authenticated principal, the gateway will have to pick the Kafka code from
+the operation it was performing, not from the Iggy error, because the Iggy error cannot tell them apart.
 
 Iggy's data-plane permission checks read the local shard's view, so a permission revocation is visible on
 the control plane immediately and on the data plane only after that shard applies it. Say so in the README
@@ -198,9 +205,10 @@ follow-up. The Iggy side already supports it on both ends (client at
 `core/configs/src/server_config/tcp.rs:31`), shipped disabled.
 
 The two hops are configured independently. `IGGY_KAFKA_IGGY_TLS_ENABLED` and its companions encrypt
-the gateway's link to Iggy and are what make the gateway usable at all against a TLS-only Iggy
-server, where every verification would otherwise fail as unreachable. The Kafka-side listener is the
-half that is still missing.
+only the connection the credential check makes to Iggy, and are what make SASL usable at all against a
+TLS-only Iggy server, where every verification would otherwise fail as unreachable. The bridge's own
+client has no TLS at any setting, so the bridge hop stays unencrypted and carries
+`IGGY_KAFKA_IGGY_PASSWORD` in the clear. The Kafka-side listener is the other half still missing.
 
 Two limits worth recording. There is no mTLS anywhere in the tree, every rustls config uses
 `with_no_client_auth()`, so certificate-based Kafka client authentication cannot map to an Iggy identity
@@ -224,8 +232,9 @@ has to resolve it first.
 - SCRAM-SHA-256 and SCRAM-SHA-512, blocked on credential storage that does not exist.
 - SASL/OAUTHBEARER and GSSAPI.
 - mTLS and certificate-based identity.
-- Mapping Kafka ACL administration APIs onto Iggy permissions. Authorization is enforced, but the
-  `DescribeAcls` and `CreateAcls` API keys stay unimplemented.
+- Authorization. No handler asks Iggy about permissions yet, since the verified identity is not carried
+  onto the data plane; SASL is an admission gate only. The `DescribeAcls` and `CreateAcls` API keys also
+  stay unimplemented.
 - KIP-368 re-authentication.
 
 ## Open questions

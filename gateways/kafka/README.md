@@ -25,8 +25,8 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Require SASL/PLAIN authentication before serving any other API (`true` or `false`, nothing else) |
-| `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames, and the ceiling on waiting for an authentication slot plus the verification itself. Separate from the 10-minute idle timeout that applies once authenticated |
-| `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications allowed to run at once, across all connections. Each costs a password hash on an Iggy shard thread, so this bounds what unauthenticated traffic can demand of the server. Size it below the Iggy node's shard count |
+| `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
+| `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
 
 ## Test
 
@@ -94,11 +94,13 @@ IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 cargo run -p ig
 ```
 
 Transport security to Iggy is configured separately from the Kafka side, because the two protect
-different hops:
+different hops. These variables cover only the connection the credential check makes, and are
+refused while SASL is off. The bridge's own client connects without TLS at any setting, and that
+connection carries `IGGY_KAFKA_IGGY_PASSWORD` in the clear:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `IGGY_KAFKA_IGGY_TLS_ENABLED` | `false` | Encrypt the gateway's link to Iggy (`true` or `false`, nothing else). Required if the Iggy server only accepts TLS, otherwise every verification fails as unreachable |
+| `IGGY_KAFKA_IGGY_TLS_ENABLED` | `false` | Encrypt the credential check's connection to Iggy (`true` or `false`, nothing else). The bridge connection is not covered. Required if the Iggy server only accepts TLS, otherwise every verification fails as unreachable |
 | `IGGY_KAFKA_IGGY_TLS_DOMAIN` | derived from the address | Name checked against the Iggy server certificate |
 | `IGGY_KAFKA_IGGY_TLS_CA_FILE` | SDK bundled roots | PEM roots to trust. Note the SDK does not use the system trust store |
 
@@ -119,8 +121,9 @@ Four things to know before switching it on:
   `ApiVersions` advertisement only while it is on, and unauthenticated clients are refused.
 - **Every connection costs a login**, meaning one password hash on an Iggy shard thread and one
   replicated registration. Verification is deliberately not cached, since caching it per username
-  would let a second connection present any password. Connection churn is therefore server load,
-  bounded by `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS`.
+  would let a second connection present any password. Connection churn is therefore server load.
+  `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` bounds the checks the gateway runs at once, and a peer
+  whose login was rejected is refused for a delay that doubles per rejection, from 0.5s up to 30s.
 - **Authentication only, for now.** The gateway verifies the credentials and then drops the
   session, because no handler consumes one yet. Iggy's permissions will decide what a principal can
   do once Produce and Fetch are wired to it

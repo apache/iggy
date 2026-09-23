@@ -286,9 +286,10 @@ pub const fn advertised_min_version(api_key: i16, firewall_min: i16) -> i16 {
 /// Advertised only when SASL is switched on, and deliberately absent from [`SUPPORTED_RANGES`].
 ///
 /// These two keys never reach [`handle_request_bounded`]: the connection loop routes them through
-/// the SASL state machine before dispatch. Keeping them out of the firewall table means a gateway
-/// with SASL off treats them as any other unknown key and closes, which is what stops enabling the
-/// feature later from silently widening what an unauthenticated client can send today.
+/// the SASL state machine before dispatch, whether SASL is on or off. With it off every connection
+/// starts authenticated, so both keys are answered `ILLEGAL_SASL_STATE` and the connection stays
+/// open, the answer a real broker gives on a PLAINTEXT listener. Keeping them out of the firewall
+/// table means dispatch never serves them on its own.
 ///
 /// `SaslHandshake` is pinned to v1 on both ends. v0 selects the headerless token framing (KIP-152)
 /// that the frame reader cannot parse, so advertising it would invite exactly the shape this

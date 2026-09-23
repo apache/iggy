@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::GatewayConfig;
@@ -242,6 +242,44 @@ async fn given_wrong_credentials_when_authenticating_should_fail_then_close() {
     .await;
     assert_eq!(error_code(&body), ERROR_SASL_AUTHENTICATION_FAILED);
     assert_closed(&mut stream).await;
+}
+
+#[tokio::test]
+async fn given_pipelined_bytes_behind_a_rejected_token_should_close_with_a_fin_not_a_reset() {
+    // Unread input at close makes Linux send RST instead of FIN, and an RST lets the client's
+    // stack discard the 58 before the client reads it. Loopback delivers the 58 ahead of the RST
+    // either way, so what this pins is the close itself: a clean EOF, not a reset.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut stream).await;
+
+    let rejected = build_request_frame(
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        Some("sasl-test"),
+        &authenticate_body(&plain_token("alice", "wrong-password")),
+    );
+    let pipelined = build_request_frame(API_KEY_METADATA, 0, 3, Some("sasl-test"), &[0, 0, 0, 0]);
+    let mut both = BytesMut::from(&rejected[..]);
+    both.extend_from_slice(&pipelined);
+    stream.write_all(&both).await.expect("write requests");
+    // Let the server answer and close before the client reads anything.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    let (echoed, body) =
+        parse_response_payload(API_KEY_SASL_AUTHENTICATE, AUTHENTICATE_VERSION, payload);
+    assert_eq!(echoed, 2);
+    assert_eq!(error_code(&body), ERROR_SASL_AUTHENTICATION_FAILED);
+    let mut rest = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut rest))
+        .await
+        .expect("the server must close the connection");
+    assert!(
+        matches!(read, Ok(0)),
+        "the close must be a FIN the client reads as EOF, not a reset: {read:?}"
+    );
 }
 
 #[tokio::test]
@@ -875,7 +913,7 @@ impl SaslAuthenticator for StallingAuthenticator {
 
 #[tokio::test]
 async fn given_all_authentication_slots_are_busy_when_waiting_too_long_should_close_not_reject() {
-    // The permit wait shares the pre-authentication budget. Without that bound a connection sits
+    // The permit wait is bounded by the pre-authentication budget. Without that a connection sits
     // in the queue holding a `max_connections` permit for as long as the backlog takes to drain,
     // which is the invariant `pre_auth_timeout` is documented to enforce. It must close rather
     // than answer 58, which a Kafka client treats as fatal even though nothing was rejected.
@@ -909,6 +947,91 @@ async fn given_all_authentication_slots_are_busy_when_waiting_too_long_should_cl
     handshake_ok(&mut queued).await;
     queued.write_all(&frame).await.expect("write request");
     assert_closed(&mut queued).await;
+}
+
+#[tokio::test]
+async fn given_a_verification_in_flight_when_shutting_down_should_close_without_waiting_it_out() {
+    // The connection loop only watches the shutdown token between frames. A verification that
+    // did not watch it too would hold the drain for the whole pre-authentication budget.
+    let config = GatewayConfig {
+        pre_auth_timeout: Duration::from_secs(30),
+        shutdown_drain_timeout: Duration::from_secs(30),
+        ..sasl_config()
+    };
+    let authenticator = Arc::new(StallingAuthenticator {
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let (addr, shutdown) = spawn_test_server_with_authenticator(config, authenticator).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut stream).await;
+    let token = plain_token("alice", "s3cret");
+    let frame = build_request_frame(
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        Some("sasl-test"),
+        &authenticate_body(&token),
+    );
+    stream.write_all(&frame).await.expect("write request");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    shutdown.send(()).expect("signal shutdown");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "shutdown must end a verification in flight"
+    );
+}
+
+#[tokio::test]
+async fn given_a_rejected_login_when_the_peer_retries_at_once_should_close_until_the_delay_passes()
+{
+    let addr = spawn_sasl_gateway().await;
+
+    let mut rejected = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut rejected).await;
+    let body = send(
+        &mut rejected,
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        &authenticate_body(&plain_token("alice", "wrong-password")),
+    )
+    .await;
+    assert_eq!(error_code(&body), ERROR_SASL_AUTHENTICATION_FAILED);
+    assert_closed(&mut rejected).await;
+
+    // Even the right password is not checked while the peer is throttled, and it gets a close
+    // rather than 58, which a Kafka client would treat as fatal.
+    let mut throttled = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut throttled).await;
+    let frame = build_request_frame(
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        Some("sasl-test"),
+        &authenticate_body(&plain_token("alice", "s3cret")),
+    );
+    throttled.write_all(&frame).await.expect("write request");
+    assert_closed(&mut throttled).await;
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut retried = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut retried).await;
+    let body = send(
+        &mut retried,
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        &authenticate_body(&plain_token("alice", "s3cret")),
+    )
+    .await;
+    assert_eq!(
+        error_code(&body),
+        ERROR_NONE,
+        "the delay must run out on its own"
+    );
 }
 
 #[tokio::test]
