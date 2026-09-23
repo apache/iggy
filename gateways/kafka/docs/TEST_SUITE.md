@@ -81,16 +81,23 @@ already-built `iggy-server` in the same target directory. Missing either makes i
 printed reason rather than fail, which is what lets `cargo test -p iggy-gateway-kafka` stay usable
 without either.
 
+Client containers run with `--pull never`, so pull the two images first. Without them the suite
+skips and names the missing one.
+
 ```bash
 cargo build --bin iggy-server
+docker pull edenhill/kcat:1.7.1
+docker pull apache/kafka:3.9.0
 KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test kafka_client_e2e_tests
 ```
 
 `KAFKA_E2E_REQUIRED=1` turns a skip into a failure, mirroring `KAFKA_FIXTURES_REQUIRED`, so a CI
 job that means to run these cannot report a pass over zero assertions. Set it there.
 
-The suite shares the `kafka_bridge` nextest group with the bridge tests, so its spawned servers are
-serialized against them rather than competing for cores and ports.
+The suite runs in its own `kafka_client_e2e` nextest group, capped at one thread, so its spawned
+servers are serialized against each other. It is kept apart from the `kafka_bridge` group so the
+container-driven tests do not queue behind the bridge tests, and both groups cap their servers'
+shard pools, so the two can run alongside each other.
 
 It automates categories S and T of [`MANUAL_TESTING.md`](MANUAL_TESTING.md). Those procedures stay,
 because they cover cases a test does not assert, but the load-bearing ones now run in CI.

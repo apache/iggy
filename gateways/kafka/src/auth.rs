@@ -62,7 +62,8 @@ const VERIFY_RECONNECTION_RETRIES: u32 = 1;
 /// caller bounds the whole exchange at its pre-authentication budget, which must also absorb the
 /// wait for an authentication slot, so every second spent here is a second that wait does not get.
 /// At one second the inner worst case is 12s against a 15s outer budget, leaving the queue three
-/// seconds rather than one.
+/// seconds rather than one. A read that times out skips the teardown wait, which could not succeed
+/// behind the SDK's still-running request, so the common slow path costs 11s, not 12s.
 ///
 /// It also bounds only *this* future, not the SDK's work. A cancelled call leaves the SDK's own
 /// read running on a detached task that holds its connection lock until that task's own deadline,
@@ -298,6 +299,20 @@ impl SaslAuthenticator for IggyAuthenticator {
             Ok(Ok(())) => fetch_permissions(&client, &credentials.username).await,
         };
 
+        // A timed-out permission read leaves the SDK's detached request task holding the stream
+        // lock until its own response deadline, and `shutdown` needs that lock first, so waiting
+        // on it could only burn `TEARDOWN_TIMEOUT` with the caller's authentication slot held.
+        // Dropping the client instead still aborts the heartbeat, which is the part that would
+        // reconnect. The socket itself lives on in that task until its deadline, which nothing on
+        // this side of the SDK can shorten.
+        if matches!(outcome, Ok((_, PermissionRead::TimedOut))) {
+            return outcome.map(|(permissions, _)| AuthenticatedPrincipal {
+                username: credentials.username.clone(),
+                permissions,
+                permissions_known: false,
+            });
+        }
+
         // Shut down on both paths, and not `disconnect`: only `shutdown` stops the heartbeat task,
         // which would otherwise keep pinging, observe the dropped transport, and reconnect using
         // the very credentials this call was only meant to check.
@@ -316,12 +331,23 @@ impl SaslAuthenticator for IggyAuthenticator {
             }
         }
 
-        outcome.map(|(permissions, permissions_known)| AuthenticatedPrincipal {
+        outcome.map(|(permissions, read)| AuthenticatedPrincipal {
             username: credentials.username.clone(),
             permissions,
-            permissions_known,
+            permissions_known: read == PermissionRead::Resolved,
         })
     }
+}
+
+/// How the permission read after a login ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionRead {
+    /// The record resolved, so the permissions are a real answer, possibly an empty one.
+    Resolved,
+    /// The read answered but gave no usable record.
+    Failed,
+    /// The read did not answer in time, and its request is still in flight inside the SDK.
+    TimedOut,
 }
 
 /// Reads the just-authenticated user's own record and projects its global permissions.
@@ -332,23 +358,23 @@ impl SaslAuthenticator for IggyAuthenticator {
 async fn fetch_permissions(
     client: &impl Client,
     username: &str,
-) -> Result<(PrincipalPermissions, bool), AuthError> {
+) -> Result<(PrincipalPermissions, PermissionRead), AuthError> {
     // Unreachable in practice: a username that reached a successful login is already inside
     // Identifier's own length bounds. Propagating rather than degrading is still the wrong shape
     // for this function, so it degrades like every other failure below.
     let Ok(identifier) = Identifier::named(username) else {
         warn!("authenticated, but the principal's name is not a valid Iggy identifier");
-        return Ok((PrincipalPermissions::default(), false));
+        return Ok((PrincipalPermissions::default(), PermissionRead::Failed));
     };
     // Deliberately not propagated as a failure. The credentials were already accepted by the login
     // above, so turning a stumble on this second round trip into a rejection would answer a correct
     // password with `SASL_AUTHENTICATION_FAILED`, which a Kafka client treats as fatal and raises
     // to the application. Losing the ACL view is the lesser harm, and it degrades to an empty one.
     let fetched = tokio::time::timeout(PERMISSION_READ_TIMEOUT, client.get_user(&identifier)).await;
-    let mut known = true;
+    let mut read = PermissionRead::Resolved;
     let user = match fetched {
         Ok(Ok(None)) => {
-            known = false;
+            read = PermissionRead::Failed;
             // Distinct from an error: the login succeeded, so the account exists. A record that
             // resolves to nothing here means the read raced a deletion, and silently reporting an
             // empty ACL view for it would look identical to a principal with no grants.
@@ -357,12 +383,12 @@ async fn fetch_permissions(
         }
         Ok(Ok(user)) => user,
         Ok(Err(error)) => {
-            known = false;
+            read = PermissionRead::Failed;
             warn!(%error, "authenticated, but could not read the principal's permissions");
             None
         }
         Err(_elapsed) => {
-            known = false;
+            read = PermissionRead::TimedOut;
             warn!("authenticated, but timed out reading the principal's permissions");
             None
         }
@@ -375,7 +401,7 @@ async fn fetch_permissions(
             .as_ref()
             .map(PrincipalPermissions::from)
             .unwrap_or_default(),
-        known,
+        read,
     ))
 }
 

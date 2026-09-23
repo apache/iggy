@@ -73,6 +73,11 @@ pub const ANY_HOST: &str = "*";
 /// topic, and every Kafka topic lives inside one Iggy stream, so a stream grant is in practice a
 /// grant over the topics a Kafka client can reach.
 ///
+/// A description, never an authorization input. It holds only global flags, so a principal whose
+/// grants are per-stream or per-topic reads here as holding nothing, and an authorizer built on it
+/// would deny what Iggy allows. Enforcement belongs to Iggy's own `Permissions`, evaluated by the
+/// server.
+///
 /// The boolean count mirrors Iggy's own `GlobalPermissions`, which is a flat set of independent
 /// grants. Collapsing them into a bitfield would hide which grant is which at every call site for
 /// no gain, so the lint is allowed here the way it is elsewhere in this repository.

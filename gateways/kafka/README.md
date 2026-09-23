@@ -133,8 +133,10 @@ Four things to know before switching it on:
 `kafka-acls.sh --list` works against the gateway. It is read only: `CreateAcls` and `DeleteAcls`
 are not implemented and not advertised.
 
-A principal sees its own permissions and nobody else's, because the gateway holds no administrative
-credentials. Only global permissions are rendered, as wildcard bindings, and the view is a snapshot
+`--list` here is a snapshot of the caller's own grants, not the broker-wide dump it is against a
+Kafka cluster. A principal sees its own permissions and nobody else's, because the gateway holds no
+administrative credentials, so filtering on another `User:` returns an empty listing whatever that
+user holds, and root's listing is root's grants rather than a catalog of every binding. Only global permissions are rendered, as wildcard bindings, and the view is a snapshot
 taken when the connection authenticated, so a permission changed afterwards is invisible until the
 client reconnects. [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is
 deliberately left out.

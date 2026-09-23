@@ -56,6 +56,15 @@ const USER_PASSWORD: &str = "s3cretpass";
 /// build on a loaded machine is not quick.
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Wall-clock cap on one client container. The ACL test runs five in a row inside nextest's 300s
+/// kill budget, so a single wedged client must fail on its own terms, well before that budget
+/// kills the test and hides which step hung.
+const CLIENT_RUN_TIMEOUT: &str = "45s";
+
+/// Per-request and per-call budget for the Java admin tools. Their defaults (30s and 60s) let one
+/// unanswered request eat most of `CLIENT_RUN_TIMEOUT` retrying.
+const JAVA_CLIENT_TIMEOUT_MS: u32 = 10_000;
+
 /// Reports why the suite cannot run, and whether that is fatal.
 ///
 /// Returns `true` when the caller should skip. `KAFKA_E2E_REQUIRED=1` makes it panic instead, so a
@@ -81,6 +90,19 @@ fn docker_missing() -> bool {
     } else {
         skip("docker is unavailable")
     }
+}
+
+/// Whether `image` is already in the local Docker store.
+///
+/// Containers run with `--pull never`, so a missing image would otherwise surface as a client that
+/// failed to start, reported against whichever feature that test happened to cover.
+fn image_present(image: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Locates the already-built `iggy-server` alongside this test binary. Does not build it.
@@ -224,9 +246,22 @@ async fn spawn_gateway(iggy_address: &str) -> SocketAddr {
 /// This blocks the calling thread for the life of the container, which is why every test here uses
 /// a multi-threaded runtime: the gateway runs as a spawned task, and on the single-threaded runtime
 /// `#[tokio::test]` gives by default, this call would starve it and nothing would ever listen.
+///
+/// `--pull never` keeps a registry download out of the test's time budget: images are pulled up
+/// front, and `stack` skips when they are absent. `timeout` bounds the run itself, and a run it
+/// cuts short exits non-zero, so `expect_ran` reports it rather than asserting over partial output.
 fn run_client(image: &str, args: &[&str], mounts: &[(&str, &str)]) -> ClientRun {
-    let mut command = Command::new("docker");
-    command.args(["run", "--rm", "--network", "host"]);
+    let mut command = Command::new("timeout");
+    command.args(["--kill-after=10s", CLIENT_RUN_TIMEOUT]);
+    command.args([
+        "docker",
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--network",
+        "host",
+    ]);
     for (host, guest) in mounts {
         command.args(["-v", &format!("{host}:{guest}:ro")]);
     }
@@ -359,7 +394,9 @@ fn java_client_config(username: &str, password: &str) -> (tempfile::TempDir, Pat
             "security.protocol=SASL_PLAINTEXT\n\
              sasl.mechanism=PLAIN\n\
              sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
-             username=\"{username}\" password=\"{password}\";\n"
+             username=\"{username}\" password=\"{password}\";\n\
+             request.timeout.ms={JAVA_CLIENT_TIMEOUT_MS}\n\
+             default.api.timeout.ms={JAVA_CLIENT_TIMEOUT_MS}\n"
         ),
     )
     .expect("write client config");
@@ -369,6 +406,15 @@ fn java_client_config(username: &str, password: &str) -> (tempfile::TempDir, Pat
 /// Brings up a server and a gateway, or reports why it could not.
 async fn stack() -> Option<(TestServer, SocketAddr)> {
     if docker_missing() {
+        return None;
+    }
+    if let Some(image) = [KCAT_IMAGE, KAFKA_IMAGE]
+        .into_iter()
+        .find(|image| !image_present(image))
+    {
+        skip(&format!(
+            "client image {image} is not pulled; run `docker pull {image}`"
+        ));
         return None;
     }
     let server = match TestServer::spawn() {
@@ -526,8 +572,16 @@ async fn given_distinct_principals_when_listing_acls_should_describe_each_differ
         "every rendered binding names the authenticated principal, got: {root}"
     );
     assert!(
-        root.contains("resourceType=TOPIC") && root.contains("operation=WRITE"),
+        grants(&root, "TOPIC", "WRITE"),
         "root holds every permission, so it must be described as able to write, got: {root}"
+    );
+    assert!(
+        grants(&root, "CLUSTER", "DESCRIBE"),
+        "root holds the server flags, so the cluster must render as describable, got: {root}"
+    );
+    assert!(
+        !grants(&root, "CLUSTER", "ALTER"),
+        "no Iggy flag gates a cluster mutation, so even root must not be shown one, got: {root}"
     );
 
     let consumer = list_acls(gateway, "consumer-only", USER_PASSWORD);

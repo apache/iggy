@@ -56,6 +56,7 @@ const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
 const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
 const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
+const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 
 const HANDSHAKE_VERSION: i16 = 1;
 const AUTHENTICATE_VERSION: i16 = 1;
@@ -1310,6 +1311,65 @@ async fn given_a_principal_with_no_permissions_should_report_an_empty_view_not_a
     assert!(
         parse_acl_bindings(&body).is_empty(),
         "no permissions means no bindings at all"
+    );
+}
+
+/// Accepts `alice` but reports that her permissions could not be read, the shape
+/// `IggyAuthenticator` produces when the login succeeds and the follow-up `get_user` does not.
+#[derive(Debug)]
+struct UnreadPermissionsAuthenticator;
+
+#[async_trait]
+impl SaslAuthenticator for UnreadPermissionsAuthenticator {
+    async fn authenticate(
+        &self,
+        credentials: &PlainCredentials,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
+        Ok(AuthenticatedPrincipal {
+            username: credentials.username.clone(),
+            permissions: PrincipalPermissions::default(),
+            permissions_known: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn given_unread_permissions_when_describing_acls_should_answer_an_error_and_stay_open() {
+    // The fallback permissions are empty, so answering from them would render the same zero
+    // bindings as a principal that genuinely holds nothing. Every other stub reports its
+    // permissions as known, so without this case the two answers could swap unnoticed.
+    let (addr, shutdown) = spawn_test_server_with_authenticator(
+        sasl_config(),
+        Arc::new(UnreadPermissionsAuthenticator),
+    )
+    .await;
+    std::mem::forget(shutdown);
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        3,
+        &any_acl_filter_body(),
+    )
+    .await;
+    assert_eq!(
+        acl_error_code(&body),
+        ERROR_UNKNOWN_SERVER_ERROR,
+        "a view that was never read must not be reported as an empty one"
+    );
+    assert!(
+        parse_acl_bindings(&body).is_empty(),
+        "an error answer carries no bindings"
+    );
+
+    // Kept open: the login was valid, and only the ACL view is missing.
+    let metadata = send(&mut stream, API_KEY_METADATA, 0, 4, &[0, 0, 0, 0]).await;
+    assert!(
+        !metadata.is_empty(),
+        "the connection must keep serving after the ACL error"
     );
 }
 
