@@ -100,6 +100,11 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// `FindCoordinator` answer for the transaction key type.
+///
+/// librdkafka treats every other error there as "coordinator unknown" and re-queries forever, and
+/// this is the one code both it and the Java client handle as fatal.
+pub const ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 /// KIP-394: a `JoinGroup` v4+ with an empty member id is answered with a freshly minted id and
 /// this code, and the client rejoins carrying it.
 pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;

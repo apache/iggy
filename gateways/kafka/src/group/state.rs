@@ -387,6 +387,11 @@ impl GroupState {
         if departed.members && !self.members.is_empty() && self.phase != Phase::PreparingRebalance {
             self.prepare_rebalance(now, None);
         }
+        // A join window left open with nobody in it would close on a later tick and clear the
+        // ids still on their way back. The next admitted member reopens the barrier.
+        if self.members.is_empty() && !self.pending.is_empty() {
+            self.join_deadline = None;
+        }
         if self.phase == Phase::PreparingRebalance {
             self.maybe_complete_join(now);
         }
@@ -2447,6 +2452,35 @@ mod tests {
             &config,
             &request(pending.as_str(), &["x"]),
             now,
+        ) else {
+            panic!("the pending rejoin must be answered, not parked");
+        };
+        assert_eq!(rejoined.error, ERROR_NONE);
+        assert!(groups[&group_id()].members.contains_key(&pending));
+    }
+
+    /// Kafka keeps pending join members across the round that empties the group, so a pending
+    /// client that rejoins after the old join window would have closed must still be admitted.
+    #[test]
+    fn given_a_pending_member_when_the_last_member_leaves_mid_rebalance_should_admit_the_rejoin_after_the_join_window()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_two_members(&mut groups, &config, now);
+        let _ = leave(&mut groups, &[(follower.as_str(), None)], now);
+        assert_eq!(groups[&group_id()].phase, Phase::PreparingRebalance);
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+
+        let result = leave(&mut groups, &[(leader.as_str(), None)], now);
+
+        assert_eq!(codes(&result), vec![ERROR_NONE]);
+        let later = now + Duration::from_secs(6);
+        let Step::Respond(rejoined) = join_step(
+            &mut groups,
+            &config,
+            &request(pending.as_str(), &["x"]),
+            later,
         ) else {
             panic!("the pending rejoin must be answered, not parked");
         };

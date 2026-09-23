@@ -100,8 +100,9 @@ Key new minimums:
 | 68 | **ConsumerGroupHeartbeat** | 0 | 1 | v0 | 🟠 Required Stub |
 | 69 | **ConsumerGroupDescribe** | 0 | 1 | v0 | 🟡 Optional Stub |
 
-> ⚠️ Kafka 4.0 clients use the **new group protocol by default** and will send key 68.
-> A gateway that hard-rejects this breaks all modern Kafka consumers.
+> ⚠️ Kafka 4.0 consumers still default to `group.protocol=classic`. Only a consumer configured
+> with `group.protocol=consumer` sends key 68, and a gateway that hard-rejects it breaks that
+> consumer.
 
 ---
 
@@ -290,7 +291,7 @@ unlisted key, so any body the gateway could send would be misparsed by the clien
 schema it expected. This includes:
 
 - **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9)
-- **New consumer group protocol**: ConsumerGroupHeartbeat (68) — default in Kafka 4.0
+- **New consumer group protocol**: ConsumerGroupHeartbeat (68), opt-in via `group.protocol=consumer` (the 4.0 default is still `classic`)
 - **Share groups (KIP-932)**: ShareFetch, ShareGroupHeartbeat, ShareAcknowledge
 - **Auth flow**: SaslHandshake (17), SaslAuthenticate (36)
 - **All broker/KRaft-internal keys** (Group 14)
