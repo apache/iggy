@@ -27,7 +27,7 @@ use std::mem::size_of;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use consensus::{PipelineEntry, Sequencer, oneshot_channel};
+use consensus::{Consensus, PipelineEntry, Sequencer, oneshot_channel};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
 use iggy_binary_protocol::{
@@ -42,8 +42,9 @@ use server_common::Message;
 use server_common::send_messages::decode_batch_slice;
 
 use super::tests::{
-    checksummed_segment_prepare, disk_poll_partition, journal_store_offset, repair_config,
-    store_offset_request, test_partition,
+    checksummed_segment_prepare, disk_poll_partition, disk_poll_partition_with_replicas,
+    journal_store_offset, repair_config, store_offset_request, test_partition,
+    test_partition_with_replicas,
 };
 use super::{IggyPartition, PurgeError};
 use crate::offset_storage::{PURGE_GENERATION_FILE, PURGE_RESET_FILE, persist_offset};
@@ -271,6 +272,118 @@ async fn given_singleton_purge_marker_when_consensus_restarts_should_accept_new_
 }
 
 #[compio::test]
+async fn given_replicated_purge_when_empty_history_recovery_retries_should_poll_new_operation_one()
+{
+    for fault in [
+        PurgeFault::ResetMarkerRename,
+        PurgeFault::PartitionDirectorySync,
+    ] {
+        let config = repair_config();
+        let (directory, mut partition) =
+            Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
+        partition.runtime_options.durability = Durability::Replicated;
+        partition.runtime_options.consumer_offset_durability = Durability::Replicated;
+        append_committed_history(&mut partition, 1..=OLD_LAST_OPERATION, OLD_PAYLOAD).await;
+        partition.purge(&config, PURGE_GENERATION).await.unwrap();
+        drop(partition);
+
+        let mut recovering = Box::pin(recover_replicated_partition(directory.path())).await;
+        assert!(recovering.persistence.is_none());
+        assert_eq!(recovering.consensus().sequencer().current_sequence(), 0);
+        assert_eq!(recovering.purge_floor_op(), OLD_LAST_OPERATION);
+        assert!(recovering.purge_recovery_pending());
+        assert!(!recovering.queued_requests_ready());
+
+        let storage = FaultingPurgeStorage::new(directory.path(), fault);
+        assert!(
+            recovering
+                .recover_purge_boundary_with_storage(&storage, 0)
+                .await
+                .is_err()
+        );
+        assert!(storage.failed.get());
+        assert!(recovering.purge_recovery_pending());
+        assert_eq!(recovering.purge_floor_op(), OLD_LAST_OPERATION);
+        drop(recovering);
+
+        // Lose all memory again, including the failed recovery attempt. The
+        // directory sync error can leave the replacement record visible to boot.
+        let mut restarted = Box::pin(recover_replicated_partition(directory.path())).await;
+        assert!(restarted.purge_recovery_pending());
+        assert_eq!(restarted.applied_purge_generation(), PURGE_GENERATION);
+        restarted.recover_purge_boundary(0).await.unwrap();
+        assert!(!restarted.purge_recovery_pending());
+        assert_eq!(restarted.purge_floor_op(), 0);
+        assert_eq!(restarted.purge_reset.unwrap().floor, 0);
+
+        append_committed_history(&mut restarted, 1..=1, FRESH_PAYLOAD).await;
+        assert_eq!(restarted.consensus().commit_min(), 1);
+        assert_eq!(restarted.stats.messages_count_inconsistent(), 1);
+        assert_next_messages(&mut restarted, &[0], FRESH_PAYLOAD).await;
+
+        // A repeated recovery notification must not clear the newly committed tail.
+        restarted.recover_purge_boundary(0).await.unwrap();
+        assert_next_messages(&mut restarted, &[0], FRESH_PAYLOAD).await;
+    }
+}
+
+#[compio::test]
+async fn given_replicated_purge_when_selected_history_is_nonempty_should_wait_for_snapshot() {
+    let config = repair_config();
+    let (directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
+    partition.runtime_options.durability = Durability::Replicated;
+    partition.runtime_options.consumer_offset_durability = Durability::Replicated;
+    append_committed_history(&mut partition, 1..=OLD_LAST_OPERATION, OLD_PAYLOAD).await;
+    partition.purge(&config, PURGE_GENERATION).await.unwrap();
+    drop(partition);
+
+    let mut restarted = Box::pin(recover_replicated_partition(directory.path())).await;
+    let poll = restarted
+        .build_poll_plan(
+            PollingConsumer::Consumer(CONSUMER_ID, 0),
+            &PollingArgs::new(PollingStrategy::next(), 1, false),
+            true,
+        )
+        .execute()
+        .await;
+    assert!(matches!(
+        restarted.complete_poll(poll),
+        Err(IggyError::TransientNotAccepted)
+    ));
+
+    // The peer could hold either the old sequence or a new sequence reusing its
+    // numbers. Journal replay alone cannot tell which messages the purge removed.
+    restarted
+        .recover_purge_boundary(OLD_LAST_OPERATION)
+        .await
+        .unwrap();
+    assert!(restarted.purge_recovery_pending());
+    assert!(restarted.consensus().is_transferring());
+    assert_eq!(restarted.purge_floor_op(), OLD_LAST_OPERATION);
+    restarted
+        .apply_repaired_prepare(checksummed_segment_prepare(1, 0, 0, OLD_PAYLOAD))
+        .await;
+    assert!(restarted.log.journal().inner.header_by_op(1).is_none());
+    assert_eq!(restarted.consensus().commit_min(), 0);
+}
+
+// Rebuild only the partition and its empty segment after purge. Server boot and
+// consensus selection are exercised separately; no volatile journal is retained.
+async fn recover_replicated_partition(directory: &Path) -> Box<IggyPartition<IggyMessageBus>> {
+    let mut partition = Box::new(test_partition_with_replicas(3));
+    partition.runtime_options.durability = Durability::Replicated;
+    partition.runtime_options.consumer_offset_durability = Durability::Replicated;
+    partition.set_partition_dir(directory.to_string_lossy().into_owned());
+    partition.log.retire_front().unwrap();
+    partition
+        .install_empty_segment(&repair_config(), 0)
+        .await
+        .unwrap();
+    partition.hydrate_applied_purge_generation().await.unwrap();
+    partition
+}
+
+#[compio::test]
 async fn given_reset_marker_publication_failure_when_purging_should_require_fencing() {
     let config = repair_config();
     let (directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
@@ -452,7 +565,9 @@ async fn assert_retry_preserves_fresh_messages(policy: Durability, fault: PurgeF
         PurgeFault::CompletionMarkerRename => {
             assert!(matches!(result, Err(PurgeError::GenerationNotRecorded(_))));
         }
-        PurgeFault::ResetMarkerRename => unreachable!("reset marker failure requires fencing"),
+        PurgeFault::ResetMarkerRename | PurgeFault::PartitionDirectorySync => {
+            unreachable!("reset marker failure requires fencing")
+        }
     }
     assert_eq!(partition.applied_purge_generation(), 0);
     assert!(partition.purge_deferred);
@@ -645,6 +760,7 @@ enum PurgeFault {
     OffsetDirectorySync(ConsumerKind),
     CompletionMarkerRename,
     ResetMarkerRename,
+    PartitionDirectorySync,
 }
 
 struct FaultingPurgeStorage {
@@ -664,6 +780,7 @@ impl FaultingPurgeStorage {
             }
             PurgeFault::CompletionMarkerRename => PURGE_GENERATION_FILE,
             PurgeFault::ResetMarkerRename => PURGE_RESET_FILE,
+            PurgeFault::PartitionDirectorySync => "",
         });
         Self {
             fault,
@@ -691,6 +808,14 @@ impl DurableStorage for FaultingPurgeStorage {
     }
 
     async fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        if matches!(self.fault, PurgeFault::PartitionDirectorySync)
+            && path == self.target
+            && !self.failed.replace(true)
+        {
+            return Err(io::Error::other(
+                "injected partition directory sync failure",
+            ));
+        }
         if matches!(self.fault, PurgeFault::OffsetDirectorySync(_)) && path == self.target {
             self.directory_sync_attempts
                 .set(self.directory_sync_attempts.get() + 1);

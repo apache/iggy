@@ -4704,13 +4704,21 @@ where
             );
             return;
         };
-        partition.ensure_materialization_recovery();
-        let actions =
-            partition
-                .consensus()
-                .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
+        let actions = partition_start_view_actions(partition, &header, suffix_body);
         let adopted = !actions.is_empty();
         if adopted {
+            let selected_head = partition.consensus().sequencer().current_sequence();
+            if let Err(error) = partition.recover_purge_boundary(selected_head).await {
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = header.group,
+                    view = header.view,
+                    %error,
+                    "cannot record the purge boundary for the adopted history; probing again"
+                );
+                partition.consensus().begin_view_probe();
+                return;
+            }
             // Any stream armed before this adoption belongs to the superseded
             // view. Repair bodies carry no nonce, so drop the receiving session
             // before reconciling or arming the new view's canonical range.
@@ -4865,6 +4873,7 @@ where
                 // the stale peer keeps heartbeating, so it re-triggers once a
                 // later persist succeeds.
                 if !partition.requires_state_transfer()
+                    && !partition.purge_recovery_pending()
                     && partition.persist_superblock_if_needed().await
                 {
                     respond_start_view::<B, _, MJ>(consensus).await;
@@ -5050,7 +5059,7 @@ where
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
-        if !partition.consensus().is_normal() {
+        if !partition.consensus().is_normal() || partition.purge_recovery_pending() {
             return;
         }
         let cluster = partition.consensus().cluster();
@@ -5862,6 +5871,23 @@ where
             let Some(pending) = partition.consensus().pending_view_log() else {
                 return;
             };
+            if partition.purge_recovery_pending() {
+                if pending.op_head > 0 {
+                    // This replica cannot classify reused operation numbers from
+                    // journal bodies. Leave the election timer running so a peer
+                    // with the selected materialized history can become primary.
+                    return;
+                }
+                if let Err(error) = partition.recover_purge_boundary(pending.op_head).await {
+                    tracing::warn!(
+                        shard = self.id,
+                        namespace_raw = namespace.inner(),
+                        %error,
+                        "cannot record the purge boundary before starting the empty view"
+                    );
+                    return;
+                }
+            }
             // Before the scan can mean anything: the repair ingest skips an op it
             // already holds a header for, so the scan would report a gap nothing
             // fills. Backups reach this on StartView adoption; a primary-elect has no
@@ -9011,7 +9037,11 @@ where
         B: MessageBus,
     {
         let consensus = partition.consensus();
-        if !consensus.is_normal() || consensus.is_transferring() || partition.repair.is_some() {
+        if !consensus.is_normal()
+            || consensus.is_transferring()
+            || partition.purge_recovery_pending()
+            || partition.repair.is_some()
+        {
             return false;
         }
         // Read, never scanned: the tally is republished by each sweep (see
@@ -9134,7 +9164,7 @@ where
     ) where
         B: MessageBus,
     {
-        if partition.repair.is_some() || from_op > to_op {
+        if partition.purge_recovery_pending() || partition.repair.is_some() || from_op > to_op {
             return;
         }
         if self.partition_repairs_inflight.get() >= PARTITION_REPAIRS_INFLIGHT_MAX {
@@ -9885,6 +9915,9 @@ where
             peer: next_peer,
             after_ticks,
         });
+        if partition.purge_recovery_pending() {
+            return;
+        }
         let config = self.plane.partitions().config().clone();
         partition.commit_journal(&config).await;
         self.maybe_request_partition_repair(partition, peer).await;
@@ -11125,7 +11158,8 @@ where
     let consensus = partition.consensus();
     let commit_min = consensus.commit_min();
     let commit_max = consensus.commit_max();
-    let recovery_owned = partition.transfer.is_some()
+    let recovery_owned = partition.purge_recovery_pending()
+        || partition.transfer.is_some()
         || partition.transfer_rearm.is_some()
         || partition.repair.is_some();
     let normal = consensus.is_normal();
@@ -11807,6 +11841,28 @@ async fn dispatch_vsr_actions<B, P, J>(
     }
 }
 
+fn partition_start_view_actions<B, SB>(
+    partition: &IggyPartition<B, SB>,
+    header: &StartViewHeader,
+    suffix_body: &[u8],
+) -> Vec<VsrAction>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    let consensus = partition.consensus();
+    // A delayed announcement could clear the purge boundary or pin recovery to
+    // a lost history. A newer view or the current boot's probe reply is required.
+    if partition.purge_recovery_pending()
+        && header.view <= consensus.view()
+        && (consensus.incarnation() == 0 || header.incarnation != consensus.incarnation())
+    {
+        return Vec::new();
+    }
+    partition.ensure_materialization_recovery();
+    consensus.handle_start_view(PlaneKind::Partitions, header, suffix_body)
+}
+
 #[allow(clippy::future_not_send)]
 async fn dispatch_partition_wire_actions<B, P, J, SB>(
     consensus: &VsrConsensus<B, P>,
@@ -11824,6 +11880,15 @@ async fn dispatch_partition_wire_actions<B, P, J, SB>(
     }
     if partition.requires_state_transfer() {
         actions.retain(|action| matches!(action, VsrAction::SendRequestStartView { .. }));
+    } else if partition.purge_recovery_pending() {
+        actions.retain(|action| {
+            matches!(
+                action,
+                VsrAction::SendRequestStartView { .. }
+                    | VsrAction::SendStartViewChange { .. }
+                    | VsrAction::SendDoViewChange { .. }
+            )
+        });
     }
     dispatch_vsr_actions::<B, P, J>(consensus, None, &actions).await;
     dispatch_partition_journal_actions(consensus, partition, &actions).await;
@@ -11843,6 +11908,9 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
     P: Pipeline<Entry = consensus::PipelineEntry>,
     SB: SuperblockStore,
 {
+    if partition.purge_recovery_pending() {
+        return;
+    }
     let bus = consensus.message_bus();
     let self_id = consensus.replica();
     let journal = &partition.log.journal().inner;
@@ -13404,11 +13472,136 @@ mod partition_ack_durability_tests {
     use consensus::LocalPipeline;
     use iggy_common::PartitionStats;
     use iggy_common::{Durability, IggyByteSize, TopicRuntimeOptions};
+    use journal::durable_storage::DiskStorage;
     use journal::prepare_journal::PrepareJournal;
     use message_bus::IggyMessageBus;
     use server_common::iobuf::Owned;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_unresolved_purge_history_when_rejoining_should_wait_for_a_fresh_view() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "iggy-purge-recovery-dispatch-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let make_partition = |bus| {
+            let mut consensus = VsrConsensus::new(1, 0, 3, 42, bus, LocalPipeline::new());
+            consensus.set_view(1);
+            consensus.set_log_view(1);
+            consensus.mark_superblock_durable(1, 1);
+            consensus.init_as_backup();
+            consensus.begin_view_probe();
+            let mut partition: IggyPartition<IggyMessageBus> =
+                IggyPartition::with_in_memory_storage(
+                    Arc::new(PartitionStats::default()),
+                    consensus,
+                    IggyByteSize::from(1024 * 1024),
+                );
+            partition.set_partition_dir(directory.to_string_lossy().into_owned());
+            partition.set_runtime_options(TopicRuntimeOptions {
+                durability: Durability::Replicated,
+                consumer_offset_durability: Durability::Replicated,
+                ..TopicRuntimeOptions::default()
+            });
+            partition
+        };
+        let mut before_restart = make_partition(IggyMessageBus::new(0));
+        before_restart.consensus().sequencer().set_sequence(3);
+        // The empty in-memory segment is already the purge's reset state.
+        before_restart
+            .complete_purge_with_storage(&DiskStorage, 1)
+            .await
+            .unwrap();
+        drop(before_restart);
+
+        let bus = IggyMessageBus::new(0);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = sent.clone();
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        for replica in 1..3 {
+            assert!(bus.owner_table().try_claim(replica, 1));
+        }
+        let mut restarted = make_partition(bus);
+        restarted.consensus().set_incarnation(7);
+        restarted.hydrate_applied_purge_generation().await.unwrap();
+        assert!(restarted.purge_recovery_pending());
+        assert_eq!(restarted.purge_floor_op(), 3);
+        assert_eq!(restarted.consensus().sequencer().current_sequence(), 0);
+        let start_view = VsrAction::SendStartView {
+            view: 1,
+            op: 0,
+            commit: 0,
+            incarnation: 0,
+            target: Some(1),
+            group: 42,
+            suffix: Vec::new(),
+        };
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(
+            restarted.consensus(),
+            &restarted,
+            vec![
+                start_view.clone(),
+                VsrAction::SendStartViewChange { view: 1, group: 42 },
+                VsrAction::SendRequestStartView { view: 1, group: 42 },
+            ],
+        )
+        .await;
+        assert_eq!(sent.borrow().len(), 4);
+        for frame in sent.borrow().iter() {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            assert!(matches!(
+                message.header().command,
+                Command::StartViewChange | Command::RequestStartView
+            ));
+        }
+
+        sent.borrow_mut().clear();
+        let mut reply = *Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.cluster = 1;
+                header.group = 42;
+                header.view = 1;
+                header.replica = 1;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                header.seal();
+            })
+            .header();
+        for (op, incarnation) in [(0, 0), (0, 6), (3, 0), (3, 6)] {
+            reply.op = op;
+            reply.incarnation = incarnation;
+            assert!(partition_start_view_actions(&restarted, &reply, &[]).is_empty());
+            assert_eq!(restarted.consensus().status(), Status::Recovering);
+            assert!(restarted.purge_recovery_pending());
+            assert_eq!(restarted.purge_floor_op(), 3);
+        }
+        reply.op = 0;
+        reply.incarnation = 7;
+        assert!(!partition_start_view_actions(&restarted, &reply, &[]).is_empty());
+        restarted.recover_purge_boundary(0).await.unwrap();
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(
+            restarted.consensus(),
+            &restarted,
+            vec![start_view],
+        )
+        .await;
+        assert_eq!(sent.borrow().len(), 1);
+        assert!(!restarted.purge_recovery_pending());
+        drop(restarted);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[compio::test]
     #[allow(clippy::too_many_lines)]

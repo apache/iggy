@@ -644,11 +644,18 @@ const fn validate_consumer_offset_transfer_count(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PartitionPathLayout;
+    use crate::journal::MessageLookup;
     use crate::offset_storage::{PurgeReset, persist_purge_reset_with_storage, read_purge_reset};
+    use crate::{Partition, PartitionPathLayout};
+    use bytes::Bytes;
     use consensus::{LocalPipeline, VsrConsensus};
+    use iggy_binary_protocol::{Command, RoutedRequestHeader};
     use iggy_common::{ConsumerGroupOffsets, ConsumerOffsets, PartitionStats};
     use message_bus::IggyMessageBus;
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    };
+    use server_common::sharding::IggyNamespace;
     use std::sync::Arc;
 
     #[compio::test]
@@ -785,9 +792,19 @@ mod tests {
     async fn given_completed_purge_when_installing_lower_head_should_recover_rebased_floor() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let mut partition = Box::pin(partition_with_completed_reset(root)).await;
+        let mut partition = transfer_test_partition(root);
+        for op in 1..=9 {
+            append_transfer_test_message(&mut partition, op).await;
+        }
+        assert_eq!(
+            partition.log.journal().inner.oldest_resident_offset(),
+            Some(0)
+        );
+        partition.purge(&transfer_test_config(), 5).await.unwrap();
         assert_eq!(partition.purge_floor_op(), 9);
         assert_eq!(partition.consensus().sequencer().current_sequence(), 9);
+        assert!(partition.log.journal().inner.resident_entries().is_empty());
+        assert!(partition.log.journal().inner.header_by_op(9).is_some());
         let mut offered = table();
         offered.purge_generation = 5;
 
@@ -798,12 +815,99 @@ mod tests {
 
         assert_eq!(partition.consensus().sequencer().current_sequence(), 4);
         assert_eq!(partition.purge_floor_op(), 4);
+
+        // Replacement operations reuse numbers below the old purge floor.
+        // They must enter the resident poll tier before any segment flush.
+        append_transfer_test_message(&mut partition, 5).await;
+        let journal = &partition.log.journal().inner;
+        let resident = journal.resident_entries();
+        assert_eq!(
+            resident.len(),
+            1,
+            "the replacement send must remain visible"
+        );
+        assert_eq!(journal.resident_message_entries().len(), 1);
+        assert_eq!(journal.oldest_resident_offset(), Some(offered.next_offset));
+        for query in [
+            MessageLookup::Offset {
+                offset: offered.next_offset,
+                count: 1,
+                ceiling: u64::MAX,
+            },
+            MessageLookup::Timestamp {
+                timestamp: 5,
+                count: 1,
+                ceiling: u64::MAX,
+            },
+        ] {
+            let (fragments, last_offset) = journal.get_sync(&query).expect("poll replacement send");
+            assert!(!fragments.is_empty());
+            assert_eq!(last_offset, Some(offered.next_offset));
+        }
         drop(partition);
         let mut restarted = transfer_test_partition(root);
         restarted.hydrate_applied_purge_generation().await.unwrap();
         assert_eq!(restarted.applied_purge_generation(), 5);
         assert_eq!(restarted.purge_floor_op(), 4);
         assert!(!restarted.purge_cleanup_pending());
+        assert!(restarted.purge_recovery_pending());
+        restarted.recover_purge_boundary(4).await.unwrap();
+        offered.purge_generation = 6;
+        restarted
+            .install_state_transfer(&transfer_test_config(), 4, Vec::new(), &offered.encode(), 6)
+            .await
+            .expect("a snapshot resolves the lost journal after restart");
+        assert!(!restarted.purge_recovery_pending());
+        drop(restarted);
+
+        // The snapshot advanced the generation beyond the local reset record.
+        // Losing its journal on another restart must still require recovery.
+        let mut after_snapshot = transfer_test_partition(root);
+        after_snapshot
+            .hydrate_applied_purge_generation()
+            .await
+            .unwrap();
+        assert_eq!(after_snapshot.applied_purge_generation(), 6);
+        assert!(after_snapshot.purge_recovery_pending());
+    }
+
+    async fn append_transfer_test_message(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
+                id: u128::from(op),
+                ..Default::default()
+            },
+            payload: Bytes::from_static(b"message"),
+            user_headers: None,
+        });
+        let message = SendMessagesOwned::from_messages(
+            IggyNamespace::from_raw(partition.consensus().group()),
+            &messages,
+        )
+        .unwrap()
+        .encode_request(RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::SendMessages,
+            client: 1,
+            session: 1,
+            request: op,
+            group: partition.consensus().group(),
+            ..Default::default()
+        })
+        .unwrap()
+        .transmute_header(
+            |request: RoutedRequestHeader, prepare: &mut PrepareHeader| {
+                prepare.command = Command::Prepare;
+                prepare.operation = Operation::SendMessages;
+                prepare.group = partition.consensus().group();
+                prepare.op = op;
+                prepare.timestamp = op;
+                prepare.size = request.size;
+            },
+        );
+        partition.append_messages(message).await.unwrap();
+        partition.consensus().sequencer().set_sequence(op);
     }
 
     #[compio::test]
@@ -3232,6 +3336,9 @@ where
                     source,
                 })?;
             self.materialization_missing = false;
+        }
+        if outcome.is_ok() {
+            self.purge_recovery = crate::iggy_partition::PurgeRecovery::Ready;
         }
         outcome
     }

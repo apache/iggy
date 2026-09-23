@@ -256,6 +256,9 @@ where
     /// Durable message reset boundary. When its generation exceeds the applied
     /// generation, retries finish bookmark cleanup without resetting messages again.
     purge_reset: Option<PurgeReset>,
+    /// A reset survived without its operation journal. Only a selected empty
+    /// history or an installed snapshot can establish its replay boundary.
+    pub(crate) purge_recovery: PurgeRecovery,
     /// `Partition::created_revision` of the metadata row this partition was
     /// built for (the reconciler's "epoch"). Keys the durable `purge.gen`
     /// record: a delete whose on-disk cleanup failed leaves the directory
@@ -425,6 +428,13 @@ enum Disposition {
         consumer_id: u32,
         offset: Option<u64>,
     },
+}
+
+/// Whether a recovered purge boundary has been matched to the selected history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeRecovery {
+    Ready,
+    AwaitingHistory,
 }
 
 /// How far purge progressed, determining whether to retry or fence the partition.
@@ -632,6 +642,7 @@ where
             offset_dir_sync_count: Cell::new(0),
             applied_purge_generation: 0,
             purge_reset: None,
+            purge_recovery: PurgeRecovery::Ready,
             created_revision: 0,
             purge_floor_op: 0,
             superblock: None,
@@ -718,14 +729,86 @@ where
             .await?
             .filter(|reset| reset.generation >= self.applied_purge_generation);
             if let Some(reset) = self.purge_reset {
-                // A singleton starts a new operation sequence on restart. Cluster
-                // replicas instead repair the shared sequence and retain its floor.
+                // A singleton starts a new operation sequence on restart. A cluster
+                // must establish the selected history before discarding its floor.
                 if self.consensus.replica_count() > 1 {
                     self.purge_floor_op = self.purge_floor_op.max(reset.floor);
                 }
                 self.purge_deferred = reset.generation > self.applied_purge_generation;
             }
+            // A snapshot can publish a purge generation without a local reset.
+            // Its journal is just as volatile as one cleared by a local purge.
+            if self.consensus.replica_count() > 1
+                && !self.durability().is_persisted()
+                && !self.consumer_offset_durability().is_persisted()
+                && (self.applied_purge_generation > 0 || self.purge_reset.is_some())
+            {
+                self.purge_recovery = PurgeRecovery::AwaitingHistory;
+            }
         }
+        Ok(())
+    }
+
+    #[must_use]
+    /// The reset survived a restart without a durable operation journal.
+    /// Until history selection or snapshot installation resolves it, this replica
+    /// must not serve reads, accept writes or acknowledge replicated operations.
+    pub const fn purge_recovery_pending(&self) -> bool {
+        matches!(self.purge_recovery, PurgeRecovery::AwaitingHistory)
+    }
+
+    /// Resolve a reset whose operation journal was lost, after consensus selects
+    /// a history. Call before starting the selected view or replaying its entries.
+    /// The caller must establish freshness through a new election or a reply to
+    /// this boot's view probe before accepting an empty history.
+    /// An empty history starts a new sequence. A nonempty history needs a snapshot:
+    /// its operation numbers alone cannot distinguish fresh sends from purged ones.
+    ///
+    /// # Errors
+    /// A failed reset record write leaves recovery fenced for a later retry.
+    pub async fn recover_purge_boundary(&mut self, selected_head: u64) -> Result<(), IggyError> {
+        self.recover_purge_boundary_with_storage(&DiskStorage, selected_head)
+            .await
+    }
+
+    async fn recover_purge_boundary_with_storage<S: DurableStorage>(
+        &mut self,
+        storage: &S,
+        selected_head: u64,
+    ) -> Result<(), IggyError> {
+        if !self.purge_recovery_pending() {
+            return Ok(());
+        }
+        if selected_head != 0 {
+            if self.consensus.state_transfer_stage() == consensus::StateTransferStage::Idle {
+                self.consensus.begin_state_transfer_await();
+            }
+            return Ok(());
+        }
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+        if let Some(reset) = self.purge_reset {
+            let rebased = PurgeReset { floor: 0, ..reset };
+            if let Some(directory) = self.partition_dir() {
+                persist_purge_reset_with_storage(
+                    storage,
+                    &format!("{directory}/{PURGE_RESET_FILE}"),
+                    rebased,
+                    self.created_revision,
+                )
+                .await?;
+            }
+            self.purge_reset = Some(rebased);
+        }
+        self.purge_floor_op = 0;
+        self.log.journal().inner.clear_poll_index(0);
+        self.transfer = None;
+        self.transfer_rearm = None;
+        if self.consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
+            self.consensus
+                .set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        }
+        self.purge_recovery = PurgeRecovery::Ready;
         Ok(())
     }
 
@@ -3009,6 +3092,7 @@ where
         if result.context.history != self.poll_history
             || self.fatal.is_some()
             || self.materialization_missing
+            || self.purge_recovery_pending()
         {
             return Err(IggyError::TransientNotAccepted);
         }
@@ -4379,6 +4463,7 @@ where
             // Reject it first with the only response that proves the request
             // was never admitted, so the caller may safely retry elsewhere.
             if self.materialization_missing
+                || self.purge_recovery_pending()
                 || consensus.is_follower()
                 || !consensus.is_normal()
                 || consensus.is_transferring()
@@ -4850,6 +4935,7 @@ where
     #[must_use]
     pub fn queued_requests_ready(&self) -> bool {
         self.fatal.is_none()
+            && !self.purge_recovery_pending()
             && self.consensus.is_primary()
             && self.consensus.is_normal()
             && !self.consensus.is_transferring()
@@ -4870,6 +4956,9 @@ where
     /// which is unrecoverable in place.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
+        if self.purge_recovery_pending() {
+            return;
+        }
         self.resynchronize_consumer_offset_reservations();
         let header = *message.header();
         // Same reason as the metadata plane: `checksum` is compared as an opaque token
@@ -5239,7 +5328,7 @@ where
 
     #[allow(clippy::future_not_send)]
     pub async fn on_ack(&mut self, message: Message<PrepareOkHeader>, config: &PartitionsConfig) {
-        if self.fatal.is_some() {
+        if self.fatal.is_some() || self.purge_recovery_pending() {
             return;
         }
         self.resynchronize_consumer_offset_reservations();
@@ -5321,6 +5410,7 @@ where
     pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
         if self.fatal.is_some()
             || self.materialization_missing
+            || self.purge_recovery_pending()
             || self.persistence_checkpoint_pending()
         {
             return;
@@ -8212,7 +8302,7 @@ where
     /// op is already committed cluster-wide; there is nobody to ack to). The
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
-        if self.materialization_missing {
+        if self.materialization_missing || self.purge_recovery_pending() {
             return;
         }
         let header = *message.header();
@@ -8563,7 +8653,7 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
-        if self.fatal.is_some() || self.materialization_missing {
+        if self.fatal.is_some() || self.materialization_missing || self.purge_recovery_pending() {
             return false;
         }
         // Durable-before-send: a PrepareOk implies this replica's
@@ -9552,11 +9642,15 @@ mod tests {
     }
 
     pub(super) fn test_partition() -> IggyPartition<IggyMessageBus> {
+        test_partition_with_replicas(1)
+    }
+
+    pub(super) fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageBus> {
         let namespace = IggyNamespace::new(1, 1, 0);
         let consensus = VsrConsensus::new(
             TEST_CLUSTER,
             0,
-            1,
+            replica_count,
             namespace.inner(),
             IggyMessageBus::new(0),
             LocalPipeline::new(),
@@ -9574,8 +9668,15 @@ mod tests {
     pub(super) async fn disk_poll_partition(
         config: &PartitionsConfig,
     ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+        Box::pin(disk_poll_partition_with_replicas(config, 1)).await
+    }
+
+    pub(super) async fn disk_poll_partition_with_replicas(
+        config: &PartitionsConfig,
+        replica_count: u8,
+    ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
         let directory = tempfile::tempdir().expect("create partition directory");
-        let mut partition = test_partition();
+        let mut partition = test_partition_with_replicas(replica_count);
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
         partition.log.retire_front().expect("retire empty segment");
         partition

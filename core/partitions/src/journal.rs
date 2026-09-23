@@ -328,6 +328,8 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         unsafe { &mut *self.evicted_ring.get() }.clear();
         self.evicted_ring_bytes.set(0);
         self.resident_control_ops.set(0);
+        // The replacement history may reuse operation numbers below the old seal.
+        self.poll_floor.set(0);
     }
 
     /// Disable repair retention (single-replica groups: nobody to repair).

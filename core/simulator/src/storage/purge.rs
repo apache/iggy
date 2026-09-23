@@ -440,7 +440,7 @@ struct PurgeStorageHarness {
     storage: SimStorage,
     config: ServerConfig,
     namespace: IggyNamespace,
-    /// Policy for consumer offsets; message durability is established by the fixture.
+    /// Policy for consumer offsets; the fixture persists and replays the message journal.
     policy: Durability,
 }
 
@@ -799,7 +799,9 @@ impl PurgeStorageHarness {
         partition.set_partition_dir(self.partition_directory());
         partition.set_created_revision(CREATED_REVISION);
         partition.set_runtime_options(TopicRuntimeOptions {
-            durability: Durability::Replicated,
+            // The fixture restores a durable journal. Losing a volatile journal
+            // instead requires consensus recovery before this replay is safe.
+            durability: Durability::Persisted,
             consumer_offset_durability: self.policy,
             ..TopicRuntimeOptions::default()
         });
