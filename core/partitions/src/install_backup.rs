@@ -24,7 +24,7 @@ use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
 
 #[cfg(feature = "simulator")]
-use crate::persistence::CheckpointBarrier;
+use crate::persistence::FileSyncBarrier;
 use crate::CREATED_REVISION_FILE;
 
 const BACKUP: &str = ".install-backup";
@@ -91,7 +91,7 @@ pub async fn begin_with_storage<S: DurableStorage>(
 }
 
 /// Simulator form of [`begin_with_storage`] that retains original writers in
-/// [`CheckpointBarrier`] values until their durability barriers complete.
+/// [`FileSyncBarrier`] values until their durability barriers complete.
 ///
 /// # Errors
 /// Returns an error when an original-writer barrier fails or the install
@@ -99,11 +99,11 @@ pub async fn begin_with_storage<S: DurableStorage>(
 #[cfg(feature = "simulator")]
 pub async fn begin_with_storage_and_barriers<S: DurableStorage>(
     directory: &Path,
-    barriers: Vec<CheckpointBarrier>,
+    barriers: Vec<FileSyncBarrier>,
     storage: &S,
 ) -> io::Result<()> {
     let synced_files =
-        futures::future::try_join_all(barriers.into_iter().map(CheckpointBarrier::run))
+        futures::future::try_join_all(barriers.into_iter().map(FileSyncBarrier::run))
             .await?
             .into_iter()
             .collect();

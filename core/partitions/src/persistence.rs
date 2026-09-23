@@ -131,17 +131,13 @@ pub type PersistenceNotifier = Rc<dyn Fn(PersistenceCompletion)>;
 
 /// A file durability barrier that keeps the original writer alive until sync.
 #[must_use]
-pub struct CheckpointBarrier {
+pub struct FileSyncBarrier {
     path: PathBuf,
     sync: Pin<Box<dyn Future<Output = io::Result<()>> + 'static>>,
 }
 
-impl CheckpointBarrier {
-    /// Retains a simulator file's original writer until
-    /// [`PartitionPersistence::checkpoint_files`] or an install barrier runs.
-    ///
-    /// Production writers are synchronized by their owning modules and use an
-    /// internal already-synchronized [`CheckpointBarrier`] for the covered path.
+impl FileSyncBarrier {
+    /// Retains a simulator file's original writer until its sync runs.
     #[cfg(feature = "simulator")]
     pub fn from_file<F: DurableFile + 'static>(path: impl Into<PathBuf>, file: F) -> Self {
         Self::from_future(path, async move { file.sync().await })
@@ -466,14 +462,17 @@ enum Mutation<S: DurableStorage> {
     },
     Barrier {
         epoch: u64,
-        sync: SyncBarrier<S>,
+        barriers: Vec<FileSyncBarrier>,
+        offset_files: Vec<RetainedOffsetFile<S::File>>,
     },
     Checkpoint {
         epoch: u64,
         through_op: u64,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
-        sync: SyncBarrier<S>,
+        barriers: Vec<FileSyncBarrier>,
+        offset_files: Vec<RetainedOffsetFile<S::File>>,
+        synced_files: BTreeSet<PathBuf>,
     },
     Reset {
         epoch: u64,
@@ -482,27 +481,6 @@ enum Mutation<S: DurableStorage> {
         prepare: Option<Frozen<4096>>,
         segments: Option<(SegmentPosition, u64)>,
     },
-}
-
-/// Original-writer synchronization shared by [`Mutation::Checkpoint`] and
-/// [`Mutation::Barrier`].
-struct SyncBarrier<S: DurableStorage> {
-    barriers: Vec<CheckpointBarrier>,
-    offset_files: Vec<RetainedOffsetFile<S::File>>,
-    synced_files: BTreeSet<PathBuf>,
-}
-
-impl<S: DurableStorage> SyncBarrier<S> {
-    async fn run(mut self) -> io::Result<BTreeSet<PathBuf>> {
-        futures::stream::iter(self.offset_files.iter().map(Ok::<_, io::Error>))
-            .try_for_each_concurrent(16, |retained| retained.file.sync())
-            .await?;
-        let barrier_paths =
-            futures::future::try_join_all(self.barriers.into_iter().map(CheckpointBarrier::run))
-                .await?;
-        self.synced_files.extend(barrier_paths);
-        Ok(self.synced_files)
-    }
 }
 
 struct AppendBatchBytes {
@@ -897,7 +875,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub fn checkpoint(&self, through_op: u64) {
         // This shorthand has no materialized paths, so
-        // [`CheckpointBarrier`] has no original writer to retain.
+        // [`FileSyncBarrier`] has no original writer to retain.
         self.checkpoint_files(through_op, Vec::new(), Vec::new(), Vec::new());
     }
 
@@ -906,30 +884,42 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         through_op: u64,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
-        barriers: Vec<CheckpointBarrier>,
+        barriers: Vec<FileSyncBarrier>,
     ) {
         if through_op <= self.checkpoint_requested.get() {
             return;
         }
         self.checkpoint_requested.set(through_op);
         self.checkpoint_needed.set(false);
-        let sync = self.sync_barrier(barriers);
+        let synced_files = self
+            .offset_files
+            .borrow()
+            .keys()
+            .map(PathBuf::from)
+            .collect();
+        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
+        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
         self.queue.borrow_mut().push_back(Mutation::Checkpoint {
             epoch: self.epoch.get(),
             through_op,
             files,
             directories,
-            sync,
+            barriers,
+            offset_files,
+            synced_files,
         });
     }
 
-    /// Queue a durability barrier through every retained original writer
-    /// without advancing [`PartitionPersistence::checkpoint_op`].
-    pub(crate) fn barrier_files(&self, barriers: Vec<CheckpointBarrier>) {
-        let sync = self.sync_barrier(barriers);
+    /// Queue a durability barrier through every retained original writer,
+    /// including offset files restored from the backup, without advancing
+    /// [`PartitionPersistence::checkpoint_op`].
+    pub(crate) fn barrier_files(&self, barriers: Vec<FileSyncBarrier>) {
+        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
+        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
         self.queue.borrow_mut().push_back(Mutation::Barrier {
             epoch: self.epoch.get(),
-            sync,
+            barriers,
+            offset_files,
         });
     }
 
@@ -1179,26 +1169,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         }
     }
 
-    fn take_retained_offset_files(&self) -> Vec<RetainedOffsetFile<S::File>> {
-        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
-        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
-        offset_files
-    }
-
-    fn sync_barrier(&self, barriers: Vec<CheckpointBarrier>) -> SyncBarrier<S> {
-        let synced_files = self
-            .offset_files
-            .borrow()
-            .keys()
-            .map(PathBuf::from)
-            .collect();
-        SyncBarrier {
-            barriers,
-            offset_files: self.take_retained_offset_files(),
-            synced_files,
-        }
-    }
-
     async fn run_inner(self: Rc<Self>) {
         if self.writer_active.replace(true) {
             self.fail(io::Error::other("partition WAL writer was started twice"));
@@ -1350,20 +1320,38 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                     .await
             }
             Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
-            Mutation::Barrier { sync, .. } => {
-                sync.run().await?;
+            Mutation::Barrier {
+                barriers,
+                offset_files,
+                ..
+            } => {
+                futures::stream::iter(offset_files.iter().map(Ok::<_, io::Error>))
+                    .try_for_each_concurrent(16, |retained| retained.file.sync())
+                    .await?;
+                futures::future::try_join_all(barriers.into_iter().map(FileSyncBarrier::run))
+                    .await?;
                 journal.sync().await
             }
             Mutation::Checkpoint {
                 through_op,
                 files,
                 directories,
-                sync,
+                barriers,
+                offset_files,
+                mut synced_files,
                 ..
             } => {
                 self.checkpoint_running.set(true);
                 let result = async {
-                    let synced_files = sync.run().await?;
+                    futures::stream::iter(offset_files.iter().map(Ok::<_, io::Error>))
+                        .try_for_each_concurrent(16, |retained| retained.file.sync())
+                        .await?;
+                    synced_files.extend(
+                        futures::future::try_join_all(
+                            barriers.into_iter().map(FileSyncBarrier::run),
+                        )
+                        .await?,
+                    );
                     journal
                         .checkpoint_files(through_op, &files, &directories, &synced_files)
                         .await

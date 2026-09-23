@@ -33,7 +33,7 @@ mod partition_storage;
 mod persistence;
 mod poll_plan;
 #[cfg(feature = "simulator")]
-pub use persistence::CheckpointBarrier;
+pub use persistence::FileSyncBarrier;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
