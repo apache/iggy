@@ -46,7 +46,7 @@ cargo test -p iggy-gateway-kafka
 Or generate only the keys the tests need:
 
 ```bash
-for key in 0 1 2 19; do
+for key in 0 1 2 10 11 12 14 19; do
   cargo run -p kafka-message-gen -- generate \
     --output gateways/kafka/tools/kafka-tool/kafka_messages \
     --api-key "$key"
