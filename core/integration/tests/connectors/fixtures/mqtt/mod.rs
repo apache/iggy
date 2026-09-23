@@ -24,22 +24,32 @@ mod publisher;
 
 use container::{
     DEFAULT_IGGY_TOPIC, DEFAULT_TEST_STREAM, ENV_SOURCE_BROKER_URL, ENV_SOURCE_CLIENT_ID,
-    ENV_SOURCE_PATH, ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA, ENV_SOURCE_STREAM,
-    ENV_SOURCE_TOPIC, MqttBrokerContainer,
+    ENV_SOURCE_PASSWORD, ENV_SOURCE_PATH, ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA,
+    ENV_SOURCE_STREAM, ENV_SOURCE_TOPIC, ENV_SOURCE_USERNAME, INVALID_MQTT_PASSWORD, MQTT_PASSWORD,
+    MQTT_USERNAME, MqttBrokerContainer,
 };
 
 struct MqttFixture {
     broker: MqttBrokerContainer,
     protocol: publisher::Protocol,
     qos: u8,
+    source_username: &'static str,
+    source_password: &'static str,
 }
 
 impl MqttFixture {
-    async fn start(protocol: publisher::Protocol, qos: u8) -> Result<Self, TestBinaryError> {
+    async fn start(
+        protocol: publisher::Protocol,
+        qos: u8,
+        source_username: &'static str,
+        source_password: &'static str,
+    ) -> Result<Self, TestBinaryError> {
         Ok(Self {
             broker: MqttBrokerContainer::start().await?,
             protocol,
             qos,
+            source_username,
+            source_password,
         })
     }
 
@@ -50,6 +60,8 @@ impl MqttFixture {
             self.protocol,
             self.qos,
             payload,
+            MQTT_USERNAME,
+            MQTT_PASSWORD,
         )
         .await
     }
@@ -63,6 +75,14 @@ impl MqttFixture {
             (
                 ENV_SOURCE_BROKER_URL.to_string(),
                 self.broker.broker_url.clone(),
+            ),
+            (
+                ENV_SOURCE_USERNAME.to_string(),
+                self.source_username.to_string(),
+            ),
+            (
+                ENV_SOURCE_PASSWORD.to_string(),
+                self.source_password.to_string(),
             ),
             (ENV_SOURCE_PROTOCOL.to_string(), protocol.to_string()),
             (ENV_SOURCE_QOS.to_string(), self.qos.to_string()),
@@ -85,7 +105,7 @@ impl MqttFixture {
 }
 
 macro_rules! define_mqtt_fixture {
-    ($name:ident, $protocol:expr, $qos:expr) => {
+    ($name:ident, $protocol:expr, $qos:expr, $username:expr, $password:expr) => {
         pub struct $name(MqttFixture);
 
         impl $name {
@@ -97,7 +117,9 @@ macro_rules! define_mqtt_fixture {
         #[async_trait]
         impl TestFixture for $name {
             async fn setup() -> Result<Self, TestBinaryError> {
-                Ok(Self(MqttFixture::start($protocol, $qos).await?))
+                Ok(Self(
+                    MqttFixture::start($protocol, $qos, $username, $password).await?,
+                ))
             }
 
             fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -107,9 +129,59 @@ macro_rules! define_mqtt_fixture {
     };
 }
 
-define_mqtt_fixture!(Mqtt311Qos0Fixture, publisher::Protocol::Mqtt311, 0);
-define_mqtt_fixture!(Mqtt311Qos1Fixture, publisher::Protocol::Mqtt311, 1);
-define_mqtt_fixture!(Mqtt311Qos2Fixture, publisher::Protocol::Mqtt311, 2);
-define_mqtt_fixture!(Mqtt5Qos0Fixture, publisher::Protocol::Mqtt5, 0);
-define_mqtt_fixture!(Mqtt5Qos1Fixture, publisher::Protocol::Mqtt5, 1);
-define_mqtt_fixture!(Mqtt5Qos2Fixture, publisher::Protocol::Mqtt5, 2);
+define_mqtt_fixture!(
+    Mqtt311Qos0Fixture,
+    publisher::Protocol::Mqtt311,
+    0,
+    MQTT_USERNAME,
+    MQTT_PASSWORD
+);
+define_mqtt_fixture!(
+    Mqtt311Qos1Fixture,
+    publisher::Protocol::Mqtt311,
+    1,
+    MQTT_USERNAME,
+    MQTT_PASSWORD
+);
+define_mqtt_fixture!(
+    Mqtt311Qos2Fixture,
+    publisher::Protocol::Mqtt311,
+    2,
+    MQTT_USERNAME,
+    MQTT_PASSWORD
+);
+define_mqtt_fixture!(
+    Mqtt5Qos0Fixture,
+    publisher::Protocol::Mqtt5,
+    0,
+    MQTT_USERNAME,
+    MQTT_PASSWORD
+);
+define_mqtt_fixture!(
+    Mqtt5Qos1Fixture,
+    publisher::Protocol::Mqtt5,
+    1,
+    MQTT_USERNAME,
+    MQTT_PASSWORD
+);
+define_mqtt_fixture!(
+    Mqtt5Qos2Fixture,
+    publisher::Protocol::Mqtt5,
+    2,
+    MQTT_USERNAME,
+    MQTT_PASSWORD
+);
+define_mqtt_fixture!(
+    Mqtt5InvalidCredentialsFixture,
+    publisher::Protocol::Mqtt5,
+    1,
+    MQTT_USERNAME,
+    INVALID_MQTT_PASSWORD
+);
+define_mqtt_fixture!(
+    Mqtt311InvalidCredentialsFixture,
+    publisher::Protocol::Mqtt311,
+    1,
+    MQTT_USERNAME,
+    INVALID_MQTT_PASSWORD
+);

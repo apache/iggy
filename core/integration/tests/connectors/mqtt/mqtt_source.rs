@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::connectors::fixtures::{
-    Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture, Mqtt311Qos0Fixture, Mqtt311Qos1Fixture,
-    Mqtt311Qos2Fixture,
+    Mqtt5InvalidCredentialsFixture, Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture,
+    Mqtt311InvalidCredentialsFixture, Mqtt311Qos0Fixture, Mqtt311Qos1Fixture, Mqtt311Qos2Fixture,
 };
 use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
 use integration::harness::{TestHarness, seeds};
@@ -29,6 +29,58 @@ use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt5_invalid_credentials_should_fail_source_initialization(
+    harness: &TestHarness,
+    fixture: Mqtt5InvalidCredentialsFixture,
+) {
+    let source = wait_for_source_status(harness, "error").await;
+    assert_eq!(
+        source
+            .get("last_error")
+            .and_then(Value::as_object)
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str),
+        Some("Invalid configuration: Plugin initialization failed (ID: 1)")
+    );
+
+    let payload = b"mqtt5-invalid-credentials";
+    fixture
+        .publish(payload)
+        .await
+        .expect("authenticated MQTT publisher should complete");
+    assert_message_is_not_persisted(harness, payload).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt311_invalid_credentials_should_fail_source_initialization(
+    harness: &TestHarness,
+    fixture: Mqtt311InvalidCredentialsFixture,
+) {
+    let source = wait_for_source_status(harness, "error").await;
+    assert_eq!(
+        source
+            .get("last_error")
+            .and_then(Value::as_object)
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str),
+        Some("Invalid configuration: Plugin initialization failed (ID: 1)")
+    );
+
+    let payload = b"mqtt311-invalid-credentials";
+    fixture
+        .publish(payload)
+        .await
+        .expect("authenticated MQTT publisher should complete");
+    assert_message_is_not_persisted(harness, payload).await;
+}
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
@@ -167,7 +219,48 @@ where
     assert_eq!(received.payload.as_ref(), payload);
 }
 
+async fn assert_message_is_not_persisted(harness: &TestHarness, payload: &[u8]) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "mqtt_source_auth_failure_consumer".try_into().unwrap();
+
+    let result = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(polled) = client
+                .poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    None,
+                    &Consumer::new(consumer_id.clone()),
+                    &PollingStrategy::next(),
+                    10,
+                    true,
+                )
+                .await
+                && polled
+                    .messages
+                    .iter()
+                    .any(|message| message.payload.as_ref() == payload)
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "invalid MQTT credentials must not persist messages"
+    );
+}
+
 async fn wait_for_source_running(harness: &TestHarness) {
+    wait_for_source_status(harness, "running").await;
+}
+
+async fn wait_for_source_status(harness: &TestHarness, expected_status: &str) -> Value {
     let runtime = harness
         .connectors_runtime()
         .expect("connectors runtime should be configured");
@@ -178,13 +271,13 @@ async fn wait_for_source_running(harness: &TestHarness) {
         loop {
             if let Ok(response) = http.get(format!("{api_url}/sources/mqtt")).send().await
                 && let Ok(source) = response.json::<Value>().await
-                && source.get("status").and_then(Value::as_str) == Some("running")
+                && source.get("status").and_then(Value::as_str) == Some(expected_status)
             {
-                return;
+                return source;
             }
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("MQTT source connector should become running");
+    .expect("MQTT source connector should reach the expected status")
 }
