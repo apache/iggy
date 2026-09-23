@@ -90,7 +90,7 @@ jobs:
       - name: Install system dependencies
         run: |
           ./scripts/ci/apt-install.sh gnome-keyring keyutils dbus-x11 libsecret-tools
-          rm -f $HOME/.local/share/keyrings/*
+          rm -f "$HOME"/.local/share/keyrings/*
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -318,7 +318,7 @@ jobs:
           export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
 
           # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
-          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> "$GITHUB_ENV"
 
           cargo llvm-cov clean --workspace
           echo "Building Python wheel with coverage instrumentation..."
