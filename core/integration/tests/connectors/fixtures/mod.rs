@@ -22,6 +22,7 @@ mod delta;
 mod doris;
 mod elasticsearch;
 mod floci;
+mod fluss;
 mod http;
 mod iceberg;
 mod influxdb;
@@ -63,6 +64,10 @@ pub use doris::{
     DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
+pub use fluss::{
+    FlussMultiSinkFixture, FlussPartitionedSinkFixture, FlussPrimaryKeySinkFixture,
+    FlussSinkFixture,
+};
 pub use http::{
     GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkIndividualFixture,
     HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture, HttpSinkNdjsonFixture,
