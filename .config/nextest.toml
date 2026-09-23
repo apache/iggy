@@ -56,7 +56,7 @@ test-group = "elasticsearch"
 max-threads = 4
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)'
+filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests) or binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)'
 test-group = "kafka_bridge"
 
 [profile.default]
