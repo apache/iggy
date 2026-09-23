@@ -60,7 +60,7 @@ const CONSUMER1_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 async fn create_stale_tcp_client(server_addr: &str) -> IggyClient {
     let config = TcpClientConfig {
         server_address: server_addr.to_string(),
-        heartbeat_interval: IggyDuration::from_str("1h").unwrap(),
+        heartbeat_interval: NonZeroIggyDuration::from_str("1h").unwrap(),
         nodelay: true,
         ..TcpClientConfig::default()
     };
@@ -72,7 +72,7 @@ async fn create_stale_tcp_client(server_addr: &str) -> IggyClient {
 async fn create_tcp_client(server_addr: &str) -> IggyClient {
     let config = TcpClientConfig {
         server_address: server_addr.to_string(),
-        heartbeat_interval: IggyDuration::from_str("500ms").unwrap(),
+        heartbeat_interval: NonZeroIggyDuration::from_str("500ms").unwrap(),
         nodelay: true,
         ..TcpClientConfig::default()
     };

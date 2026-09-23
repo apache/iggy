@@ -17,6 +17,7 @@
 
 export { Client, SimpleClient, SingleClient } from './client.js'
 export * from './client.config.js';
+export { parseConnectionString } from './client.connection-string.js';
 export * from './client.utils.js';
 export * from './client.socket.js';
 export * from './client.type.js';

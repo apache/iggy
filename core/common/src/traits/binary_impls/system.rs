@@ -18,8 +18,8 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::clients_from_wire;
 use crate::{
-    BinaryClient, ClientInfo, ClientInfoDetails, IggyDuration, IggyError, OptionSpec, OptionsScope,
-    Snapshot, SnapshotCompression, Stats, SystemClient, SystemSnapshotType,
+    BinaryClient, ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec,
+    OptionsScope, Snapshot, SnapshotCompression, Stats, SystemClient, SystemSnapshotType,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
@@ -99,7 +99,7 @@ impl<B: BinaryClient> SystemClient for B {
         Ok(())
     }
 
-    async fn heartbeat_interval(&self) -> IggyDuration {
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.get_heartbeat_interval()
     }
 

@@ -30,8 +30,10 @@ mod meilisearch;
 mod mongodb;
 mod postgres;
 mod quickwit;
+mod rabbitmq;
 mod random;
 mod random_source_liveness;
+mod redshift;
 mod runtime;
 mod s3;
 mod stdout;
@@ -40,8 +42,8 @@ mod surrealdb;
 use iggy::prelude::{IggyClient, IggyMessage, Partitioning};
 use iggy_common::Client;
 use iggy_common::{
-    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, MessageClient, PolledMessages,
-    StreamClient, TopicClient, TopicCreateOptions,
+    CompressionAlgorithm, Durability, IggyExpiry, IggyTimestamp, MaxTopicSize, MessageClient,
+    PolledMessages, StreamClient, TopicClient, TopicCreateOptions,
 };
 use integration::harness::{ConnectorsRuntimeConfig, IpAddrKind, TestHarness, TestServerConfig};
 use serde::{Deserialize, Serialize};
@@ -217,6 +219,7 @@ impl ConnectorsRuntime {
                     compression_algorithm: Some(CompressionAlgorithm::None),
                     message_expiry: Some(IggyExpiry::ServerDefault),
                     max_topic_size: Some(MaxTopicSize::ServerDefault),
+                    durability: Durability::Persisted,
                     ..TopicCreateOptions::default()
                 },
             )

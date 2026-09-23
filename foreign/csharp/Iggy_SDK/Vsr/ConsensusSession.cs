@@ -203,14 +203,8 @@ internal sealed class ConsensusSession
         var sessionId = _session ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
             "A replicated request requires a bound consensus session.");
 
-        // Partition ops replicate in their own per-partition group with no client-table dedup, so they too
-        // must leave the metadata counter untouched. Only metadata operations and logout consume an id: the
-        // server tracks request ids for those alone, and it accepts any id above the client's watermark.
-        if (operation.IsPartition())
-        {
-            return new SessionFrame(_clientId, _requestCounter, sessionId);
-        }
-
+        // Partition ops consume an id too, even though no partition-plane dedup exists yet: dedup needs
+        // each send to carry a distinct number, and the metadata watermark tolerates the gaps.
         var requestId = _requestCounter;
         _requestCounter = checked(_requestCounter + 1);
 

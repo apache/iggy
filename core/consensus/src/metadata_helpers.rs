@@ -468,10 +468,10 @@ pub async fn send_eviction_to_client<B, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_table::REGISTER_REQUEST_ID;
+    use crate::client_table::{REGISTER_REQUEST_ID, REPLY_RING_RETENTION_BYTES};
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
     use iggy_binary_protocol::{Command, Operation, ReplyHeader};
-    use message_bus::SendError;
+    use message_bus::{BusMessage, SendError};
 
     /// Acting user for register fixtures; these tests exercise preflight /
     /// replay, not user resolution, so the exact value is immaterial.
@@ -502,9 +502,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            data: Frozen<MESSAGE_ALIGN>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
-            self.client_sends.borrow_mut().push((client_id, data));
+            self.client_sends
+                .borrow_mut()
+                .push((client_id, data.into().into_contiguous()));
             Ok(())
         }
 
@@ -740,8 +742,10 @@ mod tests {
         client_table
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply);
-        // Ring capacity is 5, so request 1's reply is displaced once 6 commits.
-        for request in 1..=6u64 {
+        // Enough replies to exhaust the retention budget, so request 1's is
+        // certain to have been dropped.
+        let requests = (REPLY_RING_RETENTION_BYTES / size_of::<ReplyHeader>() + 8) as u64;
+        for request in 1..=requests {
             let reply =
                 synthesize_send_messages_reply(&consensus, client_id, request, 100 + request);
             client_table

@@ -229,9 +229,9 @@ mod tests {
         }
     }
 
-    fn make_prng() -> rand_xoshiro::Xoshiro256Plus {
+    fn make_prng() -> rand_xoshiro::Xoshiro256PlusPlus {
         use rand_xoshiro::rand_core::SeedableRng;
-        rand_xoshiro::Xoshiro256Plus::seed_from_u64(42)
+        rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(42)
     }
 
     #[test]

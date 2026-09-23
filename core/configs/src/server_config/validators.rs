@@ -26,11 +26,14 @@ use super::COMPONENT;
 use super::cluster::STATE_CHUNK_HEADER_LEN;
 use super::partition::{CONCURRENT_SERVED_SEGMENTS, SEGMENT_SIZE_OVERSHOOT_BYTES};
 use super::server::ServerConfig;
-use crate::ConfigurationError;
 use crate::common::http::HMAC_JWT_ALGORITHMS;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
+use crate::{ConfigEnvMappings, ConfigurationError};
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
+use std::ffi::OsStr;
+use std::net::SocketAddr;
+use std::path::Path;
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -40,8 +43,7 @@ const WS_DEFAULT_WRITE_BUFFER_SIZE: u64 = 128 * 1024;
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        self.system
-            .memory_pool
+        self.memory_pool
             .validate()
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate memory pool config")
@@ -58,36 +60,29 @@ impl Validatable<ConfigurationError> for ServerConfig {
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
-        self.system
-            .segment
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate segment config")
-            })?;
         self.telemetry.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate telemetry config")
         })?;
-        self.system
-            .sharding
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate sharding config")
-            })?;
+        self.sharding.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate sharding config")
+        })?;
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
         })?;
+        self.node.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate node config")
+        })?;
+        self.validate_tcp_bind_address()?;
+        self.validate_client_facing_address()?;
         self.metadata.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate metadata config")
         })?;
         self.partition.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate partition config")
         })?;
-        self.system
-            .logging
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate logging config")
-            })?;
+        self.logging.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate logging config")
+        })?;
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
@@ -370,8 +365,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        reject_unsupported(self)?;
-
         Ok(())
     }
 }
@@ -408,20 +401,147 @@ fn served_transfer_slots(config: &ServerConfig) -> (u64, u64) {
     (resident_len, slots)
 }
 
-/// The server parses the whole config surface but does not yet honor every
-/// knob. Make the still-inert ones loud at boot rather than silently ignored.
-/// All are off by default, so only a deliberate opt-in trips this.
-fn reject_unsupported(config: &ServerConfig) -> Result<(), ConfigurationError> {
-    if config.system.segment.archive_expired {
-        eprintln!("system.segment.archive_expired is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
-    }
-    if config.system.recovery.recreate_missing_state {
-        eprintln!("system.recovery.recreate_missing_state is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
+impl ServerConfig {
+    fn validate_tcp_bind_address(&self) -> Result<(), ConfigurationError> {
+        parse_bind_address("tcp.address", &self.tcp.address)?;
+        Ok(())
     }
 
-    Ok(())
+    /// The listener the client-facing address is derived from must not bind a
+    /// wildcard unless that address is declared outright.
+    ///
+    /// When running inside a container, any client listener binding loopback
+    /// is unreachable from outside that network namespace, which is warned.
+    fn validate_client_facing_address(&self) -> Result<(), ConfigurationError> {
+        self.validate_client_facing_address_in_env(is_container())?;
+        Ok(())
+    }
+
+    fn validate_client_facing_address_in_env(
+        &self,
+        is_container: bool,
+    ) -> Result<Vec<String>, ConfigurationError> {
+        if self.cluster.enabled {
+            return Ok(Vec::new());
+        }
+
+        if let Some(listener) = self.derived_address_listener() {
+            let bind = parse_bind_address(listener.key, listener.address)?;
+            if bind.ip().to_canonical().is_unspecified() && self.node.advertised_address.is_none() {
+                eprintln!(
+                    "{COMPONENT} - {} binds the wildcard {bind}, which says which interfaces this node \
+                     accepts on rather than where a client reaches it, so cluster metadata would carry no \
+                     address for this node. Set node.advertised_address to the address clients dial, or \
+                     bind a concrete address.",
+                    listener.key
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+        }
+
+        let mut warnings = Vec::new();
+        for listener in self.client_listeners() {
+            if !listener.enabled {
+                continue;
+            }
+            let bind = parse_bind_address(listener.key, listener.address)?;
+            let ip = bind.ip().to_canonical();
+
+            if ip.is_loopback() && is_container {
+                let env_var = ServerConfig::find_by_config_path(listener.key)
+                    .map_or(listener.key, |m| m.env_name);
+                let port = bind.port();
+                let hint = if self.node.advertised_address.is_none() {
+                    format!(
+                        " Set {env_var}=0.0.0.0:{port} together with IGGY_NODE_ADVERTISED_ADDRESS, or bind a concrete address."
+                    )
+                } else {
+                    format!(" Set {env_var} or bind a concrete address.")
+                };
+                let msg = format!(
+                    "{COMPONENT} - {} binds the loopback address {bind} inside a container; the \
+                     server will not be reachable from outside this network namespace.{hint}",
+                    listener.key
+                );
+                eprintln!("{msg}");
+                warnings.push(msg);
+            }
+        }
+
+        Ok(warnings)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const CONTAINER_CGROUP_MARKERS: &[&str] = &[
+    "/docker/",
+    "/docker-",
+    "/libpod-",
+    "/podman/",
+    "/kubepods/",
+    "/kubepods-",
+    "/containerd/",
+    "/lxc/",
+];
+
+/// Returns true when the process is executing inside a container.
+fn is_container() -> bool {
+    is_container_indicators(
+        Path::new("/.dockerenv"),
+        Path::new("/run/.containerenv"),
+        std::env::var_os("container").as_deref(),
+        std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
+        "/proc/self/cgroup",
+    )
+}
+
+fn is_container_indicators(
+    dockerenv_path: &Path,
+    containerenv_path: &Path,
+    container_env: Option<&OsStr>,
+    k8s_env: Option<&OsStr>,
+    cgroup_path: &str,
+) -> bool {
+    if dockerenv_path.exists() || containerenv_path.exists() {
+        return true;
+    }
+
+    if container_env.is_some() || k8s_env.is_some() {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cgroup) = std::fs::read_to_string(cgroup_path)
+            && cgroup.lines().any(|line| {
+                CONTAINER_CGROUP_MARKERS
+                    .iter()
+                    .any(|marker| line.contains(marker))
+            })
+        {
+            return true;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = cgroup_path;
+
+    false
+}
+
+/// A listener's bind address, which is a literal IP and a port and nothing
+/// else. `context` names the config key so the operator reads back the one
+/// they wrote.
+fn parse_bind_address(context: &str, address: &str) -> Result<SocketAddr, ConfigurationError> {
+    address.parse::<SocketAddr>().map_err(|error| {
+        eprintln!(
+            "{COMPONENT} - {context} '{address}' is not an address and port: {error}. The host \
+             is required and must be a literal IP, so ':PORT' and 'hostname:PORT' are both \
+             rejected; use 127.0.0.1:PORT for loopback or 0.0.0.0:PORT to accept on every \
+             interface."
+        );
+        ConfigurationError::InvalidConfigurationValue
+    })
 }
 
 #[cfg(test)]
@@ -471,6 +591,243 @@ mod tests {
     }
 
     #[test]
+    fn given_wildcard_bind_without_advertised_address_when_validating_should_reject() {
+        for wildcard in ["0.0.0.0:8090", "[::]:8090", "[::ffff:0.0.0.0]:8090"] {
+            let config = config_with_override(&format!(
+                "[tcp]\naddress = \"{wildcard}\"\n[cluster]\nenabled = false\n"
+            ));
+            assert!(
+                config.validate().is_err(),
+                "{wildcard} names no address a client can dial"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_hostless_or_named_bind_address_when_validating_should_reject() {
+        for address in [":8090", "localhost:8090", "0.0.0.0", "not-an-address"] {
+            let config = config_with_override(&format!("[tcp]\naddress = \"{address}\"\n"));
+            assert!(
+                config.validate().is_err(),
+                "{address} does not name a bind address"
+            );
+        }
+    }
+
+    #[test]
+    fn given_wildcard_bind_with_advertised_address_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = false\n\
+             [node]\nadvertised_address = \"broker-1.example.com\"\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_concrete_bind_without_advertised_address_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"192.0.2.10:8090\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_loopback_bind_in_container_when_validating_should_warn_and_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
+        );
+        let warnings = config
+            .validate_client_facing_address_in_env(true)
+            .expect("validation should pass");
+        assert_eq!(warnings.len(), 4);
+        for warning in &warnings {
+            assert!(warning.contains("outside this network namespace"));
+            assert!(warning.contains("together with IGGY_NODE_ADVERTISED_ADDRESS"));
+        }
+        assert!(warnings[0].contains("IGGY_TCP_ADDRESS=0.0.0.0:8090"));
+        assert!(warnings[1].contains("IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092"));
+        assert!(warnings[2].contains("IGGY_QUIC_ADDRESS=0.0.0.0:8080"));
+        assert!(warnings[3].contains("IGGY_HTTP_ADDRESS=0.0.0.0:3000"));
+    }
+
+    #[test]
+    fn given_loopback_bind_outside_container_when_validating_should_pass_without_warning() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
+        );
+        let warnings = config
+            .validate_client_facing_address_in_env(false)
+            .expect("validation should pass");
+        assert!(
+            warnings.is_empty(),
+            "loopback outside container must not produce a warning"
+        );
+    }
+
+    #[test]
+    fn given_loopback_bind_in_container_with_advertised_address_when_validating_should_warn_and_pass()
+     {
+        let config = config_with_override(
+            "[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = false\n\
+             [node]\nadvertised_address = \"broker-1.example.com\"\n",
+        );
+        let warnings = config
+            .validate_client_facing_address_in_env(true)
+            .expect("validation should pass");
+        assert_eq!(warnings.len(), 3);
+        for warning in &warnings {
+            assert!(warning.contains("outside this network namespace"));
+            assert!(!warning.contains("0.0.0.0"));
+            assert!(!warning.contains("together with IGGY_NODE_ADVERTISED_ADDRESS"));
+        }
+        assert!(warnings[0].contains("Set IGGY_WEBSOCKET_ADDRESS or bind a concrete address."));
+        assert!(warnings[1].contains("Set IGGY_QUIC_ADDRESS or bind a concrete address."));
+        assert!(warnings[2].contains("Set IGGY_HTTP_ADDRESS or bind a concrete address."));
+    }
+
+    #[test]
+    fn given_dockerenv_file_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let marker = temp_dir.join(format!("test_dockerenv_{}", std::process::id()));
+        std::fs::write(&marker, "").unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result =
+            is_container_indicators(&marker, &non_existent, None, None, "/non/existent/cgroup");
+        let _ = std::fs::remove_file(&marker);
+        assert!(result);
+    }
+
+    #[test]
+    fn given_containerenv_file_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let marker = temp_dir.join(format!("test_containerenv_{}", std::process::id()));
+        std::fs::write(&marker, "").unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result =
+            is_container_indicators(&non_existent, &marker, None, None, "/non/existent/cgroup");
+        let _ = std::fs::remove_file(&marker);
+        assert!(result);
+    }
+
+    #[test]
+    fn given_container_env_var_when_checking_container_should_return_true() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(is_container_indicators(
+            non_existent,
+            non_existent,
+            Some(OsStr::new("docker")),
+            None,
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[test]
+    fn given_kubernetes_env_var_when_checking_container_should_return_true() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(is_container_indicators(
+            non_existent,
+            non_existent,
+            None,
+            Some(OsStr::new("10.0.0.1")),
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_cgroup_with_docker_marker_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let cgroup_file = temp_dir.join(format!("test_docker_cgroup_{}", std::process::id()));
+        std::fs::write(
+            &cgroup_file,
+            "0::/system.slice/docker-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.scope\n",
+        )
+        .unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result = is_container_indicators(
+            &non_existent,
+            &non_existent,
+            None,
+            None,
+            cgroup_file.to_str().unwrap(),
+        );
+        let _ = std::fs::remove_file(&cgroup_file);
+        assert!(result);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_host_cgroup_without_markers_when_checking_container_should_return_false() {
+        let temp_dir = std::env::temp_dir();
+        let cgroup_file = temp_dir.join(format!("test_host_cgroup_{}", std::process::id()));
+        std::fs::write(
+            &cgroup_file,
+            "0::/user.slice/user-1000.slice/session-1.scope\n",
+        )
+        .unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result = is_container_indicators(
+            &non_existent,
+            &non_existent,
+            None,
+            None,
+            cgroup_file.to_str().unwrap(),
+        );
+        let _ = std::fs::remove_file(&cgroup_file);
+        assert!(!result);
+    }
+
+    #[test]
+    fn given_missing_container_indicators_when_checking_container_should_return_false() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(!is_container_indicators(
+            non_existent,
+            non_existent,
+            None,
+            None,
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[test]
+    fn given_wildcard_bind_on_a_disabled_listener_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\nenabled = false\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_wildcard_bind_on_the_first_enabled_listener_when_validating_should_reject() {
+        let config = config_with_override(
+            "[tcp]\nenabled = false\n[websocket]\nenabled = false\n[quic]\nenabled = false\n\
+             [http]\naddress = \"0.0.0.0:3000\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(
+            config.validate().is_err(),
+            "an http-only server derives its address from http.address"
+        );
+    }
+
+    #[test]
+    fn given_every_client_listener_disabled_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\nenabled = false\naddress = \"0.0.0.0:8090\"\n[websocket]\nenabled = false\n\
+             [quic]\nenabled = false\n[http]\nenabled = false\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_clustered_wildcard_bind_without_advertised_address_when_validating_should_pass() {
+        // The roster answers the client-facing address per node, so the bind
+        // address is free to be a wildcard with nothing declared here.
+        let config =
+            config_with_override("[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = true\n");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn given_shipped_default_config_when_validating_should_pass() {
         let config: ServerConfig = Figment::new()
             .merge(Toml::string(DEFAULT_CONFIG))
@@ -485,18 +842,6 @@ mod tests {
         config
             .validate()
             .expect("web_ui is served by the server and must validate");
-    }
-
-    #[test]
-    fn given_archive_expired_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.segment]\narchive_expired = true\n");
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn given_recreate_missing_state_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.recovery]\nrecreate_missing_state = true\n");
-        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -578,13 +923,17 @@ mod tests {
 
     #[test]
     fn given_repair_chunk_max_at_peer_queue_capacity_when_validating_should_reject() {
-        let config = config_with_override("[cluster]\nrepair_chunk_max = 256\n");
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 256\n\n[message_bus]\npeer_queue_capacity = 256\n",
+        );
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn given_repair_chunk_max_below_peer_queue_capacity_when_validating_should_pass() {
-        let config = config_with_override("[cluster]\nrepair_chunk_max = 255\n");
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 255\n\n[message_bus]\npeer_queue_capacity = 256\n",
+        );
         config
             .validate()
             .expect("a chunk below the peer queue capacity must validate");

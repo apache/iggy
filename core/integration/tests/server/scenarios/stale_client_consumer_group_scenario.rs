@@ -40,7 +40,7 @@ const TOTAL_MESSAGES: u32 = 10;
 async fn create_client(server_addr: &str, heartbeat_interval: &str) -> IggyClient {
     let config = TcpClientConfig {
         server_address: server_addr.to_string(),
-        heartbeat_interval: IggyDuration::from_str(heartbeat_interval).unwrap(),
+        heartbeat_interval: NonZeroIggyDuration::from_str(heartbeat_interval).unwrap(),
         nodelay: true,
         ..TcpClientConfig::default()
     };
@@ -52,7 +52,7 @@ async fn create_client(server_addr: &str, heartbeat_interval: &str) -> IggyClien
 async fn create_reconnecting_client(server_addr: &str) -> IggyClient {
     let config = TcpClientConfig {
         server_address: server_addr.to_string(),
-        heartbeat_interval: IggyDuration::from_str("1h").unwrap(),
+        heartbeat_interval: NonZeroIggyDuration::from_str("1h").unwrap(),
         nodelay: true,
         auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
             DEFAULT_ROOT_USERNAME.to_string(),
@@ -61,7 +61,7 @@ async fn create_reconnecting_client(server_addr: &str) -> IggyClient {
         reconnection: TcpClientReconnectionConfig {
             enabled: true,
             max_retries: Some(5),
-            interval: IggyDuration::from_str("500ms").unwrap(),
+            interval: NonZeroIggyDuration::from_str("500ms").unwrap(),
             reestablish_after: IggyDuration::from_str("100ms").unwrap(),
         },
         ..TcpClientConfig::default()
@@ -284,7 +284,7 @@ async fn should_handle_stale_client_with_auto_reconnection(
         .auto_join_consumer_group()
         .create_consumer_group_if_not_exists()
         .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
-        .polling_retry_interval(IggyDuration::from_str("500ms").unwrap())
+        .polling_retry_interval(NonZeroIggyDuration::from_str("500ms").unwrap())
         .build();
 
     consumer.init().await.unwrap();

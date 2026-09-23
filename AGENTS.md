@@ -6,11 +6,10 @@ Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
 Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
 ingests from / egresses to external systems via dlopened plugins.
 
-> Skills under `.claude/skills/` are currently scoped to the
-> **connectors** subsystem (`core/connectors/`). Load
+> Skills live under `.claude/skills/`. Load
 > [connectors-overview](.claude/skills/connectors-overview/SKILL.md)
-> first for any change there. Other subsystems follow the repo-wide
-> principles in this file.
+> first for any change under `core/connectors/`. Other subsystems
+> follow the repo-wide principles in this file.
 
 ## Contents
 
@@ -121,8 +120,8 @@ iggy/
 
 ## Skills
 
-Connectors-scoped. Each `SKILL.md` has YAML frontmatter (name,
-description). Load `connectors-overview` first as router.
+Each `SKILL.md` has YAML frontmatter (name, description). For
+connectors work, load `connectors-overview` first as router.
 
 - [connectors-overview](.claude/skills/connectors-overview/SKILL.md) - router + universal connector rules
 - [connector-runtime](.claude/skills/connector-runtime/SKILL.md) - FFI host, lifecycle, state, metrics
@@ -131,6 +130,12 @@ description). Load `connectors-overview` first as router.
 - [connector-source](.claude/skills/connector-source/SKILL.md) - source plugin authoring
 - [connector-transform](.claude/skills/connector-transform/SKILL.md) - transform authoring
 - [connector-testing](.claude/skills/connector-testing/SKILL.md) - unit + integration test patterns
+
+Repo-wide, user-invoked only. `disable-model-invocation: true` keeps it
+out of the agent's context; do not replicate its steps. When a
+non-trivial change passes verification, suggest `/team-review <target>`.
+
+- [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
 
 ## Repo-wide principles
 
@@ -183,9 +188,11 @@ description). Load `connectors-overview` first as router.
 
 BDD test naming: `given_X_when_Y_should_Z` (3-part). Promote to 4-part `given_X_when_Y_then_Z_should_W` only with a distinct "then" intermediate. Be consistent inside a file.
 
-Filter a single integration test by path:
+Filter a single integration test by path. Build the binaries the harness launches first: it runs
+whatever is already in `target/`, so a stale one fails as though the change under test broke it.
 
 ```bash
+cargo build --bin iggy-server --bin iggy-connectors
 cargo test -p integration -- connectors::runtime::benchmark::given_logging_format_json
 ```
 
@@ -197,6 +204,7 @@ cargo test -p integration -- connectors::runtime::benchmark::given_logging_forma
 - **`test_logs/` grows quickly.** Wipe between major refactors.
 - **Miri only covers `binary_protocol` + `consensus`.** Cannot emulate `io_uring` syscalls. do not try to expand Miri to crates that pull `compio`.
 - **Integration crate has no `--test` target.** Filter by test path inside the single `mod.rs` binary.
+- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server`, `iggy-connectors` or `iggy-mcp` is used silently. CI builds first (`cargo build --locked --bin iggy-server --bin iggy`); a local run does not, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
 
 ## Local state directories
 

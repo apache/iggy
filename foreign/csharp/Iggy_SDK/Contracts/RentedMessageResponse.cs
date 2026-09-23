@@ -56,7 +56,7 @@ public sealed class RentedMessageResponse
             {
                 _userHeaders = RawUserHeaders.IsEmpty
                     ? null
-                    : BinaryMapper.TryMapHeaders(RawUserHeaders.Span);
+                    : BinaryMapper.MapHeaders(RawUserHeaders.Span);
                 _userHeadersInitialized = true;
             }
 

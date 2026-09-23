@@ -31,7 +31,7 @@ use tracing::debug;
 use super::HttpState;
 use super::error::AuthError;
 use super::session::HttpSession;
-use crate::auth::verify_pat_credentials_with_expiry;
+use crate::dispatch::session_ops::verify_pat_credentials_with_expiry;
 use crate::http::ClientAddr;
 
 /// Bearer scheme prefix in the `Authorization` header.
@@ -117,7 +117,9 @@ impl FromRequestParts<HttpState> for Identity {
         let bearer = bearer_token(&parts.headers)?;
 
         // Verify only. The session key and expiry `resolve_credential` also
-        // returns feed the write path's session table; a read discards them.
+        // returns feed the write path's session table; a read discards them -
+        // its read-your-writes floor is keyed by user id, not by credential
+        // (see `MetadataWatermarks`).
         // The verify is `!Send` (a trusted-issuer JWT may await a JWKS fetch),
         // so bridge it with `SendWrapper` - sound only because compio pins this
         // future to shard 0's single thread, the only thread the JWKS client

@@ -51,10 +51,12 @@ pub type SendCallback = extern "C" fn(
 
 pub type BatchResultCallback = extern "C" fn(plugin_id: u32, batch_id: u64, result: u8) -> i32;
 
-const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time the runtime may take to report a source batch result.
+pub const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const NACK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_NACK_RETRY_DELAY: Duration = Duration::from_secs(5);
-const MAX_CONSECUTIVE_NACKS: u32 = 5;
+/// Number of consecutive rejected batches after which a source is stopped.
+pub const MAX_CONSECUTIVE_NACKS: u32 = 5;
 
 /// Delivery result for the single batch currently in flight from a source plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,14 @@ impl TryFrom<u8> for SourceBatchResult {
 struct PendingBatch {
     id: u64,
     result_sender: oneshot::Sender<BatchCompletion>,
+    result_received: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingBatchClearResult {
+    Cleared,
+    ResultReceived,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +351,7 @@ async fn handle_messages<T, F>(
                     *pending = Some(PendingBatch {
                         id: batch_id,
                         result_sender,
+                        result_received: false,
                     });
                 }
 
@@ -348,7 +359,9 @@ async fn handle_messages<T, F>(
                 drop(messages);
 
                 if callback_result != 0 {
-                    if !clear_pending_batch(&pending_batch, batch_id, plugin_id) {
+                    if clear_pending_batch(&pending_batch, batch_id, plugin_id)
+                        != PendingBatchClearResult::Cleared
+                    {
                         break;
                     }
                     let completion = apply_batch_result(
@@ -367,22 +380,30 @@ async fn handle_messages<T, F>(
                     continue;
                 }
 
+                let mut result_receiver = Box::pin(result_receiver);
                 let (completion, shutting_down) = tokio::select! {
                     biased;
-                    result = result_receiver => {
+                    result = &mut result_receiver => {
                         (result.unwrap_or(BatchCompletion::Stop), false)
                     },
                     _ = shutdown.changed() => {
-                        let completion = if clear_pending_batch(&pending_batch, batch_id, plugin_id) {
-                            apply_batch_result(
+                        let completion = match clear_pending_batch(
+                            &pending_batch,
+                            batch_id,
+                            plugin_id,
+                        ) {
+                            PendingBatchClearResult::Cleared => apply_batch_result(
                                 &source,
                                 &consecutive_nacks,
                                 SourceBatchResult::Nack,
                                 plugin_id,
                                 policy.max_consecutive_nacks,
-                            ).await
-                        } else {
-                            BatchCompletion::Stop
+                            ).await,
+                            PendingBatchClearResult::ResultReceived
+                            | PendingBatchClearResult::Unavailable => result_receiver
+                                .as_mut()
+                                .await
+                                .unwrap_or(BatchCompletion::Stop),
                         };
                         (completion, true)
                     },
@@ -390,16 +411,23 @@ async fn handle_messages<T, F>(
                         warn!(
                             "Timed out waiting for batch result for source connector with ID: {plugin_id}, batch ID: {batch_id}"
                         );
-                        let completion = if clear_pending_batch(&pending_batch, batch_id, plugin_id) {
-                            apply_batch_result(
+                        let completion = match clear_pending_batch(
+                            &pending_batch,
+                            batch_id,
+                            plugin_id,
+                        ) {
+                            PendingBatchClearResult::Cleared => apply_batch_result(
                                 &source,
                                 &consecutive_nacks,
                                 SourceBatchResult::Nack,
                                 plugin_id,
                                 policy.max_consecutive_nacks,
-                            ).await
-                        } else {
-                            BatchCompletion::Stop
+                            ).await,
+                            PendingBatchClearResult::ResultReceived
+                            | PendingBatchClearResult::Unavailable => result_receiver
+                                .as_mut()
+                                .await
+                                .unwrap_or(BatchCompletion::Stop),
                         };
                         (completion, false)
                     }
@@ -448,9 +476,9 @@ where
         }
     };
 
-    let Some(current) = take_pending_batch(pending_batch, batch_id, plugin_id) else {
+    if !mark_batch_result_received(pending_batch, batch_id, plugin_id) {
         return -1;
-    };
+    }
 
     let completion = get_runtime().block_on(apply_batch_result(
         source,
@@ -459,6 +487,9 @@ where
         plugin_id,
         max_consecutive_nacks,
     ));
+    let Some(current) = take_pending_batch(pending_batch, batch_id, plugin_id) else {
+        return -1;
+    };
     if current.result_sender.send(completion).is_err() {
         error!(
             "Failed to deliver batch result for source connector with ID: {plugin_id}, batch ID: {batch_id}"
@@ -471,6 +502,34 @@ where
     } else {
         0
     }
+}
+
+fn mark_batch_result_received(
+    pending_batch: &Mutex<Option<PendingBatch>>,
+    batch_id: u64,
+    plugin_id: u32,
+) -> bool {
+    let mut pending = lock_pending_batch(pending_batch);
+    let Some(current) = pending.as_mut() else {
+        error!("No batch is awaiting a result for source connector with ID: {plugin_id}");
+        return false;
+    };
+    if current.id != batch_id {
+        error!(
+            "Batch result ID mismatch for source connector with ID: {plugin_id}. Expected: {}, received: {batch_id}",
+            current.id
+        );
+        return false;
+    }
+    if current.result_received {
+        error!(
+            "Batch result was already received for source connector with ID: {plugin_id}, batch ID: {batch_id}"
+        );
+        return false;
+    }
+
+    current.result_received = true;
+    true
 }
 
 fn take_pending_batch(
@@ -498,18 +557,24 @@ fn clear_pending_batch(
     pending_batch: &Mutex<Option<PendingBatch>>,
     batch_id: u64,
     plugin_id: u32,
-) -> bool {
+) -> PendingBatchClearResult {
     let mut pending = lock_pending_batch(pending_batch);
-    if let Some(current) = pending.as_ref()
-        && current.id != batch_id
-    {
+    let Some(current) = pending.as_ref() else {
+        return PendingBatchClearResult::Unavailable;
+    };
+    if current.id != batch_id {
         error!(
             "Batch result ID mismatch for source connector with ID: {plugin_id}. Expected: {}, received: {batch_id}",
             current.id
         );
-        return false;
+        return PendingBatchClearResult::Unavailable;
     }
-    pending.take_if(|current| current.id == batch_id).is_some()
+    if current.result_received {
+        return PendingBatchClearResult::ResultReceived;
+    }
+
+    pending.take();
+    PendingBatchClearResult::Cleared
 }
 
 fn lock_pending_batch(
@@ -604,6 +669,16 @@ macro_rules! source_connector {
                 log_callback,
                 <$type>::new,
             );
+            if result != 0 {
+                // Rolled back rather than registered. `open` stores the
+                // instance on the container whatever it returns, so a failed
+                // one would sit here for the life of the process: the runtime
+                // gets an error back before it has recorded the id, so nothing
+                // outside can name it to close it. Dropping the container is
+                // the rollback, and it releases whatever the plugin took
+                // before it failed.
+                return result;
+            }
             INSTANCES.insert(id, container);
             result
         }
@@ -678,6 +753,7 @@ mod tests {
         polls: AtomicUsize,
         results: Mutex<Vec<SourceBatchResult>>,
         fail_batch_result: AtomicBool,
+        batch_result_delay: Duration,
     }
 
     #[async_trait::async_trait]
@@ -696,6 +772,9 @@ mod tests {
         }
 
         async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), crate::Error> {
+            if !self.batch_result_delay.is_zero() {
+                tokio::time::sleep(self.batch_result_delay).await;
+            }
             self.results
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -882,6 +961,7 @@ mod tests {
         *lock_pending_batch(&pending_batch) = Some(PendingBatch {
             id: 41,
             result_sender,
+            result_received: false,
         });
 
         assert_eq!(
@@ -927,6 +1007,7 @@ mod tests {
         *lock_pending_batch(&pending_batch) = Some(PendingBatch {
             id: 51,
             result_sender,
+            result_received: false,
         });
 
         assert_eq!(
@@ -1000,6 +1081,65 @@ mod tests {
                     .unwrap_or_else(PoisonError::into_inner),
                 vec![SourceBatchResult::Nack]
             );
+
+            task.abort();
+            let _ = task.await;
+        });
+    }
+
+    #[test]
+    fn given_result_received_before_timeout_when_hook_finishes_late_should_continue_polling() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource {
+                batch_result_delay: Duration::from_millis(200),
+                ..TestSource::default()
+            });
+            let pending_batch = Arc::new(Mutex::new(None));
+            let consecutive_nacks = Arc::new(AtomicU32::new(0));
+            let (_shutdown_sender, shutdown_receiver) = watch::channel(());
+            let (batch_sender, mut batch_receiver) = mpsc::unbounded_channel();
+            let policy = BatchPolicy {
+                result_timeout: Duration::from_millis(100),
+                ..test_policy()
+            };
+
+            let task = tokio::spawn(handle_messages(
+                29,
+                Arc::clone(&source),
+                move |_, batch_id, _, _| {
+                    batch_sender
+                        .send(batch_id)
+                        .expect("batch receiver should remain open");
+                    0
+                },
+                shutdown_receiver,
+                Arc::clone(&pending_batch),
+                Arc::clone(&consecutive_nacks),
+                policy,
+            ));
+
+            let batch_id = batch_receiver
+                .recv()
+                .await
+                .expect("first batch should be sent");
+            assert_eq!(
+                complete_test_batch(
+                    Arc::clone(&pending_batch),
+                    Arc::clone(&source),
+                    Arc::clone(&consecutive_nacks),
+                    batch_id,
+                    SourceBatchResult::Ack,
+                    29,
+                )
+                .await,
+                0
+            );
+            let next_batch_id = tokio::time::timeout(Duration::from_secs(1), batch_receiver.recv())
+                .await
+                .expect("source did not poll after the received ACK was applied")
+                .expect("batch channel closed");
+            assert_eq!(next_batch_id, 2);
 
             task.abort();
             let _ = task.await;

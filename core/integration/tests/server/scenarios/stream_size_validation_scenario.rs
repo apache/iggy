@@ -15,43 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::server::scenarios::{PARTITION_ID, PARTITIONS_COUNT};
-use bytes::Bytes;
+use crate::server::scenarios::{
+    PARTITION_ID, PARTITIONS_COUNT, batch_size, create_client, create_messages, validate_stream,
+    validate_system_stats, validate_topic,
+};
 use iggy::prelude::*;
 use integration::harness::{TestHarness, assert_clean_system, login_root};
 use std::str::FromStr;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
-
-// The partition plane applies committed ops asynchronously on the owning
-// shard (sends fold into the shared stats at commit-apply; purge/delete
-// zero them when the reconciler drives the wipe), so a read racing that
-// window can see a pre-apply value. Retry until the expectation holds,
-// then make the terminal assertion for a real mismatch.
-const STATS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
-const STATS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 const S1_NAME: &str = "test-stream-1";
 const T1_NAME: &str = "test-topic-1";
 const S2_NAME: &str = "test-stream-2";
 const T2_NAME: &str = "test-topic-2";
-const MESSAGE_PAYLOAD_SIZE_BYTES: u64 = 57;
 const MSGS_COUNT: u64 = 117; // number of messages in a single topic after one pass of appending
-// The server accounts the actual on-disk batch framing: one 256-byte
-// `SendMessages` command header per append pass plus a 48-byte per-message
-// header (`server_common::send_messages::COMMAND_HEADER_SIZE` and
-// `iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE`). Each pass below
-// sends all `MSGS_COUNT` messages in one batch.
-const NG_BATCH_HEADER_SIZE: u64 = 256;
-const NG_MESSAGE_HEADER_SIZE: u64 = 48;
-const MSGS_SIZE: u64 =
-    NG_BATCH_HEADER_SIZE + (NG_MESSAGE_HEADER_SIZE + MESSAGE_PAYLOAD_SIZE_BYTES) * MSGS_COUNT;
+// Each pass below sends all `MSGS_COUNT` messages in one batch.
+const MSGS_SIZE: u64 = batch_size(MSGS_COUNT);
 
 pub async fn run(harness: &TestHarness) {
-    let client = harness
-        .new_client()
-        .await
-        .expect("Failed to create new client");
+    let client = create_client(harness).await;
 
     // 0. Ping server, login as root user and ensure that streams do not exist
     ping_login_and_validate(&client).await;
@@ -198,7 +179,7 @@ async fn validate_operations_on_topic_twice(
     partition_id: u32,
 ) {
     // 1. Append messages to the topic
-    let mut messages = create_messages();
+    let mut messages = create_messages(MSGS_COUNT);
     client
         .send_messages(
             &Identifier::from_str(stream_name).unwrap(),
@@ -213,7 +194,7 @@ async fn validate_operations_on_topic_twice(
     validate_topic(client, stream_name, topic_name, MSGS_SIZE, MSGS_COUNT).await;
 
     // 3. Again append same number of messages to the topic
-    let mut messages = create_messages();
+    let mut messages = create_messages(MSGS_COUNT);
     client
         .send_messages(
             &Identifier::from_str(stream_name).unwrap(),
@@ -233,93 +214,6 @@ async fn validate_operations_on_topic_twice(
         MSGS_COUNT * 2,
     )
     .await;
-}
-
-async fn validate_system_stats(
-    client: &IggyClient,
-    expected_size: u64,
-    expected_messages_count: u64,
-) {
-    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
-    let stats = loop {
-        let stats = client.get_stats().await.unwrap();
-        if (stats.messages_count == expected_messages_count
-            && stats.messages_size_bytes.as_bytes_u64() == expected_size)
-            || Instant::now() >= deadline
-        {
-            break stats;
-        }
-        sleep(STATS_RETRY_INTERVAL).await;
-    };
-    assert_eq!(
-        stats.messages_count, expected_messages_count,
-        "system stats messages_count mismatch"
-    );
-    assert_eq!(
-        stats.messages_size_bytes.as_bytes_u64(),
-        expected_size,
-        "system stats messages_size_bytes mismatch"
-    );
-}
-
-async fn validate_stream(
-    client: &IggyClient,
-    stream_name: &str,
-    expected_size: u64,
-    expected_messages_count: u64,
-) {
-    // 1. Fetch until the async commit-apply converges (see the retry note at
-    // the top of the file).
-    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
-    let stream = loop {
-        let stream = client
-            .get_stream(&Identifier::from_str(stream_name).unwrap())
-            .await
-            .unwrap()
-            .expect("Failed to get stream");
-        if (stream.size == expected_size && stream.messages_count == expected_messages_count)
-            || Instant::now() >= deadline
-        {
-            break stream;
-        }
-        sleep(STATS_RETRY_INTERVAL).await;
-    };
-
-    // 2. Validate stream size and number of messages
-    assert_eq!(stream.size, expected_size);
-    assert_eq!(stream.messages_count, expected_messages_count);
-}
-
-async fn validate_topic(
-    client: &IggyClient,
-    stream_name: &str,
-    topic_name: &str,
-    expected_size: u64,
-    expected_messages_count: u64,
-) {
-    // 1. Fetch until the async commit-apply converges (see the retry note at
-    // the top of the file).
-    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
-    let topic = loop {
-        let topic = client
-            .get_topic(
-                &Identifier::from_str(stream_name).unwrap(),
-                &Identifier::from_str(topic_name).unwrap(),
-            )
-            .await
-            .unwrap()
-            .expect("Failed to get topic");
-        if (topic.size == expected_size && topic.messages_count == expected_messages_count)
-            || Instant::now() >= deadline
-        {
-            break topic;
-        }
-        sleep(STATS_RETRY_INTERVAL).await;
-    };
-
-    // 2. Validate topic size and number of messages
-    assert_eq!(topic.size, expected_size);
-    assert_eq!(topic.messages_count, expected_messages_count);
 }
 
 async fn delete_topic(client: &IggyClient, stream_name: &str, topic_name: &str) {
@@ -354,20 +248,4 @@ async fn purge_stream(client: &IggyClient, stream_name: &str) {
         .purge_stream(&Identifier::from_str(stream_name).unwrap())
         .await
         .unwrap();
-}
-
-fn create_messages() -> Vec<IggyMessage> {
-    let mut messages = Vec::new();
-    for offset in 0..MSGS_COUNT {
-        let id = (offset + 1) as u128;
-        let payload = Bytes::from(vec![0xD; MESSAGE_PAYLOAD_SIZE_BYTES as usize]);
-
-        let message = IggyMessage::builder()
-            .id(id)
-            .payload(payload)
-            .build()
-            .expect("Failed to create message");
-        messages.push(message);
-    }
-    messages
 }

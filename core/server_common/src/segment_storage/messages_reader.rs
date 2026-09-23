@@ -40,14 +40,17 @@ impl MessagesReader {
             .error(|e: &std::io::Error| format!("Failed to open messages file: {file_path}. {e}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        trace!("Validated messages file for reading: {file_path}");
-
-        Ok(Self {
-            file_path: file_path.to_string(),
-        })
+        Ok(Self::from_validated_path(file_path))
     }
 
     pub fn path(&self) -> String {
         self.file_path.clone()
+    }
+
+    pub(super) fn from_validated_path(file_path: &str) -> Self {
+        trace!("Validated messages file for reading: {file_path}");
+        Self {
+            file_path: file_path.to_owned(),
+        }
     }
 }

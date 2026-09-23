@@ -147,17 +147,26 @@ export const doubleToBuf = (v: number) => {
   return b;
 }
 
+/** Mask selecting the low 64 bits of a u128, for little-endian half-writes. */
+const U64_MASK = 0xFFFF_FFFF_FFFF_FFFFn;
+
 /**
- * Converts a BigInt to a 128-bit unsigned integer Buffer in little-endian format.
+ * Converts a u128 value to a 16-byte unsigned integer Buffer in little-endian
+ * format.
  *
- * @param num - BigInt value to convert
- * @param width - Width in bytes (default: 16)
- * @returns Buffer containing the value in little-endian byte order
+ * Writes the two 64-bit halves directly rather than round-tripping through a hex
+ * string. `value` must be a non-negative integer below 2^128; anything outside
+ * that range throws (a `RangeError` from the underlying write), which is
+ * preferable to silently truncating a message id.
+ *
+ * @param value - u128 value (0 <= value < 2^128)
+ * @returns 16-byte buffer containing the value in little-endian byte order
  */
-export function u128ToBuf(num: bigint, width = 16): Buffer {
-  const hex = num.toString(16);
-  const b = Buffer.from(hex.padStart(width * 2, '0').slice(0, width * 2), 'hex');
-  return b.reverse();
+export function u128ToBuf(value: bigint): Buffer {
+  const b = Buffer.allocUnsafe(16);
+  b.writeBigUInt64LE(value & U64_MASK, 0);
+  b.writeBigUInt64LE(value >> 64n, 8);
+  return b;
 }
 
 /**

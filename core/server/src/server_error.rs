@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
 use metadata::impls::recovery::RecoveryError;
 use server_common::log::LogError;
 use shard::ShardCtorError;
-use shard_allocator::ShardingError;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -62,7 +62,7 @@ pub enum ServerError {
     },
     #[error(
         "shard allocator produced zero shards; server must run at least one \
-         shard (check [system.sharding] cpu_allocation)"
+         shard (check [sharding] cpu_allocation)"
     )]
     ShardsCountZero,
     #[error(
@@ -77,6 +77,21 @@ pub enum ServerError {
          committed journal tail may not have flushed"
     )]
     ShardPumpDied { shard_id: u16, reason: String },
+    /// A shard's message pump stopped because a partition could not commit
+    /// an op the cluster had already committed. The partition is fenced and
+    /// the server is shutting down; the exit is non-zero so an orchestrator
+    /// does not read a durability fault as a clean stop.
+    #[error(
+        "shard {shard_id} stopped: partition {namespace_raw} could not commit op {op}, \
+         which the cluster had already committed. The replica is divergent and was \
+         fenced; the server shut down so it cannot serve a prefix the cluster has \
+         moved past"
+    )]
+    ShardFatal {
+        shard_id: u16,
+        namespace_raw: u64,
+        op: u64,
+    },
     #[error(
         "shard {shard_id} message pump did not drain within {timeout:?}. \
          Committed journal tail may not have flushed"
@@ -85,27 +100,50 @@ pub enum ServerError {
         shard_id: u16,
         timeout: std::time::Duration,
     },
-    #[error("system.sharding.inbox_capacity must be in 1..={max}; got {value}")]
+    #[error("sharding.inbox_capacity must be in 1..={max}; got {value}")]
     InvalidInboxCapacity { value: usize, max: usize },
-    #[error("system.sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
+    #[error("sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
     InvalidReplyInboxCapacity { value: usize, max: usize },
-    #[error("system.sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
+    #[error("sharding.poll_completion_capacity must be in 1..={max}; got {value}")]
+    InvalidPollCompletionCapacity { value: usize, max: usize },
+    #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,
         max: std::time::Duration,
     },
-    #[error("system.sharding.shutdown_poll_interval must be in (0, {max:?}]; got {value:?}")]
+    #[error("sharding.shutdown_poll_interval must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownPollInterval {
         value: std::time::Duration,
         max: std::time::Duration,
     },
     #[error(
-        "system.sharding.shutdown_poll_interval ({poll:?}) must be <= \
+        "sharding.shutdown_poll_interval ({poll:?}) must be <= \
          shutdown_drain_timeout ({drain:?})"
     )]
     ShutdownPollExceedsDrain {
         poll: std::time::Duration,
         drain: std::time::Duration,
+    },
+    #[error("sharding.shutdown_join_timeout must be <= {max:?}; got {value:?}")]
+    InvalidShutdownJoinTimeout {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
+    #[error(
+        "sharding.shutdown_join_timeout ({join:?}) must be >= \
+         shutdown_drain_timeout ({drain:?})"
+    )]
+    ShutdownJoinBelowDrain {
+        join: std::time::Duration,
+        drain: std::time::Duration,
+    },
+    #[error(
+        "sharding.reconcile_periodic_interval must be in (0, {max:?}]; got {value:?}. \
+         Note that \"0\", \"none\", \"unlimited\", and \"disabled\" all parse to zero"
+    )]
+    InvalidReconcilePeriodicInterval {
+        value: std::time::Duration,
+        max: std::time::Duration,
     },
     #[error("failed to serialize current server config")]
     CurrentConfigSerialize(#[source] toml::ser::Error),
@@ -121,6 +159,12 @@ pub enum ServerError {
     MetadataRecovery(#[source] RecoveryError),
     #[error("failed to open partition superblock at {dir}")]
     PartitionSuperblockIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to recover partition prepare WAL at {dir}: {source}")]
+    PartitionPrepareWalIo {
         dir: PathBuf,
         #[source]
         source: std::io::Error,
@@ -172,11 +216,11 @@ pub enum ServerError {
     //
     // The Display text deliberately claims nothing about what happens to the
     // refused files: disposition (quarantine into `.fenced.N` vs tombstone
-    // with files left in place) is decided by the `bootstrap.rs` arms that
+    // with files left in place) is decided by the `boot/recovery.rs` arms that
     // catch this error, and only they log it -- a claim here would render
     // beside theirs and contradict one branch or the other.
     #[error(
-        "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused segment \
+        "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused storage \
          recovery: {reason}"
     )]
     PartitionRecoveryRefused {
@@ -185,6 +229,21 @@ pub enum ServerError {
         topic_id: usize,
         partition_id: usize,
         reason: PartitionRecoveryRefusal,
+    },
+    /// Fails the create rather than letting the partition go live without its
+    /// first reservation: the failed write arms the group's superblock retry
+    /// backoff, and a send arriving inside that window is refused with a
+    /// transient the HTTP plane does not replay. `namespace_raw` joins this to
+    /// the write's own `iggy.partitions.diag` line, which carries the cause.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} (namespace {namespace_raw}) could not \
+         claim its first offset reservation"
+    )]
+    PartitionOffsetReservationClaim {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        namespace_raw: u64,
     },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
@@ -205,6 +264,8 @@ pub enum ServerError {
     },
     #[error("cluster enabled but no node is configured for replica {replica_id}")]
     ClusterNodeNotFound { replica_id: u8 },
+    #[error("server listeners start on shard 0 only, not on shard {shard_id}")]
+    ListenersOffShardZero { shard_id: u16 },
     #[error("cluster node count {count} exceeds supported u8 replica count")]
     ClusterReplicaCountTooLarge { count: usize },
     #[error("cluster mode requires --replica-id to identify the current node")]
@@ -275,6 +336,13 @@ pub enum ServerError {
     ShardConstruction(#[source] ShardCtorError),
     #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]
     ShardJoinFailures { failures: Vec<ShardJoinFailure> },
+    /// A panic no shard thread could surface: compio's `spawn` catches task
+    /// panics, so a dead listener or connection task leaves every thread
+    /// exiting `Ok`. The panic hook records the first one and the join path
+    /// fails the exit on it, so an orchestrator does not read the shutdown
+    /// as clean.
+    #[error("server shut down after a panic: {description}")]
+    Panicked { description: String },
 }
 
 /// Why a partition's recovered segments cannot be served.
@@ -284,9 +352,19 @@ pub enum ServerError {
 /// causes, and not all of them are at-rest corruption: an empty non-tail
 /// segment is a failed rebuild's orphan pairing, a hole is a stray or
 /// half-unlinked file, interior damage is bit rot (or a resurrected tail
-/// appended over), a divergent index is a mis-strided or foreign write, and
-/// offsets that do not continue the chain can be minted into byte-clean files
-/// by an upstream crash window as well as by damage.
+/// appended over), and offsets that do not continue the chain can be minted
+/// into byte-clean files by an upstream crash window as well as by damage.
+///
+/// An index that contradicts itself is deliberately NOT here, and neither is
+/// one the log cannot back UNLESS the topic runs under `persisted durability` and the
+/// gap is deeper than the single in-flight entry: entries are derived from the
+/// log, so recovery drops such an index whole and rebuilds it from a byte-0
+/// walk of the log rather than believing any part of it. What `persisted durability`
+/// adds is evidence from serialized completed flushes: an entry above chunk N
+/// means the log fdatasync covering chunk N completed before the later flush
+/// began. This is independent of reply timing and turns a deeper gap into
+/// evidence about the LOG. Absent that evidence the index only locates data;
+/// recovery verifies the log from byte 0.
 #[derive(Debug)]
 pub enum PartitionRecoveryRefusal {
     /// `recoverable_bytes` on the two chain-shape refusals is the sum of
@@ -305,16 +383,6 @@ pub enum PartitionRecoveryRefusal {
         next_start: u64,
         recoverable_bytes: u64,
     },
-    /// The index holds entries but no whole batch decodes AND verifies where
-    /// its last entry points, so index and log describe different files. The
-    /// damage probe ran first: anything verifying past the anchor's damage
-    /// refuses as [`Self::InteriorDamage`] instead.
-    IndexLogDivergence {
-        start_offset: u64,
-        end_offset: u64,
-        messages_size_bytes: u64,
-        indexed_size_bytes: u64,
-    },
     /// A complete, checksum-verifying batch survives PAST bytes that do not
     /// decode. A torn tail has nothing after it, so this is interior damage,
     /// and truncating at it would silently discard the surviving batches.
@@ -330,9 +398,12 @@ pub enum PartitionRecoveryRefusal {
     /// were re-examined -- a probe defect); the verification budget bounds
     /// the bytes handed to checksum verifies, whose claimed slices overlap,
     /// so residue packed with plausible headers can exhaust it from an
-    /// on-disk shape. Truncation is only ever sound for a proven torn tail,
-    /// so giving up keeps the bytes. The residue width is diagnostic only;
-    /// it is not a gate.
+    /// on-disk shape. The index anchor search charges the same verification
+    /// budget as it steps back through entries the log cannot back, so an
+    /// index packed with claims the log never proves ends here too instead
+    /// of paying a verify per entry. Truncation is only ever sound for a
+    /// proven torn tail, so giving up keeps the bytes. The residue width is
+    /// diagnostic only; it is not a gate.
     UnverifiedResidue {
         start_offset: u64,
         damage_position: u64,
@@ -365,16 +436,55 @@ pub enum PartitionRecoveryRefusal {
         batch_partition_id: u64,
         position: u64,
     },
-    /// Index entries must ascend in offset and position (they are appended,
-    /// one per flushed chunk, over a growing log); a regression means the
-    /// file was written mis-strided or over foreign bytes.
-    IndexEntriesNotMonotone { start_offset: u64, entry_index: u64 },
-    IndexEntryBeforeSegmentStart {
+    /// The sparse index of a topic running under `persisted durability` outruns its
+    /// log by more than the one entry a crash can legitimately strand there.
+    /// Persistence writes exactly one entry per flush chunk and chunks never
+    /// overlap. The WAL makes a body durable before acknowledging it and the
+    /// flush indexes it later, so every entry on disk names a chunk whose log
+    /// bytes completed their fdatasync. A completed
+    /// chunk can contain batches acknowledged before the flush threshold was
+    /// reached, while the in-flight chunk can do so too. Reply timing is not
+    /// the proof. Only the chunk in flight when the process died can have an
+    /// entry the log never backed. A deeper step-back therefore says the LOG
+    /// lost bytes it had already made durable, and rebuilding from what remains
+    /// could re-mint offsets, including offsets already returned to clients.
+    FsyncedLogLoss {
         start_offset: u64,
-        first_entry_offset: u64,
+        entry_count: u64,
+        provable_entries: u64,
+        /// Position of the highest entry the log still proves; 0 when it
+        /// proves none, which `provable_entries` disambiguates.
+        provable_position: u64,
+        /// Entries the backward search actually probed, which its own cap
+        /// holds below `entry_count` on a long index: `provable_entries == 0`
+        /// then means nothing proved in the searched window, not that the log
+        /// backs nothing.
+        searched_entries: u64,
     },
-    /// A writer reopening over recovered bounds found the on-disk length
-    /// diverging from the size recovery just validated and truncated to.
+    /// Under `persisted durability`, the byte-0 rebuild after a dropped index proved
+    /// the log only through `walked_position`, short of `durable_position`,
+    /// the byte the index's own last entry proves the log had already
+    /// fdatasynced through (the flush that wrote the entry began only after
+    /// the previous chunk's log sync completed). The step-back gate measures
+    /// loss at entry granularity; this catches the sub-chunk shape it cannot:
+    /// bytes a completed flush made durable are gone mid-chunk, so truncating
+    /// to the walked prefix would re-mint their offsets.
+    FsyncedRebuildShortfall {
+        start_offset: u64,
+        entry_count: u64,
+        walked_position: u64,
+        durable_position: u64,
+    },
+    PrepareWal {
+        directory: PathBuf,
+        source: std::io::Error,
+    },
+    CheckpointSizeMismatch {
+        start_offset: u64,
+        validated_bytes: u64,
+        expected_bytes: u64,
+    },
+    /// The physical file length differs from the required recovered boundary.
     StorageSizeMismatch {
         start_offset: u64,
         on_disk_bytes: u64,
@@ -407,18 +517,6 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "segment {previous_start} ends at offset {previous_end} but the next \
                  starts at {next_start}, leaving a hole in a chain holding \
                  {recoverable_bytes} recoverable bytes"
-            ),
-            Self::IndexLogDivergence {
-                start_offset,
-                end_offset,
-                messages_size_bytes,
-                indexed_size_bytes,
-            } => write!(
-                f,
-                "segment {start_offset} has message/index divergence: the index ends \
-                 at offset {end_offset}, byte {indexed_size_bytes}, where the \
-                 {messages_size_bytes}-byte log holds no batch that decodes and \
-                 verifies"
             ),
             Self::InteriorDamage {
                 start_offset,
@@ -469,21 +567,48 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                  stamped for partition {batch_partition_id}; a foreign record in \
                  this log is preserved as evidence, not truncated"
             ),
-            Self::IndexEntriesNotMonotone {
+            Self::FsyncedLogLoss {
                 start_offset,
-                entry_index,
+                entry_count,
+                provable_entries,
+                provable_position,
+                searched_entries,
             } => write!(
                 f,
-                "segment {start_offset} index entry {entry_index} regresses in \
-                 offset or position; the index was not appended over this log"
+                "segment {start_offset} runs under persisted durability with {entry_count} sparse \
+                 index entries, but its log backs only {provable_entries} of the \
+                 {searched_entries} searched from the top (up to byte {provable_position}); \
+                 every entry below the last describes a log chunk whose fdatasync had \
+                 completed, so the log has lost previously durable data rather than the \
+                 index having outrun it"
             ),
-            Self::IndexEntryBeforeSegmentStart {
+            Self::FsyncedRebuildShortfall {
                 start_offset,
-                first_entry_offset,
+                entry_count,
+                walked_position,
+                durable_position,
             } => write!(
                 f,
-                "segment {start_offset} index claims offset {first_entry_offset}, \
-                 below the segment's own start"
+                "segment {start_offset} runs under persisted durability with {entry_count} sparse \
+                 index entries, and the byte-0 rebuild proved its log only through byte \
+                 {walked_position}, short of byte {durable_position} which the last \
+                 entry's own fdatasync ordering proves the log had already made durable; \
+                 the log has lost previously durable bytes mid-chunk, so rebuilding \
+                 would re-mint their offsets"
+            ),
+            Self::PrepareWal { directory, source } => write!(
+                f,
+                "prepare WAL at {} cannot be recovered: {source}",
+                directory.display()
+            ),
+            Self::CheckpointSizeMismatch {
+                start_offset,
+                validated_bytes,
+                expected_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} validated prefix has {validated_bytes} bytes, \
+                 but the WAL checkpoint requires {expected_bytes}"
             ),
             Self::StorageSizeMismatch {
                 start_offset,
@@ -492,13 +617,13 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
             } => write!(
                 f,
                 "segment {start_offset} file length {on_disk_bytes} diverged from \
-                 its recovered size {expected_bytes} at writer open"
+                 its required recovered size {expected_bytes}"
             ),
         }
     }
 }
 
-/// Per-shard outcome captured by [`crate::bootstrap::ShardHandles::join_all`]
+/// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]
 /// when a shard either returned `Err` or panicked.
 ///
 /// Bundled into [`ServerError::ShardJoinFailures`] so the operator sees

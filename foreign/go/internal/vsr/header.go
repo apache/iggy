@@ -54,6 +54,7 @@ const (
 const (
 	replyOffsetSize      = 48
 	replyOffsetCommand   = 60
+	replyOffsetCommit    = 184
 	replyOffsetRequest   = 200
 	replyOffsetOperation = 208
 	replyOffsetStatus    = 216
@@ -116,7 +117,10 @@ func (c ClientID) IsZero() bool {
 }
 
 // RequestFields are the header fields a client fills in. The rest of the 256
-// bytes stay zero, including both checksums, which the server does not read.
+// bytes stay zero. The frame and body checksums are not read on the client
+// request path. request_checksum is read, but zero means unstamped and opts out
+// of the server's payload comparison, so leaving it zero is legal; the Rust SDK
+// stamps it for deduped ops, this SDK does not yet.
 type RequestFields struct {
 	// Size is the header plus body total.
 	Size uint32
@@ -177,6 +181,19 @@ func ReadReplyOperation(header *[HeaderSize]byte) Operation {
 // in flight.
 func ReadReplyRequestID(header *[HeaderSize]byte) uint64 {
 	return binary.LittleEndian.Uint64(header[replyOffsetRequest:])
+}
+
+// MetadataCommit excludes partition replies, whose commit indexes belong to
+// different consensus groups and cannot fence a metadata read.
+func MetadataCommit(header *[HeaderSize]byte) uint64 {
+	operation := ReadReplyOperation(header)
+	if PeekCommand(header) != FrameReply || !IsKnownOperation(operation) {
+		return 0
+	}
+	if operation == OperationNonReplicated || operation >= OperationSendMessages {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(header[replyOffsetCommit:])
 }
 
 // StampedRequestID reads the request id back out of a stamped request frame.

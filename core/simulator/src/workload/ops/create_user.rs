@@ -19,7 +19,7 @@
 //! live username from the shadow). Status fixed at 1 (Active).
 
 use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -41,7 +41,7 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::UserAlreadyExists];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     let username = match outcome {

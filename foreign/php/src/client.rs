@@ -27,6 +27,7 @@ use iggy::prelude::{
 use tokio::sync::Mutex;
 
 use crate::consumer::{AutoCommit, IggyConsumer};
+use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
@@ -63,6 +64,8 @@ impl IggyClient {
 
     /// Constructs a new IggyClient from a connection string.
     pub fn from_connection_string(connection_string: String) -> PhpResult<Self> {
+        // QUIC creates its endpoint before a blocking API call enters the runtime.
+        let _guard = runtime().enter();
         let client =
             RustIggyClient::from_connection_string(&connection_string).map_err(to_php_exception)?;
 
@@ -136,7 +139,8 @@ impl IggyClient {
         message_expiry_micros: Option<u64>,
         max_topic_size: Option<u64>,
         segment_size: Option<u64>,
-        enforce_fsync: Option<bool>,
+        durability: Option<PhpDurability>,
+        consumer_offset_durability: Option<PhpDurability>,
         messages_required_to_save: Option<u32>,
         size_of_messages_required_to_save: Option<u64>,
         preallocate_segments: Option<bool>,
@@ -161,7 +165,8 @@ impl IggyClient {
             message_expiry: (expiry != IggyExpiry::ServerDefault).then_some(expiry),
             max_topic_size: (max_size != MaxTopicSize::ServerDefault).then_some(max_size),
             segment_size: segment_size.map(IggyByteSize::from),
-            enforce_fsync,
+            durability: durability.unwrap_or_default().into(),
+            consumer_offset_durability: consumer_offset_durability.unwrap_or_default().into(),
             messages_required_to_save,
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
@@ -293,6 +298,9 @@ impl IggyClient {
     }
 
     /// Creates and initializes a consumer group consumer.
+    ///
+    /// `$partition_id` is ignored for a consumer group: the member reads the partitions
+    /// the server assigns to it.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(
         create_consumer_group_if_not_exists = true,
@@ -343,9 +351,7 @@ impl IggyClient {
             builder = builder.auto_commit(auto_commit.into());
         }
         builder = match poll_interval_micros {
-            Some(micros) => {
-                builder.poll_interval(non_zero_duration_micros("poll_interval_micros", micros)?)
-            }
+            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
             None => builder.without_poll_interval(),
         };
         if let Some(micros) = polling_retry_interval_micros {
@@ -408,12 +414,7 @@ impl IggyClient {
     }
 }
 
-fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<IggyDuration> {
-    if micros == 0 {
-        return Err(to_php_exception(format!(
-            "'{field}' must be greater than 0 microseconds"
-        )));
-    }
-
-    Ok(IggyDuration::from(micros))
+pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
+    NonZeroIggyDuration::try_from(micros)
+        .map_err(|_| to_php_exception(format!("'{field}' must be greater than 0 microseconds")))
 }

@@ -151,12 +151,12 @@ Options:
       --quic-send-window <QUIC_SEND_WINDOW>
           The optional send window for QUIC
 {CLAP_INDENT}
-          [default: 100000]
+          [default: 1000000]
 
       --quic-receive-window <QUIC_RECEIVE_WINDOW>
           The optional receive window for QUIC
 {CLAP_INDENT}
-          [default: 100000]
+          [default: 1000000]
 
       --quic-response-buffer-size <QUIC_RESPONSE_BUFFER_SIZE>
           The optional response buffer size for QUIC
@@ -171,7 +171,7 @@ Options:
       --quic-max-idle-timeout <QUIC_MAX_IDLE_TIMEOUT>
           The optional maximum idle timeout for QUIC
 {CLAP_INDENT}
-          [default: 10000]
+          [default: 100000]
 
       --quic-validate-certificate
           Flag to enable certificate validation for QUIC
@@ -192,7 +192,7 @@ Options:
           [default: "1s"]
 
   -q, --quiet
-          Quiet mode (disabled stdout printing)
+          Suppress logging output (command-specific output may remain)
 
   -d, --debug <DEBUG>
           Debug mode (verbose printing to given file)

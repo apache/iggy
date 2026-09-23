@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::prelude::{EncryptorKind, Identifier, IggyDuration, IggyError, Partitioning};
+use crate::prelude::{
+    EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration, Partitioning,
+};
 use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,17 +35,16 @@ pub struct IggyProducerConfig {
     topic_name: String,
     /// Sets the number of partitions to create for the topic
     topic_partitions_count: u32,
-    /// Set the topic replication factor
-    /// The max number of messages to send in a batch. Must be greater than 0.
+    /// Maximum messages per direct-send request. Zero uses the SDK's maximum batch length.
     batch_length: u32,
-    /// Sets the interval between sending the messages, can be combined with `batch_length`.
+    /// Minimum gap between sequential direct sends, measured from the previous successful send.
     linger_time: IggyDuration,
     /// Specifies to which partition the messages should be sent.
     partitioning: Partitioning,
     /// Sets the maximum number of send retries in case of a message sending failure.
     send_retries_count: Option<u32>,
     /// Sets the interval between send retries in case of a message sending failure.
-    send_retries_interval: Option<IggyDuration>,
+    send_retries_interval: Option<NonZeroIggyDuration>,
     /// Sets a optional client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
     /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
     encryptor: Option<Arc<EncryptorKind>>,
@@ -65,7 +66,7 @@ impl Default for IggyProducerConfig {
             topic_partitions_count: 1,
             encryptor: None,
             send_retries_count: Some(3),
-            send_retries_interval: Some(IggyDuration::new_from_secs(1)),
+            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
         }
     }
 }
@@ -102,7 +103,7 @@ impl IggyProducerConfig {
         partitioning: Partitioning,
         encryptor: Option<Arc<EncryptorKind>>,
         send_retries_count: Option<u32>,
-        send_retries_interval: Option<IggyDuration>,
+        send_retries_interval: Option<NonZeroIggyDuration>,
     ) -> Self {
         Self {
             stream_id,
@@ -152,7 +153,7 @@ impl IggyProducerConfig {
             topic_partitions_count: 1,
             encryptor: None,
             send_retries_count: Some(3),
-            send_retries_interval: Some(IggyDuration::new_from_secs(1)),
+            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
         })
     }
 }
@@ -198,7 +199,7 @@ impl IggyProducerConfig {
         self.send_retries_count
     }
 
-    pub fn send_retries_interval(&self) -> Option<IggyDuration> {
+    pub fn send_retries_interval(&self) -> Option<NonZeroIggyDuration> {
         self.send_retries_interval
     }
 }
@@ -223,7 +224,7 @@ mod tests {
             .linger_time(IggyDuration::from_str("5ms").unwrap())
             .partitioning(Partitioning::balanced())
             .send_retries_count(3)
-            .send_retries_interval(IggyDuration::new_from_secs(1))
+            .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
             .build();
 
         assert_eq!(
@@ -243,7 +244,7 @@ mod tests {
         assert_eq!(config.send_retries_count(), Some(3));
         assert_eq!(
             config.send_retries_interval(),
-            Some(IggyDuration::new_from_secs(1))
+            Some(NonZeroIggyDuration::ONE_SECOND)
         );
     }
 
@@ -264,7 +265,7 @@ mod tests {
         assert_eq!(config.send_retries_count(), Some(3));
         assert_eq!(
             config.send_retries_interval(),
-            Some(IggyDuration::new_from_secs(1))
+            Some(NonZeroIggyDuration::ONE_SECOND)
         );
     }
 

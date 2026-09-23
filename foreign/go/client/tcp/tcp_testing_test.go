@@ -260,7 +260,7 @@ func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 // newTestClient builds a connected client over an established connection.
 func newTestClient(t *testing.T, conn net.Conn) *IggyTcpClient {
 	t.Helper()
-	return &IggyTcpClient{
+	client := &IggyTcpClient{
 		conn:           conn,
 		transportState: iggcon.TransportStateConnected,
 		sessionState:   iggcon.SessionStateUnauthenticated,
@@ -268,5 +268,9 @@ func newTestClient(t *testing.T, conn net.Conn) *IggyTcpClient {
 		session:        vsr.NewSession(),
 		config:         defaultTcpClientConfig(),
 		closed:         make(chan struct{}),
+		exchangeGate:   make(chan struct{}, 1),
 	}
+	// Pipe fixtures model an already discovered standalone broker.
+	client.topologyKnown.Store(true)
+	return client
 }

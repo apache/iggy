@@ -22,6 +22,7 @@ package org.apache.iggy.message;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -70,6 +71,14 @@ class MessageTest {
         assertThat(message.header()).isEqualTo(header);
         assertThat(message.payload()).isEqualTo(payload);
         assertThat(message.userHeaders().size()).isEqualTo(0);
+    }
+
+    @Test
+    void ofEncodesStringPayloadAsUtf8() {
+        var message = Message.of("世界");
+
+        assertThat(message.payload()).isEqualTo("世界".getBytes(StandardCharsets.UTF_8));
+        assertThat(message.header().payloadLength()).isEqualTo(6L);
     }
 
     @Test

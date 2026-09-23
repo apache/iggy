@@ -29,13 +29,27 @@ readme = "../../README.md"
 publish = false
 
 [features]
-# Simulator-only detector hook (`IggyPartitions::hold_borrow_across_await`):
-# deliberately holds a `with_partition` borrow across an `.await` so the
-# dispatch shell can prove its borrow-across-await detector. A
-# `-p iggy-server` build excludes it; `cargo build --workspace` unifies
-# features so the shared `partitions` unit compiles it in when the simulator
+# Per-poll read accounting on the disk walk: bytes requested from the file
+# API against the encoded bytes served, and the chunk reads it took. Off by
+# default, and the server forwards `shard/poll-diagnostics` to it, so the
+# ratio is available on a short diagnostic run without a permanent log line
+# on the read path.
+poll-diagnostics = []
+
+# Simulator-only hooks: the dispatch shell's borrow-across-await detector and
+# original-writer checkpoint barriers for deterministic storage tests. A
+# `-p iggy-server` build excludes them; `cargo build --workspace` unifies
+# features so the shared `partitions` unit compiles them in when the simulator
 # requests it. No production caller.
 simulator = []
+
+# Fault injection for the harness (`IggyPartition::inject_commit_failure`):
+# makes a local commit fail the way a full disk does, so the shard sweep's
+# fence path can be driven over an in-memory partition. Requested ONLY by
+# `core/simulator`'s dev-dependencies, which the v3 resolver keeps out of any
+# non-test build, so the branch it gates cannot reach a shipped binary the way
+# a `[dependencies]` feature would through unification.
+fault-injection = []
 
 [dependencies]
 ahash = { workspace = true }
@@ -48,13 +62,15 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
-nix = { workspace = true }
 papaya = { workspace = true }
 ringbuffer = { workspace = true }
 server_common = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -90,7 +90,7 @@ jobs:
       - name: Install system dependencies
         run: |
           ./scripts/ci/apt-install.sh gnome-keyring keyutils dbus-x11 libsecret-tools
-          rm -f $HOME/.local/share/keyrings/*
+          rm -f "$HOME"/.local/share/keyrings/*
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -104,7 +104,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.11
+        uses: taiki-e/install-action@v2.87.8
         with:
           tool: cargo-llvm-cov
 
@@ -299,12 +299,12 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.11
+        uses: taiki-e/install-action@v2.87.8
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Install dependencies
         run: |
@@ -318,7 +318,7 @@ jobs:
           export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
 
           # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
-          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> "$GITHUB_ENV"
 
           cargo llvm-cov clean --workspace
           echo "Building Python wheel with coverage instrumentation..."
@@ -347,8 +347,21 @@ jobs:
       - name: Run tests
         run: |
           cd foreign/python
+
+          # TCP and HTTP ports come from server-start's own outputs rather than
+          # duplicated literals, so a future default change here can't silently
+          # desync from what the server actually started with. QUIC and WebSocket
+          # stay literals below because server-start exposes no output for them.
+          tcp_port="${{ steps.iggy.outputs.tcp_address }}"
+          http_port="${{ steps.iggy.outputs.http_address }}"
+          tcp_port="${tcp_port##*:}"
+          http_port="${http_port##*:}"
+
           IGGY_SERVER_HOST=127.0.0.1 \
-          IGGY_SERVER_TCP_PORT=8090 \
+          IGGY_SERVER_TCP_PORT="$tcp_port" \
+          IGGY_SERVER_QUIC_PORT=8080 \
+          IGGY_SERVER_HTTP_PORT="$http_port" \
+          IGGY_SERVER_WS_PORT=8092 \
           IGGY_SERVER_DOCKER_IMAGE=iggy-server:local \
             uv run --no-sync pytest tests/ -v \
               --junitxml=../../reports/python-junit.xml \
@@ -423,7 +436,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7
         with:
           node-version: "23"
           cache: "npm"
@@ -516,6 +529,10 @@ jobs:
           go test -v -race -coverprofile=../../reports/go-coverage-unit.out ./...
 
       - name: Run BDD tests with coverage
+        env:
+          IGGY_TCP_ADDRESS: 127.0.0.1:8090
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
         run: |
           cd bdd/go
           mkdir -p ../../reports

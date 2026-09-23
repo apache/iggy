@@ -15,9 +15,11 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **meilisearch_sink** | Indexes messages in Meilisearch for full-text search |
 | **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
 | **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
+| **redshift_sink** | Stores messages in Redshift warehouse tables with configurable schemas vis S3 as staging |
 | **s3_sink** | Writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces) |
 | **stdout_sink** | Prints messages to standard output (useful for debugging and development) |
 | **surrealdb_sink** | Writes messages into SurrealDB with deterministic record IDs for idempotent replay |
+| **rabbitmq_sink** | Publishes messages to RabbitMQ exchanges via AMQP |
 
 The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destination, and closing the sink.
 
@@ -246,6 +248,14 @@ for message in messages {
 ```
 
 While the schema of messages (that will be consumed from the Iggy stream), cannot be controlled by the sink connector itself, the built-in configuration allows to decide what's the expected format of the messages (the particular `StreamDecoder` will be used).
+
+`messages_metadata.schema` names the variant each `Payload` in the batch actually holds, which is not always the stream's `schema` setting. A decoder may return a different form than the wire format it reads: with `schema = "avro"` the Avro decoder extracts to JSON by default, so the batch arrives as `Payload::Json`. A configured transform can change the variant again. Match on the `Payload` itself and treat `messages_metadata.schema` as a description of what arrived, not of how the stream was configured.
+
+One poll can reach the plugin as more than one `consume()` call. The runtime groups a batch into contiguous runs of one payload variant and sends each run on its own, so a batch whose variant changes partway through arrives as several calls.
+
+Every call in that poll repeats the same `messages_metadata.current_offset`, which is the partition's high-water offset from the poll and not the offset of the last message in the call. A sink that keys a commit, a file name or a table version on `current_offset` has to tolerate the repeat.
+
+A batch whose messages were all dropped by the decoder or by a transform still reaches the plugin as one empty call. Nothing is left to read a variant from, so that call carries the stream's configured `schema` instead: an `avro` stream tags its empty batches `avro` and its non-empty ones `json`.
 
 Keep in mind, that it might be sometimes difficult/impossible e.g. to transform one format to another e.g. JSON to SBE or so, and in such a case, the consumed messages will be ignored.
 

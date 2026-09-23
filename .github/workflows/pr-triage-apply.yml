@@ -189,6 +189,10 @@ jobs:
           script: |
             const LABEL_REVIEW = 'S-waiting-on-review';
             const LABEL_AUTHOR = 'S-waiting-on-author';
+            // Orthogonal to the S-* pair rather than a third state: `pinned`
+            // is the only label stale-prs.yml exempts, so it is added and
+            // removed on its own and never goes through replaceStateLabel.
+            const LABEL_PINNED = 'pinned';
             const COMMITTER_ASSOCS = new Set(['MEMBER', 'COLLABORATOR', 'OWNER']);
             // Wider gate for the implicit changes_requested -> author
             // flip: a formal "Request changes" review is a deliberate,
@@ -228,6 +232,7 @@ jobs:
               '- `/ready` - back to `S-waiting-on-review` after addressing feedback',
               '- `/author` - flip to `S-waiting-on-author` while you finish changes',
               '- `/request-review @user-or-team` - request a reviewer',
+              '- `/pin` - exempt the PR from the stale bot, `/unpin` to undo',
               '',
               'See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#pr-triage-commands) for details.',
             ].join('\n');
@@ -298,6 +303,72 @@ jobs:
                 issue_number: prNumber,
                 labels: next,
               }), `setLabels ${add ?? '(clear S-*)'}`);
+            };
+
+            // Create the label when absent rather than assume it exists.
+            // stale-prs.yml names `pinned` as its only exemption, but no
+            // repo config guarantees the label itself was ever created, and
+            // an exemption naming a label nothing can carry is inert.
+            // Whether the labels API materializes an unknown name is
+            // undocumented, so do it explicitly. Needs `issues: write`.
+            const ensurePinnedLabel = async () => {
+              try {
+                await withRetry(() => github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: LABEL_PINNED,
+                }), `getLabel ${LABEL_PINNED}`);
+                return true;
+              } catch (e) {
+                if (e.status !== 404) {
+                  core.warning(`${LABEL_PINNED}: lookup failed: ${e.message}`);
+                  return false;
+                }
+              }
+              try {
+                await withRetry(() => github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: LABEL_PINNED,
+                  color: 'd4c5f9',
+                  description: 'Exempt from the stale bot',
+                }), `createLabel ${LABEL_PINNED}`);
+                core.info(`created label ${LABEL_PINNED}`);
+                return true;
+              } catch (e) {
+                // 422 means a concurrent run created it between our get and create.
+                if (e.status === 422) return true;
+                core.warning(`${LABEL_PINNED}: create failed: ${e.message}`);
+                return false;
+              }
+            };
+
+            // Add-only / remove-only, so unlike replaceStateLabel there is no
+            // list-then-PUT window an unrelated label change can be lost in.
+            const setPinned = async (on) => {
+              if (on) {
+                if (!await ensurePinnedLabel()) return false;
+                await withRetry(() => github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: [LABEL_PINNED],
+                }), `addLabels ${LABEL_PINNED}`);
+                return true;
+              }
+              try {
+                await withRetry(() => github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: LABEL_PINNED,
+                }), `removeLabel ${LABEL_PINNED}`);
+              } catch (e) {
+                // 404 is the PR not carrying the label, or the label not existing
+                // at all. Both mean it is already in the state /unpin asks for.
+                if (e.status !== 404) throw e;
+              }
+              return true;
             };
 
             // Best-effort commenter feedback. A failed reaction or reply
@@ -504,7 +575,7 @@ jobs:
             // The trailing `(?:\s|$)` rejects suffixed prose like
             // `/ready-to-merge` — `\b` fires at hyphen/slash and would
             // silently flip state.
-            const COMMAND_RE = /^[ \t]*\/(request-review|ready|author)(?:\s|$)/m;
+            const COMMAND_RE = /^[ \t]*\/(request-review|ready|author|unpin|pin)(?:\s|$)/m;
             if (!COMMAND_RE.test(body) && !reviewWantsAuthor) {
               core.info('no command in body and no actionable review state, skipping');
               return;
@@ -569,6 +640,8 @@ jobs:
             let sawReassign = false;
             let sawReady = false;
             let sawAuthor = false;
+            let sawPin = false;
+            let sawUnpin = false;
             // Outcome tracking for commenter feedback (see react() above).
             // applied: at least one command took effect. denied: at least
             // one recognized command was rejected for lack of permission.
@@ -650,6 +723,34 @@ jobs:
                 }
                 continue;
               }
+              // Same gate as /ready and /request-review: the PR author or a
+              // committer. Exempting a PR from the stale bot is reversible and
+              // visible as a label, so it does not need the wider /author gate.
+              if (!sawPin && /^\/pin(?:\s|$)/.test(line)) {
+                sawPin = true;
+                if (!(isCommitter || isPrAuthor)) {
+                  core.info(`/pin: ignored, ${commentAuthor} lacks permission`);
+                  denied = true;
+                } else if (await setPinned(true)) {
+                  core.info(`/pin: added ${LABEL_PINNED}`);
+                  applied = true;
+                } else {
+                  await reply('`/pin`: could not apply the `pinned` label.');
+                }
+                continue;
+              }
+              if (!sawUnpin && /^\/unpin(?:\s|$)/.test(line)) {
+                sawUnpin = true;
+                if (!(isCommitter || isPrAuthor)) {
+                  core.info(`/unpin: ignored, ${commentAuthor} lacks permission`);
+                  denied = true;
+                } else {
+                  await setPinned(false);
+                  core.info(`/unpin: removed ${LABEL_PINNED}`);
+                  applied = true;
+                }
+                continue;
+              }
             }
 
             if (reviewers.size > 0 || teamReviewers.size > 0) {
@@ -699,7 +800,8 @@ jobs:
               }
             }
 
-            if (!sawReassign && !sawReady && !sawAuthor && !reviewWantsAuthor) {
+            if (!sawReassign && !sawReady && !sawAuthor && !sawPin && !sawUnpin
+                && !reviewWantsAuthor) {
               core.info('no command matched');
             }
 

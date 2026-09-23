@@ -50,6 +50,7 @@ export const REQUEST_OFFSET = {
 export const REPLY_OFFSET = {
   size: 48,
   command: 60,
+  commit: 184,
   operation: 208,
   status: 216
 } as const;
@@ -113,8 +114,10 @@ const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
 
 /**
  * Encodes a 256-byte request header. Only the six fields the server reads
- * are written; the checksums stay zero, matching the Rust SDK's contract
- * with the VSR server.
+ * are written. The checksums stay zero: the frame and body checksums are not
+ * read on the client request path, and `request_checksum` treats zero as
+ * unstamped, which opts out of the server's payload comparison. Stamping it is
+ * optional -- the Rust SDK does for deduped ops, this SDK does not yet.
  */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   const header = Buffer.alloc(HEADER_SIZE);

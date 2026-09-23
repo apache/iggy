@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { uuidv4 } from 'uuidv7';
+import { randomFillSync } from 'node:crypto';
 import { uint32ToBuf, u128ToBuf, uint8ToBuf } from '../number.utils.js';
 import { serializeHeaders, type Headers } from './header.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
@@ -31,6 +31,9 @@ import {
 
 /** Size of the message ID in bytes (u128) */
 const MESSAGE_ID_SIZE = 16;
+
+/** Exclusive upper bound for a numeric message ID: it must be < 2^128 */
+const MESSAGE_ID_UPPER_BOUND = 1n << BigInt((MESSAGE_ID_SIZE * 8));
 
 /** Largest representable frame timestamp delta (u32, microseconds) */
 const MAX_TIMESTAMP_DELTA = 0xFFFF_FFFFn;
@@ -99,6 +102,8 @@ export const serializeMessageId = (id?: unknown) => {
       throw new Error(`invalid message id: '${id}' (numeric id must be >= 0)`)
 
     const idValue = 'number' === typeof id ? BigInt(id) : id;
+    if (idValue >= MESSAGE_ID_UPPER_BOUND)
+      throw new Error(`invalid message id: '${id}' (numeric id must be < 2^${MESSAGE_ID_SIZE * 8})`)
     return u128ToBuf(idValue);
   }
 
@@ -114,17 +119,44 @@ export const serializeMessageId = (id?: unknown) => {
 
 }
 
+/** Number of ids drawn from the pool per CSPRNG refill */
+const ID_POOL_COUNT = 4096;
+
+/** Pooled random bytes and a cursor into them, filled lazily on first mint */
+const idPool = Buffer.allocUnsafe(ID_POOL_COUNT * MESSAGE_ID_SIZE);
+let idPoolCursor = idPool.length; // past the end -> refill on first use
+
 /**
- * Serializes a message ID, minting a random UUID when the ID is
- * absent or zero.
+ * Mints a random 16-byte message ID from the pool, refilling when drained.
+ *
+ * @returns 16-byte buffer of random bytes owned by the caller
+ */
+export const mintMessageId = (): Buffer => {
+  if (idPoolCursor + MESSAGE_ID_SIZE > idPool.length) {
+    randomFillSync(idPool);
+    idPoolCursor = 0;
+  }
+  const id = Buffer.allocUnsafe(MESSAGE_ID_SIZE);
+  idPool.copy(id, 0, idPoolCursor, idPoolCursor + MESSAGE_ID_SIZE);
+  idPoolCursor += MESSAGE_ID_SIZE;
+  return id;
+};
+
+/**
+ * Resolves a message ID to a 16-byte little-endian buffer, minting a random
+ * one when the ID is absent or zero.
  *
  * @param id - Optional message ID
  * @returns 16-byte little-endian buffer containing a non-zero ID
  */
-const resolveMessageId = (id?: MessageIdKind): Buffer => {
+export const resolveMessageId = (id?: MessageIdKind): Buffer => {
+  // An absent or zero id mints a random one.
+  if (id === undefined || id === 0 || id === 0n)
+    return mintMessageId();
   const bId = serializeMessageId(id);
-  return bId.every((byte) => byte === 0)
-    ? u128ToBuf(BigInt(`0x${uuidv4().replaceAll('-', '')}`))
+  // A string id can still be the all-zero nil UUID; mint in that case too.
+  return 'string' === typeof id && bId.every((byte) => byte === 0)
+    ? mintMessageId()
     : bId;
 };
 

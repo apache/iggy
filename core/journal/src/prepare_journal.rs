@@ -243,12 +243,7 @@ async fn truncate_or_fail(
         reason,
         "truncating torn WAL tail; no complete entry follows the damage"
     );
-    storage.truncate(pos).await?;
-    // The repair must be crash-durable. `FileStorage::truncate` is a
-    // bare `set_len`; without this fsync a power loss right after the
-    // repair re-presents the torn tail on the next boot. Mirrors the
-    // write-then-fsync the `append` path already does.
-    storage.fsync().await?;
+    storage.truncate(pos)?;
     Ok(())
 }
 
@@ -575,8 +570,25 @@ impl PrepareJournal {
 
             let slot = slot_for_op(header.op, slot_count);
 
-            // Note: Regarding duplicate op in WAL. We rewrite it with whichever
-            // is the latest entry.
+            // Match append's collision fence while rebuilding the index. Reopening
+            // with fewer configured slots can otherwise hide an unsnapshotted op
+            // even though its bytes remain in the WAL. A duplicate op deliberately
+            // keeps the latest entry, and a snapshotted op is safe to evict.
+            if let Some(existing) = headers[slot]
+                && existing.op != header.op
+                && existing.op > snapshot_op
+            {
+                return Err(JournalError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal slot collision while rebuilding the index: op {} and \
+                         unsnapshotted op {} map to slot {slot} with slot_count={slot_count} \
+                         (snapshot_op={snapshot_op}); restore the previous \
+                         metadata.journal_slots value or checkpoint before shrinking it",
+                        header.op, existing.op,
+                    ),
+                )));
+            }
             headers[slot] = Some(header);
             offsets[slot] = Some(pos);
 
@@ -1445,6 +1457,46 @@ mod tests {
     }
 
     #[compio::test]
+    async fn scan_refuses_boot_on_interior_parent_chain_break() {
+        // The shape a repair frontier rewind leaves behind: every entry is
+        // complete and individually well sealed, op 3 parents to op 1 instead
+        // of op 2, and a valid chain continues from op 3. Complete entries
+        // after the break can be quorum committed, so boot must refuse rather
+        // than truncate them away as a torn tail.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let op_1 = make_identity_sealed_prepare(1, BODY, 0);
+            let checksum_1 = op_1.header().checksum;
+            journal.append(op_1.deep_copy()).await.unwrap();
+            let op_2 = make_identity_sealed_prepare(2, BODY, checksum_1);
+            journal.append(op_2.deep_copy()).await.unwrap();
+            let op_3 = make_identity_sealed_prepare(3, BODY, checksum_1);
+            let checksum_3 = op_3.header().checksum;
+            journal.append(op_3.deep_copy()).await.unwrap();
+            let op_4 = make_identity_sealed_prepare(4, BODY, checksum_3);
+            journal.append(op_4.deep_copy()).await.unwrap();
+        }
+        let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+        let error = PrepareJournal::open(&path, 0).await.unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("interior WAL corruption") && message.contains("does not chain"),
+            "a rewound parent with a complete suffix following must refuse \
+             boot rather than truncate, got: {message}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            bytes_before,
+            "the refusal must leave the WAL bytes untouched"
+        );
+    }
+
+    #[compio::test]
     async fn scan_skips_verification_for_unsealed_entries() {
         // A WAL from a pre-sealing build must still open: `checksum` reads as the
         // unsealed sentinel, so neither the identity nor the chain is checked.
@@ -1745,8 +1797,7 @@ mod tests {
             let storage = FileStorage::open(&path).await.unwrap();
             let full_len = storage.file_len();
             // Remove the last 10 bytes (partial second entry)
-            storage.truncate(full_len - 10).await.unwrap();
-            storage.fsync().await.unwrap();
+            storage.truncate(full_len - 10).unwrap();
         }
 
         // Reopen, should recover only the first entry
@@ -2057,6 +2108,70 @@ mod tests {
         drop(journal);
         let journal = PrepareJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
+    async fn reopen_with_fewer_slots_rejects_unsnapshotted_collision_without_changing_wal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+        let wal_before = std::fs::read(&path).unwrap();
+
+        let error = PrepareJournal::open_with_slots(&path, 0, 2)
+            .await
+            .expect_err("shrinking the index must not hide an unsnapshotted entry");
+
+        assert!(
+            error.to_string().contains("journal slot collision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            wal_before,
+            "a refused scan must leave the WAL intact"
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_keeps_latest_duplicate_op() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.set_snapshot_op(1);
+        journal.append(make_prepare(1, 64)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 0, 2).await.unwrap();
+        let header = *journal.header(1).expect("duplicate op must remain indexed");
+        assert_eq!(header.size as usize, HEADER_SIZE + 64);
+        assert_eq!(
+            journal
+                .entry_at(&header)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice()
+                .len(),
+            HEADER_SIZE + 64
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_with_fewer_slots_can_evict_snapshotted_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 1, 2).await.unwrap();
+        assert!(journal.header(1).is_none());
+        assert_eq!(journal.header(3).map(|header| header.op), Some(3));
     }
 
     const POISON_REASON: &str = "test: simulated post-rename failure";

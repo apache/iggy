@@ -26,7 +26,7 @@ use common::{
     install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
 };
 use message_bus::IggyMessageBus;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use std::rc::Rc;
 use std::time::Duration;
@@ -64,9 +64,16 @@ async fn lower_id_dials_higher_id_accepts() {
     let peers = vec![(0u8, addr0), (1u8, addr1)];
 
     let dial_0 = install_dialed_replicas_locally(bus0.clone(), on_message.clone());
-    start_connector(&bus0, 0, peers.clone(), dial_0, DEFAULT_RECONNECT_PERIOD).await;
+    start_connector(
+        &bus0,
+        0,
+        peers.clone(),
+        dial_0,
+        bus0.config().reconnect_period,
+    )
+    .await;
     let dial_1 = install_dialed_replicas_locally(bus1.clone(), on_message.clone());
-    start_connector(&bus1, 1, peers, dial_1, DEFAULT_RECONNECT_PERIOD).await;
+    start_connector(&bus1, 1, peers, dial_1, bus1.config().reconnect_period).await;
 
     // Wait for the directional connection to settle.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

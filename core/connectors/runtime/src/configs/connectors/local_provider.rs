@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::configs::connectors::{
-    ConnectorConfig, ConnectorConfigVersionInfo, ConnectorConfigVersions, ConnectorsConfig,
-    ConnectorsConfigProvider, CreateSinkConfig, CreateSourceConfig, SinkConfig, SourceConfig,
+    ConnectorConfig, ConnectorConfigVersionInfo, ConnectorConfigVersions, ConnectorKey,
+    ConnectorsConfig, ConnectorsConfigProvider, CreateSinkConfig, CreateSourceConfig, SinkConfig,
+    SourceConfig,
 };
 use crate::error::RuntimeError;
 use ::configs::{ConfigProvider, FileConfigProvider, TypedEnvProvider};
@@ -30,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info, warn};
+
+const PLUGIN_CONFIG_FORMAT_ENV_SUFFIX: &str = "FORMAT";
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct ConnectorId {
@@ -354,6 +357,10 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
             }
 
             let field_path = &env_key_upper[prefix.len()..];
+            // ConfigEnv handles plugin_config_format on the connector itself.
+            if field_path == PLUGIN_CONFIG_FORMAT_ENV_SUFFIX {
+                continue;
+            }
             let field_name = field_path.to_lowercase();
             let parsed_value = ::configs::parse_env_value_to_json(&env_value);
 
@@ -392,18 +399,18 @@ impl BaseConnectorConfig {
 impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
     async fn create_sink_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         cmd: CreateSinkConfig,
     ) -> Result<SinkConfig, RuntimeError> {
         let sinks = self.state.connectors_config.sinks();
         let next_version = sinks
             .iter()
-            .filter(|entry| entry.key().key == key)
+            .filter(|entry| entry.key().key == key.as_str())
             .max_by_key(|entry| entry.config.version)
             .map(|entry| entry.config.version + 1)
             .unwrap_or(0);
 
-        let config = cmd.to_sink_config(key, next_version);
+        let config = cmd.into_sink_config(key, next_version);
         let connector_config = ConnectorConfig::Sink(config.clone());
         let connector_id: ConnectorId = (&connector_config).into();
 
@@ -418,7 +425,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
             SinkConfigFile {
                 config: config.clone(),
                 created_at: Utc::now(),
-                path: path.clone(),
+                path,
             },
         );
 
@@ -427,18 +434,18 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
 
     async fn create_source_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         cmd: CreateSourceConfig,
     ) -> Result<SourceConfig, RuntimeError> {
         let sources = &self.state.connectors_config.sources;
         let next_version = sources
             .iter()
-            .filter(|entry| entry.key().key == key)
+            .filter(|entry| entry.key().key == key.as_str())
             .max_by_key(|entry| entry.config.version)
             .map(|entry| entry.config.version + 1)
             .unwrap_or(0);
 
-        let config = cmd.to_source_config(key, next_version);
+        let config = cmd.into_source_config(key, next_version);
         let connector_config = ConnectorConfig::Source(config.clone());
         let connector_id: ConnectorId = (&connector_config).into();
 
@@ -453,7 +460,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
             SourceConfigFile {
                 config: config.clone(),
                 created_at: Utc::now(),
-                path: path.clone(),
+                path,
             },
         );
 
@@ -849,5 +856,162 @@ impl Provider for ConnectorEnvProvider {
                 .deserialize_with_runtime_prefix()
                 .map_err(|e| figment::Error::from(format!("Failed to deserialize env vars: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::configs::connectors::ConfigFormat;
+
+    #[tokio::test]
+    async fn given_valid_key_when_creating_source_config_should_write_prefixed_file() {
+        let dir = TempDir::new().unwrap();
+        let provider = LocalConnectorsConfigProvider::new(dir.path().to_str().unwrap())
+            .init()
+            .await
+            .unwrap();
+        let key: ConnectorKey = "random".parse().unwrap();
+
+        let config = provider
+            .create_source_config(&key, CreateSourceConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(config.key, "random");
+        assert_eq!(config.version, 0);
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["source_random_0.toml"]);
+    }
+
+    #[test]
+    fn given_runtime_format_env_when_loading_configs_should_preserve_plugin_overrides() {
+        const CHILD_PROCESS_ENV: &str = "IGGY_CONNECTORS_FORMAT_OVERRIDE_TEST";
+        const CONNECTOR_KEY: &str = "format_override_test";
+        const FORMAT_ONLY_KEY: &str = "format_only_test";
+
+        if std::env::var_os(CHILD_PROCESS_ENV).is_none() {
+            // Environment overrides stay in a child process to avoid racing other tests.
+            let mut command = Command::new(
+                std::env::current_exe().expect("Test binary path should be available"),
+            );
+            command
+                .arg("--exact")
+                .arg(
+                    std::thread::current()
+                        .name()
+                        .expect("Test thread should have a name"),
+                )
+                .env_clear()
+                .env(CHILD_PROCESS_ENV, "1");
+            for connector_type in ["SINK", "SOURCE"] {
+                let prefix = format!(
+                    "IGGY_CONNECTORS_{connector_type}_{}_PLUGIN_CONFIG_",
+                    CONNECTOR_KEY.to_uppercase()
+                );
+                command
+                    .env(format!("{prefix}FORMAT"), "yaml")
+                    .env(format!("{prefix}URL"), "http://overridden.test")
+                    .env(format!("{prefix}FORMAT_OPTIONS"), r#"["compact","json"]"#)
+                    .env(
+                        format!(
+                            "IGGY_CONNECTORS_{connector_type}_{}_PLUGIN_CONFIG_FORMAT",
+                            FORMAT_ONLY_KEY.to_uppercase()
+                        ),
+                        "yaml",
+                    );
+            }
+            let output = command.output().expect("Config override test should run");
+            assert!(
+                output.status.success(),
+                "Config override test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = TempDir::new().expect("Config directory should be created");
+        for connector_type in ["sink", "source"] {
+            for key in [CONNECTOR_KEY, FORMAT_ONLY_KEY] {
+                let mut config = format!(
+                    r#"
+type = "{connector_type}"
+key = "{key}"
+enabled = true
+version = 0
+name = "format override test"
+path = "unused"
+streams = []
+plugin_config_format = "json"
+"#
+                );
+                if key == CONNECTOR_KEY {
+                    config.push_str(
+                        r#"
+[plugin_config]
+url = "http://original.test"
+format_options = ["original"]
+[plugin_config.headers]
+content_type = "application/json"
+"#,
+                    );
+                }
+                std::fs::write(
+                    dir.path().join(format!("{connector_type}_{key}.toml")),
+                    config,
+                )
+                .expect("Connector config should be written");
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("Test runtime should be created");
+        runtime.block_on(async {
+            let provider = LocalConnectorsConfigProvider::new(
+                dir.path()
+                    .to_str()
+                    .expect("Config directory should be UTF-8"),
+            )
+            .init()
+            .await
+            .expect("Connector configs should load");
+
+            for key in [CONNECTOR_KEY, FORMAT_ONLY_KEY] {
+                let sink = provider
+                    .get_sink_config(key, None)
+                    .await
+                    .expect("Sink config should be available")
+                    .expect("Sink config should exist");
+                let source = provider
+                    .get_source_config(key, None)
+                    .await
+                    .expect("Source config should be available")
+                    .expect("Source config should exist");
+                let expected_plugin_config = (key == CONNECTOR_KEY).then(|| {
+                    serde_json::json!({
+                        "url": "http://overridden.test",
+                        "headers": {"content_type": "application/json"},
+                        "format_options": ["compact", "json"]
+                    })
+                });
+                for (connector_type, format, plugin_config) in [
+                    ("sink", sink.plugin_config_format, sink.plugin_config),
+                    ("source", source.plugin_config_format, source.plugin_config),
+                ] {
+                    assert_eq!(format, Some(ConfigFormat::Yaml), "{connector_type} {key}");
+                    assert_eq!(
+                        plugin_config, expected_plugin_config,
+                        "{connector_type} {key}"
+                    );
+                }
+            }
+        });
     }
 }

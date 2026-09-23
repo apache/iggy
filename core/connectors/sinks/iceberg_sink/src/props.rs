@@ -30,6 +30,10 @@ fn get_props_s3(config: &IcebergSinkConfig) -> Result<HashMap<String, String>, E
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("s3.region".to_string(), config.store_region.clone());
     props.insert("s3.endpoint".to_string(), config.store_url.clone());
+    props.insert(
+        "s3.path-style-access".to_string(),
+        config.store_path_style_access.to_string(),
+    );
     match (&config.store_access_key_id, &config.store_secret_access_key) {
         (Some(access_key_id), Some(secret_access_key)) => {
             props.insert("s3.access-key-id".to_string(), access_key_id.clone());
@@ -64,6 +68,7 @@ mod tests {
             store_secret_access_key: None,
             store_region: "us-east-1".to_string(),
             store_class: IcebergSinkStoreClass::S3,
+            store_path_style_access: true,
         }
     }
 
@@ -73,8 +78,19 @@ mod tests {
         let props = get_props_s3(&config).expect("Should succeed without credentials");
         assert_eq!(props.get("s3.region").unwrap(), "us-east-1");
         assert_eq!(props.get("s3.endpoint").unwrap(), "http://localhost:9000");
+        assert_eq!(props.get("s3.path-style-access").unwrap(), "true");
         assert!(!props.contains_key("s3.access-key-id"));
         assert!(!props.contains_key("s3.secret-access-key"));
+    }
+
+    #[test]
+    fn test_get_props_s3_path_style_disabled() {
+        let config = IcebergSinkConfig {
+            store_path_style_access: false,
+            ..base_config()
+        };
+        let props = get_props_s3(&config).expect("Should succeed with virtual-host addressing");
+        assert_eq!(props.get("s3.path-style-access").unwrap(), "false");
     }
 
     #[test]

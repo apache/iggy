@@ -144,5 +144,5 @@ public sealed class StreamPermissions
     /// <summary>
     ///     Permissions for topics in the stream.
     /// </summary>
-    public Dictionary<int, TopicPermissions>? Topics { get; init; }
+    public Dictionary<uint, TopicPermissions>? Topics { get; init; }
 }

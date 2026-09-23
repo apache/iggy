@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig, validate_server_address};
+use crate::{
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, WebSocketClientConfig,
+    validate_server_address,
+};
 
 /// Builder for the WebSocket client configuration.
 /// Allows configuring the WebSocket client with custom settings or using defaults:
@@ -58,7 +61,7 @@ impl WebSocketClientConfigBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(mut self, interval: NonZeroIggyDuration) -> Self {
         self.config.reconnection.interval = interval;
         self
     }
@@ -70,7 +73,7 @@ impl WebSocketClientConfigBuilder {
     }
 
     /// Sets the heartbeat interval.
-    pub fn with_heartbeat_interval(mut self, heartbeat_interval: IggyDuration) -> Self {
+    pub fn with_heartbeat_interval(mut self, heartbeat_interval: NonZeroIggyDuration) -> Self {
         self.config.heartbeat_interval = heartbeat_interval;
         self
     }

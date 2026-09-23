@@ -21,12 +21,13 @@ set -euo pipefail
 echo "PHP SDK Test Runner"
 echo "==================="
 
-IGGY_HOST="${IGGY_HOST:-127.0.0.1}"
-IGGY_PORT="${IGGY_PORT:-8090}"
+IGGY_TCP_ADDRESS="${IGGY_TCP_ADDRESS:-127.0.0.1:8090}"
+host="${IGGY_TCP_ADDRESS%%:*}"
+port="${IGGY_TCP_ADDRESS##*:}"
 
-echo "Waiting for Iggy server at ${IGGY_HOST}:${IGGY_PORT}..."
+echo "Waiting for Iggy server at ${host}:${port}..."
 timeout 60 bash -c "
-    until timeout 5 bash -c '</dev/tcp/${IGGY_HOST}/${IGGY_PORT}'; do
+    until timeout 5 bash -c '</dev/tcp/${host}/${port}'; do
         echo '   Server not ready, waiting...'
         sleep 2
     done

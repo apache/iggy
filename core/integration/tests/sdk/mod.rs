@@ -18,6 +18,8 @@
 mod consumer_group;
 mod consumer_group_membership;
 mod consumer_offset;
+mod consumer_shutdown;
+mod disconnect_relogin;
 mod hello_world;
 mod http_refresh;
 mod options;

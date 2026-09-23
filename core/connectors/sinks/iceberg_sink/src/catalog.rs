@@ -48,7 +48,6 @@ async fn get_rest_catalog(
 
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> = match &config.store_class {
         IcebergSinkStoreClass::S3 => Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }),
         other => {

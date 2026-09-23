@@ -19,16 +19,20 @@ use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::node::NodeConfig;
 use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
+use super::sharding::ShardingConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
-use crate::common::system::SystemConfig;
+use crate::common::system::{
+    EncryptionConfig, INDEX_EXTENSION, LOG_EXTENSION, LoggingConfig, RuntimeConfig,
+};
 use configs::{
     ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
-    TypedEnvProvider,
+    RelocatedTarget, TypedEnvProvider,
 };
 use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
@@ -36,14 +40,34 @@ use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
+use server_common::bootstrap::SystemPaths;
 use std::env;
-use std::sync::Arc;
 
 pub use crate::common::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
     MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
+
+pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_ENV_PATH",
+    "IGGY_DISPLAY_CONFIG",
+    "IGGY_ROOT_USERNAME",
+    "IGGY_ROOT_PASSWORD",
+    "IGGY_TEST_VERBOSE",
+    "IGGY_TEST_CLUSTER_NODES",
+    "IGGY_TEST_CLEANUP_DISABLED",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+    "IGGY_SHARD_EVENT_INTERVAL",
+    "IGGY_CI_BUILD",
+    "IGGY_HOME",
+    "IGGY_USERNAME",
+    "IGGY_PASSWORD",
+];
+
+pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
+    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
@@ -55,50 +79,63 @@ const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 /// enough. The partition knobs matter most: they are create-only options now,
 /// so a topic that boots without one can never be given it afterwards.
 const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
+    // Refuse obsolete layout overrides instead of silently reading another directory.
     RelocatedKey {
-        path: "system.topic.max_size",
-        replacement: Some("max_topic_size"),
+        path: "partition.path",
+        replacement: RelocatedTarget::Removed,
     },
     RelocatedKey {
-        path: "system.topic.message_expiry",
-        replacement: Some("message_expiry"),
+        path: "system.path",
+        replacement: RelocatedTarget::MovedTo("path"),
     },
     RelocatedKey {
-        path: "system.partition.enforce_fsync",
-        replacement: Some("enforce_fsync"),
+        path: "system.runtime",
+        replacement: RelocatedTarget::MovedTo("runtime"),
     },
     RelocatedKey {
-        path: "system.partition.messages_required_to_save",
-        replacement: Some("messages_required_to_save"),
+        path: "system.logging",
+        replacement: RelocatedTarget::MovedTo("logging"),
     },
     RelocatedKey {
-        path: "system.partition.size_of_messages_required_to_save",
-        replacement: Some("size_of_messages_required_to_save"),
+        path: "system.encryption",
+        replacement: RelocatedTarget::MovedTo("encryption"),
     },
     RelocatedKey {
-        path: "system.segment.size",
-        replacement: Some("segment_size"),
+        path: "system.partition",
+        replacement: RelocatedTarget::MovedTo("partition"),
     },
     RelocatedKey {
-        path: "system.segment.preallocate",
-        replacement: Some("preallocate_segments"),
+        path: "system.sharding",
+        replacement: RelocatedTarget::MovedTo("sharding"),
     },
     RelocatedKey {
-        path: "system.message_deduplication",
-        replacement: None,
+        path: "system.memory_pool",
+        replacement: RelocatedTarget::MovedTo("memory_pool"),
+    },
+    RelocatedKey {
+        path: "stream",
+        replacement: RelocatedTarget::Removed,
+    },
+    RelocatedKey {
+        path: "topic",
+        replacement: RelocatedTarget::Removed,
+    },
+    // Reject the removed table and every former environment mapping beneath it.
+    RelocatedKey {
+        path: "system",
+        replacement: RelocatedTarget::Removed,
+    },
+    RelocatedKey {
+        path: "partition.consumer_offset_enforce_fsync",
+        replacement: RelocatedTarget::TopicOption("consumer_offset_durability"),
     },
     // The whole table, not just its leaves. Caps are compile-time constants
     // enforced at admission, so a per-node value could only diverge from them.
     RelocatedKey {
         path: "extra",
-        replacement: None,
+        replacement: RelocatedTarget::Removed,
     },
 ];
-
-/// [`SystemConfig`] bound to this crate's own
-/// [`super::sharding::ShardingConfig`]. `core/server` names this alias
-/// wherever it refers to the system config.
-pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
 
 /// Top-level on-disk config schema for the `iggy-server` binary.
 ///
@@ -107,13 +144,21 @@ pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
 /// by `super`.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[config_env(prefix = "IGGY_", name = "iggy-server-config")]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
     #[serde(default)]
+    pub node: NodeConfig,
+    #[serde(default)]
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
-    pub system: Arc<ServerSystemConfig>,
+    pub path: String,
+    pub runtime: RuntimeConfig,
+    pub logging: LoggingConfig,
+    pub encryption: EncryptionConfig,
+    pub memory_pool: MemoryPoolConfig,
+    pub sharding: ShardingConfig,
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
@@ -125,7 +170,58 @@ pub struct ServerConfig {
     pub message_bus: MessageBusConfig,
 }
 
+/// One client-facing listener, as the client-facing address derivation and
+/// boot validation see it: the config key naming its bind address, that
+/// address as written, and whether the listener is switched on.
+pub struct ClientListener<'a> {
+    pub key: &'static str,
+    pub address: &'a str,
+    pub enabled: bool,
+}
+
 impl ServerConfig {
+    /// The client-facing listeners, in the order the derived client-facing
+    /// address prefers them. TCP leads: it is the binary protocol every SDK
+    /// speaks, so it is the listener an address derived for clients should
+    /// describe whenever it is running.
+    #[must_use]
+    pub fn client_listeners(&self) -> [ClientListener<'_>; 4] {
+        [
+            ClientListener {
+                key: "tcp.address",
+                address: &self.tcp.address,
+                enabled: self.tcp.enabled,
+            },
+            ClientListener {
+                key: "websocket.address",
+                address: &self.websocket.address,
+                enabled: self.websocket.enabled,
+            },
+            ClientListener {
+                key: "quic.address",
+                address: &self.quic.address,
+                enabled: self.quic.enabled,
+            },
+            ClientListener {
+                key: "http.address",
+                address: &self.http.address,
+                enabled: self.http.enabled,
+            },
+        ]
+    }
+
+    /// The listener whose bind address cluster metadata derives this node's
+    /// client-facing address from when `node.advertised_address` is unset:
+    /// the first enabled one. `None` when every client-facing listener is
+    /// off, which leaves no address for a client to dial and nothing to
+    /// publish.
+    #[must_use]
+    pub fn derived_address_listener(&self) -> Option<ClientListener<'_>> {
+        self.client_listeners()
+            .into_iter()
+            .find(|listener| listener.enabled)
+    }
+
     /// Load server configuration from file and environment variables.
     ///
     /// The path comes from `IGGY_CONFIG_PATH` or defaults to
@@ -165,6 +261,13 @@ impl ServerConfig {
             Some(default_config),
         )
         .with_relocated_keys(ServerConfig::ENV_PREFIX, RELOCATED_CONFIG_KEYS)
+        .with_known_env_names(
+            Self::all_env_var_names()
+                .into_iter()
+                .chain(SERVER_PROCESS_ENV_VARS.iter().copied())
+                .collect(),
+        )
+        .with_allowed_env_prefixes(SERVER_ALLOWED_ENV_PREFIXES)
     }
 
     /// All recognised env var names for [`ServerConfig`].
@@ -185,7 +288,10 @@ pub struct ServerConfigEnvProvider {
 impl Default for ServerConfigEnvProvider {
     fn default() -> Self {
         Self {
-            provider: TypedEnvProvider::from_config(ServerConfig::ENV_PREFIX),
+            // `ServerConfig::config_provider` checks every `IGGY_` name before
+            // this provider runs.
+            provider: TypedEnvProvider::from_config(ServerConfig::ENV_PREFIX)
+                .without_unknown_env_var_check(),
         }
     }
 }
@@ -201,6 +307,158 @@ impl Provider for ServerConfigEnvProvider {
                 "Cannot deserialize environment variables for server config: {e}"
             ))
         })
+    }
+}
+
+impl ServerConfig {
+    pub fn get_system_path(&self) -> String {
+        self.path.to_string()
+    }
+
+    pub fn get_state_path(&self) -> String {
+        format!("{}/state", self.get_system_path())
+    }
+
+    pub fn get_state_messages_file_path(&self) -> String {
+        format!("{}/log", self.get_state_path())
+    }
+
+    pub fn get_state_info_path(&self) -> String {
+        format!("{}/info", self.get_state_path())
+    }
+    pub fn get_state_tokens_path(&self) -> String {
+        format!("{}/tokens", self.get_state_path())
+    }
+
+    pub fn get_runtime_path(&self) -> String {
+        format!("{}/{}", self.get_system_path(), self.runtime.path)
+    }
+
+    pub fn get_streams_path(&self) -> String {
+        format!("{}/streams", self.get_system_path())
+    }
+
+    pub fn get_stream_path(&self, stream_id: usize) -> String {
+        format!("{}/{}", self.get_streams_path(), stream_id)
+    }
+
+    pub fn get_topics_path(&self, stream_id: usize) -> String {
+        format!("{}/topics", self.get_stream_path(stream_id))
+    }
+
+    pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {
+        format!("{}/{}", self.get_topics_path(stream_id), topic_id)
+    }
+
+    pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
+        format!("{}/partitions", self.get_topic_path(stream_id, topic_id))
+    }
+
+    pub fn get_partition_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{}",
+            self.get_partitions_path(stream_id, topic_id),
+            partition_id
+        )
+    }
+
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/offsets",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    pub fn get_consumer_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/consumers",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    pub fn get_consumer_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/groups",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    pub fn get_segment_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        format!(
+            "{}/{:0>20}",
+            self.get_partition_path(stream_id, topic_id, partition_id),
+            start_offset
+        )
+    }
+
+    pub fn get_messages_file_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{LOG_EXTENSION}")
+    }
+
+    pub fn get_index_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{INDEX_EXTENSION}")
+    }
+}
+
+impl SystemPaths for ServerConfig {
+    fn get_system_path(&self) -> String {
+        ServerConfig::get_system_path(self)
+    }
+
+    fn get_state_path(&self) -> String {
+        ServerConfig::get_state_path(self)
+    }
+
+    fn get_state_messages_file_path(&self) -> String {
+        ServerConfig::get_state_messages_file_path(self)
+    }
+
+    fn get_streams_path(&self) -> String {
+        ServerConfig::get_streams_path(self)
+    }
+
+    fn get_runtime_path(&self) -> String {
+        ServerConfig::get_runtime_path(self)
     }
 }
 
@@ -224,7 +482,7 @@ mod tests {
 
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
-        assert_eq!(cfg.message_bus.peer_queue_capacity, 256);
+        assert_eq!(cfg.message_bus.peer_queue_capacity, 4096);
     }
 
     #[test]
@@ -239,11 +497,52 @@ mod tests {
     }
 
     #[test]
+    fn data_root_uses_fixed_stream_topic_and_partition_directories() {
+        let config = ServerConfig {
+            path: "/var/lib/iggy".to_owned(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            config.get_partition_path(1, 2, 3),
+            "/var/lib/iggy/streams/1/topics/2/partitions/3"
+        );
+        assert!(!ServerConfig::all_env_var_names().contains(&"IGGY_PARTITION_PATH"));
+    }
+
+    #[test]
     fn all_env_var_names_include_message_bus_section() {
         let names = ServerConfig::all_env_var_names();
         assert!(
             names.iter().any(|n| n.starts_with("IGGY_MESSAGE_BUS_")),
             "expected at least one IGGY_MESSAGE_BUS_* env var, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_provider_accepts_server_process_env_vars() {
+        for name in SERVER_PROCESS_ENV_VARS {
+            // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+            // against any concurrent environment access. `serial_test::serial` on
+            // this test is what prevents that.
+            unsafe { env::set_var(name, "1") };
+        }
+
+        let data = ServerConfigEnvProvider::default().data();
+
+        for name in SERVER_PROCESS_ENV_VARS {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+
+        // The provider holds no scan of its own, so the typed provider's
+        // debug_assert! stays quiet. A panic above is one failure this test
+        // guards, and one of these names reaching the map is the other.
+        let data = data.expect("the server env provider must accept every process variable");
+        let profile = data.get(&Profile::default()).expect("no default profile");
+        assert!(
+            profile.is_empty(),
+            "none of these variables is a config value, so none of them may reach the map: {profile:?}"
         );
     }
 }

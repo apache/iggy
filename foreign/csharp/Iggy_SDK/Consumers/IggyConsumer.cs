@@ -18,6 +18,7 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
@@ -41,12 +42,18 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private const int GroupRejoinRetryDelayMs = 1_000;
 
+    /// <summary>
+    ///     Backoff after a group poll reported <see cref="PolledMessages.NoAssignedPartition" />. Without it a
+    ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
+    /// </summary>
+    private const int NoAssignedPartitionBackoffMs = 100;
+
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
-    private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new();
+    private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
     private readonly Channel<ReceivedRentedMessage> _rentedChannel;
@@ -122,12 +129,21 @@ public partial class IggyConsumer : IAsyncDisposable
             }
         }
 
-        if (_config.CreateIggyClient && _isInitialized)
+        if (_config.CreateIggyClient)
         {
             try
             {
-                await _client.LogoutUserAsync();
-                _client.Dispose();
+                try
+                {
+                    if (_isInitialized)
+                    {
+                        await _client.LogoutUserAsync();
+                    }
+                }
+                finally
+                {
+                    _client.Dispose();
+                }
             }
             catch (Exception e)
             {
@@ -224,8 +240,8 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="resetLastPolled">
-    ///     When true, also advances the cached last-polled offset for the partition so the next poll
-    ///     resumes past the stored offset.
+    ///     When true, changes the cached duplicate-filter offset for the partition.
+    ///     Does not change the polling strategy or clear buffered messages.
     /// </param>
     /// <param name="ct">Cancellation token</param>
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
@@ -235,13 +251,13 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (resetLastPolled)
         {
-            _lastPolledOffset[(int)partitionId] = offset;
+            _lastPolledOffset[partitionId] = offset;
         }
     }
 
     /// <summary>
     ///     Deletes the stored consumer offset for a specific partition.
-    ///     The next poll will start from the beginning or based on the polling strategy.
+    ///     The local duplicate filter, polling strategy, and buffered messages remain unchanged.
     /// </summary>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="ct">Cancellation token</param>
@@ -409,6 +425,12 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (messages.Messages.Count == 0)
             {
+                if (messages.PartitionId == PolledMessages.NoAssignedPartition)
+                {
+                    LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
+                    await Task.Delay(NoAssignedPartitionBackoffMs, ct);
+                }
+
                 return;
             }
 
@@ -428,7 +450,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     Message = message,
                     CurrentOffset = message.Header.Offset,
-                    PartitionId = (uint)messages.PartitionId,
+                    PartitionId = messages.PartitionId,
                     Status = MessageStatus.Success,
                     Error = null
                 };
@@ -444,19 +466,22 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
                         lastPolledPartitionOffset, messages.PartitionId);
-                    await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, false, ct);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, false, ct);
                 }
 
                 return;
             }
 
-            _lastPolledOffset.AddOrUpdate(messages.PartitionId, currentOffset,
-                (_, _) => currentOffset);
+            _lastPolledOffset[messages.PartitionId] = currentOffset;
 
             if (_config.PollingStrategy.Kind == MessagePolling.Offset)
             {
                 _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (MessageDecryptionException ex)
         {

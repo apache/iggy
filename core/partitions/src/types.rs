@@ -15,10 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::Operation;
 use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// A local commit that failed for an op the cluster had already committed.
+///
+/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// the op, its `commit_min` never advanced, and the next
+/// `advance_commit_min` would assert on the gap. Continuing would either
+/// serve a prefix the cluster has moved past or panic somewhere less
+/// legible, so the partition fences itself on this and the shard brings the
+/// server down through the ordinary shutdown path. Recorded rather than
+/// panicked because a panic on the pump task is swallowed by the runtime,
+/// which wedges every partition on the shard while the process reports
+/// healthy.
+#[derive(Debug, Clone)]
+pub struct FatalCommit {
+    pub namespace_raw: u64,
+    pub op: u64,
+    pub operation: Operation,
+}
 
 #[derive(Debug, Clone)]
 pub struct Fragment<const ALIGN: usize = 4096> {
@@ -55,6 +74,28 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
         } else {
             self.source.slice(self.start..self.end)
         }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.source[self.start..self.end]
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Whether this fragment refcounts `source`'s allocation (and thus keeps
+    /// all of it alive, not just the sliced window).
+    #[must_use]
+    pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
+        self.source.shares_allocation(source)
     }
 }
 
@@ -210,13 +251,51 @@ impl Default for PartitionOffsets {
 /// from the serving peer.
 pub const REPAIR_RETRY_TICKS: u32 = 100;
 
+/// Consecutive stalled re-requests tolerated before a repair session is
+/// abandoned and re-armed against a different peer.
+///
+/// A session pins its peer, and `repair.is_some()` fences the sweep's detector
+/// and every edge-triggered arming site while it stands, so a peer that went
+/// away (or never was reachable, which the gap-stopped-primary rotation can
+/// pick) would wedge the group harder than having no session at all. Three
+/// rounds is ~3s at the default retry interval: long enough that an ordinary
+/// dropped frame is re-requested rather than re-targeted, short enough that a
+/// dead peer costs one debounce interval, not a view change.
+pub const REPAIR_MAX_STALL_RETRIES: u32 = 3;
+
+/// Committed ops one journal-driven commit walk applies before returning to the
+/// pump.
+///
+/// `commit_journal`'s journal half returns the whole resident
+/// `(commit_min, commit_max]` run, and applying it reaches a segment flush per
+/// batch with no await the pump can interleave: after a rejoin that is the
+/// entire backlog in one call, with the consensus tick stopped behind it. Every
+/// caller is re-driven (the shard sweep's walk backstop is level-triggered and
+/// stays true until the group drains), so a truncated walk resumes on the next
+/// tick instead of losing anything.
+///
+/// Sized as a batch big enough that an ordinary group drains in one pass and
+/// small enough that a full one cannot hold the pump for the view-change
+/// escalation window.
+pub const COMMIT_WALK_OPS_MAX: usize = 64;
+
 /// One in-flight journal-repair stream for a partition group.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairSession {
-    /// Fences stale repair frames from an earlier attempt.
+    /// Fences range replies from an earlier attempt. Repair bodies carry the
+    /// stored prepare header instead, so [`Self::view`] and canonical suffix
+    /// checks fence their ingest.
     pub nonce: u128,
-    /// Last op the stream is expected to serve (the frontier at request time).
-    pub to_op: u64,
+    /// Consensus view in which this session was armed. A later view discards
+    /// the session before any delayed repair body can enter its journal.
+    pub view: u32,
+    /// Committed frontier this repair must make locally walkable. Floor
+    /// completeness and session completion are bounded here.
+    pub commit_to_op: u64,
+    /// Highest op requested from the peer. This may extend above
+    /// [`Self::commit_to_op`] only for the canonical suffix carried by the
+    /// adopted `StartView`.
+    pub fetch_to_op: u64,
     /// Commit floor learned from `RangeEvicted { retained_from }`:
     /// `retained_from - 1`. `None` until (unless) the serving peer reports a
     /// truncated prefix.
@@ -257,27 +336,21 @@ pub enum RepairConclusion {
 }
 
 /// Where partition directories live on disk, mirroring the server's
-/// `SystemConfig` path scheme so segment files created by the partition plane
+/// `ServerConfig` path scheme so segment files created by the partition plane
 /// land next to the ones the server bootstrap created.
 #[derive(Debug, Clone)]
 pub struct PartitionPathLayout {
-    /// `{system.path}/{stream.path}`: the directory holding per-stream dirs.
+    /// `{path}/streams`: the directory holding per-stream dirs.
     pub streams_root: String,
-    /// Directory name of the per-topic level (`topic.path`).
-    pub topics_dir: String,
-    /// Directory name of the per-partition level (`partition.path`).
-    pub partitions_dir: String,
 }
 
 /// Synthetic layout for tests and the simulator, where paths only key the
 /// sim storage and never touch a real filesystem. The server always wires
-/// the real layout from its `SystemConfig`.
+/// the real layout from its `ServerConfig`.
 impl Default for PartitionPathLayout {
     fn default() -> Self {
         Self {
             streams_root: "/tmp/iggy_stub/streams".to_string(),
-            topics_dir: "topics".to_string(),
-            partitions_dir: "partitions".to_string(),
         }
     }
 }
@@ -285,15 +358,14 @@ impl Default for PartitionPathLayout {
 /// Configuration for partition operations.
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
-/// `SegmentConfig` (`core/server/src/configs/system.rs`).
+/// the server partition configuration and resolved topic options.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PartitionsConfig {
     /// Flush journal to disk when it accumulates this many messages.
     pub messages_required_to_save: u32,
     /// Flush journal to disk when it accumulates this many bytes.
     pub size_of_messages_required_to_save: IggyByteSize,
-    /// Whether to enforce fsync after writes.
-    pub enforce_fsync: bool,
     /// Whether a disk poll verifies each batch's `batch_checksum` against the bytes
     /// it just read.
     ///
@@ -325,10 +397,8 @@ impl PartitionsConfig {
         partition_id: usize,
     ) -> String {
         format!(
-            "{}/{stream_id}/{}/{topic_id}/{}/{partition_id}",
+            "{}/{stream_id}/topics/{topic_id}/partitions/{partition_id}",
             self.path_layout.streams_root,
-            self.path_layout.topics_dir,
-            self.path_layout.partitions_dir,
         )
     }
 

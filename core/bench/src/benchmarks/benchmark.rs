@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use iggy::prelude::*;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -122,11 +123,18 @@ pub trait Benchmarkable: Send {
                 .max_topic_size()
                 .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
             let message_expiry = self.args().message_expiry();
-            let enforce_fsync = self.args().enforce_fsync();
+            let durability = self.args().durability();
+            let messages_required_to_save =
+                self.args().messages_required_to_save().map(NonZeroU32::get);
 
             info!(
-                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, enforce fsync: {}",
-                topic_name, stream_name, max_topic_size, message_expiry, enforce_fsync
+                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, durability: {}, messages required to save: {:?}",
+                topic_name,
+                stream_name,
+                max_topic_size,
+                message_expiry,
+                durability,
+                messages_required_to_save
             );
 
             client
@@ -139,7 +147,9 @@ pub trait Benchmarkable: Send {
                             .then_some(message_expiry),
                         max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
                             .then_some(max_topic_size),
-                        enforce_fsync: enforce_fsync.then_some(true),
+                        durability,
+                        consumer_offset_durability: self.args().consumer_offset_durability(),
+                        messages_required_to_save,
                         ..TopicCreateOptions::default()
                     },
                 )

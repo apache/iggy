@@ -17,7 +17,7 @@
 
 //! Predicted server-state mutations emitted by op modules on commit.
 //!
-//! Name-keyed throughout. Server-ng emits empty reply bodies, so the
+//! Name-keyed throughout. Server emits empty reply bodies, so the
 //! workload cannot recover server-assigned numeric ids; shadow lookups
 //! address entities by name (`WireIdentifier::named`). Id-keyed effects
 //! return once reply-body parsing lands.
