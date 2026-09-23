@@ -116,43 +116,51 @@ impl ProducerCore {
         let client = self.client.clone();
         let client = client.read().await;
         if client.get_stream(&stream_id).await?.is_none() {
+            let name = match stream_id.kind {
+                IdKind::String => stream_id.get_string_value()?,
+                IdKind::Numeric => {
+                    error!(
+                        "Stream: {stream_id} does not exist and cannot be created from a numeric identifier."
+                    );
+                    return Err(IggyError::StreamIdNotFound(Identifier::from_identifier(
+                        &stream_id,
+                    )));
+                }
+            };
+
             if !self.create_stream_if_not_exists {
                 error!("Stream does not exist and auto-creation is disabled.");
-                return Err(IggyError::StreamNameNotFound(self.stream_name.clone()));
+                return Err(IggyError::StreamNameNotFound(name));
             }
 
-            let (name, _id) = match stream_id.kind {
-                IdKind::Numeric => (
-                    self.stream_name.to_owned(),
-                    Some(self.stream_id.get_u32_value()?),
-                ),
-                IdKind::String => (self.stream_id.get_string_value()?, None),
-            };
             info!("Creating stream: {name}");
             client.create_stream(&name).await?;
         }
 
         if client.get_topic(&stream_id, &topic_id).await?.is_none() {
+            let name = match topic_id.kind {
+                IdKind::String => topic_id.get_string_value()?,
+                IdKind::Numeric => {
+                    error!(
+                        "Topic: {topic_id} does not exist and cannot be created from a numeric identifier."
+                    );
+                    return Err(IggyError::TopicIdNotFound(
+                        Identifier::from_identifier(&topic_id),
+                        Identifier::from_identifier(&stream_id),
+                    ));
+                }
+            };
+
             if !self.create_topic_if_not_exists {
                 error!("Topic does not exist and auto-creation is disabled.");
-                return Err(IggyError::TopicNameNotFound(
-                    self.topic_name.clone(),
-                    self.stream_name.clone(),
-                ));
+                return Err(IggyError::TopicNameNotFound(name, stream_id.to_string()));
             }
 
-            let (name, _id) = match self.topic_id.kind {
-                IdKind::Numeric => (
-                    self.topic_name.to_owned(),
-                    Some(self.topic_id.get_u32_value()?),
-                ),
-                IdKind::String => (self.topic_id.get_string_value()?, None),
-            };
-            info!("Creating topic: {name} for stream: {}", self.stream_name);
+            info!("Creating topic: {name} for stream: {stream_id}");
             client
                 .create_topic(
-                    &self.stream_id,
-                    &self.topic_name,
+                    &stream_id,
+                    &name,
                     &TopicCreateOptions {
                         partitions_count: Some(self.topic_partitions_count),
                         message_expiry: (self.topic_message_expiry != IggyExpiry::ServerDefault)

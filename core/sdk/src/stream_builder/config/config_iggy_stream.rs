@@ -75,9 +75,7 @@ impl IggyStreamConfig {
             producer_config,
         })
     }
-}
 
-impl IggyStreamConfig {
     pub fn consumer_config(&self) -> &IggyConsumerConfig {
         &self.consumer_config
     }
