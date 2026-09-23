@@ -724,7 +724,7 @@ impl IggyClient {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
             name.to_owned(),
-            Consumer::group(name.try_into()?),
+            Consumer::group(Identifier::named(name)?),
             Identifier::named(stream)?,
             Identifier::named(topic)?,
             None,

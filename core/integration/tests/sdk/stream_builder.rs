@@ -19,7 +19,7 @@ use iggy::prelude::*;
 use iggy::stream_builder::{IggyConsumerConfig, IggyStreamConsumer};
 use integration::iggy_harness;
 
-const STREAM_NAME: &str = "stream-builder-stream";
+const STREAM_NAME: &str = "123";
 const TOPIC_NAME: &str = "stream-builder-topic";
 const CONSUMER_NAME: &str = "stream-builder-consumer";
 

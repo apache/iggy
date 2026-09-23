@@ -174,6 +174,7 @@ impl IggyConsumerConfig {
         batch_length: u32,
         polling_interval: IggyDuration,
     ) -> Result<Self, IggyError> {
+        // Validate stream and topic names. Returns IggyError if names are not allowed.
         Identifier::named(stream)?;
         Identifier::named(topic)?;
 

@@ -131,6 +131,7 @@ impl IggyProducerConfig {
         batch_length: u32,
         linger_time: IggyDuration,
     ) -> Result<Self, IggyError> {
+        // Validate stream and topic names. Returns IggyError if names are not allowed.
         Identifier::named(stream)?;
         Identifier::named(topic)?;
 
