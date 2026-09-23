@@ -17,8 +17,8 @@
 
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
-    DeltaCorruptedLogFixture, DeltaFixture, DeltaS3Fixture, DeltaS3MissingSecretKeyFixture,
-    DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps, DeltaS3WrongCredentialsFixture,
+    DeltaCorruptedLogFixture, DeltaFixture, DeltaS3Fixture, DeltaS3NoBucketFixture,
+    DeltaS3NoTableFixture, DeltaS3WrongCredentialsFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -296,13 +296,12 @@ async fn delta_sink_handles_malformed_table_uri(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
+    server(connectors_runtime(
+        config_path = "tests/connectors/delta/missing_secret_key_sink.toml"
+    )),
     seed = seeds::connector_stream
 )]
-async fn delta_sink_handles_missing_secret_key_on_s3(
-    harness: &TestHarness,
-    _fixture: DeltaS3MissingSecretKeyFixture,
-) {
+async fn delta_sink_handles_missing_secret_key_on_s3(harness: &TestHarness) {
     let runtime = harness
         .connectors_runtime()
         .expect("connectors runtime handle should be available");

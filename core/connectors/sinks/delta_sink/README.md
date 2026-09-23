@@ -40,7 +40,7 @@ DeltaTable.create(
 print(f"Created table at {table_uri}")
 ```
 
-The configuration is usually wrtitten individually for every connector and consists of two parts: the runtime settings which are registering the sink and telling which streams should plug into it, and the plugin's settings themselves. Here's an example of a working configuration:
+The configuration is usually written individually for every connector and consists of two parts: the runtime settings which are registering the sink and telling which streams should plug into it, and the plugin's settings themselves. Here's an example of a working configuration:
 
   ```toml
   type = "sink"
@@ -73,15 +73,16 @@ The configuration is usually wrtitten individually for every connector and consi
 ### `[[streams]]` section
 
 - Find a topic that you need and the corresponding stream that this topic is in and add it into the configuration.
-- `batch_length` and `poll_interval` have to be carefully set for Delta tables. The write happens when there is either `batch_length` number of records in the buffer or we hit `poll_interval` timeout. For Delta, writing means creating a log entry and a separate Parquet file, so if these values are too low (roughly `batch_length` < 1000 and `poll_interval` < 1s), the connector is going to write lots of small files.
-  This is highly undesirable for the reader as it will have to read from many small files instead of a few larger ones. For query performance optimization, the system consuming these files will have to apply `OPTIMIZE` query in order to consolidate the files. We recommend setting these values pretty high based on your workload so that ideally the files are already optimized for reading.
-  The guideline recommended by the developers of Delta is to keep individual file sizes between 128 MB and 1 GB. In the context of this document, it means that ideally `batch_length` + `poll_interval` should cut off the files in the way that their size is in the suggested range. The given range is only a rough guideline and you need to find a good setting based on the patterns of reading and writing in your systems.
+- `batch_length` and `poll_interval` have to be carefully set for Delta tables. `poll_interval` sets the minimum gap between polls. Each poll returns immediately with whatever messages are currently available, up to `batch_length`. The Delta sink writes and commits exactly what one poll returns, so each Delta commit holds at most `batch_length` rows, and topic intake is capped at roughly `batch_length` messages per `poll_interval` per topic.
+  `batch_length` is a ceiling: it only produces large files when messages arrive fast enough between polls to fill it, so a low-throughput topic produces small, frequent commits regardless of how high `batch_length` is set. For Delta, writing means creating a log entry and a separate Parquet file, so a low `batch_length` (roughly < 1000) or a low-throughput topic results in lots of small files.
+  This is highly undesirable for the reader as it will have to read from many small files instead of a few larger ones. For query performance optimization, the system consuming these files will have to apply `OPTIMIZE` query in order to consolidate the files. We recommend setting `batch_length` pretty high based on your workload so that ideally the files are already optimized for reading.
+  The guideline recommended by the developers of Delta is to keep individual file sizes between 128 MB and 1 GB. In the context of this document, it means that ideally `batch_length` should be tuned so that each commit's file size falls within the suggested range, assuming your topic has enough throughput to fill it. The given range is only a rough guideline and you need to find a good setting based on the patterns of reading and writing in your systems.
 
 ### Plugin configuration
 
 #### Attributes common to all types of storage
 
-- **table_uri** (required): Path or URI to the Delta table. Supported schemes: `file://`, `s3://`, `az://`, `gs://`.
+- **table_uri** (required): Absolute URI to the Delta table. Supported schemes: `file://`, `s3://`, `az://`, `gs://`. Bare filesystem paths are not accepted; local tables must use the `file://` scheme.
 - **storage_backend_type** (optional): The cloud storage backend to use. One of `"s3"`, `"azure"`, or `"gcs"`. Omit for local filesystem tables.
 
 #### Local filesystem
@@ -95,7 +96,7 @@ The configuration is usually wrtitten individually for every connector and consi
 
 Currently the implementation offers two possible ways of accessing the bucket.
 
-1. Temporary security credentials issued by AWS STS, which is a best practice recommended by AWS. The role assumed by the writer should allow these actions on the bucket, here is how a working policy looks in HCL:
+1. No static keys — the AWS SDK discovers credentials on its own via its default credential chain (environment variables, shared config/profile including SSO, web identity federation, ECS/EKS container credentials, or EC2 instance metadata). This is the best practice recommended by AWS. For example, if running with an attached IAM role, the role assumed by the writer should allow these actions on the bucket, here is how a working policy looks in HCL:
 
     ```hcl
     data "aws_iam_policy_document" "s3_write" {
@@ -105,7 +106,7 @@ Currently the implementation offers two possible ways of accessing the bucket.
         actions = [
           "s3:ListBucket"
         ]
-        resources = [aws_s3_bucket.unity_catalog["iggy-sandbox"].arn]
+        resources = ["arn:aws:s3:::your-bucket-name"]
       }
 
       statement {
@@ -117,7 +118,7 @@ Currently the implementation offers two possible ways of accessing the bucket.
           "s3:PutObjectAcl",
           "s3:AbortMultipartUpload"
         ]
-        resources = ["${aws_s3_bucket.unity_catalog["iggy-sandbox"].arn}/*"]
+        resources = ["arn:aws:s3:::your-bucket-name/*"]
       }
     }
     ```
@@ -148,6 +149,7 @@ Parameter descriptions:
 - **aws_s3_secret_key**: Optional. AWS secret access key. Can only be passed together with the access key.
 - **aws_s3_region**: Required. AWS region (e.g. `us-east-1`).
 - **aws_s3_endpoint_url**: Optional. S3 endpoint URL. Use for S3-compatible services. Make sure that the URL implies the same regions that is set in **aws_s3_region**, otherwise you'll have an error.
+  Setting a custom endpoint skips the AWS SDK's full credential chain: shared profile and SSO credentials stop working, and only static keys, web identity federation, container credentials, or instance metadata remain available. Set `AWS_FORCE_CREDENTIAL_LOAD=true` in the `iggy-connectors` process environment to restore the full chain.
 - **aws_s3_allow_http**: Optional. Set to `true` to allow HTTP connections (for local development).
 
 #### Azure Blob Storage
@@ -158,15 +160,14 @@ table_uri = "az://my-container/delta-tables/users"
 storage_backend_type = "azure"
 azure_storage_account_name = "mystorageaccount"
 azure_storage_account_key = "account-key"
-azure_storage_sas_token = "sas-token"
 azure_container_name = "my-container"
 ```
 
 Required when `storage_backend_type = "azure"`.
 
 - **azure_storage_account_name**: Azure storage account name.
-- **azure_storage_account_key**: Azure storage account key.
-- **azure_storage_sas_token**: Shared Access Signature token.
+- **azure_storage_account_key**: Azure storage account key. Provide exactly one of this or **azure_storage_sas_token**.
+- **azure_storage_sas_token**: Shared Access Signature token. Provide exactly one of this or **azure_storage_account_key**.
 - **azure_container_name**: Azure container name.
 
 #### Google Cloud Storage
@@ -186,6 +187,6 @@ Required when `storage_backend_type = "gcs"`.
 
 The connector automatically coerces JSON values to match the Delta table schema:
 
-- **Timestamp fields**: ISO 8601 / RFC 3339 formatted strings (e.g. `"2021-11-11T22:11:58Z", "2021-11-11 22:11:58"`) are converted to microsecond timestamps. Numeric timestamps pass through unchanged.
-- **String fields**: Non-string values (numbers, booleans, objects, arrays) are converted to their string representation.
-- **Nested fields**: Coercions are applied recursively to nested structs and arrays.
+- **Timestamp fields**: ISO 8601 / RFC 3339 formatted strings (e.g. `"2021-11-11T22:11:58Z", "2021-11-11 22:11:58"`) are converted to microsecond timestamps. Integer epoch-microsecond timestamps pass through unchanged. Space-separated timestamps without an offset are interpreted as UTC. Invalid timestamp strings fail the batch.
+- **String fields**: Non-null, non-string values (numbers, booleans, objects, arrays) are converted to their string representation.
+- **Nested fields**: Coercions cover nested structs, arrays of strings or timestamps, and arrays of structs. Nested arrays, maps, and variant columns pass through without these coercions. Nulls remain null.

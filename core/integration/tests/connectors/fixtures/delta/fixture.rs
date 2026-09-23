@@ -262,10 +262,13 @@ impl TestFixture for DeltaCorruptedLogFixture {
     }
 }
 
-#[async_trait]
-pub trait DeltaS3SinkOps {
-    fn minio_endpoint(&self) -> String;
+pub struct DeltaS3Fixture {
+    #[allow(dead_code)]
+    minio: ContainerAsync<GenericImage>,
+    minio_endpoint: String,
+}
 
+impl DeltaS3Fixture {
     async fn start_minio(
         network: &str,
         container_name: &str,
@@ -370,7 +373,7 @@ pub trait DeltaS3SinkOps {
         Ok(())
     }
 
-    async fn wait_for_row_count(
+    pub async fn wait_for_row_count(
         &self,
         expected_rows: usize,
         max_attempts: usize,
@@ -386,7 +389,7 @@ pub trait DeltaS3SinkOps {
             ("AWS_ACCESS_KEY_ID".into(), MINIO_ACCESS_KEY.into()),
             ("AWS_SECRET_ACCESS_KEY".into(), MINIO_SECRET_KEY.into()),
             ("AWS_REGION".into(), "us-east-1".into()),
-            ("AWS_ENDPOINT_URL".into(), self.minio_endpoint().clone()),
+            ("AWS_ENDPOINT_URL".into(), self.minio_endpoint.clone()),
             ("AWS_ALLOW_HTTP".into(), "true".into()),
             ("AWS_S3_ALLOW_HTTP".into(), "true".into()),
         ]);
@@ -398,18 +401,6 @@ pub trait DeltaS3SinkOps {
             interval_ms,
         )
         .await
-    }
-}
-
-pub struct DeltaS3Fixture {
-    #[allow(dead_code)]
-    minio: Box<ContainerAsync<GenericImage>>,
-    minio_endpoint: String,
-}
-
-impl DeltaS3SinkOps for DeltaS3Fixture {
-    fn minio_endpoint(&self) -> String {
-        self.minio_endpoint.clone()
     }
 }
 
@@ -427,7 +418,7 @@ impl TestFixture for DeltaS3Fixture {
         info!("Delta S3 fixture ready with MinIO at {minio_endpoint}");
 
         Ok(Self {
-            minio: Box::new(minio),
+            minio,
             minio_endpoint,
         })
     }
@@ -453,7 +444,7 @@ impl TestFixture for DeltaS3Fixture {
         envs.insert(ENV_SINK_AWS_S3_REGION.to_string(), "us-east-1".to_string());
         envs.insert(
             ENV_SINK_AWS_S3_ENDPOINT_URL.to_string(),
-            self.minio_endpoint().clone(),
+            self.minio_endpoint.clone(),
         );
         envs.insert(ENV_SINK_AWS_S3_ALLOW_HTTP.to_string(), "true".to_string());
         envs
@@ -462,12 +453,6 @@ impl TestFixture for DeltaS3Fixture {
 
 pub struct DeltaS3NoTableFixture {
     inner: DeltaS3Fixture,
-}
-
-impl DeltaS3SinkOps for DeltaS3NoTableFixture {
-    fn minio_endpoint(&self) -> String {
-        self.inner.minio_endpoint.clone()
-    }
 }
 
 #[async_trait]
@@ -484,7 +469,7 @@ impl TestFixture for DeltaS3NoTableFixture {
 
         Ok(Self {
             inner: DeltaS3Fixture {
-                minio: Box::new(minio),
+                minio,
                 minio_endpoint,
             },
         })
@@ -497,12 +482,6 @@ impl TestFixture for DeltaS3NoTableFixture {
 
 pub struct DeltaS3NoBucketFixture {
     inner: DeltaS3Fixture,
-}
-
-impl DeltaS3SinkOps for DeltaS3NoBucketFixture {
-    fn minio_endpoint(&self) -> String {
-        self.inner.minio_endpoint.clone()
-    }
 }
 
 #[async_trait]
@@ -518,7 +497,7 @@ impl TestFixture for DeltaS3NoBucketFixture {
 
         Ok(Self {
             inner: DeltaS3Fixture {
-                minio: Box::new(minio),
+                minio,
                 minio_endpoint,
             },
         })
@@ -529,40 +508,8 @@ impl TestFixture for DeltaS3NoBucketFixture {
     }
 }
 
-pub struct DeltaS3MissingSecretKeyFixture {
-    inner: DeltaS3Fixture,
-}
-
-impl DeltaS3SinkOps for DeltaS3MissingSecretKeyFixture {
-    fn minio_endpoint(&self) -> String {
-        self.inner.minio_endpoint.clone()
-    }
-}
-
-#[async_trait]
-impl TestFixture for DeltaS3MissingSecretKeyFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        info!("Delta S3 'missing secret key' fixture reusing a regular DeltaS3Fixture setup");
-        Ok(Self {
-            inner: DeltaS3Fixture::setup().await?,
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = self.inner.connectors_runtime_envs();
-        envs.remove(ENV_SINK_AWS_S3_SECRET_KEY);
-        envs
-    }
-}
-
 pub struct DeltaS3WrongCredentialsFixture {
     inner: DeltaS3Fixture,
-}
-
-impl DeltaS3SinkOps for DeltaS3WrongCredentialsFixture {
-    fn minio_endpoint(&self) -> String {
-        self.inner.minio_endpoint.clone()
-    }
 }
 
 #[async_trait]

@@ -18,6 +18,6 @@
 mod fixture;
 
 pub use fixture::{
-    DeltaCorruptedLogFixture, DeltaFixture, DeltaS3Fixture, DeltaS3MissingSecretKeyFixture,
-    DeltaS3NoBucketFixture, DeltaS3NoTableFixture, DeltaS3SinkOps, DeltaS3WrongCredentialsFixture,
+    DeltaCorruptedLogFixture, DeltaFixture, DeltaS3Fixture, DeltaS3NoBucketFixture,
+    DeltaS3NoTableFixture, DeltaS3WrongCredentialsFixture,
 };

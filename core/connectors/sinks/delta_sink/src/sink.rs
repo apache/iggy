@@ -44,23 +44,20 @@ impl Sink for DeltaSink {
             );
             Error::InvalidConfigValue(format!("table_uri: {e}"))
         })?;
-        let table_url_parsed = &self.config.table_uri;
+        let table_uri = &self.config.table_uri;
 
-        info!("Parsed table URI: {}", table_url_parsed);
+        info!("Parsed table URI: {}", table_url);
 
-        let storage_options = build_storage_options(&self.config).map_err(|e| {
+        let storage_options = build_storage_options(&self.config).inspect_err(|e| {
             error!("Connector configuration: invalid storage configuration. Error message: {e}");
-            Error::InitError(format!(
-                "Connector configuration: invalid storage configuration. Error message: {e}"
-            ))
         })?;
 
         info!("Successfully composed the storage options for accessing the storage backend");
 
         let builder = deltalake::DeltaTableBuilder::from_url(table_url)
             .map_err(|e| {
-                error!("deltalake-rs interface: failed to configure with table_uri = '{table_url_parsed}'. Check deltalake::DeltaTableBuilder::from_url docs and code to correct your table_uri. Error message: {e}");
-                Error::InvalidConfigValue(format!("table_uri = '{table_url_parsed}' caused an error in deltalake-rs interface. Check deltalake::DeltaTableBuilder::from_url docs and code to correct your table_uri. Error message: {e}"))
+                error!("deltalake-rs interface: failed to configure with table_uri = '{table_uri}'. Check deltalake::DeltaTableBuilder::from_url docs and code to correct your table_uri. Error message: {e}");
+                Error::InvalidConfigValue(format!("table_uri = '{table_uri}' caused an error in deltalake-rs interface. Check deltalake::DeltaTableBuilder::from_url docs and code to correct your table_uri. Error message: {e}"))
             })?
             .with_storage_options(storage_options);
         let mut table = builder.build().map_err(|e| {
@@ -72,16 +69,16 @@ impl Sink for DeltaSink {
             .await
             .map_err(
                 |e| {
-                    error!("deltalake-rs interface: failed to list table_url '{table_url_parsed}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}");
-                    Error::InitError(format!("deltalake-rs interface: failed to list table_url '{table_url_parsed}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}"))
+                    error!("deltalake-rs interface: failed to list table_url '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}");
+                    Error::InitError(format!("deltalake-rs interface: failed to list table_url '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}"))
                 }
             )?;
         if !table_exists {
             error!(
-                "No delta table found in '{table_url_parsed}. Make sure to create the delta table in the destination manually or verify the validity of such table."
+                "No delta table found in '{table_uri}'. Make sure to create the delta table in the destination manually or verify the validity of such table."
             );
             return Err(Error::InitError(format!(
-                "No delta table found in '{table_url_parsed}. Make sure to create the delta table in the destination manually or verify the validity of such table."
+                "No delta table found in '{table_uri}'. Make sure to create the delta table in the destination manually or verify the validity of such table."
             )));
         }
 
@@ -158,6 +155,9 @@ impl Sink for DeltaSink {
             return Ok(());
         }
 
+        // This lock is held across the write and flush_and_commit I/O below,
+        // serializing consume() for topics sharing this sink. Kept intentionally:
+        // see #3839 for why per-partition writers were researched and dropped.
         let mut state_guard = self.state.lock().await;
         let state = state_guard.as_mut().ok_or_else(|| {
             error!("Delta sink state not initialized — was open() called?");

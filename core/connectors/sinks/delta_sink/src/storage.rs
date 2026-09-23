@@ -41,18 +41,23 @@ pub(crate) fn build_storage_options(
                         secret_key.expose_secret().to_owned(),
                     );
                 }
-                (None, None) => {}
+                (None, None) => {
+                    // Edge case: no key here means this sink relies on the AWS SDK's own
+                    // credential discovery (e.g. IAM role). But if another Delta sink in
+                    // this same process sets a key, opening it writes that key into the
+                    // shared process environment, and this sink's fallback can silently
+                    // read it too.
+                }
                 _ => {
-                    return Err(Error::InitError(
-                        "S3 backend requires either for the access and secret key to be set together, or for both of them to be unset".into(),
+                    return Err(Error::InvalidConfigValue(
+                        "aws_s3_access_key and aws_s3_secret_key must be provided together, or both omitted".into(),
                     ));
                 }
             }
 
-            let region = config
-                .aws_s3_region
-                .as_ref()
-                .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_region'".into()))?;
+            let region = config.aws_s3_region.as_ref().ok_or_else(|| {
+                Error::InvalidConfigValue("S3 backend requires 'aws_s3_region'".into())
+            })?;
 
             opts.insert("AWS_REGION".into(), region.clone());
 
@@ -66,10 +71,12 @@ pub(crate) fn build_storage_options(
         }
         Some(StorageBackendType::Azure) => {
             let account_name = config.azure_storage_account_name.as_ref().ok_or_else(|| {
-                Error::InitError("Azure backend requires 'azure_storage_account_name'".into())
+                Error::InvalidConfigValue(
+                    "Azure backend requires 'azure_storage_account_name'".into(),
+                )
             })?;
             let container_name = config.azure_container_name.as_ref().ok_or_else(|| {
-                Error::InitError("Azure backend requires 'azure_container_name'".into())
+                Error::InvalidConfigValue("Azure backend requires 'azure_container_name'".into())
             })?;
 
             opts.insert("AZURE_STORAGE_ACCOUNT_NAME".into(), account_name.clone());
@@ -92,16 +99,16 @@ pub(crate) fn build_storage_options(
                     );
                 }
                 (Some(_), Some(_)) => {
-                    return Err(Error::InitError("Azure backend requires exactly one of 'azure_storage_account_key' or 'azure_storage_sas_token', but both were provided".into()));
+                    return Err(Error::InvalidConfigValue("Azure backend requires exactly one of 'azure_storage_account_key' or 'azure_storage_sas_token', but both were provided".into()));
                 }
                 (None, None) => {
-                    return Err(Error::InitError("Azure backend requires one of 'azure_storage_account_key' or 'azure_storage_sas_token'".into()));
+                    return Err(Error::InvalidConfigValue("Azure backend requires one of 'azure_storage_account_key' or 'azure_storage_sas_token'".into()));
                 }
             }
         }
         Some(StorageBackendType::Gcs) => {
             let service_account_key = config.gcs_service_account_key.as_ref().ok_or_else(|| {
-                Error::InitError("GCS backend requires 'gcs_service_account_key'".into())
+                Error::InvalidConfigValue("GCS backend requires 'gcs_service_account_key'".into())
             })?;
 
             opts.insert(
