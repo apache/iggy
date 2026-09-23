@@ -487,7 +487,7 @@ impl GroupState {
             member.assignment = assignments
                 .iter()
                 .find(|(target, _)| target == member_id)
-                .map_or_else(Bytes::new, |(_, blob)| blob.clone());
+                .map_or_else(Bytes::new, |(_, blob)| Bytes::copy_from_slice(blob));
             member.session_deadline = now + member.session_timeout;
         }
         if let Some(leader) = self.leader.clone()

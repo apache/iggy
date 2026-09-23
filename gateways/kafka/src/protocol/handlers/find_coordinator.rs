@@ -29,7 +29,8 @@ use kafka_protocol::protocol::StrBytes;
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_FIND_COORDINATOR, ApiVersionRange, BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
+    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, ERROR_UNSUPPORTED_VERSION, GatewayState,
+    HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_find_coordinator_shape;
 use crate::protocol::handlers::{
@@ -44,6 +45,8 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 
 /// `key_type` 0. Types 1 (transaction) and 2 (share) have no coordinator here.
 const COORDINATOR_TYPE_GROUP: i8 = 0;
+
+const COORDINATOR_TYPE_TRANSACTION: i8 = 1;
 
 /// The node id this gateway advertises for itself, in Metadata and here alike.
 const SELF_NODE_ID: i32 = 1;
@@ -96,19 +99,21 @@ pub fn encode_response(
     } else {
         vec![request.key.clone()]
     };
-    if request.key_type == COORDINATOR_TYPE_GROUP {
-        encode_inner(version, &keys, ERROR_NONE, None, Some(broker))
-    } else {
-        // Not a retriable code: transactions are out of scope for good, and
-        // COORDINATOR_NOT_AVAILABLE would make a transactional producer retry forever.
-        encode_inner(
-            version,
-            &keys,
-            ERROR_INVALID_REQUEST,
-            Some(StrBytes::from_static_str(UNSUPPORTED_KEY_TYPE_MESSAGE)),
-            None,
-        )
-    }
+    let error_code = match request.key_type {
+        COORDINATOR_TYPE_GROUP => {
+            return encode_inner(version, &keys, ERROR_NONE, None, Some(broker));
+        }
+        // Transactions are out of scope for good, so the producer must fail rather than retry.
+        COORDINATOR_TYPE_TRANSACTION => ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+        _ => ERROR_INVALID_REQUEST,
+    };
+    encode_inner(
+        version,
+        &keys,
+        error_code,
+        Some(StrBytes::from_static_str(UNSUPPORTED_KEY_TYPE_MESSAGE)),
+        None,
+    )
 }
 
 /// # Errors

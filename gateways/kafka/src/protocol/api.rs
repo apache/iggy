@@ -99,6 +99,11 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// `FindCoordinator` for a transaction coordinator, which the gateway has none of.
+///
+/// The one code both the Java client and librdkafka treat as fatal for that lookup: anything else,
+/// `INVALID_REQUEST` included, sends librdkafka into a 500ms retry loop that never ends.
+pub const ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 /// KIP-394: a `JoinGroup` v4+ with an empty member id is answered with a freshly minted id and
 /// this code, and the client rejoins carrying it.
 pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;

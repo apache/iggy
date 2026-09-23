@@ -180,8 +180,8 @@ Requires `kcat` installed. Gateway does **not** implement SASL or full broker se
 | ---- | ------ | --------- | --------------------- |
 | G1 | Broker metadata | `kcat -b 127.0.0.1:9093 -L` | ApiVersions + Metadata handshake; broker appears in metadata |
 | G2 | Produce (likely fails later) | `echo "hello" \| kcat -b 127.0.0.1:9093 -t test -P` | Produce is still a stub: retriable `NOT_LEADER_OR_FOLLOWER` (6), so kcat retries — document actual error |
-| G3 | Consumer group rebalance | `kcat -b 127.0.0.1:9093 -G g1 test` in two terminals | Each prints its assigned partitions and the two sets are disjoint; then both stall, because OffsetFetch (9) is unlisted and closes the connection — the client re-runs FindCoordinator and loops. Record the exact librdkafka log lines |
-| G4 | Ungraceful consumer exit | `kill -9` one of G3's kcats | Within `session.timeout.ms` the survivor logs a rebalance and is assigned every partition |
+| G3 | Consumer group rebalance | `kcat -b 127.0.0.1:9093 -G g1 test` in two terminals | Both complete JoinGroup and SyncGroup and are assigned 0 partitions, because the Metadata stub reports `test` as unknown and the assignor has nothing to hand out. Record the exact librdkafka log lines |
+| G4 | Ungraceful consumer exit | `kill -9` one of G3's kcats | Within `session.timeout.ms` the survivor logs a rebalance, rejoins and is again assigned 0 partitions |
 | G5 | Java console consumer | `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g2 --topic test` | Exercises JoinGroup v9, SyncGroup v5, Heartbeat v4, FindCoordinator v4. A 4.0 client may need `--consumer-property group.protocol=classic`, or it sends ConsumerGroupHeartbeat (68) and the connection closes |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.

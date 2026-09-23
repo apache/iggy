@@ -49,7 +49,8 @@ use iggy_gateway_kafka::protocol::api::{
     BrokerAdvertise, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
     ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST,
     ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
-    ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID, GatewayState, handle_request_bounded,
+    ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_MEMBER_ID, GatewayState, handle_request_bounded,
 };
 
 use codec::Decoder;
@@ -882,16 +883,20 @@ async fn given_several_keys_when_finding_the_coordinator_at_v4_should_return_one
     assert_eq!(decoder.remaining(), 0);
 }
 
-/// Transactions are out of scope permanently, so the answer is a terminal error rather than a
-/// retriable one a transactional producer would spin on forever.
+/// Transactions are out of scope permanently, so the answer is the code both the Java client and
+/// librdkafka treat as fatal, rather than one a transactional producer would spin on forever.
 #[tokio::test(start_paused = true)]
-async fn given_a_transaction_key_type_when_finding_the_coordinator_should_return_invalid_request() {
+async fn given_a_transaction_key_type_when_finding_the_coordinator_should_return_transactional_id_authorization_failed()
+ {
     let state = test_state(immediate_config());
 
     let mut decoder = find_coordinator(&state, 1, &["txn"], 1).await;
 
     decoder.read_i32().unwrap(); // throttle_time_ms
-    assert_eq!(decoder.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+    assert_eq!(
+        decoder.read_i16().unwrap(),
+        ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+    );
     assert!(decoder.read_nullable_string().unwrap().is_some());
     assert_eq!(decoder.read_i32().unwrap(), -1, "node id");
     assert_eq!(decoder.read_nullable_string().unwrap().as_deref(), Some(""));

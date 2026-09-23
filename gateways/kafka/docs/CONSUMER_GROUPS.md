@@ -105,13 +105,17 @@ at commit time.
 
 ## What a real consumer still cannot do
 
-`OffsetFetch` (9) is sent by every consumer immediately after `SyncGroup`, and it is not in scope
-([#3542](https://github.com/apache/iggy/issues/3542)). An unlisted key closes the connection, so a
-consumer that gets through a rebalance will then loop: coordinator connection closes, client marks
-the coordinator unknown, re-runs FindCoordinator, retries OffsetFetch, closes again. Membership
-survives that loop, because group state is not per-connection and heartbeats resume on the new
-connection - but the consumer never fetches. Fetch is a stub in any case, so nothing can be
-consumed until [#3535](https://github.com/apache/iggy/issues/3535)/#3542 land.
+A consumer completes JoinGroup and SyncGroup and then holds no partitions. Metadata is a stub that
+answers `UNKNOWN_TOPIC_OR_PARTITION` (3) for every topic, so the leader's assignor sees no
+partitions and hands every member an empty assignment. The consumer stays a member and keeps
+heartbeating, but has nothing to fetch.
+
+Once Metadata reports partitions, the next wall is `OffsetFetch` (9), which a consumer sends after
+`SyncGroup` for a non-empty assignment and which is not in scope
+([#3542](https://github.com/apache/iggy/issues/3542)). An unlisted key closes the connection, so
+that consumer would loop: coordinator connection closes, client marks the coordinator unknown,
+re-runs FindCoordinator, retries OffsetFetch, closes again. Fetch is a stub in any case, so nothing
+can be consumed until [#3535](https://github.com/apache/iggy/issues/3535)/#3542 land.
 
 `LeaveGroup` (13) is also out of scope ([#3543](https://github.com/apache/iggy/issues/3543)). The
 cost falls on the survivors, not the leaver: a consumer that shuts down gracefully stays a member
