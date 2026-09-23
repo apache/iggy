@@ -347,15 +347,17 @@ JDBC SQL types are automatically mapped to JSON:
   than a batch, raise `batch_size` to cover the full result, or use incremental
   mode with an ordered `tracking_column`. (Full cross-database OFFSET pagination
   is a planned follow-up.)
-- **Delivery semantics: at-least-once.** The offset advanced by a poll is only
-  *staged*; it is committed after the runtime reports that the batch was both
-  sent and its checkpoint durably persisted (`SourceBatchResult::Ack`). If either
-  step fails (`Nack`), the staged offset is discarded and the next poll rebuilds
-  the same query from the committed offset, so the batch is **re-read rather than
-  skipped** - for a transient in-process send failure as well as for a crash or
-  restart. Rows can therefore be delivered more than once (message IDs are
-  random per poll, so downstream consumers must dedupe on a business key if they
-  need exactly-once); rows are never silently dropped.
+- **Fetched-batch delivery is at-least-once.** The offset advanced by a poll is
+  only *staged*; it is committed after the runtime reports that the batch was
+  both sent and its checkpoint durably persisted (`SourceBatchResult::Ack`). If
+  either step fails (`Nack`), the staged offset is discarded and the next poll
+  rebuilds the same query from the committed offset, so the batch is **re-read
+  rather than skipped** - for a transient in-process send failure as well as for
+  a crash or restart. Rows can therefore be delivered more than once (message
+  IDs are random per poll, so downstream consumers must dedupe on a business key
+  if they need exactly-once); send or checkpoint failures do not silently drop
+  an already-fetched batch. The separate tracking-column uniqueness requirement
+  above still applies while fetching rows from the database.
 - **Connection recovery.** The connection is validated with `Connection.isValid`
   each poll and transparently re-established (closing the old handle) if it has
   dropped. The check runs on the shared `block_in_place` worker, so its timeout

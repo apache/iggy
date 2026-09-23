@@ -45,7 +45,7 @@ username = "system"
 password = "oracle"
 
 # SQL query to execute
-# Oracle example with ROWNUM or use a numeric/timestamp column
+# Use a stable numeric or timestamp cursor; Oracle ROWNUM is not a valid tracking column.
 query = "SELECT * FROM CUSTOMERS WHERE ID > {last_offset} ORDER BY ID"
 
 # How often to poll the database

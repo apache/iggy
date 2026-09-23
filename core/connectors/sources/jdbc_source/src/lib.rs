@@ -41,6 +41,33 @@ fn clear_pending_exception(env: &mut JNIEnv) {
     let _ = env.exception_clear();
 }
 
+/// Reclaim a JNI local frame without masking the operation error that caused the
+/// frame to unwind. JNI can leave an exception pending when `PopLocalFrame`
+/// fails, so clear before and after the pop attempt. When both the operation and
+/// frame cleanup fail, preserve the operation error because it identifies the
+/// original failure.
+fn finish_local_frame<T>(
+    env: &mut JNIEnv,
+    operation_result: Result<T, Error>,
+    context: &str,
+    map_error: impl FnOnce(String) -> Error,
+) -> Result<T, Error> {
+    clear_pending_exception(env);
+    // SAFETY: callers pass a null result because no local reference escapes the
+    // frame; successful operations return owned Rust data or a `GlobalRef`.
+    let pop_result = unsafe { env.pop_local_frame(&JObject::null()) };
+    match pop_result {
+        Ok(_) => operation_result,
+        Err(err) => {
+            clear_pending_exception(env);
+            match operation_result {
+                Ok(_) => Err(map_error(format!("{context}: {err}"))),
+                Err(operation_error) => Err(operation_error),
+            }
+        }
+    }
+}
+
 /// Best-effort `close()` on a JDBC handle used in error/cleanup paths. Clears
 /// any pending exception first (`close()` is a `CallVoidMethod`, which JNI
 /// forbids while an exception is pending) and again afterwards in case the
@@ -438,13 +465,18 @@ impl JdbcSource {
     /// accumulate on the caller's frame. The returned handle is a `GlobalRef`, so
     /// it survives the frame pop.
     fn create_direct_connection_internal(&self, env: &mut JNIEnv) -> Result<GlobalRef, Error> {
-        env.push_local_frame(16)
-            .map_err(|e| Error::InitError(format!("Failed to push local frame: {e}")))?;
+        jni_init!(
+            env,
+            env.push_local_frame(16),
+            "Failed to push connection local frame"
+        );
         let result = self.create_direct_connection_inner(env);
-        // SAFETY: `result` holds only a global reference (or an error); no JNI
-        // local reference escapes the frame.
-        let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-        result
+        finish_local_frame(
+            env,
+            result,
+            "Failed to pop connection local frame",
+            Error::InitError,
+        )
     }
 
     fn create_direct_connection_inner(&self, env: &mut JNIEnv) -> Result<GlobalRef, Error> {
@@ -583,9 +615,11 @@ impl JdbcSource {
             )
         };
 
-        let global_ref = env
-            .new_global_ref(connection_obj)
-            .map_err(|e| Error::InitError(format!("Failed to create global reference: {e}")))?;
+        let global_ref = jni_init!(
+            env,
+            env.new_global_ref(connection_obj),
+            "Failed to create global reference"
+        );
 
         info!("Direct database connection established successfully");
         Ok(global_ref)
@@ -621,9 +655,11 @@ impl JdbcSource {
         let conn = guard
             .as_ref()
             .ok_or_else(|| Error::Connection("No connection available".to_string()))?;
-        let local_ref = env
-            .new_local_ref(conn.as_obj())
-            .map_err(|e| Error::Connection(format!("Failed to create local ref: {e}")))?;
+        let local_ref = jni!(
+            env,
+            env.new_local_ref(conn.as_obj()),
+            "Failed to create connection local reference"
+        );
         Ok(local_ref)
     }
 
@@ -803,12 +839,18 @@ impl JdbcSource {
         // metadata object and per-column name references are reclaimed; a very
         // wide table would otherwise accumulate one local ref per column on the
         // outer frame for the whole poll.
-        env.push_local_frame(16)
-            .map_err(|e| Error::Connection(format!("Failed to push local frame: {}", e)))?;
+        jni!(
+            env,
+            env.push_local_frame(16),
+            "Failed to push metadata local frame"
+        );
         let result = self.read_column_metadata_inner(env, result_set);
-        // SAFETY: the returned Vec is owned Rust data; no JNI reference escapes.
-        let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-        result
+        finish_local_frame(
+            env,
+            result,
+            "Failed to pop metadata local frame",
+            Error::Connection,
+        )
     }
 
     fn read_column_metadata_inner(
@@ -879,13 +921,18 @@ impl JdbcSource {
             // -column local refs (getObject/getString/getBytes results) are
             // reclaimed every iteration; otherwise a large result set would
             // overflow the JNI local reference table and abort the JVM.
-            env.push_local_frame(32)
-                .map_err(|e| Error::Connection(format!("Failed to push local frame: {}", e)))?;
+            jni!(
+                env,
+                env.push_local_frame(32),
+                "Failed to push row local frame"
+            );
             let row_result = self.read_single_row(env, result_set, columns);
-            // SAFETY: `read_single_row` returns only owned Rust data (a JSON map
-            // and an optional String); no JNI local reference escapes the frame.
-            let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-            let (row_data, offset) = row_result?;
+            let (row_data, offset) = finish_local_frame(
+                env,
+                row_result,
+                "Failed to pop row local frame",
+                Error::Connection,
+            )?;
 
             // Take the tracking value of the LAST row as the next offset. Rows
             // arrive in ascending tracking order (validate_config enforces
@@ -1501,13 +1548,18 @@ impl Source for JdbcSource {
                 // no-detach nested guard once attached), so without this frame those
                 // per-poll locals accumulate on the thread's top-level frame and
                 // eventually overflow the JNI local reference table, aborting the JVM.
-                env.push_local_frame(16)
-                    .map_err(|e| Error::Connection(format!("Failed to push local frame: {e}")))?;
+                jni!(
+                    env,
+                    env.push_local_frame(16),
+                    "Failed to push poll local frame"
+                );
                 let result = self.execute_query(&mut env);
-                // SAFETY: execute_query returns only owned Rust data (messages and
-                // the candidate state); no JNI local reference escapes the frame.
-                let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-                result
+                finish_local_frame(
+                    &mut env,
+                    result,
+                    "Failed to pop poll local frame",
+                    Error::Connection,
+                )
             },
         )?;
 
@@ -1899,16 +1951,24 @@ fn classify_query_failure(env: &mut JNIEnv, action: &str) -> Error {
 fn take_pending_sql_exception(env: &mut JNIEnv) -> (Option<String>, String) {
     let throwable = match env.exception_occurred() {
         Ok(t) if !t.is_null() => t,
-        _ => return (None, "unknown error".to_string()),
+        Ok(_) => return (None, "unknown error".to_string()),
+        Err(_) => {
+            clear_pending_exception(env);
+            return (None, "unknown error".to_string());
+        }
     };
     let _ = env.exception_clear();
 
     let message = throwable_string_method(env, &throwable, "getMessage")
         .unwrap_or_else(|| "unknown error".to_string());
-    let sql_state = if env
-        .is_instance_of(&throwable, "java/sql/SQLException")
-        .unwrap_or(false)
-    {
+    let is_sql_exception = match env.is_instance_of(&throwable, "java/sql/SQLException") {
+        Ok(is_sql_exception) => is_sql_exception,
+        Err(_) => {
+            clear_pending_exception(env);
+            false
+        }
+    };
+    let sql_state = if is_sql_exception {
         throwable_string_method(env, &throwable, "getSQLState")
     } else {
         None
