@@ -28,37 +28,44 @@ use container::{
     ENV_SOURCE_TOPIC, MqttBrokerContainer,
 };
 
-pub struct MqttFixture {
+struct MqttFixture {
     broker: MqttBrokerContainer,
+    protocol: publisher::Protocol,
+    qos: u8,
 }
 
 impl MqttFixture {
-    pub async fn publish_qos_one(&self, payload: &[u8]) -> Result<(), String> {
-        publisher::publish_qos_one(
+    async fn start(protocol: publisher::Protocol, qos: u8) -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            broker: MqttBrokerContainer::start().await?,
+            protocol,
+            qos,
+        })
+    }
+
+    async fn publish(&self, payload: &[u8]) -> Result<(), String> {
+        publisher::publish(
             &self.broker.broker_url,
             container::DEFAULT_TEST_TOPIC,
+            self.protocol,
+            self.qos,
             payload,
         )
         .await
     }
-}
 
-#[async_trait]
-impl TestFixture for MqttFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        Ok(Self {
-            broker: MqttBrokerContainer::start().await?,
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+    fn runtime_envs(&self) -> HashMap<String, String> {
+        let protocol = match self.protocol {
+            publisher::Protocol::Mqtt311 => "mqtt311",
+            publisher::Protocol::Mqtt5 => "mqtt5",
+        };
         HashMap::from([
             (
                 ENV_SOURCE_BROKER_URL.to_string(),
                 self.broker.broker_url.clone(),
             ),
-            (ENV_SOURCE_PROTOCOL.to_string(), "mqtt5".to_string()),
-            (ENV_SOURCE_QOS.to_string(), "1".to_string()),
+            (ENV_SOURCE_PROTOCOL.to_string(), protocol.to_string()),
+            (ENV_SOURCE_QOS.to_string(), self.qos.to_string()),
             (
                 ENV_SOURCE_CLIENT_ID.to_string(),
                 "iggy-mqtt-integration-source".to_string(),
@@ -76,3 +83,33 @@ impl TestFixture for MqttFixture {
         ])
     }
 }
+
+macro_rules! define_mqtt_fixture {
+    ($name:ident, $protocol:expr, $qos:expr) => {
+        pub struct $name(MqttFixture);
+
+        impl $name {
+            pub async fn publish(&self, payload: &[u8]) -> Result<(), String> {
+                self.0.publish(payload).await
+            }
+        }
+
+        #[async_trait]
+        impl TestFixture for $name {
+            async fn setup() -> Result<Self, TestBinaryError> {
+                Ok(Self(MqttFixture::start($protocol, $qos).await?))
+            }
+
+            fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+                self.0.runtime_envs()
+            }
+        }
+    };
+}
+
+define_mqtt_fixture!(Mqtt311Qos0Fixture, publisher::Protocol::Mqtt311, 0);
+define_mqtt_fixture!(Mqtt311Qos1Fixture, publisher::Protocol::Mqtt311, 1);
+define_mqtt_fixture!(Mqtt311Qos2Fixture, publisher::Protocol::Mqtt311, 2);
+define_mqtt_fixture!(Mqtt5Qos0Fixture, publisher::Protocol::Mqtt5, 0);
+define_mqtt_fixture!(Mqtt5Qos1Fixture, publisher::Protocol::Mqtt5, 1);
+define_mqtt_fixture!(Mqtt5Qos2Fixture, publisher::Protocol::Mqtt5, 2);
