@@ -47,9 +47,10 @@ use wire::{
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
 
-#[test]
-fn api_versions_v1_response_non_flexible_format() {
+#[tokio::test]
+async fn api_versions_v1_response_non_flexible_format() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
@@ -72,14 +73,15 @@ fn api_versions_v1_response_non_flexible_format() {
     }
 }
 
-#[test]
-fn api_versions_v3_response_flexible_format() {
+#[tokio::test]
+async fn api_versions_v3_response_flexible_format() {
     let body = handle_request(
         API_KEY_API_VERSIONS,
         3,
         build_api_versions_flexible_request("apache-iggy", "0.1.0"),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
@@ -108,14 +110,15 @@ fn api_versions_v3_response_flexible_format() {
 
 // ── Metadata ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn metadata_response_has_broker_array_and_topic_array() {
+#[tokio::test]
+async fn metadata_response_has_broker_array_and_topic_array() {
     let body = handle_request(
         API_KEY_METADATA,
         0,
         build_metadata_all_topics_legacy(0),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
@@ -132,24 +135,27 @@ fn metadata_response_has_broker_array_and_topic_array() {
     assert_eq!(topic_count, 0);
 }
 
-#[test]
-fn metadata_empty_body_closes_connection() {
+#[tokio::test]
+async fn metadata_empty_body_closes_connection() {
     assert!(
-        handle_request(API_KEY_METADATA, 0, Bytes::new(), &default_broker()).is_close(),
+        handle_request(API_KEY_METADATA, 0, Bytes::new(), &default_broker())
+            .await
+            .is_close(),
         "empty Metadata body is malformed, not all-topics"
     );
 }
 
-#[test]
-fn api_versions_v3_empty_body_returns_invalid_request() {
+#[tokio::test]
+async fn api_versions_v3_empty_body_returns_invalid_request() {
     let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &default_broker())
+        .await
         .expect_response("ApiVersions has a top-level error_code");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
-#[test]
-fn unsupported_metadata_version_closes_connection() {
+#[tokio::test]
+async fn unsupported_metadata_version_closes_connection() {
     // Above max: a clamped v9 body is unparsable to a v99 client, so Close is the honest contract.
     assert!(
         handle_request(
@@ -158,6 +164,7 @@ fn unsupported_metadata_version_closes_connection() {
             build_metadata_flexible_request_v10(&["orders"]),
             &default_broker(),
         )
+        .await
         .is_close(),
         "Metadata above supported max must close rather than return a clamped body"
     );
@@ -165,9 +172,9 @@ fn unsupported_metadata_version_closes_connection() {
 
 // ── Misc ────────────────────────────────────────────────────────────────────
 
-#[test]
-fn unknown_api_key_closes_connection() {
-    let outcome = handle_request(999, 0, Bytes::new(), &default_broker());
+#[tokio::test]
+async fn unknown_api_key_closes_connection() {
+    let outcome = handle_request(999, 0, Bytes::new(), &default_broker()).await;
     assert!(
         outcome.is_close(),
         "unknown api_key must close (no parseable response schema)"
@@ -182,9 +189,10 @@ fn version_support_table_is_applied() {
     assert!(!is_supported_version(API_KEY_METADATA, -1));
 }
 
-#[test]
-fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
+#[tokio::test]
+async fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
     let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 - no throttle_time_ms.
     assert_eq!(body.len(), 42);
@@ -194,8 +202,8 @@ fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
     assert_eq!(d.remaining(), 36);
 }
 
-#[test]
-fn produce_malformed_body_with_acks_one_stays_silent() {
+#[tokio::test]
+async fn produce_malformed_body_with_acks_one_stays_silent() {
     // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes `acks`
     // (unlike the pre-migration field-by-field decoder, which could still answer with
     // INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure now stays
@@ -207,13 +215,15 @@ fn produce_malformed_body_with_acks_one_stays_silent() {
         0x00, 0x00, 0x00, 0x01, // one topic
     ]);
     assert!(
-        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
+            .await
+            .is_no_response(),
         "malformed Produce body must stay silent regardless of acks"
     );
 }
 
-#[test]
-fn fetch_malformed_body_returns_invalid_request() {
+#[tokio::test]
+async fn fetch_malformed_body_returns_invalid_request() {
     let response = handle_request(
         API_KEY_FETCH,
         12,
@@ -224,14 +234,15 @@ fn fetch_malformed_body_returns_invalid_request() {
         ]),
         &default_broker(),
     )
+    .await
     .expect_response("fetch must return error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
-#[test]
-fn list_offsets_malformed_body_returns_invalid_request() {
+#[tokio::test]
+async fn list_offsets_malformed_body_returns_invalid_request() {
     let response = handle_request(
         API_KEY_LIST_OFFSETS,
         6,
@@ -243,6 +254,7 @@ fn list_offsets_malformed_body_returns_invalid_request() {
         ]),
         &default_broker(),
     )
+    .await
     .expect_response("list offsets must return error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
@@ -256,8 +268,8 @@ fn list_offsets_malformed_body_returns_invalid_request() {
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
-#[test]
-fn create_topics_malformed_body_returns_invalid_request() {
+#[tokio::test]
+async fn create_topics_malformed_body_returns_invalid_request() {
     let response = handle_request(
         API_KEY_CREATE_TOPICS,
         5,
@@ -267,6 +279,7 @@ fn create_topics_malformed_body_returns_invalid_request() {
         ]),
         &default_broker(),
     )
+    .await
     .expect_response("create topics must return error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 0);
@@ -278,8 +291,8 @@ fn create_topics_malformed_body_returns_invalid_request() {
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
-#[test]
-fn metadata_null_topic_name_closes_connection() {
+#[tokio::test]
+async fn metadata_null_topic_name_closes_connection() {
     assert!(
         handle_request(
             API_KEY_METADATA,
@@ -290,6 +303,7 @@ fn metadata_null_topic_name_closes_connection() {
             ]),
             &default_broker(),
         )
+        .await
         .is_close(),
         "null topic name cannot be echoed in a Metadata response"
     );
@@ -297,8 +311,8 @@ fn metadata_null_topic_name_closes_connection() {
 
 // ── Full handler regression - every scoped API key x version through `handle_request` ──
 
-#[test]
-fn handle_request_succeeds_for_every_supported_version_with_fixture() {
+#[tokio::test]
+async fn handle_request_succeeds_for_every_supported_version_with_fixture() {
     for &(api_key, name, min_ver, max_ver) in scope::SCOPED_API_KEYS {
         if api_key == API_KEY_METADATA {
             for version in min_ver..=max_ver {
@@ -308,6 +322,7 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
                     build_metadata_all_topics_legacy(version)
                 };
                 let resp = handle_request(api_key, version, body, &default_broker())
+                    .await
                     .expect_response("test request has acks != 0 and expects a response");
                 assert!(
                     !resp.is_empty(),
@@ -324,6 +339,7 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
                     Bytes::new()
                 };
                 let resp = handle_request(api_key, version, body, &default_broker())
+                    .await
                     .expect_response("test request has acks != 0 and expects a response");
                 assert!(
                     !resp.is_empty(),
@@ -338,6 +354,7 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
                 continue;
             };
             let resp = handle_request(api_key, version, body, &default_broker())
+                .await
                 .expect_response("test request has acks != 0 and expects a response");
             assert!(
                 !resp.is_empty(),
@@ -347,13 +364,14 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
     }
 }
 
-#[test]
-fn produce_stub_response_returns_retriable_not_leader() {
+#[tokio::test]
+async fn produce_stub_response_returns_retriable_not_leader() {
     for version in 3i16..=9 {
         let Some(body) = load_fixture_body_or_skip(0, "Produce", version) else {
             continue;
         };
         let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker())
+            .await
             .expect_response("test request has acks != 0 and expects a response");
         let flexible = version >= 9;
         let mut d = Decoder::new(resp);
@@ -375,13 +393,14 @@ fn produce_stub_response_returns_retriable_not_leader() {
     }
 }
 
-#[test]
-fn fetch_stub_response_returns_retriable_not_leader() {
+#[tokio::test]
+async fn fetch_stub_response_returns_retriable_not_leader() {
     for version in 4i16..=12 {
         let Some(body) = load_fixture_body_or_skip(1, "Fetch", version) else {
             continue;
         };
         let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
+            .await
             .expect_response("test request has acks != 0 and expects a response");
         let flexible = version >= 12;
         let mut d = Decoder::new(resp);
@@ -415,12 +434,13 @@ fn fetch_stub_response_returns_retriable_not_leader() {
 /// v9 legacy encoding with a populated forgotten-topics list, and v12 flexible encoding adding a
 /// rack id (introduced at v11) on top of that. Both must decode and reach the same stub outcome
 /// as an empty-topics request.
-#[test]
-fn fetch_decodes_request_with_forgotten_topics_and_rack_id() {
+#[tokio::test]
+async fn fetch_decodes_request_with_forgotten_topics_and_rack_id() {
     for (version, rack_id) in [(9i16, None), (12i16, Some("rack-a"))] {
         let body =
             wire::build_fetch_request_with_sections(version, "orders", 2, Some("stale"), rack_id);
         let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
+            .await
             .expect_response("test request has acks != 0 and expects a response");
         let flexible = version >= 12;
         let mut d = Decoder::new(resp);
@@ -445,13 +465,14 @@ fn fetch_decodes_request_with_forgotten_topics_and_rack_id() {
     }
 }
 
-#[test]
-fn list_offsets_stub_response_returns_retriable_not_leader() {
+#[tokio::test]
+async fn list_offsets_stub_response_returns_retriable_not_leader() {
     for version in 1i16..=6 {
         let Some(body) = load_fixture_body_or_skip(2, "ListOffsets", version) else {
             continue;
         };
         let resp = handle_request(API_KEY_LIST_OFFSETS, version, body, &default_broker())
+            .await
             .expect_response("test request has acks != 0 and expects a response");
         let flexible = version >= 6;
         let mut d = Decoder::new(resp);
@@ -479,10 +500,11 @@ fn list_offsets_stub_response_returns_retriable_not_leader() {
 /// `list_offsets_stub_response_returns_retriable_not_leader` above is fixture-driven; this
 /// exercises `encode_list_offsets_response`'s per-partition echo loop with a hand-built request
 /// carrying a real (non-empty) topic/partition, independent of any `.bin` fixture.
-#[test]
-fn list_offsets_decodes_request_with_real_topic_and_partition() {
+#[tokio::test]
+async fn list_offsets_decodes_request_with_real_topic_and_partition() {
     let body = wire::build_list_offsets_branch_request(6, "orders", 2);
     let resp = handle_request(API_KEY_LIST_OFFSETS, 6, body, &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
     let _throttle = d.read_i32().unwrap();
@@ -544,8 +566,8 @@ fn read_broker_flexible(d: &mut Decoder) -> (String, i32) {
     (host, port)
 }
 
-#[test]
-fn metadata_corrupt_partial_body_closes_connection() {
+#[tokio::test]
+async fn metadata_corrupt_partial_body_closes_connection() {
     assert!(
         handle_request(
             API_KEY_METADATA,
@@ -553,19 +575,21 @@ fn metadata_corrupt_partial_body_closes_connection() {
             Bytes::from_static(&[0x00, 0x00]),
             &default_broker(),
         )
+        .await
         .is_close(),
         "truncated Metadata body must close; there is no top-level error field"
     );
 }
 
-#[test]
-fn metadata_v0_empty_topics_stub_broker() {
+#[tokio::test]
+async fn metadata_v0_empty_topics_stub_broker() {
     let body = handle_request(
         API_KEY_METADATA,
         0,
         metadata_request_legacy(0, 0),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let (host, port) = read_broker_legacy(&mut d);
@@ -579,14 +603,15 @@ fn metadata_v0_empty_topics_stub_broker() {
     );
 }
 
-#[test]
-fn metadata_v0_three_topics_each_unknown() {
+#[tokio::test]
+async fn metadata_v0_three_topics_each_unknown() {
     let body = handle_request(
         API_KEY_METADATA,
         0,
         metadata_request_legacy(0, 3),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _ = read_broker_legacy(&mut d);
@@ -601,14 +626,15 @@ fn metadata_v0_three_topics_each_unknown() {
     }
 }
 
-#[test]
-fn metadata_v1_includes_controller_id() {
+#[tokio::test]
+async fn metadata_v1_includes_controller_id() {
     let body = handle_request(
         API_KEY_METADATA,
         1,
         metadata_request_legacy(1, 0),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     // Metadata v1 has no throttle_time_ms (added in v3).
@@ -618,14 +644,15 @@ fn metadata_v1_includes_controller_id() {
     assert_eq!(controller, 1);
 }
 
-#[test]
-fn metadata_v2_includes_cluster_id_field() {
+#[tokio::test]
+async fn metadata_v2_includes_cluster_id_field() {
     let body = handle_request(
         API_KEY_METADATA,
         2,
         metadata_request_legacy(2, 0),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _ = read_broker_legacy(&mut d);
@@ -635,8 +662,8 @@ fn metadata_v2_includes_cluster_id_field() {
     assert_eq!(d.read_i32().unwrap(), 0);
 }
 
-#[test]
-fn metadata_all_legacy_versions_produce_valid_response() {
+#[tokio::test]
+async fn metadata_all_legacy_versions_produce_valid_response() {
     for version in 0i16..=8 {
         let body = handle_request(
             API_KEY_METADATA,
@@ -644,6 +671,7 @@ fn metadata_all_legacy_versions_produce_valid_response() {
             metadata_request_legacy(version, 1),
             &default_broker(),
         )
+        .await
         .expect_response("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         if version >= 3 {
@@ -664,14 +692,15 @@ fn metadata_all_legacy_versions_produce_valid_response() {
     }
 }
 
-#[test]
-fn metadata_v9_flexible_encoding() {
+#[tokio::test]
+async fn metadata_v9_flexible_encoding() {
     let body = handle_request(
         API_KEY_METADATA,
         9,
         metadata_request_flexible(2),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _throttle = d.read_i32().unwrap();
@@ -701,14 +730,15 @@ fn metadata_v9_flexible_encoding() {
     assert_eq!(d.remaining(), 0);
 }
 
-#[test]
-fn metadata_v8_includes_authorized_operations_legacy() {
+#[tokio::test]
+async fn metadata_v8_includes_authorized_operations_legacy() {
     let body = handle_request(
         API_KEY_METADATA,
         8,
         metadata_request_legacy(8, 1),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _throttle = d.read_i32().unwrap();
@@ -726,13 +756,14 @@ fn metadata_v8_includes_authorized_operations_legacy() {
     assert_eq!(d.remaining(), 0);
 }
 
-#[test]
-fn create_topics_stub_response_returns_not_controller() {
+#[tokio::test]
+async fn create_topics_stub_response_returns_not_controller() {
     for version in 2i16..=5 {
         let Some(body) = load_fixture_body_or_skip(19, "CreateTopics", version) else {
             continue;
         };
         let resp = handle_request(API_KEY_CREATE_TOPICS, version, body, &default_broker())
+            .await
             .expect_response("test request has acks != 0 and expects a response");
         let flexible = version >= 5;
         let mut d = Decoder::new(resp);
@@ -757,10 +788,11 @@ fn create_topics_stub_response_returns_not_controller() {
 /// `create_topics_stub_response_returns_not_controller` above is fixture-driven; this exercises
 /// `encode_create_topics_response`'s per-topic echo with a hand-built request carrying a real
 /// topic, replica assignment, and config entry, independent of any `.bin` fixture.
-#[test]
-fn create_topics_decodes_request_with_real_topic_and_assignment() {
+#[tokio::test]
+async fn create_topics_decodes_request_with_real_topic_and_assignment() {
     let body = wire::build_create_topics_request_with_sections(5, "orders");
     let resp = handle_request(API_KEY_CREATE_TOPICS, 5, body, &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
     let _throttle = d.read_i32().unwrap();
@@ -776,20 +808,22 @@ fn create_topics_decodes_request_with_real_topic_and_assignment() {
 
 // ── Produce acks=0 (broker must stay silent even on a malformed body) ──────
 
-#[test]
-fn produce_acks_zero_malformed_body_stays_silent() {
+#[tokio::test]
+async fn produce_acks_zero_malformed_body_stays_silent() {
     // topics array declares 1 element but no topic data follows - decode fails after acks=0
     // was on the wire, though `kafka_protocol`'s one-shot decode no longer exposes that acks
     // was read. The handler must stay silent regardless.
     let body = build_produce_v3_body(0, 1);
     assert!(
-        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
+            .await
+            .is_no_response(),
         "handler must not respond when acks=0 even if decode fails after acks"
     );
 }
 
-#[test]
-fn produce_acks_zero_stays_silent_on_advertised_but_unsupported_version() {
+#[tokio::test]
+async fn produce_acks_zero_stays_silent_on_advertised_but_unsupported_version() {
     // ApiVersions advertises Produce min=0 (KAFKA-18659) while the firewall's real floor is 3
     // (SUPPORTED_RANGES). A spec-compliant client can legitimately send v0-2 with acks=0; the
     // firewall must not run before acks is decoded, or this silence contract breaks for exactly
@@ -797,7 +831,9 @@ fn produce_acks_zero_stays_silent_on_advertised_but_unsupported_version() {
     for version in 0i16..3 {
         let body = build_produce_legacy_request(version, 0, None, None);
         assert!(
-            handle_request(API_KEY_PRODUCE, version, body, &default_broker()).is_no_response(),
+            handle_request(API_KEY_PRODUCE, version, body, &default_broker())
+                .await
+                .is_no_response(),
             "Produce v{version} acks=0 must stay silent even though the firewall doesn't accept v{version}"
         );
     }
@@ -805,11 +841,12 @@ fn produce_acks_zero_stays_silent_on_advertised_but_unsupported_version() {
 
 // ── Metadata topic name echo (must not hardcode a placeholder topic name) ──
 
-#[test]
-fn metadata_v1_echoes_requested_topic_name_in_response() {
+#[tokio::test]
+async fn metadata_v1_echoes_requested_topic_name_in_response() {
     let topic = "orders";
     let request = build_metadata_legacy_request(&[topic]);
     let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
@@ -826,14 +863,15 @@ fn metadata_v1_echoes_requested_topic_name_in_response() {
 
 // ── Metadata (spec + SCOPE.md coverage) ─────────────────────────────────────
 
-#[test]
-fn metadata_v0_empty_topics_returns_zero_length_topic_array() {
+#[tokio::test]
+async fn metadata_v0_empty_topics_returns_zero_length_topic_array() {
     let body = handle_request(
         API_KEY_METADATA,
         0,
         build_metadata_legacy_request(&[]),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _brokers = d.read_i32().unwrap();
@@ -844,27 +882,29 @@ fn metadata_v0_empty_topics_returns_zero_length_topic_array() {
     assert_eq!(d.remaining(), 0);
 }
 
-#[test]
-fn metadata_v3_includes_throttle_time_ms_before_brokers() {
+#[tokio::test]
+async fn metadata_v3_includes_throttle_time_ms_before_brokers() {
     let body = handle_request(
         API_KEY_METADATA,
         3,
         build_metadata_legacy_request_for_version(3, &[]),
         &default_broker(),
     )
+    .await
     .expect_response("metadata v3 empty topics must succeed");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0, "throttle_time_ms");
 }
 
-#[test]
-fn metadata_v9_flexible_empty_topics_returns_zero_topics() {
+#[tokio::test]
+async fn metadata_v9_flexible_empty_topics_returns_zero_topics() {
     let body = handle_request(
         API_KEY_METADATA,
         9,
         build_metadata_flexible_request(&[]),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     d.read_i32().unwrap(); // throttle
@@ -886,8 +926,8 @@ fn metadata_v9_flexible_empty_topics_returns_zero_topics() {
     assert_eq!(topic_count, 0);
 }
 
-#[test]
-fn metadata_v9_flexible_echoes_each_requested_topic_name() {
+#[tokio::test]
+async fn metadata_v9_flexible_echoes_each_requested_topic_name() {
     let topics = ["orders", "payments", "inventory"];
     let body = handle_request(
         API_KEY_METADATA,
@@ -895,6 +935,7 @@ fn metadata_v9_flexible_echoes_each_requested_topic_name() {
         build_metadata_flexible_request(&topics),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
 
     let mut d = Decoder::new(body);
@@ -951,8 +992,8 @@ fn metadata_v9_flexible_echoes_each_requested_topic_name() {
     );
 }
 
-#[test]
-fn metadata_v1_legacy_multiple_topics_echo_names() {
+#[tokio::test]
+async fn metadata_v1_legacy_multiple_topics_echo_names() {
     let topics = ["alpha", "beta"];
     let body = handle_request(
         API_KEY_METADATA,
@@ -960,6 +1001,7 @@ fn metadata_v1_legacy_multiple_topics_echo_names() {
         build_metadata_legacy_request(&topics),
         &default_broker(),
     )
+    .await
     .expect_response("test request has acks != 0 and expects a response");
 
     let mut d = Decoder::new(body);

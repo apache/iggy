@@ -127,7 +127,9 @@ impl<P: Provider> FileConfigProvider<P> {
         self
     }
 
-    fn reject_unknown_env_names(&self) -> Result<(), ConfigurationError> {
+    /// Debug builds refuse to boot on an unknown name, so CI and local runs
+    /// catch a stray or misspelled variable. Release builds warn and ignore it.
+    fn check_unknown_env_names(&self) -> Result<(), ConfigurationError> {
         let Some(known) = &self.known_env_names else {
             return Ok(());
         };
@@ -137,15 +139,24 @@ impl<P: Provider> FileConfigProvider<P> {
             known,
             self.allowed_env_prefixes,
         );
-        for name in &unknown {
-            eprintln!("Unknown configuration environment variable '{name}'. Unset it to boot.");
+        if unknown.is_empty() {
+            return Ok(());
         }
-        let rejected = !unknown.is_empty();
-        if rejected {
-            Err(ConfigurationError::InvalidConfigurationValue)
+        // Config load runs before the logger is configured, so a `warn!` record
+        // can be filtered by `RUST_LOG` or lost when boot fails before `late_init`.
+        let refuse = cfg!(debug_assertions);
+        let remedy = if refuse {
+            "Unset it to boot."
         } else {
-            Ok(())
+            "It will be ignored."
+        };
+        for name in &unknown {
+            eprintln!("Unknown configuration environment variable '{name}'. {remedy}");
         }
+        if refuse {
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        Ok(())
     }
 
     fn reject_relocated_keys(&self) -> Result<(), ConfigurationError> {
@@ -194,7 +205,7 @@ impl<P: Provider + Clone> ConfigProvider for FileConfigProvider<P> {
         // below is just as silent about a key no field reads, and the
         // pure-env container never touches the file branch at all.
         self.reject_relocated_keys()?;
-        self.reject_unknown_env_names()?;
+        self.check_unknown_env_names()?;
 
         // Start with the default configuration if provided
         let mut config_builder = Figment::new();
@@ -429,6 +440,7 @@ mod tests {
             "IGGY_CONNECTORS_STATE_PATH",
             "IGGY_MCP_CONFIG_PATH",
             "IGGY_MCP_TRANSPORT",
+            "IGGY_KAFKA_BIND_ADDR",
             "IGGY_HOME",
             "IGGY_USERNAME",
             "IGGY_PASSWORD",
@@ -457,17 +469,60 @@ mod tests {
     }
 
     /// `main.rs` loads a `.env` through `dotenvy` before `load_config` runs, and
-    /// `dotenvy` injects into the process environment that `reject_unknown_env_names`
+    /// `dotenvy` injects into the process environment that `check_unknown_env_names`
     /// scans with `env::vars_os()`. So the fence does not need a shared container
     /// or a shared `env_file`: a `.env` in the working directory is enough.
-    ///
-    /// Mutates the process environment, so it must not run beside another test
-    /// that reads it.
+    #[test]
+    fn given_a_dotenv_with_a_connectors_variable_when_loading_then_the_server_should_boot() {
+        let unknown = server_unknown_env_names(&["IGGY_CONNECTORS_CONFIG_PATH"]);
+
+        assert!(
+            unknown.is_empty(),
+            "a .env naming the connectors runtime's own config path refuses server boot, with no opt-out and a message that names no remedy"
+        );
+    }
+
+    /// The server reads these variables outside its config, so the boot check
+    /// must accept them. Without the `SERVER_PROCESS_ENV_VARS` chain in
+    /// `ServerConfig::config_provider`, a debug build refuses to boot.
+    #[test]
+    fn given_the_server_process_variables_when_checking_then_the_server_should_boot() {
+        let unknown =
+            server_unknown_env_names(crate::server_config::server::SERVER_PROCESS_ENV_VARS);
+
+        assert!(
+            unknown.is_empty(),
+            "the boot check must accept every variable the server reads outside its config, got: {unknown:?}"
+        );
+    }
+
+    /// Runs the boot check's filter over `candidates` with the real server
+    /// wiring, and without reading the ambient environment.
+    fn server_unknown_env_names(candidates: &[&str]) -> Vec<String> {
+        let provider =
+            crate::server_config::server::ServerConfig::config_provider("nonexistent-config.toml");
+        let known = provider
+            .known_env_names
+            .as_ref()
+            .expect("the server provider declares its known env names");
+
+        unknown_env_names(
+            names(candidates).into_iter(),
+            provider.env_prefix,
+            known,
+            provider.allowed_env_prefixes,
+        )
+    }
+
     #[test]
     #[serial_test::serial]
-    fn given_a_dotenv_with_a_connectors_variable_when_loading_then_the_server_should_boot() {
-        // SAFETY: single-threaded assertion over a variable no other test reads.
-        unsafe { std::env::set_var("IGGY_CONNECTORS_CONFIG_PATH", "/etc/iggy/connectors.toml") };
+    fn given_an_unknown_env_var_when_checking_then_only_debug_builds_should_refuse() {
+        const PREFIX: &str = "IGGY_FILE_PROVIDER_TEST_";
+        const UNKNOWN: &str = "IGGY_FILE_PROVIDER_TEST_UNKNOWN";
+        // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+        // against any concurrent environment access. `serial_test::serial` on
+        // this test is what prevents that.
+        unsafe { std::env::set_var(UNKNOWN, "1") };
 
         let provider = FileConfigProvider::new(
             "nonexistent-config.toml".to_string(),
@@ -475,17 +530,17 @@ mod tests {
             false,
             None,
         )
-        .with_relocated_keys("IGGY_", &[])
-        .with_known_env_names(crate::server_config::server::SERVER_PROCESS_ENV_VARS.to_vec())
-        .with_allowed_env_prefixes(crate::server_config::server::SERVER_ALLOWED_ENV_PREFIXES);
-        let rejected = provider.reject_unknown_env_names();
+        .with_relocated_keys(PREFIX, &[])
+        .with_known_env_names(Vec::new());
+        let checked = provider.check_unknown_env_names();
 
         // SAFETY: paired with the set above.
-        unsafe { std::env::remove_var("IGGY_CONNECTORS_CONFIG_PATH") };
+        unsafe { std::env::remove_var(UNKNOWN) };
 
-        assert!(
-            rejected.is_ok(),
-            "a .env naming the connectors runtime's own config path refuses server boot, with no opt-out and a message that names no remedy"
+        assert_eq!(
+            checked.is_err(),
+            cfg!(debug_assertions),
+            "an unknown variable must refuse boot in debug builds and only warn in release builds"
         );
     }
 
