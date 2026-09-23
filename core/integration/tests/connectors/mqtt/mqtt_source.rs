@@ -15,28 +15,123 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connectors::fixtures::MqttFixture;
+use crate::connectors::fixtures::{
+    Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture, Mqtt311Qos0Fixture, Mqtt311Qos1Fixture,
+    Mqtt311Qos2Fixture,
+};
 use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
 use serde_json::Value;
+use std::future::Future;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
-const MQTT_PAYLOAD: &[u8] = b"mqtt5-qos1-integration";
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn mqtt5_qos1_messages_are_persisted_to_iggy(harness: &TestHarness, fixture: MqttFixture) {
+async fn mqtt311_qos0_messages_are_persisted_to_iggy(
+    harness: &TestHarness,
+    fixture: Mqtt311Qos0Fixture,
+) {
+    assert_message_is_persisted(
+        harness,
+        fixture.publish(b"mqtt311-qos0-integration"),
+        b"mqtt311-qos0-integration",
+    )
+    .await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt311_qos1_messages_are_persisted_to_iggy(
+    harness: &TestHarness,
+    fixture: Mqtt311Qos1Fixture,
+) {
+    assert_message_is_persisted(
+        harness,
+        fixture.publish(b"mqtt311-qos1-integration"),
+        b"mqtt311-qos1-integration",
+    )
+    .await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt311_qos2_messages_are_persisted_to_iggy(
+    harness: &TestHarness,
+    fixture: Mqtt311Qos2Fixture,
+) {
+    assert_message_is_persisted(
+        harness,
+        fixture.publish(b"mqtt311-qos2-integration"),
+        b"mqtt311-qos2-integration",
+    )
+    .await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt5_qos0_messages_are_persisted_to_iggy(
+    harness: &TestHarness,
+    fixture: Mqtt5Qos0Fixture,
+) {
+    assert_message_is_persisted(
+        harness,
+        fixture.publish(b"mqtt5-qos0-integration"),
+        b"mqtt5-qos0-integration",
+    )
+    .await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt5_qos1_messages_are_persisted_to_iggy(
+    harness: &TestHarness,
+    fixture: Mqtt5Qos1Fixture,
+) {
+    assert_message_is_persisted(
+        harness,
+        fixture.publish(b"mqtt5-qos1-integration"),
+        b"mqtt5-qos1-integration",
+    )
+    .await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt5_qos2_messages_are_persisted_to_iggy(
+    harness: &TestHarness,
+    fixture: Mqtt5Qos2Fixture,
+) {
+    assert_message_is_persisted(
+        harness,
+        fixture.publish(b"mqtt5-qos2-integration"),
+        b"mqtt5-qos2-integration",
+    )
+    .await;
+}
+
+async fn assert_message_is_persisted<F>(harness: &TestHarness, publish: F, payload: &[u8])
+where
+    F: Future<Output = Result<(), String>>,
+{
     wait_for_source_running(harness).await;
-    fixture
-        .publish_qos_one(MQTT_PAYLOAD)
-        .await
-        .expect("MQTT publish should complete");
+    publish.await.expect("MQTT publish should complete");
 
     let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
@@ -59,7 +154,7 @@ async fn mqtt5_qos1_messages_are_persisted_to_iggy(harness: &TestHarness, fixtur
                 && let Some(message) = polled
                     .messages
                     .into_iter()
-                    .find(|message| message.payload.as_ref() == MQTT_PAYLOAD)
+                    .find(|message| message.payload.as_ref() == payload)
             {
                 return message;
             }
@@ -69,7 +164,7 @@ async fn mqtt5_qos1_messages_are_persisted_to_iggy(harness: &TestHarness, fixtur
     .await
     .expect("MQTT message should be persisted to Iggy");
 
-    assert_eq!(received.payload.as_ref(), MQTT_PAYLOAD);
+    assert_eq!(received.payload.as_ref(), payload);
 }
 
 async fn wait_for_source_running(harness: &TestHarness) {
