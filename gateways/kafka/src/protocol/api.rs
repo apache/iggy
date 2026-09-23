@@ -88,6 +88,13 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// applies, so every non-empty `configs` list is rejected outright rather than silently dropping
 /// a subset an operator might believe took effect.
 pub const ERROR_INVALID_CONFIG: i16 = 40;
+/// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
+///
+/// Real brokers send this for an old-message-format log; this bridge sends it for any timestamp
+/// other than the two KIP-79 sentinels, since Iggy has no per-message timestamp index at all.
+/// Non-retriable, so a Java client resolves immediately instead of retrying
+/// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
+pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]

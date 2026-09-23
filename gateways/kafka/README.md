@@ -119,11 +119,11 @@ a detached background task specifically so that dropping the awaiting future - w
 does on expiry - cannot abort it mid-flight. A timed-out call can leave that task holding the
 shared client's connection lock for up to another 30s (the SDK's own reply deadline), queuing
 every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
-Concurrency ceiling below), so this only matters once concurrent Kafka connections share a bridge
-
-- tolerable today only because nothing calls this bridge from a live handler yet; must be resolved
-before `#3535`/`#3536`. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't
-a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
+Concurrency ceiling below) and no semaphore bounding concurrent bridge calls - no longer a
+hypothetical now that ListOffsets (`#3537`) calls it from a real handler; more pressing once
+CreateTopics (`#3538`), Metadata (`#3534`), Produce (`#3535`) and Fetch (`#3536`) add their own
+concurrent callers. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't a
+followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
 
 ### Topic mapping
 
