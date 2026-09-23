@@ -72,11 +72,13 @@ const RECONNECTION_RETRIES: u32 = 3;
 /// so no finite value here can guarantee catching it. That same unboundedness is why this timeout
 /// cannot simply be dropped for post-connect calls either: [`IggyBridge`] holds one `IggyClient`
 /// with no pooling, so an unbounded reconnect dial with nothing here to stop it would wedge every
-/// later call on this bridge, not just the one that triggered it. Tolerable only because nothing
-/// calls this bridge from a live Kafka handler yet - closing it needs either a cooperatively
+/// later call on this bridge, not just the one that triggered it. No longer a hypothetical: since
+/// `ListOffsets` (#3537) this bridge is called from a live Kafka handler, with no semaphore
+/// bounding concurrent bridge calls. Closing the underlying gap needs either a cooperatively
 /// cancellable SDK call or a deadline on the SDK's own reconnect dial, neither of which this
-/// bridge can add from the outside. Must be resolved before #3535/#3536 share this client across
-/// concurrent connections.
+/// bridge can add from the outside; bounding concurrent bridge calls is a separate, addressable
+/// fix that becomes more pressing as `CreateTopics` and `Metadata` (#3538/#3534) add more live
+/// callers.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`]. See that constant's doc for why every
