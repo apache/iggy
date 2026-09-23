@@ -45,7 +45,8 @@
 
 use async_trait::async_trait;
 use iggy_connector_sdk::retry::{
-    CircuitBreaker, RetryPolicy, build_retry_client, check_connectivity_with_retry, parse_duration,
+    CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
+    parse_duration,
 };
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
@@ -288,16 +289,16 @@ impl Source for TemplateSource {
                 health_url,
                 CONNECTOR_NAME,
                 self.id,
-                RetryPolicy {
-                    max_attempts: self
+                &ConnectivityConfig {
+                    max_open_retries: self
                         .config
                         .max_open_retries
                         .unwrap_or(DEFAULT_MAX_OPEN_RETRIES),
-                    base_delay: self.retry_delay,
-                    max_delay: parse_duration(
+                    open_retry_max_delay: parse_duration(
                         self.config.open_retry_max_delay.as_deref(),
                         DEFAULT_OPEN_RETRY_MAX_DELAY,
                     ),
+                    retry_delay: self.retry_delay,
                 },
             )
             .await?;
