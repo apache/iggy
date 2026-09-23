@@ -27,8 +27,8 @@ use std::time::Duration;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-pub(super) async fn can_connect(broker_url: &str) -> bool {
-    connect_mqtt5(broker_url).await.is_ok()
+pub(super) async fn can_connect(broker_url: &str, username: &str, password: &str) -> bool {
+    connect_mqtt5(broker_url, username, password).await.is_ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,10 +43,14 @@ pub(super) async fn publish(
     protocol: Protocol,
     qos: u8,
     payload: &[u8],
+    username: &str,
+    password: &str,
 ) -> Result<(), String> {
     match protocol {
-        Protocol::Mqtt311 => publish_mqtt311(broker_url, topic, qos, payload).await,
-        Protocol::Mqtt5 => publish_mqtt5(broker_url, topic, qos, payload).await,
+        Protocol::Mqtt311 => {
+            publish_mqtt311(broker_url, topic, qos, payload, username, password).await
+        }
+        Protocol::Mqtt5 => publish_mqtt5(broker_url, topic, qos, payload, username, password).await,
     }
 }
 
@@ -55,8 +59,10 @@ async fn publish_mqtt311(
     topic: &str,
     qos: u8,
     payload: &[u8],
+    username: &str,
+    password: &str,
 ) -> Result<(), String> {
-    let (client, mut event_loop) = connect_mqtt311(broker_url).await?;
+    let (client, mut event_loop) = connect_mqtt311(broker_url, username, password).await?;
     client
         .publish(topic, qos311(qos)?, false, payload.to_vec())
         .await
@@ -70,8 +76,10 @@ async fn publish_mqtt5(
     topic: &str,
     qos: u8,
     payload: &[u8],
+    username: &str,
+    password: &str,
 ) -> Result<(), String> {
-    let (client, mut event_loop) = connect_mqtt5(broker_url).await?;
+    let (client, mut event_loop) = connect_mqtt5(broker_url, username, password).await?;
     client
         .publish(topic, qos5(qos)?, false, payload.to_vec())
         .await
@@ -154,7 +162,11 @@ async fn wait_for_mqtt5_publish(
     .map_err(|_| format!("timed out waiting for MQTT 5 QoS {qos} completion"))?
 }
 
-async fn connect_mqtt311(broker_url: &str) -> Result<(Mqtt311Client, rumqttc::EventLoop), String> {
+async fn connect_mqtt311(
+    broker_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<(Mqtt311Client, rumqttc::EventLoop), String> {
     let url =
         url::Url::parse(broker_url).map_err(|error| format!("invalid MQTT broker URL: {error}"))?;
     let host = url
@@ -168,6 +180,7 @@ async fn connect_mqtt311(broker_url: &str) -> Result<(Mqtt311Client, rumqttc::Ev
         host,
         port,
     );
+    options.set_credentials(username, password);
     options.set_keep_alive(Duration::from_secs(5));
     let (client, mut event_loop) = Mqtt311Client::new(options, 10);
 
@@ -188,7 +201,11 @@ async fn connect_mqtt311(broker_url: &str) -> Result<(Mqtt311Client, rumqttc::Ev
     Ok((client, event_loop))
 }
 
-async fn connect_mqtt5(broker_url: &str) -> Result<(Mqtt5Client, rumqttc::v5::EventLoop), String> {
+async fn connect_mqtt5(
+    broker_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<(Mqtt5Client, rumqttc::v5::EventLoop), String> {
     let url =
         url::Url::parse(broker_url).map_err(|error| format!("invalid MQTT broker URL: {error}"))?;
     let host = url
@@ -202,6 +219,7 @@ async fn connect_mqtt5(broker_url: &str) -> Result<(Mqtt5Client, rumqttc::v5::Ev
         host,
         port,
     );
+    options.set_credentials(username, password);
     options.set_keep_alive(Duration::from_secs(5));
     let (client, mut event_loop) = Mqtt5Client::new(options, 10);
 
