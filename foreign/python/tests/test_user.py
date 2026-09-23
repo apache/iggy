@@ -45,8 +45,10 @@ from .utils import (
 NEVER_EXPIRE = 18446744073709551615
 
 
-def mint_personal_access_token(name: str) -> str:
+@pytest.fixture
+def personal_access_token(unique_name):
     """Mint a PAT via HTTP so login tests do not need the Python create API."""
+    name = unique_name(min_bytes=16, max_bytes=30)
     host, port = get_http_server_config()
     api = f"http://{host}:{port}"
     login_req = urllib.request.Request(  # noqa: S310
@@ -55,7 +57,7 @@ def mint_personal_access_token(name: str) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(login_req) as response:  # noqa: S310
+    with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
         jwt = json.loads(response.read())["access_token"]["token"]
     create_req = urllib.request.Request(  # noqa: S310
         f"{api}/personal-access-tokens",
@@ -66,8 +68,18 @@ def mint_personal_access_token(name: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(create_req) as response:  # noqa: S310
-        return json.loads(response.read())["token"]
+    with urllib.request.urlopen(create_req, timeout=10) as response:  # noqa: S310
+        token = json.loads(response.read())["token"]
+    try:
+        yield token
+    finally:
+        delete_req = urllib.request.Request(  # noqa: S310
+            f"{api}/personal-access-tokens/{name}",
+            headers={"Authorization": f"Bearer {jwt}"},
+            method="DELETE",
+        )
+        with urllib.request.urlopen(delete_req, timeout=10):  # noqa: S310
+            pass
 
 
 class TestCreateUser:
@@ -265,21 +277,20 @@ class TestLoginIdentity:
         assert identity.access_token is None
 
     @pytest.mark.asyncio
-    async def test_login_with_personal_access_token(self, unique_name):
+    async def test_login_with_personal_access_token(self, personal_access_token):
         """Test PAT login with a token minted out of band."""
-        raw = mint_personal_access_token(unique_name(min_bytes=3, max_bytes=30))
         host, port = get_server_config()
         client = IggyClient(f"{host}:{port}")
         await client.connect()
 
-        identity = await client.login_with_personal_access_token(raw)
+        identity = await client.login_with_personal_access_token(personal_access_token)
 
         assert isinstance(identity, IdentityInfo)
         assert identity.access_token is None
         user = await client.get_user("iggy")
         assert user is not None
         assert identity.user_id == user.id
-        assert raw not in repr(identity)
+        assert personal_access_token not in repr(identity)
 
 
 class TestGetUser:
