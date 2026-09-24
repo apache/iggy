@@ -22,8 +22,7 @@ use crate::storage::build_storage_options;
 use async_trait::async_trait;
 use deltalake::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    owned_value_to_serde_json,
+    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, owned_value_to_serde_json,
 };
 use tracing::{debug, error, info};
 
@@ -134,21 +133,7 @@ impl Sink for DeltaSink {
             messages_metadata.current_offset,
         );
 
-        // Extract JSON values from consumed messages
-        let mut json_values: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
-        for msg in &messages {
-            match &msg.payload {
-                Payload::Json(simd_value) => {
-                    json_values.push(owned_value_to_serde_json(simd_value));
-                }
-                other => {
-                    error!(
-                        "Unsupported payload type: {other}. Delta sink only supports JSON payloads."
-                    );
-                    return Err(Error::InvalidPayloadType);
-                }
-            }
-        }
+        let mut json_values = json_values(&messages)?;
 
         if json_values.is_empty() {
             debug!("No JSON values to write");
@@ -209,5 +194,67 @@ impl Sink for DeltaSink {
         }
         info!("Delta Lake sink connector with ID: {} is closed.", self.id);
         Ok(())
+    }
+}
+
+/// Every message's JSON document as a serde value, or the batch error for a
+/// payload that has none. Proto text holding JSON is the descriptor-less
+/// `proto_convert` fallback and is written as the document it holds; proto
+/// text that is not JSON fails the batch like any other non-JSON payload.
+fn json_values(messages: &[ConsumedMessage]) -> Result<Vec<serde_json::Value>, Error> {
+    let mut json_values = Vec::with_capacity(messages.len());
+    for message in messages {
+        let Some(document) = message.payload.json_document() else {
+            error!(
+                "Unsupported payload type: {}. Delta sink only supports JSON payloads.",
+                message.payload
+            );
+            return Err(Error::InvalidPayloadType);
+        };
+        json_values.push(owned_value_to_serde_json(document.as_ref()));
+    }
+    Ok(json_values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_values;
+    use iggy_connector_sdk::{ConsumedMessage, Error, Payload};
+
+    fn message(payload: Payload) -> ConsumedMessage {
+        ConsumedMessage {
+            id: 1,
+            offset: 0,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn json_values_parses_proto_text_that_is_json() {
+        let messages = vec![
+            message(Payload::Json(simd_json::json!({"id": 1}))),
+            message(Payload::Proto(r#"{"id": 2}"#.to_owned())),
+        ];
+
+        let values = json_values(&messages).expect("proto text holding JSON is a document");
+
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]
+        );
+    }
+
+    #[test]
+    fn json_values_rejects_proto_text_that_is_not_json() {
+        let messages = vec![message(Payload::Proto("id: 2".to_owned()))];
+
+        assert_eq!(
+            json_values(&messages).expect_err("proto text that is not JSON has no document"),
+            Error::InvalidPayloadType
+        );
     }
 }
