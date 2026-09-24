@@ -18,6 +18,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use kafka_protocol::error::ResponseError;
+use tokio::sync::Semaphore;
 
 use crate::bridge::IggyBridge;
 use crate::protocol::handlers::{
@@ -35,53 +37,62 @@ pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
 /// Generic catch-all. Not sent by any stub response today; the `bridge` module's error mapping
 /// uses it for an `IggyError` with no closer Kafka analogue.
-pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
+pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = ResponseError::UnknownServerError.code();
 pub const ERROR_NONE: i16 = 0;
-pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-/// Retriable; Produce stub uses this until the Iggy bridge persists records.
-pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
-/// `bridge`'s mapping for `IggyError::TransientNotCommitted`: the request's outcome is genuinely
-/// unknown (neither confirmed applied nor confirmed rejected).
-///
-/// Retriable in real Kafka too (`TimeoutException extends RetriableException`; the Java producer's
-/// `Sender.canRetry` treats it the same as `NOT_LEADER_OR_FOLLOWER`) - this is not chosen to make
-/// clients stop retrying. It is chosen because it is the code a real broker sends for the same
-/// unknown-outcome shape (an ack that timed out with no confirmation either way), and Kafka has no
-/// dedicated "outcome unknown, retry could duplicate" code. The duplicate-write risk on retry is
-/// real regardless of which retriable code is sent; it closes only once `#3535` has an idempotent
-/// produce path, not by picking a different error code here.
-pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
+pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = ResponseError::UnknownTopicOrPartition.code();
+/// Retriable, nothing written. The Produce stub, and a partition refused only because earlier
+/// partitions used the request budget.
+pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = ResponseError::NotLeaderOrFollower.code();
+/// Outcome unknown: the write may have landed. Retriable, so a retry can duplicate it.
+/// Idempotent produce (#3545) closes that.
+pub const ERROR_REQUEST_TIMED_OUT: i16 = ResponseError::RequestTimedOut.code();
+/// Produce: a record, send or partition too large, even alone. Not retried as-is. Java splits a
+/// multi-record batch and sends the halves.
+pub const ERROR_MESSAGE_TOO_LARGE: i16 = ResponseError::MessageTooLarge.code();
 /// `bridge`'s mapping for a Kafka-side topic name that fails Kafka's own naming rules.
 ///
 /// Empty, whitespace-padded, over 249 bytes, or outside `[A-Za-z0-9._-]`, checked before any Iggy
 /// call is made - a real Kafka client library validates topic names client-side and would never
 /// send one of these, but a raw/non-conformant client could.
-pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
+pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = ResponseError::InvalidTopicException.code();
+/// Produce: `acks` is not 0, 1 or -1. A conformant client never sends one, since `acks` comes
+/// from validated configuration rather than from application input.
+pub const ERROR_INVALID_REQUIRED_ACKS: i16 = ResponseError::InvalidRequiredAcks.code();
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
 /// misstate the failure point. Not sent by any stub response today.
-pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
-pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
+pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = ResponseError::TopicAuthorizationFailed.code();
+pub const ERROR_UNSUPPORTED_VERSION: i16 = ResponseError::UnsupportedVersion.code();
 /// `bridge`'s mapping for `BridgeError::PartitionCountMismatch`: the topic exists, just not with
 /// the requested partition count.
 ///
 /// Not [`ERROR_INVALID_PARTITIONS`] - `kafka-protocol`'s own error table (`error.rs`) defines that
 /// code's text as "Number of partitions is below 1", which is a different condition (a client
 /// asking for zero/negative partitions) than "this topic already exists with a different count".
-pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
-pub const ERROR_INVALID_PARTITIONS: i16 = 37;
-pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = ResponseError::TopicAlreadyExists.code();
+pub const ERROR_INVALID_PARTITIONS: i16 = ResponseError::InvalidPartitions.code();
+pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = ResponseError::InvalidReplicationFactor.code();
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
-pub const ERROR_NOT_CONTROLLER: i16 = 41;
-pub const ERROR_INVALID_REQUEST: i16 = 42;
+pub const ERROR_NOT_CONTROLLER: i16 = ResponseError::NotController.code();
+pub const ERROR_INVALID_REQUEST: i16 = ResponseError::InvalidRequest.code();
 /// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
 ///
 /// Real brokers send this for an old-message-format log; this bridge sends it for any timestamp
 /// other than the two KIP-79 sentinels, since Iggy has no per-message timestamp index at all.
 /// Non-retriable, so a Java client resolves immediately instead of retrying
 /// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
-pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 =
+    ResponseError::UnsupportedForMessageFormat.code();
+/// Produce: zstd before v7.
+pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 =
+    ResponseError::UnsupportedCompressionType.code();
+/// Produce: a record or batch this gateway cannot map.
+///
+/// Not `CORRUPT_MESSAGE` (2), whose text fits but which `kafka-protocol`'s table marks
+/// retriable, so a client would resend a batch that can never decode. A client older than Kafka
+/// 2.4 reads 87 as a generic server error, which is still terminal and still better than a loop.
+pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -168,7 +179,12 @@ pub struct GatewayState {
     pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
     pub max_frame_size: usize,
+    /// Produce requests that decode and send at once. Caps their memory.
+    pub(crate) produce_slots: Semaphore,
 }
+
+/// Four request budgets, about 160 MB at the default 8 MiB frame. Sends run one at a time anyway.
+const PRODUCE_SLOTS: usize = 4;
 
 impl GatewayState {
     #[must_use]
@@ -181,6 +197,7 @@ impl GatewayState {
             broker,
             bridge,
             max_frame_size,
+            produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
         }
     }
 

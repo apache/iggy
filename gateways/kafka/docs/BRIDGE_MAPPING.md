@@ -157,10 +157,9 @@ A record takes the fallback when any of these hold:
 - a header value is null, empty, or longer than 255 bytes
 - the headers together would exceed the 100 KB user-header budget
 
-A repeated header name belonged on that list and is not reachable. Kafka allows one, but
-`kafka_protocol` decodes headers into an `IndexMap` and inserts each in turn (`records.rs:919`),
-so a repeat overwrites its earlier entry before any gateway code runs. The last value wins and
-the record takes the native path. Catching the case needs a decoder this gateway does not have.
+A repeated header name is refused with `INVALID_RECORD` (87). Kafka allows one, but
+`kafka_protocol` decodes headers into an `IndexMap` and keeps only the last value. The gateway
+checks the raw record bytes first (`scan_records`).
 
 Such a record is stored with a `kafka.envelope` header whose value is one byte, the byte layout
 version, currently `1`. The payload holds the key, the value and the headers in the layout below.
@@ -238,9 +237,9 @@ bounded here, in different places, because no single place can see them both.
 
 The batch header's record count sits in the header, and `RecordBatchDecoder` reserves a `Vec` from
 it (`kafka-protocol-0.18.0/src/records.rs:517`). A 61-byte batch declaring `i32::MAX` records asks
-for 377 GB. Produce reads every batch header before it decodes a record and refuses a count the
-blob cannot produce. That ceiling is the blob's own length. If something in the blob is
-compressed, the decompression budget is added to it. An uncompressed batch's records are already
+for 377 GB. Produce reads the batch header before it decodes a record and refuses a count the
+blob cannot produce. That ceiling is the blob's own length. If the batch is compressed, the whole
+decompression budget is added to it. An uncompressed batch's records are already
 in the blob, and granting it the budget as well lets a 70-byte batch declare a million records.
 
 The per-record header count sits inside a record body, as a varint, so no batch header reports it
@@ -251,8 +250,12 @@ headers aborts the process. Produce therefore walks the record bytes in the deco
 which runs for every batch including an uncompressed one. It refuses a header count the record's
 own bytes cannot hold, at two length varints per header.
 
-Neither bound changes the ratio between a minimal wire record and a decoded `Record`. A
-legitimate request of small records pays that ratio too.
+- One batch per partition, as Kafka from v3. A second one: 87.
+- More records than the batch declares: 87. The decoder would drop the extra ones.
+
+Neither bound changes the ratio between a wire record and a decoded `Record`. Produce therefore
+also caps record slots per request at `max_frame_size / 64` (131,072 for 8 MiB). Headers take 1
+slot per 3. Past it: 10, or 6 if earlier partitions used the slots and this one fits alone.
 
 Produce decompresses gzip, snappy, lz4 and zstd batches. `gateways/kafka/Cargo.toml` turns those
 four features on for `kafka-protocol` and the workspace entry stays on `broker` alone, so the
@@ -267,7 +270,8 @@ therefore still admit 4096 times that much output.
 
 Produce keeps a single decompression budget for the whole request, set to `max_frame_size`, so a
 compressed request can never yield more than the same client could have sent uncompressed. A
-batch that exhausts the budget is rejected with `MESSAGE_TOO_LARGE` (10). Each decompressed
+partition over the whole budget: `MESSAGE_TOO_LARGE` (10). One that fits alone after earlier
+partitions used the budget: `NOT_LEADER_OR_FOLLOWER` (6). Each decompressed
 record value has to clear Iggy's own `MAX_PAYLOAD_SIZE` (64 MB, `iggy_message.rs:44`) separately,
 since one record becomes one message.
 
@@ -281,10 +285,11 @@ write past the budget. Gzip, zstd and lz4 stream through that sink. Snappy is th
 states its output size up front, and `snap` reads that number without allocating. The declared
 size is charged before the decoder runs, for Kafka's own block framing and for raw snappy alike.
 
-`records::decode_batches` decompresses, and `records::DecompressionBudget` is the bound. The
-budget is a parameter, so setting it to `max_frame_size` for the whole request belongs to the
-Produce handler in [#3535](https://github.com/apache/iggy/issues/3535). Until that lands, nothing
-calls either one in a server path.
+`records::decode_batch` decompresses, and `records::DecompressionBudget` is the bound. The
+budget is a parameter, and the Produce handler
+([#3535](https://github.com/apache/iggy/issues/3535)) sets it to `max_frame_size` once per
+request. The handler converts and sends one entry at a time. It borrows the budget only in sync
+calls, because a borrow held across an await makes the connection task `!Send`.
 
 ## Offsets
 

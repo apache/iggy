@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use iggy::prelude::IggyByteSize;
 use secrecy::SecretString;
 use tracing::warn;
 
@@ -29,6 +30,8 @@ const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
 /// one field is safe. The password is a different story - see why there is no
 /// `DEFAULT_IGGY_PASSWORD` at [`IggyBridgeConfig::from_env`].
 const DEFAULT_IGGY_USERNAME: &str = "iggy";
+/// Iggy's default `message_bus.max_message_size`.
+pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Connection + topic-mapping config for [`IggyBridge`](crate::bridge::iggy_bridge::IggyBridge).
 ///
@@ -41,6 +44,8 @@ pub struct IggyBridgeConfig {
     pub username: String,
     pub password: SecretString,
     pub topic_mapping: TopicMapping,
+    /// Iggy's `message_bus.max_message_size`, in bytes. Larger partitions answer 10.
+    pub max_message_size: u64,
 }
 
 impl IggyBridgeConfig {
@@ -58,6 +63,7 @@ impl IggyBridgeConfig {
         "IGGY_KAFKA_IGGY_PASSWORD",
         "IGGY_KAFKA_IGGY_STREAM",
         "IGGY_KAFKA_TOPIC_MAP_PATH",
+        "IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE",
     ];
 
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
@@ -138,11 +144,26 @@ impl IggyBridgeConfig {
             )?
         };
 
+        let max_message_size = match std::env::var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE") {
+            Err(_) => DEFAULT_MAX_MESSAGE_SIZE,
+            Ok(value) => value
+                .parse::<IggyByteSize>()
+                .ok()
+                .map(|size| size.as_bytes_u64())
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| {
+                    BridgeError::InvalidConfig(format!(
+                        "IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE '{value}' is not a size, for example 64MiB"
+                    ))
+                })?,
+        };
+
         Ok(Self {
             address,
             username,
             password: SecretString::from(password),
             topic_mapping,
+            max_message_size,
         })
     }
 }
@@ -160,6 +181,7 @@ mod tests {
             password: SecretString::from("iggy"),
             topic_mapping: TopicMapping::new("kafka".to_string(), std::collections::HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -193,6 +215,7 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_IGGY_USERNAME");
             std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
             std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
+            std::env::remove_var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE");
         }
         let result = IggyBridgeConfig::from_env();
         unsafe {
@@ -200,6 +223,7 @@ mod tests {
         }
 
         let config = result.expect("valid config from documented defaults alone");
+        assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
         assert_eq!(config.address, "127.0.0.1:8090");
         assert_eq!(config.username, "iggy");
         assert_eq!(config.topic_mapping.default_stream(), "kafka");
@@ -209,6 +233,29 @@ mod tests {
             config.topic_mapping.resolve("anything"),
             ("kafka", "anything")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_iggy_message_size_cap() {
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+            std::env::set_var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE", "1MiB");
+        }
+        let one_mebibyte = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE", "lots");
+        }
+        let garbage = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE");
+        }
+
+        assert_eq!(one_mebibyte.unwrap().max_message_size, 1024 * 1024);
+        assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
     }
 
     #[test]

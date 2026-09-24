@@ -23,6 +23,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iggy::prelude::{HeaderKey, HeaderValue, IggyError, IggyMessage, MAX_PAYLOAD_SIZE};
@@ -133,18 +134,32 @@ pub enum RecordCodecError {
     EnvelopeHeaderName,
     #[error("record batch is malformed: {0}")]
     Batch(String),
+    #[error("{0} record batches in one partition, Kafka allows 1")]
+    SeveralBatches(usize),
     #[error("batch declares {count} records, and {limit} bytes can hold fewer")]
     RecordCountTooLarge { count: i32, limit: usize },
+    #[error("batch declares {declared} records and holds {walked}")]
+    RecordCountMismatch { declared: usize, walked: usize },
     #[error("record declares {count} headers, and {limit} bytes can hold fewer")]
     HeaderCountTooLarge { count: i32, limit: usize },
     #[error("record batch ends inside a record")]
     RecordTruncated,
     #[error("record field declares {0} bytes")]
     RecordFieldLength(i32),
-    #[error("{0} batches are out of scope")]
-    UnsupportedBatch(&'static str),
-    #[error("decompressed {produced} bytes with {remaining} left in the request budget")]
-    BudgetExceeded { produced: usize, remaining: usize },
+    #[error("transactional batches are not supported")]
+    TransactionalBatch,
+    #[error("control batches are not supported")]
+    ControlBatch,
+    #[error("partition decompresses to {size} bytes, over the {limit} byte request budget")]
+    BudgetExceeded { size: usize, limit: usize },
+    #[error("partition needs {count} record slots, over the {limit} slot request budget")]
+    RecordBudgetExceeded { count: usize, limit: usize },
+    #[error("earlier partitions used the request budget, retry")]
+    RequestBudgetSpent,
+    #[error("zstd batch in a request older than Produce v7")]
+    ZstdTooEarly,
+    #[error("record repeats header name {0}")]
+    RepeatedHeaderName(String),
 }
 
 type Result<T> = std::result::Result<T, RecordCodecError>;
@@ -159,6 +174,9 @@ type Result<T> = std::result::Result<T, RecordCodecError>;
 /// Returns an error when the timestamp does not fit, when the envelope would exceed
 /// `MAX_PAYLOAD_SIZE`, or when Iggy rejects the message for a reason the envelope does not fix.
 pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
+    if let Some(value) = plain_value(record) {
+        return plain_message(value.clone(), record.timestamp);
+    }
     if needs_envelope(record) {
         return envelope_message(record);
     }
@@ -271,9 +289,7 @@ fn timestamp_out(message: &IggyMessage) -> i64 {
 
 /// Whether any field of `record` is one Iggy refuses to hold natively.
 ///
-/// A repeated header name is on the list in `BRIDGE_MAPPING.md` and is absent here, because
-/// `kafka_protocol` decodes headers into an `IndexMap` (`records.rs:919`). A repeat overwrites
-/// its earlier entry before this code runs, so the case cannot be observed.
+/// A repeated header name never reaches here: `scan_records` refuses it.
 fn needs_envelope(record: &Record) -> bool {
     let key_unholdable = record
         .key
@@ -288,6 +304,37 @@ fn needs_envelope(record: &Record) -> bool {
                 .as_ref()
                 .is_none_or(|value| value.is_empty() || value.len() > MAX_FIELD)
     })
+}
+
+/// The value, when `kafka.v` is the only header the record needs.
+fn plain_value(record: &Record) -> Option<&Bytes> {
+    if record.key.is_some() || !record.headers.is_empty() || record.timestamp == EPOCH_TIMESTAMP {
+        return None;
+    }
+    record.value.as_ref().filter(|value| !value.is_empty())
+}
+
+/// Reuses one encoded `kafka.v` header block, so the common record skips a map and an encode.
+///
+/// Static bytes: a clone touches no refcount shared across workers.
+fn plain_message(value: Bytes, timestamp: i64) -> Result<IggyMessage> {
+    static VERSION_ONLY: OnceLock<&'static [u8]> = OnceLock::new();
+    let headers = *VERSION_ONLY.get_or_init(|| {
+        let block = IggyMessage::builder()
+            .payload(Bytes::from_static(PLACEHOLDER))
+            .user_headers(gateway_headers(NO_TIMESTAMP))
+            .build()
+            .ok()
+            .and_then(|message| message.user_headers)
+            .unwrap_or_else(|| unreachable!("the kafka.v header always fits"));
+        Box::leak(block.to_vec().into_boxed_slice())
+    });
+    let mut message = IggyMessage::builder().payload(value).build()?;
+    message.header.user_headers_length =
+        u32::try_from(headers.len()).unwrap_or_else(|_| unreachable!("the kafka.v header is tiny"));
+    message.user_headers = Some(Bytes::from_static(headers));
+    message.header.origin_timestamp = timestamp_in(timestamp)?;
+    Ok(message)
 }
 
 /// Payload to store, and the marker naming what the original value was when it is not the payload.
@@ -582,47 +629,95 @@ fn header_value(value: &[u8]) -> HeaderValue {
 
 /// What one Produce request may decompress to, in total.
 ///
-/// Charged across every batch in the request, because one frame carries many batches and a cap
-/// applied to each on its own admits as many multiples of it as the frame holds entries.
-///
-/// The budget bounds the peak, not just the total. Every decompressor here writes through
-/// `BudgetedWriter`, which refuses the write that would pass the budget, so an over-budget frame
-/// never reaches its full decompressed size in memory.
+/// Charged across every partition in the request, so many partitions cannot each take it all.
+/// Writes go through `BudgetedWriter`, so an over-budget frame never inflates whole in memory.
 pub struct DecompressionBudget {
+    bytes: usize,
     remaining: Cell<usize>,
+    /// Records the request may decode. Each one costs a `Record` and an `IggyMessage` in memory.
+    records: usize,
+    records_remaining: Cell<usize>,
+    /// What the current partition charged. Tells "too large" (10) from "retry" (6).
+    entry_bytes: Cell<usize>,
+    entry_records: Cell<usize>,
     /// Why this module refused a batch, when it did. Everything this module reports from inside
     /// the decoder's decompression hook leaves as an `io::Error` or an `anyhow::Error`, which the
-    /// decoder stringifies, so the typed reason is parked here and taken by `decode_batches`.
+    /// decoder stringifies, so the typed reason is parked here and taken by `decode_batch`.
     reason: Cell<Option<RecordCodecError>>,
 }
 
 impl DecompressionBudget {
     #[must_use]
-    pub const fn new(bytes: usize) -> Self {
+    pub const fn new(bytes: usize, records: usize) -> Self {
         Self {
+            bytes,
             remaining: Cell::new(bytes),
+            records,
+            records_remaining: Cell::new(records),
+            entry_bytes: Cell::new(0),
+            entry_records: Cell::new(0),
             reason: Cell::new(None),
         }
     }
 
-    fn charge(&self, produced: usize) -> io::Result<()> {
-        let remaining = self.remaining.get();
-        if produced > remaining {
-            self.refuse(RecordCodecError::BudgetExceeded {
-                produced,
-                remaining,
-            });
-            return Err(io::Error::other(format!(
-                "decompressed {produced} bytes with {remaining} left in the budget"
-            )));
+    fn start_entry(&self) {
+        self.entry_bytes.set(0);
+        self.entry_records.set(0);
+    }
+
+    /// Takes `len` bytes if the request has them left.
+    fn take(&self, len: usize) -> bool {
+        let Some(remaining) = self.remaining.get().checked_sub(len) else {
+            return false;
+        };
+        self.remaining.set(remaining);
+        self.entry_bytes.set(self.entry_bytes.get() + len);
+        true
+    }
+
+    /// Takes `len` bytes at once, or refuses.
+    fn charge(&self, len: usize) -> io::Result<()> {
+        if self.take(len) {
+            return Ok(());
         }
-        self.remaining.set(remaining - produced);
+        self.check_alone(len)?;
+        Err(self.refuse(RecordCodecError::RequestBudgetSpent))
+    }
+
+    /// Refuses once this partition alone passes the budget. No retry can help it.
+    fn check_alone(&self, spilled: usize) -> io::Result<()> {
+        let size = self.entry_bytes.get().saturating_add(spilled);
+        if size > self.bytes {
+            return Err(self.refuse(RecordCodecError::BudgetExceeded {
+                size,
+                limit: self.bytes,
+            }));
+        }
         Ok(())
     }
 
-    /// Parks the typed reason for the error about to be raised through the hook.
-    fn refuse(&self, reason: RecordCodecError) {
+    fn charge_records(&self, count: usize) -> Result<()> {
+        let entry = self.entry_records.get().saturating_add(count);
+        let Some(remaining) = self.records_remaining.get().checked_sub(count) else {
+            return Err(if entry > self.records {
+                RecordCodecError::RecordBudgetExceeded {
+                    count: entry,
+                    limit: self.records,
+                }
+            } else {
+                RecordCodecError::RequestBudgetSpent
+            });
+        };
+        self.records_remaining.set(remaining);
+        self.entry_records.set(entry);
+        Ok(())
+    }
+
+    /// Parks the typed reason and returns the error the decoder stringifies.
+    fn refuse(&self, reason: RecordCodecError) -> io::Error {
+        let error = io::Error::other(reason.to_string());
         self.reason.set(Some(reason));
+        error
     }
 
     /// The typed reason for a decoder error, when this module is what caused it.
@@ -639,9 +734,11 @@ impl DecompressionBudget {
 /// An `io::Write` sink that stops at the budget rather than after it.
 ///
 /// Charging the output once it exists is too late: the decompressor has already allocated it.
+/// Past the budget it counts and drops the bytes, to tell "too large" (10) from "retry" (6).
 struct BudgetedWriter<'a> {
     out: BytesMut,
     budget: &'a DecompressionBudget,
+    spilled: usize,
 }
 
 impl<'a> BudgetedWriter<'a> {
@@ -649,14 +746,34 @@ impl<'a> BudgetedWriter<'a> {
         Self {
             out: BytesMut::new(),
             budget,
+            spilled: 0,
         }
+    }
+
+    /// Charges `len` bytes. `false` once past the budget: counted, not kept.
+    fn admit(&mut self, len: usize) -> io::Result<bool> {
+        if self.spilled == 0 && self.budget.take(len) {
+            return Ok(true);
+        }
+        self.spilled = self.spilled.saturating_add(len);
+        self.budget.check_alone(self.spilled)?;
+        Ok(false)
+    }
+
+    /// The output, or a refusal if any of it spilled.
+    fn into_output(self) -> io::Result<Bytes> {
+        if self.spilled > 0 {
+            return Err(self.budget.refuse(RecordCodecError::RequestBudgetSpent));
+        }
+        Ok(self.out.freeze())
     }
 }
 
 impl Write for BudgetedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.budget.charge(buf.len())?;
-        self.out.extend_from_slice(buf);
+        if self.admit(buf.len())? {
+            self.out.extend_from_slice(buf);
+        }
         Ok(buf.len())
     }
 
@@ -665,78 +782,99 @@ impl Write for BudgetedWriter<'_> {
     }
 }
 
-/// Decodes every record batch a Produce partition entry carries.
-///
-/// A partition's `records` field is one blob that holds one or more batches back to back, so
-/// this drains `buf` rather than reading a single batch.
+/// Whether a partition may hold zstd. Produce allows it from v7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zstd {
+    Allowed,
+    Refused,
+}
+
+/// Whether the first batch in `blob` is compressed. Byte 22 is the low byte of its attributes.
+#[must_use]
+pub fn is_compressed(blob: &[u8]) -> bool {
+    blob.get(22)
+        .is_some_and(|attributes| attributes & 0b111 != 0)
+}
+
+/// Decodes the one record batch a Produce partition carries.
 ///
 /// # Errors
 ///
-/// Returns an error when a batch is malformed, when it declares more records than the request
-/// can hold, when it is a control or transactional batch, or when the request decompresses to
-/// more than `budget` allows.
-pub fn decode_batches(buf: &mut Bytes, budget: &DecompressionBudget) -> Result<Vec<Record>> {
-    preflight(buf, budget)?;
-
-    let mut records = Vec::new();
-    while buf.has_remaining() {
-        let set = RecordBatchDecoder::decode_with_custom_compression(
-            buf,
-            Some(|compressed: &mut Bytes, compression| decompress(compressed, compression, budget)),
-        )
-        .map_err(|error| budget.reason(&error.to_string()))?;
-        records.extend(set.records);
+/// Returns an error when the blob holds more than one batch, when the batch is malformed or holds
+/// a record count other than the one it declares, when it is a control or transactional batch,
+/// when it is zstd and `zstd` refuses it, or when it passes `budget`.
+pub fn decode_batch(
+    buf: &mut Bytes,
+    budget: &DecompressionBudget,
+    zstd: Zstd,
+) -> Result<Vec<Record>> {
+    budget.start_entry();
+    preflight(buf, budget, zstd)?;
+    if !buf.has_remaining() {
+        return Ok(Vec::new());
     }
-    Ok(records)
+
+    let walked = Cell::new(0);
+    let set = RecordBatchDecoder::decode_with_custom_compression(
+        buf,
+        Some(
+            |compressed: &mut Bytes, compression| -> anyhow::Result<Bytes> {
+                let (records, count) = decompress(compressed, compression, budget)?;
+                walked.set(count);
+                Ok(records)
+            },
+        ),
+    )
+    .map_err(|error| budget.reason(&error.to_string()))?;
+    // The decoder stops at the declared count and drops the rest.
+    if set.records.len() != walked.get() {
+        return Err(RecordCodecError::RecordCountMismatch {
+            declared: set.records.len(),
+            walked: walked.get(),
+        });
+    }
+    Ok(set.records)
 }
 
-/// Reads the batch headers before anything decodes a record.
+/// Checks the batch header before anything decodes a record.
 ///
-/// `RecordBatchDecoder` reserves from the batch header's record count before it reads the first
-/// record (`kafka-protocol-0.18.0/src/records.rs:517`), and that count is checked for sign only.
-/// A 61-byte batch can therefore ask for `i32::MAX` records. The counts are charged against what
-/// the blob can produce, together rather than one batch at a time, because a blob holds many
-/// batches and each reserve lands in the same `Vec`. Reading the headers costs one `Bytes` clone,
-/// which is a refcount.
-///
-/// What the blob can produce is its own length, and the decompression budget on top only when
-/// something in it is compressed. An uncompressed batch's records are already in the blob, so
-/// granting it the budget as well would let a 70-byte batch declare a million records.
-///
-/// Control and transactional batches are refused in the same pass. `record()` cannot carry either
-/// flag, so a control batch admitted here would reach consumers as ordinary data, and consumers
-/// filter control records by exactly that flag.
-fn preflight(buf: &Bytes, budget: &DecompressionBudget) -> Result<()> {
-    let mut headers = buf.clone();
-    let infos = RecordBatchDecoder::decode_batch_info(&mut headers)
+/// - One batch per partition, as Kafka requires from Produce v3.
+/// - The decoder reserves from `record_count` (`kafka-protocol-0.18.0/src/records.rs:517`), so
+///   the count must fit the blob, plus the full budget when compressed.
+/// - Control and transactional batches are refused: a stored message cannot carry their flags.
+///   An idempotent batch passes, its producer id, epoch and sequence ignored, because a stock
+///   Java producer is idempotent. `IDEMPOTENCE.md` has why a retry is then not deduplicated.
+fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()> {
+    let infos = RecordBatchDecoder::decode_batch_info(&mut buf.clone())
         .map_err(|error| RecordCodecError::Batch(error.to_string()))?;
-
-    let compressed = infos
-        .iter()
-        .any(|info| info.compression != Compression::None);
-    let limit = if compressed {
-        buf.len().saturating_add(budget.remaining.get())
-    } else {
-        buf.len()
+    let info = match infos.as_slice() {
+        [] => return Ok(()),
+        [info] => info,
+        several => return Err(RecordCodecError::SeveralBatches(several.len())),
     };
-
-    let mut declared = 0usize;
-    for info in &infos {
-        if info.transactional {
-            return Err(RecordCodecError::UnsupportedBatch("transactional"));
-        }
-        if info.control {
-            return Err(RecordCodecError::UnsupportedBatch("control"));
-        }
-        declared = declared.saturating_add(usize::try_from(info.record_count).unwrap_or(0));
-        if declared.saturating_mul(MIN_RECORD_BYTES) > limit {
-            return Err(RecordCodecError::RecordCountTooLarge {
-                count: info.record_count,
-                limit,
-            });
-        }
+    if info.transactional {
+        return Err(RecordCodecError::TransactionalBatch);
     }
-    Ok(())
+    if info.control {
+        return Err(RecordCodecError::ControlBatch);
+    }
+    if zstd == Zstd::Refused && info.compression == Compression::Zstd {
+        return Err(RecordCodecError::ZstdTooEarly);
+    }
+
+    let limit = if info.compression == Compression::None {
+        buf.len()
+    } else {
+        buf.len().saturating_add(budget.bytes)
+    };
+    let declared = usize::try_from(info.record_count).unwrap_or(0);
+    if declared.saturating_mul(MIN_RECORD_BYTES) > limit {
+        return Err(RecordCodecError::RecordCountTooLarge {
+            count: info.record_count,
+            limit,
+        });
+    }
+    budget.charge_records(declared)
 }
 
 /// Encodes records as one uncompressed v2 batch.
@@ -808,11 +946,13 @@ fn batch_size(records: &[Record]) -> usize {
 ///
 /// The decoder calls this for every batch, uncompressed ones included, which is what makes it the
 /// one place that sees the record bytes before anything reserves from what they declare.
+///
+/// Returns the records and how many there are.
 fn decompress(
     compressed: &mut Bytes,
     compression: Compression,
     budget: &DecompressionBudget,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<(Bytes, usize)> {
     let body = compressed.copy_to_bytes(compressed.remaining());
     let mut writer = BudgetedWriter::new(budget);
     let records = match compression {
@@ -824,49 +964,46 @@ fn decompress(
             let mut decoder = flate2::write::GzDecoder::new(&mut writer);
             decoder.write_all(&body)?;
             decoder.finish()?;
-            writer.out.freeze()
+            writer.into_output()?
         }
         Compression::Zstd => {
             zstd::stream::copy_decode(body.as_ref(), &mut writer)?;
-            writer.out.freeze()
+            writer.into_output()?
         }
         Compression::Lz4 => {
             let mut decoder = lz4::Decoder::new(body.as_ref())?;
             io::copy(&mut decoder, &mut writer)?;
             decoder.finish().1?;
-            writer.out.freeze()
+            writer.into_output()?
         }
         Compression::Snappy => {
             inflate_snappy(&body, &mut writer)?;
-            writer.out.freeze()
+            writer.into_output()?
         }
     };
 
-    if let Err(reason) = scan_records(&records) {
-        let message = reason.to_string();
-        budget.refuse(reason);
-        anyhow::bail!(message);
+    match scan_records(&records, budget) {
+        Ok(count) => Ok((records, count)),
+        Err(reason) => Err(budget.refuse(reason).into()),
     }
-    Ok(records)
 }
 
-/// Walks the records of one batch and refuses a header count the record cannot hold.
+/// Headers that cost one record slot. A decoded header takes about a third of a slot's memory.
+const HEADERS_PER_SLOT: usize = 3;
+
+/// Walks the records of one batch before the decoder reserves for them.
 ///
-/// `kafka_protocol` reserves an `IndexMap` from each record's own header count
-/// (`kafka-protocol-0.18.0/src/records.rs:896`), which is checked there for sign alone. That
-/// count is a varint inside a record body, so no batch header reports it and `preflight` cannot
-/// see it. A 72-byte batch declaring `i32::MAX` headers on its one record therefore reaches the
-/// reserve, and that allocation is resident rather than virtual, because hashbrown writes its
-/// control bytes. Every header costs two length varints at least, so a count past half the
-/// record's remaining bytes is refused before the decoder reads the record.
+/// - Refuses a header count the record cannot hold. The decoder reserves an `IndexMap` from it
+///   (`kafka-protocol-0.18.0/src/records.rs:896`), and that memory is resident.
+/// - Charges headers to the record budget, [`HEADERS_PER_SLOT`] per slot.
+/// - Returns the record count, which `decode_batch` checks against the batch header.
 ///
-/// The framing below mirrors `Record::decode_new`, field for field, so a record this refuses is
-/// one the decoder would refuse too. The one place the two differ is trailing bytes: the decoder
-/// stops after the count the batch header gave and ignores anything after it, while this walks to
-/// the end of the blob. A v2 batch carries its records and nothing else, so there is nothing to
-/// ignore.
-fn scan_records(records: &Bytes) -> Result<()> {
+/// The framing mirrors `Record::decode_new`, field for field.
+fn scan_records(records: &Bytes, budget: &DecompressionBudget) -> Result<usize> {
     let mut blob = records.as_ref();
+    let mut walked = 0;
+    let mut slots = 0;
+    let mut names = Vec::new();
     while !blob.is_empty() {
         let size = take_varint(&mut blob)?;
         let size = usize::try_from(size).map_err(|_| RecordCodecError::RecordFieldLength(size))?;
@@ -879,18 +1016,40 @@ fn scan_records(records: &Bytes) -> Result<()> {
         skip_field(&mut record)?; // value
 
         let count = take_varint(&mut record)?;
-        let holds = usize::try_from(count)
-            .map_err(|_| RecordCodecError::HeaderCountTooLarge {
-                count,
-                limit: record.len(),
-            })?
-            .saturating_mul(MIN_HEADER_BYTES);
-        if holds > record.len() {
-            return Err(RecordCodecError::HeaderCountTooLarge {
-                count,
-                limit: record.len(),
-            });
+        let limit = record.len();
+        let headers = usize::try_from(count)
+            .ok()
+            .filter(|headers| headers.saturating_mul(MIN_HEADER_BYTES) <= limit)
+            .ok_or(RecordCodecError::HeaderCountTooLarge { count, limit })?;
+        if headers > 1 {
+            check_header_names(&mut record, headers, &mut names)?;
         }
+        slots += headers / HEADERS_PER_SLOT;
+        walked += 1;
+    }
+    budget.charge_records(slots)?;
+    Ok(walked)
+}
+
+/// Refuses a record that repeats a header name. `kafka_protocol` keeps only the last value.
+///
+/// `names` is scratch space, reused across records.
+fn check_header_names<'a>(
+    record: &mut &'a [u8],
+    count: usize,
+    names: &mut Vec<&'a [u8]>,
+) -> Result<()> {
+    names.clear();
+    for _ in 0..count {
+        let len = take_varint(record)?;
+        let len = usize::try_from(len).map_err(|_| RecordCodecError::RecordFieldLength(len))?;
+        names.push(take_bytes(record, len)?);
+        skip_field(record)?; // value
+    }
+    names.sort_unstable();
+    if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+        let name = String::from_utf8_lossy(pair[0]).into_owned();
+        return Err(RecordCodecError::RepeatedHeaderName(name));
     }
     Ok(())
 }
@@ -942,15 +1101,17 @@ fn skip_field(buf: &mut &[u8]) -> Result<()> {
 ///
 /// Snappy is the one codec that states its output size up front, which `snap` reads without
 /// allocating. Charge that number before the decoder runs, because the decoder needs the whole
-/// block laid out to write into and cannot be fed a bounded sink.
+/// block laid out to write into and cannot be fed a bounded sink. Past the budget, blocks are
+/// counted and not inflated.
 fn inflate_snappy(body: &Bytes, writer: &mut BudgetedWriter<'_>) -> anyhow::Result<()> {
     let mut decoder = snap::raw::Decoder::new();
     let mut inflate = |block: &[u8], writer: &mut BudgetedWriter<'_>| -> anyhow::Result<()> {
         let declared = snap::raw::decompress_len(block)?;
-        writer.budget.charge(declared)?;
-        let start = writer.out.len();
-        writer.out.resize(start.saturating_add(declared), 0);
-        decoder.decompress(block, &mut writer.out[start..])?;
+        if writer.admit(declared)? {
+            let start = writer.out.len();
+            writer.out.resize(start.saturating_add(declared), 0);
+            decoder.decompress(block, &mut writer.out[start..])?;
+        }
         Ok(())
     };
 
@@ -1028,6 +1189,22 @@ mod tests {
         let mut all = vec![(VERSION_HEADER, &[MAPPING_VERSION][..])];
         all.extend_from_slice(headers);
         message_with(payload, &all)
+    }
+
+    #[test]
+    fn given_a_value_only_record_when_encoded_should_match_the_general_path() {
+        let plain = to_iggy(&record_with(None, Some(b"v"), &[])).unwrap();
+        let general = gateway_message(b"v", &[]);
+
+        assert_eq!(plain.user_headers, general.user_headers);
+        assert_eq!(
+            plain.header.user_headers_length,
+            general.header.user_headers_length
+        );
+        assert_eq!(plain.header.origin_timestamp, 1_700_000_000_123_000);
+        let back = from_iggy(&plain, 0).unwrap();
+        assert_eq!(back.value.as_deref(), Some(&b"v"[..]));
+        assert_eq!(back.timestamp, CREATE_TIME);
     }
 
     fn envelope_bytes(count: u32, trailing: &[u8]) -> Bytes {
@@ -1409,8 +1586,8 @@ mod tests {
     fn given_an_uncompressed_batch_when_round_tripped_should_keep_every_record() {
         let mut records = vec![record_at_offset(0, b"1"), record_at_offset(1, b"2")];
         let mut encoded = encode_batch(&mut records).unwrap();
-        let budget = DecompressionBudget::new(1024);
-        let decoded = decode_batches(&mut encoded, &budget).unwrap();
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[1].value.as_deref(), Some(&b"2"[..]));
     }
@@ -1439,22 +1616,54 @@ mod tests {
     }
 
     #[test]
-    fn given_two_batches_in_one_blob_when_decoded_should_drain_both() {
+    fn given_two_batches_in_one_blob_when_decoded_should_reject() {
         let mut blob = BytesMut::new();
         blob.extend_from_slice(&encode_batch(&mut [record_at_offset(0, b"1")]).unwrap());
         blob.extend_from_slice(&encode_batch(&mut [record_at_offset(1, b"2")]).unwrap());
 
-        let budget = DecompressionBudget::new(1024);
-        let decoded = decode_batches(&mut blob.freeze(), &budget).unwrap();
-        assert_eq!(decoded.len(), 2, "a partition blob can hold many batches");
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        assert!(
+            matches!(
+                decode_batch(&mut blob.freeze(), &budget, Zstd::Allowed),
+                Err(RecordCodecError::SeveralBatches(2))
+            ),
+            "Kafka allows one batch per partition from Produce v3"
+        );
+    }
+
+    #[test]
+    fn given_more_records_than_the_batch_declares_when_decoded_should_reject() {
+        let batch =
+            encode_batch(&mut [record_at_offset(0, b"1"), record_at_offset(1, b"2")]).unwrap();
+        let mut patched = patch_header(&batch, 57, &1i32.to_be_bytes());
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+
+        assert!(
+            matches!(
+                decode_batch(&mut patched, &budget, Zstd::Allowed),
+                Err(RecordCodecError::RecordCountMismatch {
+                    declared: 1,
+                    walked: 2
+                })
+            ),
+            "the decoder drops the second record, so storing the rest would lose it"
+        );
+    }
+
+    #[test]
+    fn given_a_batch_when_checked_for_compression_should_read_its_attributes() {
+        let records = [record_at_offset(0, b"v")];
+        assert!(is_compressed(&encode_with(&records, Compression::Gzip)));
+        assert!(!is_compressed(&encode_with(&records, Compression::None)));
+        assert!(!is_compressed(&[]));
     }
 
     #[test]
     fn given_a_gzip_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Gzip);
-        let budget = DecompressionBudget::new(1024);
-        let decoded = decode_batches(&mut encoded, &budget).unwrap();
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -1462,8 +1671,8 @@ mod tests {
     fn given_a_snappy_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Snappy);
-        let budget = DecompressionBudget::new(1024);
-        let decoded = decode_batches(&mut encoded, &budget).unwrap();
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -1471,8 +1680,8 @@ mod tests {
     fn given_an_lz4_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Lz4);
-        let budget = DecompressionBudget::new(1024);
-        let decoded = decode_batches(&mut encoded, &budget).unwrap();
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -1480,8 +1689,8 @@ mod tests {
     fn given_a_zstd_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Zstd);
-        let budget = DecompressionBudget::new(1024);
-        let decoded = decode_batches(&mut encoded, &budget).unwrap();
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -1489,50 +1698,66 @@ mod tests {
     fn given_a_budget_smaller_than_the_batch_when_decoded_should_reject() {
         let records = vec![record_at_offset(0, &[b'x'; 512])];
         let mut encoded = encode_with(&records, Compression::Gzip);
-        let budget = DecompressionBudget::new(8);
+        let budget = DecompressionBudget::new(8, usize::MAX);
         assert!(matches!(
-            decode_batches(&mut encoded, &budget),
+            decode_batch(&mut encoded, &budget, Zstd::Allowed),
             Err(RecordCodecError::BudgetExceeded { .. })
         ));
     }
 
     #[test]
-    fn given_two_batches_when_the_second_passes_the_budget_should_reject() {
-        let big = record_at_offset(0, &[b'x'; 256]);
-        let mut blob = BytesMut::new();
-        blob.extend_from_slice(&encode_batch(&mut [big.clone()]).unwrap());
-        blob.extend_from_slice(&encode_batch(&mut [big]).unwrap());
+    fn given_a_spent_budget_when_a_partition_fits_alone_should_ask_for_a_retry() {
+        // Enough for one partition, not for both: the budget is per request.
+        let budget = DecompressionBudget::new(400, usize::MAX);
+        let big = || encode_batch(&mut [record_at_offset(0, &[b'x'; 256])]).unwrap();
 
-        // Enough for one batch, not for both: the budget is per request, not per batch.
-        let budget = DecompressionBudget::new(400);
+        assert!(decode_batch(&mut big(), &budget, Zstd::Allowed).is_ok());
         assert!(matches!(
-            decode_batches(&mut blob.freeze(), &budget),
-            Err(RecordCodecError::BudgetExceeded { .. })
+            decode_batch(&mut big(), &budget, Zstd::Allowed),
+            Err(RecordCodecError::RequestBudgetSpent)
         ));
+    }
+
+    #[test]
+    fn given_a_spent_budget_when_a_partition_is_too_large_alone_should_refuse_it() {
+        // gzip writes 32 KiB at a time, so the refusal comes several writes before the end.
+        let budget = DecompressionBudget::new(64 * 1024, usize::MAX);
+        let mut first = encode_with(
+            &[record_at_offset(0, &vec![b'a'; 60 * 1024])],
+            Compression::Gzip,
+        );
+        let mut second = encode_with(
+            &[record_at_offset(0, &vec![b'b'; 200 * 1024])],
+            Compression::Gzip,
+        );
+
+        assert!(decode_batch(&mut first, &budget, Zstd::Allowed).is_ok());
+        assert!(
+            matches!(
+                decode_batch(&mut second, &budget, Zstd::Allowed),
+                Err(RecordCodecError::BudgetExceeded { limit, .. }) if limit == 64 * 1024
+            ),
+            "a retry cannot help a partition over the whole budget"
+        );
     }
 
     #[test]
     fn given_a_compression_bomb_when_decoded_should_stop_before_it_is_whole() {
         let bomb = vec![0u8; 4 * 1024 * 1024];
         let mut compressed = Bytes::from(encode_gzip(&bomb));
-        let budget = DecompressionBudget::new(1024);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
 
         let Err(error) = decompress(&mut compressed, Compression::Gzip, &budget) else {
             panic!("a 4 MB output against a 1 KB budget has to be refused");
         };
         drop(error);
-        let Some(RecordCodecError::BudgetExceeded {
-            produced,
-            remaining,
-        }) = budget.reason.take()
-        else {
+        let Some(RecordCodecError::BudgetExceeded { size, limit }) = budget.reason.take() else {
             panic!("the budget is what refused it");
         };
-        assert_eq!(remaining, 1024);
+        assert_eq!(limit, 1024);
         assert!(
-            produced < bomb.len(),
-            "the write that passed the budget was refused, not charged afterwards: \
-             {produced} of {} bytes",
+            size < bomb.len(),
+            "refused at the write that passed the budget: {size} of {} bytes",
             bomb.len()
         );
     }
@@ -1542,11 +1767,11 @@ mod tests {
         // A raw snappy stream whose leading varint claims u32::MAX bytes of output. `snap` reads
         // that length without allocating, so the declared size is checkable before the decode.
         let mut compressed = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0x0f, 0x00]);
-        let budget = DecompressionBudget::new(1024);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
         assert!(decompress(&mut compressed, Compression::Snappy, &budget).is_err());
         assert!(matches!(
             budget.reason.take(),
-            Some(RecordCodecError::BudgetExceeded { produced, .. }) if produced == u32::MAX as usize
+            Some(RecordCodecError::BudgetExceeded { size, .. }) if size == u32::MAX as usize
         ));
     }
 
@@ -1554,11 +1779,11 @@ mod tests {
     fn given_a_record_count_past_the_frame_when_decoded_should_reject() {
         let batch = encode_batch(&mut [record_at_offset(0, b"v")]).unwrap();
         let mut patched = patch_header(&batch, 57, &i32::MAX.to_be_bytes());
-        let budget = DecompressionBudget::new(1024);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
 
         assert!(
             matches!(
-                decode_batches(&mut patched, &budget),
+                decode_batch(&mut patched, &budget, Zstd::Allowed),
                 Err(RecordCodecError::RecordCountTooLarge { .. })
             ),
             "the decoder reserves from this count before it reads a record"
@@ -1566,27 +1791,41 @@ mod tests {
     }
 
     #[test]
-    fn given_counts_that_only_pass_one_at_a_time_when_decoded_should_reject() {
-        // One large batch raises what the blob can hold, and every small batch then declares a
-        // count that clears the bound on its own. The reserves land in one `Vec` all the same.
-        let big = encode_batch(&mut [record_at_offset(0, &[b'x'; 2048])]).unwrap();
-        let small = patch_header(
-            &encode_batch(&mut [record_at_offset(0, b"v")]).unwrap(),
-            57,
-            &200i32.to_be_bytes(),
-        );
+    fn given_a_compressed_batch_when_preflighting_should_grant_it_the_whole_budget() {
+        // 100 tiny records declare more than the blob and the bytes left can hold, and fit the
+        // whole budget. Earlier partitions spending it must not make them look malformed.
+        // One offset for all, so the encoder writes one batch.
+        let records: Vec<_> = (0..100).map(|_| record_at_offset(0, b"")).collect();
+        let mut batch = encode_with(&records, Compression::Gzip);
+        let budget = DecompressionBudget::new(4096, usize::MAX);
+        let mut spend = encode_batch(&mut [record_at_offset(0, &[b'x'; 4000])]).unwrap();
 
-        let mut blob = BytesMut::new();
-        blob.extend_from_slice(&big);
-        for _ in 0..8 {
-            blob.extend_from_slice(&small);
-        }
-
-        let budget = DecompressionBudget::new(0);
+        assert!(decode_batch(&mut spend, &budget, Zstd::Allowed).is_ok());
         assert!(matches!(
-            decode_batches(&mut blob.freeze(), &budget),
-            Err(RecordCodecError::RecordCountTooLarge { .. })
+            decode_batch(&mut batch, &budget, Zstd::Allowed),
+            Err(RecordCodecError::RequestBudgetSpent)
         ));
+    }
+
+    #[test]
+    fn given_many_headers_when_decoded_should_charge_them_as_records() {
+        let headers: Vec<_> = (0..6)
+            .map(|index| (format!("h{index}"), Some(&b"v"[..])))
+            .collect();
+        let headers: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect();
+        let mut batch = encode_batch(&mut [record_with(None, Some(b"v"), &headers)]).unwrap();
+
+        // One slot for the record and two for its six headers.
+        let tight = DecompressionBudget::new(1024, 2);
+        assert!(matches!(
+            decode_batch(&mut batch.clone(), &tight, Zstd::Allowed),
+            Err(RecordCodecError::RecordBudgetExceeded { count: 3, limit: 2 })
+        ));
+        let enough = DecompressionBudget::new(1024, 3);
+        assert!(decode_batch(&mut batch, &enough, Zstd::Allowed).is_ok());
     }
 
     /// A one-record v2 batch whose record body declares `headers` headers and carries none.
@@ -1638,15 +1877,34 @@ mod tests {
     }
 
     #[test]
+    fn given_a_repeated_header_name_when_decoded_should_reject() {
+        let headers = [("a", Some(&b"x"[..])), ("b", Some(&b"y"[..]))];
+        let mut records = [record_with(None, Some(b"v"), &headers)];
+        let batch = encode_batch(&mut records).unwrap();
+        // Rename header "b" to "a". Same length, so only the CRC needs repair.
+        let at = batch
+            .windows(4)
+            .position(|window| window == [0x02, b'b', 0x02, b'y'])
+            .unwrap();
+        let mut batch = patch_header(&batch, at + 1, b"a");
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+
+        assert!(matches!(
+            decode_batch(&mut batch, &budget, Zstd::Allowed),
+            Err(RecordCodecError::RepeatedHeaderName(name)) if name == "a"
+        ));
+    }
+
+    #[test]
     fn given_a_header_count_past_the_record_when_decoded_should_reject() {
         // The batch header says one record, so the record count bound passes. The count that
         // matters is the one inside the record, and no batch header reports it.
         let mut batch = batch_declaring_headers(i32::MAX);
-        let budget = DecompressionBudget::new(8 * 1024 * 1024);
+        let budget = DecompressionBudget::new(8 * 1024 * 1024, usize::MAX);
 
         assert!(
             matches!(
-                decode_batches(&mut batch, &budget),
+                decode_batch(&mut batch, &budget, Zstd::Allowed),
                 Err(RecordCodecError::HeaderCountTooLarge { count, .. }) if count == i32::MAX
             ),
             "this reserve is resident memory, not address space"
@@ -1658,8 +1916,13 @@ mod tests {
         // The same builder with a count the record can hold, so the scan cannot be passing the
         // test above by rejecting every hand-built batch.
         let mut batch = batch_declaring_headers(0);
-        let budget = DecompressionBudget::new(1024);
-        assert_eq!(decode_batches(&mut batch, &budget).unwrap().len(), 1);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        assert_eq!(
+            decode_batch(&mut batch, &budget, Zstd::Allowed)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1671,9 +1934,9 @@ mod tests {
             &[("trace", Some(b"abc"))],
         )];
         let mut encoded = encode_batch(&mut with_headers).unwrap();
-        let budget = DecompressionBudget::new(1024);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
 
-        let decoded = decode_batches(&mut encoded, &budget).unwrap();
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(
             decoded[0].headers.get(&StrBytes::from_static_str("trace")),
             Some(&Some(Bytes::from_static(b"abc")))
@@ -1686,10 +1949,10 @@ mod tests {
         // the documented 8 MiB, which an uncompressed batch has no claim on.
         let batch = encode_batch(&mut [record_at_offset(0, b"v")]).unwrap();
         let mut patched = patch_header(&batch, 57, &100_000i32.to_be_bytes());
-        let budget = DecompressionBudget::new(8 * 1024 * 1024);
+        let budget = DecompressionBudget::new(8 * 1024 * 1024, usize::MAX);
 
         assert!(matches!(
-            decode_batches(&mut patched, &budget),
+            decode_batch(&mut patched, &budget, Zstd::Allowed),
             Err(RecordCodecError::RecordCountTooLarge { limit, .. }) if limit == batch.len()
         ));
     }
@@ -1751,11 +2014,11 @@ mod tests {
         let mut transactional = record_at_offset(0, b"v");
         transactional.transactional = true;
         let mut encoded = encode_with(&[transactional], Compression::None);
-        let budget = DecompressionBudget::new(1024);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
 
         assert!(matches!(
-            decode_batches(&mut encoded, &budget),
-            Err(RecordCodecError::UnsupportedBatch("transactional"))
+            decode_batch(&mut encoded, &budget, Zstd::Allowed),
+            Err(RecordCodecError::TransactionalBatch)
         ));
     }
 
@@ -1764,12 +2027,12 @@ mod tests {
         let mut control = record_at_offset(0, b"v");
         control.control = true;
         let mut encoded = encode_with(&[control], Compression::None);
-        let budget = DecompressionBudget::new(1024);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
 
         assert!(
             matches!(
-                decode_batches(&mut encoded, &budget),
-                Err(RecordCodecError::UnsupportedBatch("control"))
+                decode_batch(&mut encoded, &budget, Zstd::Allowed),
+                Err(RecordCodecError::ControlBatch)
             ),
             "consumers filter control records by a flag no stored message can carry"
         );
@@ -1779,8 +2042,8 @@ mod tests {
     fn given_a_truncated_batch_when_decoded_should_reject() {
         let batch = encode_batch(&mut [record_at_offset(0, b"value")]).unwrap();
         let mut truncated = batch.slice(0..batch.len() - 4);
-        let budget = DecompressionBudget::new(1024);
-        assert!(decode_batches(&mut truncated, &budget).is_err());
+        let budget = DecompressionBudget::new(1024, usize::MAX);
+        assert!(decode_batch(&mut truncated, &budget, Zstd::Allowed).is_err());
     }
 
     #[test]
@@ -1791,9 +2054,9 @@ mod tests {
         bytes[last] ^= 0xff;
         let mut corrupt = Bytes::from(bytes);
 
-        let budget = DecompressionBudget::new(1024);
+        let budget = DecompressionBudget::new(1024, usize::MAX);
         assert!(matches!(
-            decode_batches(&mut corrupt, &budget),
+            decode_batch(&mut corrupt, &budget, Zstd::Allowed),
             Err(RecordCodecError::Batch(_))
         ));
     }
@@ -1801,10 +2064,10 @@ mod tests {
     #[test]
     fn given_an_earlier_overrun_when_a_later_batch_fails_should_not_reuse_the_budget_reason() {
         // A failed charge deducts nothing, so the budget still has room for the batch below.
-        let budget = DecompressionBudget::new(64);
+        let budget = DecompressionBudget::new(64, usize::MAX);
         let mut bomb = encode_with(&[record_at_offset(0, &[b'x'; 512])], Compression::Gzip);
         assert!(matches!(
-            decode_batches(&mut bomb, &budget),
+            decode_batch(&mut bomb, &budget, Zstd::Allowed),
             Err(RecordCodecError::BudgetExceeded { .. })
         ));
 
@@ -1815,7 +2078,7 @@ mod tests {
 
         assert!(
             matches!(
-                decode_batches(&mut short, &budget),
+                decode_batch(&mut short, &budget, Zstd::Allowed),
                 Err(RecordCodecError::Batch(_))
             ),
             "a stale overflow reports a malformed batch as MESSAGE_TOO_LARGE"
