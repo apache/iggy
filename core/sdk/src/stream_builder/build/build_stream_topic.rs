@@ -23,22 +23,25 @@ use crate::prelude::{
 use crate::stream_builder::IggyConsumerConfig;
 use tracing::{trace, warn};
 
-/// Builds an `IggyStream` and `IggyTopic` if any of them does not exists
-/// and if the boolean flags to create them are set to true. In that case it will build
-/// them using the given `IggyClient` and `IggyProducerConfig`.
+/// Creates the stream and the topic of `config` when the server does not hold them yet.
 ///
-/// If the boolean flags to create them are set to false, it will not build them and will return
-/// and return Ok(()) since this is expected behavior.d
+/// A missing stream is created only when [`create_stream_if_not_exists()`] is set, and a missing
+/// topic only when [`create_topic_if_not_exists()`] is set. When the switch is off, the function
+/// logs a warning and returns `Ok(())`. So you can decide how a missing stream or topic should be handled.
 ///
-/// # Arguments
-///
-/// * `client` - The `IggyClient` to use.
-/// * `config` - The `IggyProducerConfig` to use.
+/// A topic created here gets [`partitions_count()`] partitions, and takes the server
+/// defaults for message expiry and maximum size.
 ///
 /// # Errors
 ///
-/// * `IggyError` - If the iggy stream topic cannot be build.
+/// - Any error raised while reading the stream or the topic from the server.
+/// - Any error raised while creating the stream or the topic.
+/// - [`IggyError::InvalidIdentifier`] when the name cannot be read from the stream or topic
+///   identifier of the configuration.
 ///
+/// [`create_stream_if_not_exists()`]: crate::prelude::IggyConsumerConfig::create_stream_if_not_exists
+/// [`create_topic_if_not_exists()`]: crate::prelude::IggyConsumerConfig::create_topic_if_not_exists
+/// [`partitions_count()`]: crate::prelude::IggyConsumerConfig::partitions_count
 pub(crate) async fn build_iggy_stream_topic_if_not_exists(
     client: &IggyClient,
     config: &IggyConsumerConfig,

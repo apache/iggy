@@ -25,25 +25,54 @@ use tracing::{error, info, trace};
 
 #[async_trait]
 impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
-    /// Consume messages from the stream and process them with the given message consumer.
+    /// Reads messages until a shutdown signal arrives, and hands each one to `message_consumer`.
     ///
-    /// # Arguments
+    /// One turn of the loop waits for whichever comes first: a message, or `shutdown_rx`. Both
+    /// arriving together is a race, so a message that is buffered already can still be handled
+    /// after the signal was sent. Dropping the sender counts as a signal.
     ///
-    /// * `message_consumer`: The message consumer to use. This must be a reference to a static
-    /// object that implements the `MessageConsumer` trait.
-    /// * `shutdown_rx`: A receiver which will receive a shutdown signal, which will be used to
-    /// stop message consumption.
+    /// The loop returns `Ok(())` in three cases: (1) the signal arrived, (2) the sender was dropped, or
+    /// (3) the stream ended because [`shutdown()`](crate::prelude::IggyConsumer::shutdown) was called.
+    /// After the two signal cases the consumer stays usable, so call
+    /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown) afterwards to commit the reading
+    /// position and leave the consumer group. Under
+    /// [`AutoCommit::Disabled`](crate::prelude::AutoCommit::Disabled) that call commits nothing.
+    ///
+    /// # Committing after a message
+    ///
+    /// This is the only read path that honors the [`AutoCommitAfter`] variants. Every one of them
+    /// queues its commit once the handler returned, whether the handler returned `Ok` or `Err`:
+    ///
+    /// | Variant | Queues a commit |
+    /// | --- | --- |
+    /// | [`AutoCommitAfter::ConsumingEachMessage`] | after every message |
+    /// | [`AutoCommitAfter::ConsumingEveryNthMessage`] | after a message whose offset divides by `n`, so it counts offsets of the partition and not messages this process handled. With `n` of `0` it never fires |
+    /// | [`AutoCommitAfter::ConsumingAllMessages`] | after the message whose offset equals the partition head that the poll reported, so a consumer that lags behind commits nothing until it has caught up |
+    ///
+    /// A commit is queued, not awaited. The offset store task of the consumer sends it, and
+    /// commits queued faster than they are sent collapse into the latest one per partition. The
+    /// [`AutoCommitWhen`](crate::prelude::AutoCommitWhen) variants need no help from this loop and
+    /// behave the same on every read path.
     ///
     /// # Errors
     ///
-    /// * `IggyError::Disconnected`: The client has been disconnected.
-    /// * `IggyError::CannotEstablishConnection`: The client cannot establish a connection to iggy.
-    /// * `IggyError::StaleClient`: This client is stale and cannot be used to consume messages.
-    /// * `IggyError::InvalidServerAddress`: The server address is invalid.
-    /// * `IggyError::InvalidClientAddress`: The client address is invalid.
-    /// * `IggyError::NotConnected`: The client is not connected.
-    /// * `IggyError::ClientShutdown`: The client has been shut down.
+    /// Returns the error that ended the loop. Only a connection error ends it:
     ///
+    /// - [`IggyError::Disconnected`]: the client was disconnected.
+    /// - [`IggyError::CannotEstablishConnection`]: the client cannot reach the server.
+    /// - [`IggyError::StaleClient`]: this client is stale and cannot read messages.
+    /// - [`IggyError::InvalidServerAddress`]: the server address is invalid.
+    /// - [`IggyError::InvalidClientAddress`]: the client address is invalid.
+    /// - [`IggyError::NotConnected`]: the client is not connected.
+    /// - [`IggyError::ClientShutdown`]: the client was shut down.
+    ///
+    /// Every other read error is logged and the loop reads on, because the consumer retries by
+    /// itself. An error from `message_consumer` is logged too, and that message is skipped.
+    ///
+    /// [`AutoCommitAfter`]: crate::prelude::AutoCommitAfter
+    /// [`AutoCommitAfter::ConsumingAllMessages`]: crate::prelude::AutoCommitAfter::ConsumingAllMessages
+    /// [`AutoCommitAfter::ConsumingEachMessage`]: crate::prelude::AutoCommitAfter::ConsumingEachMessage
+    /// [`AutoCommitAfter::ConsumingEveryNthMessage`]: crate::prelude::AutoCommitAfter::ConsumingEveryNthMessage
     async fn consume_messages<P>(
         &mut self,
         message_consumer: &'a P,
