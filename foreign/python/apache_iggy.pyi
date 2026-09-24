@@ -1340,6 +1340,27 @@ class IggyClient:
         connection to establish, so only the heartbeat starts and this call
         succeeds even against an unreachable server.
         """
+    def disconnect(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Closes the current connection. Repeated calls are safe. Call `connect`
+        to use the client again. The sign-in made with `login_user` is dropped,
+        so it must be repeated after reconnecting, while a client configured
+        with auto-login credentials signs in again on `connect`. Over HTTP
+        there is no connection to close and this call does nothing.
+
+        Raises:
+            RuntimeError: If the connection cannot be closed.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Closes the connection and releases the client. For TCP, QUIC and
+        WebSocket this is terminal: later requests fail with
+        `RuntimeError("Client shutdown")`. Repeated calls are safe. Over HTTP
+        there is nothing to release and this call does nothing.
+
+        Raises:
+            RuntimeError: If the client cannot be shut down.
+        """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
