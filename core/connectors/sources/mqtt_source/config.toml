@@ -45,6 +45,11 @@ batch_size = 100
 batch_timeout = "10ms"
 verbose_logging = false
 
+# Optional per-filter QoS overrides. Every key must also appear in
+# subscriptions, and each value must be 0, 1, or 2.
+# [plugin_config.subscription_qos]
+# "devices/+/telemetry" = 2
+
 # Optional authenticated connection. Supply these through a local secret or
 # environment overrides; do not commit real credentials here.
 # username = "emqx-user"
