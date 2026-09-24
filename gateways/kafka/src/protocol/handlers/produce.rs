@@ -532,11 +532,11 @@ const fn record_error_code(error: &RecordCodecError) -> i16 {
         // Earlier partitions spent the request budget. This one fits alone, and nothing was
         // written.
         RecordCodecError::RequestBudgetSpent => ERROR_NOT_LEADER_OR_FOLLOWER,
-        // Transactional, control or idempotent. 35 is a fatal code for these producers, so
-        // they stop instead of retrying forever.
-        RecordCodecError::TransactionalBatch
-        | RecordCodecError::ControlBatch
-        | RecordCodecError::IdempotentBatch => ERROR_UNSUPPORTED_VERSION,
+        // Transactional or control. 35 is a fatal code for these producers, so they stop instead
+        // of retrying forever.
+        RecordCodecError::TransactionalBatch | RecordCodecError::ControlBatch => {
+            ERROR_UNSUPPORTED_VERSION
+        }
         RecordCodecError::ZstdTooEarly => ERROR_UNSUPPORTED_COMPRESSION_TYPE,
         // `IggyMessage::new`'s other refusal is an empty payload, which the codec never builds.
         RecordCodecError::Iggy(_)
@@ -754,17 +754,17 @@ mod tests {
     }
 
     #[test]
-    fn given_an_idempotent_batch_when_planned_should_answer_unsupported_version() {
+    fn given_an_idempotent_batch_when_planned_should_convert_it() {
         let mut records = [record(0, b"v")];
         records[0].producer_id = 7;
         records[0].producer_epoch = 0;
         records[0].sequence = 0;
         let batch = compressed_batch(&records, Compression::None);
 
-        assert_eq!(
-            planned(&entry(0, Some(batch))).unwrap_err(),
-            ERROR_UNSUPPORTED_VERSION
-        );
+        let (_, messages) =
+            planned(&entry(0, Some(batch))).expect("a stock Java producer sends this batch");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].payload.as_ref(), b"v");
     }
 
     #[test]
@@ -974,7 +974,6 @@ mod tests {
         for error in [
             RecordCodecError::TransactionalBatch,
             RecordCodecError::ControlBatch,
-            RecordCodecError::IdempotentBatch,
         ] {
             assert_eq!(record_error_code(&error), ERROR_UNSUPPORTED_VERSION);
         }

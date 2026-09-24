@@ -150,8 +150,6 @@ pub enum RecordCodecError {
     TransactionalBatch,
     #[error("control batches are not supported")]
     ControlBatch,
-    #[error("idempotent batches are not supported, set enable.idempotence=false")]
-    IdempotentBatch,
     #[error("partition decompresses to {size} bytes, over the {limit} byte request budget")]
     BudgetExceeded { size: usize, limit: usize },
     #[error("partition needs {count} record slots, over the {limit} slot request budget")]
@@ -803,8 +801,8 @@ pub fn is_compressed(blob: &[u8]) -> bool {
 /// # Errors
 ///
 /// Returns an error when the blob holds more than one batch, when the batch is malformed or holds
-/// a record count other than the one it declares, when it is a control, transactional or
-/// idempotent batch, when it is zstd and `zstd` refuses it, or when it passes `budget`.
+/// a record count other than the one it declares, when it is a control or transactional batch,
+/// when it is zstd and `zstd` refuses it, or when it passes `budget`.
 pub fn decode_batch(
     buf: &mut Bytes,
     budget: &DecompressionBudget,
@@ -843,8 +841,9 @@ pub fn decode_batch(
 /// - One batch per partition, as Kafka requires from Produce v3.
 /// - The decoder reserves from `record_count` (`kafka-protocol-0.18.0/src/records.rs:517`), so
 ///   the count must fit the blob, plus the full budget when compressed.
-/// - Control, transactional and idempotent batches are refused: a stored message cannot carry
-///   their flags, and nothing here stops a duplicate.
+/// - Control and transactional batches are refused: a stored message cannot carry their flags.
+///   An idempotent batch passes, its producer id, epoch and sequence ignored, because a stock
+///   Java producer is idempotent. `IDEMPOTENCE.md` has why a retry is then not deduplicated.
 fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()> {
     let infos = RecordBatchDecoder::decode_batch_info(&mut buf.clone())
         .map_err(|error| RecordCodecError::Batch(error.to_string()))?;
@@ -858,9 +857,6 @@ fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()
     }
     if info.control {
         return Err(RecordCodecError::ControlBatch);
-    }
-    if info.producer_id != NO_PRODUCER_ID {
-        return Err(RecordCodecError::IdempotentBatch);
     }
     if zstd == Zstd::Refused && info.compression == Compression::Zstd {
         return Err(RecordCodecError::ZstdTooEarly);
