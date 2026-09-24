@@ -344,8 +344,15 @@ impl IggyBridge {
     /// Every Kafka-visible topic: the target of every configured
     /// [`TopicMapping`](crate::bridge::topic_map::TopicMapping) override that actually exists in
     /// Iggy, plus every topic in the default stream that isn't itself one of those override
-    /// targets - checked so an overridden topic is never listed twice, once under its Kafka-side
-    /// name and once under its raw Iggy name.
+    /// targets and isn't itself named the same as an override key - checked so an overridden
+    /// topic is never listed twice, once under its Kafka-side name and once under its raw Iggy
+    /// name, and so a raw default-stream topic never masquerades under a Kafka-side name an
+    /// override has already claimed for different data. The second check matters for a chained
+    /// override (`foo -> (kafka, bar)`, `bar -> (other, x)`): without it, a raw Iggy topic
+    /// literally named `foo` sitting in the default stream would be reported a second time under
+    /// the same `foo` name the override loop already emitted (backed by `kafka/bar`'s data), and
+    /// that second `foo` would be unreachable by name anyway, since `get_kafka_topic("foo")`
+    /// always resolves through the override to `kafka/bar`, never to the raw `kafka/foo`.
     ///
     /// An Iggy stream this bridge has no mapping rule pointing at (neither the default stream nor
     /// any override's target) holds data no Kafka client ever named - deliberately excluded, the
@@ -358,9 +365,11 @@ impl IggyBridge {
     pub async fn list_kafka_topics(&self) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
         let default_stream = self.config.topic_mapping.default_stream();
         let mut default_stream_override_targets: HashSet<&str> = HashSet::new();
+        let mut override_keys: HashSet<&str> = HashSet::new();
         let mut results = Vec::new();
 
         for (kafka_topic, over) in self.config.topic_mapping.overrides() {
+            override_keys.insert(kafka_topic);
             if over.stream == default_stream {
                 default_stream_override_targets.insert(over.topic.as_str());
             }
@@ -379,7 +388,9 @@ impl IggyBridge {
         {
             let topics = with_request_timeout(self.client.get_topics(&default_stream_id)).await?;
             for topic in topics {
-                if default_stream_override_targets.contains(topic.name.as_str()) {
+                if default_stream_override_targets.contains(topic.name.as_str())
+                    || override_keys.contains(topic.name.as_str())
+                {
                     continue;
                 }
                 results.push(KafkaTopicMetadata {

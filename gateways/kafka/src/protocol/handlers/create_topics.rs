@@ -24,7 +24,7 @@ use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::create_topics_request::{CreatableReplicaAssignment, CreatableTopic};
 use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
-use kafka_protocol::messages::{CreateTopicsRequest, CreateTopicsResponse, TopicName};
+use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 use crate::bridge::{BridgeError, IggyBridge, TopicCreationOutcome};
@@ -322,9 +322,11 @@ fn error_message_for(err: &BridgeError) -> String {
 /// An assignment's own partition indices are checked too, not just its length: real Kafka
 /// requires the key set to be exactly `0..assignments.len()`, each index appearing once, and
 /// rejects anything else - a duplicate or non-consecutive index (`{5: [...], 7: [...]}`) - with
-/// `INVALID_REPLICA_ASSIGNMENT` (39), the one condition that code exists for. This bridge doesn't
-/// model per-partition replica placement, so only the index set is checked, not each entry's
-/// replica list.
+/// `INVALID_REPLICA_ASSIGNMENT` (39). Each entry's own replica list is checked too, not just the
+/// index: this gateway advertises exactly one broker (node id 1, `metadata.rs`'s `BrokerId(1)`),
+/// so the only legal replica list is `[1]` - never empty, never repeating it, never naming a
+/// broker Metadata never advertised. Real Kafka's `ReplicationControlManager` validates the whole
+/// binding this way, not just the index.
 ///
 /// With no assignments, `num_partitions = -1` / `replication_factor = -1` mean "use the broker
 /// default" from v4+ (pre-v4 requires an explicit positive value for both, since v2/v3 have no
@@ -337,7 +339,9 @@ fn validate_create_topic_shape(
         if topic.num_partitions != -1 || topic.replication_factor != -1 {
             return Err(ERROR_INVALID_REQUEST);
         }
-        if !assignment_indices_are_consecutive_from_zero(&topic.assignments) {
+        if !assignment_indices_are_consecutive_from_zero(&topic.assignments)
+            || !assignment_replicas_are_valid(&topic.assignments)
+        {
             return Err(ERROR_INVALID_REPLICA_ASSIGNMENT);
         }
         return Ok(u32::try_from(topic.assignments.len()).unwrap_or(DEFAULT_PARTITION_COUNT));
@@ -389,6 +393,18 @@ fn assignment_indices_are_consecutive_from_zero(
     indices.len() == assignments.len()
         && indices.first().copied() == Some(0)
         && indices.last().copied() == i32::try_from(last_index).ok()
+}
+
+/// The only legal replica list for any partition this gateway assigns: this gateway advertises
+/// exactly one broker (node id 1, `metadata.rs`'s `BrokerId(1)`), so `[1]` is the sole valid
+/// shape - length 1 rules out both empty and a duplicated id, and the value itself rules out a
+/// broker Metadata never advertised.
+const SINGLE_BROKER_ID: i32 = 1;
+
+fn assignment_replicas_are_valid(assignments: &[CreatableReplicaAssignment]) -> bool {
+    assignments
+        .iter()
+        .all(|assignment| assignment.broker_ids == [BrokerId(SINGLE_BROKER_ID)])
 }
 
 /// Well-formed `CreateTopics` response with a single placeholder topic.
@@ -481,7 +497,16 @@ mod tests {
     fn assignment(partition_index: i32) -> CreatableReplicaAssignment {
         CreatableReplicaAssignment::default()
             .with_partition_index(partition_index)
-            .with_broker_ids(vec![0.into()])
+            .with_broker_ids(vec![SINGLE_BROKER_ID.into()])
+    }
+
+    fn assignment_with_replicas(
+        partition_index: i32,
+        broker_ids: Vec<i32>,
+    ) -> CreatableReplicaAssignment {
+        CreatableReplicaAssignment::default()
+            .with_partition_index(partition_index)
+            .with_broker_ids(broker_ids.into_iter().map(BrokerId).collect())
     }
 
     #[test]
@@ -512,6 +537,38 @@ mod tests {
     fn pre_v4_accepts_broker_default_sentinel_with_a_manual_assignment() {
         let topic = creatable_topic(-1, -1).with_assignments(vec![assignment(0), assignment(1)]);
         assert_eq!(validate_create_topic_shape(2, &topic), Ok(2));
+    }
+
+    #[test]
+    fn manual_assignment_with_an_empty_replica_list_is_rejected() {
+        let topic =
+            creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![])]);
+        assert_eq!(
+            validate_create_topic_shape(2, &topic),
+            Err(ERROR_INVALID_REPLICA_ASSIGNMENT)
+        );
+    }
+
+    #[test]
+    fn manual_assignment_with_a_duplicated_replica_is_rejected() {
+        let topic =
+            creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![1, 1])]);
+        assert_eq!(
+            validate_create_topic_shape(2, &topic),
+            Err(ERROR_INVALID_REPLICA_ASSIGNMENT)
+        );
+    }
+
+    #[test]
+    fn manual_assignment_naming_an_unregistered_broker_is_rejected() {
+        // This gateway advertises exactly one broker (node id 1) - naming any other id claims a
+        // replica placement on a broker Metadata never advertised.
+        let topic =
+            creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![7])]);
+        assert_eq!(
+            validate_create_topic_shape(2, &topic),
+            Err(ERROR_INVALID_REPLICA_ASSIGNMENT)
+        );
     }
 
     #[test]

@@ -132,14 +132,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // client's bootstrap Metadata call, permanently, the moment the catalog grows past the
     // trip point. This check is what still enforces the budget for the named-lookup arm, where
     // the cap (100 distinct topics) bounds the request but not what each one costs to answer.
-    let total_partitions: usize = results
-        .iter()
-        .filter(|result| result.error_code == ERROR_NONE)
-        .map(|result| result.partitions_count as usize)
-        .sum();
-    if response_would_exceed_frame_size(total_partitions, state.max_frame_size) {
+    let total_bytes: usize = results.iter().map(estimated_response_bytes).sum();
+    if response_would_exceed_frame_size(total_bytes, state.max_frame_size) {
         tracing::warn!(
-            total_partitions,
+            total_bytes,
             max_frame_size = state.max_frame_size,
             "Metadata response would exceed max_frame_size; closing connection"
         );
@@ -199,8 +195,37 @@ async fn resolve_requested_named_topics(
 /// the measured minimum.
 const RESPONSE_BYTES_PER_PARTITION: usize = 64;
 
-const fn response_would_exceed_frame_size(total_partitions: usize, max_frame_size: usize) -> bool {
-    total_partitions.saturating_mul(RESPONSE_BYTES_PER_PARTITION) > max_frame_size
+/// Fixed per-`MetadataResponseTopic` cost, independent of name length or partition count:
+/// `error_code`(2) + `is_internal`(1) + the `partitions` array's own compact-length varint
+/// (charged at its 5-byte worst case) + `topic_authorized_operations`(4) + empty tagged fields(1).
+/// Every result pays this once - `encode_real_response` emits a full wrapper even for an error
+/// result, just with an empty `partitions` array, so this cost isn't conditional on `ERROR_NONE`.
+const RESPONSE_BYTES_TOPIC_OVERHEAD: usize = 13;
+
+/// Estimated encoded byte cost of one [`TopicResult`]: the fixed per-topic overhead, the name's
+/// own bytes (compact string: length plus a short varint prefix, charged at a flat +2), and -
+/// only for a successful result, since `encode_real_response` sends an empty array otherwise -
+/// [`RESPONSE_BYTES_PER_PARTITION`] per partition.
+///
+/// `bounds_guard` cannot see any of this: it charges the request by name count alone, with no way
+/// to know a name's length, a topic's per-entry overhead, or its partition count before this
+/// bridge round trip returns real data. Charging partitions alone (this function's earlier form)
+/// undercounted every result: a name costs bytes whether or not the lookup succeeded, and a
+/// zero-partition or errored result - free under a partitions-only charge - still costs a full
+/// wrapper to encode. 500 topics with 255-byte names and one partition each encode to ~146 KB
+/// against the ~32 KB a partitions-only charge would have priced in.
+fn estimated_response_bytes(result: &TopicResult) -> usize {
+    let name_bytes = result.name.as_str().len() + 2;
+    let partition_bytes = if result.error_code == ERROR_NONE {
+        (result.partitions_count as usize).saturating_mul(RESPONSE_BYTES_PER_PARTITION)
+    } else {
+        0
+    };
+    RESPONSE_BYTES_TOPIC_OVERHEAD + name_bytes + partition_bytes
+}
+
+const fn response_would_exceed_frame_size(total_bytes: usize, max_frame_size: usize) -> bool {
+    total_bytes > max_frame_size
 }
 
 /// Trims an all-topics [`IggyBridge::list_kafka_topics`] result to fit `max_frame_size`, keeping
@@ -219,18 +244,15 @@ fn truncate_all_topics_to_frame_budget(
     mut results: Vec<TopicResult>,
     max_frame_size: usize,
 ) -> Vec<TopicResult> {
-    let mut cumulative_partitions = 0usize;
+    let mut cumulative_bytes = 0usize;
     let mut keep = results.len();
     for (index, result) in results.iter().enumerate() {
-        if result.error_code != ERROR_NONE {
-            continue;
-        }
-        let next = cumulative_partitions + result.partitions_count as usize;
+        let next = cumulative_bytes + estimated_response_bytes(result);
         if response_would_exceed_frame_size(next, max_frame_size) {
             keep = index;
             break;
         }
-        cumulative_partitions = next;
+        cumulative_bytes = next;
     }
     if keep < results.len() {
         tracing::warn!(
@@ -535,30 +557,66 @@ mod tests {
     }
 
     #[test]
-    fn response_would_exceed_frame_size_rejects_a_projection_over_the_limit() {
-        // bounds_guard cannot see this cost: one requested topic name can expand into up to
-        // Iggy's own per-topic partition cap (1000) worth of MetadataResponsePartition entries,
-        // information only known after the bridge round trip this check runs after.
-        let max_frame_size = 1024;
-        let total_partitions = (max_frame_size / RESPONSE_BYTES_PER_PARTITION) + 1;
-        assert!(response_would_exceed_frame_size(
-            total_partitions,
-            max_frame_size
-        ));
+    fn response_would_exceed_frame_size_rejects_bytes_over_the_limit() {
+        assert!(response_would_exceed_frame_size(1025, 1024));
     }
 
     #[test]
-    fn response_would_exceed_frame_size_accepts_a_projection_at_or_under_the_limit() {
-        let max_frame_size = 1024;
-        let total_partitions = max_frame_size / RESPONSE_BYTES_PER_PARTITION;
-        assert!(!response_would_exceed_frame_size(
-            total_partitions,
-            max_frame_size
-        ));
+    fn response_would_exceed_frame_size_accepts_bytes_at_the_limit() {
+        assert!(!response_would_exceed_frame_size(1024, 1024));
+    }
+
+    fn topic_result(name: &'static str, error_code: i16, partitions_count: u32) -> TopicResult {
+        TopicResult {
+            name: StrBytes::from_static_str(name),
+            error_code,
+            partitions_count,
+        }
     }
 
     #[test]
-    fn response_would_exceed_frame_size_does_not_overflow_on_a_pathological_partition_count() {
-        assert!(response_would_exceed_frame_size(usize::MAX, 1024));
+    fn estimated_response_bytes_charges_name_and_overhead_even_at_zero_partitions() {
+        // Regression: a partitions-only charge (the earlier form of this function) priced a
+        // zero-partition result at 0, when `encode_real_response` still emits a full
+        // `MetadataResponseTopic` wrapper with the name in it.
+        let result = topic_result("orders", ERROR_NONE, 0);
+        assert_eq!(
+            estimated_response_bytes(&result),
+            RESPONSE_BYTES_TOPIC_OVERHEAD + "orders".len() + 2
+        );
+    }
+
+    #[test]
+    fn estimated_response_bytes_charges_overhead_and_name_on_an_error_result_too() {
+        // Regression: the earlier per-topic sum filtered to `error_code == ERROR_NONE` before
+        // charging anything, so an all-erroring batch (e.g. every requested name unknown) was
+        // priced at 0 bytes total despite `encode_real_response` emitting one wrapper per result
+        // regardless of its error code.
+        let result = topic_result("orders", ERROR_UNKNOWN_TOPIC_OR_PARTITION, 0);
+        assert_eq!(
+            estimated_response_bytes(&result),
+            RESPONSE_BYTES_TOPIC_OVERHEAD + "orders".len() + 2
+        );
+    }
+
+    #[test]
+    fn estimated_response_bytes_ignores_partitions_count_on_an_error_result() {
+        // `encode_real_response` sends an empty `partitions` array whenever `error_code !=
+        // ERROR_NONE`, so a stale non-zero `partitions_count` on an error result (shouldn't occur,
+        // but nothing enforces it structurally) must not inflate the charge.
+        let ok = topic_result("orders", ERROR_NONE, 10);
+        let err = topic_result("orders", ERROR_UNKNOWN_TOPIC_OR_PARTITION, 10);
+        assert_eq!(
+            estimated_response_bytes(&err),
+            RESPONSE_BYTES_TOPIC_OVERHEAD + "orders".len() + 2
+        );
+        assert!(estimated_response_bytes(&ok) > estimated_response_bytes(&err));
+    }
+
+    #[test]
+    fn estimated_response_bytes_charges_longer_names_more() {
+        let short = topic_result("a", ERROR_NONE, 0);
+        let long = topic_result("a-much-longer-topic-name", ERROR_NONE, 0);
+        assert!(estimated_response_bytes(&long) > estimated_response_bytes(&short));
     }
 }

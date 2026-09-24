@@ -88,7 +88,7 @@ fn build_request(topics: &[TopicSpec], validate_only: bool) -> Bytes {
         for &partition_index in topic.assignments {
             enc.write_i32(partition_index);
             enc.write_varint(2); // one broker
-            enc.write_i32(0); // broker_id
+            enc.write_i32(1); // broker_id - the one broker this gateway advertises (node id 1)
             enc.write_empty_tagged_fields();
         }
 
