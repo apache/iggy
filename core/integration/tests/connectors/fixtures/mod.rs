@@ -102,6 +102,10 @@ pub use redshift::{
     RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
     RedshiftSinkVarbyteFixture,
 };
+pub use s3::{
+    DATA_KEY as S3_SOURCE_DATA_KEY, RESTART_RECORD_COUNT as S3_SOURCE_RECORD_COUNT,
+    S3SourceFixture, S3SourceRestartFixture,
+};
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 pub use surrealdb::{
     SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkDatabaseFixture, SurrealDbSinkFixture,
