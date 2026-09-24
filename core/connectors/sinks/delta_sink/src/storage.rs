@@ -19,6 +19,7 @@ use crate::{DeltaSinkConfig, StorageBackendType};
 use iggy_connector_sdk::Error;
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
+use tracing::info;
 
 pub(crate) fn build_storage_options(
     config: &DeltaSinkConfig,
@@ -32,6 +33,7 @@ pub(crate) fn build_storage_options(
                 config.aws_s3_secret_key.as_ref(),
             ) {
                 (Some(access_key), Some(secret_key)) => {
+                    info!("S3 backend: using static access key/secret key credentials");
                     opts.insert(
                         "AWS_ACCESS_KEY_ID".into(),
                         access_key.expose_secret().to_owned(),
@@ -47,6 +49,9 @@ pub(crate) fn build_storage_options(
                     // this same process sets a key, opening it writes that key into the
                     // shared process environment, and this sink's fallback can silently
                     // read it too.
+                    info!(
+                        "S3 backend: no static keys provided, relying on AWS SDK's default credential chain"
+                    );
                 }
                 _ => {
                     return Err(Error::InvalidConfigValue(

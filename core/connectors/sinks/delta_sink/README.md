@@ -18,7 +18,7 @@ First, make sure that the Delta table already exists in the location you're prov
 import pyarrow as pa
 from deltalake import DeltaTable
 
-table_uri = "s3://test_location/tables/test"
+table_uri = "s3://my-bucket/tables/test"
 
 schema = pa.schema([
     pa.field("user_id", pa.string(), nullable=True),
@@ -64,9 +64,9 @@ The configuration is usually written individually for every connector and consis
   # these settings are specific to each plugin, and in case of Delta sink, to the type of storage used
   [plugin_config]
   # the table must exist in the given location
-  table_uri = "s3://iggy-sandbox/tables/test"
+  table_uri = "s3://my-bucket/tables/test"
   storage_backend_type = "s3"
-  aws_s3_region = "eu-central-1"
+  aws_s3_region = "us-east-1"
   aws_s3_allow_http = false
   ```
 
@@ -77,6 +77,7 @@ The configuration is usually written individually for every connector and consis
   `batch_length` is a ceiling: it only produces large files when messages arrive fast enough between polls to fill it, so a low-throughput topic produces small, frequent commits regardless of how high `batch_length` is set. For Delta, writing means creating a log entry and a separate Parquet file, so a low `batch_length` (roughly < 1000) or a low-throughput topic results in lots of small files.
   This is highly undesirable for the reader as it will have to read from many small files instead of a few larger ones. For query performance optimization, the system consuming these files will have to apply `OPTIMIZE` query in order to consolidate the files. We recommend setting `batch_length` pretty high based on your workload so that ideally the files are already optimized for reading.
   The guideline recommended by the developers of Delta is to keep individual file sizes between 128 MB and 1 GB. In the context of this document, it means that ideally `batch_length` should be tuned so that each commit's file size falls within the suggested range, assuming your topic has enough throughput to fill it. The given range is only a rough guideline and you need to find a good setting based on the patterns of reading and writing in your systems.
+  A larger `batch_length` means a failed write loses more data: offsets commit at poll time, so if the Delta write or commit fails afterward, that whole batch is lost with no retry. It also sits in memory longer and in multiple copies — raw messages, coerced JSON, and the writer's internal buffer — until the commit succeeds.
 
 ### Plugin configuration
 
@@ -97,6 +98,8 @@ The configuration is usually written individually for every connector and consis
 Currently the implementation offers two possible ways of accessing the bucket.
 
 1. No static keys — the AWS SDK discovers credentials on its own via its default credential chain (environment variables, shared config/profile including SSO, web identity federation, ECS/EKS container credentials, or EC2 instance metadata). This is the best practice recommended by AWS. For example, if running with an attached IAM role, the role assumed by the writer should allow these actions on the bucket, here is how a working policy looks in HCL:
+
+    If another Delta sink in the same `iggy-connectors` process is configured with static keys, opening it writes those keys into the shared process environment, and this keyless fallback can pick them up — which identity ends up writing depends on sink init order.
 
     ```hcl
     data "aws_iam_policy_document" "s3_write" {
@@ -127,7 +130,7 @@ Currently the implementation offers two possible ways of accessing the bucket.
 
     ```toml
     [plugin_config]
-    table_uri = "s3://iggy-sandbox/tables/test"
+    table_uri = "s3://my-bucket/tables/test"
     storage_backend_type = "s3"
     aws_s3_region = "us-east-1"
     ```
@@ -148,7 +151,7 @@ Parameter descriptions:
 - **aws_s3_access_key**: Optional. AWS access key ID. Can only be passed together with the secret key.
 - **aws_s3_secret_key**: Optional. AWS secret access key. Can only be passed together with the access key.
 - **aws_s3_region**: Required. AWS region (e.g. `us-east-1`).
-- **aws_s3_endpoint_url**: Optional. S3 endpoint URL. Use for S3-compatible services. Make sure that the URL implies the same regions that is set in **aws_s3_region**, otherwise you'll have an error.
+- **aws_s3_endpoint_url**: Optional. S3 endpoint URL. Use for S3-compatible services. Make sure that the URL implies the same region that is set in **aws_s3_region**, otherwise you'll have an error.
   Setting a custom endpoint skips the AWS SDK's full credential chain: shared profile and SSO credentials stop working, and only static keys, web identity federation, container credentials, or instance metadata remain available. Set `AWS_FORCE_CREDENTIAL_LOAD=true` in the `iggy-connectors` process environment to restore the full chain.
 - **aws_s3_allow_http**: Optional. Set to `true` to allow HTTP connections (for local development).
 

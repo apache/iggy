@@ -51,8 +51,6 @@ impl Sink for DeltaSink {
             error!("Connector configuration: invalid storage configuration. Error message: {e}");
         })?;
 
-        info!("Successfully composed the storage options for accessing the storage backend");
-
         let builder = deltalake::DeltaTableBuilder::from_url(table_url)
             .map_err(|e| {
                 error!("deltalake-rs interface: failed to configure with table_uri = '{table_uri}'. Check deltalake::DeltaTableBuilder::from_url docs and code to correct your table_uri. Error message: {e}");
@@ -68,8 +66,8 @@ impl Sink for DeltaSink {
             .await
             .map_err(
                 |e| {
-                    error!("deltalake-rs interface: failed to list table_url '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}");
-                    Error::InitError(format!("deltalake-rs interface: failed to list table_url '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}"))
+                    error!("deltalake-rs interface: failed to list table_uri '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}");
+                    Error::InitError(format!("deltalake-rs interface: failed to list table_uri '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}"))
                 }
             )?;
         if !table_exists {

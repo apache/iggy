@@ -53,6 +53,7 @@ struct SinkState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeltaSinkConfig {
     pub table_uri: String,
     #[serde(default)]

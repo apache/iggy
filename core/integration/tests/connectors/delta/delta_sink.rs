@@ -253,7 +253,7 @@ async fn delta_sink_handles_bucket_absence_on_s3(
     let (stdout, stderr) = runtime.collect_logs();
     let logs = format!("{stdout}\n{stderr}");
     assert!(
-        logs.contains("failed to list table_url") && logs.contains("ERROR"),
+        logs.contains("failed to list table_uri") && logs.contains("ERROR"),
         "the error is expected since the bucket is not created"
     );
 }
@@ -328,7 +328,7 @@ async fn delta_sink_handles_invalid_credentials_on_s3(
     let (stdout, stderr) = runtime.collect_logs();
     let logs = format!("{stdout}\n{stderr}");
     assert!(
-        logs.contains("failed to list table_url") && logs.contains("ERROR"),
+        logs.contains("failed to list table_uri") && logs.contains("ERROR"),
         "the error is expected since the S3 credentials are wrong"
     );
 }
