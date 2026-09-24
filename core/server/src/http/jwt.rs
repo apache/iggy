@@ -172,7 +172,7 @@ impl JwtManager {
             validation,
             jwks_client: JwksClient::default(),
             trusted_issuers,
-            forbidden_user_ids: external_auth_user_id.into_iter().collect(),
+            forbidden_user_ids: std::iter::once(0).chain(external_auth_user_id).collect(),
         })
     }
 
@@ -270,20 +270,11 @@ impl JwtManager {
             return Err(IggyError::Unauthenticated);
         };
 
-        // A trusted external subject must never resolve to the root user
-        // or the external auth reserved user_id.
-        if config.user_id == 0 {
-            error!(
-                issuer = %config.issuer,
-                "trusted-issuer token cannot map to root user (user_id = 0)"
-            );
-            return Err(IggyError::Unauthenticated);
-        }
         if self.forbidden_user_ids.contains(&config.user_id) {
             error!(
                 issuer = %config.issuer,
                 user_id = config.user_id,
-                "trusted-issuer token maps to a forbidden user_id (external_auth.user_id)"
+                "trusted-issuer token maps to a forbidden user_id"
             );
             return Err(IggyError::Unauthenticated);
         }

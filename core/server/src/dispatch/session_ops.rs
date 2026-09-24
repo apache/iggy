@@ -1467,7 +1467,6 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                 sessions.borrow_mut().set_session_permissions(
                     transport_client_id,
                     crate::external_auth::SessionPermissions {
-                        principal,
                         permissions: std::sync::Arc::new(permissions),
                         expires_at,
                     },
