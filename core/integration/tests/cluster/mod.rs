@@ -21,6 +21,7 @@ mod consumer_offset_quota;
 mod crash_durability;
 mod crash_offset_reuse;
 mod crash_recovery_corruption;
+mod external_auth_replication;
 mod failover_client_continuity;
 mod fast_primary_rejoin;
 mod metadata_checkpoint_restart;
