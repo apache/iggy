@@ -23,13 +23,12 @@
 //! or deny it. This module owns the request/response types, the HTTP
 //! callout, and the session-scoped permission carrier.
 //!
-//! Known limitation: there is no per-client rate limit on callout attempts.
-//! Every failed built-in login triggers a callout, so a brute-force attack
-//! can amplify traffic to the external service. The shard reactor's
-//! single-threaded model bounds binary-transport concurrency, but the HTTP
-//! transport is concurrent. Operators should rate-limit at the network
-//! layer or inside the external auth service itself.
+//! Per-thread in-flight callouts are capped at [`MAX_IN_FLIGHT_CALLOUTS`]
+//! via [`CalloutGuard`]. There is no per-client rate limit: operators should
+//! rate-limit brute-force attempts at the network layer or inside the
+//! external auth service itself.
 
+use std::cell::Cell;
 use std::fmt;
 
 use configs::external_auth::ExternalAuthConfig;
@@ -44,12 +43,39 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 /// and would otherwise be forwarded verbatim to the external service.
 const MAX_CREDENTIAL_BYTES: usize = 8_192;
 
+const MAX_IN_FLIGHT_CALLOUTS: u32 = 64;
+
 thread_local! {
     static HTTP_CLIENT: cyper::Client =
         cyper::Client::builder()
             .redirect(cyper::redirect::Policy::none())
             .build()
             .expect("failed to build cyper HTTP client for external auth");
+
+    static IN_FLIGHT_CALLOUTS: Cell<u32> = const { Cell::new(0) };
+}
+
+struct CalloutGuard;
+
+impl CalloutGuard {
+    fn acquire() -> Result<Self, ExternalAuthError> {
+        IN_FLIGHT_CALLOUTS.with(|c| {
+            let current = c.get();
+            if current >= MAX_IN_FLIGHT_CALLOUTS {
+                return Err(ExternalAuthError::HttpError(format!(
+                    "too many concurrent callouts ({current})"
+                )));
+            }
+            c.set(current + 1);
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for CalloutGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT_CALLOUTS.with(|c| c.set(c.get().saturating_sub(1)));
+    }
 }
 
 fn get_http_client() -> cyper::Client {
@@ -98,10 +124,10 @@ pub enum CredentialType {
 
 /// JSON response from the external auth service. Fields are `Option`
 /// because different decisions use different subsets; `into_decision`
-/// validates the required fields per variant. A tagged enum would be
-/// cleaner but serde's internal-tag path buffers through `Value`,
-/// which loses string-to-integer map key parsing for
-/// `Permissions.streams: BTreeMap<u32, _>`.
+/// validates the required fields per variant. The `permissions` object
+/// must be fully specified: every field of `GlobalPermissions`,
+/// `StreamPermissions` and `TopicPermissions` is required so the auth
+/// service is explicit about what it grants.
 #[derive(Debug, Deserialize)]
 struct ExternalAuthResponse {
     decision: DecisionTag,
@@ -265,7 +291,6 @@ pub fn warn_insecure_url(config: &ExternalAuthConfig) {
 /// the full `BTreeMap` tree on every request.
 #[derive(Debug, Clone)]
 pub struct SessionPermissions {
-    pub principal: String,
     pub permissions: std::sync::Arc<Permissions>,
     pub expires_at: u64,
 }
@@ -291,6 +316,7 @@ pub async fn callout_external_auth(
         )));
     }
 
+    let _guard = CalloutGuard::acquire()?;
     let client = get_http_client();
     let timeout = config.timeout.get_duration();
 
@@ -495,17 +521,32 @@ mod tests {
             "principal": "device-1234",
             "permissions": {
                 "global": {
+                    "manage_servers": false,
+                    "read_servers": false,
+                    "manage_users": false,
+                    "read_users": false,
+                    "manage_streams": false,
                     "read_streams": true,
+                    "manage_topics": false,
                     "read_topics": true,
                     "poll_messages": true,
                     "send_messages": true
                 },
                 "streams": {
                     "1": {
+                        "manage_stream": false,
+                        "read_stream": false,
+                        "manage_topics": false,
+                        "read_topics": false,
                         "poll_messages": true,
                         "send_messages": true,
                         "topics": {
-                            "0": { "poll_messages": true }
+                            "0": {
+                                "manage_topic": false,
+                                "read_topic": false,
+                                "poll_messages": true,
+                                "send_messages": false
+                            }
                         }
                     }
                 }
@@ -539,15 +580,30 @@ mod tests {
         }
     }
 
+    const ALL_FALSE_GLOBAL: &str = r#"{
+        "manage_servers": false,
+        "read_servers": false,
+        "manage_users": false,
+        "read_users": false,
+        "manage_streams": false,
+        "read_streams": false,
+        "manage_topics": false,
+        "read_topics": false,
+        "poll_messages": false,
+        "send_messages": false
+    }"#;
+
     #[test]
-    fn response_inline_grant_minimal_permissions_default_all_false() {
-        let json = r#"{
-            "decision": "inline_grant",
-            "principal": "dev-1",
-            "permissions": {},
-            "expires_at": 9999999999
-        }"#;
-        match parse_response(json).unwrap() {
+    fn response_inline_grant_all_false_permissions() {
+        let json = format!(
+            r#"{{
+                "decision": "inline_grant",
+                "principal": "dev-1",
+                "permissions": {{ "global": {ALL_FALSE_GLOBAL} }},
+                "expires_at": 9999999999
+            }}"#
+        );
+        match parse_response(&json).unwrap() {
             ExternalAuthDecision::InlineGrant {
                 permissions,
                 expires_at,
@@ -571,24 +627,39 @@ mod tests {
     }
 
     #[test]
-    fn response_inline_grant_missing_expires_at_should_error() {
+    fn response_inline_grant_missing_global_fields_should_error() {
         let json = r#"{
             "decision": "inline_grant",
             "principal": "dev-1",
-            "permissions": {}
+            "permissions": {"global": {}},
+            "expires_at": 9999999999
         }"#;
-        let err = parse_response(json).unwrap_err();
+        assert!(parse_response(json).is_err());
+    }
+
+    #[test]
+    fn response_inline_grant_missing_expires_at_should_error() {
+        let json = format!(
+            r#"{{
+                "decision": "inline_grant",
+                "principal": "dev-1",
+                "permissions": {{ "global": {ALL_FALSE_GLOBAL} }}
+            }}"#
+        );
+        let err = parse_response(&json).unwrap_err();
         assert!(err.to_string().contains("missing expires_at"));
     }
 
     #[test]
     fn response_inline_grant_missing_principal_should_error() {
-        let json = r#"{
-            "decision": "inline_grant",
-            "permissions": {"global": {}},
-            "expires_at": 9999999999
-        }"#;
-        let err = parse_response(json).unwrap_err();
+        let json = format!(
+            r#"{{
+                "decision": "inline_grant",
+                "permissions": {{ "global": {ALL_FALSE_GLOBAL} }},
+                "expires_at": 9999999999
+            }}"#
+        );
+        let err = parse_response(&json).unwrap_err();
         assert!(err.to_string().contains("missing principal"));
     }
 

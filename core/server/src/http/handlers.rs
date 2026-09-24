@@ -2035,17 +2035,12 @@ fn handle_http_auth_decision(
                 return Err(IggyError::Unauthenticated.into());
             }
             let user_id = state.external_auth.user_id;
-            tracing::debug!(
-                principal = principal.as_str(),
-                expires_at,
-                "external auth inline grant accepted"
-            );
+            tracing::debug!(principal, expires_at, "external auth inline grant accepted");
             let generated = state.jwt.generate_capped(user_id, expires_at)?;
             let session_key = crate::http::extractor::SessionKey::Jwt(generated.jti.clone());
             if !state.insert_session_grant(
                 session_key,
                 crate::external_auth::SessionPermissions {
-                    principal,
                     permissions: std::sync::Arc::new(permissions),
                     expires_at,
                 },
