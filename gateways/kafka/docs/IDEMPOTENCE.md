@@ -129,8 +129,20 @@ Produce persists, because `producer_epoch` is always 0, so a replayed id is a re
 `(producer_id, producer_epoch)` pair a live producer may still hold. The counter therefore starts
 at the wall clock in milliseconds rather than at 0. A restarted gateway starts above every id its
 previous run handed out unless that run averaged more than one allocation per millisecond of its
-uptime, or the clock stepped back across the restart. Nothing is persisted for this, and 2^47
-milliseconds leaves the counter space thousands of years from running out.
+uptime, or the clock stepped back across the restart. A clock that reads before the Unix epoch
+seeds 0 and replays from the bottom. 2^47 milliseconds leaves the counter space thousands of years
+from running out.
+
+Nothing is persisted for this, so the clock seed narrows the replay window without closing it. That
+is harmless while no code path reads the producer id. It stops being harmless once one does:
+[#3535](https://github.com/apache/iggy/issues/3535) must first either persist a high-water mark
+and seed the counter above it, or bump `producer_epoch` on every gateway start. Either one makes a
+replayed `(producer_id, producer_epoch)` pair impossible rather than unlikely.
+
+`IGGY_KAFKA_INSTANCE_ID` defaults to 0 so a single gateway needs no configuration. Two gateways
+left on the default draw from the same 47-bit space and can hand out identical ids, on the first
+allocation if they start in the same millisecond. Nothing in the cluster detects that, so a gateway started without the
+variable logs a warning, and the running value is in the startup log line.
 
 An empty `transactional_id` reads as absent. A wire null decodes to `None`, but
 `kafka-protocol`'s own `Default` is `Some("")`, and a producer that is idempotent-only names no

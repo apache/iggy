@@ -63,8 +63,10 @@ const PRODUCER_EPOCH: i16 = 0;
 /// `(producer_id, producer_epoch)` and the epoch is always 0 here, so a counter restarting at 0
 /// would hand a restarted gateway's producers the pairs its previous run gave out. Seeding from
 /// the clock keeps every new id above the old ones unless the previous run averaged more than one
-/// allocation per millisecond of its uptime, or the clock stepped back across the restart, with
-/// nothing persisted.
+/// allocation per millisecond of its uptime, the clock stepped back across the restart, or the
+/// clock reads before the Unix epoch and seeds 0. Nothing is persisted, and nothing reads the id
+/// yet. Before Produce (#3535) keys anything on it, the allocator has to persist a high-water mark
+/// or bump the epoch on every start.
 #[derive(Debug)]
 pub struct ProducerIdAllocator {
     instance_id: u16,

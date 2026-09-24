@@ -196,6 +196,13 @@ fn load_config() -> Result<GatewayConfig, String> {
         config.instance_id = raw
             .parse()
             .map_err(|e| format!("invalid IGGY_KAFKA_INSTANCE_ID `{raw}`: {e}"))?;
+    } else {
+        // A second gateway left on the default hands out the same producer ids as the first,
+        // and nothing in the cluster can detect it, so an unset value is surfaced at startup.
+        warn!(
+            "IGGY_KAFKA_INSTANCE_ID is not set, defaulting to 0: every gateway fronting the same \
+             Iggy cluster needs its own value, or they hand out colliding producer ids"
+        );
     }
 
     Ok(config)
