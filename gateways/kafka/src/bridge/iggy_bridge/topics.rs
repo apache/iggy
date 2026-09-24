@@ -82,7 +82,7 @@ impl IggyBridge {
     /// default should be for this bridge is a decision for whichever of `#3535`/`#3536` first
     /// calls this with a real Kafka request in hand, not one to invent here ahead of that need.
     ///
-    /// No caching: every call pays a stream-create attempt ([`Self::ensure_stream`]) and a
+    /// No caching: every call pays a stream-create attempt ([Self::ensure_stream]) and a
     /// `get_topic` (two round trips once both already exist), even for a topic this same bridge
     /// already confirmed a moment ago. A cache keyed on `kafka_topic` would remove that cost, but
     /// would also have to answer "how does a cache entry ever get invalidated" - the topic being
