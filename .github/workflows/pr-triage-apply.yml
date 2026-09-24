@@ -172,11 +172,8 @@ jobs:
           # arrives as pull_request_review and takes the checked path, while
           # the issue_comment path only ever sees an artifact written by the
           # default branch's collect. Any other event is rejected.
-          payload=( payload/*.json payload/event.json )
-          f=""
-          for candidate in "${payload[@]}"; do
-            [[ -f "$candidate" ]] && f="$candidate" && break
-          done
+          payload=( payload/*.json )
+          f="${payload[0]:-}"
           if [[ -z "$f" ]]; then
             echo "triage payload not found under payload/" >&2
             ls -la payload/ >&2 || true
@@ -190,20 +187,46 @@ jobs:
             esac
           }
 
-          author=""; assoc=""; state=""; pr=""; id=""
+          # Retry 5xx, 429 and network failures, as withRetry does for the
+          # script path. Anything else fails at once with gh's own message;
+          # a 404 returns 44 so a caller can tell it apart.
+          gh_api() {
+            local err out code="" delay
+            err="$(mktemp)"
+            for delay in 0.5 1.5 4 ""; do
+              if out="$(gh api "$@" 2>"$err")"; then
+                rm -f "$err"
+                printf '%s\n' "$out"
+                return 0
+              fi
+              code="$(grep -oE 'HTTP [0-9]{3}' "$err" | tail -n1 | cut -d' ' -f2 || true)"
+              case "$code" in
+                ''|429|5??) ;;
+                *) break ;;
+              esac
+              [[ -n "$delay" ]] || break
+              echo "gh api $1: transient failure (${code:-network}), retrying in ${delay}s" >&2
+              sleep "$delay"
+            done
+            cat "$err" >&2
+            rm -f "$err"
+            if [[ "$code" == 404 ]]; then return 44; fi
+            return 1
+          }
+
+          author=""; assoc=""; state=""; pr=""; cid=""
           : > payload/body.txt
 
           case "$UPSTREAM_EVENT" in
             issue_comment)
               cid="$(jq -r '.comment.id // ""' "$f")"
               require_num "$cid" comment_id
-              c="$(gh api "repos/${REPO}/issues/comments/${cid}")"
+              c="$(gh_api "repos/${REPO}/issues/comments/${cid}")"
               author="$(jq -r '.user.login // ""' <<<"$c")"
               assoc="$(jq -r '.author_association' <<<"$c")"
               jq -r '.body // ""' <<<"$c" > payload/body.txt
               # issue_url ends in the PR (issue) number.
               pr="$(jq -r '.issue_url' <<<"$c" | grep -oE '[0-9]+$' || true)"
-              id="$cid"
               ;;
             pull_request_review)
               rid="$(jq -r '.review.id // ""' "$f")"
@@ -212,15 +235,24 @@ jobs:
               require_num "$cpr" pr_number
               # Fetching the review under the claimed PR verifies the pair: a
               # review id that does not belong to that PR 404s here, so the
-              # claimed PR number cannot be steered to another PR.
-              r="$(gh api "repos/${REPO}/pulls/${cpr}/reviews/${rid}")"
+              # claimed PR number cannot be steered to another PR. Skip it
+              # rather than fail the run, as the PR lookup below does.
+              rc=0
+              r="$(gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}")" || rc=$?
+              if (( rc == 44 )); then
+                echo "review ${rid} is not on PR ${cpr}, skipping"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              elif (( rc != 0 )); then
+                exit "$rc"
+              fi
               # The pair is real but may be someone else's old review on any
               # PR. HEAD_SHA is set by GitHub, not the fork, and is the head
-              # the collect run fired on. A forged run fires on the fork's own
-              # commit, which is in no other PR's commit list. The review's
-              # commit_id is not compared: GitHub moves it when the branch is
-              # updated, which often happens seconds after an approval.
-              shas="$(gh api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
+              # the collect run fired on. Requiring it to be one of the claimed
+              # PR's commits is what confines a forged payload to the fork's
+              # own PR: a forged run fires on the fork's own commit, which is
+              # in no other PR's commit list.
+              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
               if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
                 echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
                 exit 1
@@ -235,7 +267,7 @@ jobs:
               fi
               age=$(( $(date -u -d "$RUN_CREATED" +%s) - $(date -u -d "$sub" +%s) ))
               if (( age < -60 || age > 300 )); then
-                echo "review ${rid} was submitted ${age}s before the collect run" >&2
+                echo "review ${rid} was submitted at ${sub} and the collect run created at ${RUN_CREATED}, outside the allowed window" >&2
                 exit 1
               fi
               author="$(jq -r '.user.login // ""' <<<"$r")"
@@ -280,13 +312,14 @@ jobs:
           {
             echo "comment_author=${author}"
             echo "comment_assoc=${assoc}"
-            echo "comment_id=${id}"
+            echo "comment_id=${cid}"
             echo "pr_number=${pr}"
             echo "review_state=${state}"
             echo "triage_event_name=${UPSTREAM_EVENT}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Dispatch
+        if: steps.resolve.outputs.skip != 'true'
         uses: actions/github-script@v9
         env:
           COMMENT_AUTHOR: ${{ steps.resolve.outputs.comment_author }}

@@ -102,11 +102,37 @@ jobs:
               ''|*[!0-9]*) echo "non-numeric ${2}: '${1}'" >&2; exit 1 ;;
             esac
           }
+          # Retry 5xx, 429 and network failures, as withRetry does for the
+          # script path. Anything else fails at once with gh's own message;
+          # a 404 returns 44 so a caller can tell it apart.
+          gh_api() {
+            local err out code="" delay
+            err="$(mktemp)"
+            for delay in 0.5 1.5 4 ""; do
+              if out="$(gh api "$@" 2>"$err")"; then
+                rm -f "$err"
+                printf '%s\n' "$out"
+                return 0
+              fi
+              code="$(grep -oE 'HTTP [0-9]{3}' "$err" | tail -n1 | cut -d' ' -f2 || true)"
+              case "$code" in
+                ''|429|5??) ;;
+                *) break ;;
+              esac
+              [[ -n "$delay" ]] || break
+              echo "gh api $1: transient failure (${code:-network}), retrying in ${delay}s" >&2
+              sleep "$delay"
+            done
+            cat "$err" >&2
+            rm -f "$err"
+            if [[ "$code" == 404 ]]; then return 44; fi
+            return 1
+          }
           case "$UPSTREAM_EVENT" in
             issue_comment)
               cid="$(jq -r '.comment.id // ""' "$f")"
               require_num "$cid" comment_id
-              pr="$(gh api "repos/${REPO}/issues/comments/${cid}" \
+              pr="$(gh_api "repos/${REPO}/issues/comments/${cid}" \
                 --jq '.issue_url' | grep -oE '[0-9]+$' || true)"
               ;;
             pull_request_review)
@@ -115,13 +141,13 @@ jobs:
               require_num "$rid" review_id
               require_num "$cpr" pr_number
               # A review id that does not belong to the claimed PR 404s here.
-              gh api "repos/${REPO}/pulls/${cpr}/reviews/${rid}" >/dev/null
+              gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}" >/dev/null
               # HEAD_SHA is set by GitHub, not the fork. A forged run fires on
               # the fork's own commit, which is in no other PR's commit list,
               # so a real review cannot be replayed onto another PR. The
               # review's commit_id is not compared: GitHub moves it when the
               # branch is updated.
-              shas="$(gh api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
+              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
               if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
                 echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
                 exit 1
