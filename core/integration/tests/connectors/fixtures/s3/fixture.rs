@@ -15,31 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use integration::harness::seeds;
 use integration::harness::{TestBinaryError, TestFixture};
-use s3::creds::Credentials;
-use s3::{Bucket, Region};
-use std::collections::HashMap;
-use std::time::Duration;
-use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
-use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use s3::Bucket;
 use tracing::info;
-use uuid::Uuid;
 
-const MINIO_IMAGE: &str = "quay.io/minio/minio";
-const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
-const MINIO_PORT: u16 = 9000;
-const MINIO_CONSOLE_PORT: u16 = 9001;
+use crate::connectors::fixtures::{
+    self,
+    floci::{self, ACCESS_KEY, FlociContainer, REGION, SECRET_KEY},
+};
 
-const MINIO_ACCESS_KEY: &str = "admin";
-const MINIO_SECRET_KEY: &str = "password";
-const MINIO_BUCKET: &str = "iggy-s3-test";
-/// Bounds the wait for MinIO's S3 API to come up behind its health endpoint.
-const BUCKET_CREATE_ATTEMPTS: u32 = 30;
-const BUCKET_CREATE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const TEST_BUCKET: &str = "iggy-s3-test";
 
 const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_S3_PATH";
 const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_S3_STREAMS_0_STREAM";
@@ -134,7 +123,7 @@ pub trait S3SinkOps: Sync {
 
 pub struct S3SinkFixture {
     #[allow(dead_code)]
-    container: ContainerAsync<GenericImage>,
+    floci: FlociContainer,
     bucket: Box<Bucket>,
     endpoint: String,
 }
@@ -152,111 +141,13 @@ impl S3SinkOps for S3SinkFixture {
 #[async_trait]
 impl TestFixture for S3SinkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let id = Uuid::new_v4();
-        let container_name = format!("minio-s3-{id}");
-
-        let container = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
-            .with_exposed_port(MINIO_PORT.tcp())
-            .with_exposed_port(MINIO_CONSOLE_PORT.tcp())
-            .with_wait_for(WaitFor::http(
-                HttpWaitStrategy::new("/minio/health/live")
-                    .with_port(MINIO_PORT.tcp())
-                    .with_expected_status_code(200u16),
-            ))
-            .with_container_name(&container_name)
-            .with_env_var("MINIO_ROOT_USER", MINIO_ACCESS_KEY)
-            .with_env_var("MINIO_ROOT_PASSWORD", MINIO_SECRET_KEY)
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .with_mapped_port(0, MINIO_PORT.tcp())
-            .with_mapped_port(0, MINIO_CONSOLE_PORT.tcp())
-            .start()
-            .await
-            .map_err(|error| TestBinaryError::FixtureSetup {
-                fixture_type: "S3SinkFixture".to_string(),
-                message: format!("Failed to start MinIO container: {error}"),
-            })?;
-
-        let mapped_port = container
-            .ports()
-            .await
-            .map_err(|error| TestBinaryError::FixtureSetup {
-                fixture_type: "S3SinkFixture".to_string(),
-                message: format!("Failed to get ports: {error}"),
-            })?
-            .map_to_host_port_ipv4(MINIO_PORT)
-            .ok_or_else(|| TestBinaryError::FixtureSetup {
-                fixture_type: "S3SinkFixture".to_string(),
-                message: "No mapping for MinIO port".to_string(),
-            })?;
-
-        let endpoint = format!("http://localhost:{mapped_port}");
-        info!("MinIO container for S3 sink available at {endpoint}");
-
-        let region = Region::Custom {
-            region: "us-east-1".to_string(),
-            endpoint: endpoint.clone(),
-        };
-        let credentials = Credentials::new(
-            Some(MINIO_ACCESS_KEY),
-            Some(MINIO_SECRET_KEY),
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| TestBinaryError::FixtureSetup {
-            fixture_type: "S3SinkFixture".to_string(),
-            message: format!("Failed to create credentials: {e}"),
-        })?;
-
-        // MinIO answers on its health endpoint before it can serve the S3 API,
-        // so bucket creation can come back 503 while it finishes starting. The
-        // call itself is `Ok` in that case -- the status lives in the response
-        // -- so taking it as success left the bucket absent, and the first
-        // `list_objects` then parsed an S3 error document as a listing and
-        // failed with the unhelpful `missing field 'Name'`. Retry until the
-        // status is a real one: 2xx created, 409 already owned by us.
-        let mut last_status = 0;
-        let mut created = false;
-        for _ in 0..BUCKET_CREATE_ATTEMPTS {
-            let response = Bucket::create_with_path_style(
-                MINIO_BUCKET,
-                region.clone(),
-                credentials.clone(),
-                s3::BucketConfiguration::default(),
-            )
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "S3SinkFixture".to_string(),
-                message: format!("Failed to create bucket: {e}"),
-            })?;
-            last_status = response.response_code;
-            if (200..300).contains(&last_status) || last_status == 409 {
-                created = true;
-                break;
-            }
-            tokio::time::sleep(BUCKET_CREATE_RETRY_DELAY).await;
-        }
-        if !created {
-            return Err(TestBinaryError::FixtureSetup {
-                fixture_type: "S3SinkFixture".to_string(),
-                message: format!(
-                    "Bucket '{MINIO_BUCKET}' not creatable after \
-                     {BUCKET_CREATE_ATTEMPTS} attempts (last status: {last_status})"
-                ),
-            });
-        }
-        info!("S3 bucket '{MINIO_BUCKET}' ready (status: {last_status})");
-
-        let mut bucket = Bucket::new(MINIO_BUCKET, region, credentials).map_err(|e| {
-            TestBinaryError::FixtureSetup {
-                fixture_type: "S3SinkFixture".to_string(),
-                message: format!("Failed to create bucket handle: {e}"),
-            }
-        })?;
-        bucket.set_path_style();
+        let floci =
+            FlociContainer::start(None, &fixtures::unique_container_name("floci-s3")).await?;
+        let endpoint = floci.endpoint.clone();
+        let bucket = floci::create_bucket(&endpoint, TEST_BUCKET).await?;
 
         Ok(Self {
-            container,
+            floci,
             bucket,
             endpoint,
         })
@@ -277,17 +168,17 @@ impl TestFixture for S3SinkFixture {
             format!("[{}]", seeds::names::TOPIC),
         );
         envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SINK_PLUGIN_BUCKET.to_string(), MINIO_BUCKET.to_string());
-        envs.insert(ENV_SINK_PLUGIN_REGION.to_string(), "us-east-1".to_string());
+        envs.insert(ENV_SINK_PLUGIN_BUCKET.to_string(), TEST_BUCKET.to_string());
+        envs.insert(ENV_SINK_PLUGIN_REGION.to_string(), REGION.to_string());
         envs.insert(ENV_SINK_PLUGIN_ENDPOINT.to_string(), self.endpoint.clone());
         envs.insert(ENV_SINK_PLUGIN_PREFIX.to_string(), String::new());
         envs.insert(
             ENV_SINK_PLUGIN_ACCESS_KEY.to_string(),
-            MINIO_ACCESS_KEY.to_string(),
+            ACCESS_KEY.to_string(),
         );
         envs.insert(
             ENV_SINK_PLUGIN_SECRET_KEY.to_string(),
-            MINIO_SECRET_KEY.to_string(),
+            SECRET_KEY.to_string(),
         );
         envs.insert(
             ENV_SINK_PLUGIN_FILE_ROTATION.to_string(),
