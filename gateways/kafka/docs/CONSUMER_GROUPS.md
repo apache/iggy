@@ -94,6 +94,7 @@ other. Full static membership belongs to
 | `max_members_per_group` | 1000 | Kafka's `group.max.size`; beyond it, `GROUP_MAX_SIZE_REACHED` (81) |
 | `max_total_members` | 10000 | Across every group, checked before a member id is minted; `COORDINATOR_NOT_AVAILABLE` (15) |
 | `max_member_blob_bytes` | 64 KiB | One JoinGroup's total protocol metadata, and one SyncGroup assignment blob; beyond it, `INVALID_REQUEST` (42) |
+| `max_group_roster_bytes` | 4 MiB | Member ids, instance ids and largest protocol metadata summed across one group, which bounds the leader's JoinGroup response; beyond it, `GROUP_MAX_SIZE_REACHED` (81) |
 
 The frame-level bounds guard (`src/protocol/bounds_guard.rs`) bounds one request. These bound what
 is *retained*: a member's subscription and assignment outlive the connection that sent them, up to

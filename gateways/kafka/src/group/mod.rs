@@ -82,6 +82,11 @@ pub struct GroupCoordinatorConfig {
     /// Cap on the opaque bytes retained per member: the sum of one `JoinGroup`'s
     /// `protocols[].metadata`, and the size of one `SyncGroup` assignment blob.
     pub max_member_blob_bytes: usize,
+    /// Cap on the roster one group's leader is sent in its `JoinGroup` response: every member's
+    /// id, instance id and subscription metadata. `max_members_per_group * max_member_blob_bytes`
+    /// is 64 MiB at the defaults, so without this a full group builds a response far larger than
+    /// the default 8 MiB `max_frame_size` the gateway itself accepts.
+    pub max_group_roster_bytes: usize,
 }
 
 impl Default for GroupCoordinatorConfig {
@@ -95,6 +100,7 @@ impl Default for GroupCoordinatorConfig {
             max_members_per_group: 1_000,
             max_total_members: 10_000,
             max_member_blob_bytes: 64 * 1024,
+            max_group_roster_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -114,11 +120,13 @@ pub struct JoinRequest {
     pub require_known_member_id: bool,
 }
 
+/// Every field is copied out of the frame rather than cloned: a clone is a refcounted view that
+/// keeps the whole decoded frame, `reason` included, alive for as long as the join parks.
 impl From<(i16, &JoinGroupRequest)> for JoinRequest {
     fn from((api_version, request): (i16, &JoinGroupRequest)) -> Self {
         let session_timeout = millis_to_duration(request.session_timeout_ms);
         Self {
-            group_id: request.group_id.0.clone(),
+            group_id: owned_str(&request.group_id.0),
             session_timeout,
             // v0 has no rebalance timeout and decodes to -1. A non-positive value from any other
             // version is treated the same way rather than admitting a zero-length rebalance
@@ -128,13 +136,18 @@ impl From<(i16, &JoinGroupRequest)> for JoinRequest {
             } else {
                 session_timeout
             },
-            member_id: request.member_id.clone(),
-            group_instance_id: request.group_instance_id.clone(),
-            protocol_type: request.protocol_type.clone(),
+            member_id: owned_str(&request.member_id),
+            group_instance_id: request.group_instance_id.as_ref().map(owned_str),
+            protocol_type: owned_str(&request.protocol_type),
             protocols: request
                 .protocols
                 .iter()
-                .map(|protocol| (protocol.name.clone(), protocol.metadata.clone()))
+                .map(|protocol| {
+                    (
+                        owned_str(&protocol.name),
+                        Bytes::copy_from_slice(&protocol.metadata),
+                    )
+                })
                 .collect(),
             require_known_member_id: api_version >= 4,
         }
@@ -364,12 +377,20 @@ fn park_outcome<T>(
     }
 }
 
+/// A `StrBytes` with its own allocation, detached from the frame it was decoded from.
+fn owned_str(value: &StrBytes) -> StrBytes {
+    StrBytes::from_string(value.as_str().to_owned())
+}
+
 fn millis_to_duration(millis: i32) -> Duration {
     u64::try_from(millis).map_or(Duration::ZERO, Duration::from_millis)
 }
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::messages::GroupId;
+    use kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol;
+
     use super::*;
 
     #[test]
@@ -381,6 +402,40 @@ mod tests {
 
         assert_eq!(normalized.session_timeout, Duration::from_millis(9_000));
         assert_eq!(normalized.rebalance_timeout, Duration::from_millis(9_000));
+    }
+
+    /// The handler drops the decoded request before parking, which frees the frame only if
+    /// nothing normalized out of it still points into it.
+    #[test]
+    fn given_a_decoded_join_when_normalizing_should_not_point_into_the_frame() {
+        let frame = Bytes::from_static(b"g m i consumer range meta");
+        let text = |range| StrBytes::from_utf8(frame.slice(range)).unwrap();
+        let request = JoinGroupRequest::default()
+            .with_group_id(GroupId(text(0..1)))
+            .with_member_id(text(2..3))
+            .with_group_instance_id(Some(text(4..5)))
+            .with_protocol_type(text(6..14))
+            .with_protocols(vec![
+                JoinGroupRequestProtocol::default()
+                    .with_name(text(15..20))
+                    .with_metadata(frame.slice(21..25)),
+            ]);
+
+        let normalized = JoinRequest::from((9, &request));
+
+        let within = |ptr: *const u8| frame.as_ptr_range().contains(&ptr);
+        let (name, metadata) = &normalized.protocols[0];
+        let pointers = [
+            normalized.group_id.as_ptr(),
+            normalized.member_id.as_ptr(),
+            normalized.group_instance_id.as_ref().unwrap().as_ptr(),
+            normalized.protocol_type.as_ptr(),
+            name.as_ptr(),
+            metadata.as_ptr(),
+        ];
+        assert!(pointers.into_iter().all(|ptr| !within(ptr)));
+        assert_eq!(normalized.group_instance_id.as_deref(), Some("i"));
+        assert_eq!(metadata.as_ref(), b"meta");
     }
 
     #[test]

@@ -358,7 +358,7 @@ async fn handle_connection(
         // supports, so `decode` cannot fail on the version argument itself; any error here is a
         // malformed header and closes the connection.
         let mut body = frame;
-        let req = RequestHeader::decode(&mut body, req_hdr_ver)
+        let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
             .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
 
         debug!(
@@ -369,6 +369,11 @@ async fn handle_connection(
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
+        // A group request can park for a whole rebalance timeout. `client_id` and the tagged
+        // fields are views into the frame, so keeping them would pin the frame for that long
+        // after the handler has let go of its own copy.
+        req.client_id = None;
+        req.unknown_tagged_fields.clear();
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.

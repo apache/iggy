@@ -36,6 +36,7 @@ use uuid::Uuid;
 
 use crate::group::{
     GroupCoordinatorConfig, JoinRequest, JoinResult, JoinedMember, SyncRequest, SyncResult,
+    owned_str,
 };
 use crate::protocol::api::{
     ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
@@ -101,22 +102,14 @@ pub struct Member {
 fn retained_protocols(protocols: &[(StrBytes, Bytes)]) -> Vec<(StrBytes, Bytes)> {
     protocols
         .iter()
-        .map(|(name, metadata)| {
-            (
-                StrBytes::from_string(name.as_str().to_owned()),
-                Bytes::copy_from_slice(metadata),
-            )
-        })
+        .map(|(name, metadata)| (owned_str(name), Bytes::copy_from_slice(metadata)))
         .collect()
 }
 
 impl Member {
     fn new(request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) -> Self {
         Self {
-            group_instance_id: request
-                .group_instance_id
-                .as_ref()
-                .map(|id| StrBytes::from_string(id.as_str().to_owned())),
+            group_instance_id: request.group_instance_id.as_ref().map(owned_str),
             session_timeout: request.session_timeout,
             rebalance_timeout: request.rebalance_timeout.min(max_rebalance_timeout),
             protocols: retained_protocols(&request.protocols),
@@ -129,10 +122,7 @@ impl Member {
     }
 
     fn rejoin(&mut self, request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) {
-        self.group_instance_id = request
-            .group_instance_id
-            .as_ref()
-            .map(|id| StrBytes::from_string(id.as_str().to_owned()));
+        self.group_instance_id = request.group_instance_id.as_ref().map(owned_str);
         self.session_timeout = request.session_timeout;
         self.rebalance_timeout = request.rebalance_timeout.min(max_rebalance_timeout);
         self.protocols = retained_protocols(&request.protocols);
@@ -142,6 +132,10 @@ impl Member {
         // for the next generation's answer, while one still parked on the previous generation
         // must keep the snapshot it is waiting to collect.
         self.join_response = None;
+    }
+
+    fn roster_bytes(&self, member_id: &StrBytes) -> usize {
+        roster_entry_bytes(member_id, self.group_instance_id.as_ref(), &self.protocols)
     }
 
     fn supports(&self, name: &StrBytes) -> bool {
@@ -220,6 +214,28 @@ impl GroupState {
 
     fn is_empty(&self) -> bool {
         self.members.is_empty() && self.pending.is_empty()
+    }
+
+    /// Would admitting `request` as `member_id` grow the leader's roster past its cap? The
+    /// member's own current entry is replaced, not added to.
+    fn roster_overflows(
+        &self,
+        config: &GroupCoordinatorConfig,
+        member_id: &StrBytes,
+        request: &JoinRequest,
+    ) -> bool {
+        let others: usize = self
+            .members
+            .iter()
+            .filter(|(id, _)| *id != member_id)
+            .map(|(id, member)| member.roster_bytes(id))
+            .sum();
+        let joining = roster_entry_bytes(
+            member_id,
+            request.group_instance_id.as_ref(),
+            &request.protocols,
+        );
+        others + joining > config.max_group_roster_bytes
     }
 
     fn max_rebalance_timeout(&self) -> Duration {
@@ -538,6 +554,23 @@ fn tick_group(groups: &mut Groups, group_id: &StrBytes, now: Instant) -> bool {
     true
 }
 
+/// An upper bound on what one member adds to the leader's roster. Only the selected protocol's
+/// metadata is sent, and which protocol wins is not known until the join completes, so the
+/// largest one stands in for it.
+fn roster_entry_bytes(
+    member_id: &StrBytes,
+    group_instance_id: Option<&StrBytes>,
+    protocols: &[(StrBytes, Bytes)],
+) -> usize {
+    member_id.len()
+        + group_instance_id.map_or(0, |id| id.len())
+        + protocols
+            .iter()
+            .map(|(_, metadata)| metadata.len())
+            .max()
+            .unwrap_or(0)
+}
+
 /// Everything a `JoinGroup` can be rejected for before any group is touched.
 fn join_request_error(config: &GroupCoordinatorConfig, request: &JoinRequest) -> Option<i16> {
     if request.group_id.is_empty() || request.group_id.len() > MAX_GROUP_ID_BYTES {
@@ -596,8 +629,8 @@ fn ensure_group(
         return Err(ERROR_COORDINATOR_NOT_AVAILABLE);
     }
     groups.insert(
-        request.group_id.clone(),
-        GroupState::new(request.protocol_type.clone(), now),
+        owned_str(&request.group_id),
+        GroupState::new(owned_str(&request.protocol_type), now),
     );
     Ok(true)
 }
@@ -675,6 +708,14 @@ pub fn join_step(
             return reject(ERROR_UNKNOWN_MEMBER_ID);
         };
         let member_id = generate_member_id(request.group_instance_id.as_ref());
+        // Checked before an id is handed out too, so a member that could never be admitted is
+        // not sent round a `MEMBER_ID_REQUIRED` trip first.
+        if group.roster_overflows(config, &member_id, request) {
+            return reject_created(groups, created, ERROR_GROUP_MAX_SIZE_REACHED);
+        }
+        let Some(group) = groups.get_mut(&request.group_id) else {
+            return reject(ERROR_UNKNOWN_MEMBER_ID);
+        };
         if request.require_known_member_id {
             group
                 .pending
@@ -685,6 +726,14 @@ pub fn join_step(
         return admit(group, config, &member_id, request, now);
     }
 
+    let known = group.pending.contains_key(&request.member_id)
+        || group.members.contains_key(&request.member_id);
+    if !known {
+        return reject(ERROR_UNKNOWN_MEMBER_ID);
+    }
+    if group.roster_overflows(config, &request.member_id, request) {
+        return reject(ERROR_GROUP_MAX_SIZE_REACHED);
+    }
     if group.pending.contains_key(&request.member_id) {
         return admit(group, config, &request.member_id, request, now);
     }
@@ -917,6 +966,8 @@ fn admit(
     now: Instant,
 ) -> Step<JoinResult> {
     group.pending.remove(member_id);
+    // A pending id arrives back as the client's copy of it, a view into its request frame.
+    let member_id = &owned_str(member_id);
     group.members.insert(
         member_id.clone(),
         Member::new(request, now, config.max_rebalance_timeout),
@@ -1384,6 +1435,91 @@ mod tests {
             !std::ptr::eq(retained.as_ptr(), frame.as_ptr()),
             "a retained member must own its bytes, not pin the frame they arrived in"
         );
+    }
+
+    /// Map keys are retained exactly like member payloads, and a pending id comes back as the
+    /// client's copy of the one it was handed.
+    #[test]
+    fn given_a_join_when_a_group_and_member_are_created_should_not_key_them_by_the_request_buffer()
+    {
+        let config = config();
+        let mut groups = Groups::new();
+        let frame = Bytes::from_static(b"g consumer");
+        let first = JoinRequest {
+            group_id: StrBytes::from_utf8(frame.slice(0..1)).unwrap(),
+            protocol_type: StrBytes::from_utf8(frame.slice(2..10)).unwrap(),
+            require_known_member_id: true,
+            ..request("", &["x"])
+        };
+        let issued = member_id_of(&join_step(&mut groups, &config, &first, Instant::now()));
+
+        let echoed_frame = Bytes::from(issued.as_bytes().to_vec());
+        let rejoin = JoinRequest {
+            member_id: StrBytes::from_utf8(echoed_frame.clone()).unwrap(),
+            ..first
+        };
+        let _ = join_step(&mut groups, &config, &rejoin, Instant::now());
+
+        let within = |buffer: &Bytes, ptr: *const u8| buffer.as_ptr_range().contains(&ptr);
+        let (group_key, group) = groups.iter().next().unwrap();
+        let (member_key, _) = group.members.iter().next().unwrap();
+        assert!(
+            !within(&frame, group_key.as_ptr()),
+            "group id pins the frame"
+        );
+        assert!(
+            !within(&frame, group.protocol_type.as_ptr()),
+            "protocol type pins the frame"
+        );
+        assert!(
+            !within(&echoed_frame, member_key.as_ptr()),
+            "an admitted pending id pins the frame it was echoed in"
+        );
+    }
+
+    /// Each member fits `max_member_blob_bytes` on its own, so only a group-level bound stops
+    /// the leader's roster outgrowing the frame size.
+    #[test]
+    fn given_a_full_roster_when_another_member_joins_should_reject_it_as_group_full() {
+        let metadata = Bytes::from(vec![0u8; 100]);
+        let with_metadata = |member_id: &str| JoinRequest {
+            protocols: vec![(StrBytes::from_static_str("x"), metadata.clone())],
+            ..request(member_id, &["x"])
+        };
+        let first = with_metadata("");
+        let config = GroupCoordinatorConfig {
+            max_group_roster_bytes: 150 + 100,
+            ..config()
+        };
+        let mut groups = Groups::new();
+        let now = Instant::now();
+
+        let admitted = join_step(&mut groups, &config, &first, now);
+        assert!(matches!(admitted, Step::Respond(ref result) if result.error == ERROR_NONE));
+        let rejected = join_step(&mut groups, &config, &with_metadata(""), now);
+
+        let Step::Respond(result) = rejected else {
+            panic!("a capacity rejection must answer, not park");
+        };
+        assert_eq!(result.error, ERROR_GROUP_MAX_SIZE_REACHED);
+        assert_eq!(groups[&group_id()].members.len(), 1);
+    }
+
+    #[test]
+    fn given_an_oversized_roster_entry_when_it_creates_the_group_should_not_leave_it_behind() {
+        let config = GroupCoordinatorConfig {
+            max_group_roster_bytes: 1,
+            ..config()
+        };
+        let mut groups = Groups::new();
+
+        let outcome = join_step(&mut groups, &config, &request("", &["x"]), Instant::now());
+
+        let Step::Respond(result) = outcome else {
+            panic!("a capacity rejection must answer, not park");
+        };
+        assert_eq!(result.error, ERROR_GROUP_MAX_SIZE_REACHED);
+        assert!(groups.is_empty());
     }
 
     /// The park bound has to be asserted on what the waiter is actually told, because that is
