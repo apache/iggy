@@ -35,7 +35,8 @@ upstream_stream = "upstream_stream"
 upstream_topic = "upstream_topic"
 poll_interval = "1s"
 batch_size = 100
-# Starting position used only when a partition has no committed offset:
+# Starting position when a partition has no committed offset, including after
+# the upstream topic is recreated with the same name:
 # "earliest", "latest", or an absolute numeric offset.
 # With "latest", if the first batch is NACKed before an offset is committed,
 # retrying recalculates the moving tail and may skip messages from the failed

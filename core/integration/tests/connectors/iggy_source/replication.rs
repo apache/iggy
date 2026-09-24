@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, HeaderKey, HeaderValue, IggyClient, IggyMessage,
-    Partitioning,
+    Partitioning, TopicCreateOptions,
 };
 use iggy_common::{
     Consumer, Identifier, MessageClient, PartitionClient, PollingStrategy, StreamClient,
@@ -69,6 +69,7 @@ struct PersistedIggySourceState {
     offsets: HashMap<u32, u64>,
     messages_synced: u64,
     errors_count: u64,
+    topic_created_at: Option<u64>,
 }
 
 #[async_trait]
@@ -915,4 +916,62 @@ async fn state_persists_across_connector_restart(
             "Sequence mismatch at index {i}"
         );
     }
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn recreated_upstream_topic_replicates_from_initial_offset(
+    harness: &TestHarness,
+    fixture: IggySourceUpstreamFixture,
+) {
+    let upstream_client = fixture.client().await.expect("upstream client");
+    fixture.ensure_upstream_topic(&upstream_client).await;
+
+    let original = (0..TEST_MESSAGE_COUNT)
+        .map(|index| format!("original-{index}"))
+        .collect::<Vec<_>>();
+    fixture.produce_messages(&upstream_client, &original).await;
+    let original_state = wait_for_source_state(harness, &HashMap::from([(0, 4)]), 5, 0).await;
+    assert!(original_state.topic_created_at.is_some());
+
+    let stream_id = Identifier::named(UPSTREAM_STREAM).expect("valid stream name");
+    let topic_id = Identifier::named(UPSTREAM_TOPIC).expect("valid topic name");
+    upstream_client
+        .delete_topic(&stream_id, &topic_id)
+        .await
+        .expect("Failed to delete upstream topic");
+    upstream_client
+        .create_topic(
+            &stream_id,
+            UPSTREAM_TOPIC,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("Failed to recreate upstream topic");
+
+    let replacement = ["replacement-0".to_string(), "replacement-1".to_string()];
+    fixture
+        .produce_messages(&upstream_client, &replacement)
+        .await;
+
+    let replacement_state = wait_for_source_state(harness, &HashMap::from([(0, 1)]), 7, 0).await;
+    assert_ne!(
+        replacement_state.topic_created_at,
+        original_state.topic_created_at
+    );
+    let received = drain_downstream_topic(harness, "iggy_source_recreated_topic", 7).await;
+    let payloads = received
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads,
+        original.into_iter().chain(replacement).collect::<Vec<_>>()
+    );
 }
