@@ -302,15 +302,9 @@ impl HttpInner {
                             (Some(fresh), torn)
                         }
                     };
-                    // Reclaim orphaned grants: either the expiry has passed
-                    // or the session table no longer holds a matching entry
-                    // (the JWT expired and was swept above).
-                    {
-                        let sessions = self.sessions.borrow();
-                        self.session_grants.borrow_mut().retain(|key, grant| {
-                            grant.expires_at > now && sessions.contains_key(&key.as_table_key())
-                        });
-                    }
+                    self.session_grants
+                        .borrow_mut()
+                        .retain(|_, grant| grant.expires_at > now);
                     self.teardown_reply_targets(torn);
                     return admitted.ok_or(AuthError::SessionUnavailable);
                 }
