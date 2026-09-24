@@ -41,6 +41,23 @@ fn clear_pending_exception(env: &mut JNIEnv) {
     let _ = env.exception_clear();
 }
 
+/// Take and clear a pending Java exception, returning its class and message via
+/// `Throwable.toString()`. JNI's Rust error only reports that Java threw; the
+/// throwable carries the diagnostic that distinguishes a missing driver from a
+/// linkage or initialization failure.
+fn take_pending_java_exception(env: &mut JNIEnv) -> Option<String> {
+    let throwable = match env.exception_occurred() {
+        Ok(throwable) if !throwable.is_null() => throwable,
+        Ok(_) => return None,
+        Err(_) => {
+            clear_pending_exception(env);
+            return None;
+        }
+    };
+    clear_pending_exception(env);
+    throwable_string_method(env, &throwable, "toString")
+}
+
 /// Reclaim a JNI local frame without masking the operation error that caused the
 /// frame to unwind. JNI can leave an exception pending when `PopLocalFrame`
 /// fails, so clear before and after the pop attempt. When both the operation and
@@ -86,8 +103,11 @@ macro_rules! jni {
         match $call {
             Ok(value) => value,
             Err(err) => {
-                clear_pending_exception(&mut *$env);
-                return Err(Error::Connection(format!("{}: {err}", $ctx)));
+                let java_exception = take_pending_java_exception(&mut *$env);
+                let detail = java_exception
+                    .map(|exception| format!("{err}: {exception}"))
+                    .unwrap_or_else(|| err.to_string());
+                return Err(Error::Connection(format!("{}: {detail}", $ctx)));
             }
         }
     };
@@ -99,8 +119,11 @@ macro_rules! jni_init {
         match $call {
             Ok(value) => value,
             Err(err) => {
-                clear_pending_exception(&mut *$env);
-                return Err(Error::InitError(format!("{}: {err}", $ctx)));
+                let java_exception = take_pending_java_exception(&mut *$env);
+                let detail = java_exception
+                    .map(|exception| format!("{err}: {exception}"))
+                    .unwrap_or_else(|| err.to_string());
+                return Err(Error::InitError(format!("{}: {detail}", $ctx)));
             }
         }
     };
@@ -416,40 +439,6 @@ impl JdbcSource {
             .attach_current_thread()
             .map_err(|e| Error::InitError(format!("Failed to attach thread to JVM: {}", e)))?;
 
-        info!("Loading JDBC driver: {}", self.config.driver_class);
-
-        // Load driver using Class.forName() which triggers static initialization
-        info!(
-            "Loading driver class via Class.forName: {}",
-            self.config.driver_class
-        );
-
-        let class_class = jni_init!(
-            env,
-            env.find_class("java/lang/Class"),
-            "Failed to find Class"
-        );
-
-        let driver_class_name = jni_init!(
-            env,
-            env.new_string(&self.config.driver_class),
-            "Failed to create class name string"
-        );
-
-        // Call Class.forName(className) to load and initialize the driver
-        jni_init!(
-            env,
-            env.call_static_method(
-                class_class,
-                "forName",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[JValue::Object(&driver_class_name.into())],
-            ),
-            format!("Failed to load driver class '{}'", self.config.driver_class)
-        );
-
-        info!("JDBC driver loaded and registered successfully");
-
         info!(
             "Creating direct JDBC connection to: {}",
             sanitize_jdbc_url(self.config.jdbc_url.expose_secret())
@@ -467,7 +456,7 @@ impl JdbcSource {
     fn create_direct_connection_internal(&self, env: &mut JNIEnv) -> Result<GlobalRef, Error> {
         jni_init!(
             env,
-            env.push_local_frame(16),
+            env.push_local_frame(24),
             "Failed to push connection local frame"
         );
         let result = self.create_direct_connection_inner(env);
@@ -480,7 +469,9 @@ impl JdbcSource {
     }
 
     fn create_direct_connection_inner(&self, env: &mut JNIEnv) -> Result<GlobalRef, Error> {
-        // Set the thread context class loader to help DriverManager find the driver
+        // Use the system loader explicitly for both driver initialization and the
+        // thread context. This keeps DriverManager's view of the driver aligned
+        // with the JVM classpath even when invoked from an attached native thread.
         let current_thread_class = jni_init!(
             env,
             env.find_class("java/lang/Thread"),
@@ -499,41 +490,66 @@ impl JdbcSource {
             "Failed to get current thread"
         );
 
-        // Get the class loader that loaded the driver
-        let driver_class = jni_init!(
+        let class_loader_class = jni_init!(
             env,
-            env.find_class(self.config.driver_class.replace('.', "/")),
-            "Failed to find driver class"
+            env.find_class("java/lang/ClassLoader"),
+            "Failed to find ClassLoader"
         );
 
-        let driver_class_loader = jni_init!(
+        let system_class_loader = jni_init!(
             env,
-            env.call_method(
-                &driver_class,
-                "getClassLoader",
+            env.call_static_method(
+                class_loader_class,
+                "getSystemClassLoader",
                 "()Ljava/lang/ClassLoader;",
                 &[],
             )
             .and_then(|v| v.l()),
-            "Failed to get driver class loader"
+            "Failed to get system class loader"
         );
 
-        // Set the context class loader
         jni_init!(
             env,
             env.call_method(
                 &current_thread,
                 "setContextClassLoader",
                 "(Ljava/lang/ClassLoader;)V",
-                &[JValue::Object(&driver_class_loader)],
+                &[JValue::Object(&system_class_loader)],
             ),
             "Failed to set context class loader"
         );
 
         info!(
-            "Set thread context class loader for driver: {}",
+            "Loading JDBC driver via the system class loader: {}",
             self.config.driver_class
         );
+
+        let class_class = jni_init!(
+            env,
+            env.find_class("java/lang/Class"),
+            "Failed to find Class"
+        );
+        let driver_class_name = jni_init!(
+            env,
+            env.new_string(&self.config.driver_class),
+            "Failed to create class name string"
+        );
+        jni_init!(
+            env,
+            env.call_static_method(
+                class_class,
+                "forName",
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+                &[
+                    JValue::Object(&driver_class_name.into()),
+                    JValue::Bool(1),
+                    JValue::Object(&system_class_loader),
+                ],
+            ),
+            format!("Failed to load driver class '{}'", self.config.driver_class)
+        );
+
+        info!("JDBC driver loaded and registered successfully");
 
         // Get connection from DriverManager
         let driver_manager = jni_init!(
@@ -1950,14 +1966,14 @@ fn classify_query_failure(env: &mut JNIEnv, action: &str) -> Error {
 /// `java.sql.SQLException`) and message.
 fn take_pending_sql_exception(env: &mut JNIEnv) -> (Option<String>, String) {
     let throwable = match env.exception_occurred() {
-        Ok(t) if !t.is_null() => t,
+        Ok(throwable) if !throwable.is_null() => throwable,
         Ok(_) => return (None, "unknown error".to_string()),
         Err(_) => {
             clear_pending_exception(env);
             return (None, "unknown error".to_string());
         }
     };
-    let _ = env.exception_clear();
+    clear_pending_exception(env);
 
     let message = throwable_string_method(env, &throwable, "getMessage")
         .unwrap_or_else(|| "unknown error".to_string());

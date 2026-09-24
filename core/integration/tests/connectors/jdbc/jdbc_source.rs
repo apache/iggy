@@ -688,6 +688,27 @@ async fn bulk_result_larger_than_batch_size_fails_closed() {
         .await;
     let client = runtime.create_client().await;
 
+    // Prove the connector opened before checking the fail-closed behavior. A
+    // startup failure also produces no messages and would otherwise make this
+    // negative-path test pass for the wrong reason.
+    let api_url = runtime
+        .harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let sources: serde_json::Value = reqwest::get(format!("{api_url}/sources"))
+        .await
+        .expect("Failed to query source status")
+        .error_for_status()
+        .expect("Source status endpoint returned an error")
+        .json()
+        .await
+        .expect("Failed to deserialize source status");
+    assert_eq!(
+        sources[0]["status"], "running",
+        "JDBC source must be running before exercising bulk fail-closed behavior: {sources}"
+    );
+
     // Several poll cycles (poll interval is 1s). A fail-closed source delivers
     // nothing, and in particular never the truncated 2-row subset.
     sleep(Duration::from_secs(4)).await;
