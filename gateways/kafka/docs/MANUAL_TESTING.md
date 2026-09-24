@@ -209,7 +209,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |
 | 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
 | 29 | TOPIC_AUTHORIZATION_FAILED | Produce with a bridge: Iggy user lacks permission |
-| 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception), plus Produce with a bridge: transactional, control or idempotent batch. Every other API key's out-of-range version closes the connection instead - see Category B |
+| 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception), plus Produce with a bridge: transactional or control batch. Every other API key's out-of-range version closes the connection instead - see Category B |
 | 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
 | 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
 | 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |

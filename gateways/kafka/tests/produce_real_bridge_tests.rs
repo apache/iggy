@@ -670,6 +670,36 @@ async fn given_a_transactional_batch_when_handled_should_answer_unsupported_vers
 
 #[tokio::test]
 #[serial]
+async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_both_copies() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+
+    let mut records = [record(0, None, b"v", &[])];
+    records[0].producer_id = 7;
+    records[0].producer_epoch = 0;
+    records[0].sequence = 0;
+    let entries = [(0, batch(&records, Compression::None))];
+
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 0)],
+        "a stock Java producer is idempotent, so its batches must land"
+    );
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 1)],
+        "the sequence is ignored, so a resend never answers DUPLICATE_SEQUENCE_NUMBER (46)"
+    );
+    assert_eq!(
+        stored(&server, 0, 10).await.len(),
+        2,
+        "a retry writes twice until the producer pool in IDEMPOTENCE.md lands"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn given_no_bridge_when_handled_should_still_answer_the_retriable_stub() {
     // Every other suite drives this path, so a regression in it surfaces far from Produce.
     // Pinned here, next to the path that replaced it.

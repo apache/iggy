@@ -77,8 +77,9 @@ Delivery through this gateway is **at-least-once**, and stays at-least-once acro
 restart. Transactions are not supported, and will not be. A retry after a timeout can write a
 record twice.
 
-Java producers must set `enable.idempotence=false`. The gateway does not serve `InitProducerId`
-yet ([#3545](https://github.com/apache/iggy/issues/3545)), and it refuses idempotent batches.
+Java producers must set `enable.idempotence=false` until the gateway serves `InitProducerId`
+([#3545](https://github.com/apache/iggy/issues/3545)). Produce already stores idempotent batches.
+It ignores their producer id, epoch and sequence, so it does not deduplicate a retry.
 
 Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
 guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
@@ -111,6 +112,7 @@ answers for itself.
 | Topics | Creates none. Missing: 3. Bad name: 17. |
 | `timeout_ms` | Honored, max 20 s. Past it: 7. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
+| Producer id, epoch, sequence | Ignored, so a retry writes twice. |
 | Timestamps over about 71 min apart | Several sends. A failure after the first can duplicate on retry. |
 | Several batches in one partition | 87, as Kafka. |
 | More records than the batch declares | 87, as Kafka. |
@@ -123,7 +125,7 @@ answers for itself.
 | ---- | ---- | ------ |
 | 10 | Record, send or partition too large, even alone | Java splits multi-record batches. Else fails. |
 | 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
-| 35 | Transactional, control or idempotent batch | Fails. |
+| 35 | Transactional or control batch | Fails. |
 | 6 | Earlier partitions used the request budget, and this one fits alone. Nothing written. | Retries. |
 | 7 | Deadline passed, or connection lost mid-send. May be written. | Retries. Can duplicate. |
 
