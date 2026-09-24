@@ -190,7 +190,7 @@ cat kafka_messages/018_ApiVersions_v3.bin | nc 127.0.0.1 9092 | xxd | head
 | 18 | ApiVersions | v0–v5 | ✅ Critical |
 | 19 | CreateTopics | v2–v7 | ✅ Critical |
 | 20 | DeleteTopics | v1–v6 | 🟡 Important |
-| 21 | DeleteRecords | v0–v2 | 🔵 Phase 2 |
+| 21 | DeleteRecords | v0–v2 | ⚪ Not advertised |
 | 22 | InitProducerId | v0–v6 | 🔵 Phase 2 |
 | 24 | AddPartitionsToTxn | v0–v5 | 🔵 Phase 2 |
 | 25 | AddOffsetsToTxn | v0–v4 | 🔵 Phase 2 |

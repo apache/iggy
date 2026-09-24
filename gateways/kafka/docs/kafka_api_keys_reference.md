@@ -15,6 +15,7 @@
 | 🟠 Required Stub | Client state-machine API — must return a well-formed response or clients will stall/crash |
 | 🟡 Optional Stub | Admin/observability — can safely return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` |
 | ❌ Reject | Internal broker / KRaft only — return `INVALID_REQUEST` with a well-formed frame; **do not close the connection** |
+| ⚪ Not advertised | Deliberately absent from ApiVersions, so a client fails locally with an unsupported-API error and never sends it |
 
 > This table no longer carries a per-key header-framing status column. `src/protocol/header.rs`
 > has no per-key table of its own to be behind or caught up on: it delegates entirely to
@@ -111,10 +112,13 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 19 | **CreateTopics** | 2 | 7 | v5 | 🟠 Required Stub |
 | 20 | **DeleteTopics** | 1 | 6 | v4 | 🟡 Optional Stub |
-| 21 | **DeleteRecords** | 0 | 2 | v2 | 🟡 Optional Stub |
+| 21 | **DeleteRecords** | 0 | 2 | v2 | ⚪ Not advertised |
 | 37 | **CreatePartitions** | 0 | 3 | v2 | 🟡 Optional Stub |
 
 > ⚠️ `SUPPORTED_RANGES` in `api.rs` currently advertises CreateTopics max=5; actual max is v7.
+>
+> DeleteRecords stays unadvertised until Iggy exposes a log-start offset; see
+> [`SCOPE.md`](SCOPE.md#deleterecords-is-not-advertised-3547).
 
 ---
 

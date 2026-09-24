@@ -77,9 +77,35 @@ All API keys not listed above close the connection (see Governance model above) 
 | 10 | FindCoordinator | Consumer group — later issue |
 | 11–16 | JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups | Consumer group — later issue |
 | 17 | SaslHandshake | Auth — later issue |
-| 20+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
+| 20, 22+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
+| 21 | DeleteRecords | Not advertised on purpose, see below |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
+
+### DeleteRecords is not advertised ([#3547](https://github.com/apache/iggy/issues/3547))
+
+DeleteRecords (21) asks a broker to drop everything below an offset and to answer with the
+partition's new low watermark. Iggy cannot do either honestly:
+
+- It deletes whole segments only (`SegmentClient::delete_segments`), so a trim to an offset inside
+  a segment would delete less than asked or more than asked.
+- It exposes no log-start offset, the same gap that makes ListOffsets answer `EARLIEST` with `0`
+  (see the ListOffsets entry under Phase 2 below). A reported low watermark would be contradicted by the next
+  ListOffsets call.
+
+Leaving the key out of ApiVersions is how the Kafka protocol says a broker does not support an
+API, and it is the better answer than a stub. A client checks the advertised keys before sending,
+so `Admin.deleteRecords()` fails at once with `UnsupportedVersionException` and librdkafka with
+`RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE`, without a request ever reaching the gateway. A stub
+could answer `UNSUPPORTED_VERSION` or `POLICY_VIOLATION` per partition, the latter being what a
+real broker returns for a compacted topic. But it would advertise an API that fails on every
+partition, add a decode and encode path for it, and make ApiVersions claim a capability that does
+not exist.
+
+Real support needs Iggy to expose a log-start offset that segment deletion and retention both
+advance. Its internal delete watermark (`deleted_up_to_offset`) is neither readable by clients
+nor moved by retention.
+That is the same core change the ListOffsets `EARLIEST` gap needs, and DeleteRecords can follow it.
 
 ---
 
