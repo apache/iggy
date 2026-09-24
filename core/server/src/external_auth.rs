@@ -191,7 +191,7 @@ fn redact_url_userinfo(url: &str) -> std::borrow::Cow<'_, str> {
     let Some((scheme, rest)) = url.split_once("://") else {
         return std::borrow::Cow::Borrowed(url);
     };
-    match rest.split_once('@') {
+    match rest.rsplit_once('@') {
         Some((_, after_at)) => std::borrow::Cow::Owned(format!("{scheme}://{after_at}")),
         None => std::borrow::Cow::Borrowed(url),
     }
