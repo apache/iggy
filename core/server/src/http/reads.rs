@@ -399,38 +399,34 @@ pub(in crate::http) fn authorize_data_plane(
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
     inline_grant_check: impl FnOnce(&Permissions, usize, usize) -> bool,
 ) -> Result<(), IggyError> {
+    let (Ok(wire_stream), Ok(wire_topic)) =
+        (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
+    else {
+        return if state.external_auth.enabled && user_id == state.external_auth.user_id {
+            Err(IggyError::Unauthorized)
+        } else {
+            Ok(())
+        };
+    };
+    let Some((stream_id, topic_id)) = resolve_gate_topic(state, &wire_stream, &wire_topic) else {
+        return if state.external_auth.enabled && user_id == state.external_auth.user_id {
+            Err(IggyError::Unauthorized)
+        } else {
+            Ok(())
+        };
+    };
     if state.external_auth.enabled && user_id == state.external_auth.user_id {
         let sk = crate::http::extractor::SessionKey::from_table_key(session_key)
             .ok_or(IggyError::Unauthorized)?;
         let perms = state
             .session_grant_permissions(&sk)
             .ok_or(IggyError::Unauthorized)?;
-        // Fail-closed: for external auth users the session-scoped check below
-        // is the only topic-level gate (the STM authz gate allows all
-        // data-plane ops by op-code). A resolution miss must deny, not fall
-        // through to the handler's own not-found path.
-        let (Ok(wire_stream), Ok(wire_topic)) =
-            (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
-        else {
-            return Err(IggyError::Unauthorized);
-        };
-        let Some((sid, tid)) = resolve_gate_topic(state, &wire_stream, &wire_topic) else {
-            return Err(IggyError::Unauthorized);
-        };
-        return if inline_grant_check(&perms, sid, tid) {
+        return if inline_grant_check(&perms, stream_id, topic_id) {
             Ok(())
         } else {
             Err(IggyError::Unauthorized)
         };
     }
-    let (Ok(wire_stream), Ok(wire_topic)) =
-        (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
-    else {
-        return Ok(());
-    };
-    let Some((stream_id, topic_id)) = resolve_gate_topic(state, &wire_stream, &wire_topic) else {
-        return Ok(());
-    };
     state
         .shard
         .plane
