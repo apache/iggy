@@ -61,7 +61,7 @@ messages are requested from each upstream partition in one poll cycle.
 | `upstream_topic` | yes | none | Name of the topic to replicate from. |
 | `poll_interval` | no | `2s` | Delay before each upstream poll cycle. |
 | `batch_size` | no | `100` | Maximum messages requested from each upstream partition per poll cycle. Must be between `1` and `10,000`. |
-| `initial_offset` | no | `earliest` | Starting position for a partition without a saved offset. Accepts `earliest`, `latest`, or an absolute numeric offset. |
+| `initial_offset` | no | `earliest` | Starting position for a partition without a saved offset, including after the upstream topic is recreated with the same name. Accepts `earliest`, `latest`, or an absolute numeric offset. |
 | `include_user_headers` | no | `true` | Copy user headers to downstream messages. |
 | `malformed_message_policy` | no | `block` | Handling for messages with unparsable user headers: `block` retries from the failed offset; `drop_headers` forwards the payload without those headers. |
 | `retry_interval` | no | `1s` | Base delay used for exponential backoff when every partition poll in a cycle fails. |
@@ -82,6 +82,9 @@ offset. `initial_offset` is used only when that partition has no saved offset:
 - `earliest` starts with the oldest available message.
 - `latest` requests up to `batch_size` of the most recent messages.
 - A numeric value starts at that absolute offset.
+
+If the upstream topic is recreated with the same name, the connector clears
+its saved offsets and uses `initial_offset` for the new topic.
 
 The connector stages new offsets while polling. It commits them only after the
 runtime sends the complete downstream batch and saves the connector state. If

@@ -112,6 +112,22 @@ struct State {
     offsets: HashMap<u32, u64>,
     messages_synced: u64,
     errors_count: u64,
+    topic_created_at: Option<u64>,
+}
+
+impl State {
+    fn reset_offsets_if_topic_changed(&mut self, created_at: u64) -> bool {
+        if self.topic_created_at == Some(created_at) {
+            return false;
+        }
+
+        // Old offsets can be past the new topic's frontier, where polls return
+        // empty batches and silently skip its history.
+        let reset_offsets = !self.offsets.is_empty();
+        self.offsets.clear();
+        self.topic_created_at = Some(created_at);
+        reset_offsets
+    }
 }
 
 #[derive(Debug, Default)]
@@ -199,6 +215,7 @@ impl IggySource {
                 offsets: HashMap::new(),
                 messages_synced: 0,
                 errors_count: 0,
+                topic_created_at: None,
             })),
             pending_state: Mutex::new(None),
             partitions: Vec::new(),
@@ -390,14 +407,34 @@ impl Source for IggySource {
             sleep(delay).await;
         }
 
-        let consumer = Consumer::default();
-
         let mut candidate_state = self.state.lock().await.clone();
+        let topic = client
+            .get_topic(stream_id, topic_id)
+            .await
+            .map_err(|error| {
+                Error::Connection(format!("Failed to fetch upstream topic details: {error}"))
+            })?;
+        let current_partitions = topic.as_ref().map(|topic| {
+            if candidate_state.reset_offsets_if_topic_changed(topic.created_at.as_micros()) {
+                warn!(
+                    "Upstream topic '{}/{}' changed for {CONNECTOR_NAME} connector ID: {}, \
+                     resetting saved offsets to initial offset",
+                    self.config.upstream_stream, self.config.upstream_topic, self.id
+                );
+            }
+            topic
+                .partitions
+                .iter()
+                .map(|partition| partition.id)
+                .collect::<Vec<_>>()
+        });
+        let partitions = current_partitions.as_deref().unwrap_or(&self.partitions);
+        let consumer = Consumer::default();
 
         let mut messages = Vec::with_capacity(self.batch_size as usize);
         let mut cycle_counts = PollCycleCounts::default();
 
-        for &partition_id in &self.partitions {
+        for &partition_id in partitions {
             let strategy = next_strategy(
                 self.initial_offset,
                 candidate_state.offsets.get(&partition_id).copied(),
@@ -492,7 +529,7 @@ impl Source for IggySource {
                  Total synced: {}, poll errors in cycle: {}, conversion errors in cycle: {}",
                 self.id,
                 messages.len(),
-                self.partitions.len(),
+                partitions.len(),
                 total_synced,
                 cycle_counts.upstream_poll_errors,
                 cycle_counts.conversion_errors
@@ -503,7 +540,7 @@ impl Source for IggySource {
                  Total synced: {}, poll errors in cycle: {}, conversion errors in cycle: {}",
                 self.id,
                 messages.len(),
-                self.partitions.len(),
+                partitions.len(),
                 total_synced,
                 cycle_counts.upstream_poll_errors,
                 cycle_counts.conversion_errors
@@ -711,6 +748,7 @@ mod tests {
             offsets: HashMap::from([(0, 42), (1, 7)]),
             messages_synced: 500,
             errors_count: 3,
+            topic_created_at: Some(100),
         };
 
         let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
@@ -725,6 +763,7 @@ mod tests {
             assert_eq!(restored.offsets.get(&1), Some(&7));
             assert_eq!(restored.messages_synced, 500);
             assert_eq!(restored.errors_count, 3);
+            assert_eq!(restored.topic_created_at, Some(100));
         });
     }
 
@@ -738,6 +777,7 @@ mod tests {
             assert!(state.offsets.is_empty());
             assert_eq!(state.messages_synced, 0);
             assert_eq!(state.errors_count, 0);
+            assert_eq!(state.topic_created_at, None);
         });
     }
 
@@ -752,6 +792,7 @@ mod tests {
             assert!(state.offsets.is_empty());
             assert_eq!(state.messages_synced, 0);
             assert_eq!(state.errors_count, 0);
+            assert_eq!(state.topic_created_at, None);
         });
     }
 
@@ -761,6 +802,7 @@ mod tests {
             offsets: HashMap::from([(2, 1000)]),
             messages_synced: 1000,
             errors_count: 5,
+            topic_created_at: Some(100),
         };
 
         let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
@@ -770,6 +812,29 @@ mod tests {
         assert_eq!(original.offsets, deserialized.offsets);
         assert_eq!(original.messages_synced, deserialized.messages_synced);
         assert_eq!(original.errors_count, deserialized.errors_count);
+        assert_eq!(original.topic_created_at, deserialized.topic_created_at);
+    }
+
+    #[test]
+    fn given_changed_topic_should_reset_offsets_only() {
+        let mut state = State {
+            offsets: HashMap::from([(0, 42), (1, 7)]),
+            messages_synced: 500,
+            errors_count: 3,
+            topic_created_at: Some(100),
+        };
+
+        assert!(!state.reset_offsets_if_topic_changed(100));
+        assert_eq!(state.offsets.len(), 2);
+        assert!(state.reset_offsets_if_topic_changed(101));
+        assert!(state.offsets.is_empty());
+        assert_eq!(
+            next_strategy(InitialOffset::Earliest, state.offsets.get(&0).copied()),
+            PollingStrategy::first()
+        );
+        assert_eq!(state.topic_created_at, Some(101));
+        assert_eq!(state.messages_synced, 500);
+        assert_eq!(state.errors_count, 3);
     }
 
     #[test]
@@ -813,6 +878,7 @@ mod tests {
             offsets: HashMap::from([(0, 42)]),
             messages_synced: 42,
             errors_count: 0,
+            topic_created_at: Some(100),
         };
 
         let connector_state = source.serialize_state(&state);
@@ -832,11 +898,13 @@ mod tests {
                 offsets: HashMap::from([(0, 9)]),
                 messages_synced: 10,
                 errors_count: 1,
+                topic_created_at: Some(100),
             };
             *source.pending_state.lock().await = Some(State {
                 offsets: HashMap::from([(0, 19)]),
                 messages_synced: 20,
                 errors_count: 2,
+                topic_created_at: Some(100),
             });
 
             source
@@ -862,11 +930,13 @@ mod tests {
                 offsets: HashMap::from([(0, 9)]),
                 messages_synced: 10,
                 errors_count: 1,
+                topic_created_at: Some(100),
             };
             *source.pending_state.lock().await = Some(State {
                 offsets: HashMap::from([(0, 19)]),
                 messages_synced: 20,
                 errors_count: 2,
+                topic_created_at: Some(100),
             });
 
             source
