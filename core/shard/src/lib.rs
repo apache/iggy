@@ -18,12 +18,14 @@
 pub mod builder;
 pub mod config;
 pub mod coordinator;
+pub mod host;
 pub mod metrics;
 mod poll;
 mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
+pub use host::{NoopHost, ShardHost};
 pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
@@ -288,14 +290,6 @@ pub enum MetadataSubmit {
     },
 }
 
-/// Handler shard 0 runs for an inbound [`MetadataSubmit`].
-///
-/// The server wires it to `submit_register_in_process` /
-/// `submit_logout_in_process` / `submit_request_in_process` and sends the
-/// result back over the frame's `reply` sender. A peer shard (no consensus)
-/// must never receive this frame.
-pub type MetadataSubmitHandler = Rc<dyn Fn(MetadataSubmit)>;
-
 /// One connected client's identity, as seen by the shard that homes it.
 ///
 /// Gathered from every shard for `get_clients` (shared-nothing: each shard
@@ -321,11 +315,6 @@ pub struct ConnectedClientInfo {
     /// Packed protocol version, see `iggy_binary_protocol::ProtocolVersion`.
     pub protocol_version: Option<u32>,
 }
-
-/// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
-/// The server wires it to read the shard's `SessionManager` and push its
-/// connected clients back over the carried reply sender.
-pub type ListClientsHandler = Rc<dyn Fn(ListClientsReply)>;
 
 #[derive(Debug)]
 pub enum ListClientsReply {
@@ -1389,13 +1378,17 @@ where
     /// surface without going through consensus.
     pub bus: B,
 
-    /// Callback attached to every delegated replica connection installed
-    /// on this shard. The bus' reader task invokes this for each inbound
-    /// consensus message; the callback is typically `|_, msg| shard.dispatch(msg)`.
+    /// The process embedding this shard: serves client requests, runs
+    /// metadata submits, answers the list-clients query. See [`ShardHost`].
+    host: Rc<dyn ShardHost>,
+
+    /// [`ShardHost::on_replica_message`] as the bus installs it on every
+    /// delegated replica connection; built once so an install clones one `Rc`.
     on_replica_message: MessageHandler,
 
-    /// Callback attached to every delegated client connection installed on
-    /// this shard. Invoked for each inbound `Request` frame.
+    /// [`ShardHost::on_client_request`] as the bus installs it on every
+    /// delegated client connection, and as shard 0 hands it to the transports
+    /// it terminates locally (see [`Self::client_request_handler`]).
     on_client_request: RequestHandler,
 
     /// In-flight metadata journal repair: set when the recovery
@@ -1461,18 +1454,6 @@ where
     /// its restarts as well as within one boot. Seeded by
     /// [`forward_nonce_seed`].
     forward_nonce: Cell<u64>,
-
-    /// Handler for inbound [`MetadataSubmit`] frames. Only shard 0 receives
-    /// these (it owns the metadata consensus group); peers send them here
-    /// via [`Self::forward_metadata_submit`]. Defaults to a no-op for the
-    /// simulator stub ctor.
-    on_metadata_submit: MetadataSubmitHandler,
-
-    /// Handler for inbound [`LifecycleFrame::ListClients`] broadcast
-    /// queries. Every shard receives these (not just shard 0); the server
-    /// wires it to its per-shard `SessionManager`. Defaults to a no-op for
-    /// the simulator stub ctor.
-    on_list_clients: ListClientsHandler,
 
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
@@ -1733,6 +1714,9 @@ where
     /// * `bus` - shard-local bus handle (kept alongside the buses owned
     ///   by the consensus planes so the router can reach the
     ///   `ConnectionInstaller` surface directly).
+    /// * `host` - the embedding process' handlers, see [`ShardHost`].
+    ///   Wrapped once here into the `Rc<dyn Fn>` adapters the bus installs
+    ///   per delegated connection.
     /// * `senders` - one [`TaggedSender`] per shard. The ctor asserts
     ///   `senders[i].shard_id() == i`; use [`shard_channel`] at
     ///   construction time so every sender carries the id of the shard
@@ -1766,10 +1750,7 @@ where
     pub fn new(
         identity: ShardIdentity,
         bus: B,
-        on_replica_message: MessageHandler,
-        on_client_request: RequestHandler,
-        on_metadata_submit: MetadataSubmitHandler,
-        on_list_clients: ListClientsHandler,
+        host: Rc<dyn ShardHost>,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
@@ -1796,10 +1777,9 @@ where
             name,
             plane,
             bus,
-            on_replica_message,
-            on_client_request,
-            on_metadata_submit,
-            on_list_clients,
+            on_replica_message: host::replica_message_handler(&host),
+            on_client_request: host::client_request_handler(&host),
+            host,
             senders,
             shard_count,
             inbox,
@@ -2273,12 +2253,22 @@ where
         self.coordinator.clone()
     }
 
+    /// The adapter this shard installs on its delegated client connections,
+    /// for the transports shard 0 terminates locally. What every transport
+    /// on a shard must share is the host behind it (the per-client queues
+    /// and the disconnect hook live there); a second adapter over the same
+    /// host would be harmless, this one just saves building it.
+    #[must_use]
+    pub fn client_request_handler(&self) -> RequestHandler {
+        Rc::clone(&self.on_client_request)
+    }
+
     /// Create a shard without inter-shard channels or delegated connections.
     ///
     /// Useful for the simulator where inbound messages are delivered
     /// directly via [`on_message`](Self::on_message) instead of the TCP /
-    /// fd-transfer path. Installs no-op connection handlers because the
-    /// simulator never receives a replica connection-setup frame.
+    /// fd-transfer path. Hosted by [`NoopHost`] because the simulator never
+    /// receives a connection-setup or host-bound frame.
     #[must_use]
     pub fn without_inbox(
         identity: ShardIdentity,
@@ -2304,14 +2294,14 @@ where
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
+        let host: Rc<dyn ShardHost> = Rc::new(NoopHost);
         Self {
             id,
             name,
             bus,
-            on_replica_message: std::rc::Rc::new(|_, _| {}),
-            on_client_request: std::rc::Rc::new(|_, _| {}),
-            on_metadata_submit: std::rc::Rc::new(|_| {}),
-            on_list_clients: std::rc::Rc::new(|_| {}),
+            on_replica_message: host::replica_message_handler(&host),
+            on_client_request: host::client_request_handler(&host),
+            host,
             plane,
             coordinator: None,
             senders: Vec::new(),
@@ -3278,7 +3268,8 @@ where
                 if self.peer_is_known(msg.header().replica, "ConsumerSessionHeartbeat")
                     && control_suffix_body_verified(&msg, msg.header().checksum_body).is_some()
                 {
-                    (self.on_metadata_submit)(MetadataSubmit::ConsumerSessionHeartbeat(msg));
+                    self.host
+                        .on_metadata_submit(MetadataSubmit::ConsumerSessionHeartbeat(msg));
                 }
             }
             MessageBag::ForwardLogout(ref msg) => self.on_forward_logout(*msg.header()),
@@ -3296,12 +3287,13 @@ where
             self.id, 0,
             "ForwardRegister routes to the metadata consensus owner"
         );
-        (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
-            vsr_client_id: header.client,
-            user_id: header.user_id,
-            nonce: header.nonce,
-            origin_replica: header.replica,
-        });
+        self.host
+            .on_metadata_submit(MetadataSubmit::ForwardedRegister {
+                vsr_client_id: header.client,
+                user_id: header.user_id,
+                nonce: header.nonce,
+                origin_replica: header.replica,
+            });
     }
 
     fn on_forward_register_result(&self, header: ForwardRegisterResultHeader) {
@@ -3329,13 +3321,14 @@ where
             self.id, 0,
             "ForwardLogout routes to the metadata consensus owner"
         );
-        (self.on_metadata_submit)(MetadataSubmit::ForwardedLogout {
-            vsr_client_id: header.client,
-            session: header.session,
-            request: header.request,
-            nonce: header.nonce,
-            origin_replica: header.replica,
-        });
+        self.host
+            .on_metadata_submit(MetadataSubmit::ForwardedLogout {
+                vsr_client_id: header.client,
+                session: header.session,
+                request: header.request,
+                nonce: header.nonce,
+                origin_replica: header.replica,
+            });
     }
 
     fn on_forward_logout_result(&self, header: ForwardLogoutResultHeader) {

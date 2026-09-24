@@ -47,9 +47,9 @@ use super::test_support::{PollTestMetadata, partition_with_messages};
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    ConsumerAttachment, IggyShard, LifecycleFrame, PartitionConsensusConfig, PartitionRead,
-    PartitionReadReply, Receiver, ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender,
-    channel, shard_channel,
+    ConsumerAttachment, IggyShard, LifecycleFrame, NoopHost, PartitionConsensusConfig,
+    PartitionRead, PartitionReadReply, Receiver, ReplicaTopology, ShardFrame, ShardIdentity,
+    TaggedSender, channel, shard_channel,
 };
 
 #[compio::test]
@@ -896,10 +896,7 @@ fn owner_with_metadata(
     let owner = CompletionTestShard::new(
         ShardIdentity::new(0, "poll-completion-test".to_string()),
         bus.clone(),
-        Rc::new(|_, _| {}),
-        Rc::new(|_, _| {}),
-        Rc::new(|_| {}),
-        Rc::new(|_| {}),
+        Rc::new(NoopHost),
         metadata,
         partitions,
         vec![sender.clone()],

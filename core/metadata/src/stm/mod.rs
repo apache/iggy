@@ -280,10 +280,16 @@ impl ConsensusGroupAllocator {
 /// Generates the state's inner struct and wrapper type.
 ///
 /// # Generated items
-/// - `{$state}Inner` struct with the specified fields (the data)
+/// - `{$state}Inner` struct with the specified fields (the data), plus a
+///   `pub(crate) last_result`
 /// - `$state` wrapper struct (contains `LeftRight` storage)
 /// - `From<LeftRight<...>>` impl for `$state`
 /// - `From<{$state}Inner>` impl for `$state`
+///
+/// Each field carries its own visibility, written as in a struct definition.
+/// Declare a field `pub(crate)` when other crates must reach it only through
+/// this crate's accessors, such as a name-to-id index behind a resolver: a
+/// `pub` index lets another crate write it or fork the resolver.
 ///
 /// The command enum, parsing, dispatch, and Absorb impl are generated
 /// by `collect_handlers!` separately, keeping state definition decoupled
@@ -292,16 +298,16 @@ impl ConsensusGroupAllocator {
 macro_rules! define_state {
     (
         $state:ident {
-            $($field_name:ident : $field_type:ty),* $(,)?
+            $($field_vis:vis $field_name:ident : $field_type:ty),* $(,)?
         }
     ) => {
         paste::paste! {
             #[derive(Debug, Clone, Default)]
             pub struct [<$state Inner>] {
                 $(
-                    pub $field_name: $field_type,
+                    $field_vis $field_name: $field_type,
                 )*
-                pub last_result: Option<$crate::stm::result::ApplyReply>,
+                pub(crate) last_result: Option<$crate::stm::result::ApplyReply>,
             }
 
             impl [<$state Inner>] {

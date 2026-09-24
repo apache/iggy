@@ -107,12 +107,7 @@ where
         return Err(LoginRegisterError::InvalidCredentials);
     }
     shard.plane.metadata().mux_stm.users().read(|users| {
-        let user = users
-            .index
-            .get(username)
-            .copied()
-            .and_then(|user_id| users.items.get(user_id as usize));
-        let Some(user) = user else {
+        let Some(user) = users.user_by_name(username) else {
             // Constant-cost path: verify against a dummy hash so a missing
             // username is indistinguishable by response timing from a wrong
             // password (both return InvalidCredentials).
@@ -421,10 +416,10 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
             break;
         }
         // Production-only wall clock: the heartbeat verifier is spawned solely
-        // by `build_shard_for_thread`, never by the simulator's
-        // `wire_shell_handlers`, so neither the interval wait above nor this
-        // read is on a deterministic path. Driving this task under the
-        // deterministic executor means routing both through the injected clock.
+        // by `build_shard_for_thread`, never by the simulator's shell mode, so
+        // neither the interval wait above nor this read is on a deterministic
+        // path. Driving this task under the deterministic executor means
+        // routing both through the injected clock.
         let stale = sessions
             .borrow()
             .collect_stale(max_age, std::time::Instant::now());
@@ -1471,7 +1466,6 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,

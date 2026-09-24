@@ -162,9 +162,7 @@
 //! discriminator, like `checkpoint_id` on every prepare
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
-use crate::partition_helpers::{
-    build_partition_fresh, delete_partitions_from_disk, load_partition_or_fence,
-};
+use crate::partition_helpers::{build_partition_fresh, load_partition_or_fence};
 use crate::shell::ServerShard;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -180,6 +178,7 @@ use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Partition, StatsRegistry};
+use partitions::delete_partitions_from_disk;
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -781,6 +780,7 @@ async fn reconcile_additions(
         } else {
             build_partition_fresh(
                 ctx.config.as_ref(),
+                partitions.config(),
                 ns,
                 partition_stats,
                 created_revision,
@@ -1019,7 +1019,7 @@ async fn tear_down_owned_partition(
         ns.stream_id(),
         ns.topic_id(),
         ns.partition_id(),
-        ctx.config.as_ref(),
+        partitions.config(),
     )
     .await
     {
@@ -1810,12 +1810,15 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
                 encryptor: None,
-                path_layout: PartitionPathLayout::default(),
+                // The reconciler reads segment and offset paths off this layout,
+                // so it must root where `test_config` rooted the server's own.
+                path_layout: PartitionPathLayout {
+                    streams_root: config.get_streams_path(),
+                },
             },
         );
         let shards_table = PapayaShardsTable::new();
@@ -2237,6 +2240,7 @@ mod tests {
             fetch_partition_build_inputs(&ctx, ns).expect("committed namespace has stats");
         let live = build_partition_fresh(
             &config,
+            ctx.shard.plane.partitions().config(),
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
@@ -2267,6 +2271,7 @@ mod tests {
 
         let redundant = build_partition_fresh(
             &config,
+            ctx.shard.plane.partitions().config(),
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
@@ -3566,7 +3571,7 @@ mod tests {
             ns.stream_id(),
             ns.topic_id(),
             ns.partition_id(),
-            ctx.config.as_ref(),
+            partitions.config(),
         )
         .await
         .expect("teardown disk delete succeeds");

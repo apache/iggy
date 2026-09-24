@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 /// and the read-your-writes floor. `Default` (everything absent, no address,
 /// floor `0`) stands for a connection neither this map nor the bus knows.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ConnectionContext {
+pub struct ConnectionContext {
     /// `(client_id, session)` once register committed, `None` before.
     pub bound: Option<(u128, u64)>,
     /// Acting user from `login`, `None` while still `Connected`.

@@ -18,14 +18,14 @@
 //! Shard construction and the partition recovery it drives.
 
 use crate::boot::topology::{RosterCells, TcpTopology, build_cluster_roster};
-use crate::boot::wire_shell_handlers;
 use crate::consumer_group::lease::ConsumerGroupLiveness;
+use crate::dispatch::host::ServerHost;
 use crate::partition_helpers::load_partition_or_fence;
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
-    ServerMetadata, ServerShard, ShellHandlers, ShellShardHandle, consensus_timers,
-    repair_gap_debounce_ticks, repair_retry_ticks,
+    ServerMetadata, ServerShard, ShellShardHandle, consensus_timers, repair_gap_debounce_ticks,
+    repair_retry_ticks,
 };
 use configs::server::ServerConfig;
 use consensus::{
@@ -37,7 +37,6 @@ use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::PingPongSuperblock;
 use message_bus::IggyMessageBus;
-use message_bus::client_listener::RequestHandler;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use partitions::{IggyPartitions, PartitionsConfig};
@@ -56,15 +55,13 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 /// A shard built for its thread, with what `shard_main` wires after the
-/// build: the session manager its request plane shares, the shard's one
-/// client-request handler (shard 0 hands the same instance to its local
-/// transports), and the weak self-reference the deferred handlers
-/// upgrade per frame, already backfilled.
+/// build: the session manager its request plane shares and the weak
+/// self-reference the host's handlers upgrade per frame, already
+/// backfilled.
 pub(in crate::boot) struct ShardBuild {
     pub shard: Rc<ServerShard>,
     pub sessions: Rc<RefCell<SessionManager>>,
     pub consumer_group_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
-    pub on_client_request: RequestHandler,
     pub shard_handle: ShellShardHandle<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>,
 }
 
@@ -147,7 +144,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
             size_of_messages_required_to_save: IggyByteSize::from(
                 iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
             ),
-
             validate_checksum: config.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
@@ -252,22 +248,17 @@ pub(in crate::boot) async fn build_shard_for_thread(
 
     let shard_handle = Rc::new(RefCell::new(None));
     // Same wiring path as the simulator's shell mode: one per-shard
-    // SessionManager shared by the client-request handler (binds sessions)
-    // and the get_clients handler (reads them). It also carries this shard's
-    // cluster roster for the GetClusterMetadata read.
-    let ShellHandlers {
-        on_replica_message,
-        on_client_request,
-        on_metadata_submit,
-        on_list_clients,
-        sessions,
-        consumer_group_liveness,
-    } = wire_shell_handlers(
+    // SessionManager shared by the client-request path (binds sessions)
+    // and the list-clients handler (reads them). It also carries this
+    // shard's cluster roster for the GetClusterMetadata read.
+    let host = Rc::new(ServerHost::new(
         &bus,
         &shard_handle,
         Arc::new(config.clone()),
         config.personal_access_token.max_tokens_per_user,
-    );
+    ));
+    let sessions = Rc::clone(host.sessions());
+    let consumer_group_liveness = Rc::clone(host.consumer_group_liveness());
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -280,10 +271,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
         Rc::clone(&bus),
-        on_replica_message,
-        Rc::clone(&on_client_request),
-        on_metadata_submit,
-        on_list_clients,
+        host,
         metadata,
         partitions,
         senders,
@@ -332,7 +320,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
         shard,
         sessions,
         consumer_group_liveness,
-        on_client_request,
         shard_handle,
     })
 }

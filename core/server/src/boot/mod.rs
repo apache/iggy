@@ -32,6 +32,7 @@ pub mod systemd;
 mod threads;
 mod topology;
 
+pub use crate::dispatch::host::ServerHost;
 pub use credentials::apply_default_root_credentials;
 pub use threads::ShardHandles;
 
@@ -57,29 +58,17 @@ use crate::boot::threads::{
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
-use crate::dispatch::submit::make_metadata_submit_handler;
-use crate::dispatch::{
-    make_deferred_client_request_handler, make_deferred_replica_message_handler,
-    make_list_clients_handler,
-};
 use crate::server_error::ServerError;
-use crate::session_manager::SessionManager;
-use crate::shell::{
-    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellBus, ShellHandlers,
-    ShellShardHandle,
-};
+use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::{Operation, PrepareHeader};
-use journal::superblock::SuperblockStore;
-use journal::{Journal, JournalHandle};
+use iggy_binary_protocol::Operation;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
-use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
@@ -88,54 +77,12 @@ use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
 };
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tracing::{error, info, warn};
-
-/// Build the deferred dispatch handlers for `shard_handle` against `bus`.
-///
-/// They share one fresh [`SessionManager`]. The caller must set the weak
-/// self-reference in `shard_handle` once the shard is built, so the
-/// handlers can upgrade it per frame.
-pub fn wire_shell_handlers<B, MJ, S, SB>(
-    bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
-    server_config: Arc<ServerConfig>,
-    max_tokens_per_user: u32,
-) -> ShellHandlers
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
-    let consumer_group_liveness = Rc::default();
-    let session_timeout = server_config.consumer_group.session_timeout.get_duration();
-    ShellHandlers {
-        on_replica_message: make_deferred_replica_message_handler(shard_handle),
-        on_client_request: make_deferred_client_request_handler(
-            bus,
-            shard_handle,
-            &sessions,
-            server_config,
-            max_tokens_per_user,
-        ),
-        on_metadata_submit: make_metadata_submit_handler(
-            shard_handle,
-            &consumer_group_liveness,
-            session_timeout,
-        ),
-        on_list_clients: make_list_clients_handler(&sessions),
-        sessions,
-        consumer_group_liveness,
-    }
-}
 
 /// Load the server configuration from the active config provider.
 ///
@@ -683,7 +630,6 @@ async fn shard_main(
         shard,
         sessions,
         consumer_group_liveness,
-        on_client_request,
         shard_handle,
     } = Box::pin(build_shard_for_thread(
         shard_id,
@@ -960,7 +906,8 @@ async fn shard_main(
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
-        let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
+        let accepted_client =
+            make_shard_zero_client_accept_fns(coord, &bus, shard.client_request_handler());
         let roster = sessions.borrow().cluster_roster();
 
         if let Err(error) = start_tcp_runtime(

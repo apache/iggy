@@ -19,8 +19,8 @@
 //!
 //! The metadata consensus group lives on shard 0, but connections live on
 //! their home shards. Peer shards send a [`shard::MetadataSubmit`] and await
-//! the committed outcome; [`make_metadata_submit_handler`] is what shard 0
-//! runs for those frames. The session-lifecycle arms (register / logout and
+//! the committed outcome; [`handle_metadata_submit`] is what shard 0 runs
+//! for those frames. The session-lifecycle arms (register / logout and
 //! their replica forwards) delegate to `session_ops`, which owns that
 //! machinery.
 
@@ -29,9 +29,8 @@ use crate::dispatch::session_ops::{
     answer_forwarded_logout, answer_forwarded_register, submit_logout_local_or_forward,
     submit_register_local_or_forward,
 };
-use crate::dispatch::upgrade_shard_handle;
 use crate::reply_frame::committed_reply_header;
-use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
+use crate::shell::{ShellBus, ShellShard};
 use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::{GenericHeader, PrepareHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
@@ -43,157 +42,144 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-/// Handler shard 0 runs for an inbound [`shard::MetadataSubmit`]: a peer
-/// shard has verified credentials and owns the session locally, and asks
-/// shard 0 (the metadata consensus owner) to run only the consensus
+/// Shard 0's end of the RPC, run for an inbound [`shard::MetadataSubmit`]:
+/// a peer shard has verified credentials and owns the session locally, and
+/// asks shard 0 (the metadata consensus owner) to run only the consensus
 /// proposal. Spawns a task so the awaiting peer is woken once the op
 /// commits. Submit failures are returned verbatim so the peer can preserve
-/// unknown-outcome retry semantics.
+/// unknown-outcome retry semantics. Called only from
+/// `ServerHost::on_metadata_submit`; `pub(in crate::dispatch)` is the
+/// tightest visibility Rust can express, so this doc carries the constraint.
 #[allow(clippy::too_many_lines)]
-pub fn make_metadata_submit_handler<B, MJ, S, SB>(
-    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
+pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
+    submit: shard::MetadataSubmit,
     liveness: &Rc<RefCell<ConsumerGroupLiveness>>,
     session_timeout: Duration,
-) -> shard::MetadataSubmitHandler
-where
+) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let shard_handle = Rc::clone(shard_handle);
     let liveness = Rc::clone(liveness);
-    Rc::new(move |submit| {
-        let Some(shard) = upgrade_shard_handle(&shard_handle) else {
-            return;
-        };
-        let bus = shard.bus.clone();
-        let liveness = Rc::clone(&liveness);
-        bus.spawn(async move {
-            match submit {
-                shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
-                    let metadata = shard.plane.metadata();
-                    if let Some(consensus) = metadata.consensus.as_ref() {
-                        liveness.borrow_mut().receive(
-                            consensus.cluster(),
-                            (consensus.is_primary()
-                                && consensus.is_normal()
-                                && !consensus.is_transferring())
-                            .then_some(consensus.view()),
-                            &message,
-                            Instant::now(),
-                            session_timeout,
-                        );
-                    }
-                }
-                shard::MetadataSubmit::AttachConsumerSession {
-                    vsr_client_id,
-                    session,
-                    user_id,
-                    reply,
-                } => {
-                    let attached = shard
-                        .plane
-                        .metadata()
-                        .client_table
-                        .borrow_mut()
-                        .attach_session(vsr_client_id, session, user_id)
-                        .ok_or(IggyError::StaleClient);
-                    let _ = reply.try_send(attached);
-                }
-                shard::MetadataSubmit::Register {
-                    vsr_client_id,
-                    user_id,
-                    reply,
-                } => {
-                    let bound =
-                        submit_register_local_or_forward(&shard, vsr_client_id, user_id).await;
-                    let _ = reply.try_send(bound);
-                }
-                shard::MetadataSubmit::ForwardedRegister {
-                    vsr_client_id,
-                    user_id,
-                    nonce,
-                    origin_replica,
-                } => {
-                    answer_forwarded_register(
-                        &shard,
-                        vsr_client_id,
-                        user_id,
-                        nonce,
-                        origin_replica,
-                    )
-                    .await;
-                }
-                shard::MetadataSubmit::ForwardedLogout {
-                    vsr_client_id,
-                    session,
-                    request,
-                    nonce,
-                    origin_replica,
-                } => {
-                    answer_forwarded_logout(
-                        &shard,
-                        vsr_client_id,
-                        session,
-                        request,
-                        nonce,
-                        origin_replica,
-                    )
-                    .await;
-                }
-                shard::MetadataSubmit::Logout {
-                    vsr_client_id,
-                    session,
-                    request,
-                    reply,
-                } => {
-                    let outcome =
-                        submit_logout_local_or_forward(&shard, vsr_client_id, session, request)
-                            .await;
-                    let _ = reply.try_send(outcome);
-                }
-                shard::MetadataSubmit::ClientRequest { request, reply } => {
-                    let committed = match request.try_into_typed::<RoutedRequestHeader>() {
-                        Ok(typed) => shard
-                            .plane
-                            .metadata()
-                            .submit_request_in_process(typed)
-                            .await
-                            .ok(),
-                        Err(error) => {
-                            warn!(?error, "ClientRequest submit: undecodable request header");
-                            None
-                        }
-                    };
-                    let _ = reply.try_send(committed);
-                }
-                shard::MetadataSubmit::CompleteRevocation {
-                    stream_id,
-                    topic_id,
-                    group_id,
-                    source_client_id,
-                    partition_id,
-                    reply,
-                } => {
-                    let commit = shard
-                        .plane
-                        .metadata()
-                        .submit_complete_revocation_in_process(
-                            stream_id,
-                            topic_id,
-                            group_id,
-                            source_client_id,
-                            partition_id,
-                        )
-                        .await
-                        .ok();
-                    let _ = reply.try_send(commit);
+    let bus = shard.bus.clone();
+    bus.spawn(async move {
+        match submit {
+            shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
+                let metadata = shard.plane.metadata();
+                if let Some(consensus) = metadata.consensus.as_ref() {
+                    liveness.borrow_mut().receive(
+                        consensus.cluster(),
+                        (consensus.is_primary()
+                            && consensus.is_normal()
+                            && !consensus.is_transferring())
+                        .then_some(consensus.view()),
+                        &message,
+                        Instant::now(),
+                        session_timeout,
+                    );
                 }
             }
-        });
-    })
+            shard::MetadataSubmit::AttachConsumerSession {
+                vsr_client_id,
+                session,
+                user_id,
+                reply,
+            } => {
+                let attached = shard
+                    .plane
+                    .metadata()
+                    .client_table
+                    .borrow_mut()
+                    .attach_session(vsr_client_id, session, user_id)
+                    .ok_or(IggyError::StaleClient);
+                let _ = reply.try_send(attached);
+            }
+            shard::MetadataSubmit::Register {
+                vsr_client_id,
+                user_id,
+                reply,
+            } => {
+                let bound = submit_register_local_or_forward(&shard, vsr_client_id, user_id).await;
+                let _ = reply.try_send(bound);
+            }
+            shard::MetadataSubmit::ForwardedRegister {
+                vsr_client_id,
+                user_id,
+                nonce,
+                origin_replica,
+            } => {
+                answer_forwarded_register(&shard, vsr_client_id, user_id, nonce, origin_replica)
+                    .await;
+            }
+            shard::MetadataSubmit::ForwardedLogout {
+                vsr_client_id,
+                session,
+                request,
+                nonce,
+                origin_replica,
+            } => {
+                answer_forwarded_logout(
+                    &shard,
+                    vsr_client_id,
+                    session,
+                    request,
+                    nonce,
+                    origin_replica,
+                )
+                .await;
+            }
+            shard::MetadataSubmit::Logout {
+                vsr_client_id,
+                session,
+                request,
+                reply,
+            } => {
+                let outcome =
+                    submit_logout_local_or_forward(&shard, vsr_client_id, session, request).await;
+                let _ = reply.try_send(outcome);
+            }
+            shard::MetadataSubmit::ClientRequest { request, reply } => {
+                let committed = match request.try_into_typed::<RoutedRequestHeader>() {
+                    Ok(typed) => shard
+                        .plane
+                        .metadata()
+                        .submit_request_in_process(typed)
+                        .await
+                        .ok(),
+                    Err(error) => {
+                        warn!(?error, "ClientRequest submit: undecodable request header");
+                        None
+                    }
+                };
+                let _ = reply.try_send(committed);
+            }
+            shard::MetadataSubmit::CompleteRevocation {
+                stream_id,
+                topic_id,
+                group_id,
+                source_client_id,
+                partition_id,
+                reply,
+            } => {
+                let commit = shard
+                    .plane
+                    .metadata()
+                    .submit_complete_revocation_in_process(
+                        stream_id,
+                        topic_id,
+                        group_id,
+                        source_client_id,
+                        partition_id,
+                    )
+                    .await
+                    .ok();
+                let _ = reply.try_send(commit);
+            }
+        }
+    });
 }
 
 /// Submit a replicated client request to the metadata owner (shard 0) and
