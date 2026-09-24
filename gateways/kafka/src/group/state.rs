@@ -443,14 +443,16 @@ impl GroupState {
 
     fn complete_join(&mut self, now: Instant) {
         self.members.retain(|_, member| member.rejoined);
-        self.pending.clear();
         self.join_deadline = None;
         self.initial = false;
+        // A window that closes with nobody in it forms no generation, so the ids still on their
+        // way back keep their own expiry and the next admitted member reopens the barrier.
         if self.members.is_empty() {
             self.leader = None;
             self.bump();
             return;
         }
+        self.pending.clear();
 
         let leader = match self.leader.clone() {
             Some(leader) if self.members.contains_key(&leader) => leader,
@@ -2486,6 +2488,63 @@ mod tests {
         };
         assert_eq!(rejoined.error, ERROR_NONE);
         assert!(groups[&group_id()].members.contains_key(&pending));
+    }
+
+    /// The leave ticks the group before removing anyone, so a window already past its deadline
+    /// closes first and drops the member that never rejoined. Its own leave then finds it gone.
+    #[test]
+    fn given_a_pending_member_when_the_last_member_leaves_after_the_join_window_should_admit_the_rejoin()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_two_members(&mut groups, &config, now);
+        let _ = leave(&mut groups, &[(follower.as_str(), None)], now);
+        let join_deadline = groups[&group_id()]
+            .join_deadline
+            .expect("the leave must open a join window");
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+
+        let result = leave(&mut groups, &[(leader.as_str(), None)], join_deadline);
+
+        assert_eq!(codes(&result), vec![ERROR_UNKNOWN_MEMBER_ID]);
+        assert!(groups[&group_id()].pending.contains_key(&pending));
+        let Step::Respond(rejoined) = join_step(
+            &mut groups,
+            &config,
+            &request(pending.as_str(), &["x"]),
+            join_deadline,
+        ) else {
+            panic!("the pending rejoin must be answered, not parked");
+        };
+        assert_eq!(rejoined.error, ERROR_NONE);
+        assert!(groups[&group_id()].members.contains_key(&pending));
+    }
+
+    /// Same wipe through session expiry: the tick evicts the last member and closes the overdue
+    /// window in one pass.
+    #[test]
+    fn given_a_pending_member_when_the_last_member_expires_after_the_join_window_should_keep_the_pending_id()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_, follower) = stable_two_members(&mut groups, &config, now);
+        let _ = leave(&mut groups, &[(follower.as_str(), None)], now);
+        let pending = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &JoinRequest {
+                session_timeout: Duration::from_secs(60),
+                ..pending_request()
+            },
+            now,
+        ));
+        let later = now + Duration::from_secs(11);
+
+        assert!(tick_group(&mut groups, &group_id(), later));
+        assert!(groups[&group_id()].members.is_empty());
+        assert!(groups[&group_id()].pending.contains_key(&pending));
     }
 
     #[test]
