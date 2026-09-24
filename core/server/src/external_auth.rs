@@ -34,7 +34,6 @@ use std::fmt;
 use configs::external_auth::ExternalAuthConfig;
 use iggy_common::Permissions;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
@@ -252,7 +251,7 @@ pub fn validate_config(
         tracing::warn!(
             timeout = %config.timeout,
             "external_auth.timeout is unusually large (> 30 s); \
-             the callout blocks the shard reactor for its full duration"
+             a callout stalls that login attempt for its full duration"
         );
     }
     if config.user_id == 0 {
@@ -307,6 +306,12 @@ pub async fn callout_external_auth(
 ) -> Result<ExternalAuthDecision, ExternalAuthError> {
     use futures::StreamExt;
 
+    if request.username.len() > MAX_CREDENTIAL_BYTES {
+        return Err(ExternalAuthError::BadRequest(format!(
+            "username too large ({} bytes, limit {MAX_CREDENTIAL_BYTES})",
+            request.username.len()
+        )));
+    }
     if let Some(ref cred) = request.credential
         && cred.len() > MAX_CREDENTIAL_BYTES
     {
@@ -419,26 +424,6 @@ fn into_decision(resp: ExternalAuthResponse) -> Result<ExternalAuthDecision, Ext
                 .reason
                 .unwrap_or_else(|| "denied by external auth".to_owned());
             Ok(ExternalAuthDecision::Deny { reason })
-        }
-    }
-}
-
-/// Try external auth and map the result to a decision the login flow
-/// can act on. Fail-closed: a callout failure (timeout, network error,
-/// bad response) denies the login.
-///
-/// # Errors
-///
-/// Returns [`ExternalAuthError`] when the callout itself failed.
-pub async fn try_external_auth(
-    config: &ExternalAuthConfig,
-    request: ExternalAuthRequest,
-) -> Result<ExternalAuthDecision, ExternalAuthError> {
-    match callout_external_auth(config, request).await {
-        Ok(decision) => Ok(decision),
-        Err(error) => {
-            warn!(error = %error, "external auth callout failed");
-            Err(error)
         }
     }
 }

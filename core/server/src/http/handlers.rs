@@ -126,7 +126,7 @@ use crate::dispatch::authz::{
 use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::external_auth::{
-    CredentialType, ExternalAuthDecision, ExternalAuthRequest, try_external_auth,
+    CredentialType, ExternalAuthDecision, ExternalAuthRequest, callout_external_auth,
 };
 use crate::http::ClientAddr;
 use crate::http::error::{
@@ -1349,9 +1349,9 @@ pub(in crate::http) async fn poll_messages(
                     permissioner.poll_messages(uid, stream_id, topic_id)
                 })
         },
-        |p| {
-            resolve_gate_topic_ids(&state, &stream_id, &topic_id)
-                .is_none_or(|(sid, tid)| can_poll_messages(p, sid, tid))
+        |p| match resolve_gate_topic_ids(&state, &stream_id, &topic_id) {
+            Some((sid, tid)) => can_poll_messages(p, sid, tid),
+            None => false,
         },
     ))
     .await?;
@@ -1435,9 +1435,9 @@ pub(in crate::http) async fn get_consumer_offset(
                     permissioner.get_consumer_offset(uid, stream_id, topic_id)
                 })
         },
-        |p| {
-            resolve_gate_topic_ids(&state, &stream_id, &topic_id)
-                .is_none_or(|(sid, tid)| can_poll_messages(p, sid, tid))
+        |p| match resolve_gate_topic_ids(&state, &stream_id, &topic_id) {
+            Some((sid, tid)) => can_poll_messages(p, sid, tid),
+            None => false,
         },
     ))
     .await?;
@@ -1963,10 +1963,9 @@ pub(in crate::http) async fn delete_pat(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Try external auth for an HTTP login. Returns `Some(result)` when the
-/// external service responded (grant or deny) or when a callout failure
-/// produces a terminal deny. Returns `None` when the caller should fall
-/// through to built-in credential verification.
+/// Try external auth for an HTTP login. On success maps the decision
+/// to a JWT identity response; on failure (callout error or denial)
+/// returns the appropriate HTTP error.
 async fn try_external_auth_http_login(
     state: &HttpInner,
     credential_type: CredentialType,
@@ -1985,8 +1984,12 @@ async fn try_external_auth_http_login(
         transport: "http".to_owned(),
         client_address: client_address.to_owned(),
     };
-    let Ok(decision) = try_external_auth(&state.external_auth, request).await else {
-        return Err(IggyError::Unauthenticated.into());
+    let decision = match callout_external_auth(&state.external_auth, request).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::warn!(error = %error, "external auth callout failed");
+            return Err(IggyError::Unauthenticated.into());
+        }
     };
     handle_http_auth_decision(state, decision)
 }

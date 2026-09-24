@@ -1358,7 +1358,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             return;
         };
 
-        match crate::external_auth::try_external_auth(external_auth, ext_request).await {
+        match crate::external_auth::callout_external_auth(external_auth, ext_request).await {
             Ok(crate::external_auth::ExternalAuthDecision::IggyUser { user_id }) => {
                 if user_id == 0 {
                     warn!(
