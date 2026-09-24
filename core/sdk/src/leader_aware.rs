@@ -493,6 +493,18 @@ impl ConnectCoordinator {
         F: FnOnce(bool, ConnectOwnerToken) -> Fut,
         Fut: Future<Output = Result<(), IggyError>>,
     {
+        self.run_until(None, operation).await
+    }
+
+    pub(crate) async fn run_until<F, Fut>(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        operation: F,
+    ) -> Result<(), IggyError>
+    where
+        F: FnOnce(bool, ConnectOwnerToken) -> Fut,
+        Fut: Future<Output = Result<(), IggyError>>,
+    {
         let observed_generation = self.generation.load(Ordering::SeqCst);
         if self
             .active
@@ -518,7 +530,13 @@ impl ConnectCoordinator {
             if generation > observed_generation {
                 return self.result_for(generation);
             }
-            changed.await;
+            if let Some(deadline) = deadline {
+                tokio::time::timeout_at(deadline, changed)
+                    .await
+                    .map_err(|_| IggyError::RequestTimeout)?;
+            } else {
+                changed.await;
+            }
         }
     }
 

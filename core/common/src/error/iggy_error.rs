@@ -549,6 +549,9 @@ pub enum IggyError {
     CannotBindToSocket(String) = 12000,
     #[error("Task execution timeout")]
     TaskTimeout = 12001,
+    /// The request budget expired. A request already written may have committed.
+    #[error("Request timed out; outcome may be unknown")]
+    RequestTimeout = 12002,
 
     #[error("IO error: {0}")]
     IoError(String) = 13000,
