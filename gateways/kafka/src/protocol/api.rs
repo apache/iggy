@@ -95,6 +95,11 @@ pub const ERROR_INVALID_CONFIG: i16 = 40;
 /// Non-retriable, so a Java client resolves immediately instead of retrying
 /// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+/// `CreateTopics`: request addressed more distinct topics than this bridge admits in one call.
+///
+/// A server-imposed limit, not a malformed request - `INVALID_REQUEST` would blame the client for
+/// a request Kafka itself would accept.
+pub const ERROR_POLICY_VIOLATION: i16 = 44;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]

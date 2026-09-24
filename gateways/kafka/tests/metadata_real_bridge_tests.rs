@@ -29,8 +29,7 @@ use serial_test::serial;
 
 use iggy_gateway_kafka::bridge::{IggyBridge, TopicMapping, TopicOverride};
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState,
+    BrokerAdvertise, ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::metadata;
 
@@ -379,11 +378,17 @@ async fn a_topic_named_twice_in_one_request_resolves_to_one_entry() {
     );
 }
 
-/// Regression test: a named-lookup request addressing more than the bridge-backed topic cap must
-/// be rejected wholesale (every name, `INVALID_REQUEST`) rather than partially served.
+/// Regression test: a named-lookup request addressing more than the old per-name bridge-backed
+/// topic cap (100) must resolve every name individually, not be rejected wholesale. A hard cap
+/// here permanently broke a long-lived Java producer once its `ProducerMetadata`'s cumulative
+/// tracked-topic set (resent in full on every refresh) crossed it - every later request answered
+/// every topic `INVALID_REQUEST`, with no way for the producer to shrink its own tracked set and
+/// recover. `IggyBridge::get_kafka_topics` batches by resolved stream instead of by name, so a
+/// name count this large costs the same one-`get_topics`-call-per-stream (here: one, the default
+/// stream) it would for any smaller batch.
 #[tokio::test]
 #[serial]
-async fn a_named_lookup_of_more_than_the_topic_cap_is_rejected() {
+async fn a_named_lookup_of_more_than_the_old_topic_cap_resolves_every_name() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let (state, _seed) = connected_state(&server).await;
@@ -393,7 +398,9 @@ async fn a_named_lookup_of_more_than_the_topic_cap_is_rejected() {
 
     let topics = send(&state, Some(&name_refs)).await;
     assert_eq!(topics.len(), 101);
+    // None of these topics exist - each is resolved individually and unknown, not blanket
+    // rejected as a batch.
     for (_, error_code, _) in &topics {
-        assert_eq!(*error_code, ERROR_INVALID_REQUEST);
+        assert_eq!(*error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 }

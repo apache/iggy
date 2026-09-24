@@ -178,13 +178,18 @@ below it are still open for the issues that build on top of it.
     lookups.
   - The response-size cap above only covers the "all topics" and per-name-expansion cases. A
     named lookup is separately bounded on the request side: names repeated in one request are
-    deduped up front to one response entry, not just one `get_kafka_topic` round trip - real
-    Kafka answers a topic named twice in one request with one response entry, and re-expanding to
-    match the request would let a handful of repeats of one large topic name amplify a response
-    sized off the repeat count instead of the distinct count. A lookup naming more than 100
-    distinct topics is rejected outright (`INVALID_REQUEST`, no bridge call for any of them -
-    `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096) is a pre-decode ceiling, not a usability one),
-    and the whole lookup's aggregate bridge work runs under a fixed 20s wall-clock deadline
+    deduped up front to one response entry, not just one bridge round trip - real Kafka answers a
+    topic named twice in one request with one response entry, and re-expanding to match the
+    request would let a handful of repeats of one large topic name amplify a response sized off
+    the repeat count instead of the distinct count. No cap on distinct names: `bounds_guard`'s
+    `MAX_REQUEST_ELEMENTS` (4,096) is still the pre-decode ceiling, but `IggyBridge::get_kafka_topics`
+    batches by the *stream* each name resolves to rather than paying one round trip per name, so
+    the real bridge cost is bounded by distinct streams involved (config-time-bounded), not by
+    how many names the client asks about. A per-name cap here previously permanently broke a
+    long-lived Java producer once its `ProducerMetadata`'s cumulative tracked-topic set - resent
+    in full on every refresh - crossed the cap: every later request answered every topic
+    `INVALID_REQUEST`, and the producer had no way to shrink its own tracked set to recover. The
+    whole lookup's aggregate bridge work still runs under a fixed 20s wall-clock deadline
     (`Metadata` carries no `timeout_ms` field in any version, unlike `CreateTopics`, so this cannot
     be client-honored) - a deadline that fires answers every name `REQUEST_TIMED_OUT` rather than
     continuing to hold the shared lockstep `IggyClient`.

@@ -27,13 +27,15 @@ use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
 use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
+use tokio::time::Instant;
+
 use crate::bridge::{BridgeError, IggyBridge, TopicCreationOutcome};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
-    GatewayState, HandleOutcome,
+    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::{
@@ -52,6 +54,14 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// Matches real Kafka's own out-of-box `num.partitions=1` broker default. Not read from any
 /// bridge config - there is no such config surface today.
 const DEFAULT_PARTITION_COUNT: u32 = 1;
+
+/// Iggy's own server-side per-topic partition cap (`rewrite.rs`'s `IggyError::TooManyPartitions`).
+///
+/// Not exported by `iggy::prelude`, so mirrored here as a named constant rather than a bare
+/// literal repeated at every call site. Enforcing it locally means `validate_only` answers the
+/// same rejection the real path would eventually get from the bridge, instead of reporting
+/// `NONE` for a partition count the real path can never actually create.
+const MAX_PARTITIONS_COUNT: u32 = 1000;
 
 /// Cap on distinct topic names one `CreateTopics` request may address through the bridge.
 ///
@@ -131,50 +141,35 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             max = MAX_BRIDGE_BACKED_TOPICS,
             "CreateTopics request addresses too many distinct topics; rejecting"
         );
+        // A server-imposed limit, not a malformed request - INVALID_REQUEST would blame the
+        // client for a request Kafka itself would accept.
+        let message = StrBytes::from(format!(
+            "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} distinct topics per CreateTopics request"
+        ));
         let results = req
             .topics
             .iter()
             .map(|topic| {
                 CreatableTopicResult::default()
                     .with_name(topic.name.clone())
-                    .with_error_code(ERROR_INVALID_REQUEST)
+                    .with_error_code(ERROR_POLICY_VIOLATION)
+                    .with_error_message(Some(message.clone()))
             })
             .collect();
         let resp = CreateTopicsResponse::default().with_topics(results);
         return respond_or_close(encode_message(&resp, api_version, 256), "CreateTopics");
     }
 
-    let deadline = clamp_request_timeout(req.timeout_ms);
-    let results = match tokio::time::timeout(
+    let deadline = Instant::now() + clamp_request_timeout(req.timeout_ms);
+    let results = create_all_topics(
+        bridge,
+        api_version,
+        &req.topics,
+        &duplicate_names,
+        req.validate_only,
         deadline,
-        create_all_topics(
-            bridge,
-            api_version,
-            &req.topics,
-            &duplicate_names,
-            req.validate_only,
-        ),
     )
-    .await
-    {
-        Ok(results) => results,
-        Err(_elapsed) => {
-            tracing::warn!(
-                distinct_topics = distinct_bridge_backed.len(),
-                deadline_ms = deadline.as_millis(),
-                "CreateTopics request's aggregate bridge work exceeded its deadline; \
-                 answering retriable instead of blocking further"
-            );
-            req.topics
-                .iter()
-                .map(|topic| {
-                    CreatableTopicResult::default()
-                        .with_name(topic.name.clone())
-                        .with_error_code(ERROR_REQUEST_TIMED_OUT)
-                })
-                .collect()
-        }
-    };
+    .await;
     let resp = CreateTopicsResponse::default().with_topics(results);
     respond_or_close(encode_message(&resp, api_version, 256), "CreateTopics")
 }
@@ -185,12 +180,20 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 /// create it never got a `NONE` for (`AdminClient` keys its futures by name, so a second
 /// per-topic result for the same name is silently discarded client-side regardless of which one
 /// this bridge picked).
+///
+/// `deadline` bounds each topic's own bridge work individually (`timeout_at`), not the whole
+/// loop: a single `timeout` around the entire call would discard every already-resolved result
+/// the moment one topic's call ran long, answering `REQUEST_TIMED_OUT` even for topics that had
+/// already committed. Once `deadline` passes, every remaining topic's own `timeout_at` elapses
+/// immediately rather than making a fresh bridge call, so a stuck topic near the front of a large
+/// batch does not turn into one slow round trip per topic behind it.
 async fn create_all_topics(
     bridge: &IggyBridge,
     api_version: i16,
     topics: &[CreatableTopic],
     duplicate_names: &HashSet<TopicName>,
     validate_only: bool,
+    deadline: Instant,
 ) -> Vec<CreatableTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
     for topic in topics {
@@ -198,8 +201,27 @@ async fn create_all_topics(
             CreatableTopicResult::default()
                 .with_name(topic.name.clone())
                 .with_error_code(ERROR_INVALID_REQUEST)
+                .with_error_message(None)
         } else {
-            create_one_topic(bridge, api_version, topic, validate_only).await
+            match tokio::time::timeout_at(
+                deadline,
+                create_one_topic(bridge, api_version, topic, validate_only),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        kafka_topic = topic.name.as_str(),
+                        "CreateTopics: this topic's bridge work exceeded the request deadline; \
+                         answering retriable instead of blocking further"
+                    );
+                    CreatableTopicResult::default()
+                        .with_name(topic.name.clone())
+                        .with_error_code(ERROR_REQUEST_TIMED_OUT)
+                        .with_error_message(None)
+                }
+            }
         };
         results.push(result);
     }
@@ -223,10 +245,16 @@ fn find_duplicate_names(topics: &[CreatableTopic]) -> HashSet<TopicName> {
 
 /// Validates and, when the topic is not rejected outright, provisions one requested topic.
 ///
-/// `configs` is rejected before the shape check - a config-bearing request is rejected the same
-/// way regardless of how its partitions/replication are shaped.
+/// Existence beats a local (config/shape) rejection, not the other way around: real Kafka's
+/// controller checks its in-memory topic set before it ever looks at the request's configs or
+/// shape, so an existing topic answers `TOPIC_ALREADY_EXISTS` regardless of whether the new
+/// request would itself be valid. Kafka Connect's idempotent bootstrap depends on this - it
+/// resends `cleanup.policy=compact` against topics it doesn't know already exist, and expects
+/// `ALREADY_EXISTS` back, not a config rejection. The existence probe only runs when a local
+/// check would otherwise reject, so the common (valid-request) path pays no extra round trip for
+/// it.
 ///
-/// `validate_only` and the real create path diverge deliberately below that point, not just in
+/// `validate_only` and the real create path diverge deliberately past that point, not just in
 /// whether they call the bridge: `validate_only` never mutates anything, so a plain existence
 /// read ([`IggyBridge::get_kafka_topic`]) is fine - there's no race to protect against when
 /// nothing gets created either way. The real path instead calls
@@ -240,22 +268,25 @@ async fn create_one_topic(
     topic: &CreatableTopic,
     validate_only: bool,
 ) -> CreatableTopicResult {
-    let result = CreatableTopicResult::default().with_name(topic.name.clone());
+    let result = CreatableTopicResult::default()
+        .with_name(topic.name.clone())
+        .with_error_message(None);
+    let kafka_topic = topic.name.as_str();
 
-    if !topic.configs.is_empty() {
-        return result
-            .with_error_code(ERROR_INVALID_CONFIG)
-            .with_error_message(Some(StrBytes::from(
-                "per-topic configs are not supported by this bridge".to_string(),
-            )));
-    }
-
-    let partition_count = match validate_create_topic_shape(version, topic) {
+    let partition_count = match local_shape_error(version, topic) {
         Ok(count) => count,
-        Err(code) => return result.with_error_code(code),
+        Err((error_code, error_message)) => {
+            return match bridge.get_kafka_topic(kafka_topic).await {
+                Ok(Some(_existing)) => result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS),
+                // A failed existence probe doesn't get to mask a real, independently-valid
+                // rejection - the request has a local defect either way.
+                Ok(None) | Err(_) => result
+                    .with_error_code(error_code)
+                    .with_error_message(error_message),
+            };
+        }
     };
 
-    let kafka_topic = topic.name.as_str();
     let success = || {
         result
             .clone()
@@ -268,9 +299,7 @@ async fn create_one_topic(
         return match bridge.get_kafka_topic(kafka_topic).await {
             Ok(Some(_existing)) => result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS),
             Ok(None) => success(),
-            Err(err) => result
-                .with_error_code(err.to_kafka_error_code())
-                .with_error_message(Some(StrBytes::from(error_message_for(&err)))),
+            Err(err) => bridge_error_result(result, kafka_topic, &err),
         };
     }
 
@@ -288,25 +317,75 @@ async fn create_one_topic(
         Ok(TopicCreationOutcome::AlreadyExists) => {
             result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS)
         }
-        Err(err) => result
-            .with_error_code(err.to_kafka_error_code())
-            .with_error_message(Some(StrBytes::from(error_message_for(&err)))),
+        Err(err) => bridge_error_result(result, kafka_topic, &err),
     }
 }
 
-/// Error text for `CreatableTopicResult.error_message`, without re-embedding the topic name:
-/// `result.name` (`CreatableTopicResult::with_name`) already carries it, so `err.to_string()`'s
-/// own embedded copy for these two variants would double the per-topic response cost for a name
-/// the client already sent and already has back. Validation runs before any bridge I/O, so this
-/// is a purely local, zero-round-trip amplification if left in - 100 topics named with a maximal
-/// legal length build a response roughly twice the size the name alone would justify.
-fn error_message_for(err: &BridgeError) -> String {
+/// `configs`-then-shape local validation, bundled so [`create_one_topic`] can probe existence
+/// once, only on the rejection path. Returns `(error_code, error_message)` rather than a whole
+/// [`CreatableTopicResult`] to keep this `Result`'s `Err` arm small (`clippy::result_large_err`);
+/// the caller already holds the shared `name`/base fields to rebuild the full result from.
+fn local_shape_error(
+    version: i16,
+    topic: &CreatableTopic,
+) -> core::result::Result<u32, (i16, Option<StrBytes>)> {
+    if !topic.configs.is_empty() {
+        return Err((
+            ERROR_INVALID_CONFIG,
+            Some(StrBytes::from(
+                "per-topic configs are not supported by this bridge".to_string(),
+            )),
+        ));
+    }
+    validate_create_topic_shape(version, topic).map_err(|code| (code, None))
+}
+
+/// Maps a bridge failure to a Kafka result, logging the real cause server-side.
+///
+/// The Kafka client never sees more than the fixed text below: `err.to_string()`'s own embedded
+/// detail can be wrong for an error reconstructed from a bare wire status code
+/// (`BridgeError::Iggy`'s own doc explains why `IggyError::from_code` fills data fields with
+/// defaults on that path), so sending it to the client risks sending a wrong claim rather than no
+/// claim. The two client-caused variants are the exception - their text is fixed and always
+/// correct, so it's safe to forward and logged at `debug!` (attacker/misuse-controlled, not
+/// operator-actionable); everything else points at the bridge or Iggy itself and is logged at
+/// `error!` (`bridge/error.rs:155`'s own guidance: handlers log the real Iggy error).
+fn bridge_error_result(
+    result: CreatableTopicResult,
+    kafka_topic: &str,
+    err: &BridgeError,
+) -> CreatableTopicResult {
+    let error_code = err.to_kafka_error_code();
     match err {
-        BridgeError::InvalidKafkaTopicName { reason, .. } => reason.clone(),
-        BridgeError::InvalidPartitionCount { .. } => {
-            "partition count must be at least 1".to_string()
+        BridgeError::InvalidKafkaTopicName { reason, .. } => {
+            tracing::debug!(
+                kafka_topic,
+                reason,
+                "CreateTopics rejected an invalid topic name"
+            );
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(reason.clone())))
         }
-        other => other.to_string(),
+        BridgeError::InvalidPartitionCount { .. } => {
+            tracing::debug!(
+                kafka_topic,
+                "CreateTopics rejected an invalid partition count"
+            );
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(
+                    "partition count must be at least 1".to_string(),
+                )))
+        }
+        other => {
+            tracing::error!(kafka_topic, %other, "CreateTopics failed against the Iggy bridge");
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(
+                    "internal error provisioning this topic".to_string(),
+                )))
+        }
     }
 }
 
@@ -349,6 +428,17 @@ fn validate_create_topic_shape(
 
     let broker_default_ok = version >= 4;
 
+    // Checked ahead of (and separately from) `partitions_ok` below: that check's own
+    // `INVALID_PARTITIONS` (37) means "count is below 1" on the wire (`bridge/error.rs`'s own
+    // comment on `IggyError::TooManyPartitions`), the opposite condition from "too many" - reusing
+    // it here would send a client-visible message that contradicts the request it just sent. This
+    // is the same code the real (non-`validate_only`) path eventually gets back from the bridge
+    // once a count this large actually reaches `create_kafka_topic`, so `validate_only` now
+    // answers what the real create would.
+    if u32::try_from(topic.num_partitions).is_ok_and(|count| count > MAX_PARTITIONS_COUNT) {
+        return Err(ERROR_INVALID_REQUEST);
+    }
+
     let partitions_ok = if broker_default_ok {
         topic.num_partitions == -1 || topic.num_partitions > 0
     } else {
@@ -358,10 +448,16 @@ fn validate_create_topic_shape(
         return Err(ERROR_INVALID_PARTITIONS);
     }
 
+    // Exactly 1, not merely positive: this gateway advertises exactly one broker (node id 1,
+    // `metadata.rs`'s `BrokerId(1)`), the same ceiling the manual-assignment branch above already
+    // enforces per partition (`assignment_replicas_are_valid`). A real single-broker Kafka
+    // controller rejects `replication_factor > 1` the same way (`ReplicationControlManager`) -
+    // accepting it here and silently reporting back `1` (`success()`, below) would tell the
+    // client its request succeeded as sent when it didn't.
     let replication_ok = if broker_default_ok {
-        topic.replication_factor == -1 || topic.replication_factor > 0
+        topic.replication_factor == -1 || topic.replication_factor == 1
     } else {
-        topic.replication_factor > 0
+        topic.replication_factor == 1
     };
     if !replication_ok {
         return Err(ERROR_INVALID_REPLICATION_FACTOR);
@@ -586,6 +682,47 @@ mod tests {
         assert_eq!(
             validate_create_topic_shape(5, &topic),
             Err(ERROR_INVALID_REPLICATION_FACTOR)
+        );
+    }
+
+    #[test]
+    fn replication_factor_above_one_is_rejected_even_though_positive() {
+        // This gateway advertises exactly one broker - the manual-assignment branch already
+        // rejects a multi-replica assignment (`manual_assignment_with_a_duplicated_replica_is_rejected`);
+        // the equivalent numeric-field request must be rejected the same way, not merely
+        // accepted-and-silently-downgraded.
+        let topic = creatable_topic(1, 3);
+        assert_eq!(
+            validate_create_topic_shape(5, &topic),
+            Err(ERROR_INVALID_REPLICATION_FACTOR)
+        );
+    }
+
+    #[test]
+    fn replication_factor_of_exactly_one_is_accepted() {
+        let topic = creatable_topic(1, 1);
+        assert_eq!(validate_create_topic_shape(5, &topic), Ok(1));
+    }
+
+    #[test]
+    fn partition_count_at_the_cap_is_accepted() {
+        let topic = creatable_topic(i32::try_from(MAX_PARTITIONS_COUNT).unwrap(), 1);
+        assert_eq!(
+            validate_create_topic_shape(5, &topic),
+            Ok(MAX_PARTITIONS_COUNT)
+        );
+    }
+
+    #[test]
+    fn partition_count_above_the_cap_is_rejected_with_the_real_creates_own_code() {
+        // Not INVALID_PARTITIONS (37): that code's wire text is "below 1", the opposite
+        // condition. This is the same code the real (non-validate_only) path eventually gets
+        // back from the bridge once IggyError::TooManyPartitions reaches it
+        // (`bridge/error.rs::too_many_partitions_maps_to_invalid_request_not_invalid_partitions`).
+        let topic = creatable_topic(i32::try_from(MAX_PARTITIONS_COUNT).unwrap() + 1, 1);
+        assert_eq!(
+            validate_create_topic_shape(5, &topic),
+            Err(ERROR_INVALID_REQUEST)
         );
     }
 

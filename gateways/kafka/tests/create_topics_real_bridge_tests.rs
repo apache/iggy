@@ -38,7 +38,7 @@ use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::protocol::api::{
     BrokerAdvertise, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NONE, ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
+    ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_topics;
 
@@ -302,6 +302,30 @@ async fn create_topics_with_a_per_topic_config_returns_invalid_config_and_create
     assert!(streams.is_empty());
 }
 
+/// Kafka Connect's idempotent bootstrap sends `createTopics` with `cleanup.policy=compact`
+/// against topics it doesn't know already exist, expecting `TOPIC_ALREADY_EXISTS` for ones that
+/// are - real Kafka's controller checks existence before it looks at configs. This bridge doesn't
+/// support per-topic configs at all, so if it checked configs first, Connect's already-existing
+/// topics would always answer `INVALID_CONFIG` instead, which Connect does not treat as
+/// "already there, fine" the way it treats `TOPIC_ALREADY_EXISTS`.
+#[tokio::test]
+#[serial]
+async fn create_topics_with_a_config_against_an_existing_topic_answers_already_exists() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let (first_error, _) = send(&state, &[TopicSpec::new("orders", 3)], false).await;
+    assert_eq!(first_error, ERROR_NONE);
+
+    let topic = TopicSpec {
+        has_config: true,
+        ..TopicSpec::new("orders", 3)
+    };
+    let (error_code, _) = send(&state, &[topic], false).await;
+    assert_eq!(error_code, ERROR_TOPIC_ALREADY_EXISTS);
+}
+
 /// A manual replica assignment resolves the created partition count from its own length, not
 /// from `num_partitions` (`-1` here, per KIP-464).
 #[tokio::test]
@@ -498,7 +522,8 @@ async fn create_topics_rejects_more_than_the_topic_cap() {
     let results = send_all(&state, &topics, false).await;
     assert_eq!(results.len(), 101);
     for (_, error_code) in &results {
-        assert_eq!(*error_code, ERROR_INVALID_REQUEST);
+        // A server-imposed limit, not a malformed request.
+        assert_eq!(*error_code, ERROR_POLICY_VIOLATION);
     }
 
     let raw = raw_client(&server).await;

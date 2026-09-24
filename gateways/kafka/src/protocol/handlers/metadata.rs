@@ -25,14 +25,14 @@ use kafka_protocol::messages::metadata_response::{
     MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
 use kafka_protocol::messages::{BrokerId, MetadataRequest, MetadataResponse, TopicName};
-use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::protocol::{Encodable, StrBytes};
 
 use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
-    is_supported_version, supported_max_version,
+    API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ERROR_NONE, ERROR_REQUEST_TIMED_OUT,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, is_supported_version,
+    supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_metadata_shape;
 use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
@@ -43,23 +43,20 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 9,
 };
 
-/// Cap on distinct topic names one named-lookup `Metadata` request may address through the
-/// bridge. Does not apply to a null topics array ("all topics") - that path is server-driven
-/// (bounded by [`response_would_exceed_frame_size`] instead), not client-count-driven.
-///
-/// `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096) is a pre-decode `DoS` ceiling, not a usability
-/// recommendation: each distinct name costs one `get_kafka_topic` round trip against the single
-/// lockstep `IggyClient` every Kafka connection on this gateway shares
-/// (`bridge/iggy_bridge/mod.rs`'s "Concurrency ceiling").
-const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
-
 /// Wall-clock ceiling for a named-lookup request's aggregate bridge work.
 ///
 /// `Metadata` carries no `timeout_ms` field in any version (unlike `CreateTopics`), so this is a
-/// fixed ceiling, not a client-honored one - sized well above one `get_kafka_topic` call's own
-/// `REQUEST_TIMEOUT` (15s, bridge-internal) so a single slow-but-alive call is not the common
-/// trigger, while still bounding the sum across up to [`MAX_BRIDGE_BACKED_TOPICS`] calls.
+/// fixed ceiling, not a client-honored one - sized well above one `get_topics` call's own
+/// `REQUEST_TIMEOUT` (15s, bridge-internal) so a single slow-but-alive stream lookup is not the
+/// common trigger, while still bounding the sum across every distinct stream
+/// [`IggyBridge::get_kafka_topics`] ends up calling for this request.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Above this many total partitions in an all-topics response, `encode_real_response` runs on a
+/// blocking-pool thread instead of inline (see the call site). Conservative relative to the one
+/// measured data point available (20-54ms at 131,000 partitions) rather than a profiled
+/// threshold - tune with a real benchmark if it proves too high or too low in practice.
+const BLOCKING_ENCODE_PARTITION_THRESHOLD: u32 = 20_000;
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     if !is_supported_version(API_KEY_METADATA, api_version) {
@@ -106,17 +103,34 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
+    let per_partition_bytes = template_partition_bytes(api_version);
+
     let results = match requested {
-        None => match bridge.list_kafka_topics().await {
-            Ok(topics) => {
+        None => match tokio::time::timeout(REQUEST_DEADLINE, bridge.list_kafka_topics()).await {
+            Ok(Ok(topics)) => {
                 let results: Vec<TopicResult> = topics.into_iter().map(found_result).collect();
-                truncate_all_topics_to_frame_budget(results, state.max_frame_size)
+                truncate_all_topics_to_frame_budget(
+                    results,
+                    state.max_frame_size,
+                    per_partition_bytes,
+                )
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 // Same "no top-level error field" constraint as a decode failure: there is no
                 // way to answer "the bridge itself is unreachable" for an all-topics request
                 // that doesn't also falsely claim zero topics exist.
                 tracing::warn!(%error, "Failed to list Kafka topics from the Iggy bridge; closing connection");
+                return HandleOutcome::Close;
+            }
+            Err(_elapsed) => {
+                // No per-name cap to answer against here (this is the server-driven all-topics
+                // path), so there is no honest per-topic RETRIABLE list to send back either -
+                // same close as an unreachable bridge, not a different case.
+                tracing::warn!(
+                    deadline_secs = REQUEST_DEADLINE.as_secs(),
+                    "Listing Kafka topics from the Iggy bridge exceeded its deadline; closing \
+                     connection"
+                );
                 return HandleOutcome::Close;
             }
         },
@@ -132,7 +146,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // client's bootstrap Metadata call, permanently, the moment the catalog grows past the
     // trip point. This check is what still enforces the budget for the named-lookup arm, where
     // the cap (100 distinct topics) bounds the request but not what each one costs to answer.
-    let total_bytes: usize = results.iter().map(estimated_response_bytes).sum();
+    let total_bytes: usize = results
+        .iter()
+        .map(|result| estimated_response_bytes(result, per_partition_bytes))
+        .sum();
     if response_would_exceed_frame_size(total_bytes, state.max_frame_size) {
         tracing::warn!(
             total_bytes,
@@ -142,36 +159,72 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         return HandleOutcome::Close;
     }
 
-    respond_or_close(
-        encode_real_response(api_version, &results, &state.broker),
-        "Metadata",
-    )
+    let total_partitions: u64 = results
+        .iter()
+        .filter(|result| result.error_code == ERROR_NONE)
+        .map(|result| u64::from(result.partitions_count))
+        .sum();
+
+    let encoded = if total_partitions > u64::from(BLOCKING_ENCODE_PARTITION_THRESHOLD) {
+        // Building `MetadataResponsePartition` once per partition and serializing the whole
+        // response is measured at 20-54ms at 131,000 partitions - long enough, on a
+        // shared-nothing shard's single executor, to stall every other connection's request on
+        // this shard for the duration. `spawn_blocking` moves that cost off the shard's own task
+        // so ordinary requests keep their latency regardless of how large one all-topics response
+        // gets.
+        let broker = state.broker.clone();
+        tokio::task::spawn_blocking(move || encode_real_response(api_version, &results, &broker))
+            .await
+            .unwrap_or_else(|join_error| {
+                tracing::error!(%join_error, "Metadata all-topics encode task panicked");
+                Err(KafkaProtocolError::Malformed(join_error.to_string()))
+            })
+    } else {
+        encode_real_response(api_version, &results, &state.broker)
+    };
+    respond_or_close(encoded, "Metadata")
 }
 
-/// Resolves a named-lookup Metadata request's topics: dedupes first so every path below (cap,
-/// deadline, success) builds its response from the distinct set rather than one entry per
-/// request occurrence - real Kafka answers a topic named more than once with one response entry,
-/// not one per repeat, and re-expanding to match the request let a handful of repeats of one
-/// large topic name amplify a response sized off the repeat count instead of the distinct count.
+/// Resolves a named-lookup Metadata request's topics: dedupes first so the response is built from
+/// the distinct set rather than one entry per request occurrence - real Kafka answers a topic
+/// named more than once with one response entry, not one per repeat, and re-expanding to match
+/// the request would let a handful of repeats of one large topic name amplify a response sized
+/// off the repeat count instead of the distinct count.
+///
+/// No cap on how many distinct names one request may carry (`bounds_guard`'s
+/// `MAX_REQUEST_ELEMENTS`, 4,096, is still the decode-time ceiling): the bridge round trip cost
+/// this used to bound was one call per name, but [`IggyBridge::get_kafka_topics`] batches by the
+/// distinct *streams* those names resolve to instead, which is a config-time-bounded quantity a
+/// large name count doesn't grow. A Java producer's `ProducerMetadata` resends every topic it has
+/// ever produced to on each refresh, not just the ones in the current batch - once that set
+/// crossed a per-request name cap, every subsequent Metadata call answered every topic
+/// `INVALID_REQUEST` and the producer could never recover, since it has no way to shrink its own
+/// tracked set. A single timeout still bounds the one batched call.
 async fn resolve_requested_named_topics(
     bridge: &IggyBridge,
     names: &[StrBytes],
 ) -> Vec<TopicResult> {
     let distinct = dedup_topic_names(names);
-    if distinct.len() > MAX_BRIDGE_BACKED_TOPICS {
-        tracing::warn!(
-            distinct_topics = distinct.len(),
-            max = MAX_BRIDGE_BACKED_TOPICS,
-            "Metadata request addresses too many distinct topics; rejecting"
-        );
-        return distinct
-            .iter()
-            .map(|name| error_result(name.clone(), ERROR_INVALID_REQUEST))
-            .collect();
-    }
-
-    match tokio::time::timeout(REQUEST_DEADLINE, resolve_named_topics(bridge, &distinct)).await {
-        Ok(results) => results,
+    match tokio::time::timeout(REQUEST_DEADLINE, bridge.get_kafka_topics(&distinct)).await {
+        Ok(Ok(resolved)) => resolved
+            .into_iter()
+            .map(|(name, metadata)| match metadata {
+                Some(metadata) => TopicResult {
+                    name,
+                    error_code: ERROR_NONE,
+                    partitions_count: metadata.partitions_count,
+                },
+                None => error_result(name, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            })
+            .collect(),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "Metadata: resolving requested topics failed against the Iggy bridge");
+            let error_code = error.to_kafka_error_code();
+            distinct
+                .into_iter()
+                .map(|name| error_result(name, error_code))
+                .collect()
+        }
         Err(_elapsed) => {
             tracing::warn!(
                 distinct_topics = distinct.len(),
@@ -180,20 +233,38 @@ async fn resolve_requested_named_topics(
                  retriable instead of blocking further"
             );
             distinct
-                .iter()
-                .map(|name| error_result(name.clone(), ERROR_REQUEST_TIMED_OUT))
+                .into_iter()
+                .map(|name| error_result(name, ERROR_REQUEST_TIMED_OUT))
                 .collect()
         }
     }
 }
 
-/// Conservative per-partition byte cost of one encoded `MetadataResponsePartition` at v9 (the
-/// densest wire shape this handler emits): measured ~26 bytes (`error_code` + `partition_index` +
-/// `leader_id` + `leader_epoch` + a 1-entry `replica_nodes` + a 1-entry `isr_nodes` + an empty
-/// `offline_replicas` + tagged fields). 64 matches the margin `bounds_guard`'s own
-/// `RESPONSE_BYTES_PER_ELEMENT` uses for the same kind of estimate, rather than shaving this to
-/// the measured minimum.
-const RESPONSE_BYTES_PER_PARTITION: usize = 64;
+/// Fallback per-partition byte cost, used only if [`template_partition_bytes`]'s own
+/// `compute_size` call somehow fails for the fixed, always-well-formed shape it builds. Chosen
+/// well above every version's real cost (measured 26-34 bytes) so a fallback can only truncate
+/// more eagerly than the real encoder would, never less.
+const RESPONSE_BYTES_PER_PARTITION_FALLBACK: usize = 64;
+
+/// Exact per-partition byte cost of one encoded `MetadataResponsePartition` at `version`, shaped
+/// identically to what [`encode_real_response`] actually emits for a successful topic: one
+/// `replica_nodes` entry, one `isr_nodes` entry, an empty `offline_replicas`.
+///
+/// A flat constant here previously overcharged every version below v9 (the densest wire shape,
+/// which a flat 64-byte charge was measured against) - v0-v8's smaller encodings (fewer or
+/// narrower fixed fields, no tagged-field byte) cost as little as 26 bytes, so the flat charge
+/// started truncating an all-topics response at 41-53% of `max_frame_size` instead of near its
+/// actual limit. `compute_size` asks the encoder itself, so this tracks every version exactly
+/// instead of re-deriving and re-verifying a magic number per version by hand.
+fn template_partition_bytes(version: i16) -> usize {
+    MetadataResponsePartition::default()
+        .with_partition_index(0)
+        .with_leader_id(BrokerId(1))
+        .with_replica_nodes(vec![BrokerId(1)])
+        .with_isr_nodes(vec![BrokerId(1)])
+        .compute_size(version)
+        .unwrap_or(RESPONSE_BYTES_PER_PARTITION_FALLBACK)
+}
 
 /// Fixed per-`MetadataResponseTopic` cost, independent of name length or partition count:
 /// `error_code`(2) + `is_internal`(1) + the `partitions` array's own compact-length varint
@@ -214,10 +285,10 @@ const RESPONSE_BYTES_TOPIC_OVERHEAD: usize = 13;
 /// zero-partition or errored result - free under a partitions-only charge - still costs a full
 /// wrapper to encode. 500 topics with 255-byte names and one partition each encode to ~146 KB
 /// against the ~32 KB a partitions-only charge would have priced in.
-fn estimated_response_bytes(result: &TopicResult) -> usize {
+fn estimated_response_bytes(result: &TopicResult, per_partition_bytes: usize) -> usize {
     let name_bytes = result.name.as_str().len() + 2;
     let partition_bytes = if result.error_code == ERROR_NONE {
-        (result.partitions_count as usize).saturating_mul(RESPONSE_BYTES_PER_PARTITION)
+        (result.partitions_count as usize).saturating_mul(per_partition_bytes)
     } else {
         0
     };
@@ -243,11 +314,12 @@ const fn response_would_exceed_frame_size(total_bytes: usize, max_frame_size: us
 fn truncate_all_topics_to_frame_budget(
     mut results: Vec<TopicResult>,
     max_frame_size: usize,
+    per_partition_bytes: usize,
 ) -> Vec<TopicResult> {
     let mut cumulative_bytes = 0usize;
     let mut keep = results.len();
     for (index, result) in results.iter().enumerate() {
-        let next = cumulative_bytes + estimated_response_bytes(result);
+        let next = cumulative_bytes + estimated_response_bytes(result, per_partition_bytes);
         if response_would_exceed_frame_size(next, max_frame_size) {
             keep = index;
             break;
@@ -283,29 +355,6 @@ fn found_result(metadata: crate::bridge::KafkaTopicMetadata) -> TopicResult {
     }
 }
 
-async fn lookup_one_topic(bridge: &IggyBridge, name: StrBytes) -> TopicResult {
-    match bridge.get_kafka_topic(&name).await {
-        // `get_kafka_topic` (unlike `list_kafka_topics`) returns the SDK's own `TopicDetails`,
-        // which carries the topic's raw Iggy-side name, not the Kafka-side one under an override
-        // - so this echoes the caller's own `name`, not a field off the result.
-        Ok(Some(details)) => TopicResult {
-            name,
-            error_code: ERROR_NONE,
-            partitions_count: details.partitions_count,
-        },
-        Ok(None) => TopicResult {
-            name,
-            error_code: ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-            partitions_count: 0,
-        },
-        Err(err) => TopicResult {
-            name,
-            error_code: err.to_kafka_error_code(),
-            partitions_count: 0,
-        },
-    }
-}
-
 const fn error_result(name: StrBytes, error_code: i16) -> TopicResult {
     TopicResult {
         name,
@@ -325,19 +374,6 @@ fn dedup_topic_names(names: &[StrBytes]) -> Vec<StrBytes> {
         }
     }
     distinct
-}
-
-/// Resolves each of `names`, one `get_kafka_topic` round trip per entry.
-///
-/// `names` must already be the distinct set ([`dedup_topic_names`]) - this makes no attempt to
-/// re-derive or re-expand it, so a caller passing a list with repeats gets one round trip and one
-/// result per repeat, silently paying for the amplification this split was written to avoid.
-async fn resolve_named_topics(bridge: &IggyBridge, names: &[StrBytes]) -> Vec<TopicResult> {
-    let mut results = Vec::with_capacity(names.len());
-    for name in names {
-        results.push(lookup_one_topic(bridge, name.clone()).await);
-    }
-    results
 }
 
 /// # Errors
@@ -574,6 +610,8 @@ mod tests {
         }
     }
 
+    const TEST_PER_PARTITION_BYTES: usize = RESPONSE_BYTES_PER_PARTITION_FALLBACK;
+
     #[test]
     fn estimated_response_bytes_charges_name_and_overhead_even_at_zero_partitions() {
         // Regression: a partitions-only charge (the earlier form of this function) priced a
@@ -581,7 +619,7 @@ mod tests {
         // `MetadataResponseTopic` wrapper with the name in it.
         let result = topic_result("orders", ERROR_NONE, 0);
         assert_eq!(
-            estimated_response_bytes(&result),
+            estimated_response_bytes(&result, TEST_PER_PARTITION_BYTES),
             RESPONSE_BYTES_TOPIC_OVERHEAD + "orders".len() + 2
         );
     }
@@ -594,7 +632,7 @@ mod tests {
         // regardless of its error code.
         let result = topic_result("orders", ERROR_UNKNOWN_TOPIC_OR_PARTITION, 0);
         assert_eq!(
-            estimated_response_bytes(&result),
+            estimated_response_bytes(&result, TEST_PER_PARTITION_BYTES),
             RESPONSE_BYTES_TOPIC_OVERHEAD + "orders".len() + 2
         );
     }
@@ -607,16 +645,39 @@ mod tests {
         let ok = topic_result("orders", ERROR_NONE, 10);
         let err = topic_result("orders", ERROR_UNKNOWN_TOPIC_OR_PARTITION, 10);
         assert_eq!(
-            estimated_response_bytes(&err),
+            estimated_response_bytes(&err, TEST_PER_PARTITION_BYTES),
             RESPONSE_BYTES_TOPIC_OVERHEAD + "orders".len() + 2
         );
-        assert!(estimated_response_bytes(&ok) > estimated_response_bytes(&err));
+        assert!(
+            estimated_response_bytes(&ok, TEST_PER_PARTITION_BYTES)
+                > estimated_response_bytes(&err, TEST_PER_PARTITION_BYTES)
+        );
     }
 
     #[test]
     fn estimated_response_bytes_charges_longer_names_more() {
         let short = topic_result("a", ERROR_NONE, 0);
         let long = topic_result("a-much-longer-topic-name", ERROR_NONE, 0);
-        assert!(estimated_response_bytes(&long) > estimated_response_bytes(&short));
+        assert!(
+            estimated_response_bytes(&long, TEST_PER_PARTITION_BYTES)
+                > estimated_response_bytes(&short, TEST_PER_PARTITION_BYTES)
+        );
+    }
+
+    #[test]
+    fn template_partition_bytes_is_smaller_at_v0_than_the_conservative_fallback() {
+        // v0 has no leader_epoch, no offline_replicas tagged-field byte, and a legacy (non-compact)
+        // array encoding - real cost is well under the flat 64-byte charge this replaced.
+        assert!(template_partition_bytes(0) < RESPONSE_BYTES_PER_PARTITION_FALLBACK);
+    }
+
+    #[test]
+    fn template_partition_bytes_is_never_larger_than_the_fallback() {
+        for version in RANGE.min_version..=RANGE.max_version {
+            assert!(
+                template_partition_bytes(version) <= RESPONSE_BYTES_PER_PARTITION_FALLBACK,
+                "v{version} exceeded the conservative fallback"
+            );
+        }
     }
 }

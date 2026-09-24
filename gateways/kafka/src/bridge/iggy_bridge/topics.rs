@@ -17,11 +17,12 @@
 
 //! Stream and topic provisioning.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use iggy::prelude::{
     Identifier, IggyError, StreamClient, TopicClient, TopicCreateOptions, TopicDetails,
 };
+use kafka_protocol::protocol::StrBytes;
 use tracing::{debug, info};
 
 use super::{IggyBridge, with_request_timeout};
@@ -81,11 +82,12 @@ impl IggyBridge {
     /// default should be for this bridge is a decision for whichever of `#3535`/`#3536` first
     /// calls this with a real Kafka request in hand, not one to invent here ahead of that need.
     ///
-    /// No caching: every call pays a `get_stream` and a `get_topic` (two round trips once both
-    /// already exist), even for a topic this same bridge already confirmed a moment ago. A cache
-    /// keyed on `kafka_topic` would remove that cost, but would also have to answer "how does a
-    /// cache entry ever get invalidated" - the topic being deleted and recreated with a different
-    /// partition count out from under a stale cache entry is exactly
+    /// No caching: every call pays a stream-create attempt ([`Self::ensure_stream`]) and a
+    /// `get_topic` (two round trips once both already exist), even for a topic this same bridge
+    /// already confirmed a moment ago. A cache keyed on `kafka_topic` would remove that cost, but
+    /// would also have to answer "how does a cache entry ever get invalidated" - the topic being
+    /// deleted and recreated with a different partition count out from under a stale cache entry
+    /// is exactly
     /// `ensure_topic_targets_the_streams_live_incarnation_after_a_delete_and_recreate`'s own
     /// scenario, and a naive cache breaks that guarantee to save two round trips. Whatever wires
     /// this into `#3535`/`#3536` should call it once per topic and remember that it did, rather
@@ -132,23 +134,24 @@ impl IggyBridge {
     /// `stm/stream.rs`: freed keys are reused by the next created stream), so a numeric id
     /// captured here could point at a *different* stream by the time `ensure_topic` uses it, if
     /// this stream is deleted and recreated in between. The name has no such window.
+    ///
+    /// Attempts the create directly rather than probing existence first: `get_stream` answers
+    /// with `StreamDetails`, which embeds every topic header in the stream (`iggy_common`'s
+    /// `StreamDetails.topics: Vec<Topic>`), not just the stream's own metadata - a probe paid on
+    /// every call, including the steady-state case where the stream (almost always) already
+    /// exists, could cost one full per-stream topic listing per topic in a `CreateTopics` batch
+    /// (up to 100 today). `StreamNameAlreadyExists` on the create attempt is exactly as
+    /// informative as a prior `get_stream` would have been - the stream exists either way - so
+    /// this pays one round trip in every case instead of up to two in the common one.
     async fn ensure_stream(&self, stream_name: &str) -> Result<Identifier, BridgeError> {
         let identifier = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        if with_request_timeout(self.client.get_stream(&identifier))
-            .await?
-            .is_some()
-        {
-            debug!("Iggy stream '{stream_name}' already exists");
-            return Ok(identifier);
-        }
-
         match with_request_timeout(self.client.create_stream(stream_name)).await {
             Ok(_created) => {
                 info!("created Iggy stream '{stream_name}'");
                 Ok(identifier)
             }
             Err(BridgeError::Iggy(IggyError::StreamNameAlreadyExists(_))) => {
-                // Lost a create race - the name now exists regardless of who won it.
+                debug!("Iggy stream '{stream_name}' already exists");
                 Ok(identifier)
             }
             Err(err) => Err(err),
@@ -282,6 +285,70 @@ impl IggyBridge {
         with_request_timeout(self.client.get_topic(&stream_id, &topic_id)).await
     }
 
+    /// Resolves many Kafka-visible names at once, one entry per input in the same order.
+    ///
+    /// Batches by the Iggy stream each name resolves to, rather than paying one round trip per
+    /// name: most requested names share the default stream, and override targets are a handful
+    /// at most, so the real round-trip cost is the number of *distinct streams* involved, not the
+    /// number of names. A caller with many requested names but few distinct target streams pays
+    /// one `get_topics` call per stream - this is what makes it safe to resolve an unbounded
+    /// number of names in one call, unlike looping [`Self::get_kafka_topic`] per name, which pays
+    /// one round trip per name regardless of how many share a stream and needs its own
+    /// caller-side cap to keep that cost bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Timeout`] if a call takes longer than `REQUEST_TIMEOUT`. Returns
+    /// [`BridgeError::Iggy`] for connectivity/auth failures.
+    pub async fn get_kafka_topics(
+        &self,
+        kafka_topics: &[StrBytes],
+    ) -> Result<Vec<(StrBytes, Option<KafkaTopicMetadata>)>, BridgeError> {
+        let resolved: Vec<(StrBytes, String, String)> = kafka_topics
+            .iter()
+            .map(|kafka_topic| {
+                let (stream_name, topic_name) =
+                    self.config.topic_mapping.resolve(kafka_topic.as_str());
+                (
+                    kafka_topic.clone(),
+                    stream_name.to_string(),
+                    topic_name.to_string(),
+                )
+            })
+            .collect();
+
+        let distinct_streams: HashSet<String> = resolved
+            .iter()
+            .map(|(_, stream_name, _)| stream_name.clone())
+            .collect();
+
+        let mut topics_by_stream: HashMap<String, HashMap<String, u32>> =
+            HashMap::with_capacity(distinct_streams.len());
+        for stream_name in distinct_streams {
+            let stream_id = Identifier::named(&stream_name).map_err(BridgeError::Iggy)?;
+            let topics = with_request_timeout(self.client.get_topics(&stream_id)).await?;
+            let by_name = topics
+                .into_iter()
+                .map(|topic| (topic.name, topic.partitions_count))
+                .collect();
+            topics_by_stream.insert(stream_name, by_name);
+        }
+
+        Ok(resolved
+            .into_iter()
+            .map(|(kafka_topic, stream_name, topic_name)| {
+                let metadata = topics_by_stream
+                    .get(&stream_name)
+                    .and_then(|topics| topics.get(&topic_name))
+                    .map(|&partitions_count| KafkaTopicMetadata {
+                        kafka_topic: kafka_topic.as_str().to_string(),
+                        partitions_count,
+                    });
+                (kafka_topic, metadata)
+            })
+            .collect())
+    }
+
     /// Creates the Iggy stream/topic backing `kafka_topic`, or reports that it already exists.
     ///
     /// Atomic from this call's perspective, unlike a separate existence check
@@ -373,31 +440,57 @@ impl IggyBridge {
             if over.stream == default_stream {
                 default_stream_override_targets.insert(over.topic.as_str());
             }
-            if let Some(details) = self.get_kafka_topic(kafka_topic).await? {
-                results.push(KafkaTopicMetadata {
+            match self.get_kafka_topic(kafka_topic).await {
+                Ok(Some(details)) => results.push(KafkaTopicMetadata {
                     kafka_topic: kafka_topic.to_string(),
                     partitions_count: details.partitions_count,
-                });
+                }),
+                Ok(None) => {}
+                // One override naming a topic this caller (the bridge user) can't read must not
+                // abort every other topic's listing - real Kafka's own DescribeTopics skips a
+                // topic the caller lacks ACLs for rather than failing the whole response. Any
+                // other error kind (timeout, connectivity) still propagates: those aren't
+                // per-topic facts, they mean nothing in this response can be trusted.
+                Err(BridgeError::Iggy(IggyError::Unauthorized)) => {
+                    debug!(
+                        "skipping override '{kafka_topic}' -> '{}/{}' in Metadata: caller is \
+                         unauthorized to read it",
+                        over.stream, over.topic
+                    );
+                }
+                Err(err) => return Err(err),
             }
         }
 
         let default_stream_id = Identifier::named(default_stream).map_err(BridgeError::Iggy)?;
-        if with_request_timeout(self.client.get_stream(&default_stream_id))
-            .await?
-            .is_some()
-        {
-            let topics = with_request_timeout(self.client.get_topics(&default_stream_id)).await?;
-            for topic in topics {
-                if default_stream_override_targets.contains(topic.name.as_str())
-                    || override_keys.contains(topic.name.as_str())
-                {
-                    continue;
-                }
-                results.push(KafkaTopicMetadata {
-                    kafka_topic: topic.name,
-                    partitions_count: topic.partitions_count,
-                });
+        // No separate get_stream probe: get_topics already answers an empty list when the stream
+        // itself is missing (server-side "legacy parity: a missing stream lists as empty, not
+        // StreamNotFound"), so a probe first would pay a second round trip to learn something
+        // this one call already tells us - and it costs an extra ACL check this caller might not
+        // even have, when a user with only read_topics on the default stream (no read_streams)
+        // should still see its topics listed.
+        let topics = with_request_timeout(self.client.get_topics(&default_stream_id)).await?;
+        for topic in topics {
+            if default_stream_override_targets.contains(topic.name.as_str())
+                || override_keys.contains(topic.name.as_str())
+            {
+                continue;
             }
+            if let Err(reason) = validate_kafka_topic_name("kafka_topic", &topic.name) {
+                // A raw Iggy topic name that isn't itself a legal Kafka topic name (e.g. contains
+                // a space) would list under a name no named Metadata/CreateTopics lookup can ever
+                // resolve back - `validate_kafka_topic_name` is the same gate every named path
+                // already enforces, so this keeps "listed" and "reachable by name" the same set.
+                debug!(
+                    "skipping raw Iggy topic '{}' in Metadata: {reason}",
+                    topic.name
+                );
+                continue;
+            }
+            results.push(KafkaTopicMetadata {
+                kafka_topic: topic.name,
+                partitions_count: topic.partitions_count,
+            });
         }
 
         Ok(results)
