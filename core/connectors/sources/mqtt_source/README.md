@@ -4,6 +4,9 @@ This dynamically loaded source plugin subscribes to an MQTT broker through
 `rumqttc` and forwards each received MQTT publish payload to the Iggy connector
 runtime through the existing `iggy_connector_sdk::source_connector!` ABI.
 
+For the connector boundary, supported use cases, delivery guarantees, and
+explicit non-goals, see [SCOPE.md](SCOPE.md).
+
 The connector is an external plugin. It does not modify the Iggy server or
 define a private C ABI. The SDK macro exposes the lifecycle symbols consumed by
 the connectors runtime.
@@ -125,8 +128,9 @@ ProducedMessages with one bounded pending batch
 - The driver buffers incoming messages only within bounded batch capacity while
   making progress on a full rumqttc request channel.
 
-The source remains at-least-once. Acknowledging a batch does not guarantee that
-no duplicate will appear after a process or broker restart.
+The QoS 1 and QoS 2 paths provide at-least-once delivery. QoS 0 remains
+at-most-once. Acknowledging a batch does not guarantee that no duplicate will
+appear after a process or broker restart.
 
 ## Integration-test execution decision
 
@@ -184,6 +188,7 @@ The MQTT plugin fields are:
 | `protocol` | no | `mqtt311` or `mqtt5`; defaults to `mqtt5` |
 | `qos` | no | Subscription QoS `0`, `1`, or `2`; defaults to `1` |
 | `subscription_qos` | no | Exact topic-filter overrides for `qos`; every key must be listed in `subscriptions` and every value must be `0`, `1`, or `2` |
+| `tls` | no | TLS settings for `mqtts://` or `ssl://` brokers |
 | `client_id` | no | MQTT client identifier; the runtime ID is used when absent |
 | `username` / `password` | no | Must be supplied together |
 | `clean_start` | no | MQTT clean-session/clean-start setting |
@@ -194,6 +199,30 @@ The MQTT plugin fields are:
 | `batch_size` | no | Maximum MQTT messages returned by one source poll; defaults to `100` |
 | `batch_timeout` | no | Maximum accumulation time after the first message; defaults to `10ms` |
 | `verbose_logging` | no | Enables additional plugin logging |
+
+TLS is enabled by an `mqtts://` or `ssl://` broker URL. Without a `[tls]`
+table, `rumqttc` uses the system trust roots. A custom CA, client certificate,
+and client key can be supplied through files:
+
+```toml
+broker_url = "mqtts://emqx.example.com:8883"
+
+[plugin_config.tls]
+ca_file = "/etc/iggy/certs/emqx-ca.pem"
+client_cert_file = "/etc/iggy/certs/client-cert.pem"
+client_key_file = "/etc/iggy/certs/client-key.pem"
+server_name = "emqx.example.com"
+```
+
+`ca_file` is optional. `client_cert_file` and `client_key_file` must be
+provided together. The connector reads and validates configured files during
+`open`; it never logs certificate contents or private-key paths. Certificate
+verification remains enabled and there is no insecure bypass option.
+
+The current `rumqttc` transport derives TLS server-name verification from the
+broker URL host. Therefore, when `server_name` is supplied, it must match that
+host. This keeps the setting explicit without pretending that the current
+client API supports a separate network endpoint and SNI name.
 
 The plugin-side batch is bounded by `batch_size`. The runtime still applies its
 own Iggy producer `batch_length` and `linger_time` settings after the FFI
@@ -252,6 +281,53 @@ is one MQTT connection, source lifecycle, state file, and set of metrics per
 route. A future single-instance dynamic-routing design would require the FFI
 message to carry a destination and the runtime to manage producers keyed by
 that destination.
+
+## Runtime integration
+
+The MQTT plugin is only one part of a source configuration. The runtime source
+configuration selects the plugin, Iggy destination, output schema, batching,
+optional transforms, logging, and benchmark mode. MQTT payloads must use the
+`raw` stream schema because the connector preserves them as opaque bytes.
+
+```toml
+type = "source"
+key = "mqtt"
+enabled = true
+version = 1
+name = "MQTT source"
+path = "target/release/libiggy_connector_mqtt_source"
+plugin_config_format = "json"
+verbose = false
+benchmark = false
+
+[[streams]]
+stream = "iot"
+topic = "telemetry"
+schema = "raw"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+broker_url = "mqtt://127.0.0.1:1883"
+subscriptions = ["devices/+/telemetry"]
+protocol = "mqtt5"
+qos = 1
+```
+
+Transforms configured on the source are applied by the connectors runtime
+after the MQTT plugin produces the message and before it is encoded and sent
+to Iggy. A transform may modify, pass through, or intentionally filter the
+payload and headers.
+
+The runtime-level `verbose` and `benchmark` options are separate from the
+plugin-level `verbose_logging` option. The former controls runtime processing
+logs and benchmark timing; the latter controls additional MQTT plugin logs.
+
+The connector does not assign a stable `ProducedMessage.id` or source event
+timestamp. MQTT packet identifiers are protocol-session identifiers and must
+not be used as durable deduplication keys. Consumers that need idempotency
+should derive an application-level identifier from the payload or MQTT
+metadata.
 
 Credentials use secret-aware types inside the plugin and must not be committed
 to this repository. Use a local secret file, an environment override, or a

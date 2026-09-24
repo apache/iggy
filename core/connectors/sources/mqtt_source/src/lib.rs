@@ -33,6 +33,7 @@ use std::{
 };
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use driver::{AckToken, MqttDriver};
 
@@ -87,6 +88,8 @@ pub struct MqttSourceConfig {
     pub protocol: MqttProtocol,
     #[serde(default = "default_qos")]
     pub qos: u8,
+    #[serde(default)]
+    pub tls: Option<MqttTlsConfig>,
     pub client_id: Option<String>,
     pub username: Option<String>,
     pub password: Option<SecretString>,
@@ -99,6 +102,14 @@ pub struct MqttSourceConfig {
     pub batch_size: Option<usize>,
     pub batch_timeout: Option<String>,
     pub verbose_logging: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MqttTlsConfig {
+    pub ca_file: Option<String>,
+    pub client_cert_file: Option<String>,
+    pub client_key_file: Option<String>,
+    pub server_name: Option<String>,
 }
 
 pub struct MqttSource {
@@ -203,6 +214,7 @@ impl MqttSource {
                 "username and password must be configured together".to_string(),
             ));
         }
+        validate_tls_config(&self.config)?;
 
         let qos = Qos::try_from(self.config.qos)?;
         for subscription in &self.config.subscriptions {
@@ -472,6 +484,39 @@ fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Dur
         .map_err(|error| Error::InvalidConfigValue(format!("{field}: {error}")))
 }
 
+fn validate_tls_config(config: &MqttSourceConfig) -> Result<(), Error> {
+    let Some(tls) = &config.tls else {
+        return Ok(());
+    };
+
+    let broker_url = Url::parse(&config.broker_url)
+        .map_err(|error| Error::InvalidConfigValue(format!("broker_url: {error}")))?;
+    if !matches!(broker_url.scheme(), "mqtts" | "ssl") {
+        return Err(Error::InvalidConfigValue(
+            "tls requires an mqtts:// or ssl:// broker_url".to_string(),
+        ));
+    }
+    if tls.client_cert_file.is_some() != tls.client_key_file.is_some() {
+        return Err(Error::InvalidConfigValue(
+            "tls client_cert_file and client_key_file must be configured together".to_string(),
+        ));
+    }
+    if let Some(server_name) = &tls.server_name {
+        if server_name.trim().is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "tls server_name must not be empty".to_string(),
+            ));
+        }
+        if broker_url.host_str() != Some(server_name.as_str()) {
+            return Err(Error::InvalidConfigValue(
+                "tls server_name must match the broker_url host with the current rumqttc version"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +528,7 @@ mod tests {
             subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
             qos: 1,
+            tls: None,
             client_id: Some("test-source".to_string()),
             username: None,
             password: None,
@@ -770,6 +816,50 @@ mod tests {
     fn given_password_without_username_should_reject_configuration() {
         let mut config = test_config();
         config.password = Some(SecretString::new("password".to_string().into()));
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_tls_client_certificate_without_key_should_reject_configuration() {
+        let mut config = test_config();
+        config.broker_url = "mqtts://localhost:8883".to_string();
+        config.tls = Some(MqttTlsConfig {
+            ca_file: None,
+            client_cert_file: Some("client.pem".to_string()),
+            client_key_file: None,
+            server_name: Some("localhost".to_string()),
+        });
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_tls_with_plaintext_broker_should_reject_configuration() {
+        let mut config = test_config();
+        config.tls = Some(MqttTlsConfig {
+            ca_file: None,
+            client_cert_file: None,
+            client_key_file: None,
+            server_name: Some("localhost".to_string()),
+        });
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_tls_server_name_different_from_broker_host_should_reject_configuration() {
+        let mut config = test_config();
+        config.broker_url = "mqtts://localhost:8883".to_string();
+        config.tls = Some(MqttTlsConfig {
+            ca_file: None,
+            client_cert_file: None,
+            client_key_file: None,
+            server_name: Some("emqx.example.com".to_string()),
+        });
         let source = MqttSource::new(7, config, None);
 
         assert!(source.validate_config().is_err());

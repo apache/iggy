@@ -47,6 +47,15 @@ batch_size = 100
 batch_timeout = "10ms"
 verbose_logging = false
 
+# Optional TLS configuration for mqtts:// brokers. The client certificate and
+# key must be configured together. The server name must match the broker URL
+# host with the current rumqttc transport API.
+# [plugin_config.tls]
+# ca_file = "/etc/iggy/certs/emqx-ca.pem"
+# client_cert_file = "/etc/iggy/certs/client-cert.pem"
+# client_key_file = "/etc/iggy/certs/client-key.pem"
+# server_name = "emqx.example.com"
+
 # Optional per-filter QoS overrides. Every key must also appear in
 # subscriptions, and each value must be 0, 1, or 2.
 # [plugin_config.subscription_qos]
