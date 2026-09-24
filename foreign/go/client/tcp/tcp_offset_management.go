@@ -40,6 +40,15 @@ func (c *IggyTcpClient) GetConsumerOffset(ctx context.Context, consumer iggcon.C
 }
 
 func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
+	// TODO(#4292): a group commit for a partition whose primary is not the
+	// coordinator goes out on the coordinator session, is refused as not
+	// admitted, and sendFrame walks the roster to the primary. That reconnect
+	// registers a new client identity, which is not a member of the group, so
+	// the replayed commit fails with ConsumerGroupPartitionNotOwned and the
+	// membership is gone. Route clustered group commits (and deletes) to the
+	// partition primary through the attached consumer session, as pollPrimary
+	// does for auto-commit polls and the Rust SDK's PollRouter::write_offset
+	// does for offset writes.
 	_, err := c.do(ctx, &command.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
