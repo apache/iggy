@@ -47,9 +47,13 @@ runs:
       shell: bash
       run: |
         TARGET="$(uname -m)-unknown-linux-musl"
-        curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
-          | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 \
-              "cargo-about-0.9.0-${TARGET}/cargo-about"
+        tarball="$(mktemp)"
+        # Staged to a file because curl --retry cannot rewind a pipe.
+        curl -sSfL --retry 5 --retry-all-errors -o "$tarball" \
+          "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz"
+        tar -xzf "$tarball" -C "$HOME/.cargo/bin" --strip-components=1 \
+          "cargo-about-0.9.0-${TARGET}/cargo-about"
+        rm -f "$tarball"
 
     - name: Validate apache/iggy bundle (server + CLI + embedded web)
       shell: bash

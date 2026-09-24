@@ -274,7 +274,7 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
-    crate::responses::init_stats_data_path(config.get_system_path().into());
+    crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
     let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 

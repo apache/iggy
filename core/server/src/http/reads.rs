@@ -39,9 +39,7 @@ use std::rc::Rc;
 use crate::http::error::{Consistency, ReadError};
 use crate::http::extractor::Identity;
 use crate::http::state::HttpInner;
-use crate::responses::{
-    NonReplicatedResponse, build_non_replicated_response, resolve_stream_id, resolve_topic_id,
-};
+use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 
 /// The per-op RBAC + consistency check itself, without the waits: run the
 /// route's `rule` against the caller's committed permissions via the live
@@ -334,7 +332,7 @@ pub(in crate::http) fn resolve_gate_stream(
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| resolve_stream_id(inner, stream_id))
+        .read(|inner| inner.resolve_stream_id(stream_id))
 }
 
 /// Resolve a wire user identifier to its committed slab id, or `None` on a
@@ -366,8 +364,8 @@ pub(in crate::http) fn resolve_gate_topic(
         .mux_stm
         .streams()
         .read(|inner| {
-            let stream_id = resolve_stream_id(inner, stream_id)?;
-            let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
             Some((stream_id, topic_id))
         })
 }
@@ -505,8 +503,8 @@ pub(in crate::http) fn topic_durability(
         .mux_stm
         .streams()
         .read(|inner| {
-            let stream_id = resolve_stream_id(inner, &stream)?;
-            let topic_id = resolve_topic_id(inner, stream_id, &topic)?;
+            let stream_id = inner.resolve_stream_id(&stream)?;
+            let topic_id = inner.resolve_topic_id(stream_id, &topic)?;
             let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
             let created_revision = topic.partitions.first()?.created_revision;
             Some(TopicDurability {
@@ -531,7 +529,6 @@ mod tests {
     };
     use crate::http::state::MetadataWatermarks;
     use crate::http::wire::encode_send_messages;
-    use crate::responses::{resolve_stream_id, resolve_topic_id};
     use iggy_binary_protocol::codes::{
         DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
         GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
@@ -591,7 +588,7 @@ mod tests {
                 .topic_index
                 .insert("orders".into(), replacement_topic);
             assert_eq!(
-                resolve_topic_id(&inner, stream_id, &WireIdentifier::named("orders").unwrap()),
+                inner.resolve_topic_id(stream_id, &WireIdentifier::named("orders").unwrap()),
                 Some(replacement_topic)
             );
             if rename_stream {
@@ -601,17 +598,14 @@ mod tests {
                     inner.items.insert(metadata::stm::stream::Stream::default());
                 inner.index.insert("events".into(), replacement_stream);
                 assert_eq!(
-                    resolve_stream_id(&inner, &WireIdentifier::named("events").unwrap()),
+                    inner.resolve_stream_id(&WireIdentifier::named("events").unwrap()),
                     Some(replacement_stream)
                 );
             }
 
+            assert_eq!(inner.resolve_stream_id(&request.stream_id), Some(stream_id));
             assert_eq!(
-                resolve_stream_id(&inner, &request.stream_id),
-                Some(stream_id)
-            );
-            assert_eq!(
-                resolve_topic_id(&inner, stream_id, &request.topic_id),
+                inner.resolve_topic_id(stream_id, &request.topic_id),
                 Some(topic_id)
             );
             assert_eq!(

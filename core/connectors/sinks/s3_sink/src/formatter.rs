@@ -173,7 +173,13 @@ fn payload_to_json_value(payload: &Payload) -> Value {
             Ok(v) => v,
             Err(_) => Value::String(base64_encode(bytes)),
         },
-        Payload::Proto(text) => Value::String(text.clone()),
+        // Proto text holding JSON is the descriptor-less `proto_convert`
+        // fallback and is written as the document it holds, the way the same
+        // bytes were written when the batch was tagged `json`.
+        Payload::Proto(text) => match payload.json_document() {
+            Some(document) => owned_value_to_serde_json(document.as_ref()),
+            None => Value::String(text.clone()),
+        },
         Payload::FlatBuffer(bytes) => Value::String(base64_encode(bytes)),
         Payload::Avro(bytes) => Value::String(base64_encode(bytes)),
     }
@@ -317,6 +323,26 @@ mod tests {
 
         assert!(value["headers"].is_object());
         assert_eq!(value["headers"]["content-type"], "application/json");
+    }
+
+    #[test]
+    fn proto_payload_holding_json_is_written_as_a_document() {
+        let payload = Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_string());
+
+        assert_eq!(
+            payload_to_json_value(&payload),
+            serde_json::json!({"id": 1, "name": "row-1"})
+        );
+    }
+
+    #[test]
+    fn proto_text_that_is_not_json_is_written_as_a_string() {
+        let payload = Payload::Proto("name: \"row-1\"".to_string());
+
+        assert_eq!(
+            payload_to_json_value(&payload),
+            Value::String("name: \"row-1\"".to_string())
+        );
     }
 
     #[test]

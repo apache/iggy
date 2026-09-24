@@ -33,7 +33,8 @@ pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSI
 // Visibility rule: `pub` = named external consumer. main.rs consumes `boot`
 // (including `boot::systemd`) and `server_error`; the simulator consumes
 // `shell`, `boot::wire_shell_handlers`, and (through `ShellHandlers.sessions`)
-// `session_manager`. Everything else is crate-internal.
+// `session_manager`, plus the storage abstraction for offset recovery reexported
+// below. Everything else is internal to the crate.
 
 // boot: process entry, shard threads, recovery orchestration.
 pub mod boot;
@@ -44,7 +45,9 @@ pub(crate) mod shard_allocator;
 pub(crate) mod consumer_group;
 pub(crate) mod dispatch;
 pub(crate) mod external_auth;
+pub(crate) mod namespace;
 pub(crate) mod pat;
+pub(crate) mod reply_frame;
 pub(crate) mod responses;
 pub(crate) mod rewrite;
 pub mod session_manager;
@@ -69,3 +72,6 @@ pub(crate) mod offset_recovery;
 pub(crate) mod partition_helpers;
 pub(crate) mod segment_recovery;
 pub mod server_error;
+pub(crate) mod sysinfo_probe;
+
+pub use partition_helpers::configure_consumer_offsets_with_storage;

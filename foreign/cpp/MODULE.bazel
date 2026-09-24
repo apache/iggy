@@ -25,6 +25,7 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "googletest", version = "1.18.0.bcr.1")
 bazel_dep(name = "cucumber-cpp", version = "0.8.0.bcr.1")
 bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "abseil-cpp", version = "20260526.0")
 
 rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
 rust_host_tools.host_tools(

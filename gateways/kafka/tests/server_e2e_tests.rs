@@ -234,7 +234,7 @@ async fn e2e_produce_v3_acks_one_still_returns_response() {
 #[tokio::test]
 async fn e2e_list_offsets_v0_closes_connection() {
     // `kafka_protocol` has no encoder for ListOffsets v0's legacy `old_style_offsets` shape
-    // (it predates the schema the crate generates from - see `responses::encode_list_offsets_error_response`),
+    // (it predates the schema the crate generates from - see `list_offsets::encode_error_response`),
     // so a v0 request - already below the firewall's min=1 - now closes instead of getting the
     // pre-migration downgraded response.
     let (addr, _shutdown) = spawn_test_server().await;

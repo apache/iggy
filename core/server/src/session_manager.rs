@@ -628,7 +628,7 @@ const fn state_name(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::responses::build_empty_reply;
+    use crate::reply_frame::build_empty_reply;
     use consensus::ClientTable;
     use consensus::client_table::SessionEnd;
     use iggy_binary_protocol::{Operation, RoutedRequestHeader};

@@ -2,7 +2,13 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
-> **Stub warning:** no API persists or reads real data yet. Produce, Fetch, and ListOffsets return retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of trusting a fake success. CreateTopics does **not** create topics; valid requests return `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. Persistence lands with the Iggy bridge (see [docs/SCOPE.md](docs/SCOPE.md)).
+> **Stub warning:** most APIs still don't persist or read real data. Produce and Fetch return
+> retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
+> trusting a fake success. CreateTopics does **not** create topics; valid requests return
+> `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. ListOffsets is wired
+> to the Iggy bridge: with `IGGY_KAFKA_BRIDGE_ENABLED=true` it answers `EARLIEST`/`LATEST` from
+> real partition state; with the bridge off (the default) it stays a stub and answers
+> `NOT_LEADER_OR_FOLLOWER` (6). See [docs/SCOPE.md](docs/SCOPE.md).
 
 ## Run
 
@@ -23,6 +29,7 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
+| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
 
 ## Test
 
@@ -110,11 +117,11 @@ a detached background task specifically so that dropping the awaiting future - w
 does on expiry - cannot abort it mid-flight. A timed-out call can leave that task holding the
 shared client's connection lock for up to another 30s (the SDK's own reply deadline), queuing
 every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
-Concurrency ceiling below), so this only matters once concurrent Kafka connections share a bridge
-
-- tolerable today only because nothing calls this bridge from a live handler yet; must be resolved
-before `#3535`/`#3536`. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't
-a followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
+Concurrency ceiling below) and no semaphore bounding concurrent bridge calls - no longer a
+hypothetical now that ListOffsets (`#3537`) calls it from a real handler; more pressing once
+CreateTopics (`#3538`), Metadata (`#3534`), Produce (`#3535`) and Fetch (`#3536`) add their own
+concurrent callers. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't a
+followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
 
 ### Topic mapping
 
