@@ -307,6 +307,7 @@ rust-embed = "8.13.0"
 rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.46", features = ["ring"] }
 rumqttc = { version = "0.25.1", features = ["url"] }
+rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 scopeguard = "1.2.0"
 sd-notify = "0.5"

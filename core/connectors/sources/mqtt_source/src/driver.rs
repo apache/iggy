@@ -17,6 +17,7 @@
 
 use super::{MqttProtocol, MqttSourceConfig, Qos, qos_for_subscription};
 use iggy_common::{HeaderKey, HeaderValue};
+use rumqttc::tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 use rumqttc::v5::{
     AsyncClient as Mqtt5Client, Event as Mqtt5Event, EventLoop as Mqtt5EventLoop,
     Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
@@ -24,12 +25,16 @@ use rumqttc::v5::{
 };
 use rumqttc::{
     AsyncClient as Mqtt311Client, Event as Mqtt311Event, EventLoop as Mqtt311EventLoop,
-    Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options,
+    Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options, TlsConfiguration, Transport,
     mqttbytes::{QoS as Mqtt311Qos, v4::Publish as Mqtt311Publish},
 };
+use rustls_native_certs::load_native_certs;
+use rustls_pemfile::{certs, private_key};
 use secrecy::ExposeSecret;
 use std::{
     collections::{BTreeMap, VecDeque},
+    io::{BufReader, Cursor},
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::timeout;
@@ -94,6 +99,7 @@ impl MqttDriver {
         poll_timeout: Duration,
         request_capacity: usize,
     ) -> Result<Self, iggy_connector_sdk::Error> {
+        install_rustls_provider();
         let broker_url = broker_url_with_client_id(config, id)?;
         match config.protocol {
             MqttProtocol::Mqtt311 => {
@@ -107,6 +113,9 @@ impl MqttDriver {
                     .set_request_channel_capacity(request_capacity)
                     .set_manual_acks(true);
                 set_mqtt311_credentials(&mut options, config);
+                if let Some(transport) = tls_transport(config)? {
+                    options.set_transport(transport);
+                }
 
                 let (client, mut event_loop) = Mqtt311Client::new(options, request_capacity);
                 for topic in &config.subscriptions {
@@ -140,6 +149,9 @@ impl MqttDriver {
                     .set_manual_acks(true)
                     .set_session_expiry_interval(config.session_expiry_interval);
                 set_mqtt5_credentials(&mut options, config);
+                if let Some(transport) = tls_transport(config)? {
+                    options.set_transport(transport);
+                }
 
                 let (client, mut event_loop) = Mqtt5Client::new(options, request_capacity);
                 for topic in &config.subscriptions {
@@ -327,6 +339,159 @@ impl MqttDriver {
 
 fn retain_unacknowledged_tokens(ack_tokens: &mut Vec<AckToken>, acknowledged: usize) {
     ack_tokens.drain(..acknowledged);
+}
+
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn tls_transport(
+    config: &MqttSourceConfig,
+) -> Result<Option<Transport>, iggy_connector_sdk::Error> {
+    let Some(tls) = &config.tls else {
+        return Ok(None);
+    };
+
+    let ca = tls
+        .ca_file
+        .as_deref()
+        .map(|path| read_certificate_file(path, "tls.ca_file"))
+        .transpose()?;
+    let client_auth = match (&tls.client_cert_file, &tls.client_key_file) {
+        (Some(cert_path), Some(key_path)) => Some((
+            read_certificate_file(cert_path, "tls.client_cert_file")?,
+            read_private_key_file(key_path, "tls.client_key_file")?,
+        )),
+        (None, None) => None,
+        _ => unreachable!("TLS client certificate and key validation occurs before connect"),
+    };
+
+    let tls_config = TlsConfiguration::Rustls(Arc::new(build_tls_config(ca, client_auth)?));
+
+    Ok(Some(Transport::tls_with_config(tls_config)))
+}
+
+fn read_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
+    std::fs::read(path).map_err(|error| {
+        iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} could not be read: {error}"))
+    })
+}
+
+fn read_certificate_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
+    let contents = read_file(path, field)?;
+    let mut reader = BufReader::new(Cursor::new(&contents));
+    let certificates = certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} is invalid: {error}"))
+        })?;
+    if certificates.is_empty() {
+        return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
+            "{field} does not contain a PEM certificate"
+        )));
+    }
+    Ok(contents)
+}
+
+fn read_private_key_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
+    let contents = read_file(path, field)?;
+    let mut reader = BufReader::new(Cursor::new(&contents));
+    if private_key(&mut reader)
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} is invalid: {error}"))
+        })?
+        .is_none()
+    {
+        return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
+            "{field} does not contain a PEM private key"
+        )));
+    }
+    Ok(contents)
+}
+
+fn system_root_cert_store() -> Result<RootCertStore, iggy_connector_sdk::Error> {
+    let mut root_cert_store = RootCertStore::empty();
+    let native_certificates = load_native_certs();
+    for certificate in native_certificates.certs {
+        root_cert_store.add(certificate).map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "system TLS certificate is invalid: {error}"
+            ))
+        })?;
+    }
+    if root_cert_store.is_empty() {
+        return Err(iggy_connector_sdk::Error::InvalidConfigValue(
+            "no system TLS root certificates were found".to_string(),
+        ));
+    }
+    Ok(root_cert_store)
+}
+
+fn build_tls_config(
+    ca: Option<Vec<u8>>,
+    client_auth: Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<ClientConfig, iggy_connector_sdk::Error> {
+    let root_cert_store = match ca {
+        Some(ca) => {
+            let mut reader = BufReader::new(Cursor::new(ca));
+            let certificates =
+                certs(&mut reader)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                            "tls.ca_file is invalid: {error}"
+                        ))
+                    })?;
+            let mut root_cert_store = RootCertStore::empty();
+            for certificate in certificates {
+                root_cert_store.add(certificate).map_err(|error| {
+                    iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                        "tls.ca_file contains an invalid certificate: {error}"
+                    ))
+                })?;
+            }
+            if root_cert_store.is_empty() {
+                return Err(iggy_connector_sdk::Error::InvalidConfigValue(
+                    "tls.ca_file does not contain a usable certificate".to_string(),
+                ));
+            }
+            root_cert_store
+        }
+        None => system_root_cert_store()?,
+    };
+    let client_config = ClientConfig::builder().with_root_certificates(root_cert_store);
+
+    let Some((client_certificate, client_key)) = client_auth else {
+        return Ok(client_config.with_no_client_auth());
+    };
+    let mut reader = BufReader::new(Cursor::new(client_certificate));
+    let certificates = certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "tls.client_cert_file is invalid: {error}"
+            ))
+        })?;
+    let mut key_reader = BufReader::new(Cursor::new(client_key));
+    let key = private_key(&mut key_reader)
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "tls.client_key_file is invalid: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            iggy_connector_sdk::Error::InvalidConfigValue(
+                "tls.client_key_file does not contain a PEM private key".to_string(),
+            )
+        })?;
+
+    client_config
+        .with_client_auth_cert(certificates, key)
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "TLS client certificate and key do not match: {error}"
+            ))
+        })
 }
 
 fn broker_url_with_client_id(
@@ -836,6 +1001,7 @@ mod tests {
             subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
             qos: 1,
+            tls: None,
             client_id: Some("test-source".to_string()),
             username: None,
             password: None,
@@ -867,6 +1033,50 @@ mod tests {
     }
 
     #[test]
+    fn given_missing_tls_ca_file_should_reject_before_connecting() {
+        let config = MqttSourceConfig {
+            broker_url: "mqtts://127.0.0.1:8883".to_string(),
+            subscriptions: vec!["devices/test".to_string()],
+            subscription_qos: BTreeMap::new(),
+            protocol: MqttProtocol::Mqtt5,
+            qos: 1,
+            tls: Some(super::super::MqttTlsConfig {
+                ca_file: Some("/path/that/does/not/exist.pem".to_string()),
+                client_cert_file: None,
+                client_key_file: None,
+                server_name: Some("127.0.0.1".to_string()),
+            }),
+            client_id: Some("test-source".to_string()),
+            username: None,
+            password: None,
+            clean_start: false,
+            session_expiry_interval: None,
+            keep_alive: Some("5s".to_string()),
+            poll_timeout: Some("100ms".to_string()),
+            request_capacity: Some(4),
+            batch_size: Some(3),
+            batch_timeout: Some("10ms".to_string()),
+            verbose_logging: None,
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+
+        let result = runtime.block_on(MqttDriver::connect(
+            7,
+            &config,
+            Qos::One,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            4,
+        ));
+
+        assert!(matches!(
+            result,
+            Err(iggy_connector_sdk::Error::InvalidConfigValue(message))
+                if message.starts_with("tls.ca_file could not be read:")
+        ));
+    }
+
+    #[test]
     fn given_broker_url_without_client_id_should_add_configured_client_id() {
         let config = MqttSourceConfig {
             broker_url: "mqtt://127.0.0.1:1883?keep_alive_secs=30".to_string(),
@@ -874,6 +1084,7 @@ mod tests {
             subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
             qos: 1,
+            tls: None,
             client_id: Some("configured-client".to_string()),
             username: None,
             password: None,
