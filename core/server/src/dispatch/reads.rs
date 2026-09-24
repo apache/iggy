@@ -26,7 +26,10 @@
 //! the HTTP layer), never in the builder.
 
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::authz::{authorize_default_read, authorize_partition_read, authorize_uid};
+use crate::dispatch::authz::{
+    authorize_default_read, authorize_partition_read, authorize_uid,
+    inline_grant_lacks_stream_scope,
+};
 use crate::dispatch::failure::{
     FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
 };
@@ -81,7 +84,6 @@ use metadata::permissioner::Permissioner;
 use server_common::Message;
 use shard::{PartitionRead, PartitionReadReply};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
@@ -420,10 +422,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 return;
             }
-            if session_perms
-                .as_deref()
-                .is_some_and(|p| p.streams.as_ref().is_none_or(BTreeMap::is_empty))
-            {
+            if inline_grant_lacks_stream_scope(session_perms.as_deref()) {
                 send_non_replicated_deny(
                     shard,
                     &request,
@@ -634,10 +633,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 return;
             }
-            if session_perms
-                .as_deref()
-                .is_some_and(|p| p.streams.as_ref().is_none_or(BTreeMap::is_empty))
-            {
+            if inline_grant_lacks_stream_scope(session_perms.as_deref()) {
                 send_non_replicated_deny(
                     shard,
                     &request,

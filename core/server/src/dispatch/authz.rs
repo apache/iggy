@@ -296,10 +296,12 @@ where
             };
             (req.stream_id, req.topic_id)
         }
-        _ => return None,
+        _ => return Some(IggyError::Unauthorized.as_code()),
     };
-    let (sid, tid) = resolve_topic_scope(shard, &stream_id, &topic_id)?;
-    if can_poll_messages(perms, sid, tid) {
+    let Some((sid, tid)) = resolve_topic_scope(shard, &stream_id, &topic_id) else {
+        return Some(IggyError::Unauthorized.as_code());
+    };
+    if can_read_topic(perms, sid, tid) {
         None
     } else {
         Some(IggyError::Unauthorized.as_code())
@@ -636,6 +638,19 @@ where
         session_perms,
         |p| can_read_topic(p, stream_id, topic_id),
     )
+}
+
+/// True when the session holds inline-grant permissions with no stream grants.
+/// Used to deny self-scoped reads (`GET_ME`, `SYNC_CONSUMER_GROUP`) that would
+/// otherwise bypass the Permissioner because they carry no resource scope.
+pub(in crate::dispatch) fn inline_grant_lacks_stream_scope(
+    session_perms: Option<&Permissions>,
+) -> bool {
+    session_perms.is_some_and(|p| {
+        p.streams
+            .as_ref()
+            .is_none_or(std::collections::BTreeMap::is_empty)
+    })
 }
 
 /// Resolve a wire stream identifier to its committed slab id, or `None` on a
