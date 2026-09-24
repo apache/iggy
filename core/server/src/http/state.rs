@@ -508,6 +508,19 @@ impl HttpInner {
         Some(std::sync::Arc::clone(&sp.permissions))
     }
 
+    /// Resolve session-scoped permissions for an external auth session.
+    /// Returns `None` for regular users or when no grant is stored.
+    pub(in crate::http) fn resolve_session_perms(
+        &self,
+        session: &crate::http::session::HttpSession,
+    ) -> Option<std::sync::Arc<iggy_common::Permissions>> {
+        if !self.external_auth.enabled || session.user_id != self.external_auth.user_id {
+            return None;
+        }
+        let sk = crate::http::extractor::SessionKey::from_table_key(&session.key)?;
+        self.session_grant_permissions(&sk)
+    }
+
     /// Drop the session table entry for `session`, but only if it is still the
     /// current occupant of its key (pointer-fenced, so a later re-registration
     /// under the same key is never purged). Also tears down its in-process
@@ -517,9 +530,10 @@ impl HttpInner {
     /// request re-register cleanly through the barrier.
     pub(in crate::http) fn forget_session(&self, session: &Rc<HttpSession>) {
         let torn = forget_if_same(&mut self.sessions.borrow_mut(), session);
-        if let Some(sk) = crate::http::extractor::SessionKey::from_table_key(&session.key) {
-            self.session_grants.borrow_mut().remove(&sk);
-        }
+        // The grant is NOT removed here: the bearer token is still valid and
+        // the holder will re-register a session on its next request. Dropping
+        // the grant would 403 every request until the token expires. Expiry
+        // reclaims the grant in insert_session_grant and resolve_session.
         self.teardown_reply_targets(torn.into_iter().collect());
     }
 
