@@ -1,6 +1,6 @@
 # Consumer offset storage
 
-Status: proposed. Answers [#3540](https://github.com/apache/iggy/issues/3540) and blocks
+Status: accepted. Answers [#3540](https://github.com/apache/iggy/issues/3540) and unblocks
 [#3542](https://github.com/apache/iggy/issues/3542), OffsetCommit and OffsetFetch.
 
 ## Decision
@@ -135,6 +135,21 @@ named in the gateway README for that reason, and a handler that hits the limit l
 error at `error!` level, which is what `bridge/error.rs` already asks handlers to do wherever the
 Kafka code it sends is less specific than the Iggy error it received.
 
+### Committed offsets hold back retention
+
+Iggy deletes a partition's segments, by retention or by `DeleteSegments`, only up to the lowest
+offset any consumer or consumer group has committed there
+(`core/partitions/src/iggy_partition.rs`, `min_committed_offset`). Every `kafka.cg.*` offset is
+one of those, so a Kafka group that stops consuming stops retention on every partition it
+committed on, for as long as the offset exists. Kafka itself never lets committed offsets block
+retention, and it expires them after `offsets.retention.minutes`. Iggy has no offset expiry, so an
+abandoned group's offsets stay, keep that barrier in place, and keep counting against the
+4096-key limit above until an operator deletes the Iggy consumer group `kafka.cg.<group>`. The
+gateway never does, since it does not implement `DeleteGroups` (42).
+
+`PurgeTopic` resets each partition to offset 0 and clears its consumer offsets, Kafka groups'
+included, so a purge leaves every group with nothing committed.
+
 An Iggy name is capped at 255 bytes (`core/common/src/lib.rs:168`), which leaves 246 for a Kafka
 group id after the prefix. A longer group id is rejected with `INVALID_GROUP_ID` (24).
 
@@ -147,12 +162,25 @@ agree on committed offsets without talking to each other.
 They do not agree on group membership. That belongs to the coordinator
 ([#3541](https://github.com/apache/iggy/issues/3541)) and is not settled here.
 
-## Open question
+## Partition assignment
 
-Iggy consumer offsets keyed by group, as above, or one of A, B and C from the issue?
+The gateway will run no assignor, and Iggy's balanced consumer-group assignment is not used for
+Kafka groups. In the classic group protocol a Kafka group's leader computes the assignment on the
+client, with whatever strategy the client is configured for (range, round-robin, sticky or
+cooperative-sticky), and the coordinator ([#3541](https://github.com/apache/iggy/issues/3541))
+relays it to the other members unread. Supporting every strategy therefore costs nothing here, and
+none of them touches how offsets are stored: a commit names the partition it is for, whichever
+member owns it. KIP-848's server-side assignment (`ConsumerGroupHeartbeat`, key 68) is out of
+scope.
 
-If no answer lands by 2026-09-22, the design above is taken and the work proceeds. This document
-is then updated to record that it was decided by default.
+## Decision record
+
+The open question was whether to store offsets as Iggy consumer offsets keyed by group, as above,
+or take one of A, B and C from the issue. This document proposed a default: the design above
+unless an answer landed by 2026-09-22. It was merged in
+[#4205](https://github.com/apache/iggy/pull/4205) as a proposal, approved by @hubcio and
+@numinnex. No alternative was raised by that date, so it was decided by default and the design
+above is the one taken.
 
 ## References
 
