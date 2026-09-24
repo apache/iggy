@@ -201,6 +201,34 @@ capacity; when it temporarily fills while acknowledgements are queued, the
 driver advances the event loop and buffers incoming messages up to the bounded
 batch capacity instead of dropping them.
 
+## Route-specific destinations
+
+The current source FFI contract does not carry a destination stream or topic,
+and the runtime creates one Iggy producer for each source configuration. The
+first production routing model therefore uses one MQTT source instance per
+route. Each instance owns a non-overlapping MQTT subscription and one static
+Iggy destination:
+
+```text
+mqtt_site_a.toml
+  devices/site-a/# → site_a / telemetry
+
+mqtt_site_b.toml
+  devices/site-b/# → site_b / telemetry
+```
+
+The example files are [`mqtt_site_a.toml`](../../runtime/example_config/connectors/mqtt_site_a.toml)
+and [`mqtt_site_b.toml`](../../runtime/example_config/connectors/mqtt_site_b.toml).
+Use unique connector keys and MQTT client IDs for every route. Keep the topic
+filters non-overlapping unless duplicate delivery to multiple Iggy destinations
+is intentional.
+
+This approach requires no SDK, FFI, runtime, or plugin code change. The tradeoff
+is one MQTT connection, source lifecycle, state file, and set of metrics per
+route. A future single-instance dynamic-routing design would require the FFI
+message to carry a destination and the runtime to manage producers keyed by
+that destination.
+
 Credentials use secret-aware types inside the plugin and must not be committed
 to this repository. Use a local secret file, an environment override, or a
 secret-management system for deployed credentials.
