@@ -7382,6 +7382,7 @@ dependencies = [
  "async-trait",
  "dashmap",
  "humantime",
+ "iggy_common",
  "iggy_connector_sdk",
  "rumqttc",
  "secrecy",

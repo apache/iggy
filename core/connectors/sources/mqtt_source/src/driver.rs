@@ -16,6 +16,7 @@
 // under the License.
 
 use super::{MqttProtocol, MqttSourceConfig, Qos};
+use iggy_common::{HeaderKey, HeaderValue};
 use rumqttc::v5::{
     AsyncClient as Mqtt5Client, Event as Mqtt5Event, EventLoop as Mqtt5EventLoop,
     Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
@@ -27,14 +28,21 @@ use rumqttc::{
     mqttbytes::{QoS as Mqtt311Qos, v4::Publish as Mqtt311Publish},
 };
 use secrecy::ExposeSecret;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Duration,
+};
 use tokio::time::timeout;
 use url::Url;
+
+const ACK_RETRY_ATTEMPTS: usize = 5;
+const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MqttMessageMetadata {
     pub(crate) qos: Qos,
     pub(crate) packet_id: Option<u16>,
+    pub(crate) dup: bool,
     pub(crate) retain: bool,
 }
 
@@ -42,6 +50,7 @@ pub(crate) struct MqttMessageMetadata {
 pub(crate) struct MqttMessage {
     pub(crate) payload: Vec<u8>,
     pub(crate) topic: String,
+    pub(crate) headers: BTreeMap<HeaderKey, HeaderValue>,
     pub(crate) metadata: MqttMessageMetadata,
 }
 
@@ -73,6 +82,7 @@ enum MqttConnection {
 
 pub(crate) struct MqttDriver {
     connection: MqttConnection,
+    buffered_messages: VecDeque<ReceivedMessage>,
 }
 
 impl MqttDriver {
@@ -111,6 +121,7 @@ impl MqttDriver {
                         client: Box::new(client),
                         event_loop: Box::new(event_loop),
                     },
+                    buffered_messages: VecDeque::new(),
                 })
             }
             MqttProtocol::Mqtt5 => {
@@ -139,6 +150,7 @@ impl MqttDriver {
                         client: Box::new(client),
                         event_loop: Box::new(event_loop),
                     },
+                    buffered_messages: VecDeque::new(),
                 })
             }
         }
@@ -148,46 +160,99 @@ impl MqttDriver {
         &mut self,
         poll_timeout: Duration,
     ) -> Result<Option<ReceivedMessage>, iggy_connector_sdk::Error> {
-        match &mut self.connection {
-            MqttConnection::Mqtt311 { event_loop, .. } => {
-                let event = match timeout(poll_timeout, event_loop.poll()).await {
-                    Ok(Ok(event)) => event,
-                    Ok(Err(error)) => {
-                        return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
-                    }
-                    Err(_) => return Ok(None),
-                };
-                match event {
-                    Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
-                        Ok(Some(normalize_mqtt311(publish)?))
-                    }
-                    Mqtt311Event::Outgoing(_) => Ok(None),
-                    Mqtt311Event::Incoming(_) => Ok(None),
-                }
+        if let Some(message) = self.buffered_messages.pop_front() {
+            return Ok(Some(message));
+        }
+
+        let deadline = tokio::time::Instant::now() + poll_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
             }
-            MqttConnection::Mqtt5 { event_loop, .. } => {
-                let event = match timeout(poll_timeout, event_loop.poll()).await {
-                    Ok(Ok(event)) => event,
-                    Ok(Err(error)) => {
-                        return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
+            let event = match &mut self.connection {
+                MqttConnection::Mqtt311 { event_loop, .. } => {
+                    match timeout(remaining, event_loop.poll()).await {
+                        Ok(Ok(event)) => match event {
+                            Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
+                                Some(normalize_mqtt311(publish)?)
+                            }
+                            Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => None,
+                        },
+                        Ok(Err(error)) => {
+                            return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
+                        }
+                        Err(_) => return Ok(None),
                     }
-                    Err(_) => return Ok(None),
-                };
-                match event {
-                    Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
-                        Ok(Some(normalize_mqtt5(publish)?))
-                    }
-                    Mqtt5Event::Outgoing(_) => Ok(None),
-                    Mqtt5Event::Incoming(_) => Ok(None),
                 }
+                MqttConnection::Mqtt5 { event_loop, .. } => {
+                    match timeout(remaining, event_loop.poll()).await {
+                        Ok(Ok(event)) => match event {
+                            Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
+                                Some(normalize_mqtt5(publish)?)
+                            }
+                            Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => None,
+                        },
+                        Ok(Err(error)) => {
+                            return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
+                        }
+                        Err(_) => return Ok(None),
+                    }
+                }
+            };
+            if event.is_some() {
+                return Ok(event);
             }
         }
     }
 
-    pub(crate) fn acknowledge(
-        &self,
-        ack_token: &AckToken,
+    pub(crate) async fn acknowledge_batch(
+        &mut self,
+        ack_tokens: &mut Vec<AckToken>,
+        poll_timeout: Duration,
+        max_buffered_messages: usize,
     ) -> Result<(), iggy_connector_sdk::Error> {
+        let mut acknowledged = 0;
+        let retry_delay = ACK_RETRY_DELAY.min(poll_timeout);
+        while acknowledged < ack_tokens.len() {
+            let mut last_error = None;
+            let mut acknowledged_token = false;
+            for attempt in 0..=ACK_RETRY_ATTEMPTS {
+                match self.try_acknowledge(&ack_tokens[acknowledged]) {
+                    Ok(()) => {
+                        acknowledged_token = true;
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt == ACK_RETRY_ATTEMPTS {
+                            break;
+                        }
+                        if let Err(error) = self
+                            .poll_for_ack_progress(poll_timeout, max_buffered_messages)
+                            .await
+                        {
+                            retain_unacknowledged_tokens(ack_tokens, acknowledged);
+                            return Err(error);
+                        }
+                        if !retry_delay.is_zero() {
+                            tokio::time::sleep(retry_delay).await;
+                        }
+                    }
+                }
+            }
+
+            if !acknowledged_token {
+                retain_unacknowledged_tokens(ack_tokens, acknowledged);
+                return Err(last_error.unwrap_or(iggy_connector_sdk::Error::InvalidState));
+            }
+            acknowledged += 1;
+        }
+        ack_tokens.clear();
+        Ok(())
+    }
+
+    fn try_acknowledge(&self, ack_token: &AckToken) -> Result<(), iggy_connector_sdk::Error> {
         match (&self.connection, &ack_token.0) {
             (MqttConnection::Mqtt311 { client, .. }, AckTokenKind::Mqtt311(publish)) => client
                 .try_ack(publish)
@@ -198,6 +263,62 @@ impl MqttDriver {
             _ => Err(iggy_connector_sdk::Error::InvalidState),
         }
     }
+
+    async fn poll_for_ack_progress(
+        &mut self,
+        poll_timeout: Duration,
+        max_buffered_messages: usize,
+    ) -> Result<(), iggy_connector_sdk::Error> {
+        let received = match &mut self.connection {
+            MqttConnection::Mqtt311 { event_loop, .. } => {
+                let event = timeout(poll_timeout, event_loop.poll())
+                    .await
+                    .map_err(|_| {
+                        iggy_connector_sdk::Error::Connection(
+                            "timed out while flushing MQTT acknowledgements".to_string(),
+                        )
+                    })?
+                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
+                match event {
+                    Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
+                        Some(normalize_mqtt311(publish)?)
+                    }
+                    Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => None,
+                }
+            }
+            MqttConnection::Mqtt5 { event_loop, .. } => {
+                let event = timeout(poll_timeout, event_loop.poll())
+                    .await
+                    .map_err(|_| {
+                        iggy_connector_sdk::Error::Connection(
+                            "timed out while flushing MQTT acknowledgements".to_string(),
+                        )
+                    })?
+                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
+                match event {
+                    Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
+                        Some(normalize_mqtt5(publish)?)
+                    }
+                    Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => None,
+                }
+            }
+        };
+
+        if let Some(received) = received {
+            if self.buffered_messages.len() >= max_buffered_messages {
+                return Err(iggy_connector_sdk::Error::Connection(
+                    "MQTT message buffer reached batch_size while flushing acknowledgements"
+                        .to_string(),
+                ));
+            }
+            self.buffered_messages.push_back(received);
+        }
+        Ok(())
+    }
+}
+
+fn retain_unacknowledged_tokens(ack_tokens: &mut Vec<AckToken>, acknowledged: usize) {
+    ack_tokens.drain(..acknowledged);
 }
 
 fn broker_url_with_client_id(
@@ -277,31 +398,137 @@ fn normalize_mqtt311(
     let metadata = MqttMessageMetadata {
         qos,
         packet_id: (qos != Qos::Zero).then_some(publish.pkid),
+        dup: publish.dup,
         retain: publish.retain,
     };
+    let headers = metadata_headers("mqtt311", &publish.topic, metadata)?;
     let message = MqttMessage {
         payload: publish.payload.to_vec(),
         topic: publish.topic.clone(),
+        headers,
         metadata,
     };
     let ack_token = (metadata.qos != Qos::Zero).then_some(AckToken(AckTokenKind::Mqtt311(publish)));
     Ok(ReceivedMessage { message, ack_token })
 }
 
-fn normalize_mqtt5(publish: Mqtt5Publish) -> Result<ReceivedMessage, iggy_connector_sdk::Error> {
+pub(crate) fn normalize_mqtt5(
+    publish: Mqtt5Publish,
+) -> Result<ReceivedMessage, iggy_connector_sdk::Error> {
     let qos = publish.qos.into();
     let metadata = MqttMessageMetadata {
         qos,
         packet_id: (qos != Qos::Zero).then_some(publish.pkid),
+        dup: publish.dup,
         retain: publish.retain,
     };
+    let topic = topic_string(&publish.topic)?;
+    let mut headers = metadata_headers("mqtt5", &topic, metadata)?;
+    if let Some(properties) = publish.properties.as_ref() {
+        insert_mqtt5_properties(&mut headers, properties)?;
+    }
     let message = MqttMessage {
         payload: publish.payload.to_vec(),
-        topic: topic_string(&publish.topic)?,
+        topic,
+        headers,
         metadata,
     };
     let ack_token = (metadata.qos != Qos::Zero).then_some(AckToken(AckTokenKind::Mqtt5(publish)));
     Ok(ReceivedMessage { message, ack_token })
+}
+
+fn metadata_headers(
+    protocol: &str,
+    topic: &str,
+    metadata: MqttMessageMetadata,
+) -> Result<BTreeMap<HeaderKey, HeaderValue>, iggy_connector_sdk::Error> {
+    let mut headers = BTreeMap::new();
+    insert_string_header(&mut headers, "mqtt.protocol", protocol)?;
+    insert_string_header(&mut headers, "mqtt.topic", topic)?;
+    headers.insert(header_key("mqtt.qos")?, qos_value(metadata.qos).into());
+    headers.insert(header_key("mqtt.dup")?, metadata.dup.into());
+    headers.insert(header_key("mqtt.retain")?, metadata.retain.into());
+    if let Some(packet_id) = metadata.packet_id {
+        headers.insert(header_key("mqtt.packet_id")?, packet_id.into());
+    }
+    Ok(headers)
+}
+
+fn insert_mqtt5_properties(
+    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
+    properties: &rumqttc::v5::mqttbytes::v5::PublishProperties,
+) -> Result<(), iggy_connector_sdk::Error> {
+    if let Some(value) = properties.payload_format_indicator {
+        headers.insert(header_key("mqtt.payload_format_indicator")?, value.into());
+    }
+    if let Some(value) = properties.message_expiry_interval {
+        headers.insert(header_key("mqtt.message_expiry_interval")?, value.into());
+    }
+    if let Some(value) = properties.topic_alias {
+        headers.insert(header_key("mqtt.topic_alias")?, value.into());
+    }
+    if let Some(value) = properties.response_topic.as_deref() {
+        insert_string_header(headers, "mqtt.response_topic", value)?;
+    }
+    if let Some(value) = properties.correlation_data.as_ref() {
+        insert_raw_header(headers, "mqtt.correlation_data", value)?;
+    }
+    for (index, (key, value)) in properties.user_properties.iter().enumerate() {
+        insert_string_header(headers, &format!("mqtt.user_property.{index}.key"), key)?;
+        insert_string_header(headers, &format!("mqtt.user_property.{index}.value"), value)?;
+    }
+    for (index, value) in properties.subscription_identifiers.iter().enumerate() {
+        headers.insert(
+            header_key(&format!("mqtt.subscription_identifier.{index}"))?,
+            (*value as u64).into(),
+        );
+    }
+    if let Some(value) = properties.content_type.as_deref() {
+        insert_string_header(headers, "mqtt.content_type", value)?;
+    }
+    Ok(())
+}
+
+fn insert_string_header(
+    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
+    name: &str,
+    value: &str,
+) -> Result<(), iggy_connector_sdk::Error> {
+    let header_value = HeaderValue::try_from(value).map_err(|error| {
+        iggy_connector_sdk::Error::Serialization(format!(
+            "invalid MQTT header value for {name}: {error}"
+        ))
+    })?;
+    headers.insert(header_key(name)?, header_value);
+    Ok(())
+}
+
+fn insert_raw_header(
+    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
+    name: &str,
+    value: &[u8],
+) -> Result<(), iggy_connector_sdk::Error> {
+    let header_value = HeaderValue::try_from(value.to_vec()).map_err(|error| {
+        iggy_connector_sdk::Error::Serialization(format!(
+            "invalid MQTT header value for {name}: {error}"
+        ))
+    })?;
+    headers.insert(header_key(name)?, header_value);
+    Ok(())
+}
+
+fn header_key(name: &str) -> Result<HeaderKey, iggy_connector_sdk::Error> {
+    HeaderKey::try_from(name).map_err(|error| {
+        iggy_connector_sdk::Error::Serialization(format!("invalid MQTT header key {name}: {error}"))
+    })
+}
+
+fn qos_value(qos: Qos) -> u8 {
+    match qos {
+        Qos::Zero => 0,
+        Qos::One => 1,
+        Qos::Two => 2,
+    }
 }
 
 fn topic_string(topic: &[u8]) -> Result<String, iggy_connector_sdk::Error> {
@@ -351,6 +578,7 @@ impl From<Mqtt5Qos> for Qos {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rumqttc::v5::mqttbytes::v5::PublishProperties;
 
     #[test]
     fn given_qos_should_convert_to_mqtt311_qos() {
@@ -374,6 +602,47 @@ mod tests {
         assert!(received.ack_token.is_none());
         assert_eq!(received.message.metadata.qos, Qos::Zero);
         assert_eq!(received.message.metadata.packet_id, None);
+    }
+
+    #[test]
+    fn given_mqtt311_publish_should_map_metadata_to_headers() {
+        let mut publish = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"payload");
+        publish.dup = true;
+        publish.retain = true;
+
+        let received = normalize_mqtt311(publish).expect("MQTT 3.1.1 publish should normalize");
+        let headers = &received.message.headers;
+
+        assert_eq!(
+            headers[&header_key("mqtt.protocol").unwrap()]
+                .as_str()
+                .unwrap(),
+            "mqtt311"
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.topic").unwrap()]
+                .as_str()
+                .unwrap(),
+            "devices/test"
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.qos").unwrap()]
+                .as_uint8()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.packet_id").unwrap()]
+                .as_uint16()
+                .unwrap(),
+            0
+        );
+        assert!(headers[&header_key("mqtt.dup").unwrap()].as_bool().unwrap());
+        assert!(
+            headers[&header_key("mqtt.retain").unwrap()]
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -442,6 +711,116 @@ mod tests {
     }
 
     #[test]
+    fn given_mqtt5_publish_properties_should_map_to_headers() {
+        let properties = PublishProperties {
+            payload_format_indicator: Some(1),
+            message_expiry_interval: Some(30),
+            topic_alias: Some(4),
+            response_topic: Some("devices/response".to_string()),
+            correlation_data: Some(b"correlation".as_slice().into()),
+            user_properties: vec![("device_id".to_string(), "device-1".to_string())],
+            subscription_identifiers: vec![7, 9],
+            content_type: Some("application/json".to_string()),
+        };
+        let publish = Mqtt5Publish::new(
+            "devices/test",
+            Mqtt5Qos::AtLeastOnce,
+            b"payload".as_slice(),
+            Some(properties),
+        );
+
+        let received = normalize_mqtt5(publish).expect("MQTT 5 publish should normalize");
+        let headers = &received.message.headers;
+
+        assert_eq!(
+            headers[&header_key("mqtt.protocol").unwrap()]
+                .as_str()
+                .unwrap(),
+            "mqtt5"
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.payload_format_indicator").unwrap()]
+                .as_uint8()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.message_expiry_interval").unwrap()]
+                .as_uint32()
+                .unwrap(),
+            30
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.topic_alias").unwrap()]
+                .as_uint16()
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.response_topic").unwrap()]
+                .as_str()
+                .unwrap(),
+            "devices/response"
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.correlation_data").unwrap()]
+                .as_raw()
+                .unwrap(),
+            b"correlation"
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.user_property.0.key").unwrap()]
+                .as_str()
+                .unwrap(),
+            "device_id"
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.user_property.0.value").unwrap()]
+                .as_str()
+                .unwrap(),
+            "device-1"
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.subscription_identifier.0").unwrap()]
+                .as_uint64()
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.subscription_identifier.1").unwrap()]
+                .as_uint64()
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            headers[&header_key("mqtt.content_type").unwrap()]
+                .as_str()
+                .unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn given_partial_ack_failure_should_retain_unacknowledged_tokens() {
+        let first = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"first");
+        let second = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"second");
+        let third = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"third");
+        let mut ack_tokens = vec![
+            AckToken(AckTokenKind::Mqtt311(first)),
+            AckToken(AckTokenKind::Mqtt311(second)),
+            AckToken(AckTokenKind::Mqtt311(third)),
+        ];
+
+        retain_unacknowledged_tokens(&mut ack_tokens, 1);
+
+        assert_eq!(ack_tokens.len(), 2);
+        let AckToken(AckTokenKind::Mqtt311(publish)) = &ack_tokens[0] else {
+            panic!("expected MQTT 3.1.1 acknowledgement token");
+        };
+        assert_eq!(publish.payload.as_ref(), b"second");
+    }
+
+    #[test]
     fn given_invalid_broker_url_should_reject_before_connecting() {
         let config = MqttSourceConfig {
             broker_url: "not a mqtt url".to_string(),
@@ -456,6 +835,8 @@ mod tests {
             keep_alive: Some("5s".to_string()),
             poll_timeout: Some("100ms".to_string()),
             request_capacity: Some(4),
+            batch_size: Some(3),
+            batch_timeout: Some("10ms".to_string()),
             verbose_logging: None,
         };
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
@@ -491,6 +872,8 @@ mod tests {
             keep_alive: Some("30s".to_string()),
             poll_timeout: Some("1s".to_string()),
             request_capacity: Some(4),
+            batch_size: Some(3),
+            batch_timeout: Some("10ms".to_string()),
             verbose_logging: None,
         };
 

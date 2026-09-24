@@ -37,6 +37,8 @@ const CONNECTOR_NAME: &str = "MQTT source";
 const DEFAULT_KEEP_ALIVE: &str = "30s";
 const DEFAULT_POLL_TIMEOUT: &str = "1s";
 const DEFAULT_REQUEST_CAPACITY: usize = 32;
+const DEFAULT_BATCH_SIZE: usize = 100;
+const DEFAULT_BATCH_TIMEOUT: &str = "10ms";
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -87,6 +89,8 @@ pub struct MqttSourceConfig {
     pub keep_alive: Option<String>,
     pub poll_timeout: Option<String>,
     pub request_capacity: Option<usize>,
+    pub batch_size: Option<usize>,
+    pub batch_timeout: Option<String>,
     pub verbose_logging: Option<bool>,
 }
 
@@ -94,6 +98,8 @@ pub struct MqttSource {
     id: u32,
     config: MqttSourceConfig,
     poll_timeout: Duration,
+    batch_size: usize,
+    batch_timeout: Duration,
     driver: Mutex<Option<MqttDriver>>,
     state: Mutex<State>,
     pending_batch: Mutex<Option<PendingBatch>>,
@@ -117,7 +123,7 @@ struct State {
 
 #[derive(Debug)]
 struct PendingBatch {
-    ack_token: Option<AckToken>,
+    ack_tokens: Vec<AckToken>,
     candidate_state: State,
 }
 
@@ -136,6 +142,8 @@ impl MqttSource {
             id,
             config,
             poll_timeout: Duration::from_secs(1),
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_timeout: Duration::from_millis(10),
             driver: Mutex::new(None),
             state: Mutex::new(restored_state.unwrap_or_default()),
             pending_batch: Mutex::new(None),
@@ -146,7 +154,7 @@ impl MqttSource {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
-    fn validate_config(&self) -> Result<(Qos, Duration, Duration, usize), Error> {
+    fn validate_config(&self) -> Result<(Qos, Duration, Duration, usize, usize, Duration), Error> {
         if self.config.broker_url.trim().is_empty() {
             return Err(Error::InvalidConfigValue(
                 "broker_url must not be empty".to_string(),
@@ -190,6 +198,18 @@ impl MqttSource {
             ));
         }
 
+        let batch_size = self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        if batch_size == 0 {
+            return Err(Error::InvalidConfigValue(
+                "batch_size must be greater than zero".to_string(),
+            ));
+        }
+        let batch_timeout = parse_duration(
+            self.config.batch_timeout.as_deref(),
+            DEFAULT_BATCH_TIMEOUT,
+            "batch_timeout",
+        )?;
+
         let minimum_keep_alive = match self.config.protocol {
             MqttProtocol::Mqtt311 => Duration::from_secs(1),
             MqttProtocol::Mqtt5 => Duration::from_secs(5),
@@ -201,18 +221,50 @@ impl MqttSource {
             )));
         }
 
-        Ok((qos, keep_alive, poll_timeout, request_capacity))
+        Ok((
+            qos,
+            keep_alive,
+            poll_timeout,
+            request_capacity,
+            batch_size,
+            batch_timeout,
+        ))
     }
 
     async fn current_state(&self) -> State {
         self.state.lock().await.clone()
+    }
+
+    async fn collect_batch(
+        &self,
+        driver: &mut MqttDriver,
+    ) -> Result<Vec<driver::ReceivedMessage>, Error> {
+        let Some(first) = driver.next_message(self.poll_timeout).await? else {
+            return Ok(Vec::new());
+        };
+
+        let mut messages = Vec::with_capacity(self.batch_size);
+        messages.push(first);
+        let deadline = tokio::time::Instant::now() + self.batch_timeout;
+        while messages.len() < self.batch_size {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Some(message) = driver.next_message(remaining).await? else {
+                break;
+            };
+            messages.push(message);
+        }
+        Ok(messages)
     }
 }
 
 #[async_trait]
 impl Source for MqttSource {
     async fn open(&mut self) -> Result<(), Error> {
-        let (qos, keep_alive, poll_timeout, request_capacity) = self.validate_config()?;
+        let (qos, keep_alive, poll_timeout, request_capacity, batch_size, batch_timeout) =
+            self.validate_config()?;
         let driver = match MqttDriver::connect(
             self.id,
             &self.config,
@@ -233,12 +285,16 @@ impl Source for MqttSource {
             }
         };
         self.poll_timeout = poll_timeout;
+        self.batch_size = batch_size;
+        self.batch_timeout = batch_timeout;
         *self.driver.lock().await = Some(driver);
         info!(
-            "Opened {CONNECTOR_NAME} connector with ID {} using {:?}, QoS {}, for {} subscription(s)",
+            "Opened {CONNECTOR_NAME} connector with ID {} using {:?}, QoS {}, batch_size {}, batch_timeout {:?}, for {} subscription(s)",
             self.id,
             self.config.protocol,
             self.config.qos,
+            self.batch_size,
+            self.batch_timeout,
             self.config.subscriptions.len()
         );
         Ok(())
@@ -256,50 +312,61 @@ impl Source for MqttSource {
             .await
             .take()
             .ok_or_else(|| Error::InitError("MQTT driver is not initialized".to_string()))?;
-        let received = driver.next_message(self.poll_timeout).await;
+        let received = self.collect_batch(&mut driver).await;
         *self.driver.lock().await = Some(driver);
-        let Some(received) = received? else {
+        let received = received?;
+        if received.is_empty() {
             return Ok(empty_messages());
-        };
+        }
 
         let state = self.current_state().await;
         let candidate_state = State {
-            acknowledged_messages: state.acknowledged_messages.saturating_add(1),
+            acknowledged_messages: state
+                .acknowledged_messages
+                .saturating_add(received.len() as u64),
         };
         let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
             Error::Serialization("failed to serialize MQTT source state".to_string())
         })?;
-        if self.config.verbose_logging.unwrap_or(false) {
-            debug!(
-                "Received MQTT message for {CONNECTOR_NAME} connector with ID {}: topic={}, qos={:?}, packet_id={:?}, retain={}",
-                self.id,
-                received.message.topic,
-                received.message.metadata.qos,
-                received.message.metadata.packet_id,
-                received.message.metadata.retain
-            );
+        let mut messages = Vec::with_capacity(received.len());
+        let mut ack_tokens = Vec::with_capacity(received.len());
+        for received in received {
+            if self.config.verbose_logging.unwrap_or(false) {
+                debug!(
+                    "Received MQTT message for {CONNECTOR_NAME} connector with ID {}: topic={}, qos={:?}, packet_id={:?}, retain={}",
+                    self.id,
+                    received.message.topic,
+                    received.message.metadata.qos,
+                    received.message.metadata.packet_id,
+                    received.message.metadata.retain
+                );
+            }
+            if let Some(ack_token) = received.ack_token {
+                ack_tokens.push(ack_token);
+            }
+            messages.push(ProducedMessage {
+                id: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                headers: Some(received.message.headers),
+                payload: received.message.payload,
+            });
         }
         *self.pending_batch.lock().await = Some(PendingBatch {
-            ack_token: received.ack_token,
+            ack_tokens,
             candidate_state,
         });
 
         Ok(ProducedMessages {
             schema: Schema::Raw,
-            messages: vec![ProducedMessage {
-                id: None,
-                checksum: None,
-                timestamp: None,
-                origin_timestamp: None,
-                headers: None,
-                payload: received.message.payload,
-            }],
+            messages,
             state: Some(persisted_state),
         })
     }
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
-        let Some(pending_batch) = self.pending_batch.lock().await.take() else {
+        let Some(mut pending_batch) = self.pending_batch.lock().await.take() else {
             return Ok(());
         };
         if result == SourceBatchResult::Nack {
@@ -310,18 +377,28 @@ impl Source for MqttSource {
             return Ok(());
         }
 
-        if let Some(ack_token) = pending_batch.ack_token.as_ref() {
-            let acknowledgement = {
-                let driver = self.driver.lock().await;
-                let driver = driver.as_ref().ok_or_else(|| {
-                    Error::InitError("MQTT driver is not initialized".to_string())
-                })?;
-                driver.acknowledge(ack_token)
-            };
-            if let Err(error) = acknowledgement {
-                *self.pending_batch.lock().await = Some(pending_batch);
-                return Err(error);
-            }
+        if pending_batch.ack_tokens.is_empty() {
+            *self.state.lock().await = pending_batch.candidate_state;
+            return Ok(());
+        }
+
+        let Some(mut driver) = self.driver.lock().await.take() else {
+            *self.pending_batch.lock().await = Some(pending_batch);
+            return Err(Error::InitError(
+                "MQTT driver is not initialized".to_string(),
+            ));
+        };
+        let acknowledgement = driver
+            .acknowledge_batch(
+                &mut pending_batch.ack_tokens,
+                self.poll_timeout,
+                self.batch_size,
+            )
+            .await;
+        *self.driver.lock().await = Some(driver);
+        if let Err(error) = acknowledgement {
+            *self.pending_batch.lock().await = Some(pending_batch);
+            return Err(error);
         }
         *self.state.lock().await = pending_batch.candidate_state;
         Ok(())
@@ -372,6 +449,8 @@ mod tests {
             keep_alive: Some("30s".to_string()),
             poll_timeout: Some("100ms".to_string()),
             request_capacity: Some(4),
+            batch_size: Some(3),
+            batch_timeout: Some("10ms".to_string()),
             verbose_logging: None,
         }
     }
@@ -435,7 +514,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
             *source.pending_batch.lock().await = Some(PendingBatch {
-                ack_token: None,
+                ack_tokens: Vec::new(),
                 candidate_state: State {
                     acknowledged_messages: 1,
                 },
@@ -454,8 +533,18 @@ mod tests {
         let source = MqttSource::new(7, test_config(), None);
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
+            let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
+                "devices/test",
+                rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+                b"payload".as_slice(),
+                None,
+            );
+            let ack_token = driver::normalize_mqtt5(publish)
+                .expect("MQTT publish should normalize")
+                .ack_token
+                .expect("QoS 1 publish should have an acknowledgement token");
             *source.pending_batch.lock().await = Some(PendingBatch {
-                ack_token: None,
+                ack_tokens: vec![ack_token],
                 candidate_state: State {
                     acknowledged_messages: 1,
                 },
@@ -466,6 +555,7 @@ mod tests {
                 .await
                 .expect("nack should be handled");
             assert_eq!(source.current_state().await.acknowledged_messages, 0);
+            assert!(source.pending_batch.lock().await.is_none());
         });
     }
 
@@ -478,6 +568,38 @@ mod tests {
 
             assert!(source.validate_config().is_ok());
         }
+    }
+
+    #[test]
+    fn given_zero_batch_size_should_reject_configuration() {
+        let mut config = test_config();
+        config.batch_size = Some(0);
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_invalid_batch_timeout_should_reject_configuration() {
+        let mut config = test_config();
+        config.batch_timeout = Some("not a duration".to_string());
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_missing_batch_configuration_should_use_bounded_defaults() {
+        let mut config = test_config();
+        config.batch_size = None;
+        config.batch_timeout = None;
+        let source = MqttSource::new(7, config, None);
+
+        let (_, _, _, _, batch_size, batch_timeout) = source
+            .validate_config()
+            .expect("default batch config should be valid");
+        assert_eq!(batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(batch_timeout, Duration::from_millis(10));
     }
 
     #[test]
