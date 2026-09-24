@@ -16,3 +16,4 @@
 // under the License.
 
 mod s3_sink;
+mod s3_source;

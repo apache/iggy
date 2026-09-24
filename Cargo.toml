@@ -54,6 +54,7 @@ members = [
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
+    "core/connectors/sources/s3_source",
     "core/consensus",
     "core/cpu_allocation",
     "core/harness_derive",
@@ -104,6 +105,8 @@ async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.92"
 async_zip = { version = "0.0.19", features = ["tokio", "lzma", "bzip2", "xz", "deflate", "zstd"] }
+aws-config = "1.11.0"
+aws-sdk-s3 = "1.149.0"
 axum = { version = "0.8.9", features = ["macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.23.1"
@@ -234,6 +237,7 @@ meilisearch-sdk = { version = "0.33.0", default-features = false, features = [
     "tls",
     "jwt_rust_crypto",
 ] }
+memchr = "2.8.3"
 message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"
@@ -267,6 +271,7 @@ parquet = "58.4.0"
 partitions = { path = "core/partitions" }
 passterm = "2.0.6"
 paste = "1.0"
+percent-encoding = "2.3.2"
 pgwire = "0.40.7"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.4"
