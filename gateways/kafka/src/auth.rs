@@ -21,11 +21,13 @@
 //! password are an Iggy username and password, so authenticating is forwarding them to an Iggy
 //! login and seeing whether it succeeds. `docs/AUTHENTICATION.md` has the reasoning.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use iggy::prelude::{
-    AutoLogin, Client, Credentials, Identifier, IggyClientBuilder, IggyError, Permissions,
+    AutoLogin, Client, Credentials, Identifier, IggyError, Permissions, TcpClient,
+    TcpClientConfigBuilder,
 };
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
@@ -35,10 +37,10 @@ use crate::protocol::sasl::PlainCredentials;
 
 /// Bound on one credential verification.
 ///
-/// Covers the dial and the login only. The permission read and the teardown have their own, much
-/// smaller budgets ([`PERMISSION_READ_TIMEOUT`] and [`TEARDOWN_TIMEOUT`]), so the three together
-/// stay inside the caller's pre-authentication budget rather than exceeding it. The caller bounds
-/// the whole thing again from outside, because a permit wait is not covered here at all.
+/// Covers the dial and the login only. The teardown has its own, much smaller budget
+/// ([`TEARDOWN_TIMEOUT`]). The permission read has none of its own: it is the only request on its
+/// connection, and the caller's pre-authentication budget bounds it from outside along with
+/// everything else, including a permit wait that is not covered here at all.
 ///
 /// A verification that has not answered inside this is indistinguishable, from the Kafka client's
 /// side, from one that failed, and the client is holding a connection open waiting for it. Shorter
@@ -57,28 +59,12 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// hide the failure underneath one the client cannot see.
 const VERIFY_RECONNECTION_RETRIES: u32 = 1;
 
-/// Budget for the permission read that follows a successful login.
-///
-/// Much smaller than [`VERIFY_TIMEOUT`] on purpose, and deliberately small in absolute terms. The
-/// caller bounds the whole exchange at its pre-authentication budget, which must also absorb the
-/// wait for an authentication slot, so every second spent here is a second that wait does not get.
-/// At one second the inner worst case is 12s against a 15s outer budget, leaving the queue three
-/// seconds rather than one. A read that times out skips the teardown wait, which could not succeed
-/// behind the SDK's still-running request, so the common slow path costs 11s, not 12s.
-///
-/// It also bounds only *this* future, not the SDK's work. A cancelled call leaves the SDK's own
-/// read running on a detached task that holds its connection lock until that task's own deadline,
-/// so a shorter budget here does not stop that work, it only stops the caller waiting on it. The
-/// login has already succeeded by this point, so abandoning the read costs an ACL view and nothing
-/// else.
-const PERMISSION_READ_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// Budget for tearing the verification client down again.
 ///
 /// Deliberately far shorter than [`VERIFY_TIMEOUT`]. The authentication slot is already released by
 /// the time teardown runs, but every second here still comes out of the caller's own
-/// pre-authentication budget. Nothing is lost by cutting it short: `Drop` aborts the heartbeat task
-/// regardless.
+/// pre-authentication budget. Nothing is lost by cutting it short: dropping the client closes the
+/// socket regardless.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Why a SASL exchange did not produce a verified identity.
@@ -280,8 +266,10 @@ impl SaslAuthenticator for IggyAuthenticator {
             credentials.username.clone(),
             credentials.password.clone(),
         ));
-        let mut builder = IggyClientBuilder::new()
-            .with_tcp()
+        // A bare transport client, not an `IggyClient`. The wrapper starts a heartbeat the moment it
+        // connects, and on a lockstep connection that ping queues the permission read behind it.
+        // Nothing here needs a heartbeat anyway: the client lives for one login and one read.
+        let mut builder = TcpClientConfigBuilder::new()
             .with_server_address(self.address.clone())
             .with_auto_sign_in(auto_login)
             .with_reconnection_max_retries(Some(VERIFY_RECONNECTION_RETRIES));
@@ -294,12 +282,14 @@ impl SaslAuthenticator for IggyAuthenticator {
                 builder = builder.with_tls_ca_file(ca_file.clone());
             }
         }
-        let client = builder.build().map_err(|error| classify(&error))?;
+        let client = builder
+            .build()
+            .and_then(|config| TcpClient::create(Arc::new(config)))
+            .map_err(|error| classify(&error))?;
 
         let connected = tokio::time::timeout(VERIFY_TIMEOUT, client.connect()).await;
         // The password verify the slot bounds is done. Holding it across the permission read and
-        // teardown kept a slot busy for up to two more seconds per login, and after a timed-out
-        // read for as long as the SDK's detached request still ran.
+        // teardown would keep a slot busy for two more round trips per login.
         drop(slot);
         let outcome = match connected {
             Err(_elapsed) => Err(AuthError::Unavailable),
@@ -312,28 +302,13 @@ impl SaslAuthenticator for IggyAuthenticator {
             Ok(Ok(())) => fetch_permissions(&client, &credentials.username).await,
         };
 
-        // A timed-out permission read leaves the SDK's detached request task holding the stream
-        // lock until its own response deadline, and `shutdown` needs that lock first, so waiting
-        // on it could only burn `TEARDOWN_TIMEOUT` of the caller's pre-authentication budget.
-        // Dropping the client instead still aborts the heartbeat, which is the part that would
-        // reconnect. The socket itself lives on in that task until its deadline, which nothing on
-        // this side of the SDK can shorten.
-        if matches!(outcome, Ok((_, PermissionRead::TimedOut))) {
-            return outcome.map(|(permissions, _)| AuthenticatedPrincipal {
-                username: credentials.username.clone(),
-                permissions,
-                permissions_known: false,
-            });
-        }
-
-        // Shut down on both paths, and not `disconnect`: only `shutdown` stops the heartbeat task,
-        // which would otherwise keep pinging, observe the dropped transport, and reconnect using
-        // the very credentials this call was only meant to check.
+        // Shut down rather than drop, so the socket closes cleanly and Iggy releases the session
+        // now instead of noticing the dead peer later.
         //
         // Both failure shapes are reported, and separately: the outer `Elapsed` and the inner
         // `IggyError` mean different things, and folding them together would log "timed out" for a
-        // shutdown that failed immediately. Neither leaks the client, since `Drop` aborts the
-        // heartbeat regardless, but an invisible failure here would hide a real one.
+        // shutdown that failed immediately. Neither leaks the client, since dropping it closes the
+        // socket regardless, but an invisible failure here would hide a real one.
         match tokio::time::timeout(TEARDOWN_TIMEOUT, client.shutdown()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -359,8 +334,6 @@ enum PermissionRead {
     Resolved,
     /// The read answered but gave no usable record.
     Failed,
-    /// The read did not answer in time, and its request is still in flight inside the SDK.
-    TimedOut,
 }
 
 /// Reads the just-authenticated user's own record and projects its global permissions.
@@ -383,10 +356,15 @@ async fn fetch_permissions(
     // above, so turning a stumble on this second round trip into a rejection would answer a correct
     // password with `SASL_AUTHENTICATION_FAILED`, which a Kafka client treats as fatal and raises
     // to the application. Losing the ACL view is the lesser harm, and it degrades to an empty one.
-    let fetched = tokio::time::timeout(PERMISSION_READ_TIMEOUT, client.get_user(&identifier)).await;
+    //
+    // Not bounded here either. The SDK runs the exchange on a task of its own that holds the
+    // connection until the server answers or its own response deadline passes, so cancelling this
+    // future would stop only the waiting, not the read, and leave a live session behind the slot
+    // this login already gave back. The caller's pre-authentication budget still bounds the wait.
+    let fetched = client.get_user(&identifier).await;
     let mut read = PermissionRead::Resolved;
     let user = match fetched {
-        Ok(Ok(None)) => {
+        Ok(None) => {
             read = PermissionRead::Failed;
             // Distinct from an error: the login succeeded, so the account exists. A record that
             // resolves to nothing here means the read raced a deletion, and silently reporting an
@@ -394,15 +372,10 @@ async fn fetch_permissions(
             warn!("authenticated, but the principal's own record resolved to nothing");
             None
         }
-        Ok(Ok(user)) => user,
-        Ok(Err(error)) => {
+        Ok(user) => user,
+        Err(error) => {
             read = PermissionRead::Failed;
             warn!(%error, "authenticated, but could not read the principal's permissions");
-            None
-        }
-        Err(_elapsed) => {
-            read = PermissionRead::TimedOut;
-            warn!("authenticated, but timed out reading the principal's permissions");
             None
         }
     };

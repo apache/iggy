@@ -96,6 +96,29 @@ fn docker_missing() -> bool {
 ///
 /// Containers run with `--pull never`, so a missing image would otherwise surface as a client that
 /// failed to start, reported against whichever feature that test happened to cover.
+/// Whether this host can run `run_client` at all.
+///
+/// `run_client` depends on two things outside Docker: `--network host` reaching the host's
+/// loopback, which only Linux does, and GNU `timeout` with `--kill-after`, which macOS lacks. A
+/// host without either would get past `stack` and then panic inside `expect_ran` or the spawn
+/// itself, reading as a gateway failure rather than a missing prerequisite.
+fn host_unsupported() -> bool {
+    if !cfg!(target_os = "linux") {
+        return skip("`docker run --network host` reaches the host loopback only on Linux");
+    }
+    let gnu_timeout = Command::new("timeout")
+        .args(["--kill-after=1s", "1s", "true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if gnu_timeout {
+        false
+    } else {
+        skip("GNU `timeout` with `--kill-after` is unavailable")
+    }
+}
+
 fn image_present(image: &str) -> bool {
     Command::new("docker")
         .args(["image", "inspect", image])
@@ -405,7 +428,7 @@ fn java_client_config(username: &str, password: &str) -> (tempfile::TempDir, Pat
 
 /// Brings up a server and a gateway, or reports why it could not.
 async fn stack() -> Option<(TestServer, SocketAddr)> {
-    if docker_missing() {
+    if host_unsupported() || docker_missing() {
         return None;
     }
     if let Some(image) = [KCAT_IMAGE, KAFKA_IMAGE]
