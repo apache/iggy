@@ -25,7 +25,12 @@ use iggy_connector_sdk::{
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    str::FromStr,
+    time::Duration,
+};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, error, info, warn};
 
@@ -76,6 +81,8 @@ impl TryFrom<u8> for Qos {
 pub struct MqttSourceConfig {
     pub broker_url: String,
     pub subscriptions: Vec<String>,
+    #[serde(default)]
+    pub subscription_qos: BTreeMap<String, u8>,
     #[serde(default)]
     pub protocol: MqttProtocol,
     #[serde(default = "default_qos")]
@@ -171,6 +178,26 @@ impl MqttSource {
                 "subscriptions must contain at least one non-empty topic".to_string(),
             ));
         }
+        let mut unique_subscriptions = HashSet::with_capacity(self.config.subscriptions.len());
+        for subscription in &self.config.subscriptions {
+            if !unique_subscriptions.insert(subscription) {
+                return Err(Error::InvalidConfigValue(format!(
+                    "subscriptions contains duplicate topic filter: {subscription}"
+                )));
+            }
+        }
+        for subscription in self.config.subscription_qos.keys() {
+            if !self
+                .config
+                .subscriptions
+                .iter()
+                .any(|topic| topic == subscription)
+            {
+                return Err(Error::InvalidConfigValue(format!(
+                    "subscription_qos contains unknown topic filter: {subscription}"
+                )));
+            }
+        }
         if self.config.username.is_some() != self.config.password.is_some() {
             return Err(Error::InvalidConfigValue(
                 "username and password must be configured together".to_string(),
@@ -178,6 +205,9 @@ impl MqttSource {
         }
 
         let qos = Qos::try_from(self.config.qos)?;
+        for subscription in &self.config.subscriptions {
+            qos_for_subscription(&self.config, subscription, qos)?;
+        }
         let keep_alive = parse_duration(
             self.config.keep_alive.as_deref(),
             DEFAULT_KEEP_ALIVE,
@@ -257,6 +287,17 @@ impl MqttSource {
             messages.push(message);
         }
         Ok(messages)
+    }
+}
+
+pub(crate) fn qos_for_subscription(
+    config: &MqttSourceConfig,
+    subscription: &str,
+    default_qos: Qos,
+) -> Result<Qos, Error> {
+    match config.subscription_qos.get(subscription).copied() {
+        Some(value) => Qos::try_from(value),
+        None => Ok(default_qos),
     }
 }
 
@@ -439,6 +480,7 @@ mod tests {
         MqttSourceConfig {
             broker_url: "mqtt://localhost:1883".to_string(),
             subscriptions: vec!["devices/+/telemetry".to_string()],
+            subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
             qos: 1,
             client_id: Some("test-source".to_string()),
@@ -568,6 +610,110 @@ mod tests {
 
             assert!(source.validate_config().is_ok());
         }
+    }
+
+    #[test]
+    fn given_unknown_subscription_qos_override_should_reject_configuration() {
+        let mut config = test_config();
+        config
+            .subscription_qos
+            .insert("devices/+/status".to_string(), 2);
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_invalid_subscription_qos_override_should_reject_configuration() {
+        let mut config = test_config();
+        config
+            .subscription_qos
+            .insert("devices/+/telemetry".to_string(), 3);
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_duplicate_subscription_filters_should_reject_configuration() {
+        let mut config = test_config();
+        config.subscriptions.push("devices/+/telemetry".to_string());
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_subscription_qos_override_should_use_default_for_other_filters() {
+        let mut config = test_config();
+        config.subscriptions.push("devices/+/status".to_string());
+        config
+            .subscription_qos
+            .insert("devices/+/telemetry".to_string(), 2);
+        let source = MqttSource::new(7, config, None);
+        let (default_qos, _, _, _, _, _) = source
+            .validate_config()
+            .expect("subscription QoS configuration should be valid");
+
+        assert_eq!(
+            qos_for_subscription(&source.config, "devices/+/telemetry", default_qos)
+                .expect("override should be valid"),
+            Qos::Two
+        );
+        assert_eq!(
+            qos_for_subscription(&source.config, "devices/+/status", default_qos)
+                .expect("default QoS should be valid"),
+            Qos::One
+        );
+    }
+
+    #[test]
+    fn given_mqtt311_subscription_qos_should_resolve_each_filter() {
+        let mut config = test_config();
+        config.protocol = MqttProtocol::Mqtt311;
+        config.subscriptions.push("devices/+/status".to_string());
+        config
+            .subscription_qos
+            .insert("devices/+/status".to_string(), 0);
+        let source = MqttSource::new(7, config, None);
+        let (default_qos, _, _, _, _, _) = source
+            .validate_config()
+            .expect("MQTT 3.1.1 subscription configuration should be valid");
+
+        assert_eq!(
+            qos_for_subscription(&source.config, "devices/+/telemetry", default_qos)
+                .expect("default QoS should be valid"),
+            Qos::One
+        );
+        assert_eq!(
+            qos_for_subscription(&source.config, "devices/+/status", default_qos)
+                .expect("override should be valid"),
+            Qos::Zero
+        );
+    }
+
+    #[test]
+    fn given_mqtt5_subscription_qos_should_resolve_each_filter() {
+        let mut config = test_config();
+        config.subscriptions.push("devices/+/status".to_string());
+        config
+            .subscription_qos
+            .insert("devices/+/status".to_string(), 2);
+        let source = MqttSource::new(7, config, None);
+        let (default_qos, _, _, _, _, _) = source
+            .validate_config()
+            .expect("MQTT 5 subscription configuration should be valid");
+
+        assert_eq!(
+            qos_for_subscription(&source.config, "devices/+/telemetry", default_qos)
+                .expect("default QoS should be valid"),
+            Qos::One
+        );
+        assert_eq!(
+            qos_for_subscription(&source.config, "devices/+/status", default_qos)
+                .expect("override should be valid"),
+            Qos::Two
+        );
     }
 
     #[test]

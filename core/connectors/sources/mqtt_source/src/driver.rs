@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{MqttProtocol, MqttSourceConfig, Qos};
+use super::{MqttProtocol, MqttSourceConfig, Qos, qos_for_subscription};
 use iggy_common::{HeaderKey, HeaderValue};
 use rumqttc::v5::{
     AsyncClient as Mqtt5Client, Event as Mqtt5Event, EventLoop as Mqtt5EventLoop,
@@ -110,9 +110,13 @@ impl MqttDriver {
 
                 let (client, mut event_loop) = Mqtt311Client::new(options, request_capacity);
                 for topic in &config.subscriptions {
-                    client.subscribe(topic, qos.into()).await.map_err(|error| {
-                        iggy_connector_sdk::Error::Connection(error.to_string())
-                    })?;
+                    let subscription_qos = qos_for_subscription(config, topic, qos)?;
+                    client
+                        .subscribe(topic, subscription_qos.into())
+                        .await
+                        .map_err(|error| {
+                            iggy_connector_sdk::Error::Connection(error.to_string())
+                        })?;
                 }
                 poll_mqtt311(&mut event_loop, poll_timeout).await?;
 
@@ -139,9 +143,13 @@ impl MqttDriver {
 
                 let (client, mut event_loop) = Mqtt5Client::new(options, request_capacity);
                 for topic in &config.subscriptions {
-                    client.subscribe(topic, qos.into()).await.map_err(|error| {
-                        iggy_connector_sdk::Error::Connection(error.to_string())
-                    })?;
+                    let subscription_qos = qos_for_subscription(config, topic, qos)?;
+                    client
+                        .subscribe(topic, subscription_qos.into())
+                        .await
+                        .map_err(|error| {
+                            iggy_connector_sdk::Error::Connection(error.to_string())
+                        })?;
                 }
                 poll_mqtt5(&mut event_loop, poll_timeout).await?;
 
@@ -825,6 +833,7 @@ mod tests {
         let config = MqttSourceConfig {
             broker_url: "not a mqtt url".to_string(),
             subscriptions: vec!["devices/test".to_string()],
+            subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
             qos: 1,
             client_id: Some("test-source".to_string()),
@@ -862,6 +871,7 @@ mod tests {
         let config = MqttSourceConfig {
             broker_url: "mqtt://127.0.0.1:1883?keep_alive_secs=30".to_string(),
             subscriptions: vec!["devices/test".to_string()],
+            subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
             qos: 1,
             client_id: Some("configured-client".to_string()),

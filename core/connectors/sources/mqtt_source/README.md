@@ -183,6 +183,7 @@ The MQTT plugin fields are:
 | `subscriptions` | yes | Non-empty list of MQTT topic filters |
 | `protocol` | no | `mqtt311` or `mqtt5`; defaults to `mqtt5` |
 | `qos` | no | Subscription QoS `0`, `1`, or `2`; defaults to `1` |
+| `subscription_qos` | no | Exact topic-filter overrides for `qos`; every key must be listed in `subscriptions` and every value must be `0`, `1`, or `2` |
 | `client_id` | no | MQTT client identifier; the runtime ID is used when absent |
 | `username` / `password` | no | Must be supplied together |
 | `clean_start` | no | MQTT clean-session/clean-start setting |
@@ -200,6 +201,29 @@ boundary. `request_capacity` remains the bounded rumqttc request-channel
 capacity; when it temporarily fills while acknowledgements are queued, the
 driver advances the event loop and buffers incoming messages up to the bounded
 batch capacity instead of dropping them.
+
+### Per-subscription QoS
+
+`qos` is the default subscription QoS. The optional `subscription_qos` table
+overrides it for individual filters using exact string matches:
+
+```toml
+subscriptions = [
+  "devices/+/telemetry",
+  "devices/+/status",
+]
+qos = 1
+
+[plugin_config.subscription_qos]
+"devices/+/telemetry" = 2
+"devices/+/status" = 0
+```
+
+The connector rejects duplicate filters, overrides for filters that are not in
+`subscriptions`, and values outside `0`, `1`, and `2`. The same resolution is
+used for MQTT 3.1.1 and MQTT 5 subscription setup. The QoS of an incoming
+publish and its acknowledgement token still come from the broker delivery,
+not from this configuration table.
 
 ## Route-specific destinations
 
