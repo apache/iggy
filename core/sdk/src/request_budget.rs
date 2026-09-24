@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{IggyError, NonZeroIggyDuration};
 use std::future::Future;
 use std::time::Duration;
+
+use iggy_common::{IggyError, NonZeroIggyDuration};
 use tokio::time::{Instant, timeout_at};
 
 /// One logical request's absolute deadline, shared by its attempts.
