@@ -373,11 +373,12 @@ pub fn new_shard(
     // Same seed the server bootstrap runs after its own replay.
     metadata.seed_applied_frontier_from_consensus();
     // NOTE: The simulator uses ExternalAuthConfig::default() (enabled: false),
-    // so set_external_auth_user_id is never called. If the simulator ever
-    // enables external auth, the seed_baseline closure above must call
-    // mux_stm.set_external_auth_user_id(config.external_auth.user_id) to
-    // match the server's boot path, or the authz gate will silently skip the
-    // external auth user_id check and allow management ops it should deny.
+    // so set_external_auth_user_id is never called. With the id unset the
+    // authz gate routes the reserved user to the permissioner, which denies
+    // its join and leave, so the sim diverges from nodes that set it. If
+    // the simulator ever enables external auth, call
+    // mux_stm.set_external_auth_user_id(config.external_auth.user_id) here
+    // (there is no seed_baseline closure in this path).
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
     // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.
     let metadata_bundle = (shard_idx == 0).then(|| metadata.mux_stm.factory_bundle());

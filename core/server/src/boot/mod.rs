@@ -645,11 +645,11 @@ async fn shard_main(
     } else {
         (None, None, None, None, (0, 0), None)
     };
-    // Peer shards (Waiter path) and snapshot-restored mux_stm need the
-    // external auth user_id too. The Owner path sets it in seed_baseline
-    // (before WAL replay); the Waiter path gets it here after the bundle.
-    // set_external_auth_user_id is idempotent for the same value, so the
-    // Owner path's earlier set is a no-op here.
+    // Peer shards (Waiter path) and the post-recovery guard need the
+    // external auth user_id. The Owner path sets it in seed_baseline when
+    // replaying from the WAL; a snapshot restore sets it from the snapshot's
+    // own field (MetadataSnapshot v6+). This post-recovery call covers the
+    // Waiter path and is idempotent for the same value.
     if config.external_auth.enabled {
         mux_stm.set_external_auth_user_id(config.external_auth.user_id);
         // The reserved user_id must not collide with a real user, or the
