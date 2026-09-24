@@ -17,16 +17,17 @@
 
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
+use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use std::collections::HashMap;
 
 mod container;
 mod publisher;
 
 use container::{
-    DEFAULT_IGGY_TOPIC, DEFAULT_TEST_STREAM, ENV_SOURCE_BROKER_URL, ENV_SOURCE_CLIENT_ID,
-    ENV_SOURCE_PASSWORD, ENV_SOURCE_PATH, ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA,
-    ENV_SOURCE_STREAM, ENV_SOURCE_TOPIC, ENV_SOURCE_USERNAME, INVALID_MQTT_PASSWORD, MQTT_PASSWORD,
-    MQTT_USERNAME, MqttBrokerContainer,
+    DEFAULT_IGGY_TOPIC, DEFAULT_TEST_STREAM, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_BATCH_TIMEOUT,
+    ENV_SOURCE_BROKER_URL, ENV_SOURCE_CLIENT_ID, ENV_SOURCE_PASSWORD, ENV_SOURCE_PATH,
+    ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA, ENV_SOURCE_STREAM, ENV_SOURCE_TOPIC,
+    ENV_SOURCE_USERNAME, INVALID_MQTT_PASSWORD, MQTT_PASSWORD, MQTT_USERNAME, MqttBrokerContainer,
 };
 
 struct MqttFixture {
@@ -35,6 +36,8 @@ struct MqttFixture {
     qos: u8,
     source_username: &'static str,
     source_password: &'static str,
+    batch_size: &'static str,
+    batch_timeout: &'static str,
 }
 
 impl MqttFixture {
@@ -44,13 +47,41 @@ impl MqttFixture {
         source_username: &'static str,
         source_password: &'static str,
     ) -> Result<Self, TestBinaryError> {
+        Self::start_with_batch(
+            protocol,
+            qos,
+            source_username,
+            source_password,
+            "10",
+            "10ms",
+        )
+        .await
+    }
+
+    async fn start_with_batch(
+        protocol: publisher::Protocol,
+        qos: u8,
+        source_username: &'static str,
+        source_password: &'static str,
+        batch_size: &'static str,
+        batch_timeout: &'static str,
+    ) -> Result<Self, TestBinaryError> {
         Ok(Self {
             broker: MqttBrokerContainer::start().await?,
             protocol,
             qos,
             source_username,
             source_password,
+            batch_size,
+            batch_timeout,
         })
+    }
+
+    async fn restart_broker(&self) -> Result<(), String> {
+        self.broker
+            .restart()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn publish(&self, payload: &[u8]) -> Result<(), String> {
@@ -64,6 +95,55 @@ impl MqttFixture {
             MQTT_PASSWORD,
         )
         .await
+    }
+
+    async fn publish_batch(&self, payloads: &[Vec<u8>]) -> Result<(), String> {
+        publisher::publish_batch(
+            &self.broker.broker_url,
+            container::DEFAULT_TEST_TOPIC,
+            self.protocol,
+            self.qos,
+            payloads,
+            MQTT_USERNAME,
+            MQTT_PASSWORD,
+        )
+        .await
+    }
+
+    async fn publish_mixed_batch(&self, messages: &[(u8, Vec<u8>)]) -> Result<(), String> {
+        publisher::publish_mixed_batch(
+            &self.broker.broker_url,
+            container::DEFAULT_TEST_TOPIC,
+            self.protocol,
+            messages,
+            MQTT_USERNAME,
+            MQTT_PASSWORD,
+        )
+        .await
+    }
+
+    async fn publish_with_properties(
+        &self,
+        payload: &[u8],
+        properties: PublishProperties,
+    ) -> Result<(), String> {
+        match self.protocol {
+            publisher::Protocol::Mqtt5 => {
+                publisher::publish_mqtt5_with_properties(
+                    &self.broker.broker_url,
+                    container::DEFAULT_TEST_TOPIC,
+                    self.qos,
+                    payload,
+                    properties,
+                    MQTT_USERNAME,
+                    MQTT_PASSWORD,
+                )
+                .await
+            }
+            publisher::Protocol::Mqtt311 => {
+                Err("MQTT 5 properties require an MQTT 5 fixture".to_string())
+            }
+        }
     }
 
     fn runtime_envs(&self) -> HashMap<String, String> {
@@ -86,6 +166,14 @@ impl MqttFixture {
             ),
             (ENV_SOURCE_PROTOCOL.to_string(), protocol.to_string()),
             (ENV_SOURCE_QOS.to_string(), self.qos.to_string()),
+            (
+                ENV_SOURCE_BATCH_SIZE.to_string(),
+                self.batch_size.to_string(),
+            ),
+            (
+                ENV_SOURCE_BATCH_TIMEOUT.to_string(),
+                self.batch_timeout.to_string(),
+            ),
             (
                 ENV_SOURCE_CLIENT_ID.to_string(),
                 "iggy-mqtt-integration-source".to_string(),
@@ -129,6 +217,39 @@ macro_rules! define_mqtt_fixture {
     };
 }
 
+pub struct Mqtt5PendingBatchFixture(MqttFixture);
+
+impl Mqtt5PendingBatchFixture {
+    pub async fn publish(&self, payload: &[u8]) -> Result<(), String> {
+        self.0.publish(payload).await
+    }
+
+    pub async fn restart_broker(&self) -> Result<(), String> {
+        self.0.restart_broker().await
+    }
+}
+
+#[async_trait]
+impl TestFixture for Mqtt5PendingBatchFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self(
+            MqttFixture::start_with_batch(
+                publisher::Protocol::Mqtt5,
+                1,
+                MQTT_USERNAME,
+                MQTT_PASSWORD,
+                "100",
+                "5s",
+            )
+            .await?,
+        ))
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.runtime_envs()
+    }
+}
+
 define_mqtt_fixture!(
     Mqtt311Qos0Fixture,
     publisher::Protocol::Mqtt311,
@@ -164,6 +285,29 @@ define_mqtt_fixture!(
     MQTT_USERNAME,
     MQTT_PASSWORD
 );
+
+impl Mqtt5Qos1Fixture {
+    pub async fn publish_with_properties(
+        &self,
+        payload: &[u8],
+        properties: PublishProperties,
+    ) -> Result<(), String> {
+        self.0.publish_with_properties(payload, properties).await
+    }
+}
+
+impl Mqtt311Qos1Fixture {
+    pub async fn publish_batch(&self, payloads: &[Vec<u8>]) -> Result<(), String> {
+        self.0.publish_batch(payloads).await
+    }
+}
+
+impl Mqtt5Qos2Fixture {
+    pub async fn publish_mixed_batch(&self, messages: &[(u8, Vec<u8>)]) -> Result<(), String> {
+        self.0.publish_mixed_batch(messages).await
+    }
+}
+
 define_mqtt_fixture!(
     Mqtt5Qos2Fixture,
     publisher::Protocol::Mqtt5,
@@ -185,3 +329,9 @@ define_mqtt_fixture!(
     MQTT_USERNAME,
     INVALID_MQTT_PASSWORD
 );
+
+impl Mqtt5Qos1Fixture {
+    pub async fn publish_batch(&self, payloads: &[Vec<u8>]) -> Result<(), String> {
+        self.0.publish_batch(payloads).await
+    }
+}

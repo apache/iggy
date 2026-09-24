@@ -29,7 +29,7 @@ const EMQX_IMAGE: &str = "docker.io/emqx/emqx";
 const EMQX_TAG: &str = "latest";
 const EMQX_MQTT_PORT: u16 = 1883;
 const EMQX_DASHBOARD_PORT: u16 = 18083;
-const EMQX_START_ATTEMPTS: usize = 40;
+const EMQX_START_ATTEMPTS: usize = 240;
 const EMQX_START_INTERVAL: Duration = Duration::from_millis(250);
 pub(super) const MQTT_USERNAME: &str = "iggy-mqtt-user";
 pub(super) const MQTT_PASSWORD: &str = "iggy-mqtt-password";
@@ -46,6 +46,10 @@ pub(super) const ENV_SOURCE_PASSWORD: &str = "IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN
 pub(super) const ENV_SOURCE_PROTOCOL: &str = "IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_PROTOCOL";
 pub(super) const ENV_SOURCE_QOS: &str = "IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_QOS";
 pub(super) const ENV_SOURCE_CLIENT_ID: &str = "IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_CLIENT_ID";
+pub(super) const ENV_SOURCE_BATCH_SIZE: &str =
+    "IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_BATCH_SIZE";
+pub(super) const ENV_SOURCE_BATCH_TIMEOUT: &str =
+    "IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_BATCH_TIMEOUT";
 pub(super) const ENV_SOURCE_STREAM: &str = "IGGY_CONNECTORS_SOURCE_MQTT_STREAMS_0_STREAM";
 pub(super) const ENV_SOURCE_TOPIC: &str = "IGGY_CONNECTORS_SOURCE_MQTT_STREAMS_0_TOPIC";
 pub(super) const ENV_SOURCE_SCHEMA: &str = "IGGY_CONNECTORS_SOURCE_MQTT_STREAMS_0_SCHEMA";
@@ -104,6 +108,26 @@ impl MqttBrokerContainer {
             container,
             broker_url,
         })
+    }
+
+    pub(super) async fn restart(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .pause()
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!("Failed to pause EMQX container: {error}"),
+            })?;
+        sleep(Duration::from_secs(2)).await;
+        self.container
+            .unpause()
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!("Failed to resume EMQX container: {error}"),
+            })?;
+
+        wait_for_mqtt(&self.broker_url, MQTT_USERNAME, MQTT_PASSWORD).await
     }
 }
 
