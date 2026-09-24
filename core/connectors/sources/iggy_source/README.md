@@ -92,14 +92,15 @@ the batch is rejected, the previous offsets remain committed and the messages
 are eligible for replay. Consumers should therefore tolerate duplicate
 delivery after failures or crashes.
 
+After five consecutive downstream send or state-save failures, the source
+stops. An operator must restart it before it can replay the unacknowledged
+messages.
+
 > When `initial_offset = "latest"` and no offset has been committed yet, each
 > retry recalculates the current tail of the upstream partition. If a first
 > batch is rejected while new messages arrive, messages from that failed batch
 > can be skipped. Use `earliest` or a numeric offset when replay continuity is
 > required.
-
-If retention makes a saved offset invalid, the connector clears that
-partition's saved position and applies `initial_offset` again.
 
 ## Message Mapping
 
